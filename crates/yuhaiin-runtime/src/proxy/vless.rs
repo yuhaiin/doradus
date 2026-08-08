@@ -1,0 +1,147 @@
+//! VLESS inbound adapter.
+//!
+//! Wire parsing and response framing live in `yuhaiin-protocol`; this module
+//! only authenticates the configured UUID and routes the resulting TCP or
+//! UDP-over-TCP flow through the shared runtime selector.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split};
+use tokio::sync::{Mutex, mpsc};
+use yuhaiin_core::flow::{
+    Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey, FlowObserver,
+};
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
+use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use yuhaiin_protocol::vless::{self, Command};
+
+use super::common::{relay_counted, udp_flow_key};
+use crate::inbound::InboundSpec;
+use crate::{ConnectionMonitor, RuntimeProxySelector};
+
+pub(crate) async fn serve<S>(
+    mut stream: S,
+    peer: SocketAddr,
+    spec: InboundSpec,
+    selector: Arc<RuntimeProxySelector>,
+    monitor: Arc<ConnectionMonitor>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let uuid = vless::parse_uuid(&spec.password)?;
+    let request = vless::read_request(&mut stream, &uuid).await?;
+    let destination = request.destination;
+    let mut context = FlowContext::new(destination.clone());
+    context.source = Some(Endpoint::ip(Network::Tcp, peer));
+    context.original_domain = destination.host().cloned();
+    spec.annotate_context(&mut context);
+    match request.command {
+        Command::Tcp => {
+            let flow = TunFlowKey {
+                network: Network::Tcp,
+                source: peer,
+                destination: destination
+                    .addr()
+                    .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
+            };
+            let outbound = match selector.select(&context).connect(&context).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    monitor.record_failure("vless", &destination.to_string(), &error.to_string());
+                    return Err(error);
+                }
+            };
+            vless::write_response(&mut stream, &[]).await?;
+            relay_counted(stream, outbound, flow, context, monitor)
+                .await
+                .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))
+        }
+        Command::Udp => serve_udp(stream, peer, spec, selector, monitor, destination).await,
+    }
+}
+
+/// Serve a VLESS UDP request. VLESS v0 fixes the destination in the initial
+/// request; each subsequent packet is only length-prefixed, matching the Go
+/// implementation's `PacketConn` behavior.
+async fn serve_udp<S>(
+    mut stream: S,
+    peer: SocketAddr,
+    spec: InboundSpec,
+    selector: Arc<RuntimeProxySelector>,
+    monitor: Arc<ConnectionMonitor>,
+    destination: Endpoint,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    vless::write_response(&mut stream, &[]).await?;
+    let mut context = FlowContext::new(destination.clone());
+    context.source = Some(Endpoint::ip(Network::Udp, peer));
+    context.original_domain = destination.host().cloned();
+    spec.annotate_context(&mut context);
+    let flow = udp_flow_key(peer, &destination);
+    let datagram: Arc<dyn AsyncDatagram> =
+        Arc::from(selector.select(&context).open_datagram(&context).await?);
+    monitor.opened(TunFlow { key: flow }, context);
+    let (mut reader, writer) = split(stream);
+    let writer = Arc::new(Mutex::new(writer));
+    let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(64);
+    let receiver = Arc::clone(&datagram);
+    let receive_task = tokio::spawn(async move {
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            match receiver.recv_from(&mut buffer).await {
+                Ok((length, _target)) => {
+                    if reply_tx.send(buffer[..length].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let mut close_events = monitor.subscribe_close_requests();
+    let result = async {
+        let mut packet = vec![0u8; 64 * 1024];
+        loop {
+            tokio::select! {
+                length = reader.read_u16() => {
+                    let length = usize::from(length.map_err(io_error)?);
+                    if length > packet.len() {
+                        return Err(Error::invalid("VLESS UDP payload is too large"));
+                    }
+                    reader.read_exact(&mut packet[..length]).await.map_err(io_error)?;
+                    datagram.send_to(&packet[..length], destination.clone()).await?;
+                    monitor.bytes(flow, TunFlowDirection::Upload, length);
+                }
+                Some(payload) = reply_rx.recv() => {
+                    let mut writer = writer.lock().await;
+                    writer.write_u16(payload.len() as u16).await.map_err(io_error)?;
+                    writer.write_all(&payload).await.map_err(io_error)?;
+                    monitor.bytes(flow, TunFlowDirection::Download, payload.len());
+                }
+                close = close_events.recv() => {
+                    match close {
+                        Ok(requested) if requested == flow => break,
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                else => break,
+            }
+        }
+        Ok(())
+    }
+    .await;
+    receive_task.abort();
+    let _ = receive_task.await;
+    let _ = datagram.close().await;
+    monitor.closed(flow);
+    result
+}
+
+fn io_error(error: std::io::Error) -> Error {
+    Error::new(ErrorKind::Io, error.to_string())
+}

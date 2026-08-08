@@ -52,7 +52,9 @@ impl GoProxyRuntimeConfig {
                 || (kind.eq_ignore_ascii_case("tls")
                     && !matches!(
                         self.transport,
-                        GoProxyTransport::Trojan | GoProxyTransport::Shadowsocks
+                        GoProxyTransport::Trojan
+                            | GoProxyTransport::Shadowsocks
+                            | GoProxyTransport::Vless
                     ))
         }) {
             return Err(Error::new(
@@ -87,6 +89,7 @@ impl GoProxyRuntimeConfig {
             | GoProxyTransport::Socks5
             | GoProxyTransport::Shadowsocks
             | GoProxyTransport::Trojan
+            | GoProxyTransport::Vless
             | GoProxyTransport::Yuubinsya => Some(fixed_endpoint(&self.layers)),
             _ => None,
         }
@@ -116,9 +119,12 @@ impl GoProxyRuntimeConfig {
                     password: optional_string(config, "password"),
                 }
             }
-            GoProxyTransport::Shadowsocks | GoProxyTransport::Trojan => BaseProxyKind::Fixed {
-                address: address.ok_or_else(|| Error::invalid("proxy protocol has no endpoint"))?,
-            },
+            GoProxyTransport::Shadowsocks | GoProxyTransport::Trojan | GoProxyTransport::Vless => {
+                BaseProxyKind::Fixed {
+                    address: address
+                        .ok_or_else(|| Error::invalid("proxy protocol has no endpoint"))?,
+                }
+            }
             GoProxyTransport::Yuubinsya => {
                 let config = layer_config(&self.layers, "yuubinsya")?;
                 let password = required_string(config, "password")?;
@@ -154,6 +160,7 @@ fn transport_name(transport: &GoProxyTransport) -> &str {
         GoProxyTransport::Socks5 => "socks5",
         GoProxyTransport::Shadowsocks => "shadowsocks",
         GoProxyTransport::Trojan => "trojan",
+        GoProxyTransport::Vless => "vless",
         GoProxyTransport::Yuubinsya => "yuubinsya",
         GoProxyTransport::Tls => "tls",
         GoProxyTransport::Http2 => "http2",

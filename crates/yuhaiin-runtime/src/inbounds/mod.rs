@@ -283,7 +283,9 @@ async fn start_listeners(
             }
             continue;
         }
-        if spec.udp_mode.tcp_enabled() {
+        if spec.udp_mode.tcp_enabled()
+            || (spec.protocol.eq_ignore_ascii_case("vless") && spec.udp_mode.udp_enabled())
+        {
             let listener = TcpListener::bind(spec.listen).await.map_err(|error| {
                 Error::new(ErrorKind::Io, format!("bind inbound {}: {error}", spec.id))
             })?;
@@ -432,6 +434,7 @@ impl InboundSpec {
             .to_owned();
         let password = section
             .get("password")
+            .or_else(|| section.get("uuid"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned();
@@ -1079,6 +1082,7 @@ where
         "http" => crate::proxy::http::serve(stream, peer, spec, selector, monitor).await,
         "mixed" => serve_mixed(stream, peer, spec, selector, monitor).await,
         "trojan" => crate::proxy::trojan::serve(stream, peer, spec, selector, monitor).await,
+        "vless" => crate::proxy::vless::serve(stream, peer, spec, selector, monitor).await,
         "yuubinsya" => crate::proxy::yuubinsya::serve(stream, peer, spec, selector, monitor).await,
         other => Err(Error::new(
             ErrorKind::Unsupported,
@@ -1176,6 +1180,7 @@ mod tests {
     use yuhaiin_core::process::ProcessInfo;
     use yuhaiin_core::{Endpoint, Network};
     use yuhaiin_protocol::trojan::{self, Command};
+    use yuhaiin_protocol::vless::{self, Command as VlessCommand};
     use yuhaiin_store::{ConfigStore, GoNodeRecord};
 
     #[cfg(feature = "doh-tls")]
@@ -1322,6 +1327,94 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         client.shutdown().await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
         echo_task.abort();
+    }
+
+    #[tokio::test]
+    async fn vless_inbound_routes_a_real_tcp_flow_through_shared_outbound() {
+        let (selector, monitor) = direct_runtime().await;
+        let (echo_address, echo_task) = echo_server().await;
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let spec = InboundSpec {
+            id: "vless-inbound".to_owned(),
+            protocol: "vless".to_owned(),
+            listen: "127.0.0.1:19082".parse().unwrap(),
+            username: String::new(),
+            password: "00112233-4455-6677-8899-aabbccddeeff".to_owned(),
+            udp_mode: UdpMode::Disabled,
+            protocol_udp: false,
+            transports: vec!["normal".to_owned()],
+            outbound_id: "direct".to_owned(),
+        };
+        let task = tokio::spawn(crate::proxy::vless::serve(
+            server,
+            "127.0.0.1:41003".parse().unwrap(),
+            spec,
+            selector,
+            monitor,
+        ));
+        let destination = Endpoint::ip(Network::Tcp, echo_address);
+        let uuid = vless::parse_uuid("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        vless::write_request(&mut client, &uuid, VlessCommand::Tcp, &destination)
+            .await
+            .unwrap();
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [0, 0]);
+        client.write_all(b"vless-inbound").await.unwrap();
+        let mut echoed = [0u8; 13];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"vless-inbound");
+        client.shutdown().await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        echo_task.abort();
+    }
+
+    #[tokio::test]
+    async fn vless_udp_command_routes_length_prefixed_packets_through_shared_outbound() {
+        let (selector, monitor) = direct_runtime().await;
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_address = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 1024];
+            let (length, peer) = echo.recv_from(&mut buffer).await.unwrap();
+            echo.send_to(&buffer[..length], peer).await.unwrap();
+        });
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let spec = InboundSpec {
+            id: "vless-udp-inbound".to_owned(),
+            protocol: "vless".to_owned(),
+            listen: "127.0.0.1:19083".parse().unwrap(),
+            username: String::new(),
+            password: "00112233-4455-6677-8899-aabbccddeeff".to_owned(),
+            udp_mode: UdpMode::Enabled,
+            protocol_udp: true,
+            transports: vec!["normal".to_owned()],
+            outbound_id: "direct".to_owned(),
+        };
+        let task = tokio::spawn(crate::proxy::vless::serve(
+            server,
+            "127.0.0.1:41004".parse().unwrap(),
+            spec,
+            selector,
+            monitor,
+        ));
+        let destination = Endpoint::ip(Network::Udp, echo_address);
+        let uuid = vless::parse_uuid("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        vless::write_request(&mut client, &uuid, VlessCommand::Udp, &destination)
+            .await
+            .unwrap();
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [0, 0]);
+        client.write_u16(9).await.unwrap();
+        client.write_all(b"vless-udp").await.unwrap();
+        let length = usize::from(client.read_u16().await.unwrap());
+        let mut payload = vec![0u8; length];
+        client.read_exact(&mut payload).await.unwrap();
+        assert_eq!(payload, b"vless-udp");
+        client.shutdown().await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        echo_task.await.unwrap();
     }
 
     #[tokio::test]

@@ -8,3 +8,4 @@ pub mod shadowsocks;
 #[cfg(feature = "tls-rustcrypto")]
 pub mod tls;
 pub mod trojan;
+pub mod vless;

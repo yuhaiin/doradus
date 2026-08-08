@@ -42,6 +42,7 @@ pub enum GoProxyTransport {
     Socks5,
     Shadowsocks,
     Trojan,
+    Vless,
     Yuubinsya,
     Tls,
     Http2,
@@ -171,6 +172,7 @@ fn parse_proxy_transport(value: &str) -> GoProxyTransport {
         "socks5" => GoProxyTransport::Socks5,
         "shadowsocks" => GoProxyTransport::Shadowsocks,
         "trojan" => GoProxyTransport::Trojan,
+        "vless" => GoProxyTransport::Vless,
         "yuubinsya" => GoProxyTransport::Yuubinsya,
         "tls" => GoProxyTransport::Tls,
         "http2" => GoProxyTransport::Http2,
@@ -191,6 +193,7 @@ fn select_proxy_transport(chain_types: &[String], layers: &[GoProxyLayer]) -> Go
     for preferred in [
         "yuubinsya",
         "socks5",
+        "vless",
         "shadowsocks",
         "trojan",
         "http",

@@ -22,6 +22,8 @@ pub(crate) mod socks4a;
 pub(crate) mod socks5;
 #[path = "proxy/trojan.rs"]
 pub(crate) mod trojan;
+#[path = "proxy/vless.rs"]
+pub(crate) mod vless;
 #[cfg(feature = "websocket")]
 #[path = "proxy/websocket.rs"]
 pub(crate) mod websocket;
@@ -59,7 +61,9 @@ impl RuntimeSnapshot {
             )?) as Arc<dyn AsyncProxy>
         } else if matches!(
             config.transport,
-            yuhaiin_store::GoProxyTransport::Shadowsocks | yuhaiin_store::GoProxyTransport::Trojan
+            yuhaiin_store::GoProxyTransport::Shadowsocks
+                | yuhaiin_store::GoProxyTransport::Trojan
+                | yuhaiin_store::GoProxyTransport::Vless
         ) {
             let base = config
                 .to_base_proxy_config_with_resolver(timeout, self.resolver.clone())
@@ -88,18 +92,20 @@ impl RuntimeSnapshot {
                 .find(|layer| {
                     layer.kind.eq_ignore_ascii_case(match config.transport {
                         yuhaiin_store::GoProxyTransport::Shadowsocks => "shadowsocks",
-                        _ => "trojan",
+                        yuhaiin_store::GoProxyTransport::Trojan => "trojan",
+                        yuhaiin_store::GoProxyTransport::Vless => "vless",
+                        _ => unreachable!(),
                     })
                 })
                 .ok_or_else(|| Error::invalid("proxy protocol layer is missing"))?;
-            let password = layer
-                .config
-                .get("password")
-                .and_then(serde_json::Value::as_str)
-                .filter(|password| !password.is_empty())
-                .ok_or_else(|| Error::invalid("proxy protocol password is empty"))?;
             match config.transport {
                 yuhaiin_store::GoProxyTransport::Shadowsocks => {
+                    let password = layer
+                        .config
+                        .get("password")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|password| !password.is_empty())
+                        .ok_or_else(|| Error::invalid("proxy protocol password is empty"))?;
                     let method = layer
                         .config
                         .get("method")
@@ -109,9 +115,27 @@ impl RuntimeSnapshot {
                         upstream, method, password,
                     )?) as Arc<dyn AsyncProxy>
                 }
-                _ => Arc::new(yuhaiin_protocol::trojan::TrojanProxy::new(
-                    upstream, password,
-                )) as Arc<dyn AsyncProxy>,
+                yuhaiin_store::GoProxyTransport::Trojan => {
+                    let password = layer
+                        .config
+                        .get("password")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|password| !password.is_empty())
+                        .ok_or_else(|| Error::invalid("proxy protocol password is empty"))?;
+                    Arc::new(yuhaiin_protocol::trojan::TrojanProxy::new(
+                        upstream, password,
+                    )) as Arc<dyn AsyncProxy>
+                }
+                yuhaiin_store::GoProxyTransport::Vless => {
+                    let uuid = layer
+                        .config
+                        .get("uuid")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| Error::invalid("VLESS UUID is missing"))?;
+                    Arc::new(yuhaiin_protocol::vless::VlessProxy::new(upstream, uuid)?)
+                        as Arc<dyn AsyncProxy>
+                }
+                _ => unreachable!("protocol branch validated above"),
             }
         } else {
             let base = config
@@ -268,7 +292,9 @@ fn is_chain_config(config: &GoProxyRuntimeConfig) -> bool {
         .any(|kind| kind.eq_ignore_ascii_case("tls"))
         && !matches!(
             config.transport,
-            yuhaiin_store::GoProxyTransport::Trojan | yuhaiin_store::GoProxyTransport::Shadowsocks
+            yuhaiin_store::GoProxyTransport::Trojan
+                | yuhaiin_store::GoProxyTransport::Shadowsocks
+                | yuhaiin_store::GoProxyTransport::Vless
         )
     {
         return true;
@@ -557,6 +583,42 @@ mod tests {
         };
         let built = snapshot(config)
             .build_proxy("shadowsocks", Duration::from_secs(2))
+            .await
+            .unwrap();
+        let context = yuhaiin_core::FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        assert!(built.proxy.connect(&context).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn go_vless_layer_builds_a_runtime_proxy_without_password_assumption() {
+        let config = GoProxyRuntimeConfig {
+            id: "vless".to_owned(),
+            name: "vless".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned(), "vless".to_owned()],
+            layers: vec![
+                yuhaiin_store::GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({"addresses":[{"host":"127.0.0.1","port":24445}]}),
+                },
+                yuhaiin_store::GoProxyLayer {
+                    kind: "vless".to_owned(),
+                    config: serde_json::json!({
+                        "uuid":"00112233-4455-6677-8899-aabbccddeeff",
+                        "futureField":true
+                    }),
+                },
+            ],
+            transport: GoProxyTransport::Vless,
+            data_json: serde_json::to_vec(&serde_json::json!({"chain":[]})).unwrap(),
+        };
+        let built = snapshot(config)
+            .build_proxy("vless", Duration::from_secs(2))
             .await
             .unwrap();
         let context = yuhaiin_core::FlowContext::new(yuhaiin_core::Endpoint::ip(
