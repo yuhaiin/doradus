@@ -20,6 +20,9 @@ pub(crate) mod http;
 pub(crate) mod socks4a;
 #[path = "proxy/socks5.rs"]
 pub(crate) mod socks5;
+#[cfg(feature = "websocket")]
+#[path = "proxy/websocket.rs"]
+pub(crate) mod websocket;
 #[path = "proxy/yuubinsya.rs"]
 pub(crate) mod yuubinsya;
 
