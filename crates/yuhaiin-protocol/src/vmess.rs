@@ -214,6 +214,40 @@ pub fn decode_request(packet: &[u8], uuid: &[u8; 16]) -> Result<Request> {
     })
 }
 
+/// Read and decode one modern VMess request header from a stream.
+pub async fn read_request<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    uuid: &[u8; 16],
+) -> Result<Request> {
+    let mut prefix = [0u8; 42];
+    reader.read_exact(&mut prefix).await.map_err(io_error)?;
+    let auth_id: [u8; 16] = prefix[..16]
+        .try_into()
+        .map_err(|_| Error::new(ErrorKind::Protocol, "invalid VMess auth id"))?;
+    let nonce: [u8; 8] = prefix[34..42]
+        .try_into()
+        .map_err(|_| Error::new(ErrorKind::Protocol, "invalid VMess header nonce"))?;
+    let key = command_key(uuid);
+    let length_key = kdf16(&key, &[VMESS_HEADER_PAYLOAD_LENGTH_KEY, &auth_id, &nonce]);
+    let length_iv = kdf(&key, &[VMESS_HEADER_PAYLOAD_LENGTH_IV, &auth_id, &nonce]);
+    let length = aead_open(&length_key, &length_iv[..12], &prefix[16..34], &auth_id)?;
+    let payload_length =
+        usize::from(u16::from_be_bytes(length.as_slice().try_into().map_err(
+            |_| Error::new(ErrorKind::Protocol, "invalid VMess header length"),
+        )?));
+    if payload_length > MAX_HEADER_SIZE {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "VMess request header is too large",
+        ));
+    }
+    let mut payload = vec![0u8; payload_length + 16];
+    reader.read_exact(&mut payload).await.map_err(io_error)?;
+    let mut packet = prefix.to_vec();
+    packet.extend_from_slice(&payload);
+    decode_request(&packet, uuid)
+}
+
 pub fn encode_response_header(
     response_v: u8,
     body_key: &[u8; 16],
@@ -315,8 +349,8 @@ impl AsyncProxy for VmessProxy {
             tokio::spawn(relay_remote_to_local(
                 remote_reader,
                 local_writer,
-                state.body_key,
-                state.body_iv,
+                response_key(&state.body_key),
+                response_key(&state.body_iv),
                 state.response_v,
                 state.security,
             ));
@@ -454,7 +488,7 @@ async fn read_response_header<R: AsyncRead + Unpin>(
     Ok(())
 }
 
-async fn read_body_frame<R: AsyncRead + Unpin>(
+pub async fn read_body_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     key: &[u8; 16],
     iv: &[u8; 16],
@@ -491,7 +525,7 @@ async fn read_body_frame<R: AsyncRead + Unpin>(
     Ok(Some(payload))
 }
 
-async fn write_body_frame<W: AsyncWrite + Unpin>(
+pub async fn write_body_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     key: &[u8; 16],
     iv: &[u8; 16],
@@ -544,6 +578,10 @@ fn chacha_key(key: &[u8; 16]) -> [u8; 32] {
     output[..16].copy_from_slice(&first);
     output[16..].copy_from_slice(&second);
     output
+}
+
+fn response_key(key: &[u8; 16]) -> [u8; 16] {
+    Sha256::digest(key)[..16].try_into().unwrap()
 }
 
 fn seal_header(key: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>> {

@@ -157,6 +157,7 @@ fn go_node_runtime_preserves_proxy_layers_and_selects_supported_base() {
         ("shadowsocks", GoProxyTransport::Shadowsocks),
         ("trojan", GoProxyTransport::Trojan),
         ("vless", GoProxyTransport::Vless),
+        ("vmess", GoProxyTransport::Vmess),
         ("yuubinsya", GoProxyTransport::Yuubinsya),
         ("tls", GoProxyTransport::Tls),
         ("http2", GoProxyTransport::Http2),

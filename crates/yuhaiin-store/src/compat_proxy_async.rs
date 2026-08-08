@@ -50,13 +50,17 @@ impl GoProxyRuntimeConfig {
         if self.chain_types.iter().any(|kind| {
             matches!(kind.to_ascii_lowercase().as_str(), "http2")
                 || (kind.eq_ignore_ascii_case("websocket")
-                    && !matches!(self.transport, GoProxyTransport::Vless))
+                    && !matches!(
+                        self.transport,
+                        GoProxyTransport::Vless | GoProxyTransport::Vmess
+                    ))
                 || (kind.eq_ignore_ascii_case("tls")
                     && !matches!(
                         self.transport,
                         GoProxyTransport::Trojan
                             | GoProxyTransport::Shadowsocks
                             | GoProxyTransport::Vless
+                            | GoProxyTransport::Vmess
                     ))
         }) {
             return Err(Error::new(
@@ -92,6 +96,7 @@ impl GoProxyRuntimeConfig {
             | GoProxyTransport::Shadowsocks
             | GoProxyTransport::Trojan
             | GoProxyTransport::Vless
+            | GoProxyTransport::Vmess
             | GoProxyTransport::Yuubinsya => Some(fixed_endpoint(&self.layers)),
             _ => None,
         }
@@ -121,12 +126,12 @@ impl GoProxyRuntimeConfig {
                     password: optional_string(config, "password"),
                 }
             }
-            GoProxyTransport::Shadowsocks | GoProxyTransport::Trojan | GoProxyTransport::Vless => {
-                BaseProxyKind::Fixed {
-                    address: address
-                        .ok_or_else(|| Error::invalid("proxy protocol has no endpoint"))?,
-                }
-            }
+            GoProxyTransport::Shadowsocks
+            | GoProxyTransport::Trojan
+            | GoProxyTransport::Vless
+            | GoProxyTransport::Vmess => BaseProxyKind::Fixed {
+                address: address.ok_or_else(|| Error::invalid("proxy protocol has no endpoint"))?,
+            },
             GoProxyTransport::Yuubinsya => {
                 let config = layer_config(&self.layers, "yuubinsya")?;
                 let password = required_string(config, "password")?;
@@ -163,6 +168,7 @@ fn transport_name(transport: &GoProxyTransport) -> &str {
         GoProxyTransport::Shadowsocks => "shadowsocks",
         GoProxyTransport::Trojan => "trojan",
         GoProxyTransport::Vless => "vless",
+        GoProxyTransport::Vmess => "vmess",
         GoProxyTransport::Yuubinsya => "yuubinsya",
         GoProxyTransport::Tls => "tls",
         GoProxyTransport::Http2 => "http2",

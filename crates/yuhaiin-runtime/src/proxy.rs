@@ -50,6 +50,8 @@ impl RuntimeSnapshot {
 
         let proxy = if is_vless_websocket_config(&config) {
             build_vless_transport_proxy(&config, timeout, self.resolver.clone()).await?
+        } else if is_vmess_transport_config(&config) {
+            build_vmess_transport_proxy(&config, timeout, self.resolver.clone()).await?
         } else if is_chain_config(&config) {
             let json = std::str::from_utf8(&config.data_json).map_err(|error| {
                 Error::new(
@@ -66,6 +68,7 @@ impl RuntimeSnapshot {
             yuhaiin_store::GoProxyTransport::Shadowsocks
                 | yuhaiin_store::GoProxyTransport::Trojan
                 | yuhaiin_store::GoProxyTransport::Vless
+                | yuhaiin_store::GoProxyTransport::Vmess
         ) {
             let base = config
                 .to_base_proxy_config_with_resolver(timeout, self.resolver.clone())
@@ -96,6 +99,7 @@ impl RuntimeSnapshot {
                         yuhaiin_store::GoProxyTransport::Shadowsocks => "shadowsocks",
                         yuhaiin_store::GoProxyTransport::Trojan => "trojan",
                         yuhaiin_store::GoProxyTransport::Vless => "vless",
+                        yuhaiin_store::GoProxyTransport::Vmess => "vmess",
                         _ => unreachable!(),
                     })
                 })
@@ -136,6 +140,23 @@ impl RuntimeSnapshot {
                         .ok_or_else(|| Error::invalid("VLESS UUID is missing"))?;
                     Arc::new(yuhaiin_protocol::vless::VlessProxy::new(upstream, uuid)?)
                         as Arc<dyn AsyncProxy>
+                }
+                yuhaiin_store::GoProxyTransport::Vmess => {
+                    let uuid = layer
+                        .config
+                        .get("id")
+                        .or_else(|| layer.config.get("uuid"))
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| Error::invalid("VMess UUID is missing"))?;
+                    let security = layer
+                        .config
+                        .get("security")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("auto");
+                    let alter_id = vmess_alter_id(&layer.config)?;
+                    Arc::new(yuhaiin_protocol::vmess::VmessProxy::new(
+                        upstream, uuid, security, alter_id,
+                    )?) as Arc<dyn AsyncProxy>
                 }
                 _ => unreachable!("protocol branch validated above"),
             }
@@ -297,6 +318,7 @@ fn is_chain_config(config: &GoProxyRuntimeConfig) -> bool {
             yuhaiin_store::GoProxyTransport::Trojan
                 | yuhaiin_store::GoProxyTransport::Shadowsocks
                 | yuhaiin_store::GoProxyTransport::Vless
+                | yuhaiin_store::GoProxyTransport::Vmess
         )
     {
         return true;
@@ -329,6 +351,26 @@ fn is_vless_websocket_config(config: &GoProxyRuntimeConfig) -> bool {
             matches!(
                 kind.to_ascii_lowercase().as_str(),
                 "fixed" | "fixedv2" | "tls" | "websocket" | "vless"
+            )
+        })
+}
+
+fn is_vmess_transport_config(config: &GoProxyRuntimeConfig) -> bool {
+    let has_vmess = config
+        .chain_types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("vmess"));
+    let has_transport = config
+        .chain_types
+        .iter()
+        .any(|kind| matches!(kind.to_ascii_lowercase().as_str(), "tls" | "websocket"));
+    config.transport == yuhaiin_store::GoProxyTransport::Vmess
+        && has_vmess
+        && has_transport
+        && config.chain_types.iter().all(|kind| {
+            matches!(
+                kind.to_ascii_lowercase().as_str(),
+                "fixed" | "fixedv2" | "tls" | "websocket" | "vmess"
             )
         })
 }
@@ -379,6 +421,75 @@ async fn build_vless_transport_proxy(
     Ok(Arc::new(yuhaiin_protocol::vless::VlessProxy::new(
         upstream, uuid,
     )?))
+}
+
+async fn build_vmess_transport_proxy(
+    config: &GoProxyRuntimeConfig,
+    timeout: Duration,
+    resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let base = config
+        .to_base_proxy_config_with_resolver(timeout, resolver)
+        .await?;
+    let mut upstream: Arc<dyn AsyncProxy> = base.build()?;
+    if config
+        .chain_types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("tls"))
+    {
+        #[cfg(feature = "doh-tls")]
+        {
+            upstream = build_protocol_tls_proxy(config, upstream)?;
+        }
+        #[cfg(not(feature = "doh-tls"))]
+        {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "VMess TLS transport requires the doh-tls feature",
+            ));
+        }
+    }
+    if config
+        .chain_types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("websocket"))
+    {
+        upstream = build_protocol_websocket_proxy(config, upstream)?;
+    }
+    let layer = config
+        .layers
+        .iter()
+        .find(|layer| layer.kind.eq_ignore_ascii_case("vmess"))
+        .ok_or_else(|| Error::invalid("VMess protocol layer is missing"))?;
+    let uuid = layer
+        .config
+        .get("id")
+        .or_else(|| layer.config.get("uuid"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::invalid("VMess UUID is missing"))?;
+    let security = layer
+        .config
+        .get("security")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("auto");
+    let alter_id = vmess_alter_id(&layer.config)?;
+    Ok(Arc::new(yuhaiin_protocol::vmess::VmessProxy::new(
+        upstream, uuid, security, alter_id,
+    )?))
+}
+
+fn vmess_alter_id(config: &serde_json::Value) -> Result<u32> {
+    let Some(value) = config.get("aid").or_else(|| config.get("alter_id")) else {
+        return Ok(0);
+    };
+    if let Some(number) = value.as_u64() {
+        return u32::try_from(number).map_err(|_| Error::invalid("VMess alter_id is out of range"));
+    }
+    value
+        .as_str()
+        .ok_or_else(|| Error::invalid("VMess alter_id must be a string or integer"))?
+        .parse::<u32>()
+        .map_err(|error| Error::invalid(format!("VMess alter_id is invalid: {error}")))
 }
 
 #[cfg(feature = "websocket")]
@@ -737,6 +848,44 @@ mod tests {
         assert!(built.proxy.connect(&context).await.is_err());
     }
 
+    #[tokio::test]
+    async fn go_vmess_layer_builds_a_modern_runtime_proxy() {
+        let config = GoProxyRuntimeConfig {
+            id: "vmess".to_owned(),
+            name: "vmess".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned(), "vmess".to_owned()],
+            layers: vec![
+                yuhaiin_store::GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({"addresses":[{"host":"127.0.0.1","port":24446}]}),
+                },
+                yuhaiin_store::GoProxyLayer {
+                    kind: "vmess".to_owned(),
+                    config: serde_json::json!({
+                        "id":"00112233-4455-6677-8899-aabbccddeeff",
+                        "aid":"0",
+                        "security":"aes-128-gcm",
+                        "futureField":true
+                    }),
+                },
+            ],
+            transport: GoProxyTransport::Vmess,
+            data_json: serde_json::to_vec(&serde_json::json!({"chain":[]})).unwrap(),
+        };
+        let built = snapshot(config)
+            .build_proxy("vmess", Duration::from_secs(2))
+            .await
+            .unwrap();
+        let context = yuhaiin_core::FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        assert!(built.proxy.connect(&context).await.is_err());
+    }
+
     #[cfg(feature = "doh-tls")]
     #[tokio::test]
     async fn go_trojan_layer_builds_tls_transport_before_protocol_wrapper() {
@@ -977,6 +1126,49 @@ mod tests {
             block_on(snapshot(config).build_proxy("vless-websocket", Duration::from_secs(1)))
                 .unwrap();
         assert_eq!(built.config.id, "vless-websocket");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn runtime_builds_vmess_over_websocket_transport_chain() {
+        let config = GoProxyRuntimeConfig {
+            id: "vmess-websocket".to_owned(),
+            name: "vmess-websocket".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec![
+                "fixedv2".to_owned(),
+                "websocket".to_owned(),
+                "vmess".to_owned(),
+            ],
+            layers: vec![
+                GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({
+                        "addresses": [{"host": "127.0.0.1", "port": 40502}]
+                    }),
+                },
+                GoProxyLayer {
+                    kind: "websocket".to_owned(),
+                    config: serde_json::json!({"host": "localhost", "path": "/vmess"}),
+                },
+                GoProxyLayer {
+                    kind: "vmess".to_owned(),
+                    config: serde_json::json!({
+                        "id": "00000000-0000-0000-0000-000000000001",
+                        "aid": 0,
+                        "security": "auto"
+                    }),
+                },
+            ],
+            transport: GoProxyTransport::Vmess,
+            data_json: serde_json::json!({}).to_string().into_bytes(),
+        };
+        let built =
+            block_on(snapshot(config).build_proxy("vmess-websocket", Duration::from_secs(1)))
+                .unwrap();
+        assert_eq!(built.config.id, "vmess-websocket");
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
