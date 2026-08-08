@@ -3026,6 +3026,7 @@ dependencies = [
  "smoltcp",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "yuhaiin-core",
 ]
 
@@ -3045,6 +3046,7 @@ dependencies = [
  "sha2 0.11.0",
  "smoltcp",
  "tokio",
+ "tokio-tungstenite",
  "tun-rs",
 ]
 

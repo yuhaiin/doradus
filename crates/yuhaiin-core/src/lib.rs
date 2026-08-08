@@ -36,6 +36,8 @@ pub mod proxy_factory;
 pub mod tls;
 #[cfg(feature = "tun")]
 pub mod tun;
+#[cfg(feature = "websocket")]
+pub mod websocket;
 pub mod yuubinsya;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

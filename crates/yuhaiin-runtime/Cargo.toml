@@ -19,7 +19,7 @@ doh-tls = [
     "yuhaiin-core/tls-rustcrypto",
     "dep:webpki-roots",
 ]
-websocket = ["dep:futures-util", "dep:tokio-tungstenite"]
+websocket = ["dep:futures-util", "dep:tokio-tungstenite", "yuhaiin-core/websocket"]
 
 [dependencies]
 base64 = "0.22.1"

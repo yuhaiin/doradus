@@ -22,9 +22,19 @@ pub struct ChainNode {
     #[serde(default)]
     pub tls: Option<TlsConfig>,
     #[serde(default)]
+    pub websocket: Option<WebSocketConfig>,
+    #[serde(default)]
     pub http2: Option<Http2Config>,
     #[serde(default)]
     pub yuubinsya: Option<YuubinsyaConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebSocketConfig {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,6 +84,7 @@ pub struct ValidatedChain {
     pub name: Option<String>,
     pub fixed_addresses: Vec<ValidatedFixedAddress>,
     pub tls: ValidatedTls,
+    pub websocket: Option<ValidatedWebSocket>,
     pub http2: ValidatedHttp2,
     pub yuubinsya: ValidatedYuubinsya,
 }
@@ -112,6 +123,18 @@ pub struct ValidatedTls {
     pub next_protos: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedWebSocket {
+    pub host: String,
+    pub path: String,
+}
+
+impl ValidatedWebSocket {
+    pub fn request_uri(&self) -> String {
+        format!("ws://{}{}", self.host, self.path)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidatedHttp2 {
     pub concurrency: usize,
@@ -134,15 +157,46 @@ pub fn parse_config(json: &str) -> Result<ValidatedChain> {
 
 impl ChainConfig {
     pub fn validate(self) -> Result<ValidatedChain> {
-        if self.chain.len() != 4 {
+        if !(4..=5).contains(&self.chain.len()) {
             return Err(Error::invalid(
-                "the first runnable chain supports exactly fixedv2, tls, http2, yuubinsya",
+                "the first runnable chain supports fixedv2, optional tls/websocket, http2, yuubinsya",
             ));
         }
         let fixed = require_node(&self.chain[0], "fixedv2", |node| node.fixedv2.clone())?;
-        let tls = require_node(&self.chain[1], "tls", |node| node.tls.clone())?;
-        let http2 = require_node(&self.chain[2], "http2", |node| node.http2.clone())?;
-        let yuubinsya = require_node(&self.chain[3], "yuubinsya", |node| node.yuubinsya.clone())?;
+        let yuubinsya = require_node(
+            self.chain.last().expect("chain length validated"),
+            "yuubinsya",
+            |node| node.yuubinsya.clone(),
+        )?;
+
+        let middle = &self.chain[1..self.chain.len() - 1];
+        let mut tls = None;
+        let mut websocket = None;
+        let mut http2 = None;
+        let mut saw_http2 = false;
+        for node in middle {
+            match node.kind.as_str() {
+                "tls" if tls.is_none() && !saw_http2 => {
+                    tls = Some(require_node(node, "tls", |node| node.tls.clone())?);
+                }
+                "websocket" if websocket.is_none() && !saw_http2 => {
+                    websocket = Some(require_node(node, "websocket", |node| {
+                        node.websocket.clone()
+                    })?);
+                }
+                "http2" if !saw_http2 => {
+                    http2 = Some(require_node(node, "http2", |node| node.http2.clone())?);
+                    saw_http2 = true;
+                }
+                other => {
+                    return Err(Error::invalid(format!(
+                        "unsupported or reordered chain node {other:?}"
+                    )));
+                }
+            }
+        }
+        let http2 = http2.ok_or_else(|| Error::invalid("chain requires an http2 node"))?;
+        let has_websocket = websocket.is_some();
 
         if fixed.addresses.is_empty() {
             return Err(Error::invalid("fixedv2 requires at least one address"));
@@ -164,39 +218,70 @@ impl ChainConfig {
             fixed_addresses.push(ValidatedFixedAddress { host, port });
         }
 
-        if !tls.enable {
-            return Err(Error::invalid("TLS node must have enable=true"));
-        }
-        if tls.servernames.is_empty() {
-            return Err(Error::invalid("TLS node requires servernames"));
-        }
-        let mut ca_certificates = Vec::with_capacity(tls.ca_cert.len());
-        for (index, certificate) in tls.ca_cert.iter().enumerate() {
-            let certificate = base64::engine::general_purpose::STANDARD
-                .decode(certificate)
-                .map_err(|error| {
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        format!("TLS ca_cert[{index}] is not base64: {error}"),
-                    )
-                })?;
-            if certificate.is_empty() {
-                return Err(Error::invalid("TLS CA certificate cannot be empty"));
-            }
-            ca_certificates.push(certificate);
-        }
-        if ca_certificates.is_empty() {
-            return Err(Error::invalid("TLS node requires at least one ca_cert"));
-        }
+        let tls = match tls {
+            Some(tls) => {
+                if !tls.enable {
+                    return Err(Error::invalid("TLS node must have enable=true"));
+                }
+                if tls.servernames.is_empty() {
+                    return Err(Error::invalid("TLS node requires servernames"));
+                }
+                let mut ca_certificates = Vec::with_capacity(tls.ca_cert.len());
+                for (index, certificate) in tls.ca_cert.iter().enumerate() {
+                    let certificate = base64::engine::general_purpose::STANDARD
+                        .decode(certificate)
+                        .map_err(|error| {
+                            Error::new(
+                                ErrorKind::InvalidInput,
+                                format!("TLS ca_cert[{index}] is not base64: {error}"),
+                            )
+                        })?;
+                    if certificate.is_empty() {
+                        return Err(Error::invalid("TLS CA certificate cannot be empty"));
+                    }
+                    ca_certificates.push(certificate);
+                }
+                if ca_certificates.is_empty() {
+                    return Err(Error::invalid("TLS node requires at least one ca_cert"));
+                }
 
-        let next_protos = if tls.next_protos.is_empty() {
-            vec!["h2".to_owned()]
-        } else {
-            tls.next_protos
+                let next_protos = if tls.next_protos.is_empty() {
+                    if has_websocket {
+                        Vec::new()
+                    } else {
+                        vec!["h2".to_owned()]
+                    }
+                } else {
+                    tls.next_protos
+                };
+                if !has_websocket && !next_protos.iter().any(|protocol| protocol == "h2") {
+                    return Err(Error::invalid("HTTP/2 chain requires TLS ALPN h2"));
+                }
+                ValidatedTls {
+                    servernames: tls
+                        .servernames
+                        .into_iter()
+                        .map(|name| name.replace("&lt;", "<").replace("&gt;", ">"))
+                        .collect(),
+                    ca_certificates,
+                    next_protos,
+                }
+            }
+            None => ValidatedTls {
+                servernames: Vec::new(),
+                ca_certificates: Vec::new(),
+                next_protos: Vec::new(),
+            },
         };
-        if !next_protos.iter().any(|protocol| protocol == "h2") {
-            return Err(Error::invalid("HTTP/2 chain requires TLS ALPN h2"));
-        }
+
+        let websocket = websocket.map(|websocket| ValidatedWebSocket {
+            host: if websocket.host.is_empty() {
+                "localhost".to_owned()
+            } else {
+                websocket.host
+            },
+            path: normalize_websocket_path(&websocket.path),
+        });
 
         let concurrency = http2.concurrency.max(1);
         let max_streams = http2.max_streams.max(1);
@@ -208,15 +293,8 @@ impl ChainConfig {
             id: self.id,
             name: self.name,
             fixed_addresses,
-            tls: ValidatedTls {
-                servernames: tls
-                    .servernames
-                    .into_iter()
-                    .map(|name| name.replace("&lt;", "<").replace("&gt;", ">"))
-                    .collect(),
-                ca_certificates,
-                next_protos,
-            },
+            tls,
+            websocket,
             http2: ValidatedHttp2 {
                 concurrency,
                 max_streams,
@@ -228,6 +306,16 @@ impl ChainConfig {
                 udp_coalesce: yuubinsya.udp_coalesce,
             },
         })
+    }
+}
+
+fn normalize_websocket_path(path: &str) -> String {
+    if path.is_empty() {
+        "/".to_owned()
+    } else if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
     }
 }
 
@@ -381,5 +469,29 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_str(CONFIG).unwrap();
         value["chain"][3]["yuubinsya"]["password"] = serde_json::Value::String(String::new());
         assert!(parse_config(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn validates_websocket_chain_without_forcing_tls_h2_alpn() {
+        let config = r#"
+        {
+          "chain": [
+            {"type":"fixedv2","fixedv2":{"addresses":[{"host":"127.0.0.1:443"}]}},
+            {"type":"tls","tls":{"enable":true,"servernames":["proxy.example"],"ca_cert":["AQ=="]}},
+            {"type":"websocket","websocket":{"host":"proxy.example","path":"proxy/ws"}},
+            {"type":"http2","http2":{}},
+            {"type":"yuubinsya","yuubinsya":{"password":"secret"}}
+          ]
+        }
+        "#;
+        let chain = parse_config(config).unwrap();
+        assert!(chain.tls.next_protos.is_empty());
+        assert_eq!(
+            chain.websocket,
+            Some(ValidatedWebSocket {
+                host: "proxy.example".to_owned(),
+                path: "/proxy/ws".to_owned(),
+            })
+        );
     }
 }

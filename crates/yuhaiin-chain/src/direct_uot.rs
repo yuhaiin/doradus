@@ -57,9 +57,12 @@ pub(crate) fn parse_go_direct_uot(
     if !kinds
         .iter()
         .any(|kind| kind.eq_ignore_ascii_case("yuubinsya"))
-        || kinds
-            .iter()
-            .any(|kind| matches!(kind.to_ascii_lowercase().as_str(), "tls" | "http2"))
+        || kinds.iter().any(|kind| {
+            matches!(
+                kind.to_ascii_lowercase().as_str(),
+                "tls" | "http2" | "websocket"
+            )
+        })
     {
         return Ok(None);
     }

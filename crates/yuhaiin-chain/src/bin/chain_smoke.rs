@@ -12,11 +12,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = env::args().nth(2).unwrap_or_else(|| "tcp".to_owned());
     let json = std::fs::read_to_string(path)?;
     let chain = parse_config(&json)?;
+    let sni = chain
+        .tls
+        .servernames
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "none".to_owned());
     println!(
-        "chain-config-valid fixed={} concurrency={} sni={}",
+        "chain-config-valid fixed={} concurrency={} sni={} websocket={}",
         chain.fixed_addresses.len(),
         chain.http2.concurrency,
-        chain.tls.server_name()
+        sni,
+        chain.websocket.is_some()
     );
     let client = ChainClient::new(chain.clone())?;
 

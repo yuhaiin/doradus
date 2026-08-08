@@ -20,7 +20,7 @@ mod session;
 
 pub use config::{
     ChainConfig, ChainNode, ValidatedChain, ValidatedFixedAddress, ValidatedHttp2, ValidatedTls,
-    ValidatedYuubinsya, parse_config,
+    ValidatedWebSocket, ValidatedYuubinsya, parse_config,
 };
 pub use go_node::parse_go_node;
 pub use h2_server::YuubinsyaH2Server;
@@ -43,6 +43,7 @@ use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf, split};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify, watch};
 use tokio_rustls::TlsConnector;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use yuhaiin_core::dns_resolver_async::{AsyncIpResolver, SystemAsyncIpResolver};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{
@@ -110,8 +111,8 @@ struct CachedPing {
     last_used: StdMutex<Instant>,
 }
 
-/// A validated, reusable client for one fixed -> TLS -> HTTP/2 -> Yuubinsya
-/// chain.
+/// A validated, reusable client for one fixed -> optional TLS/WebSocket ->
+/// HTTP/2 -> Yuubinsya chain.
 #[derive(Clone)]
 pub struct ChainClient {
     chain: Arc<ValidatedChain>,
@@ -132,7 +133,11 @@ impl ChainClient {
         chain: ValidatedChain,
         resolver: Arc<dyn AsyncIpResolver>,
     ) -> Result<Self> {
-        let roots = root_store(&chain.tls.ca_certificates)?;
+        let roots = if chain.tls.ca_certificates.is_empty() {
+            RootCertStore::empty()
+        } else {
+            root_store(&chain.tls.ca_certificates)?
+        };
         let h2_idle_timeout = chain.http2.idle_timeout;
         let provider = Arc::new(rustls_rustcrypto::provider());
         let mut config = ClientConfig::builder_with_provider(provider)
@@ -355,7 +360,7 @@ impl ChainClient {
 
     async fn open_h2_stream(&self) -> Result<tokio::io::DuplexStream> {
         self.ensure_open()?;
-        let tls_identity = self.chain.tls.pool_identity();
+        let tls_identity = self.transport_identity();
         let addresses = self.resolve_fixed_addresses().await?;
         let stream = self
             .pool
@@ -372,6 +377,16 @@ impl ChainClient {
             return Err(closed_error());
         }
         Ok(stream)
+    }
+
+    fn transport_identity(&self) -> String {
+        let websocket = self
+            .chain
+            .websocket
+            .as_ref()
+            .map(|websocket| format!("{}{}", websocket.host, websocket.path))
+            .unwrap_or_default();
+        format!("{}\0websocket:{websocket}", self.chain.tls.pool_identity())
     }
 
     async fn resolve_fixed_addresses(&self) -> Result<Vec<SocketAddr>> {
@@ -412,15 +427,37 @@ impl ChainClient {
             .await
             .map_err(|_| Error::new(ErrorKind::Timeout, "fixed TCP connect timed out"))?
             .map_err(|error| Error::new(ErrorKind::Io, format!("fixed TCP connect: {error}")))?;
-        let server_name = self.chain.tls.server_name();
-        let server_name = rustls::pki_types::ServerName::try_from(server_name)
-            .map_err(|_| Error::invalid("TLS server name is invalid"))?;
-        let tls = self
-            .tls
-            .connect(server_name, stream)
-            .await
-            .map_err(tls_error)?;
-        H2Connection::handshake_with_limits(tls, self.chain.http2.max_streams).await
+        let mut stream: BoxAsyncStream = if self.chain.tls.servernames.is_empty() {
+            Box::new(stream)
+        } else {
+            let server_name = self.chain.tls.server_name();
+            let server_name = rustls::pki_types::ServerName::try_from(server_name)
+                .map_err(|_| Error::invalid("TLS server name is invalid"))?;
+            Box::new(
+                self.tls
+                    .connect(server_name, stream)
+                    .await
+                    .map_err(tls_error)?,
+            )
+        };
+        if let Some(websocket) = &self.chain.websocket {
+            let request = websocket
+                .request_uri()
+                .into_client_request()
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("WebSocket request: {error}"),
+                    )
+                })?;
+            let (websocket, _) = tokio_tungstenite::client_async(request, stream)
+                .await
+                .map_err(|error| {
+                    Error::new(ErrorKind::Protocol, format!("WebSocket handshake: {error}"))
+                })?;
+            stream = Box::new(yuhaiin_core::websocket::WebSocketIo::new(websocket));
+        }
+        H2Connection::handshake_with_limits(stream, self.chain.http2.max_streams).await
     }
 }
 

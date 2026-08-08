@@ -47,14 +47,15 @@ impl GoProxyRuntimeConfig {
     }
 
     fn ensure_base_transport(&self) -> Result<()> {
-        if self
-            .chain_types
-            .iter()
-            .any(|kind| matches!(kind.to_ascii_lowercase().as_str(), "tls" | "http2"))
-        {
+        if self.chain_types.iter().any(|kind| {
+            matches!(
+                kind.to_ascii_lowercase().as_str(),
+                "tls" | "http2" | "websocket"
+            )
+        }) {
             return Err(Error::new(
                 ErrorKind::Unsupported,
-                "Go TLS/HTTP2 chain requires yuhaiin-chain runtime construction",
+                "Go TLS/HTTP2/WebSocket chain requires yuhaiin-chain runtime construction",
             ));
         }
         if self

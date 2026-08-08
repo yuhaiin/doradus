@@ -17,7 +17,8 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.50.0", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["tls12"] }
-yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
+tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["handshake"] }
+yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy", "websocket"] }
 
 [lints]
 workspace = true

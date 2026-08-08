@@ -19,6 +19,8 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 
 use yuhaiin_core::process::{ProcessResolver, default_process_resolver};
+#[cfg(all(feature = "websocket", feature = "http2"))]
+use yuhaiin_core::proxy::BoxAsyncStream;
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Result};
 use yuhaiin_store::GoInboundRecord;
 
@@ -168,14 +170,6 @@ async fn start_listeners(
                 continue;
             }
         };
-        if has_transport(&spec.transports, "http2") && has_transport(&spec.transports, "websocket")
-        {
-            monitor.warn(format!(
-                "skip inbound {}: HTTP/2 and WebSocket transports cannot be combined in one listener",
-                spec.id
-            ));
-            continue;
-        }
         if has_transport(&spec.transports, "websocket") {
             if spec.udp_mode.udp_enabled() {
                 monitor.warn(format!(
@@ -192,15 +186,63 @@ async fn start_listeners(
                 let spec = spec.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let logs = monitor.logs();
-                #[cfg(feature = "websocket")]
-                listeners.push(tokio::spawn(async move {
-                    if let Err(error) =
-                        serve_websocket_listener(listener, spec, selector, monitor, tls_acceptor)
+                #[cfg(all(feature = "websocket", feature = "http2"))]
+                {
+                    if has_transport(&spec.transports, "http2") {
+                        listeners.push(tokio::spawn(async move {
+                            if let Err(error) = serve_websocket_h2_listener(
+                                listener,
+                                spec,
+                                selector,
+                                monitor,
+                                tls_acceptor,
+                            )
                             .await
-                    {
-                        logs.error(format!("WebSocket inbound listener stopped: {error}"));
+                            {
+                                logs.error(format!(
+                                    "WebSocket+HTTP/2 inbound listener stopped: {error}"
+                                ));
+                            }
+                        }));
+                    } else {
+                        listeners.push(tokio::spawn(async move {
+                            if let Err(error) = serve_websocket_listener(
+                                listener,
+                                spec,
+                                selector,
+                                monitor,
+                                tls_acceptor,
+                            )
+                            .await
+                            {
+                                logs.error(format!("WebSocket inbound listener stopped: {error}"));
+                            }
+                        }));
                     }
-                }));
+                }
+                #[cfg(all(feature = "websocket", not(feature = "http2")))]
+                {
+                    if has_transport(&spec.transports, "http2") {
+                        let _ = (listener, spec, selector, monitor, tls_acceptor);
+                        logs.warn(
+                            "skip inbound: WebSocket+HTTP/2 requires both websocket and http2 features",
+                        );
+                    } else {
+                        listeners.push(tokio::spawn(async move {
+                            if let Err(error) = serve_websocket_listener(
+                                listener,
+                                spec,
+                                selector,
+                                monitor,
+                                tls_acceptor,
+                            )
+                            .await
+                            {
+                                logs.error(format!("WebSocket inbound listener stopped: {error}"));
+                            }
+                        }));
+                    }
+                }
                 #[cfg(not(feature = "websocket"))]
                 {
                     let _ = (listener, spec, selector, monitor, tls_acceptor);
@@ -585,7 +627,10 @@ fn build_inbound_tls_acceptor(
                 .map(ToOwned::to_owned)
                 .collect();
         }
-        if has_transport(transports, "http2") && server.alpn_protocols.is_empty() {
+        if has_transport(transports, "http2")
+            && !has_transport(transports, "websocket")
+            && server.alpn_protocols.is_empty()
+        {
             server.alpn_protocols.push(b"h2".to_vec());
         }
         Ok(Some(TlsAcceptor::from(Arc::new(server))))
@@ -892,6 +937,68 @@ async fn serve_listener(
 }
 
 #[cfg(feature = "websocket")]
+async fn accept_websocket_stream<S>(stream: S) -> Result<crate::proxy::websocket::WebSocketIo<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let websocket = tokio_tungstenite::accept_async(stream)
+        .await
+        .map_err(|error| {
+            Error::new(ErrorKind::Protocol, format!("WebSocket handshake: {error}"))
+        })?;
+    Ok(crate::proxy::websocket::WebSocketIo::new(websocket))
+}
+
+#[cfg(all(feature = "websocket", feature = "http2"))]
+async fn serve_websocket_h2_listener(
+    listener: TcpListener,
+    spec: InboundSpec,
+    selector: Arc<RuntimeProxySelector>,
+    monitor: Arc<ConnectionMonitor>,
+    tls_acceptor: Option<InboundTlsAcceptor>,
+) -> Result<()> {
+    loop {
+        let (stream, peer) = listener
+            .accept()
+            .await
+            .map_err(crate::proxy::common::io_error)?;
+        let selector = selector.clone();
+        let monitor = monitor.clone();
+        let spec = spec.clone();
+        let tls_acceptor = tls_acceptor.clone();
+        let logs = monitor.logs();
+        tokio::spawn(async move {
+            let result = async {
+                #[cfg(feature = "doh-tls")]
+                let stream: BoxAsyncStream = if let Some(acceptor) = tls_acceptor {
+                    Box::new(acceptor.accept(stream).await.map_err(|error| {
+                        Error::new(
+                            ErrorKind::Protocol,
+                            format!("inbound WebSocket TLS handshake: {error}"),
+                        )
+                    })?)
+                } else {
+                    Box::new(stream)
+                };
+                #[cfg(not(feature = "doh-tls"))]
+                let stream = {
+                    let _ = tls_acceptor;
+                    stream
+                };
+                let stream = accept_websocket_stream(stream).await?;
+                serve_h2_connection(stream, peer, spec, selector, monitor).await
+            }
+            .await;
+            if let Err(error) = result {
+                logs.error(format!(
+                    "WebSocket+HTTP/2 inbound connection error: {error}"
+                ));
+            }
+        });
+    }
+}
+
+#[cfg(feature = "websocket")]
 async fn serve_websocket_listener(
     listener: TcpListener,
     spec: InboundSpec,
@@ -951,12 +1058,7 @@ async fn serve_websocket_stream<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let websocket = tokio_tungstenite::accept_async(stream)
-        .await
-        .map_err(|error| {
-            Error::new(ErrorKind::Protocol, format!("WebSocket handshake: {error}"))
-        })?;
-    let stream = crate::proxy::websocket::WebSocketIo::new(websocket);
+    let stream = accept_websocket_stream(stream).await?;
     serve_connection(stream, peer, protocol, spec, selector, monitor).await
 }
 
@@ -1925,6 +2027,91 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 let mut echoed = vec![0u8; 18];
                 client.read_exact(&mut echoed).await.unwrap();
                 assert_eq!(&echoed, b"tls-through-direct");
+            })
+            .await;
+
+            listener_task.abort();
+            let _ = listener_task.await;
+            echo_task.abort();
+            let _ = echo_task.await;
+            result.unwrap();
+        });
+    }
+
+    #[cfg(all(feature = "websocket", feature = "http2"))]
+    #[test]
+    fn websocket_http2_transport_bridges_http_inbound_and_routes_a_real_tcp_flow() {
+        block_on(async {
+            use bytes::Bytes;
+            use http::Request;
+
+            let (echo_address, echo_task) = echo_server().await;
+            let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let inbound_address = inbound_listener.local_addr().unwrap();
+            let (selector, monitor) = direct_runtime().await;
+            let listener_task = tokio::spawn(serve_websocket_h2_listener(
+                inbound_listener,
+                InboundSpec {
+                    id: "websocket-http2-inbound".to_owned(),
+                    protocol: "http".to_owned(),
+                    listen: inbound_address,
+                    username: String::new(),
+                    password: String::new(),
+                    udp_mode: UdpMode::Disabled,
+                    protocol_udp: false,
+                    transports: vec!["websocket".to_owned(), "http2".to_owned()],
+                    outbound_id: "direct".to_owned(),
+                },
+                selector,
+                monitor,
+                None,
+            ));
+
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let transport = TcpStream::connect(inbound_address).await.unwrap();
+                let (websocket, _) =
+                    tokio_tungstenite::client_async("ws://localhost/proxy/ws", transport)
+                        .await
+                        .unwrap();
+                let (mut client, connection) =
+                    h2::client::handshake(crate::proxy::websocket::WebSocketIo::new(websocket))
+                        .await
+                        .unwrap();
+                let connection_task = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                let request = Request::builder()
+                    .method(http::Method::CONNECT)
+                    .uri("http://localhost")
+                    .body(())
+                    .unwrap();
+                let (response, mut request_body) = client.send_request(request, false).unwrap();
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), http::StatusCode::OK);
+                let request_headers = format!(
+                    "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+                    echo_address, echo_address
+                );
+                request_body
+                    .send_data(Bytes::from(request_headers), false)
+                    .unwrap();
+                request_body
+                    .send_data(Bytes::from_static(b"websocket-http2"), true)
+                    .unwrap();
+                let mut body = response.into_body();
+                let mut received = Vec::new();
+                while let Some(data) = body.data().await {
+                    let data = data.unwrap();
+                    body.flow_control().release_capacity(data.len()).unwrap();
+                    received.extend_from_slice(&data);
+                    if received.ends_with(b"websocket-http2") {
+                        break;
+                    }
+                }
+                assert!(received.starts_with(b"HTTP/1.1 200 Connection Established\r\n\r\n"));
+                assert!(received.ends_with(b"websocket-http2"));
+                connection_task.abort();
+                let _ = connection_task.await;
             })
             .await;
 

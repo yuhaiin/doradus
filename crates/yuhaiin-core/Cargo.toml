@@ -11,6 +11,7 @@ async-proxy = ["dep:futures-util", "dep:tokio"]
 tls-rustcrypto = ["dep:rustls", "dep:rustls-rustcrypto"]
 tun = ["dep:futures-lite", "dep:smoltcp", "dep:tun-rs"]
 tun-routes = ["tun", "dep:route_manager"]
+websocket = ["async-proxy", "dep:tokio-tungstenite"]
 
 [dependencies]
 bytes = { version = "1.12.1", optional = true }
@@ -24,6 +25,7 @@ rustls-rustcrypto = { version = "0.0.2-alpha", optional = true, default-features
 sha2 = { version = "0.11.0", default-features = false }
 smoltcp = { version = "0.13.1", optional = true, default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "async"] }
 tokio = { version = "1.50.0", optional = true, default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.28.0", optional = true, default-features = false, features = ["handshake"] }
 tun-rs = { version = "2.8.8", optional = true, default-features = false, features = ["async_io"] }
 
 [[bin]]

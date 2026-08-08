@@ -18,12 +18,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::accept_async;
 use yuhaiin_chain::{
-    ChainClient, ChainProxy, ValidatedChain, ValidatedHttp2, ValidatedTls, ValidatedYuubinsya,
-    YuubinsyaH2Server, YuubinsyaServerProxy,
+    ChainClient, ChainProxy, ValidatedChain, ValidatedHttp2, ValidatedTls, ValidatedWebSocket,
+    ValidatedYuubinsya, YuubinsyaH2Server, YuubinsyaServerProxy, parse_config,
 };
 use yuhaiin_core::proxy::{AsyncProxy, DirectAsyncProxy, DropAsyncProxy, StaticProxySelector};
 use yuhaiin_core::tun::{SmoltcpTunDevice, TunDispatcher, TunProxyRuntime};
+use yuhaiin_core::websocket::WebSocketIo;
 use yuhaiin_core::yuubinsya::{
     YuubinsyaProtocol, decode_header, decode_uot_frame, derive_salt, encode_uot_frame,
 };
@@ -781,6 +783,7 @@ fn chain_client_with_max_streams(
             ca_certificates: vec![certificate],
             next_protos: vec!["h2".to_owned()],
         },
+        websocket: None,
         http2: ValidatedHttp2 {
             concurrency: 4,
             max_streams,
@@ -793,6 +796,153 @@ fn chain_client_with_max_streams(
         },
     })
     .unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn websocket_http2_chain_round_trips_through_yuubinsya() {
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_address = target_listener.local_addr().unwrap();
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target_listener.accept().await.unwrap();
+        let mut request = vec![0u8; 13];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"ws-chain-echo");
+        stream.write_all(&request).await.unwrap();
+    });
+
+    let upstream: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy {
+        timeout: Duration::from_secs(3),
+    });
+    let proxy = Arc::new(YuubinsyaServerProxy::new(
+        derive_salt(PASSWORD.as_bytes()),
+        upstream,
+    ));
+    let h2_server = Arc::new(YuubinsyaH2Server::new(yuubinsya_server_config(), proxy).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_task = {
+        let h2_server = Arc::clone(&h2_server);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let websocket = accept_async(stream).await.unwrap();
+            h2_server
+                .serve_h2(WebSocketIo::new(websocket))
+                .await
+                .unwrap();
+        })
+    };
+
+    let config = serde_json::json!({
+        "chain": [
+            {"type": "fixedv2", "fixedv2": {"addresses": [{
+                "host": format!("{}:{}", address.ip(), address.port())
+            }]}},
+            {"type": "websocket", "websocket": {
+                "host": "localhost", "path": "proxy/ws"
+            }},
+            {"type": "http2", "http2": {"concurrency": 2, "max_streams": 8}},
+            {"type": "yuubinsya", "yuubinsya": {"password": PASSWORD}}
+        ]
+    });
+    let client = ChainClient::new(parse_config(&config.to_string()).unwrap()).unwrap();
+    let mut stream = client
+        .connect_tcp(Endpoint::ip(Network::Tcp, target_address))
+        .await
+        .unwrap();
+    stream.write_all(b"ws-chain-echo").await.unwrap();
+    let mut response = vec![0u8; 13];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"ws-chain-echo");
+    stream.shutdown().await.unwrap();
+    client.close().await;
+    target_task.await.unwrap();
+    server_task.abort();
+    let _ = server_task.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tls_websocket_http2_chain_uses_http11_upgrade_before_h2() {
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_address = target_listener.local_addr().unwrap();
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target_listener.accept().await.unwrap();
+        let mut request = vec![0u8; 11];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"tls-ws-echo");
+        stream.write_all(&request).await.unwrap();
+    });
+
+    let upstream: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy {
+        timeout: Duration::from_secs(3),
+    });
+    let proxy = Arc::new(YuubinsyaServerProxy::new(
+        derive_salt(PASSWORD.as_bytes()),
+        upstream,
+    ));
+    let h2_server = Arc::new(YuubinsyaH2Server::new(yuubinsya_server_config(), proxy).unwrap());
+    let mut tls_config = (*yuubinsya_server_config()).clone();
+    tls_config.alpn_protocols.clear();
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_task = {
+        let h2_server = Arc::clone(&h2_server);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let stream = tls_acceptor.accept(stream).await.unwrap();
+            let websocket = accept_async(stream).await.unwrap();
+            h2_server
+                .serve_h2(WebSocketIo::new(websocket))
+                .await
+                .unwrap();
+        })
+    };
+
+    let certificate = rustls_pemfile::certs(&mut Cursor::new(CA_CERTIFICATE_PEM))
+        .next()
+        .unwrap()
+        .unwrap();
+    let client = ChainClient::new(ValidatedChain {
+        id: None,
+        name: Some("TLS WebSocket fixture".to_owned()),
+        fixed_addresses: vec![yuhaiin_chain::ValidatedFixedAddress {
+            host: address.ip().to_string(),
+            port: address.port(),
+        }],
+        tls: ValidatedTls {
+            servernames: vec!["localhost".to_owned()],
+            ca_certificates: vec![certificate.as_ref().to_vec()],
+            next_protos: Vec::new(),
+        },
+        websocket: Some(ValidatedWebSocket {
+            host: "localhost".to_owned(),
+            path: "/proxy/ws".to_owned(),
+        }),
+        http2: ValidatedHttp2 {
+            concurrency: 2,
+            max_streams: 8,
+            idle_timeout: Duration::from_secs(30),
+        },
+        yuubinsya: ValidatedYuubinsya {
+            password: PASSWORD.to_owned(),
+            udp_over_stream: false,
+            udp_coalesce: false,
+        },
+    })
+    .unwrap();
+    let mut stream = client
+        .connect_tcp(Endpoint::ip(Network::Tcp, target_address))
+        .await
+        .unwrap();
+    stream.write_all(b"tls-ws-echo").await.unwrap();
+    let mut response = vec![0u8; 11];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"tls-ws-echo");
+    stream.shutdown().await.unwrap();
+    client.close().await;
+    target_task.await.unwrap();
+    server_task.abort();
+    let _ = server_task.await;
 }
 
 fn proxy_runtime(proxy: Arc<dyn AsyncProxy>) -> TunProxyRuntime {

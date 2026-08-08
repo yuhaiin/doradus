@@ -197,11 +197,12 @@ impl AsyncProxySelector for RuntimeProxySelector {
 }
 
 fn is_chain_config(config: &GoProxyRuntimeConfig) -> bool {
-    if config
-        .chain_types
-        .iter()
-        .any(|kind| matches!(kind.to_ascii_lowercase().as_str(), "tls" | "http2"))
-    {
+    if config.chain_types.iter().any(|kind| {
+        matches!(
+            kind.to_ascii_lowercase().as_str(),
+            "tls" | "http2" | "websocket"
+        )
+    }) {
         return true;
     }
     config.chain_types.iter().any(|kind| {
@@ -431,6 +432,45 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind, ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn runtime_routes_go_websocket_http2_chain_to_chain_builder() {
+        let config = GoProxyRuntimeConfig {
+            id: "websocket-chain".to_owned(),
+            name: "websocket-chain".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec![
+                "fixedv2".to_owned(),
+                "websocket".to_owned(),
+                "http2".to_owned(),
+                "yuubinsya".to_owned(),
+            ],
+            layers: Vec::new(),
+            transport: GoProxyTransport::Yuubinsya,
+            data_json: serde_json::json!({
+                "chain": [
+                    {"type": "fixedv2", "fixedv2": {
+                        "addresses": [{"host": "127.0.0.1:40501"}]
+                    }},
+                    {"type": "websocket", "websocket": {
+                        "host": "localhost", "path": "/proxy/ws"
+                    }},
+                    {"type": "http2", "http2": {"concurrency": 2}},
+                    {"type": "yuubinsya", "yuubinsya": {
+                        "password": "password"
+                    }}
+                ]
+            })
+            .to_string()
+            .into_bytes(),
+        };
+        let built =
+            block_on(snapshot(config).build_proxy("websocket-chain", Duration::from_secs(1)))
+                .unwrap();
+        assert_eq!(built.config.id, "websocket-chain");
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
