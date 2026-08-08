@@ -6,7 +6,9 @@ use std::{
 use yuhaiin_core::Result;
 use yuhaiin_store::{ConfigMutation, ConfigStore};
 
-use crate::{RuntimeBuilder, RuntimeHandle, RuntimeProxySelector, RuntimeSnapshot};
+use crate::{
+    ConnectionMonitor, RuntimeBuilder, RuntimeHandle, RuntimeProxySelector, RuntimeSnapshot,
+};
 
 /// Shared configuration-to-runtime owner for management APIs.
 ///
@@ -21,6 +23,8 @@ pub struct RuntimeController {
     reload_lock: Arc<tokio::sync::Mutex<()>>,
     reload_error: Arc<RwLock<Option<String>>>,
     selectors: Arc<RwLock<Vec<Weak<RuntimeProxySelector>>>>,
+    monitor: Arc<ConnectionMonitor>,
+    reload_events: tokio::sync::broadcast::Sender<()>,
 }
 
 impl RuntimeController {
@@ -28,12 +32,15 @@ impl RuntimeController {
     pub async fn from_builder(builder: RuntimeBuilder) -> Result<Self> {
         let builder = Arc::new(builder);
         let handle = RuntimeHandle::new(builder.build().await?);
+        let (reload_events, _) = tokio::sync::broadcast::channel(32);
         Ok(Self {
             builder,
             handle,
             reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             reload_error: Arc::new(RwLock::new(None)),
             selectors: Arc::new(RwLock::new(Vec::new())),
+            monitor: Arc::new(ConnectionMonitor::new()),
+            reload_events,
         })
     }
 
@@ -43,6 +50,14 @@ impl RuntimeController {
 
     pub fn handle(&self) -> &RuntimeHandle {
         &self.handle
+    }
+
+    pub fn monitor(&self) -> Arc<ConnectionMonitor> {
+        self.monitor.clone()
+    }
+
+    pub fn subscribe_reload(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.reload_events.subscribe()
     }
 
     /// Build and register a TUN proxy selector. The controller refreshes all
@@ -122,6 +137,7 @@ impl RuntimeController {
         let mut runtime =
             yuhaiin_core::tun::TunProxyRuntime::new(selector.clone(), channel_capacity)?
                 .with_nat(nat, idle_timeout)?;
+        runtime = runtime.with_observer(self.monitor.clone());
         if let Some(handler) = async_dns_handler {
             runtime = runtime.with_async_dns_handler(handler);
         }
@@ -205,6 +221,7 @@ impl RuntimeController {
         for (selector, proxy) in selectors.into_iter().zip(prepared) {
             selector.replace(proxy);
         }
+        let _ = self.reload_events.send(());
         self.set_reload_error("");
         Ok(next)
     }

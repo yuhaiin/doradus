@@ -12,6 +12,8 @@ mod doh_tls;
 #[cfg(feature = "doh-tls")]
 mod dot_tls;
 mod handle;
+pub mod inbound;
+pub mod monitor;
 mod proxy;
 mod resolver;
 mod route;
@@ -41,6 +43,7 @@ pub use doh_tls::{RustCryptoH2Connector, RustCryptoTlsDialer, root_store as doh_
 #[cfg(feature = "doh-tls")]
 pub use dot_tls::RustCryptoDotResolverFactory;
 pub use handle::RuntimeHandle;
+pub use monitor::ConnectionMonitor;
 pub use proxy::{ProxyBuild, RuntimeProxySelector};
 #[cfg(feature = "http2")]
 pub use resolver::H2DohResolverFactory;

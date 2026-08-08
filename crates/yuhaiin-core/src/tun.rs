@@ -411,6 +411,29 @@ impl TunFlow {
     }
 }
 
+/// Direction of bytes observed at the TUN/application boundary.
+#[cfg(feature = "async-proxy")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunFlowDirection {
+    /// Bytes sent by the application into the proxy runtime.
+    Upload,
+    /// Bytes received from the proxy runtime and written back to the TUN.
+    Download,
+}
+
+/// Lifecycle and byte observer for management-plane connection statistics.
+///
+/// The observer is deliberately a synchronous, allocation-tolerant boundary:
+/// packet processing must never await a management consumer. Implementations
+/// should keep callbacks bounded and may fan out to a lock-free/broadcast
+/// structure owned by the application layer.
+#[cfg(feature = "async-proxy")]
+pub trait TunFlowObserver: Send + Sync {
+    fn opened(&self, flow: TunFlow, context: crate::FlowContext);
+    fn bytes(&self, flow: TunFlowKey, direction: TunFlowDirection, bytes: usize);
+    fn closed(&self, flow: TunFlowKey);
+}
+
 /// Events emitted after `TunDispatcher::poll` has allowed smoltcp to consume
 /// packets and advance socket state.
 ///
@@ -882,6 +905,7 @@ type AsyncDnsTask = LocalBoxFuture<'static, (TunFlowKey, Result<Vec<u8>>)>;
 pub struct TunProxyRuntime {
     selector: Arc<dyn AsyncProxySelector>,
     context_provider: Arc<dyn Fn(TunFlow) -> crate::FlowContext + Send + Sync>,
+    observer: Option<Arc<dyn TunFlowObserver>>,
     dns_handler: Option<Arc<dyn DnsHandler>>,
     async_dns_handler: Option<Arc<dyn AsyncDnsHandler>>,
     nat: Option<NatBinding>,
@@ -909,6 +933,7 @@ impl TunProxyRuntime {
         Ok(Self {
             selector,
             context_provider: Arc::new(|flow| flow.context()),
+            observer: None,
             dns_handler: None,
             async_dns_handler: None,
             nat: None,
@@ -932,6 +957,11 @@ impl TunProxyRuntime {
 
     pub fn with_async_dns_handler(mut self, handler: Arc<dyn AsyncDnsHandler>) -> Self {
         self.async_dns_handler = Some(handler);
+        self
+    }
+
+    pub fn with_observer(mut self, observer: Arc<dyn TunFlowObserver>) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -1018,6 +1048,9 @@ impl TunProxyRuntime {
                 self.track_flow(flow.key)?;
                 self.remove_task(&flow.key);
                 let context = (self.context_provider)(flow);
+                if let Some(observer) = &self.observer {
+                    observer.opened(flow, context.clone());
+                }
                 let proxy = self.selector.select(&context);
                 let (command, commands) = mpsc::channel(self.channel_capacity);
                 let output = self.output_tx.clone();
@@ -1030,6 +1063,9 @@ impl TunProxyRuntime {
             }
             TunEvent::TcpData { flow, payload } => {
                 self.touch_flow(flow.key)?;
+                if let Some(observer) = &self.observer {
+                    observer.bytes(flow.key, TunFlowDirection::Upload, payload.len());
+                }
                 self.send_command_or_cleanup(&flow.key, ProxyCommand::Data(payload))?;
             }
             TunEvent::TcpHalfClosed { flow } => {
@@ -1041,7 +1077,15 @@ impl TunProxyRuntime {
                 self.untrack_flow(&flow.key)?;
             }
             TunEvent::UdpDatagram { flow, payload } => {
+                let first = !self.tracked_flows.contains(&flow.key);
                 self.track_flow(flow.key)?;
+                let context = (self.context_provider)(flow);
+                if first && let Some(observer) = &self.observer {
+                    observer.opened(flow, context.clone());
+                }
+                if let Some(observer) = &self.observer {
+                    observer.bytes(flow.key, TunFlowDirection::Upload, payload.len());
+                }
                 if flow.key.destination.port() == 53 {
                     if let Some(handler) = self.dns_handler.clone() {
                         let output = self.output_tx.clone();
@@ -1053,7 +1097,6 @@ impl TunProxyRuntime {
                         return Ok(());
                     }
                 }
-                let context = (self.context_provider)(flow);
                 let target = context.effective_destination();
                 let source = udp_source_key(flow.key);
                 if !self.udp_tasks.contains_key(&source) {
@@ -1128,6 +1171,9 @@ impl TunProxyRuntime {
             match output {
                 ProxyOutput::TcpData { flow, payload } => {
                     self.touch_flow(flow)?;
+                    if let Some(observer) = &self.observer {
+                        observer.bytes(flow, TunFlowDirection::Download, payload.len());
+                    }
                     if dispatcher.write_tcp(flow, &payload).is_err() {
                         self.remove_task(&flow);
                         self.untrack_flow(&flow)?;
@@ -1135,6 +1181,9 @@ impl TunProxyRuntime {
                 }
                 ProxyOutput::UdpData { flow, payload } => {
                     self.touch_flow(flow)?;
+                    if let Some(observer) = &self.observer {
+                        observer.bytes(flow, TunFlowDirection::Download, payload.len());
+                    }
                     if dispatcher.write_udp(flow, &payload).is_err() {
                         self.remove_flow_task(&flow);
                         self.untrack_flow(&flow)?;
@@ -1393,12 +1442,11 @@ impl TunProxyRuntime {
     }
 
     fn track_flow(&mut self, flow: TunFlowKey) -> Result<()> {
-        let Some(nat) = &self.nat else {
-            return Ok(());
-        };
-        let key = nat_key(flow);
-        if nat.table.touch(&key)?.is_none() {
-            nat.table.insert(key, flow.source, nat.idle_timeout)?;
+        if let Some(nat) = &self.nat {
+            let key = nat_key(flow);
+            if nat.table.touch(&key)?.is_none() {
+                nat.table.insert(key, flow.source, nat.idle_timeout)?;
+            }
         }
         self.tracked_flows.insert(flow);
         Ok(())
@@ -1420,6 +1468,9 @@ impl TunProxyRuntime {
         };
         let _ = nat.table.remove(&nat_key(*flow))?;
         self.tracked_flows.remove(flow);
+        if let Some(observer) = &self.observer {
+            observer.closed(*flow);
+        }
         Ok(())
     }
 

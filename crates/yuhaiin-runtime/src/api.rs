@@ -8,11 +8,15 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use std::convert::Infallible;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 
 use yuhaiin_store::{
@@ -137,6 +141,17 @@ pub fn router(state: ApiState) -> Router {
             "/api/v2/resolvers/{id}",
             get(resolver_get).put(resolver_put).delete(resolver_delete),
         )
+        .route("/api/v2/connections", get(connections_get))
+        .route("/api/v2/connections/total", get(connections_total))
+        .route("/api/v2/connections/traffic", get(connections_traffic))
+        .route("/api/v2/connections/telemetry", get(connections_telemetry))
+        .route("/api/v2/connections/events", get(connections_events))
+        .route("/api/v2/connections/close", post(connections_close))
+        .route(
+            "/api/v2/connections/failed-history",
+            get(connections_failed_history),
+        )
+        .route("/api/v2/connections/history", get(connections_history))
         .route(
             "/api/v2/route/config",
             get(route_config_get).put(route_config_put),
@@ -239,6 +254,22 @@ async fn rpc(
         "resolver.fakedns.put" => fakedns_put_value(&state, body).await,
         "resolver.server.get" => resolver_server_get_value(&state).await,
         "resolver.server.put" => resolver_server_put_value(&state, body).await,
+        "connections" => json_value(state.controller.monitor().connections_value()),
+        "connections.total" => json_value(state.controller.monitor().total_flow_value()),
+        "connections.traffic" => {
+            let interval = string_or(&body, "interval", "hour");
+            json_value(state.controller.monitor().traffic_value(
+                &interval,
+                body.get("from").and_then(Value::as_str),
+                body.get("to").and_then(Value::as_str),
+            ))
+        }
+        "connections.telemetry" => json_value(state.controller.monitor().telemetry_value()),
+        "connections.close" => close_connections_value(&state, body).await,
+        "connections.failed_history" => {
+            json_value(state.controller.monitor().failed_history_value())
+        }
+        "connections.history" => json_value(state.controller.monitor().all_history_value()),
         "tun.config.get" => read_config_json(&state, "tun.runtime", default_tun_config()).await,
         "tun.config.put" => write_config_json(&state, "tun.runtime", body).await,
         "route.config.get" => route_config_get_value(&state).await,
@@ -341,6 +372,84 @@ async fn node_put(
 
 async fn node_delete(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
     delete_node_value(&state, id).await
+}
+
+async fn connections_get(State(state): State<ApiState>) -> ApiResult {
+    json_value(state.controller.monitor().connections_value())
+}
+
+async fn connections_total(State(state): State<ApiState>) -> ApiResult {
+    json_value(state.controller.monitor().total_flow_value())
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TrafficQuery {
+    interval: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+async fn connections_traffic(
+    State(state): State<ApiState>,
+    Query(query): Query<TrafficQuery>,
+) -> ApiResult {
+    json_value(state.controller.monitor().traffic_value(
+        query.interval.as_deref().unwrap_or("hour"),
+        query.from.as_deref(),
+        query.to.as_deref(),
+    ))
+}
+
+async fn connections_telemetry(State(state): State<ApiState>) -> ApiResult {
+    json_value(state.controller.monitor().telemetry_value())
+}
+
+async fn connections_failed_history(State(state): State<ApiState>) -> ApiResult {
+    json_value(state.controller.monitor().failed_history_value())
+}
+
+async fn connections_history(State(state): State<ApiState>) -> ApiResult {
+    json_value(state.controller.monitor().all_history_value())
+}
+
+async fn connections_close(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
+    close_connections_value(&state, value).await
+}
+
+async fn close_connections_value(state: &ApiState, value: Value) -> ApiResult {
+    let ids = value
+        .get("ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::bad("connections close requires an ids array"))?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    state.controller.monitor().request_close(&ids);
+    empty()
+}
+
+async fn connections_events(
+    State(state): State<ApiState>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
+    let monitor = state.controller.monitor();
+    let initial = monitor.initial_event();
+    let updates = BroadcastStream::new(monitor.subscribe()).filter_map(|event| {
+        event.ok().map(|event| {
+            SseEvent::default()
+                .event(event.kind)
+                .json_data(event.payload)
+                .unwrap_or_else(|_| SseEvent::default())
+        })
+    });
+    let stream = tokio_stream::iter(vec![Ok::<SseEvent, Infallible>(
+        SseEvent::default()
+            .event(initial.kind)
+            .json_data(initial.payload)
+            .unwrap_or_else(|_| SseEvent::default()),
+    )])
+    .chain(updates.map(Ok));
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 async fn inbounds_get(State(state): State<ApiState>, Query(query): Query<ListQuery>) -> ApiResult {
