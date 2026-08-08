@@ -9,5 +9,6 @@ pub mod shadowsocks;
 pub mod tls;
 pub mod trojan;
 pub mod vless;
+pub mod vmess;
 #[cfg(feature = "websocket")]
 pub mod websocket;
