@@ -57,7 +57,10 @@ pub use resolver::{
     TimeoutResolver, parse_dns_server,
 };
 pub use route::{
-    compile_go_route_rules, compile_go_route_rules_with_geo, route_rule_from_go_record,
+    RouteListRefreshReport, RouteListSnapshot, compile_go_route_rules,
+    compile_go_route_rules_with_geo, compile_go_route_rules_with_lists, expand_go_route_rule,
+    load_route_lists, refresh_route_list_caches, route_list_cache_dir, route_list_cache_path,
+    route_rule_from_go_record,
 };
 #[cfg(feature = "doh-tls")]
 pub use rustcrypto_resolver::RustCryptoResolverFactory;
@@ -106,6 +109,7 @@ pub struct RuntimeSnapshot {
     pub resolvers: Vec<GoResolverRuntimeConfig>,
     pub route: Option<GoRouteRuntimeConfig>,
     pub route_rules: Vec<GoRouteRuleRecord>,
+    pub route_lists: RouteListSnapshot,
     pub router: RouterRuntime,
     pub resolver_by_id: BTreeMap<String, Arc<dyn AsyncIpResolver>>,
     pub resolver_errors: BTreeMap<String, String>,
@@ -247,6 +251,8 @@ impl RuntimeBuilder {
         let resolvers = repository.list_go_resolver_runtime_configs().await?;
         let route = repository.load_go_route_runtime_config().await?;
         let route_rules = repository.list_go_route_rules().await?;
+        let route_list_records = repository.list_go_route_lists().await?;
+        let route_lists = load_route_lists(&route_list_records);
         let proxies = repository.list_go_proxy_runtime_configs().await?;
         let geo_metadata = repository.list_maxmind_metadata().await?;
         let geo = geo_metadata
@@ -318,8 +324,9 @@ impl RuntimeBuilder {
                 }
             }
         }
-        let router = compile_go_route_rules_with_geo(
+        let router = compile_go_route_rules_with_lists(
             &route_rules,
+            &route_lists,
             self.options.route_fallback.clone(),
             geo.clone(),
         )?;
@@ -330,6 +337,7 @@ impl RuntimeBuilder {
             resolvers,
             route,
             route_rules,
+            route_lists,
             router,
             resolver_by_id,
             resolver_errors,
@@ -440,7 +448,7 @@ mod tests {
     use std::time::Duration;
     use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
     use yuhaiin_core::{BoxFuture, DomainName, IpSet, ResolveStrategy};
-    use yuhaiin_store::GoUdpProxyFqdnStrategy;
+    use yuhaiin_store::{GoRouteListRecord, GoUdpProxyFqdnStrategy};
     use yuhaiin_trie::router::Router;
 
     fn block_on<F: Future>(future: F) -> F::Output {
@@ -506,6 +514,59 @@ mod tests {
         let snapshot = block_on(builder.build()).unwrap();
         assert!(snapshot.route.is_none());
         assert!(snapshot.resolvers.is_empty());
+    }
+
+    #[test]
+    fn builder_publishes_route_list_contents_into_the_router_snapshot() {
+        let store = block_on(ConfigStore::open_memory()).unwrap();
+        block_on(
+            store.repository().put_go_route_list(&GoRouteListRecord {
+                name: "local-domains".to_owned(),
+                list_type: "host".to_owned(),
+                source_type: "local".to_owned(),
+                updated_at: 1,
+                data_json: br#"{
+                "name":"local-domains",
+                "type":"host",
+                "source":{"type":"local","local":{"lists":["example.test"]}}
+            }"#
+                .to_vec(),
+            }),
+        )
+        .unwrap();
+        block_on(
+            store.repository().put_go_route_rule(&GoRouteRuleRecord {
+                id: "list-rule".to_owned(),
+                name: "list-rule".to_owned(),
+                priority: 1,
+                disabled: false,
+                action_mode: "proxy".to_owned(),
+                match_type: "all".to_owned(),
+                tag: "test".to_owned(),
+                updated_at: 2,
+                data_json: br#"{
+                "mode":"proxy",
+                "rules":[{"type":"host","host":{"list":"local-domains"}}]
+            }"#
+                .to_vec(),
+            }),
+        )
+        .unwrap();
+        let snapshot =
+            block_on(RuntimeBuilder::new(store, Arc::new(SystemAsyncIpResolver)).build()).unwrap();
+        assert_eq!(
+            snapshot.route_lists.values("local-domains").unwrap(),
+            ["example.test"]
+        );
+        let endpoint = yuhaiin_core::Endpoint::domain(
+            yuhaiin_core::Network::Tcp,
+            DomainName::new("www.example.test").unwrap(),
+            443,
+        );
+        assert_eq!(
+            snapshot.router.decide(&endpoint).mode,
+            yuhaiin_core::RouteMode::Proxy
+        );
     }
 
     #[test]
@@ -582,6 +643,7 @@ mod tests {
                 udp_proxy_fqdn: GoUdpProxyFqdnStrategy::Resolve,
             }),
             route_rules: Vec::new(),
+            route_lists: RouteListSnapshot::default(),
             router,
             resolver_by_id,
             resolver_errors: BTreeMap::new(),

@@ -28,7 +28,10 @@ use yuhaiin_store::{
     GoRouteSettingsRecord, GoSubscriptionLinkRecord,
 };
 
-use crate::{RuntimeController, log::log_batch_value, route_rule_from_go_record};
+use crate::{
+    RouteListSnapshot, RuntimeController, expand_go_route_rule, log::log_batch_value,
+    refresh_route_list_caches,
+};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -838,10 +841,19 @@ async fn route_lists_activation(State(state): State<ApiState>) -> ApiResult {
 }
 
 async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
+    let records = state
+        .controller
+        .store()
+        .repository()
+        .list_go_route_lists()
+        .await?;
+    let report = refresh_route_list_caches(&records, Duration::from_secs(90)).await;
     let refreshed_at = unix_millis();
     let activation = json!({
-        "hostIndexRefreshAt": 0,
+        "hostIndexRefreshAt": refreshed_at,
         "lastRefreshAt": refreshed_at,
+        "refreshed": report.refreshed,
+        "errors": report.errors,
     });
     let bytes = serde_json::to_vec(&activation)?;
     state
@@ -850,11 +862,10 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
             store.put_config(ROUTE_LIST_ACTIVATION_KEY, &bytes).await
         })
         .await?;
-    state
-        .controller
-        .monitor()
-        .logs()
-        .info(format!("route list refresh applied at {refreshed_at}"));
+    state.controller.monitor().logs().info(format!(
+        "route list refresh applied at {refreshed_at}, {} cache entries updated",
+        report.refreshed
+    ));
     empty()
 }
 
@@ -1307,6 +1318,7 @@ async fn route_config_put_value(state: &ApiState, value: Value) -> ApiResult {
 }
 
 async fn route_lists_get_value(state: &ApiState, input: &Value) -> ApiResult {
+    let route_lists = state.controller.handle().load().route_lists.clone();
     let records = state
         .controller
         .store()
@@ -1315,7 +1327,7 @@ async fn route_lists_get_value(state: &ApiState, input: &Value) -> ApiResult {
         .await?;
     let values = records
         .into_iter()
-        .map(route_list_item_json)
+        .map(|record| route_list_item_json(record, &route_lists))
         .collect::<Vec<_>>();
     Ok(Json(page(values, input)))
 }
@@ -1551,8 +1563,9 @@ async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
         yuhaiin_core::RouteMode::Block => "drop",
     };
     let mut matched = Vec::new();
+    let route_lists = &snapshot.route_lists;
     for record in &snapshot.route_rules {
-        if let Some(rule) = route_rule_from_go_record(record)? {
+        for rule in expand_go_route_rule(record, route_lists)? {
             let is_match = rule.matches(&context.effective_destination());
             if is_match {
                 matched.push((record, rule));
@@ -2369,12 +2382,28 @@ fn resolver_json(record: GoResolverRecord) -> Value {
     value
 }
 
-fn route_list_item_json(record: GoRouteListRecord) -> Value {
+fn route_list_item_json(record: GoRouteListRecord, route_lists: &RouteListSnapshot) -> Value {
     let value = raw_json(
         &record.data_json,
         json!({"name": record.name, "type": record.list_type}),
     );
-    json!({"name": string_or(&value, "name", &record.name), "type": string_or(&value, "type", &record.list_type), "source": string_or(&value.get("source").cloned().unwrap_or_default(), "type", &record.source_type), "itemCount": 0, "errorCount": 0, "preview": ""})
+    let name = string_or(&value, "name", &record.name);
+    let entries = route_lists.values(&name).unwrap_or_default();
+    let preview = entries
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let error_count = u32::from(route_lists.error(&name).is_some());
+    json!({
+        "name": name,
+        "type": string_or(&value, "type", &record.list_type),
+        "source": string_or(&value.get("source").cloned().unwrap_or_default(), "type", &record.source_type),
+        "itemCount": entries.len(),
+        "errorCount": error_count,
+        "preview": preview,
+    })
 }
 
 fn route_rule_item_json(record: GoRouteRuleRecord) -> Value {
@@ -2677,6 +2706,34 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["mode"], "drop");
         assert!(value.get("matchResult").is_some());
+    }
+
+    #[tokio::test]
+    async fn route_list_api_reports_loaded_local_items_after_reload() {
+        let state = state().await;
+        let _ = save_route_list_value(
+            &state,
+            json!({
+                "name":"local-domains",
+                "type":"host",
+                "source":{"type":"local","local":{"lists":["example.test","api.example.test"]}}
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let listed = route_lists_get_value(&state, &json!({"page":1,"pageSize":20}))
+            .await
+            .unwrap();
+        assert_eq!(listed.0["items"][0]["name"], "local-domains");
+        assert_eq!(listed.0["items"][0]["itemCount"], 2);
+        assert_eq!(listed.0["items"][0]["errorCount"], 0);
+        assert!(
+            listed.0["items"][0]["preview"]
+                .as_str()
+                .unwrap()
+                .contains("example.test")
+        );
     }
 
     #[tokio::test]

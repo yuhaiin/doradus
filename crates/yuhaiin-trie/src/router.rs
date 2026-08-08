@@ -88,6 +88,10 @@ pub struct RouteDecision {
 #[derive(Clone)]
 pub struct Router {
     rules: CombinedTrie<Vec<RouteRule>>,
+    /// Rules without a domain/CIDR matcher (for example Go's network-only or
+    /// empty `all` rule) are evaluated for every endpoint. Keeping them out of
+    /// the trie avoids inventing a fake domain that would not match IP flows.
+    global_rules: Vec<RouteRule>,
     fallback: RouteDecision,
     geo: Option<Arc<dyn GeoLookup>>,
 }
@@ -105,13 +109,19 @@ impl Router {
         rules.sort_by_key(|rule| rule.priority);
         let mut index = Self {
             rules: CombinedTrie::new(),
+            global_rules: Vec::new(),
             fallback,
             geo: None,
         };
         let mut grouped: BTreeMap<String, Vec<RouteRule>> = BTreeMap::new();
         for rule in rules {
-            grouped.entry(rule.pattern.clone()).or_default().push(rule);
+            if rule.pattern.trim().is_empty() {
+                index.global_rules.push(rule);
+            } else {
+                grouped.entry(rule.pattern.clone()).or_default().push(rule);
+            }
         }
+        index.global_rules.sort_by_key(|rule| rule.priority);
         for (pattern, values) in grouped {
             index.rules.insert(pattern.as_str(), values)?;
         }
@@ -129,16 +139,15 @@ impl Router {
     }
 
     pub fn decide(&self, endpoint: &Endpoint) -> RouteDecision {
-        let Some(candidates) = self.rules.search(endpoint) else {
-            return self.fallback.clone();
-        };
-        candidates
+        let candidates = self.rules.search(endpoint);
+        self.global_rules
             .iter()
+            .chain(candidates.into_iter().flat_map(|rules| rules.iter()))
             .filter(|rule| rule.matches_with_geo(endpoint, self.geo.as_deref()))
             // Go's route matcher walks rules in persisted priority order and
             // stops at the first match.  Lower priority values therefore win;
             // this is also what makes the UI's drag-and-drop order effective.
-            .next()
+            .min_by_key(|rule| rule.priority)
             .map(|rule| RouteDecision {
                 mode: rule.action.into(),
                 resolver_policy: rule.resolver_policy,

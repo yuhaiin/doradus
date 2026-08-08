@@ -231,6 +231,7 @@ mod tests {
             resolvers: Vec::new(),
             route: None,
             route_rules: Vec::new(),
+            route_lists: crate::RouteListSnapshot::default(),
             router: RouterRuntime::new(
                 Router::compile(
                     Vec::new(),

@@ -49,7 +49,8 @@
 | P2-GEO | P2 | MaxMindDB 生产链路 | reader、坏库、IPv4-mapped IPv6 和 Router country rule 已有；仍需固定版本 GeoLite/官方 test fixture、下载长度与 hash 校验、atomic replace、并发热替换、旧 reader 生命周期和重启恢复。 |
 | P2-SOAK | P2 | 性能、内存、电量与长稳基线 | 仍需 Go/Rust 同场景吞吐、延迟、RSS、分配、wakeups、FakeIP/SQLite 增长、Android 电量和长时间 soak 报告；在报告前不宣称 Rust 性能收益。 |
 | P2-AUDIT | P2 | 安全、依赖与发布审计 | 仍需 TLS provider 互操作/证书验证、依赖 license、纯 Rust/C binding、日志脱敏、release profile、交叉编译和 reproducible build 审计。 |
-| P2-API | P2 | 管理 HTTP 与前端对接 | 已完成第一版：真实前端 `requestJSON` 使用的 RPC operation 已覆盖 outbound/node、inbound、resolver、hosts/FakeDNS、route config/list/rule/tag、settings 和 TUN config；共享 Go compatibility record 保存未知字段，写入后统一事务 reload，失败保留旧 snapshot。已通过 API 单测和真实 binary + curl 回归。 |
+| P2-API | P2 | 管理 HTTP 与前端对接 | 第一版 RPC/前端兼容边界已完成；本轮补充 route-list 内容加载、真实 itemCount/errorCount/preview、HTTP(S) refresh、`~/.cache/yuhaiin-rust/rules` 原子缓存、Go 嵌套 host/network/port/geoip 规则进入 immutable Router snapshot，并通过 runtime/API/本地 HTTP server 回归。仍需 process/inbound/not 表达式、下载器经配置代理的路径和更多真实 Go 生产列表 fixture。 |
+| P2-ROUTE-LISTS | P2 | Go route-list 内容与嵌套 matcher parity | 已完成 local/file/cache-remote 内容解析、hosts_as_host、原子 HTTP refresh、缺失列表的 fail-closed 不匹配和 host/network/port/geoip/all/any 展开；仍需 `not`、process/inbound matcher、真实生产列表格式矩阵和下载器 proxy/bootstrap 互操作。 |
 | P2-BINARY | P2 | 可直接运行的服务进程 | 已完成：`cargo run -p yuhaiin-runtime --bin yuhaiin --all-features` 可启动 HTTP 服务；默认数据库在 `$XDG_DATA_HOME/yuhaiin-rust/state.sqlite` 或 `~/.local/share/yuhaiin-rust/state.sqlite`，测试临时数据使用 `~/.cache`，不使用 `/tmp`；`YUHAIIN_TUN=1` 启用 TUN，`YUHAIIN_HTTP`/`YUHAIIN_DB` 可覆盖监听和数据库路径。 |
 
 ### 未完成事项的可执行 checklist
@@ -121,6 +122,7 @@ P1 的明确边界：Full Cone NAT、rusqlite bundled 后端、真实 Go v5 FTS-
 - [x] **P2-API-01：** `POST /api/v2/rpc/nodes.post|get`、`resolvers.post|get`、`route.rules.post|get`、`resolver.hosts.put|get` 和 `route.config.put|get` 与前端扁平 JSON request body 兼容。
 - [x] **P2-API-02：** API 写入统一经过 SQLite typed compatibility table/config key 和 `RuntimeController::mutate_and_reload`；构建失败不替换旧 snapshot。
 - [x] **P2-API-03：** 节点、入站、resolver、route rule/list 原始 JSON 保存在兼容记录 `data_json`，未知字段不因 HTTP DTO 转换丢失；列表响应包含前端需要的 `items/page/pageSize/total`。
+- [~] **P2-API-04：** route list 已从“只保存 JSON”推进到 runtime 内容：local/file/缓存 remote、HTTP(S) refresh、`~/.cache/yuhaiin-rust/rules` 原子替换、itemCount/errorCount/preview 和 host/network/port/geoip/all/any 规则展开均有实现与测试；`not`、process/inbound matcher、配置代理下载路径和真实生产列表 fixture 仍待补齐。
 - [x] **P2-BINARY-01：** `yuhaiin` binary 直接启动 HTTP listener；默认创建内置 direct node，支持 `YUHAIIN_DB`、`YUHAIIN_HTTP`、`YUHAIIN_TUN`，生命周期由 Ctrl-C/watch shutdown 收敛。
 - [x] **P2-BINARY-02：** 启用 TUN 时使用单一路径 `tun-rs AsyncDevice + smoltcp`，selector/NAT/DNS handler 来自同一个 runtime snapshot；可选 UDP DNS server 使用同一 resolver snapshot。
 
