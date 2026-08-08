@@ -15,7 +15,10 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Notify, broadcast};
 
-use yuhaiin_core::tun::{TunFlow, TunFlowDirection, TunFlowKey, TunFlowObserver};
+use yuhaiin_core::flow::{
+    Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
+    FlowObserver as TunFlowObserver,
+};
 use yuhaiin_core::{Endpoint, FlowContext, RouteMode};
 use yuhaiin_store::ConfigStore;
 
@@ -115,6 +118,7 @@ struct PersistedMonitor {
 pub struct ConnectionMonitor {
     state: Arc<Mutex<MonitorState>>,
     events: broadcast::Sender<MonitorEvent>,
+    close_events: broadcast::Sender<TunFlowKey>,
     logs: RuntimeLog,
     persistence: Option<Arc<Notify>>,
 }
@@ -128,9 +132,11 @@ impl Default for ConnectionMonitor {
 impl ConnectionMonitor {
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(256);
+        let (close_events, _) = broadcast::channel(256);
         Self {
             state: Arc::new(Mutex::new(MonitorState::default())),
             events,
+            close_events,
             logs: RuntimeLog::new(),
             persistence: None,
         }
@@ -400,6 +406,7 @@ impl ConnectionMonitor {
 
     pub fn request_close(&self, ids: &[String]) -> usize {
         let mut state = self.lock();
+        let mut requested = Vec::new();
         let mut count = 0;
         for id in ids {
             let Some(flow) = state.ids.get(id).copied() else {
@@ -407,10 +414,39 @@ impl ConnectionMonitor {
             };
             if !state.close_requests.contains(&flow) {
                 state.close_requests.push(flow);
+                requested.push(flow);
                 count += 1;
             }
         }
+        drop(state);
+        for flow in requested {
+            let _ = self.close_events.send(flow);
+        }
         count
+    }
+
+    pub(crate) fn subscribe_close_requests(&self) -> broadcast::Receiver<TunFlowKey> {
+        self.close_events.subscribe()
+    }
+
+    /// Wait until the management API requests this flow to close.
+    ///
+    /// The subscription is created before checking the state so a request
+    /// cannot be lost between the state check and the first await. The state
+    /// check also covers a request that arrived before this relay subscribed.
+    pub(crate) async fn wait_for_close(&self, flow: TunFlowKey) {
+        let mut events = self.subscribe_close_requests();
+        loop {
+            if self.close_requested(flow) {
+                return;
+            }
+            match events.recv().await {
+                Ok(requested) if requested == flow => return,
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
     }
 
     pub fn record_failure(&self, protocol: &str, host: &str, error: &str) {
@@ -882,6 +918,23 @@ mod tests {
         assert_eq!(monitor.request_close(&["1".to_owned()]), 1);
         assert_eq!(monitor.take_close_requests(), vec![flow.key]);
         assert!(monitor.take_close_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn monitor_wakes_non_tun_relays_for_close_requests() {
+        let monitor = ConnectionMonitor::new();
+        let (flow, context) = flow();
+        monitor.opened(flow, context);
+        let waiter = {
+            let monitor = monitor.clone();
+            tokio::spawn(async move { monitor.wait_for_close(flow.key).await })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(monitor.request_close(&["1".to_owned()]), 1);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("close waiter should wake")
+            .expect("close waiter should not panic");
     }
 
     #[test]

@@ -4,8 +4,8 @@ use std::sync::Arc;
 use base64::Engine;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use yuhaiin_core::flow::FlowKey as TunFlowKey;
 use yuhaiin_core::proxy::AsyncProxySelector;
-use yuhaiin_core::tun::TunFlowKey;
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 use super::common::{io_error, relay_counted, relay_counted_with_prefix};

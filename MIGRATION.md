@@ -748,6 +748,8 @@ Rust 版管理面位于 `yuhaiin-runtime::api`，不要求前端改写。第一�
 - `route.config.*`、`route.lists.*`、`route.rules.*`、`route.tags.*`：规则/列表原文持久化，常见 domain/CIDR/host-list 表达式编译到当前 Router；
 - `settings.*`、`tun.config.*`、`info`：管理进程和数据面启动配置。
 
+`connections` 由 `yuhaiin-runtime::ConnectionMonitor` 统一维护，TUN、HTTP/SOCKS5/Yuubinsya 入站都使用同一 live snapshot、流量计数、SSE 事件和历史统计。`connections.close` 先按 Go 合约严格校验十进制数字 ID，再通过 per-flow close event 唤醒 TCP relay 或 UDP flow；因此前端关闭普通入站连接时不会只改变列表而遗留底层 socket。TUN 仍保留原有的 packet dispatcher 消费队列，两个路径共享 `ConnectionMonitor` 的状态和持久化统计。
+
 列表响应保持 `{items, page: {page, pageSize, total}}`，记录的未知字段保留在 store 的 `data_json`，secret 脱敏和完整 Go 高级协议属于后续兼容范围。每个写操作先提交 SQLite，再由 `RuntimeController::mutate_and_reload` 串行重建；重建失败时旧 snapshot 继续服务，并通过错误响应告知前端。
 
 ### 7.7.2 可运行 binary

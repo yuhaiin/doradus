@@ -1,11 +1,15 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split};
 
+use yuhaiin_core::flow::{
+    Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
+    FlowObserver as TunFlowObserver,
+};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream};
-use yuhaiin_core::tun::{TunFlow, TunFlowDirection, TunFlowKey, TunFlowObserver};
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -26,6 +30,24 @@ pub(crate) struct UdpReply {
     pub(crate) id: UdpFlowId,
     pub(crate) target: Endpoint,
     pub(crate) payload: Vec<u8>,
+}
+
+pub(crate) async fn close_udp_flows(
+    flows: &mut HashMap<UdpFlowId, UdpFlowState>,
+    flow: TunFlowKey,
+    monitor: &ConnectionMonitor,
+) {
+    let ids = flows
+        .iter()
+        .filter(|(_, state)| state.key == flow)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    for id in ids {
+        if let Some(state) = flows.remove(&id) {
+            let _ = state.datagram.close().await;
+            monitor.closed(state.key);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -119,7 +141,15 @@ where
 {
     let mut buffer = vec![0u8; 16 * 1024];
     loop {
-        let read = reader.read(&mut buffer).await?;
+        let read = tokio::select! {
+            result = reader.read(&mut buffer) => result?,
+            _ = monitor.wait_for_close(flow) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "connection close requested",
+                ));
+            }
+        };
         if read == 0 {
             writer.shutdown().await?;
             return Ok(());

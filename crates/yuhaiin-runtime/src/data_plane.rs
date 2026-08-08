@@ -4,8 +4,10 @@
 //! `PacketTunnelProvider`, and future embedders can create their platform TUN
 //! device themselves and hand the owned [`TunRuntime`] to the same runner.
 
+#[cfg(feature = "tun")]
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+#[cfg(feature = "tun")]
 use std::time::Duration;
 
 use serde_json::Value;
@@ -14,7 +16,9 @@ use yuhaiin_core::dns::{
     AsyncDnsHandler, DnsRecordType, DnsResponse, decode_query, encode_response,
 };
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
-use yuhaiin_core::{Error, ErrorKind, LocalBoxFuture, ResolveStrategy, Result};
+#[cfg(feature = "tun")]
+use yuhaiin_core::{Error, ErrorKind};
+use yuhaiin_core::{LocalBoxFuture, ResolveStrategy, Result};
 
 use crate::{RuntimeController, parse_dns_server};
 
@@ -267,6 +271,7 @@ pub async fn wait_for_shutdown_or_reload(
     }
 }
 
+#[cfg(feature = "tun")]
 fn io_error(error: impl std::fmt::Display) -> Error {
     Error::new(ErrorKind::Io, error.to_string())
 }

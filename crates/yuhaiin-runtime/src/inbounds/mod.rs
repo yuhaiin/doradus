@@ -839,7 +839,7 @@ mod tests {
     use std::sync::Arc;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
+    use tokio::net::{TcpStream, UdpSocket};
 
     use super::*;
     use crate::{RuntimeBuilder, RuntimeController};
@@ -1028,6 +1028,163 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             let _ = listener_task.await;
             echo_task.abort();
             let _ = echo_task.await;
+            result.unwrap();
+        });
+    }
+
+    #[test]
+    fn connections_close_aborts_a_live_socks5_relay() {
+        block_on(async {
+            let (echo_address, echo_task) = echo_server().await;
+            let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let inbound_address = inbound_listener.local_addr().unwrap();
+            let (selector, monitor) = direct_runtime().await;
+            let listener_task = tokio::spawn(serve_listener(
+                inbound_listener,
+                InboundSpec {
+                    id: "socks-close-inbound".to_owned(),
+                    protocol: "socks5".to_owned(),
+                    listen: inbound_address,
+                    username: String::new(),
+                    password: String::new(),
+                    udp_mode: UdpMode::Disabled,
+                    protocol_udp: false,
+                    transports: vec!["normal".to_owned()],
+                    outbound_id: "direct".to_owned(),
+                },
+                selector,
+                monitor.clone(),
+                None,
+            ));
+
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut client = TcpStream::connect(inbound_address).await.unwrap();
+                client.write_all(&[5, 1, 0]).await.unwrap();
+                let mut method = [0u8; 2];
+                client.read_exact(&mut method).await.unwrap();
+                let ip = match echo_address.ip() {
+                    std::net::IpAddr::V4(ip) => ip.octets(),
+                    std::net::IpAddr::V6(_) => panic!("test echo server must be IPv4"),
+                };
+                let mut request = vec![5, 1, 0, 1];
+                request.extend_from_slice(&ip);
+                request.extend_from_slice(&echo_address.port().to_be_bytes());
+                client.write_all(&request).await.unwrap();
+                let mut reply = [0u8; 10];
+                client.read_exact(&mut reply).await.unwrap();
+                client.write_all(b"close-me").await.unwrap();
+                let mut echoed = [0u8; 8];
+                client.read_exact(&mut echoed).await.unwrap();
+
+                let connection_id = monitor.connections_value()["connections"][0]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                assert_eq!(monitor.request_close(&[connection_id]), 1);
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if monitor.connections_value()["connections"]
+                            .as_array()
+                            .is_some_and(Vec::is_empty)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("close request should remove the live relay");
+            })
+            .await;
+
+            listener_task.abort();
+            let _ = listener_task.await;
+            echo_task.abort();
+            let _ = echo_task.await;
+            result.unwrap();
+        });
+    }
+
+    #[test]
+    fn connections_close_removes_a_live_socks5_udp_flow() {
+        block_on(async {
+            let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let target_address = target.local_addr().unwrap();
+            let target_task = tokio::spawn(async move {
+                let mut buffer = [0u8; 2048];
+                if let Ok((length, peer)) = target.recv_from(&mut buffer).await {
+                    let _ = target.send_to(&buffer[..length], peer).await;
+                }
+            });
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server_address = server.local_addr().unwrap();
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let (selector, monitor) = direct_runtime().await;
+            let listener_task = tokio::spawn(crate::proxy::socks5::serve_socks5_udp_loop(
+                server,
+                InboundSpec {
+                    id: "socks-udp-close-inbound".to_owned(),
+                    protocol: "socks5".to_owned(),
+                    listen: server_address,
+                    username: String::new(),
+                    password: String::new(),
+                    udp_mode: UdpMode::Enabled,
+                    protocol_udp: true,
+                    transports: vec!["normal".to_owned()],
+                    outbound_id: "direct".to_owned(),
+                },
+                selector,
+                monitor.clone(),
+                None,
+            ));
+
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let target = Endpoint::ip(Network::Udp, target_address);
+                let packet =
+                    crate::proxy::socks5::encode_socks_udp_packet(&target, b"udp-close").unwrap();
+                client.send_to(&packet, server_address).await.unwrap();
+                let mut reply = [0u8; 2048];
+                let (length, _) = client.recv_from(&mut reply).await.unwrap();
+                let (_, payload) = crate::proxy::socks5::parse_socks_udp_packet(&reply[..length])
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(payload, b"udp-close");
+
+                let connection_id = tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if let Some(id) = monitor.connections_value()["connections"]
+                            .as_array()
+                            .and_then(|connections| connections.first())
+                            .and_then(|connection| connection["id"].as_str())
+                        {
+                            break id.to_owned();
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("UDP flow should be visible to the monitor");
+                assert_eq!(monitor.request_close(&[connection_id]), 1);
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if monitor.connections_value()["connections"]
+                            .as_array()
+                            .is_some_and(Vec::is_empty)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("close request should remove the UDP flow");
+            })
+            .await;
+
+            listener_task.abort();
+            let _ = listener_task.await;
+            target_task.abort();
+            let _ = target_task.await;
             result.unwrap();
         });
     }

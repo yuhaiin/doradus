@@ -600,9 +600,15 @@ async fn close_connections_value(state: &ApiState, value: Value) -> ApiResult {
         .and_then(Value::as_array)
         .ok_or_else(|| ApiError::bad("connections close requires an ids array"))?
         .iter()
-        .filter_map(Value::as_str)
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
+        .map(|value| {
+            let id = value
+                .as_str()
+                .ok_or_else(|| ApiError::bad("connection ids must be strings"))?;
+            id.parse::<u64>()
+                .map_err(|_| ApiError::bad(format!("invalid connection id {id:?}")))?;
+            Ok::<_, ApiError>(id.to_owned())
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     state.controller.monitor().request_close(&ids);
     empty()
 }
@@ -2991,6 +2997,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(closed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn connections_close_rejects_non_numeric_ids_like_go() {
+        let state = state().await;
+        let response = router(state)
+            .oneshot(
+                Request::post("/api/v2/connections/close")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ids":["not-a-number"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

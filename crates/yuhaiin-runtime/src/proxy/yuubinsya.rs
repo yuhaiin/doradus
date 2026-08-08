@@ -6,12 +6,16 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 use yuhaiin_chain::YuubinsyaServerProxy;
+use yuhaiin_core::flow::{
+    Flow as TunFlow, FlowDirection as TunFlowDirection, FlowObserver as TunFlowObserver,
+};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncProxySelector, YuubinsyaUdpServer};
-use yuhaiin_core::tun::{TunFlow, TunFlowDirection, TunFlowObserver};
 use yuhaiin_core::yuubinsya::derive_salt;
 use yuhaiin_core::{Error, FlowContext, Result};
 
-use super::common::{RoutedProxy, UdpFlowId, UdpFlowState, UdpReply, udp_flow_key};
+use super::common::{
+    RoutedProxy, UdpFlowId, UdpFlowState, UdpReply, close_udp_flows, udp_flow_key,
+};
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -43,6 +47,7 @@ pub(crate) async fn serve_udp(
 ) -> Result<()> {
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(64);
     let mut flows = HashMap::<UdpFlowId, UdpFlowState>::new();
+    let mut close_events = monitor.subscribe_close_requests();
     let mut packet = vec![0u8; 64 * 1024];
     loop {
         tokio::select! {
@@ -89,6 +94,15 @@ pub(crate) async fn serve_udp(
                 };
                 state.datagram.send_to(&packet[..length], target).await?;
                 monitor.bytes(state.key, TunFlowDirection::Upload, length);
+            }
+            close_event = close_events.recv() => {
+                match close_event {
+                    Ok(flow) => {
+                        close_udp_flows(&mut flows, flow, &monitor).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
             Some(reply) = reply_rx.recv() => {
                 let Some(state) = flows.get(&reply.id) else { continue; };

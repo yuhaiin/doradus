@@ -6,11 +6,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+use yuhaiin_core::flow::{
+    Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
+    FlowObserver as TunFlowObserver,
+};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
-use yuhaiin_core::tun::{TunFlow, TunFlowDirection, TunFlowKey, TunFlowObserver};
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
-use super::common::{UdpFlowId, UdpFlowState, UdpReply, io_error, relay_counted, udp_flow_key};
+use super::common::{
+    UdpFlowId, UdpFlowState, UdpReply, close_udp_flows, io_error, relay_counted, udp_flow_key,
+};
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -143,7 +148,7 @@ pub(crate) async fn serve_udp_socket(
     serve_socks5_udp_loop(socket, spec, selector, monitor, None).await
 }
 
-async fn serve_socks5_udp_loop(
+pub(crate) async fn serve_socks5_udp_loop(
     socket: UdpSocket,
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
@@ -152,6 +157,7 @@ async fn serve_socks5_udp_loop(
 ) -> Result<()> {
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(64);
     let mut flows = HashMap::<UdpFlowId, UdpFlowState>::new();
+    let mut close_events = monitor.subscribe_close_requests();
     let mut client = allowed_peer;
     let mut packet = vec![0u8; 64 * 1024];
     loop {
@@ -212,6 +218,15 @@ async fn serve_socks5_udp_loop(
                 };
                 state.datagram.send_to(payload, target).await?;
                 monitor.bytes(state.key, TunFlowDirection::Upload, payload.len());
+            }
+            close_event = close_events.recv() => {
+                match close_event {
+                    Ok(flow) => {
+                        close_udp_flows(&mut flows, flow, &monitor).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
             Some(reply) = reply_rx.recv() => {
                 let Some(state) = flows.get(&reply.id) else { continue; };
@@ -283,7 +298,7 @@ where
     }
 }
 
-fn parse_socks_udp_packet(packet: &[u8]) -> Result<Option<(Endpoint, &[u8])>> {
+pub(crate) fn parse_socks_udp_packet(packet: &[u8]) -> Result<Option<(Endpoint, &[u8])>> {
     if packet.len() < 4 || packet[0] != 0 || packet[1] != 0 {
         return Err(Error::new(ErrorKind::Protocol, "invalid SOCKS5 UDP header"));
     }
@@ -342,7 +357,7 @@ fn parse_socks_endpoint_bytes(bytes: &[u8], network: Network) -> Result<(Endpoin
     }
 }
 
-fn encode_socks_udp_packet(target: &Endpoint, payload: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn encode_socks_udp_packet(target: &Endpoint, payload: &[u8]) -> Result<Vec<u8>> {
     let mut packet = vec![0, 0, 0];
     encode_socks_endpoint(&mut packet, target)?;
     packet.extend_from_slice(payload);
