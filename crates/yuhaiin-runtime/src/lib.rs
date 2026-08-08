@@ -4,6 +4,8 @@
 //! models. It is suitable for a future HTTP/yuhaiin-react handler without
 //! introducing a second DTO tree or exposing SQLite connections.
 
+#[cfg(feature = "http-api")]
+pub mod api;
 mod controller;
 #[cfg(feature = "doh-tls")]
 mod doh_tls;
@@ -235,7 +237,7 @@ impl RuntimeBuilder {
     pub async fn build(&self) -> Result<RuntimeSnapshot> {
         let repository = self.store.repository();
         let nat = repository.get_nat_config_or_default("default").await?;
-        let hosts = repository.load_go_dns_hosts_table().await?;
+        let hosts = load_hosts(&repository, &self.store).await?;
         let resolvers = repository.list_go_resolver_runtime_configs().await?;
         let route = repository.load_go_route_runtime_config().await?;
         let route_rules = repository.list_go_route_rules().await?;
@@ -247,7 +249,10 @@ impl RuntimeBuilder {
             .transpose()?
             .map(|database| Arc::new(database) as Arc<dyn GeoLookup>);
 
-        let fakeip_config = repository.load_go_fakeip_runtime_config().await?;
+        let fakeip_config = match repository.load_go_fakeip_runtime_config().await? {
+            Some(config) => Some(config),
+            None => load_fakeip_config(&self.store).await?,
+        };
         let fakeip = match fakeip_config {
             Some(config) if config.enabled => {
                 let options = self.options.fakeip_options;
@@ -350,6 +355,74 @@ fn wrap_resolver(
         None => upstream,
     };
     Arc::new(AsyncHostsResolver::new(hosts.clone(), upstream))
+}
+
+async fn load_hosts(
+    repository: &yuhaiin_store::ConfigRepository,
+    store: &ConfigStore,
+) -> Result<HostsTable> {
+    let persisted = repository.list_go_dns_hosts().await?;
+    if !persisted.is_empty() {
+        return repository.load_go_dns_hosts_table().await;
+    }
+    let hosts = HostsTable::new();
+    let Some(bytes) = store.get_config("resolver.hosts").await? else {
+        return Ok(hosts);
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("resolver.hosts is invalid JSON: {error}"),
+        )
+    })?;
+    let object = value
+        .get("hosts")
+        .and_then(serde_json::Value::as_object)
+        .or_else(|| value.as_object())
+        .ok_or_else(|| Error::invalid("resolver.hosts must be a JSON object"))?;
+    for (host, target) in object {
+        let Some(target) = target.as_str() else {
+            return Err(Error::invalid("resolver.hosts targets must be strings"));
+        };
+        hosts.insert_target(yuhaiin_core::DomainName::new(host)?, target)?;
+    }
+    Ok(hosts)
+}
+
+async fn load_fakeip_config(
+    store: &ConfigStore,
+) -> Result<Option<yuhaiin_store::GoFakeIpRuntimeConfig>> {
+    let Some(bytes) = store.get_config("resolver.fakedns").await? else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("resolver.fakedns is invalid JSON: {error}"),
+        )
+    })?;
+    let enabled = value
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let ipv4_range = value
+        .get("ipv4Range")
+        .or_else(|| value.get("ipv4_range"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("198.18.0.0/15");
+    let ipv6_range = value
+        .get("ipv6Range")
+        .or_else(|| value.get("ipv6_range"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("fc00::/18");
+    let record = yuhaiin_store::GoDnsSettingsRecord {
+        id: 0,
+        server: String::new(),
+        fakedns_enabled: enabled,
+        fakedns_ipv4_range: ipv4_range.to_owned(),
+        fakedns_ipv6_range: ipv6_range.to_owned(),
+    };
+    record.to_fakeip_runtime_config().map(Some)
 }
 
 #[cfg(test)]

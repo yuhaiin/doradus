@@ -5,23 +5,30 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default = ["http-api", "tun", "tun-routes", "doh-tls"]
+http-api = ["dep:axum", "dep:tower-http", "tokio/signal", "tokio/rt-multi-thread"]
 http2 = ["dep:http", "yuhaiin-core/http2"]
 tun = ["yuhaiin-core/tun"]
+tun-routes = ["tun", "yuhaiin-core/tun-routes"]
 doh-tls = [
     "http2",
     "dep:rustls",
     "dep:rustls-rustcrypto",
     "dep:tokio-rustls",
     "yuhaiin-core/tls-rustcrypto",
+    "dep:webpki-roots",
 ]
 
 [dependencies]
 serde_json = "1.0.149"
+serde = { version = "1.0.228", features = ["derive"] }
+axum = { version = "0.8.4", default-features = false, features = ["http1", "json", "query", "tokio"], optional = true }
+tower-http = { version = "0.6.6", default-features = false, features = ["cors"], optional = true }
 http = { version = "1.5.0", optional = true }
 rustls = { version = "0.23.41", optional = true, default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = { version = "0.0.2-alpha", optional = true, default-features = false, features = ["std", "tls12", "zeroize"] }
 tokio = { version = "1.50.0", default-features = false, features = ["io-util", "net", "rt", "sync", "time"] }
+webpki-roots = { version = "1.0.3", optional = true }
 tokio-rustls = { version = "0.26.4", optional = true, default-features = false, features = ["tls12"] }
 yuhaiin-chain = { path = "../yuhaiin-chain" }
 yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
@@ -31,7 +38,13 @@ yuhaiin-trie = { path = "../yuhaiin-trie", features = ["async-proxy"] }
 [lints]
 workspace = true
 
+[[bin]]
+name = "yuhaiin"
+path = "src/bin/yuhaiin.rs"
+required-features = ["http-api"]
+
 [dev-dependencies]
 bytes = "1.12.1"
 h2 = "0.4.15"
 rustls-pemfile = "2.2.0"
+tower = { version = "0.5.2", features = ["util"] }

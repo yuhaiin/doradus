@@ -7,7 +7,7 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
-> 当前实现快照：第一批可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store` 和 `yuhaiin-runtime` 五个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责应用层组装和原子 reload，不新增 HTTP DTO，也不把平台权限细节泄漏到上层。
+> 当前实现快照：可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store` 和 `yuhaiin-runtime` 五个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责应用层组装和原子 reload，`yuhaiin-runtime::api` 提供与现有 `yuhaiin-react` client 对齐的管理面，`src/bin/yuhaiin.rs` 提供可直接运行的服务进程。HTTP 层复用 Go compatibility records，不新增一套配置 DTO，也不把平台权限细节泄漏到上层。
 
 > 已实现的代码包括：SQLite 配置事务与 schema v3 typed repository、Go v6 fixture/import/字段差异报告、FakeIP IPv4/IPv6 分配/持久化/旧 snapshot 幂等导入与 A/AAAA/PTR/HTTPS/SVCB hint answer transform、域名/CIDR/Geo country Router snapshot publish/rollback、带 TTL/容量淘汰的 DNS cache、同步/异步 UDP DNS client/server/policy/cancellation boundary、DoH transport boundary、注入 connector 的 HTTP/2 DoH framing、可直接接入异步 DNS/TUN packet pipeline 的 `H2DohDnsHandler`、可复用的 RustCrypto TCP→TLS→ALPN h2 DoH connector 和 DoT TCP framing resolver、同时组装 System/UDP/TCP/DoH/DoT 的 `RustCryptoResolverFactory`、hosts→upstream→FakeIP 的可注入异步 resolver stack、`yuhaiin-runtime` 的 Go compatibility snapshot 组装与 direct/HTTP/SOCKS5/chain proxy 构造、direct/fixed/drop/HTTP CONNECT/SOCKS5、feature-gated `rustls-rustcrypto` TLS client、Yuubinsya native UDP client/server socket、UOT/TCP/coalesce/Ping client/server session、full-cone NAT UDP relay、MaxMindDB reader、唯一的 `tun-rs AsyncDevice + smoltcp` TUN adapter，以及独立的 `yuhaiin-chain`（fixedv2 → TLS → HTTP/2 pool/CONNECT → Yuubinsya TCP/UOT/Ping）。TLS provider 仍是 alpha，DoQ/DoH3 和特权 Linux namespace/Android/macOS 验收仍是独立门槛，未用 C TLS 代替。
 
@@ -32,7 +32,7 @@ Rust 版本的第一阶段必须能够独立提供以下能力，并且可以逐
 
 - DoQ、DoH3：保留 transport trait 和 feature 位置，等纯 Rust TLS/QUIC 后端经过审计后再实现。
 - 透明代理、iptables/nftables、完整进程识别和所有平台网络配置的自动化细节；TUN 先完成 Linux/Android 主路径，再扩展平台。
-- UI、HTTP API、订阅系统；但 SQLite 配置库属于本次基础设施范围，不能省略。
+- 完整复刻 Go UI、订阅系统、连接历史和所有高级协议；第一版必须提供可供现有前端使用的核心管理 HTTP API，但高级 endpoint 可以明确返回未实现错误。
 - 为了“看起来完整”而先加入大量协议。未经过互操作测试的协议不应进入默认 feature。
 
 ### 1.3 完成定义
@@ -42,6 +42,7 @@ Rust 版本的第一阶段必须能够独立提供以下能力，并且可以逐
 - 有与 Go 行为对应的 trait/API 和错误语义，而不是只实现 happy path。
 - 有纯本地单元测试、边界测试、并发测试；协议 parser 有 property/fuzz 测试。
 - 有 Go/Rust 互操作测试，至少覆盖当前 yuhaiin 的 client/server 一端对另一端。
+- 有可直接启动的 Rust 服务进程：SQLite 配置、管理 HTTP API、runtime reload，以及 Linux 上的单一路径 TUN 数据面能够组合运行。
 - 有关闭、超时、取消、半关闭、重连和资源回收测试。
 - `cargo tree` 中没有未经批准的 C/C++/系统库绑定；SQLite 的 `libsqlite3-sys` 仅作为已批准的 bundled backend 例外，默认 feature 仍不启用 `native-tls`、OpenSSL、`ring` 或 `aws-lc-sys`。
 - 失败时能区分：输入错误、超时、远端拒绝、连接关闭、取消、资源耗尽和内部错误。
@@ -725,6 +726,37 @@ YUHAIIN_CHAIN_PROBE=1 \
 ```
 
 这里的 `CONFIG.json` 只作为用户外部配置读取，密码和 CA 不复制进仓库。当前 `concurrency` 同时限制 bounded CONNECT pipe 容量；Rust 版已经有按 fixed endpoint 的 HTTP/2 pool、多 stream 复用、有 owner flush task 的有界 UOT coalesced writer、application-level drain、peer GOAWAY 观察和连接重建，且已有优雅 drain/session rollover 验收。由于 `h2 0.4` 的公开 client API 不提供主动发送 GOAWAY frame，Rust 版接受将 client-side GOAWAY 作为非阻塞延期，不调用私有 API 或引入 raw frame hack；当前关闭策略已满足使用需求，未来只有升级到公开支持该能力的 h2 API 才重新评估主动 GOAWAY。
+
+## 7.7 第一版管理 HTTP 与服务进程
+
+### 7.7.1 与 yuhaiin-react 的真实调用方式
+
+现有前端的 `requestJSON` 会把 REST 风格调用转换成扁平 JSON body，并发送：
+
+```text
+POST /api/v2/rpc/<operation>
+Content-Type: application/json
+```
+
+Rust 版管理面位于 `yuhaiin-runtime::api`，不要求前端改写。第一版已覆盖：
+
+- `nodes.*` / `node.*`：作为 outbound/node 管理，保存 Go `nodes_v2` 兼容行；
+- `inbounds.*`：保存并回读 Go `inbounds_v2` 原始 JSON，当前数据面优先使用 TUN；
+- `resolvers.*`、`resolver.hosts.*`、`resolver.fakedns.*`、`resolver.server.*`：UDP/TCP/System 和可选 RustCrypto DoH/DoT registry；
+- `route.config.*`、`route.lists.*`、`route.rules.*`、`route.tags.*`：规则/列表原文持久化，常见 domain/CIDR/host-list 表达式编译到当前 Router；
+- `settings.*`、`tun.config.*`、`info`：管理进程和数据面启动配置。
+
+列表响应保持 `{items, page: {page, pageSize, total}}`，记录的未知字段保留在 store 的 `data_json`，secret 脱敏和完整 Go 高级协议属于后续兼容范围。每个写操作先提交 SQLite，再由 `RuntimeController::mutate_and_reload` 串行重建；重建失败时旧 snapshot 继续服务，并通过错误响应告知前端。
+
+### 7.7.2 可运行 binary
+
+```bash
+cargo run -p yuhaiin-runtime --bin yuhaiin --all-features
+```
+
+默认监听 `127.0.0.1:18080`，数据库使用 `$XDG_DATA_HOME/yuhaiin-rust/state.sqlite`，没有 `XDG_DATA_HOME` 时使用 `~/.local/share/yuhaiin-rust/state.sqlite`。`YUHAIIN_HTTP` 和 `YUHAIIN_DB` 可覆盖这两个值；测试和迁移临时文件放在 `~/.cache`，不使用 `/tmp`。
+
+设置 `YUHAIIN_TUN=1` 或写入 `tun.runtime.enabled=true` 后，进程启动单一路径 `tun-rs AsyncDevice + smoltcp`，从同一个 runtime snapshot 组装 selector、Full Cone NAT 和 DNS handler。TUN 的 `ipv4` 可写成 `10.0.0.1/24` 或 `{address,prefix}`；第一版默认 MTU 1500、单队列、有界 channel。系统权限、route 和设备创建失败会 fail-closed，不能把失败降级成 direct。
 
 ## 8. Proxy 迁移顺序与契约
 

@@ -2,7 +2,7 @@
 
 这份清单和 `MIGRATION.md` 配套使用。`[x]` 只表示该项已经有代码和自动化测试；`[~]` 表示设计已经确定但尚未完成实现；`[ ]` 表示尚未开始或仍有未解决的验收项。
 
-更新时间：2026-08-08
+更新时间：2026-08-09
 
 ## 当前进度
 
@@ -21,6 +21,7 @@
 - [~] MaxMindDB 查询（reader、坏库错误、IPv4-mapped IPv6 归一化、共享只读句柄和 `GeoLookup` route boundary 已接入，`RuntimeBuilder/RuntimeSnapshot` 已按 store metadata 加载 reader 并注入 route snapshot）；真实 GeoLite fixture、下载校验、并发 reader 热替换和重启恢复仍待补
 - [x] Linux namespace/容器网络验收（TUN 创建、sysfs 存在、真实 ICMP ingress、smoltcp ICMP socket、软件 checksum 和 kernel ping echo 已通过）
 - [ ] Android/macOS 平台构建和权限验收
+- [x] 第一版管理面与可执行服务：`yuhaiin-runtime` 提供与 `yuhaiin-react` 现有 client 对齐的 `/api/v2/rpc/<operation>`，可管理 nodes/outbounds、inbounds、resolvers、hosts/FakeDNS、route config/lists/rules/tags、settings 和 TUN 配置；`yuhaiin` binary 负责 SQLite、runtime reload、HTTP listener、可选 DNS UDP server 和 `tun-rs + smoltcp` 数据面启动
 
 ## 未完成项与下一阶段计划
 
@@ -48,6 +49,8 @@
 | P2-GEO | P2 | MaxMindDB 生产链路 | reader、坏库、IPv4-mapped IPv6 和 Router country rule 已有；仍需固定版本 GeoLite/官方 test fixture、下载长度与 hash 校验、atomic replace、并发热替换、旧 reader 生命周期和重启恢复。 |
 | P2-SOAK | P2 | 性能、内存、电量与长稳基线 | 仍需 Go/Rust 同场景吞吐、延迟、RSS、分配、wakeups、FakeIP/SQLite 增长、Android 电量和长时间 soak 报告；在报告前不宣称 Rust 性能收益。 |
 | P2-AUDIT | P2 | 安全、依赖与发布审计 | 仍需 TLS provider 互操作/证书验证、依赖 license、纯 Rust/C binding、日志脱敏、release profile、交叉编译和 reproducible build 审计。 |
+| P2-API | P2 | 管理 HTTP 与前端对接 | 已完成第一版：真实前端 `requestJSON` 使用的 RPC operation 已覆盖 outbound/node、inbound、resolver、hosts/FakeDNS、route config/list/rule/tag、settings 和 TUN config；共享 Go compatibility record 保存未知字段，写入后统一事务 reload，失败保留旧 snapshot。已通过 API 单测和真实 binary + curl 回归。 |
+| P2-BINARY | P2 | 可直接运行的服务进程 | 已完成：`cargo run -p yuhaiin-runtime --bin yuhaiin --all-features` 可启动 HTTP 服务；默认数据库在 `$XDG_DATA_HOME/yuhaiin-rust/state.sqlite` 或 `~/.local/share/yuhaiin-rust/state.sqlite`，测试临时数据使用 `~/.cache`，不使用 `/tmp`；`YUHAIIN_TUN=1` 启用 TUN，`YUHAIIN_HTTP`/`YUHAIIN_DB` 可覆盖监听和数据库路径。 |
 
 ### 未完成事项的可执行 checklist
 
@@ -94,9 +97,11 @@ P1 的明确边界：Full Cone NAT、rusqlite bundled 后端、真实 Go v5 FTS-
 
 #### P2 Linux / 平台
 
-- [ ] **P2-LINUX-01：** 验收 MTU、IPv4/IPv6 fragment 和超 MTU packet 行为。
-- [ ] **P2-LINUX-02：** 验收 TUN/route 设备被外部删除、network namespace teardown 和 post-up 失败时的反向清理。
-- [ ] **P2-LINUX-03：** 探测并验收多队列能力；若平台不支持，必须有明确的降级结果和测试记录。
+第一版 lite 的主线验收以 Linux `tun-rs + smoltcp` 单队列路径为准；Android/macOS 和极端设备行为是同一数据面的后续平台验收，不阻塞当前 Linux 服务进程和前端管理闭环。
+
+- [~] **P2-LINUX-01：** 第一版使用 `TunConfig::mtu` 严格校验并由 tun-rs 配置设备；MTU/fragment 的真实设备矩阵仍需目标环境补测。
+- [~] **P2-LINUX-02：** route lease、启动失败 rollback、设备消失和 namespace 基础路径已有测试；外部删除/极端 teardown 矩阵仍需目标环境补测。
+- [~] **P2-LINUX-03：** 第一版明确使用单队列，`queue_capacity` 有界并可配置；多队列能力探测保留为后续优化。
 - [ ] **P2-ANDROID-01：** 构建 Android target，接入 `VpnService` fd，验证权限、MTU、IPv4/IPv6 route、前后台切换和重启。
 - [ ] **P2-ANDROID-02：** 验收 Android 强制终止恢复、fd/数据库锁清理，并完成最小 JNI/FFI 边界审计。
 - [ ] **P2-MACOS-01：** 接入 utun fd、系统 route、权限/签名和启动/卸载生命周期。
@@ -110,6 +115,14 @@ P1 的明确边界：Full Cone NAT、rusqlite bundled 后端、真实 Go v5 FTS-
 - [ ] **P2-SOAK-02：** 在真实 Android 设备上补电量、后台存活、前后台切换和长时间运行报告；在报告前不宣称 Rust 性能或省电收益。
 - [ ] **P2-AUDIT-01：** 审计 TLS provider 互操作、密码套件、证书验证、日志脱敏和凭据/token 泄漏风险。
 - [ ] **P2-AUDIT-02：** 审计依赖 license、纯 Rust/C binding、release profile、交叉编译和 reproducible build，并保存锁文件对应结果。
+
+#### P2 管理面与服务进程验收
+
+- [x] **P2-API-01：** `POST /api/v2/rpc/nodes.post|get`、`resolvers.post|get`、`route.rules.post|get`、`resolver.hosts.put|get` 和 `route.config.put|get` 与前端扁平 JSON request body 兼容。
+- [x] **P2-API-02：** API 写入统一经过 SQLite typed compatibility table/config key 和 `RuntimeController::mutate_and_reload`；构建失败不替换旧 snapshot。
+- [x] **P2-API-03：** 节点、入站、resolver、route rule/list 原始 JSON 保存在兼容记录 `data_json`，未知字段不因 HTTP DTO 转换丢失；列表响应包含前端需要的 `items/page/pageSize/total`。
+- [x] **P2-BINARY-01：** `yuhaiin` binary 直接启动 HTTP listener；默认创建内置 direct node，支持 `YUHAIIN_DB`、`YUHAIIN_HTTP`、`YUHAIIN_TUN`，生命周期由 Ctrl-C/watch shutdown 收敛。
+- [x] **P2-BINARY-02：** 启用 TUN 时使用单一路径 `tun-rs AsyncDevice + smoltcp`，selector/NAT/DNS handler 来自同一个 runtime snapshot；可选 UDP DNS server 使用同一 resolver snapshot。
 
 #### 可选增强（不阻塞主线）
 
