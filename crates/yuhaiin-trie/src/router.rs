@@ -33,15 +33,29 @@ pub struct RouteRule {
     pub pattern: String,
     pub action: RuleAction,
     pub network: Option<Network>,
+    /// Negative network constraints from Go's `not` expression.
+    pub excluded_networks: Vec<Network>,
     pub port: Option<(u16, u16)>,
+    /// Negative port constraints from Go's `not` expression.
+    pub excluded_ports: Vec<(u16, u16)>,
     /// Optional MaxMind country code constraint for IP endpoints.
     pub geo_country: Option<String>,
+    /// Negative MaxMind country constraints from Go's `not` expression.
+    pub excluded_geo_countries: Vec<String>,
     /// Optional Go inbound-name matcher. Empty means that the rule is not
     /// constrained by the accepting inbound.
     pub inbound_names: Vec<String>,
+    /// Negative inbound-name constraints from Go's `not` expression.
+    pub excluded_inbound_names: Vec<String>,
     /// Optional Go process-list matcher. Empty means that the rule is not
     /// constrained by process metadata.
     pub process_names: Vec<String>,
+    /// Negative process-list constraints from Go's `not` expression.
+    pub excluded_process_names: Vec<String>,
+    /// Patterns compiled once at route publication time and excluded from
+    /// this rule. This keeps negative domain/CIDR matching on the same trie
+    /// implementation as positive routing.
+    pub excluded_patterns: CombinedTrie<()>,
     pub resolver_policy: ResolverPolicy,
     pub priority: i32,
 }
@@ -57,9 +71,19 @@ impl RouteRule {
         geo: Option<&dyn GeoLookup>,
         context: Option<&FlowContext>,
     ) -> bool {
+        if self.excluded_patterns.search(endpoint).is_some() {
+            return false;
+        }
         if self
             .network
             .is_some_and(|network| network != endpoint.network())
+        {
+            return false;
+        }
+        if self
+            .excluded_networks
+            .iter()
+            .any(|network| *network == endpoint.network())
         {
             return false;
         }
@@ -68,6 +92,15 @@ impl RouteRule {
                 return false;
             };
             if port < start || port > end {
+                return false;
+            }
+        }
+        if let Some(port) = endpoint.port() {
+            if self
+                .excluded_ports
+                .iter()
+                .any(|(start, end)| port >= *start && port <= *end)
+            {
                 return false;
             }
         }
@@ -83,6 +116,19 @@ impl RouteRule {
             };
             if !actual.eq_ignore_ascii_case(expected) {
                 return false;
+            }
+        }
+        if !self.excluded_geo_countries.is_empty() {
+            if let (Some(address), Some(geo)) = (endpoint.addr().map(|address| address.ip()), geo) {
+                if let Ok(Some(actual)) = geo.country_code(address) {
+                    if self
+                        .excluded_geo_countries
+                        .iter()
+                        .any(|expected| actual.eq_ignore_ascii_case(expected))
+                    {
+                        return false;
+                    }
+                }
             }
         }
         if !self.inbound_names.is_empty() {
@@ -106,6 +152,24 @@ impl RouteRule {
                 .as_deref()
                 .is_some_and(|process| self.process_names.iter().any(|name| name == process))
             {
+                return false;
+            }
+        }
+        if let Some(context) = context {
+            let inbound = context
+                .inbound_name
+                .as_deref()
+                .or(context.inbound.as_deref());
+            if inbound
+                .is_some_and(|value| self.excluded_inbound_names.iter().any(|name| name == value))
+            {
+                return false;
+            }
+            if context.process.as_deref().is_some_and(|process| {
+                self.excluded_process_names
+                    .iter()
+                    .any(|name| name == process)
+            }) {
                 return false;
             }
         }
@@ -373,10 +437,16 @@ mod tests {
             pattern: pattern.to_owned(),
             action,
             network: None,
+            excluded_networks: Vec::new(),
             port: None,
+            excluded_ports: Vec::new(),
             geo_country: None,
+            excluded_geo_countries: Vec::new(),
             inbound_names: Vec::new(),
+            excluded_inbound_names: Vec::new(),
             process_names: Vec::new(),
+            excluded_process_names: Vec::new(),
+            excluded_patterns: CombinedTrie::new(),
             resolver_policy: ResolverPolicy {
                 strategy: ResolveStrategy::Default,
                 use_fake_ip: action == RuleAction::Proxy,
@@ -428,6 +498,52 @@ mod tests {
         assert_eq!(router.decide(&endpoint).mode, RouteMode::Proxy);
         let other = Endpoint::ip(Network::Tcp, SocketAddr::from(([192, 0, 2, 1], 53)));
         assert_eq!(router.decide(&other).mode, RouteMode::Direct);
+    }
+
+    #[test]
+    fn router_applies_negative_pattern_network_port_and_context_constraints() {
+        let mut negative = rule("", RuleAction::Proxy, 10);
+        negative
+            .excluded_patterns
+            .insert("blocked.example", ())
+            .unwrap();
+        negative.excluded_networks.push(Network::Udp);
+        negative.excluded_ports.push((80, 80));
+        negative.excluded_inbound_names.push("http-main".to_owned());
+        negative.excluded_process_names.push("browser".to_owned());
+        let router = Router::compile(
+            vec![negative],
+            RouteDecision {
+                mode: RouteMode::Direct,
+                resolver_policy: ResolverPolicy::default(),
+                priority: 0,
+            },
+        )
+        .unwrap();
+        let allowed = Endpoint::domain(
+            Network::Tcp,
+            DomainName::new("allowed.example").unwrap(),
+            443,
+        );
+        let blocked_domain = Endpoint::domain(
+            Network::Tcp,
+            DomainName::new("www.blocked.example").unwrap(),
+            443,
+        );
+        assert_eq!(router.decide(&allowed).mode, RouteMode::Proxy);
+        assert_eq!(router.decide(&blocked_domain).mode, RouteMode::Direct);
+
+        let udp = Endpoint::ip(Network::Udp, "192.0.2.1:443".parse().unwrap());
+        let port = Endpoint::ip(Network::Tcp, "192.0.2.1:80".parse().unwrap());
+        assert_eq!(router.decide(&udp).mode, RouteMode::Direct);
+        assert_eq!(router.decide(&port).mode, RouteMode::Direct);
+
+        let mut context = FlowContext::new(allowed.clone());
+        context.inbound_name = Some("http-main".to_owned());
+        assert_eq!(router.decide_context(&context).mode, RouteMode::Direct);
+        context.inbound_name = Some("socks-main".to_owned());
+        context.process = Some("browser".to_owned());
+        assert_eq!(router.decide_context(&context).mode, RouteMode::Direct);
     }
 
     #[test]

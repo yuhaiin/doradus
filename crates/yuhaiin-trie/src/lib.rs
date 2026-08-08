@@ -7,7 +7,7 @@ use yuhaiin_core::{DomainName, Endpoint, Error, Result};
 
 pub mod router;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DomainNode<T> {
     value: Option<T>,
     children: BTreeMap<String, DomainNode<T>>,
@@ -25,7 +25,7 @@ impl<T> Default for DomainNode<T> {
 ///
 /// `*.example.com` is stored as a literal wildcard label and matches exactly
 /// one label. A normal parent rule continues to match subdomains.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainTrie<T> {
     root: DomainNode<T>,
 }
@@ -125,7 +125,7 @@ fn search_domain<'a, T>(
     exact_result.or(wildcard_result).or(best)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CidrNode<T> {
     value: Option<T>,
     zero: Option<Box<CidrNode<T>>>,
@@ -143,7 +143,7 @@ impl<T> Default for CidrNode<T> {
 }
 
 /// Longest-prefix-match trie supporting IPv4 and IPv6 independently.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CidrTrie<T> {
     v4: CidrNode<T>,
     v6: CidrNode<T>,
@@ -249,7 +249,7 @@ fn address_bits(address: IpAddr) -> impl Iterator<Item = bool> {
 }
 
 /// Combined lookup used by the router's rule compiler.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CombinedTrie<T> {
     pub domains: DomainTrie<T>,
     pub cidrs: CidrTrie<T>,

@@ -23,6 +23,7 @@ use yuhaiin_core::{
     ResolverPolicy, Result,
 };
 use yuhaiin_store::{GoRouteListRecord, GoRouteRuleRecord};
+use yuhaiin_trie::CombinedTrie;
 use yuhaiin_trie::router::{RouteDecision, RouteRule, Router, RouterRuntime, RuleAction};
 
 /// Runtime contents of Go route lists. The persisted record keeps the
@@ -730,18 +731,29 @@ pub fn expand_go_route_rule(
     }
     Ok(variants
         .into_iter()
-        .map(|variant| RouteRule {
-            pattern: variant.pattern.unwrap_or_default(),
-            action,
-            network: variant.network,
-            port: variant.port,
-            geo_country: variant.geo_country,
-            inbound_names: variant.inbound_names.unwrap_or_default(),
-            process_names: variant.process_names.unwrap_or_default(),
-            resolver_policy,
-            priority,
+        .map(|variant| {
+            Ok(RouteRule {
+                pattern: variant.pattern.unwrap_or_default(),
+                action,
+                network: variant.network,
+                excluded_networks: variant.excluded_networks,
+                port: variant.port,
+                excluded_ports: variant.excluded_ports,
+                geo_country: variant.geo_country,
+                excluded_geo_countries: variant.excluded_geo_countries,
+                inbound_names: variant.inbound_names.unwrap_or_default(),
+                excluded_inbound_names: variant.excluded_inbound_names.unwrap_or_default(),
+                process_names: variant.process_names.unwrap_or_default(),
+                excluded_process_names: variant.excluded_process_names.unwrap_or_default(),
+                excluded_patterns: compile_excluded_patterns(
+                    variant.excluded_patterns,
+                    record.id.as_str(),
+                )?,
+                resolver_policy,
+                priority,
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>>>()?)
 }
 
 fn route_rule_from_root(record: &GoRouteRuleRecord, root: &Value) -> Result<Option<RouteRule>> {
@@ -790,10 +802,16 @@ fn route_rule_from_root(record: &GoRouteRuleRecord, root: &Value) -> Result<Opti
         pattern,
         action,
         network,
+        excluded_networks: Vec::new(),
         port,
+        excluded_ports: Vec::new(),
         geo_country,
+        excluded_geo_countries: Vec::new(),
         inbound_names: inbound_names.unwrap_or_default(),
+        excluded_inbound_names: Vec::new(),
         process_names: process_names.unwrap_or_default(),
+        excluded_process_names: Vec::new(),
+        excluded_patterns: CombinedTrie::new(),
         resolver_policy,
         priority,
     }))
@@ -818,16 +836,31 @@ struct RuleVariant {
     /// global rule whose remaining network/port/geo predicates still apply.
     pattern: Option<String>,
     network: Option<Network>,
+    excluded_networks: Vec<Network>,
     port: Option<(u16, u16)>,
+    excluded_ports: Vec<(u16, u16)>,
     geo_country: Option<String>,
+    excluded_geo_countries: Vec<String>,
     inbound_names: Option<Vec<String>>,
+    excluded_inbound_names: Option<Vec<String>>,
     process_names: Option<Vec<String>>,
+    excluded_process_names: Option<Vec<String>>,
+    excluded_patterns: Vec<String>,
 }
 
 fn parse_rule_expression(
     value: &Value,
     lists: &RouteListSnapshot,
     id: &str,
+) -> Result<Vec<RuleVariant>> {
+    parse_rule_expression_inner(value, lists, id, false)
+}
+
+fn parse_rule_expression_inner(
+    value: &Value,
+    lists: &RouteListSnapshot,
+    id: &str,
+    negated: bool,
 ) -> Result<Vec<RuleVariant>> {
     let kind = value
         .get("type")
@@ -840,7 +873,14 @@ fn parse_rule_expression(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        return combine_all(&children, lists, id);
+        if negated {
+            let mut variants = Vec::new();
+            for child in children {
+                variants.extend(parse_rule_expression_inner(&child, lists, id, true)?);
+            }
+            return Ok(variants);
+        }
+        return combine_all(&children, lists, id, false);
     }
     if kind == "any" || value.get("any").is_some() {
         let children = value
@@ -848,17 +888,20 @@ fn parse_rule_expression(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        if negated {
+            return combine_all(&children, lists, id, true);
+        }
         let mut variants = Vec::new();
         for child in children {
-            variants.extend(parse_rule_expression(&child, lists, id)?);
+            variants.extend(parse_rule_expression_inner(&child, lists, id, false)?);
         }
         return Ok(variants);
     }
     if kind == "not" || value.get("not").is_some() {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            format!("route rule {id} has unsupported `not` expression"),
-        ));
+        let nested = value
+            .get("not")
+            .ok_or_else(|| unsupported_expression(id, "not expression value"))?;
+        return parse_rule_expression_inner(nested, lists, id, !negated);
     }
 
     match kind.as_str() {
@@ -867,13 +910,26 @@ fn parse_rule_expression(
             let name = string_field(host, &["list", "name"])
                 .ok_or_else(|| unsupported_expression(id, "host list name"))?;
             let patterns = lists.values(&name).unwrap_or_default();
-            Ok(patterns
-                .iter()
-                .map(|pattern| RuleVariant {
-                    pattern: Some(pattern.clone()),
+            if patterns.is_empty() {
+                // A missing/empty route list must not turn a negated matcher
+                // into an accidental global rule. Keep the same fail-closed
+                // behavior as the positive list expansion.
+                return Ok(Vec::new());
+            }
+            if negated {
+                Ok(vec![RuleVariant {
+                    excluded_patterns: patterns.to_vec(),
                     ..RuleVariant::default()
-                })
-                .collect())
+                }])
+            } else {
+                Ok(patterns
+                    .iter()
+                    .map(|pattern| RuleVariant {
+                        pattern: Some(pattern.clone()),
+                        ..RuleVariant::default()
+                    })
+                    .collect())
+            }
         }
         "network" => {
             let nested = value.get("network").unwrap_or(value);
@@ -881,9 +937,16 @@ fn parse_rule_expression(
                 string_field(nested, &["network", "protocol"]).as_deref(),
                 id,
             )?;
-            Ok(vec![RuleVariant {
-                network,
-                ..Default::default()
+            Ok(vec![if negated {
+                RuleVariant {
+                    excluded_networks: network.into_iter().collect(),
+                    ..Default::default()
+                }
+            } else {
+                RuleVariant {
+                    network,
+                    ..Default::default()
+                }
             }])
         }
         "port" => {
@@ -892,7 +955,18 @@ fn parse_rule_expression(
                 .get("ports")
                 .or_else(|| nested.get("port"))
                 .unwrap_or(nested);
-            parse_port_variants(value, id)
+            let variants = parse_port_variants(value, id)?;
+            if negated {
+                Ok(vec![RuleVariant {
+                    excluded_ports: variants
+                        .into_iter()
+                        .filter_map(|variant| variant.port)
+                        .collect(),
+                    ..Default::default()
+                }])
+            } else {
+                Ok(variants)
+            }
         }
         "geoip" => {
             let nested = value.get("geoip").unwrap_or(value);
@@ -911,13 +985,20 @@ fn parse_rule_expression(
             if countries.is_empty() {
                 return Err(unsupported_expression(id, "geoip countries"));
             }
-            Ok(countries
-                .into_iter()
-                .map(|country| RuleVariant {
-                    geo_country: Some(country),
+            if negated {
+                Ok(vec![RuleVariant {
+                    excluded_geo_countries: countries,
                     ..Default::default()
-                })
-                .collect())
+                }])
+            } else {
+                Ok(countries
+                    .into_iter()
+                    .map(|country| RuleVariant {
+                        geo_country: Some(country),
+                        ..Default::default()
+                    })
+                    .collect())
+            }
         }
         "inbound" => {
             let nested = value.get("inbound").unwrap_or(value);
@@ -940,9 +1021,16 @@ fn parse_rule_expression(
             if names.is_empty() {
                 return Ok(Vec::new());
             }
-            Ok(vec![RuleVariant {
-                inbound_names: Some(names),
-                ..Default::default()
+            Ok(vec![if negated {
+                RuleVariant {
+                    excluded_inbound_names: Some(names),
+                    ..Default::default()
+                }
+            } else {
+                RuleVariant {
+                    inbound_names: Some(names),
+                    ..Default::default()
+                }
             }])
         }
         "process" => {
@@ -955,17 +1043,31 @@ fn parse_rule_expression(
             if names.is_empty() {
                 return Ok(Vec::new());
             }
-            Ok(vec![RuleVariant {
-                process_names: Some(names),
-                ..Default::default()
+            Ok(vec![if negated {
+                RuleVariant {
+                    excluded_process_names: Some(names),
+                    ..Default::default()
+                }
+            } else {
+                RuleVariant {
+                    process_names: Some(names),
+                    ..Default::default()
+                }
             }])
         }
         "domain" | "cidr" | "ip" => {
             let pattern = string_field(value, &["domain", "host", "cidr", "ip", "pattern"])
                 .ok_or_else(|| unsupported_expression(id, "matcher pattern"))?;
-            Ok(vec![RuleVariant {
-                pattern: Some(pattern),
-                ..Default::default()
+            Ok(vec![if negated {
+                RuleVariant {
+                    excluded_patterns: vec![pattern],
+                    ..Default::default()
+                }
+            } else {
+                RuleVariant {
+                    pattern: Some(pattern),
+                    ..Default::default()
+                }
             }])
         }
         other => Err(unsupported_expression(
@@ -979,10 +1081,11 @@ fn combine_all(
     children: &[Value],
     lists: &RouteListSnapshot,
     id: &str,
+    child_negated: bool,
 ) -> Result<Vec<RuleVariant>> {
     let mut variants = vec![RuleVariant::default()];
     for child in children {
-        let child_variants = parse_rule_expression(child, lists, id)?;
+        let child_variants = parse_rule_expression_inner(child, lists, id, child_negated)?;
         let mut combined = Vec::new();
         for left in &variants {
             for right in &child_variants {
@@ -1018,6 +1121,28 @@ fn combine_all(
                         Some(names) => names,
                         None => continue,
                     };
+                let excluded_inbound_names = union_name_constraints(
+                    &left.excluded_inbound_names,
+                    &right.excluded_inbound_names,
+                );
+                let excluded_process_names = union_name_constraints(
+                    &left.excluded_process_names,
+                    &right.excluded_process_names,
+                );
+                let mut excluded_patterns = left.excluded_patterns.clone();
+                excluded_patterns.extend(right.excluded_patterns.iter().cloned());
+                let mut excluded_networks = left.excluded_networks.clone();
+                excluded_networks.extend(right.excluded_networks.iter().copied());
+                excluded_networks.sort_by_key(|network| *network as u8);
+                excluded_networks.dedup();
+                let mut excluded_ports = left.excluded_ports.clone();
+                excluded_ports.extend(right.excluded_ports.iter().copied());
+                excluded_ports.sort_unstable();
+                excluded_ports.dedup();
+                let mut excluded_geo_countries = left.excluded_geo_countries.clone();
+                excluded_geo_countries.extend(right.excluded_geo_countries.iter().cloned());
+                excluded_geo_countries.sort_unstable_by_key(|country| country.to_ascii_lowercase());
+                excluded_geo_countries.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
                 combined.push(RuleVariant {
                     pattern: left.pattern.clone().or_else(|| right.pattern.clone()),
                     network,
@@ -1025,12 +1150,42 @@ fn combine_all(
                     geo_country,
                     inbound_names,
                     process_names,
+                    excluded_networks,
+                    excluded_ports,
+                    excluded_geo_countries,
+                    excluded_inbound_names,
+                    excluded_process_names,
+                    excluded_patterns,
                 });
             }
         }
         variants = combined;
     }
     Ok(variants)
+}
+
+fn union_name_constraints(
+    left: &Option<Vec<String>>,
+    right: &Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    let mut values = left.clone().unwrap_or_default();
+    values.extend(right.clone().unwrap_or_default());
+    values.sort();
+    values.dedup();
+    (!values.is_empty()).then_some(values)
+}
+
+fn compile_excluded_patterns(patterns: Vec<String>, id: &str) -> Result<CombinedTrie<()>> {
+    let mut index = CombinedTrie::new();
+    for pattern in patterns {
+        index.insert(pattern.as_str(), ()).map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("route rule {id} has invalid excluded pattern {pattern:?}: {error}"),
+            )
+        })?;
+    }
+    Ok(index)
 }
 
 /// `Some(None)` means no constraint, `Some(Some(values))` means a constraint,
@@ -1511,6 +1666,65 @@ mod tests {
                 .unwrap()
                 .contains(&"example.com".to_owned())
         );
+    }
+
+    #[test]
+    fn not_domain_expression_compiles_to_an_exclusion_trie() {
+        let router = compile_go_route_rules_with_lists(
+            &[record(
+                r#"{"mode":"drop","rules":[{"type":"not","not":{"type":"domain","domain":"blocked.example"}}]}"#,
+                "drop",
+                "all",
+            )],
+            &RouteListSnapshot::default(),
+            RouteDecision {
+                mode: yuhaiin_core::RouteMode::Direct,
+                resolver_policy: ResolverPolicy::default(),
+                priority: 100,
+            },
+            None,
+        )
+        .unwrap();
+        let blocked = Endpoint::domain(
+            Network::Tcp,
+            yuhaiin_core::DomainName::new("www.blocked.example").unwrap(),
+            443,
+        );
+        let allowed = Endpoint::domain(
+            Network::Tcp,
+            yuhaiin_core::DomainName::new("other.example").unwrap(),
+            443,
+        );
+        assert_eq!(
+            router.decide(&blocked).mode,
+            yuhaiin_core::RouteMode::Direct
+        );
+        assert_eq!(router.decide(&allowed).mode, yuhaiin_core::RouteMode::Block);
+    }
+
+    #[test]
+    fn not_any_uses_demorgan_and_preserves_network_and_port_constraints() {
+        let router = compile_go_route_rules_with_lists(
+            &[record(
+                r#"{"mode":"drop","rules":[{"type":"not","not":{"type":"any","any":[{"type":"network","network":{"network":"udp"}},{"type":"port","port":{"ports":[53]}}]}}]}"#,
+                "drop",
+                "all",
+            )],
+            &RouteListSnapshot::default(),
+            RouteDecision {
+                mode: yuhaiin_core::RouteMode::Direct,
+                resolver_policy: ResolverPolicy::default(),
+                priority: 100,
+            },
+            None,
+        )
+        .unwrap();
+        let tcp_80 = Endpoint::ip(Network::Tcp, "192.0.2.1:80".parse().unwrap());
+        let tcp_53 = Endpoint::ip(Network::Tcp, "192.0.2.1:53".parse().unwrap());
+        let udp_80 = Endpoint::ip(Network::Udp, "192.0.2.1:80".parse().unwrap());
+        assert_eq!(router.decide(&tcp_80).mode, yuhaiin_core::RouteMode::Block);
+        assert_eq!(router.decide(&tcp_53).mode, yuhaiin_core::RouteMode::Direct);
+        assert_eq!(router.decide(&udp_80).mode, yuhaiin_core::RouteMode::Direct);
     }
 
     #[test]
