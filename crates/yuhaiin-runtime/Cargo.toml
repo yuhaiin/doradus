@@ -52,4 +52,5 @@ required-features = ["http-api"]
 
 [dev-dependencies]
 h2 = "0.4.15"
+http-body-util = "0.1.4"
 tower = { version = "0.5.2", features = ["util"] }

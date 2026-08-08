@@ -2949,6 +2949,7 @@ dependencies = [
  "bytes",
  "h2",
  "http",
+ "http-body-util",
  "rustls",
  "rustls-pemfile",
  "rustls-rustcrypto",

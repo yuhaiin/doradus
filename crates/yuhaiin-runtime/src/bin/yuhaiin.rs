@@ -136,16 +136,17 @@ async fn run() -> Result<()> {
         .await
         .map_err(|error| Error::new(ErrorKind::Io, format!("HTTP API task: {error}")))?;
     let _ = shutdown_tx.send(true);
+    let logs = controller.monitor().logs();
 
     #[cfg(feature = "tun")]
     if let Err(error) = tun_task.await.map_err(join_error)? {
-        eprintln!("TUN task stopped: {error}");
+        logs.error(format!("TUN task stopped: {error}"));
     }
     if let Err(error) = dns_task.await.map_err(join_error)? {
-        eprintln!("DNS task stopped: {error}");
+        logs.error(format!("DNS task stopped: {error}"));
     }
     if let Err(error) = inbound_task.await.map_err(join_error)? {
-        eprintln!("inbound task stopped: {error}");
+        logs.error(format!("inbound task stopped: {error}"));
     }
     if let Some(source) = controller.take_restore_request() {
         restore_database(source, &database).await?;

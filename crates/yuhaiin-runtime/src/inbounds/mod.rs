@@ -133,7 +133,7 @@ async fn start_listeners(
         let mut spec = match InboundSpec::from_record(record.clone()) {
             Ok(spec) => spec,
             Err(error) => {
-                eprintln!("skip inbound: {error}");
+                monitor.error(format!("skip inbound: {error}"));
                 continue;
             }
         };
@@ -145,25 +145,25 @@ async fn start_listeners(
                     && !transport.eq_ignore_ascii_case("http2")
             })
         {
-            eprintln!(
+            monitor.warn(format!(
                 "skip inbound {}: configured transport is not implemented",
                 spec.id
-            );
+            ));
             continue;
         }
         let tls_acceptor = match build_inbound_tls_acceptor(&record.data_json, &spec.transports) {
             Ok(acceptor) => acceptor,
             Err(error) => {
-                eprintln!("skip inbound {}: {error}", spec.id);
+                monitor.error(format!("skip inbound {}: {error}", spec.id));
                 continue;
             }
         };
         if has_transport(&spec.transports, "http2") {
             if spec.udp_mode.udp_enabled() {
-                eprintln!(
+                monitor.warn(format!(
                     "skip UDP inbound {}: HTTP/2 transport only wraps TCP listeners",
                     spec.id
-                );
+                ));
             }
             if spec.udp_mode.tcp_enabled() {
                 let listener = TcpListener::bind(spec.listen).await.map_err(|error| {
@@ -173,18 +173,19 @@ async fn start_listeners(
                 let monitor = monitor.clone();
                 let spec = spec.clone();
                 let tls_acceptor = tls_acceptor.clone();
+                let logs = monitor.logs();
                 #[cfg(feature = "http2")]
                 listeners.push(tokio::spawn(async move {
                     if let Err(error) =
                         serve_h2_listener(listener, spec, selector, monitor, tls_acceptor).await
                     {
-                        eprintln!("HTTP/2 inbound listener stopped: {error}");
+                        logs.error(format!("HTTP/2 inbound listener stopped: {error}"));
                     }
                 }));
                 #[cfg(not(feature = "http2"))]
                 {
                     let _ = (listener, spec, selector, monitor, tls_acceptor);
-                    eprintln!("skip inbound: HTTP/2 transport requires the http2 feature");
+                    logs.warn("skip inbound: HTTP/2 transport requires the http2 feature");
                 }
             }
             continue;
@@ -197,11 +198,12 @@ async fn start_listeners(
             let monitor = monitor.clone();
             let spec = spec.clone();
             let tls_acceptor = tls_acceptor.clone();
+            let logs = monitor.logs();
             listeners.push(tokio::spawn(async move {
                 if let Err(error) =
                     serve_listener(listener, spec, selector, monitor, tls_acceptor).await
                 {
-                    eprintln!("inbound listener stopped: {error}");
+                    logs.error(format!("inbound listener stopped: {error}"));
                 }
             }));
         }
@@ -212,10 +214,10 @@ async fn start_listeners(
             match spec.protocol.as_str() {
                 "yuubinsya" => {
                     if tls_acceptor.is_some() {
-                        eprintln!(
+                        monitor.warn(format!(
                             "skip UDP inbound {}: TLS transport only wraps TCP listeners",
                             spec.id
-                        );
+                        ));
                         continue;
                     }
                     let socket = yuhaiin_core::proxy::YuubinsyaUdpServer::bind(
@@ -224,21 +226,22 @@ async fn start_listeners(
                         true,
                     )
                     .await?;
+                    let logs = monitor.logs();
                     listeners.push(tokio::spawn(async move {
                         if let Err(error) =
                             crate::proxy::yuubinsya::serve_udp(socket, spec, selector, monitor)
                                 .await
                         {
-                            eprintln!("Yuubinsya UDP listener stopped: {error}");
+                            logs.error(format!("Yuubinsya UDP listener stopped: {error}"));
                         }
                     }));
                 }
                 "socks5" if spec.protocol_udp => {
                     if tls_acceptor.is_some() {
-                        eprintln!(
+                        monitor.warn(format!(
                             "skip UDP inbound {}: TLS transport only wraps TCP listeners",
                             spec.id
-                        );
+                        ));
                         continue;
                     }
                     let socket = UdpSocket::bind(spec.listen).await.map_err(|error| {
@@ -247,19 +250,20 @@ async fn start_listeners(
                             format!("bind SOCKS5 UDP inbound {}: {error}", spec.id),
                         )
                     })?;
+                    let logs = monitor.logs();
                     listeners.push(tokio::spawn(async move {
                         if let Err(error) =
                             crate::proxy::socks5::serve_udp_socket(socket, spec, selector, monitor)
                                 .await
                         {
-                            eprintln!("SOCKS5 UDP listener stopped: {error}");
+                            logs.error(format!("SOCKS5 UDP listener stopped: {error}"));
                         }
                     }));
                 }
-                _ => eprintln!(
+                _ => monitor.warn(format!(
                     "skip UDP inbound {}: protocol {:?} has no UDP mode",
                     spec.id, spec.protocol
-                ),
+                )),
             }
         }
     }
@@ -563,6 +567,7 @@ async fn serve_h2_listener(
                 let selector = selector.clone();
                 let monitor = monitor.clone();
                 let tls_acceptor = tls_acceptor.clone();
+                let logs = monitor.logs();
                 connections.spawn(async move {
                     let result: Result<()> = if let Some(acceptor) = tls_acceptor {
                         #[cfg(feature = "doh-tls")]
@@ -593,7 +598,7 @@ async fn serve_h2_listener(
                         serve_h2_connection(stream, peer, spec, selector, monitor).await
                     };
                     if let Err(error) = result {
-                        eprintln!("HTTP/2 inbound connection error: {error}");
+                        logs.error(format!("HTTP/2 inbound connection error: {error}"));
                     }
                 });
             }
@@ -643,8 +648,8 @@ where
             }
             Some(result) = streams.join_next(), if !streams.is_empty() => {
                 match result {
-                    Ok(Err(error)) => eprintln!("HTTP/2 inbound stream error: {error}"),
-                    Err(error) => eprintln!("HTTP/2 inbound stream task panicked: {error}"),
+                    Ok(Err(error)) => monitor.error(format!("HTTP/2 inbound stream error: {error}")),
+                    Err(error) => monitor.error(format!("HTTP/2 inbound stream task panicked: {error}")),
                     Ok(Ok(())) => {}
                 }
             }
@@ -775,6 +780,7 @@ async fn serve_listener(
         let spec = spec.clone();
         let protocol = protocol.clone();
         let tls_acceptor = tls_acceptor.clone();
+        let logs = monitor.logs();
         tokio::spawn(async move {
             #[cfg(feature = "doh-tls")]
             let result = if let Some(acceptor) = tls_acceptor {
@@ -796,7 +802,7 @@ async fn serve_listener(
                 serve_connection(stream, peer, protocol, spec, selector, monitor).await
             };
             if let Err(error) = result {
-                eprintln!("inbound connection error: {error}");
+                logs.error(format!("inbound connection error: {error}"));
             }
         });
     }

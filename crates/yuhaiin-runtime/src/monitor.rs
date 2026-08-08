@@ -19,6 +19,8 @@ use yuhaiin_core::tun::{TunFlow, TunFlowDirection, TunFlowKey, TunFlowObserver};
 use yuhaiin_core::{Endpoint, FlowContext, RouteMode};
 use yuhaiin_store::ConfigStore;
 
+use crate::RuntimeLog;
+
 const HISTORY_LIMIT: usize = 2048;
 const BUCKET_LIMIT: usize = 90 * 24 * 60;
 const PERSISTENCE_KEY: &str = "statistics.runtime";
@@ -62,6 +64,7 @@ struct MonitorState {
     telemetry: BTreeMap<(String, String), (u64, u64, u64)>,
     history: Vec<Value>,
     failed_history: BTreeMap<(String, String, String), FailedEntry>,
+    block_history: BTreeMap<(String, String, String), BlockEntry>,
     close_requests: Vec<TunFlowKey>,
 }
 
@@ -71,6 +74,15 @@ struct FailedEntry {
     host: String,
     process: String,
     error: String,
+    time: i64,
+    count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BlockEntry {
+    protocol: String,
+    host: String,
+    process: String,
     time: i64,
     count: u64,
 }
@@ -95,12 +107,15 @@ struct PersistedMonitor {
     telemetry: Vec<PersistedTelemetry>,
     history: Vec<Value>,
     failed_history: Vec<FailedEntry>,
+    #[serde(default)]
+    block_history: Vec<BlockEntry>,
 }
 
 #[derive(Clone)]
 pub struct ConnectionMonitor {
     state: Arc<Mutex<MonitorState>>,
     events: broadcast::Sender<MonitorEvent>,
+    logs: RuntimeLog,
     persistence: Option<Arc<Notify>>,
 }
 
@@ -116,6 +131,7 @@ impl ConnectionMonitor {
         Self {
             state: Arc::new(Mutex::new(MonitorState::default())),
             events,
+            logs: RuntimeLog::new(),
             persistence: None,
         }
     }
@@ -164,6 +180,22 @@ impl ConnectionMonitor {
 
     pub fn subscribe(&self) -> broadcast::Receiver<MonitorEvent> {
         self.events.subscribe()
+    }
+
+    pub fn logs(&self) -> RuntimeLog {
+        self.logs.clone()
+    }
+
+    pub fn info(&self, message: impl AsRef<str>) {
+        self.logs.info(message);
+    }
+
+    pub fn warn(&self, message: impl AsRef<str>) {
+        self.logs.warn(message);
+    }
+
+    pub fn error(&self, message: impl AsRef<str>) {
+        self.logs.error(message);
     }
 
     pub fn connections_value(&self) -> Value {
@@ -309,11 +341,61 @@ impl ConnectionMonitor {
         json!({"items": state.history, "dumpProcessEnabled": false})
     }
 
+    pub fn block_history_value(&self) -> Value {
+        let state = self.lock();
+        let mut items = state
+            .block_history
+            .values()
+            .map(|entry| {
+                json!({
+                    "protocol": entry.protocol,
+                    "host": entry.host,
+                    "process": entry.process,
+                    "time": format_time(entry.time),
+                    "blockCount": entry.count.to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            right
+                .get("time")
+                .and_then(Value::as_str)
+                .cmp(&left.get("time").and_then(Value::as_str))
+        });
+        json!({"items": items, "dumpProcessEnabled": false})
+    }
+
     pub fn initial_event(&self) -> MonitorEvent {
         MonitorEvent {
             kind: "connections_added".to_owned(),
             payload: self.connections_value(),
         }
+    }
+
+    /// Subscribe before taking the active snapshot so an SSE reconnect cannot
+    /// miss a connection opened during the initial HTTP response.
+    pub fn initial_event_and_subscribe(&self) -> (MonitorEvent, broadcast::Receiver<MonitorEvent>) {
+        let state = self.lock();
+        let receiver = self.events.subscribe();
+        let mut values = state
+            .connections
+            .values()
+            .map(|entry| entry.value.clone())
+            .collect::<Vec<_>>();
+        values.sort_by_key(|value| {
+            value
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        });
+        (
+            MonitorEvent {
+                kind: "connections_added".to_owned(),
+                payload: json!({"connections": values}),
+            },
+            receiver,
+        )
     }
 
     pub fn request_close(&self, ids: &[String]) -> usize {
@@ -477,6 +559,38 @@ impl ConnectionMonitor {
         let Some(entry) = state.connections.remove(&flow) else {
             return;
         };
+        if entry.value.get("mode").and_then(Value::as_str) == Some("block") {
+            let protocol = entry
+                .value
+                .get("protocol")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let host = entry
+                .value
+                .get("domain")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .or_else(|| entry.value.get("addr").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_owned();
+            let process = entry
+                .value
+                .get("process")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let key = (protocol.clone(), host.clone(), process.clone());
+            let blocked = state.block_history.entry(key).or_insert(BlockEntry {
+                protocol,
+                host,
+                process,
+                time: unix_seconds(),
+                count: 0,
+            });
+            blocked.time = unix_seconds();
+            blocked.count = blocked.count.saturating_add(1);
+        }
         state.ids.remove(&entry.id);
         state.close_requests.retain(|pending| *pending != flow);
         state.history.push(json!({
@@ -510,6 +624,20 @@ impl ConnectionMonitor {
         state.history = persisted.history;
         state.failed_history = persisted
             .failed_history
+            .into_iter()
+            .map(|entry| {
+                (
+                    (
+                        entry.protocol.clone(),
+                        entry.host.clone(),
+                        entry.process.clone(),
+                    ),
+                    entry,
+                )
+            })
+            .collect();
+        state.block_history = persisted
+            .block_history
             .into_iter()
             .map(|entry| {
                 (
@@ -558,6 +686,7 @@ impl ConnectionMonitor {
                 .collect(),
             history: state.history.clone(),
             failed_history: state.failed_history.values().cloned().collect(),
+            block_history: state.block_history.values().cloned().collect(),
         }
     }
 }
@@ -745,6 +874,28 @@ mod tests {
         let history = monitor.failed_history_value();
         assert_eq!(history["items"][0]["failedCount"], "2");
         assert_eq!(history["items"][0]["error"], "timeout");
+    }
+
+    #[test]
+    fn monitor_exposes_block_history_in_the_route_contract_shape() {
+        let monitor = ConnectionMonitor::new();
+        let (flow, mut context) = flow();
+        context.route_mode = RouteMode::Block;
+        context.original_domain = Some(yuhaiin_core::DomainName::new("blocked.example").unwrap());
+        monitor.opened(flow, context);
+        monitor.closed(flow.key);
+
+        let mut second = FlowContext::new(Endpoint::ip(flow.key.network, flow.key.destination));
+        second.route_mode = RouteMode::Block;
+        second.original_domain = Some(yuhaiin_core::DomainName::new("blocked.example").unwrap());
+        monitor.opened(flow, second);
+        monitor.closed(flow.key);
+
+        let value = monitor.block_history_value();
+        assert_eq!(value["items"][0]["protocol"], "tcp");
+        assert_eq!(value["items"][0]["host"], "blocked.example");
+        assert_eq!(value["items"][0]["blockCount"], "2");
+        assert_eq!(value["dumpProcessEnabled"], false);
     }
 
     #[test]

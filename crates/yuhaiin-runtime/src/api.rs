@@ -28,7 +28,7 @@ use yuhaiin_store::{
     GoRouteSettingsRecord, GoSubscriptionLinkRecord,
 };
 
-use crate::{RuntimeController, route_rule_from_go_record};
+use crate::{RuntimeController, log::log_batch_value, route_rule_from_go_record};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -313,7 +313,9 @@ async fn rpc(
         "backup.restore" => restore_backup_value(&state, &body).await,
         "tools.interfaces" => tools_interfaces_value(),
         "tools.licenses" => tools_licenses_value(),
-        "tools.logs" | "tools.logs.v2" => json_value(json!({"log": []})),
+        "tools.logs" | "tools.logs.v2" => json_value(log_batch_value(
+            state.controller.monitor().logs().snapshot(),
+        )),
         "nodes.get" => nodes_get_value(&state, &body).await,
         "nodes.post" => save_node_value(&state, body, None).await,
         "nodes.selected" => selected_nodes_value(&state).await,
@@ -389,8 +391,8 @@ async fn rpc(
             read_config_json(&state, "route.lists.config", default_route_list_config()).await
         }
         "route.lists.config.put" => write_config_json(&state, "route.lists.config", body).await,
-        "route.lists.refresh" => empty(),
-        "route.lists.activation" => json_value(json!({ "hostIndexRefreshAt": 0 })),
+        "route.lists.refresh" => route_lists_refresh_value(&state).await,
+        "route.lists.activation" => route_lists_activation_value(&state).await,
         "route.rules.get" => route_rules_get_value(&state, &body).await,
         "route.rules.post" => save_route_rule_value(&state, body, None).await,
         "route.rule.get" => {
@@ -602,8 +604,8 @@ async fn connections_events(
     State(state): State<ApiState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
     let monitor = state.controller.monitor();
-    let initial = monitor.initial_event();
-    let updates = BroadcastStream::new(monitor.subscribe()).filter_map(|event| {
+    let (initial, receiver) = monitor.initial_event_and_subscribe();
+    let updates = BroadcastStream::new(receiver).filter_map(|event| {
         event.ok().map(|event| {
             SseEvent::default()
                 .event(event.kind)
@@ -621,17 +623,31 @@ async fn connections_events(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-async fn tools_logs() -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
-    tools_logs_v2().await
+async fn tools_logs(
+    State(state): State<ApiState>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
+    tools_logs_v2(State(state)).await
 }
 
-async fn tools_logs_v2() -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
-    let event = SseEvent::default()
+async fn tools_logs_v2(
+    State(state): State<ApiState>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
+    let (snapshot, receiver) = state.controller.monitor().logs().snapshot_and_subscribe();
+    let initial = SseEvent::default()
         .event("log")
-        .json_data(json!({"log": []}))
+        .json_data(log_batch_value(snapshot))
         .unwrap_or_else(|_| SseEvent::default());
-    Sse::new(tokio_stream::iter(vec![Ok::<SseEvent, Infallible>(event)]))
-        .keep_alive(KeepAlive::default())
+    let updates = BroadcastStream::new(receiver).filter_map(|batch| {
+        batch.ok().map(|lines| {
+            SseEvent::default()
+                .event("log")
+                .json_data(log_batch_value(lines))
+                .unwrap_or_else(|_| SseEvent::default())
+        })
+    });
+    let stream =
+        tokio_stream::iter(vec![Ok::<SseEvent, Infallible>(initial)]).chain(updates.map(Ok));
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 async fn tools_interfaces() -> ApiResult {
@@ -810,12 +826,47 @@ async fn route_lists_config_put(
     write_config_json(&state, "route.lists.config", value).await
 }
 
-async fn route_lists_refresh() -> ApiResult {
+const ROUTE_LIST_ACTIVATION_KEY: &str = "route.lists.activation";
+const ROUTE_ACTIVATION_KEY: &str = "route.activation";
+
+async fn route_lists_refresh(State(state): State<ApiState>) -> ApiResult {
+    route_lists_refresh_value(&state).await
+}
+
+async fn route_lists_activation(State(state): State<ApiState>) -> ApiResult {
+    route_lists_activation_value(&state).await
+}
+
+async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
+    let refreshed_at = unix_millis();
+    let activation = json!({
+        "hostIndexRefreshAt": 0,
+        "lastRefreshAt": refreshed_at,
+    });
+    let bytes = serde_json::to_vec(&activation)?;
+    state
+        .controller
+        .mutate_and_reload(move |store| async move {
+            store.put_config(ROUTE_LIST_ACTIVATION_KEY, &bytes).await
+        })
+        .await?;
+    state
+        .controller
+        .monitor()
+        .logs()
+        .info(format!("route list refresh applied at {refreshed_at}"));
     empty()
 }
 
-async fn route_lists_activation() -> ApiResult {
-    json_value(json!({"hostIndexRefreshAt": 0}))
+async fn route_lists_activation_value(state: &ApiState) -> ApiResult {
+    let value = state
+        .controller
+        .store()
+        .get_config(ROUTE_LIST_ACTIVATION_KEY)
+        .await?
+        .map(|bytes| raw_json(&bytes, json!({"hostIndexRefreshAt": 0})))
+        .unwrap_or_else(|| json!({"hostIndexRefreshAt": 0}));
+    json_value(value)
 }
 
 async fn route_list_get(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
@@ -1552,21 +1603,41 @@ fn split_rule_test_target(value: &str) -> std::result::Result<(String, u16), Api
     Ok((value.to_owned(), 0))
 }
 
-async fn route_rules_block_history_value(_state: &ApiState) -> ApiResult {
-    // The Rust route runtime does not yet have Go's optional process dumper;
-    // preserve the wire shape and make the absence explicit.
-    json_value(json!({"items": [], "dumpProcessEnabled": false}))
+async fn route_rules_block_history_value(state: &ApiState) -> ApiResult {
+    json_value(state.controller.monitor().block_history_value())
 }
 
 async fn route_apply_value(state: &ApiState) -> ApiResult {
-    state.controller.reload().await?;
+    let applied_at = unix_millis();
+    let activation = json!({
+        "hostIndexRefreshAt": 0,
+        "ruleApplyAt": 0,
+        "lastApplyAt": applied_at,
+    });
+    let bytes = serde_json::to_vec(&activation)?;
+    state
+        .controller
+        .mutate_and_reload(move |store| async move {
+            store.put_config(ROUTE_ACTIVATION_KEY, &bytes).await
+        })
+        .await?;
+    state
+        .controller
+        .monitor()
+        .logs()
+        .info(format!("route rules applied at {applied_at}"));
     empty()
 }
 
 async fn route_activation_value(state: &ApiState) -> ApiResult {
-    json_value(
-        json!({"hostIndexRefreshAt": 0, "ruleApplyAt": state.controller.handle().revision()}),
-    )
+    let value = state
+        .controller
+        .store()
+        .get_config(ROUTE_ACTIVATION_KEY)
+        .await?
+        .map(|bytes| raw_json(&bytes, json!({"hostIndexRefreshAt": 0, "ruleApplyAt": 0})))
+        .unwrap_or_else(|| json!({"hostIndexRefreshAt": 0, "ruleApplyAt": 0}));
+    json_value(value)
 }
 
 async fn hosts_get_value(state: &ApiState) -> ApiResult {
@@ -2477,6 +2548,13 @@ fn unix_seconds() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs() as i64)
 }
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            duration.as_millis().min(i64::MAX as u128) as i64
+        })
+}
 fn json_value(value: Value) -> ApiResult {
     Ok(Json(value))
 }
@@ -2511,6 +2589,7 @@ mod tests {
     use crate::{RuntimeBuilder, RuntimeController};
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
     use std::sync::Arc;
     use tower::ServiceExt;
     use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
@@ -2811,6 +2890,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn logs_and_route_activation_are_live_management_state() {
+        let state = state().await;
+        let monitor = state.controller.monitor();
+        state
+            .controller
+            .monitor()
+            .logs()
+            .push_raw("time=2026-01-01T00:00:00Z level=INFO msg=\"boot\"\n");
+        let app = router(state);
+
+        let logs = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v2/rpc/tools.logs")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logs.status(), StatusCode::OK);
+        let logs: Value =
+            serde_json::from_slice(&to_bytes(logs.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            logs["log"][0],
+            "time=2026-01-01T00:00:00Z level=INFO msg=\"boot\""
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v2/tools/logs/v2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("boot"));
+        monitor.logs().push_raw("live-log\n");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&second).contains("live-log"));
+
+        let refreshed = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v2/route/lists/refresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status(), StatusCode::OK);
+        let activation = app
+            .oneshot(
+                Request::get("/api/v2/route/lists/activation")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let activation: Value =
+            serde_json::from_slice(&to_bytes(activation.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert!(activation["lastRefreshAt"].as_i64().unwrap_or_default() > 0);
     }
 
     #[tokio::test]
