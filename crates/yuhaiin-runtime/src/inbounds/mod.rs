@@ -10,7 +10,7 @@
 
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -18,7 +18,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 
-use yuhaiin_core::{Error, ErrorKind, FlowContext, Result};
+use yuhaiin_core::process::{ProcessResolver, default_process_resolver};
+use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Result};
 use yuhaiin_store::GoInboundRecord;
 
 use crate::{ConnectionMonitor, RuntimeController, RuntimeProxySelector};
@@ -32,6 +33,11 @@ fn has_transport(transports: &[String], kind: &str) -> bool {
     transports
         .iter()
         .any(|transport| transport.eq_ignore_ascii_case(kind))
+}
+
+fn inbound_process_resolver() -> Option<&'static dyn ProcessResolver> {
+    static RESOLVER: OnceLock<Option<Arc<dyn ProcessResolver>>> = OnceLock::new();
+    RESOLVER.get_or_init(default_process_resolver).as_deref()
 }
 
 #[derive(Debug, Clone)]
@@ -375,10 +381,38 @@ impl InboundSpec {
     }
 
     pub(crate) fn annotate_context(&self, context: &mut FlowContext) {
+        self.annotate_context_with_process_resolver(context, inbound_process_resolver());
+    }
+
+    fn annotate_context_with_process_resolver(
+        &self,
+        context: &mut FlowContext,
+        resolver: Option<&dyn ProcessResolver>,
+    ) {
         context.inbound = Some(self.protocol.clone());
         context.inbound_name = Some(self.id.clone());
         if !self.outbound_id.is_empty() {
             context.outbound = Some(self.outbound_id.clone());
+        }
+        let Some(resolver) = resolver else {
+            return;
+        };
+        let Some(source) = context.source.as_ref().and_then(Endpoint::addr) else {
+            return;
+        };
+        if context.process.is_some() && context.process_id.is_some() && context.user_id.is_some() {
+            return;
+        }
+        if let Ok(Some(process)) = resolver.resolve(context.network, source, self.listen) {
+            if context.process.is_none() {
+                context.process = Some(process.path);
+            }
+            if context.process_id.is_none() {
+                context.process_id = Some(process.pid);
+            }
+            if context.user_id.is_none() {
+                context.user_id = Some(process.uid);
+            }
         }
     }
 }
@@ -920,6 +954,7 @@ mod tests {
     use serde_json::json;
     use yuhaiin_chain::AsyncYuubinsyaTcpSession;
     use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_core::process::ProcessInfo;
     use yuhaiin_core::{Endpoint, Network};
     use yuhaiin_store::{ConfigStore, GoNodeRecord};
 
@@ -1045,6 +1080,89 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         assert_eq!(UdpMode::from_value(Some(&json!(true))), UdpMode::Enabled);
         assert!(UdpMode::UdpOnly.udp_enabled());
         assert!(!UdpMode::UdpOnly.tcp_enabled());
+    }
+
+    struct FixedProcessResolver;
+
+    impl ProcessResolver for FixedProcessResolver {
+        fn resolve(
+            &self,
+            _network: Network,
+            _source: SocketAddr,
+            _destination: SocketAddr,
+        ) -> std::io::Result<Option<ProcessInfo>> {
+            Ok(Some(ProcessInfo {
+                path: "/usr/bin/inbound-client".to_owned(),
+                pid: 4242,
+                uid: 1000,
+            }))
+        }
+    }
+
+    #[test]
+    fn inbound_context_enriches_process_metadata_before_shared_router_selection() {
+        let spec = InboundSpec {
+            id: "process-inbound".to_owned(),
+            protocol: "http".to_owned(),
+            listen: "127.0.0.1:18080".parse().unwrap(),
+            username: String::new(),
+            password: String::new(),
+            udp_mode: UdpMode::Disabled,
+            protocol_udp: false,
+            transports: vec!["normal".to_owned()],
+            outbound_id: "direct".to_owned(),
+        };
+        let mut context = FlowContext::new(Endpoint::ip(
+            Network::Tcp,
+            "198.51.100.10:443".parse().unwrap(),
+        ));
+        context.source = Some(Endpoint::ip(
+            Network::Tcp,
+            "127.0.0.1:41000".parse().unwrap(),
+        ));
+        spec.annotate_context_with_process_resolver(&mut context, Some(&FixedProcessResolver));
+        assert_eq!(context.inbound.as_deref(), Some("http"));
+        assert_eq!(context.inbound_name.as_deref(), Some("process-inbound"));
+        assert_eq!(context.outbound.as_deref(), Some("direct"));
+        assert_eq!(context.process.as_deref(), Some("/usr/bin/inbound-client"));
+        assert_eq!(context.process_id, Some(4242));
+        assert_eq!(context.user_id, Some(1000));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn inbound_context_resolves_the_real_local_client_process_from_proc() {
+        block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listen = listener.local_addr().unwrap();
+            let client = TcpStream::connect(listen).await.unwrap();
+            let (_server, peer) = listener.accept().await.unwrap();
+            let spec = InboundSpec {
+                id: "real-process-inbound".to_owned(),
+                protocol: "socks5".to_owned(),
+                listen,
+                username: String::new(),
+                password: String::new(),
+                udp_mode: UdpMode::Disabled,
+                protocol_udp: false,
+                transports: vec!["normal".to_owned()],
+                outbound_id: "direct".to_owned(),
+            };
+            let mut context = FlowContext::new(Endpoint::ip(
+                Network::Tcp,
+                "198.51.100.11:443".parse().unwrap(),
+            ));
+            context.source = Some(Endpoint::ip(Network::Tcp, peer));
+            spec.annotate_context(&mut context);
+            assert_eq!(context.process_id, Some(std::process::id()));
+            assert!(
+                context
+                    .process
+                    .as_deref()
+                    .is_some_and(|path| !path.is_empty())
+            );
+            drop(client);
+        });
     }
 
     #[test]
