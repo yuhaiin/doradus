@@ -22,7 +22,7 @@ use yuhaiin_core::{Error, ErrorKind, LocalBoxFuture, ResolveStrategy, Result};
 #[cfg(not(feature = "doh-tls"))]
 use yuhaiin_runtime::BuiltinResolverFactory;
 use yuhaiin_runtime::api::ApiState;
-use yuhaiin_runtime::{RuntimeBuilder, RuntimeController, parse_dns_server};
+use yuhaiin_runtime::{RuntimeBuilder, RuntimeController, inbound, parse_dns_server};
 use yuhaiin_store::{ConfigStore, GoNodeRecord};
 
 #[cfg(feature = "tun")]
@@ -123,6 +123,8 @@ async fn run() -> Result<()> {
     let tun_task = spawn_tun_task(controller.clone(), shutdown_rx.clone()).await?;
 
     let dns_task = spawn_dns_task(controller.clone(), shutdown_rx.clone()).await?;
+    let inbound_task =
+        tokio::task::spawn_local(inbound::run_until(controller.clone(), shutdown_rx.clone()));
 
     let api_task = tokio::spawn(yuhaiin_runtime::api::serve_until(
         listener,
@@ -140,6 +142,9 @@ async fn run() -> Result<()> {
     }
     if let Err(error) = dns_task.await.map_err(join_error)? {
         eprintln!("DNS task stopped: {error}");
+    }
+    if let Err(error) = inbound_task.await.map_err(join_error)? {
+        eprintln!("inbound task stopped: {error}");
     }
     api_result.map_err(io_error)
 }

@@ -12,6 +12,15 @@ use yuhaiin_trie::router::RuntimeRoutedProxySelector;
 
 use crate::RuntimeSnapshot;
 
+#[path = "proxy/common.rs"]
+pub(crate) mod common;
+#[path = "proxy/http.rs"]
+pub(crate) mod http;
+#[path = "proxy/socks5.rs"]
+pub(crate) mod socks5;
+#[path = "proxy/yuubinsya.rs"]
+pub(crate) mod yuubinsya;
+
 /// The selected runtime proxy plus its persisted public configuration.
 /// Keeping both together makes future HTTP handlers able to expose stable
 /// metadata without reconstructing or serializing protocol internals.

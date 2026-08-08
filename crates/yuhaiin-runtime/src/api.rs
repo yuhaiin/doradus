@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::convert::Infallible;
+use std::path::PathBuf;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
@@ -152,6 +153,7 @@ pub fn router(state: ApiState) -> Router {
             get(connections_failed_history),
         )
         .route("/api/v2/connections/history", get(connections_history))
+        .route("/api/v2/tools/logs/v2", get(tools_logs_v2))
         .route(
             "/api/v2/route/config",
             get(route_config_get).put(route_config_put),
@@ -222,8 +224,20 @@ async fn rpc(
     };
     match operation.as_str() {
         "info" => info_value(&state),
+        "update.check" => update_check_value(&body),
+        "update.apply" => update_apply_value(&state, &body).await,
+        "update.status" => update_status_value(&state).await,
         "settings.get" => read_config_json(&state, "settings", default_settings()).await,
         "settings.put" => write_config_json(&state, "settings", body).await,
+        "backup.config.get" => {
+            read_config_json(&state, "backup.config", default_backup_config()).await
+        }
+        "backup.config.put" => write_config_json(&state, "backup.config", body).await,
+        "backup.run" => run_backup_value(&state).await,
+        "backup.restore" => restore_backup_value(&state, &body).await,
+        "tools.interfaces" => tools_interfaces_value(),
+        "tools.licenses" => tools_licenses_value(),
+        "tools.logs" | "tools.logs.v2" => json_value(json!({"log": []})),
         "nodes.get" => nodes_get_value(&state, &body).await,
         "nodes.post" => save_node_value(&state, body, None).await,
         "nodes.selected" => selected_nodes_value(&state).await,
@@ -254,6 +268,22 @@ async fn rpc(
         "resolver.fakedns.put" => fakedns_put_value(&state, body).await,
         "resolver.server.get" => resolver_server_get_value(&state).await,
         "resolver.server.put" => resolver_server_put_value(&state, body).await,
+        "subscriptions.get" => subscriptions_get_value(&state).await,
+        "subscriptions.put" => subscriptions_put_value(&state, body).await,
+        "subscriptions.delete" => subscriptions_delete_value(&state, &body).await,
+        "subscriptions.delete_preview" => json_value(json!({"nodes": 0, "users": 0})),
+        "subscriptions.update" => empty(),
+        "publishes" => publishes_get_value(&state).await,
+        "publish.put" => publish_put_value(&state, body).await,
+        "publish.delete" => publish_delete_value(&state, required_string(&body, "name")?).await,
+        "publish.resolve" => publish_resolve_value(&state, &body).await,
+        "users.get" => users_get_value(&state, &body).await,
+        "users.post" => user_save_value(&state, body, None).await,
+        "user.get" => user_get_value(&state, required_string(&body, "id")?).await,
+        "user.put" => {
+            user_save_value(&state, body.clone(), Some(required_string(&body, "id")?)).await
+        }
+        "user.delete" => user_delete_value(&state, required_string(&body, "id")?).await,
         "connections" => json_value(state.controller.monitor().connections_value()),
         "connections.total" => json_value(state.controller.monitor().total_flow_value()),
         "connections.traffic" => {
@@ -450,6 +480,15 @@ async fn connections_events(
     )])
     .chain(updates.map(Ok));
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn tools_logs_v2() -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
+    let event = SseEvent::default()
+        .event("log")
+        .json_data(json!({"log": []}))
+        .unwrap_or_else(|_| SseEvent::default());
+    Sse::new(tokio_stream::iter(vec![Ok::<SseEvent, Infallible>(event)]))
+        .keep_alive(KeepAlive::default())
 }
 
 async fn inbounds_get(State(state): State<ApiState>, Query(query): Query<ListQuery>) -> ApiResult {
@@ -1231,6 +1270,294 @@ async fn tag_delete_value(state: &ApiState, tag: String) -> ApiResult {
         })
         .await?;
     empty()
+}
+
+fn update_check_value(body: &Value) -> ApiResult {
+    let channel = string_or(&body, "channel", "stable");
+    json_value(json!({
+        "supported": false,
+        "channel": channel,
+        "currentVersion": env!("CARGO_PKG_VERSION"),
+        "targetVersion": "",
+        "targetTag": "",
+        "prerelease": false,
+        "releaseUrl": "",
+        "releaseNotes": "",
+        "publishedAt": "",
+        "assetName": "",
+        "assetSha256": "",
+        "updateAvailable": false,
+        "reason": "self-update is managed by the package/runtime supervisor"
+    }))
+}
+
+async fn update_apply_value(state: &ApiState, value: &Value) -> ApiResult {
+    let _ = write_config_json(state, "update.last_request", value.clone()).await?;
+    empty()
+}
+
+async fn update_status_value(state: &ApiState) -> ApiResult {
+    let error = state
+        .controller
+        .store()
+        .get_config("update.error")
+        .await?
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    json_value(json!({
+        "running": false,
+        "stage": "idle",
+        "progress": 0,
+        "bytesDownloaded": 0,
+        "totalBytes": 0,
+        "error": error
+    }))
+}
+
+async fn run_backup_value(state: &ApiState) -> ApiResult {
+    let destination = backup_destination()?;
+    state
+        .controller
+        .store()
+        .backup_to(&destination)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({})))
+}
+
+async fn restore_backup_value(_state: &ApiState, _value: &Value) -> ApiResult {
+    Err(ApiError::unavailable(
+        "database restore requires restarting the Rust service with the selected backup",
+    ))
+}
+
+fn tools_interfaces_value() -> ApiResult {
+    json_value(json!({"interfaces": []}))
+}
+
+fn tools_licenses_value() -> ApiResult {
+    json_value(json!({"yuhaiin": [], "android": []}))
+}
+
+async fn subscriptions_get_value(state: &ApiState) -> ApiResult {
+    Ok(Json(
+        json!({"items": config_items(state, "subscriptions.items").await?}),
+    ))
+}
+
+async fn subscriptions_put_value(state: &ApiState, value: Value) -> ApiResult {
+    let items = value
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| ApiError::bad("subscriptions requires an items array"))?;
+    write_config_json(state, "subscriptions.items", json!({"items": items})).await
+}
+
+async fn subscriptions_delete_value(state: &ApiState, value: &Value) -> ApiResult {
+    let names = value
+        .get("names")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::bad("subscriptions delete requires a names array"))?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let items = config_items(state, "subscriptions.items")
+        .await?
+        .into_iter()
+        .filter(|item| {
+            !names.contains(&item.get("name").and_then(Value::as_str).unwrap_or_default())
+        })
+        .collect::<Vec<_>>();
+    let _ = write_config_json(state, "subscriptions.items", json!({"items": items})).await?;
+    empty()
+}
+
+async fn publishes_get_value(state: &ApiState) -> ApiResult {
+    Ok(Json(
+        json!({"items": config_items(state, "publishes.items").await?}),
+    ))
+}
+
+async fn publish_put_value(state: &ApiState, mut value: Value) -> ApiResult {
+    let name = required_string(&value, "name")?;
+    set_string(&mut value, "name", name.clone());
+    let mut items = config_items(state, "publishes.items").await?;
+    items.retain(|item| item.get("name").and_then(Value::as_str) != Some(name.as_str()));
+    items.push(value);
+    let _ = write_config_json(state, "publishes.items", json!({"items": items})).await?;
+    empty()
+}
+
+async fn publish_delete_value(state: &ApiState, name: String) -> ApiResult {
+    let mut items = config_items(state, "publishes.items").await?;
+    items.retain(|item| item.get("name").and_then(Value::as_str) != Some(name.as_str()));
+    let _ = write_config_json(state, "publishes.items", json!({"items": items})).await?;
+    empty()
+}
+
+async fn publish_resolve_value(state: &ApiState, value: &Value) -> ApiResult {
+    let name = required_string(value, "name")?;
+    let publish = config_items(state, "publishes.items")
+        .await?
+        .into_iter()
+        .find(|item| item.get("name").and_then(Value::as_str) == Some(name.as_str()))
+        .ok_or_else(|| ApiError::not_found(format!("publish {name:?} was not found")))?;
+    let points = publish
+        .get("points")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let nodes = state
+        .controller
+        .store()
+        .repository()
+        .list_go_nodes()
+        .await?
+        .into_iter()
+        .filter(|node| points.is_empty() || points.contains(node.id.as_str()))
+        .map(node_json)
+        .collect::<Vec<_>>();
+    json_value(json!({"points": nodes}))
+}
+
+async fn users_get_value(state: &ApiState, input: &Value) -> ApiResult {
+    let users = config_items(state, "users.items")
+        .await?
+        .into_iter()
+        .map(user_view)
+        .collect::<Vec<_>>();
+    Ok(Json(page(users, input)))
+}
+
+async fn user_get_value(state: &ApiState, id: String) -> ApiResult {
+    config_items(state, "users.items")
+        .await?
+        .into_iter()
+        .find(|user| user.get("id").and_then(Value::as_str) == Some(id.as_str()))
+        .map(|user| Json(user_view(user)))
+        .ok_or_else(|| ApiError::not_found(format!("user {id:?} was not found")))
+}
+
+async fn user_save_value(state: &ApiState, mut value: Value, id: Option<String>) -> ApiResult {
+    let id = id
+        .or_else(|| string_or_opt(&value, "id"))
+        .unwrap_or_else(|| format!("rust-user-{}-{}", unix_seconds(), std::process::id()));
+    let mut items = config_items(state, "users.items").await?;
+    let previous = items
+        .iter()
+        .find(|user| user.get("id").and_then(Value::as_str) == Some(id.as_str()))
+        .cloned();
+    set_string(&mut value, "id", id.clone());
+    if value.get("credential").is_none() {
+        if let Some(previous) = previous.as_ref().and_then(|user| user.get("credential")) {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("credential".to_owned(), previous.clone());
+            }
+        }
+    }
+    items.retain(|user| user.get("id").and_then(Value::as_str) != Some(id.as_str()));
+    items.push(value.clone());
+    let _ = write_config_json(state, "users.items", json!({"items": items})).await?;
+    json_value(user_view(value))
+}
+
+async fn user_delete_value(state: &ApiState, id: String) -> ApiResult {
+    let mut items = config_items(state, "users.items").await?;
+    let before = items.len();
+    items.retain(|user| user.get("id").and_then(Value::as_str) != Some(id.as_str()));
+    if items.len() == before {
+        return Err(ApiError::not_found(format!("user {id:?} was not found")));
+    }
+    let _ = write_config_json(state, "users.items", json!({"items": items})).await?;
+    empty()
+}
+
+async fn config_items(state: &ApiState, key: &str) -> Result<Vec<Value>, ApiError> {
+    let Some(bytes) = state.controller.store().get_config(key).await? else {
+        return Ok(Vec::new());
+    };
+    let value = raw_json(&bytes, json!({"items": []}));
+    Ok(value
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn user_view(mut value: Value) -> Value {
+    let credential = value
+        .get("credential")
+        .cloned()
+        .unwrap_or_else(|| json!({"type": "token", "token": ""}));
+    let mut view = json!({
+        "id": string_or(&value, "id", ""),
+        "name": string_or(&value, "name", ""),
+        "enabled": bool_or(&value, "enabled", true),
+        "origin": string_or(&value, "origin", "rust-api"),
+        "usage": string_or(&value, "usage", ""),
+        "credential": credential_view(&credential),
+    });
+    if let Some(reference_count) = value.get("outboundReferences") {
+        if let Some(object) = view.as_object_mut() {
+            object.insert("outboundReferences".to_owned(), reference_count.clone());
+        }
+    }
+    value = view;
+    value
+}
+
+fn credential_view(value: &Value) -> Value {
+    let kind = string_or(value, "type", "token");
+    let section = value.get(&kind).unwrap_or(value);
+    let username = string_or_opt(section, "username");
+    let password = string_or_opt(section, "password");
+    let uuid = string_or_opt(section, "uuid");
+    let token = string_or_opt(section, "token");
+    let secret = password.as_deref().or(uuid.as_deref()).or(token.as_deref());
+    let mut result = json!({
+        "type": kind,
+        "hasUsername": username.is_some(),
+        "hasSecret": secret.is_some_and(|secret| !secret.is_empty()),
+    });
+    if let Some(object) = result.as_object_mut() {
+        if let Some(username) = username {
+            object.insert("username".to_owned(), Value::String(username));
+        }
+        if let Some(password) = password {
+            object.insert("password".to_owned(), Value::String(password));
+        }
+        if let Some(uuid) = uuid {
+            object.insert("uuid".to_owned(), Value::String(uuid));
+        }
+        if let Some(token) = token {
+            object.insert("token".to_owned(), Value::String(token));
+        }
+    }
+    result
+}
+
+fn default_backup_config() -> Value {
+    json!({
+        "instanceName": "",
+        "s3": {"enabled": false, "accessKey": "", "secretKey": "", "bucket": "", "region": "", "endpointUrl": "", "usePathStyle": false, "storageClass": ""},
+        "interval": 0,
+        "lastBackupHash": ""
+    })
+}
+
+fn backup_destination() -> Result<PathBuf, ApiError> {
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from(".cache"));
+    let directory = root.join("yuhaiin-rust").join("backups");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| ApiError::internal(format!("create backup directory: {error}")))?;
+    Ok(directory.join(format!("state-{}.sqlite", unix_seconds())))
 }
 
 async fn read_config_json(state: &ApiState, key: &str, default: Value) -> ApiResult {

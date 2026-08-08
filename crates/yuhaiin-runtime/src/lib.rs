@@ -12,6 +12,7 @@ mod doh_tls;
 #[cfg(feature = "doh-tls")]
 mod dot_tls;
 mod handle;
+#[path = "inbounds/mod.rs"]
 pub mod inbound;
 pub mod monitor;
 mod proxy;
