@@ -743,9 +743,9 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         "nodeId": context.outbound.as_deref().unwrap_or_default(),
         "nodeName": context.outbound_name.as_deref().unwrap_or_default(),
         "protocol": flow.key.network.to_string(),
-        "process": "",
-        "pid": "",
-        "uid": "",
+        "process": context.process.as_deref().unwrap_or_default(),
+        "pid": context.process_id.map(|value| value.to_string()).unwrap_or_default(),
+        "uid": context.user_id.map(|value| value.to_string()).unwrap_or_default(),
         "tlsServerName": "",
         "httpHost": "",
         "component": "tun",
@@ -840,6 +840,24 @@ mod tests {
                 .len(),
             9
         );
+    }
+
+    #[test]
+    fn monitor_preserves_inbound_and_process_metadata_in_connections() {
+        let monitor = ConnectionMonitor::new();
+        let (flow, mut context) = flow();
+        context.inbound = Some("socks5".to_owned());
+        context.inbound_name = Some("desktop-socks".to_owned());
+        context.process = Some("/usr/bin/example-app".to_owned());
+        context.process_id = Some(42);
+        context.user_id = Some(1000);
+        monitor.opened(flow, context);
+        let connection = &monitor.connections_value()["connections"][0];
+        assert_eq!(connection["inbound"], "socks5");
+        assert_eq!(connection["inboundName"], "desktop-socks");
+        assert_eq!(connection["process"], "/usr/bin/example-app");
+        assert_eq!(connection["pid"], "42");
+        assert_eq!(connection["uid"], "1000");
     }
 
     #[test]

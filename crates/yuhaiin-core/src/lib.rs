@@ -284,6 +284,12 @@ pub struct FlowContext {
     pub inbound_name: Option<String>,
     pub outbound: Option<String>,
     pub outbound_name: Option<String>,
+    /// Process metadata supplied by a platform process resolver. TUN callers
+    /// can leave this empty when the operating system does not expose socket
+    /// ownership; inbound and test callers can still provide it explicitly.
+    pub process: Option<String>,
+    pub process_id: Option<u32>,
+    pub user_id: Option<u32>,
     pub skip_route: bool,
     pub udp_migrate_id: Arc<AtomicU64>,
 }
@@ -302,6 +308,9 @@ impl FlowContext {
             inbound_name: None,
             outbound: None,
             outbound_name: None,
+            process: None,
+            process_id: None,
+            user_id: None,
             skip_route: false,
             udp_migrate_id: Arc::new(AtomicU64::new(0)),
         }

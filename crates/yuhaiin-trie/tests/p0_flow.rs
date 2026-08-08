@@ -449,6 +449,8 @@ fn route_rule(pattern: &str) -> RouteRule {
         network: Some(Network::Udp),
         port: Some((443, 443)),
         geo_country: None,
+        inbound_names: Vec::new(),
+        process_names: Vec::new(),
         resolver_policy: ResolverPolicy::default(),
         priority: 10,
     }

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use yuhaiin_core::{Endpoint, GeoLookup, Network, ResolverPolicy, RouteMode};
+use yuhaiin_core::{Endpoint, FlowContext, GeoLookup, Network, ResolverPolicy, RouteMode};
 
 #[cfg(feature = "async-proxy")]
 use yuhaiin_core::proxy::{AsyncProxy, AsyncProxySelector};
@@ -36,16 +36,27 @@ pub struct RouteRule {
     pub port: Option<(u16, u16)>,
     /// Optional MaxMind country code constraint for IP endpoints.
     pub geo_country: Option<String>,
+    /// Optional Go inbound-name matcher. Empty means that the rule is not
+    /// constrained by the accepting inbound.
+    pub inbound_names: Vec<String>,
+    /// Optional Go process-list matcher. Empty means that the rule is not
+    /// constrained by process metadata.
+    pub process_names: Vec<String>,
     pub resolver_policy: ResolverPolicy,
     pub priority: i32,
 }
 
 impl RouteRule {
     pub fn matches(&self, endpoint: &Endpoint) -> bool {
-        self.matches_with_geo(endpoint, None)
+        self.matches_with_context(endpoint, None, None)
     }
 
-    fn matches_with_geo(&self, endpoint: &Endpoint, geo: Option<&dyn GeoLookup>) -> bool {
+    fn matches_with_context(
+        &self,
+        endpoint: &Endpoint,
+        geo: Option<&dyn GeoLookup>,
+        context: Option<&FlowContext>,
+    ) -> bool {
         if self
             .network
             .is_some_and(|network| network != endpoint.network())
@@ -71,6 +82,30 @@ impl RouteRule {
                 return false;
             };
             if !actual.eq_ignore_ascii_case(expected) {
+                return false;
+            }
+        }
+        if !self.inbound_names.is_empty() {
+            let Some(context) = context else {
+                return false;
+            };
+            let inbound = context
+                .inbound_name
+                .as_deref()
+                .or(context.inbound.as_deref());
+            if !inbound.is_some_and(|value| self.inbound_names.iter().any(|name| name == value)) {
+                return false;
+            }
+        }
+        if !self.process_names.is_empty() {
+            let Some(context) = context else {
+                return false;
+            };
+            if !context
+                .process
+                .as_deref()
+                .is_some_and(|process| self.process_names.iter().any(|name| name == process))
+            {
                 return false;
             }
         }
@@ -139,11 +174,19 @@ impl Router {
     }
 
     pub fn decide(&self, endpoint: &Endpoint) -> RouteDecision {
+        self.decide_with_context(endpoint, None)
+    }
+
+    fn decide_with_context(
+        &self,
+        endpoint: &Endpoint,
+        context: Option<&FlowContext>,
+    ) -> RouteDecision {
         let candidates = self.rules.search(endpoint);
         self.global_rules
             .iter()
             .chain(candidates.into_iter().flat_map(|rules| rules.iter()))
-            .filter(|rule| rule.matches_with_geo(endpoint, self.geo.as_deref()))
+            .filter(|rule| rule.matches_with_context(endpoint, self.geo.as_deref(), context))
             // Go's route matcher walks rules in persisted priority order and
             // stops at the first match.  Lower priority values therefore win;
             // this is also what makes the UI's drag-and-drop order effective.
@@ -161,11 +204,11 @@ impl Router {
     /// domain rule must also be able to override the fallback.  The normal
     /// rule priority decides when both forms match.
     pub fn decide_context(&self, context: &yuhaiin_core::FlowContext) -> RouteDecision {
-        let packet = self.decide(&context.destination);
+        let packet = self.decide_with_context(&context.destination, Some(context));
         let Some(_) = context.original_domain else {
             return packet;
         };
-        let domain = self.decide(&context.effective_destination());
+        let domain = self.decide_with_context(&context.effective_destination(), Some(context));
         if domain.priority <= packet.priority {
             domain
         } else {
@@ -323,6 +366,8 @@ mod tests {
             network: None,
             port: None,
             geo_country: None,
+            inbound_names: Vec::new(),
+            process_names: Vec::new(),
             resolver_policy: ResolverPolicy {
                 strategy: ResolveStrategy::Default,
                 use_fake_ip: action == RuleAction::Proxy,

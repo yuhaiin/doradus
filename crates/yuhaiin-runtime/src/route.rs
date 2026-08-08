@@ -454,6 +454,7 @@ fn array_strings(value: Option<&Value>) -> std::result::Result<Vec<String>, Stri
 fn normalize_list_values(kind: &str, raw_values: Vec<String>) -> Vec<String> {
     let kind = kind.replace('-', "_");
     let hosts_file = kind == "hosts_as_host";
+    let process_only = kind == "process" || kind == "processes";
     let cidr_only = matches!(kind.as_str(), "cidr" | "ip" | "ip_cidr");
     let mut values = BTreeSet::new();
     for raw in raw_values {
@@ -479,6 +480,10 @@ fn normalize_list_values(kind: &str, raw_values: Vec<String>) -> Vec<String> {
                 .trim_start_matches("||")
                 .trim_start_matches('.');
             if value.is_empty() {
+                continue;
+            }
+            if process_only {
+                values.insert(value.to_owned());
                 continue;
             }
             if cidr_only && !value.contains('/') {
@@ -606,6 +611,8 @@ pub fn expand_go_route_rule(
             network: variant.network,
             port: variant.port,
             geo_country: variant.geo_country,
+            inbound_names: variant.inbound_names.unwrap_or_default(),
+            process_names: variant.process_names.unwrap_or_default(),
             resolver_policy,
             priority,
         })
@@ -644,6 +651,8 @@ fn route_rule_from_root(record: &GoRouteRuleRecord, root: &Value) -> Result<Opti
     let port = parse_port(field(root, matcher, &["port", "ports"]), record.id.as_str())?;
     let geo_country = string_field(root, &["geo_country", "geoCountry", "country"])
         .or_else(|| string_field(matcher, &["geo_country", "geoCountry", "country"]));
+    let inbound_names = parse_inbound_names(root, matcher);
+    let process_names = parse_process_names(root, matcher);
     let resolver_policy = parse_resolver_policy(root, matcher, action, record.id.as_str())?;
     let priority = i32::try_from(record.priority).map_err(|_| {
         Error::new(
@@ -658,6 +667,8 @@ fn route_rule_from_root(record: &GoRouteRuleRecord, root: &Value) -> Result<Opti
         network,
         port,
         geo_country,
+        inbound_names: inbound_names.unwrap_or_default(),
+        process_names: process_names.unwrap_or_default(),
         resolver_policy,
         priority,
     }))
@@ -684,6 +695,8 @@ struct RuleVariant {
     network: Option<Network>,
     port: Option<(u16, u16)>,
     geo_country: Option<String>,
+    inbound_names: Option<Vec<String>>,
+    process_names: Option<Vec<String>>,
 }
 
 fn parse_rule_expression(
@@ -781,6 +794,47 @@ fn parse_rule_expression(
                 })
                 .collect())
         }
+        "inbound" => {
+            let nested = value.get("inbound").unwrap_or(value);
+            let mut names = nested
+                .get("names")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if let Some(name) = string_field(nested, &["name"]) {
+                names.push(name);
+            }
+            names.sort();
+            names.dedup();
+            if names.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(vec![RuleVariant {
+                inbound_names: Some(names),
+                ..Default::default()
+            }])
+        }
+        "process" => {
+            let nested = value.get("process").unwrap_or(value);
+            let name = string_field(nested, &["list", "name"])
+                .ok_or_else(|| unsupported_expression(id, "process list name"))?;
+            let mut names = lists.values(&name).unwrap_or_default().to_vec();
+            names.sort();
+            names.dedup();
+            if names.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(vec![RuleVariant {
+                process_names: Some(names),
+                ..Default::default()
+            }])
+        }
         "domain" | "cidr" | "ip" => {
             let pattern = string_field(value, &["domain", "host", "cidr", "ip", "pattern"])
                 .ok_or_else(|| unsupported_expression(id, "matcher pattern"))?;
@@ -829,17 +883,49 @@ fn combine_all(
                     (Some(country), _) | (_, Some(country)) => Some(country.clone()),
                     (None, None) => None,
                 };
+                let inbound_names =
+                    match intersect_name_constraints(&left.inbound_names, &right.inbound_names) {
+                        Some(names) => names,
+                        None => continue,
+                    };
+                let process_names =
+                    match intersect_name_constraints(&left.process_names, &right.process_names) {
+                        Some(names) => names,
+                        None => continue,
+                    };
                 combined.push(RuleVariant {
                     pattern: left.pattern.clone().or_else(|| right.pattern.clone()),
                     network,
                     port,
                     geo_country,
+                    inbound_names,
+                    process_names,
                 });
             }
         }
         variants = combined;
     }
     Ok(variants)
+}
+
+/// `Some(None)` means no constraint, `Some(Some(values))` means a constraint,
+/// and `None` means two `all` children have no common value.
+fn intersect_name_constraints(
+    left: &Option<Vec<String>>,
+    right: &Option<Vec<String>>,
+) -> Option<Option<Vec<String>>> {
+    match (left, right) {
+        (None, None) => Some(None),
+        (Some(values), None) | (None, Some(values)) => Some(Some(values.clone())),
+        (Some(left), Some(right)) => {
+            let values = left
+                .iter()
+                .filter(|value| right.iter().any(|candidate| candidate == *value))
+                .cloned()
+                .collect::<Vec<_>>();
+            (!values.is_empty()).then_some(Some(values))
+        }
+    }
 }
 
 fn intersect_ports(left: Option<(u16, u16)>, right: Option<(u16, u16)>) -> Option<(u16, u16)> {
@@ -891,6 +977,49 @@ fn unsupported_expression(id: &str, detail: impl std::fmt::Display) -> Error {
         ErrorKind::Unsupported,
         format!("route rule {id} has unsupported {detail}"),
     )
+}
+
+fn parse_inbound_names(root: &Value, matcher: &Value) -> Option<Vec<String>> {
+    let value = root
+        .get("inbound")
+        .or_else(|| matcher.get("inbound"))
+        .unwrap_or(&Value::Null);
+    let mut names = value
+        .get("names")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(name) = string_field(value, &["name"]) {
+        names.push(name);
+    }
+    names.sort();
+    names.dedup();
+    (!names.is_empty()).then_some(names)
+}
+
+fn parse_process_names(root: &Value, matcher: &Value) -> Option<Vec<String>> {
+    let value = root
+        .get("process")
+        .or_else(|| matcher.get("process"))
+        .unwrap_or(&Value::Null);
+    let names = value
+        .get("names")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| string_field(value, &["name", "path"]).map(|value| vec![value]));
+    names.filter(|names| !names.is_empty())
 }
 
 fn parse_action(mode: &str, root: &Value, id: &str) -> Result<RuleAction> {
@@ -1057,6 +1186,7 @@ fn invalid_port(id: &str) -> Error {
 mod tests {
     use super::*;
     use yuhaiin_core::{Endpoint, Network};
+    use yuhaiin_store::GoRouteListRecord;
 
     fn record(json: &str, mode: &str, match_type: &str) -> GoRouteRuleRecord {
         GoRouteRuleRecord {
@@ -1101,6 +1231,66 @@ mod tests {
         assert_eq!(
             router.decide(&endpoint).mode,
             yuhaiin_core::RouteMode::Proxy
+        );
+    }
+
+    #[test]
+    fn process_and_inbound_matchers_use_flow_context_metadata() {
+        let lists = load_route_lists(&[GoRouteListRecord {
+            name: "apps".to_owned(),
+            list_type: "process".to_owned(),
+            source_type: "local".to_owned(),
+            updated_at: 0,
+            data_json: br#"{
+                "type":"process",
+                "source":{"type":"local","local":{"lists":["/usr/bin/example-app"]}}
+            }"#
+            .to_vec(),
+        }]);
+        let rule = record(
+            r#"{
+                "mode":"proxy",
+                "rules":[{"type":"all","all":[
+                    {"type":"process","process":{"list":"apps"}},
+                    {"type":"inbound","inbound":{"names":["socks-main"]}},
+                    {"type":"network","network":{"network":"tcp"}}
+                ]}]
+            }"#,
+            "proxy",
+            "all",
+        );
+        let router = compile_go_route_rules_with_lists(
+            &[rule],
+            &lists,
+            RouteDecision {
+                mode: yuhaiin_core::RouteMode::Direct,
+                resolver_policy: ResolverPolicy::default(),
+                priority: 100,
+            },
+            None,
+        )
+        .unwrap();
+        let mut context = yuhaiin_core::FlowContext::new(Endpoint::ip(
+            Network::Tcp,
+            "192.0.2.10:443".parse().unwrap(),
+        ));
+        context.inbound_name = Some("socks-main".to_owned());
+        context.process = Some("/usr/bin/example-app".to_owned());
+        assert_eq!(
+            router.snapshot().decide_context(&context).mode,
+            yuhaiin_core::RouteMode::Proxy
+        );
+
+        context.process = Some("/usr/bin/other-app".to_owned());
+        assert_eq!(
+            router.snapshot().decide_context(&context).mode,
+            yuhaiin_core::RouteMode::Direct
+        );
+        context.process = Some("/usr/bin/example-app".to_owned());
+        context.inbound_name = Some("http-main".to_owned());
+        assert_eq!(
+            router.snapshot().decide_context(&context).mode,
+            yuhaiin_core::RouteMode::Direct
         );
     }
 
