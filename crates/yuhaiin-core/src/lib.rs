@@ -28,6 +28,7 @@ pub use geo::GeoLookup;
 #[cfg(feature = "http2")]
 pub mod http2;
 pub mod nat;
+pub mod process;
 pub mod proxy;
 #[cfg(feature = "async-proxy")]
 pub mod proxy_factory;

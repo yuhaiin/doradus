@@ -37,6 +37,7 @@ use futures_util::{FutureExt, StreamExt};
 use crate::LocalBoxFuture;
 #[cfg(feature = "async-proxy")]
 use crate::nat::{NatKey, NatTable};
+use crate::process::{ProcessResolver, default_process_resolver};
 use crate::{Endpoint, Error, ErrorKind, Network, Result};
 
 pub use crate::flow::{Flow as TunFlow, FlowKey as TunFlowKey};
@@ -848,6 +849,7 @@ type AsyncDnsTask = LocalBoxFuture<'static, (TunFlowKey, Result<Vec<u8>>)>;
 pub struct TunProxyRuntime {
     selector: Arc<dyn AsyncProxySelector>,
     context_provider: Arc<dyn Fn(TunFlow) -> crate::FlowContext + Send + Sync>,
+    process_resolver: Option<Arc<dyn ProcessResolver>>,
     observer: Option<Arc<dyn TunFlowObserver>>,
     dns_handler: Option<Arc<dyn DnsHandler>>,
     async_dns_handler: Option<Arc<dyn AsyncDnsHandler>>,
@@ -876,6 +878,7 @@ impl TunProxyRuntime {
         Ok(Self {
             selector,
             context_provider: Arc::new(|flow| flow.context()),
+            process_resolver: default_process_resolver(),
             observer: None,
             dns_handler: None,
             async_dns_handler: None,
@@ -914,6 +917,21 @@ impl TunProxyRuntime {
     {
         self.context_provider = Arc::new(provider);
         self
+    }
+
+    /// Add process ownership metadata to newly opened flows when the target
+    /// platform exposes socket ownership.  The default is Linux `/proc`; a
+    /// caller can replace it with a native Android or desktop resolver.
+    pub fn with_process_resolver<R>(mut self, resolver: R) -> Self
+    where
+        R: ProcessResolver + 'static,
+    {
+        self.process_resolver = Some(Arc::new(resolver));
+        self
+    }
+
+    pub fn set_process_resolver(&mut self, resolver: Option<Arc<dyn ProcessResolver>>) {
+        self.process_resolver = resolver;
     }
 
     /// Replace the read-only flow context snapshot at a lifecycle boundary.
@@ -964,6 +982,30 @@ impl TunProxyRuntime {
         self.tasks.len() + self.udp_tasks.len() + self.dns_tasks.len() + self.async_dns_tasks.len()
     }
 
+    fn context_for_flow(&self, flow: TunFlow) -> crate::FlowContext {
+        let mut context = (self.context_provider)(flow);
+        let needs_process =
+            context.process.is_none() || context.process_id.is_none() || context.user_id.is_none();
+        if needs_process {
+            if let Some(resolver) = &self.process_resolver {
+                if let Ok(Some(process)) =
+                    resolver.resolve(flow.key.network, flow.key.source, flow.key.destination)
+                {
+                    if context.process.is_none() {
+                        context.process = Some(process.path);
+                    }
+                    if context.process_id.is_none() {
+                        context.process_id = Some(process.pid);
+                    }
+                    if context.user_id.is_none() {
+                        context.user_id = Some(process.uid);
+                    }
+                }
+            }
+        }
+        context
+    }
+
     pub fn sweep(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
         let Some(nat) = &self.nat else {
             return Ok(0);
@@ -990,7 +1032,7 @@ impl TunProxyRuntime {
             TunEvent::TcpOpened { flow } => {
                 self.track_flow(flow.key)?;
                 self.remove_task(&flow.key);
-                let context = (self.context_provider)(flow);
+                let context = self.context_for_flow(flow);
                 if let Some(observer) = &self.observer {
                     observer.opened(flow, context.clone());
                 }
@@ -1022,7 +1064,7 @@ impl TunProxyRuntime {
             TunEvent::UdpDatagram { flow, payload } => {
                 let first = !self.tracked_flows.contains(&flow.key);
                 self.track_flow(flow.key)?;
-                let context = (self.context_provider)(flow);
+                let context = self.context_for_flow(flow);
                 if first && let Some(observer) = &self.observer {
                     observer.opened(flow, context.clone());
                 }

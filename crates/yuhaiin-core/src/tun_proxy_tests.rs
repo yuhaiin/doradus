@@ -2,6 +2,54 @@ use super::tun_test_support::*;
 use super::*;
 
 #[cfg(feature = "async-proxy")]
+#[test]
+fn proxy_runtime_enriches_context_with_injected_process_metadata() {
+    use crate::process::{ProcessInfo, ProcessResolver};
+    use crate::proxy::{AsyncProxy, DirectAsyncProxy, StaticProxySelector};
+    use std::io;
+
+    struct FixedResolver;
+    impl ProcessResolver for FixedResolver {
+        fn resolve(
+            &self,
+            _network: Network,
+            _source: SocketAddr,
+            _destination: SocketAddr,
+        ) -> io::Result<Option<ProcessInfo>> {
+            Ok(Some(ProcessInfo {
+                path: "/usr/bin/test-client".to_owned(),
+                pid: 42,
+                uid: 1000,
+            }))
+        }
+    }
+
+    let direct: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy {
+        timeout: Duration::from_secs(1),
+    });
+    let selector = Arc::new(StaticProxySelector {
+        direct: Arc::clone(&direct),
+        proxy: Arc::clone(&direct),
+        bypass: Arc::clone(&direct),
+        drop: Arc::new(crate::proxy::DropAsyncProxy),
+    });
+    let runtime = TunProxyRuntime::new(selector, 4)
+        .unwrap()
+        .with_process_resolver(FixedResolver);
+    let flow = TunFlow {
+        key: TunFlowKey {
+            network: Network::Tcp,
+            source: "10.0.0.2:40000".parse().unwrap(),
+            destination: "93.184.216.34:443".parse().unwrap(),
+        },
+    };
+    let context = runtime.context_for_flow(flow);
+    assert_eq!(context.process.as_deref(), Some("/usr/bin/test-client"));
+    assert_eq!(context.process_id, Some(42));
+    assert_eq!(context.user_id, Some(1000));
+}
+
+#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn proxy_runtime_relays_udp_event_through_direct_proxy() {
     use crate::proxy::{AsyncProxy, DirectAsyncProxy, StaticProxySelector};
