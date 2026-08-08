@@ -1,0 +1,26 @@
+[package]
+name = "yuhaiin-trie"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+async-proxy = ["yuhaiin-core/async-proxy"]
+
+[dependencies]
+yuhaiin-core = { path = "../yuhaiin-core" }
+
+[dev-dependencies]
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp"] }
+tokio = { version = "1.50.0", default-features = false, features = ["macros", "net", "rt", "sync", "time"] }
+yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy", "tun"] }
+yuhaiin-store = { path = "../yuhaiin-store", features = ["async-dns"] }
+
+[[test]]
+name = "p0_flow"
+path = "tests/p0_flow.rs"
+required-features = ["async-proxy"]
+
+[lints]
+workspace = true

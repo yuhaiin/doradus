@@ -1,0 +1,41 @@
+[package]
+name = "yuhaiin-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+http2 = ["dep:bytes", "dep:futures-util", "dep:h2", "dep:http", "dep:tokio"]
+async-proxy = ["dep:futures-util", "dep:tokio"]
+tls-rustcrypto = ["dep:rustls", "dep:rustls-rustcrypto"]
+tun = ["dep:futures-lite", "dep:smoltcp", "dep:tun-rs"]
+tun-routes = ["tun", "dep:route_manager"]
+
+[dependencies]
+bytes = { version = "1.12.1", optional = true }
+futures-util = { version = "0.3.33", optional = true, default-features = false, features = ["std"] }
+hickory-proto = { version = "0.26.1", default-features = false, features = ["std"] }
+h2 = { version = "0.4.15", optional = true }
+http = { version = "1.5.0", optional = true }
+maxminddb = "0.30.0"
+futures-lite = { version = "2.6.1", optional = true }
+rustls = { version = "0.23.41", optional = true, default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = { version = "0.0.2-alpha", optional = true, default-features = false, features = ["std", "tls12", "zeroize"] }
+sha2 = { version = "0.11.0", default-features = false }
+smoltcp = { version = "0.13.1", optional = true, default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "async"] }
+tokio = { version = "1.50.0", optional = true, default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tun-rs = { version = "2.8.8", optional = true, default-features = false, features = ["async_io"] }
+route_manager = { version = "0.2.13", optional = true, default-features = false }
+
+[[bin]]
+name = "tun-smoke"
+path = "src/bin/tun_smoke.rs"
+required-features = ["tun"]
+
+[[bin]]
+name = "nat-worker"
+path = "src/bin/nat_worker.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "yuhaiin-chain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+bytes = "1.12.1"
+h2 = "0.4.15"
+http = "1.5.0"
+rand = { version = "0.10.2", default-features = false, features = ["std", "thread_rng"] }
+rustls = { version = "0.23.41", default-features = false, features = ["std", "tls12"] }
+rustls-pemfile = "2.2.0"
+rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["std", "tls12", "zeroize"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.50.0", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["tls12"] }
+yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp"] }
+yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy", "tun"] }
+
+[[bin]]
+name = "chain-smoke"
+path = "src/bin/chain_smoke.rs"

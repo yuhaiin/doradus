@@ -1,0 +1,3 @@
+{"version":1,"family":4,"prefix":"198.18.0.0/15","kind":"entry","domain":"legacy.example.com","address":"198.18.0.10"}
+{"version":1,"family":4,"prefix":"198.18.0.0/15","kind":"entry","domain":"legacy.example.net","address":"198.18.0.11"}
+{"version":1,"family":4,"prefix":"198.18.0.0/15","kind":"cursor","next":"198.18.0.12"}

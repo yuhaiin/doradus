@@ -1,0 +1,2 @@
+{"version":1,"family":6,"prefix":"fc00::/18","kind":"entry","domain":"legacy6.example.com","address":"fc00::2"}
+{"version":1,"family":6,"prefix":"fc00::/18","kind":"cursor","next":"fc00::3"}

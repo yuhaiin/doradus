@@ -1,0 +1,1201 @@
+# yuhaiin Go -> Rust 迁移设计与实施文档
+
+> 文档状态：架构基线，2026-08-08
+>
+> 目标目录：`/home/asutorufa/Documents/Programming/yuhaiin-rust`
+>
+> 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
+> 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
+
+> 当前实现快照：第一批可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store` 和 `yuhaiin-runtime` 五个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责应用层组装和原子 reload，不新增 HTTP DTO，也不把平台权限细节泄漏到上层。
+
+> 已实现的代码包括：SQLite 配置事务与 schema v3 typed repository、Go v6 fixture/import/字段差异报告、FakeIP IPv4/IPv6 分配/持久化/旧 snapshot 幂等导入与 A/AAAA/PTR/HTTPS/SVCB hint answer transform、域名/CIDR/Geo country Router snapshot publish/rollback、带 TTL/容量淘汰的 DNS cache、同步/异步 UDP DNS client/server/policy/cancellation boundary、DoH transport boundary、注入 connector 的 HTTP/2 DoH framing、可直接接入异步 DNS/TUN packet pipeline 的 `H2DohDnsHandler`、可复用的 RustCrypto TCP→TLS→ALPN h2 DoH connector 和 DoT TCP framing resolver、同时组装 System/UDP/TCP/DoH/DoT 的 `RustCryptoResolverFactory`、hosts→upstream→FakeIP 的可注入异步 resolver stack、`yuhaiin-runtime` 的 Go compatibility snapshot 组装与 direct/HTTP/SOCKS5/chain proxy 构造、direct/fixed/drop/HTTP CONNECT/SOCKS5、feature-gated `rustls-rustcrypto` TLS client、Yuubinsya native UDP client/server socket、UOT/TCP/coalesce/Ping client/server session、full-cone NAT UDP relay、MaxMindDB reader、唯一的 `tun-rs AsyncDevice + smoltcp` TUN adapter，以及独立的 `yuhaiin-chain`（fixedv2 → TLS → HTTP/2 pool/CONNECT → Yuubinsya TCP/UOT/Ping）。TLS provider 仍是 alpha，DoQ/DoH3 和特权 Linux namespace/Android/macOS 验收仍是独立门槛，未用 C TLS 代替。
+
+## 1. 目标、边界和完成定义
+
+### 1.1 目标
+
+Rust 版本的第一阶段必须能够独立提供以下能力，并且可以逐步替换 Go 进程中的对应链路：
+
+1. FakeIP：IPv4/IPv6 地址池、域名正向映射、IP 反向映射、持久化、旧数据迁移。
+2. DNS：resolver、DNS server、UDP、DoH/HTTP2、DoT；异步 UDP server 提供可由 owner future 取消的 `serve_until` 生命周期入口；TCP 作为 UDP 截断后的回退，DoQ/DoH3 延后。
+3. Router：域名 trie、通配符、CIDR 最长前缀匹配、规则列表、resolver 选择、proxy/direct/block 决策。
+4. Proxy：`yuubinsya` 的 TCP、原生 UDP、UDP-over-TCP、迁移 ID、ping；TLS、HTTP/2、SOCKS5、HTTP CONNECT、direct、fixed、drop。
+5. NAT：`/home/asutorufa/Documents/Programming/yuhaiin/pkg/net/nat` 的按源/迁移 ID 建流、UDP 转发、反向地址映射、目标解析缓存、空闲回收和有界背压。
+6. TUN：系统 TUN 设备、IPv4/IPv6 packet loop、现成用户态 IP stack、TCP/UDP/ICMP 分发和平台路由生命周期；第一阶段只维护一条数据面路径。
+7. MaxMindDB：GeoIP/GeoLite 数据库加载、IP/域名查询、热替换、关闭和 route matcher 注入。
+8. SQLite：配置、规则、节点、resolver、inbound、统计和 FakeIP 状态的 schema/migration/repository；为兼容真实 Go SQLite 文件并控制资源占用，默认构建使用经过验证的 `rusqlite` bundled SQLite，并把 C binding 限定在数据库适配边界。
+
+### 1.2 非目标
+
+第一阶段不实现或不阻塞主线的内容：
+
+- DoQ、DoH3：保留 transport trait 和 feature 位置，等纯 Rust TLS/QUIC 后端经过审计后再实现。
+- 透明代理、iptables/nftables、完整进程识别和所有平台网络配置的自动化细节；TUN 先完成 Linux/Android 主路径，再扩展平台。
+- UI、HTTP API、订阅系统；但 SQLite 配置库属于本次基础设施范围，不能省略。
+- 为了“看起来完整”而先加入大量协议。未经过互操作测试的协议不应进入默认 feature。
+
+### 1.3 完成定义
+
+一个模块只有同时满足下列条件才算迁移完成：
+
+- 有与 Go 行为对应的 trait/API 和错误语义，而不是只实现 happy path。
+- 有纯本地单元测试、边界测试、并发测试；协议 parser 有 property/fuzz 测试。
+- 有 Go/Rust 互操作测试，至少覆盖当前 yuhaiin 的 client/server 一端对另一端。
+- 有关闭、超时、取消、半关闭、重连和资源回收测试。
+- `cargo tree` 中没有未经批准的 C/C++/系统库绑定；SQLite 的 `libsqlite3-sys` 仅作为已批准的 bundled backend 例外，默认 feature 仍不启用 `native-tls`、OpenSSL、`ring` 或 `aws-lc-sys`。
+- 失败时能区分：输入错误、超时、远端拒绝、连接关闭、取消、资源耗尽和内部错误。
+
+## 2. 当前 Go 实现的事实基线
+
+迁移以当前 Go 源码为准，而不是以旧文档或包名猜测为准。对应入口如下：
+
+| 能力 | Go 参考实现 |
+| --- | --- |
+| FakeIP | `pkg/net/dns/fakeip/fakeip.go`、`pool.go`、`sqlite.go` |
+| DNS resolver | `pkg/net/dns/resolver/dns.go`、`udp.go`、`tcp.go`、`doh.go`、`dot.go`、`group.go` |
+| DNS server | `pkg/net/dns/server/server.go` |
+| 通用 trie | `pkg/net/trie/trie.go`、`domain/*`、`cidr/*` |
+| Router | `pkg/route/route.go`、`rule.go`、`list.go`、`runtime_types.go` |
+| Yuubinsya | `pkg/net/proxy/yuubinsya/header.go`、`packet.go`、`client.go`、`server.go`、`uot.go` |
+| 其他 proxy | `pkg/net/proxy/direct`、`fixed`、`drop`、`http`、`http2`、`socks5`、`tls` |
+| NAT | `pkg/net/nat/table.go`、`source.go`、`migrate.go` |
+| TUN | `pkg/net/proxy/tun/tun.go`、`gvisor/*`、`tun2socket/*`、`pkg/net/netlink/tun.go` |
+| MaxMindDB | `pkg/net/trie/maxminddb/db.go`、`pkg/route/list.go` |
+| SQLite/config | `pkg/storage/sqlite/*`、`pkg/store/*`、`pkg/legacy/chore/sqlite_db.go` |
+
+必须保留的已知行为：
+
+- FakeIP 不是简单的内存哈希：当前实现会保存 cursor、映射和 `last_used_at`，并且旧安装可能同时存在历史 fakeip bucket、SQLite fakeip 表和旧 Pebble 数据。
+- resolver 的 A/AAAA 查询通常并行；UDP 响应按 DNS ID 加 question 匹配；TC 响应需要用 TCP 重试；DoH 使用 `application/dns-message`，并通过自定义 dialer 走 yuhaiin proxy。
+- 域名匹配是反向 label trie，不是普通字符串前缀；CIDR 匹配需要最长前缀语义。
+- Router 先把匹配列表和 resolver policy 写入 flow context，再选择实际 proxy；不能在每一层重新解析并覆盖这些状态。
+- Yuubinsya 的认证 token 是 `SHA256(password + "+s@1t")`，不是密码本身；wire protocol 需要保留历史 protocol number 和 UDP migration ID。
+- NAT 的 key 为 `MigrateID`，没有 migration ID 时使用源地址 comparable key；一个 key 对应一个长期 UDP flow，不能为每个数据包重新建连接。
+
+## 3. 总体架构
+
+### 3.1 推荐 workspace
+
+建议第一步就建立 workspace，但只创建空的、可编译的 crate；每个 crate 只依赖更底层的 crate。
+
+```text
+yuhaiin-rust/
+├── Cargo.toml                 # workspace、统一 lint 和依赖版本
+├── MIGRATION.md
+├── crates/
+│   ├── yuhaiin-core/          # 地址、flow context、错误、基础 trait
+│   ├── yuhaiin-io/            # tokio socket、dial、监听器、stream/datagram 封装
+│   ├── yuhaiin-crypto/        # hash、密码 token、TLS provider 适配
+│   ├── yuhaiin-trie/          # domain/cidr/combined trie，纯数据结构
+│   ├── yuhaiin-store/         # SQLite schema/repository、redb 可选缓存、迁移接口
+│   ├── yuhaiin-fakeip/        # FakeIP pool 和 DNS answer 变换（初版暂在 yuhaiin-store::fakeip）
+│   ├── yuhaiin-dns/           # DNS message、resolver transports、server
+│   ├── yuhaiin-proxy/         # proxy trait、direct/fixed/drop 等基础实现
+│   ├── yuhaiin-proxy-yuubinsya/ # Yuubinsya wire codec、client、server
+│   ├── yuhaiin-proxy-http/    # HTTP CONNECT、HTTP/2、SOCKS5、TLS wrapper
+│   ├── yuhaiin-chain/          # 当前可运行的 fixedv2 -> TLS -> HTTP/2 -> Yuubinsya 组合
+│   ├── yuhaiin-router/        # list snapshot、rule matcher、route dispatch
+│   ├── yuhaiin-nat/           # UDP NAT table/source control
+│   ├── yuhaiin-tun/           # tun-rs device + smoltcp adapter、TCP/UDP/ICMP ingress（初版暂在 yuhaiin-core::tun）
+│   ├── yuhaiin-geo/           # MaxMindDB reader、GeoIP snapshot、热替换
+│   ├── yuhaiin-config/        # SQLite migrations、typed repositories、backup/export
+│   ├── yuhaiin-runtime/       # RuntimeSnapshot、hosts/FakeIP/resolver/proxy 组装和 reload
+│   └── yuhaiin-interop/       # 仅测试：Go/Rust 互操作 fixture 和 harness
+└── deny.toml                  # 依赖许可证、来源和 native link 审计
+```
+
+如果早期实现量较小，可以先把后三个 proxy crate 合并到 `yuhaiin-proxy`，但代码目录仍按
+`codec/transport/client/server` 分开。拆 crate 的目的是依赖方向和测试隔离，不是为了增加层次。
+
+### 3.2 依赖方向
+
+```text
+core
+ ├── io
+ ├── crypto
+ ├── trie
+ └── store
+       └── fakeip
+              └── dns
+
+proxy  ───────────────┐
+fakeip/dns ────────────┼──> router ───> nat
+core/io/crypto ────────┘
+
+config/sqlite ────────> store ───> fakeip/dns/router
+geo ──────────────────> router
+tun ──────────────────> router/nat/proxy
+```
+
+实际依赖不允许 `proxy -> dns`。resolver 通过 trait 注入，Proxy 只接收
+`Dialer`/`Resolver` trait；`router` 或 app 负责把具体 resolver 和 proxy 组装起来。这样可以避免：
+
+- proxy 为连接远端域名时反向调用完整 router，造成递归；
+- DNS 为 DoH 建连接时又进入 DNS，造成死循环；
+- NAT 的 `skip_route` 语义被某个 wrapper 丢失。
+
+`ConfigStore::status()` 提供 schema version、Go import marker、journal mode、page/freelist、`quick_check`
+和 Full Cone NAT 状态；它直接返回 store 的共享记录，供未来 HTTP/reload handler 使用，不复制一套 DTO。
+
+当前 `yuhaiin-runtime` 只依赖已有的 compatibility/runtime structs：`RuntimeBuilder` 读取
+hosts、FakeIP、resolver、route 和 proxy records，发布一个 `RuntimeSnapshot`；`RuntimeHandle`
+为 TUN、代理和未来 HTTP/reload handler 提供共享 `Arc<RuntimeSnapshot>`，只在完整构建成功后
+原子 publish；`revision`/条件 publish 会拒绝陈旧的并发 reload，`load_with_revision()` 在同一
+读锁内返回版本和 snapshot，重建失败或被更新覆盖时保留旧 snapshot，不再额外引入 DTO；
+`RuntimeController` 在同一个共享边界中提供 `ConfigMutation`/typed repository 持久化、串行 reload、
+失败时保留旧 snapshot 和 `last_reload_error()` 状态；未来 HTTP handler 可以直接复用它，而不需要
+自己管理 SQLite transaction、revision 或 DTO。`AsyncHostsResolver` 与 `FakeIpResolver` 按
+hosts→upstream→FakeIP 顺序组合，proxy
+通过同一个 `Arc<dyn AsyncIpResolver>` 构造。`RuntimeController::build_proxy_selector` 会注册
+TUN selector，并在 reload 发布前准备新的 proxy slots；任一 proxy 构造失败时不发布新 snapshot，
+已运行的 selector 和旧 flow 继续使用旧实例。`ResolverTransportFactory` registry 已提供
+`RuntimeBuilder` 同时读取 `nat_config` 的 `default` 记录并把它放入同一个 snapshot；
+`RuntimeSnapshot::new_full_cone_nat()` 将持久化 idle timeout 转换为 TUN 可直接使用的
+`(NatTable, Duration)`，遇到 `full_cone=false` 或非法 timeout 会 fail-closed，避免运行时
+悄悄退化成 restricted NAT。`RuntimeController::build_tun_proxy_runtime()`（或带 DNS
+handler 的 `build_tun_proxy_runtime_with_dns()`）在同一个
+reload 锁和同一个 snapshot 下组装 selector、Full Cone NAT 与 timeout，避免 TUN 启动时
+读到彼此不一致的配置；packet-level DNS handler 继续由 DNS 层注入，不在 runtime 层
+重复实现 DoH/UDP/FakeIP policy。
+System/UDP/TCP 的按 ID 构造，route rule 的常见 domain/CIDR matcher、action、network/port
+和 resolver policy 会编译为 `RouterRuntime`；route settings 可按 direct/proxy mode 选择
+resolver，已构造 resolver 在查询失败或空结果时可回退到 shared resolver，构建失败可选择
+fail-build 或 keep-unavailable，并已有同一 store 重建新 snapshot 的 reload 回归；无法表达的旧
+matcher fail-closed。DoH 已提供 `RustCryptoDohResolverFactory` 的直连 TCP/TLS/ALPN h2
+实现，并以 resolver timeout 取消完整响应 future；需要代理链或自定义 bootstrap 时仍使用
+注入式 connector。启用 runtime `doh-tls` feature 后，`RustCryptoDohResolverFactory` 和
+`RustCryptoDotResolverFactory` 提供直连 TCP/TLS 数据面；DoQ/DoH3 不允许无提示地回退 system
+DNS，避免 DoH bootstrap 反向进入自身 proxy chain。启用 runtime `http2` feature 后，`H2DohResolverFactory` 复用 core
+`H2DohClient`，由上层注入 TLS/proxy connector；
+`RuntimeBuilder` 同时读取
+`maxmind_metadata` 的第一条记录，用 `GeoDb` 加载纯 Rust MaxMindDB 并注入 route snapshot；
+reload 时旧 snapshot 继续持有旧 reader，不会被新 reader 提前关闭。
+
+### 3.3 生命周期和并发原则
+
+- 所有外部 I/O 使用显式 `CancellationToken` 或 request context；不要依赖全局 runtime 或线程局部变量。
+- 配置和路由表使用不可变 snapshot：写入时构造新 snapshot，完成后一次性替换 `Arc`；查询只读取一个 snapshot。
+- 不在 mutex、SQLite/redb transaction 或连接池锁中 `.await`。
+- `close()` 必须幂等，先停止 producer，再停止 worker，再关闭 socket；不能让后台 task 永久持有 `Arc`。
+- stream 和 datagram 是不同的能力；不要用一个“万能连接”把 `AsyncRead/Write` 强行模拟成 UDP。
+- parser 只处理 bytes，不接触全局状态；验证、解码、业务处理三步分离，便于 fuzz。
+
+## 4. 核心契约设计
+
+### 4.1 Address
+
+不能直接用 `SocketAddr` 作为全局地址类型，否则会丢失远端域名、FakeIP 原始域名和是否允许远端解析。
+
+```rust
+pub enum Endpoint {
+    Ip { network: Network, addr: SocketAddr },
+    Domain { network: Network, host: DomainName, port: u16 },
+}
+
+pub enum Network { Tcp, Udp, Icmp, Any }
+```
+
+要求：
+
+- `DomainName` 在构造时做大小写、尾点、label 长度和非法字节校验；wire 层仍保留需要的原始表示。
+- 提供 `comparable_key()`，key 必须区分 network、IP/domain、host、port 和必要的 scope id。
+- 提供 `to_socks5_addr()`、`from_socks5_addr()`，仅由地址 codec 使用。
+- `Endpoint::Domain` 在 route/proxy 传递链中保持不变；只有显式 `resolve_locally` 或 transport 需要 IP 时才解析。
+
+### 4.2 Stream、Datagram 和 Proxy
+
+建议使用 object-safe 的 boxed future，或者使用 `async_trait`，但不要把每个 proxy 的泛型暴露给上层：
+
+```rust
+pub trait Proxy: Send + Sync {
+    fn connect(&self, ctx: &FlowContext, target: Endpoint) -> BoxFuture<'_, Result<BoxStream>>;
+    fn open_datagram(&self, ctx: &FlowContext, target: Endpoint)
+        -> BoxFuture<'_, Result<BoxDatagram>>;
+    fn ping(&self, ctx: &FlowContext, target: Endpoint) -> BoxFuture<'_, Result<Duration>>;
+    fn close(&self) -> BoxFuture<'_, Result<()>>;
+}
+```
+
+`BoxStream` 需要支持 `AsyncRead + AsyncWrite + Unpin + Send`；`BoxDatagram` 至少提供：
+
+```rust
+trait Datagram: Send + Sync {
+    fn send_to(&self, payload: &[u8], target: Endpoint) -> BoxFuture<'_, Result<usize>>;
+    fn recv_from(&self, buf: &mut [u8]) -> BoxFuture<'_, Result<(usize, Endpoint)>>;
+    fn local_addr(&self) -> Result<Endpoint>;
+    fn close(&self) -> BoxFuture<'_, Result<()>>;
+}
+```
+
+实际代码可用 `async_trait` 简化，但所有 trait 必须满足 `Send + Sync`，并且错误中包含操作名和目标。
+
+### 4.3 FlowContext
+
+把 Go `netapi.Context` 中会影响路由和 DNS 的状态显式化：
+
+```rust
+pub struct FlowContext {
+    pub source: Option<Endpoint>,
+    pub destination: Endpoint,
+    pub inbound: Option<Endpoint>,
+    pub network: Network,
+    pub route_mode: RouteMode,
+    pub resolver_policy: ResolverPolicy,
+    pub resolver: Arc<dyn Resolver>,
+    pub lists: Arc<ListMatchSnapshot>,
+    pub fakeip: Option<Arc<FakeIpView>>,
+    pub udp_migrate_id: Arc<AtomicU64>,
+    pub skip_route: bool,
+    pub sniff_host: Option<DomainName>,
+}
+```
+
+实现时可以把不变字段放在 `Arc<FlowMeta>`，把 migration ID 等少量可变字段放在独立的
+`Arc<AtomicU64>`。禁止用一个大 `Mutex<FlowContext>` 包住整个连接生命周期。
+
+### 4.4 Error taxonomy
+
+`yuhaiin-core` 定义统一错误，底层错误通过 `source` 保留：
+
+```text
+InvalidInput
+ProtocolViolation
+AuthenticationFailed
+ResolveFailed
+DialFailed
+Timeout
+Cancelled
+ConnectionClosed
+Backpressure
+Unsupported
+Internal
+```
+
+对外日志需要带 `operation`、`target`、`proxy/resolver name`、`flow key`；密码、token、完整 DNS message 不进入普通日志。
+
+## 5. FakeIP 迁移方案
+
+### 5.1 行为模型
+
+每个 address family 和 prefix 一个独立 pool：
+
+```text
+FakeIpManager
+ ├── ipv4: FakeIpPool(prefix, max_entries)
+ └── ipv6: FakeIpPool(prefix, max_entries)
+```
+
+接口：
+
+```rust
+trait FakeIpPool: Send + Sync {
+    fn prefix(&self) -> IpNet;
+    fn ip_for_domain(&self, domain: &DomainName) -> Result<IpAddr>;
+    fn domain_for_ip(&self, ip: IpAddr) -> Result<Option<DomainName>>;
+}
+```
+
+分配规则：
+
+1. prefix 先 mask；cursor 初始为 prefix 的前一个地址。
+2. 先查 domain -> IP；命中时更新访问时间，不重新分配。
+3. 未命中时串行分配，二次查找避免并发重复映射。
+4. cursor 在 prefix 内递增；到末尾后从头循环。
+5. 先复用达到 TTL 的旧映射；仍达到 `max_entries` 时按 `last_used_at` 的 LRU 复用一个旧地址，再分配空闲 IP；池满时不能无限循环。
+6. IPv4/IPv6、prefix、domain 都是查询 key 的组成部分；更换 prefix 不得误用旧映射。
+7. 反查只能返回当前 pool 且仍有效的映射；不存在时返回 `None`，不能把池内任意 IP 当成域名。
+
+Go 当前 SQLite 实现的 `last_used_at` touch 是延迟批量刷盘。Rust 的 `FakeIpPoolOptions::touch_interval_seconds` 在内存中更新命中时间，达到间隔后才写 typed 表；`flush_touches` 在关闭/配置替换前把所有 dirty touch 以一个事务刷盘。当前池不自行启动后台 worker，runtime 必须显式调用 flush 并处理错误，不能静默丢失 touch。
+
+### 5.2 持久化：SQLite 主库，redb 可选
+
+SQLite 不能省略：它是配置、规则、节点、resolver、inbound、统计和迁移兼容性的主存储格式；FakeIP
+也应优先使用同一个 SQLite state DB，而不是另起一个与配置无关的数据库。
+
+`yuhaiin-config` 负责 schema/migration/repository，`yuhaiin-store` 提供 typed repository trait，
+FakeIP、Router、DNS 和控制面只依赖 trait，不直接拼 SQL。建议保留当前 Go schema 的主要表名和字段语义：
+
+```text
+metadata, migrate
+settings_kv, settings_json
+dns_settings, dns_resolvers, dns_hosts, dns_fakedns_lists
+route_settings, route_rules, route_lists, route_list_refresh
+inbounds, nodes, node_tags, subscriptions, backup_settings
+statistics_kv, traffic_hourly, connection_sessions, connection_history
+fakeip_entries, fakeip_cursors
+```
+
+FakeIP 的 SQLite schema：
+
+```sql
+CREATE TABLE fakeip_entries (
+  family INTEGER NOT NULL,
+  prefix TEXT NOT NULL,
+  domain TEXT NOT NULL,
+  ip BLOB NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_used_at INTEGER NOT NULL,
+  PRIMARY KEY (family, prefix, domain),
+  UNIQUE (family, prefix, ip)
+);
+
+CREATE INDEX fakeip_entries_ip_idx
+  ON fakeip_entries(family, prefix, ip);
+
+CREATE INDEX fakeip_entries_lru_idx
+  ON fakeip_entries(family, prefix, last_used_at);
+
+CREATE TABLE fakeip_cursors (
+  family INTEGER NOT NULL,
+  prefix TEXT NOT NULL,
+  cursor_ip BLOB NOT NULL,
+  cursor_idx INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (family, prefix)
+);
+```
+
+正向和反向索引必须在同一个 SQLite transaction 中更新。分配事务的最小步骤：
+
+```text
+begin write
+  re-check domain
+  count/reuse one IP
+  remove old reverse entry if reusing
+  insert domain entry
+  insert reverse entry
+  update cursor
+commit
+```
+
+不要用两个独立 transaction 写正向和反向索引，否则崩溃后可能出现“正向存在、反向不存在”。当前 `ConfigStore::replace_fakeip_entry`、`delete_fakeip_entries` 和 `touch_fakeip_entries` 都只从 `yuhaiin-store` 暴露 typed transaction boundary，FakeIP pool 不直接拼 SQL。
+
+`FakeIpPool::open_with_prefix` 用显式 canonical prefix（例如 `198.18.0.0/15`）加载生产表；旧的通用 KV `fakeip/map/*`、`fakeip/ipv6/map/*` 只作为一次性兼容输入，成功写入 typed rows/cursor 后在同一事务内删除。`open` 仍为只有 start/end 的旧调用者生成稳定的 range prefix。`FakeIpPoolOptions` 同时约束 TTL、容量和 touch 间隔，`allocate_at` 供 deterministic clock 测试使用。
+
+#### SQLite engine 选择
+
+- 当前实现使用 `rusqlite 0.40.1` 的 `bundled` feature，由 SQLite amalgamation 构建，并通过 `crates/yuhaiin-store/src/sqlite.rs` 的小型 typed adapter 隔离底层 API。选择依据是实测而不是语言纯度：在同一份 415,334,400-byte 的真实 Go v5 FTS-free snapshot 上，rusqlite 完成复制、WAL/NORMAL 配置和行查询，probe 输出约 53 ms copy、232 ms configure、RSS 约 5.6 MiB；此前 fsqlite 在相同迁移场景超过 90 秒仍未完成，RSS 约 1.28 GiB。因此 fsqlite 不再作为生产后端，纯 Rust 实现保留为未来可替换 adapter 的研究方向。
+- 真实 Go v5 snapshot 仍必须先移除可重建的 `nodes_fts` 派生索引、校验 manifest/hash，再交给 Rust 安装；未移除 FTS5 的原库仍然 fail-closed，不能把 exporter 边界问题误判为普通 SQLite 数据损坏。当前 rusqlite bundled SQLite 已通过 206 nodes、27,439 FakeIP rows、IPv4/IPv6 双 cursor 的真实导入读回，以及 store 全量单元/跨进程 WAL 测试。FakeIP typed schema 的 8,192 次双栈长 soak 已通过；后续仍需更多真实生产 snapshot。
+- 在同一份实际生产数据副本上运行当前 Go migration version 6 后，Go exporter 生成的 60,973,056-byte schema v6 FTS-free snapshot 也已由 Rust 安装；source/destination `quick_check` 均为 `ok`，206 nodes、27,439 FakeIP rows、15,483 IPv4 + 11,956 IPv6 mappings 和两个 cursor 均保持。这个结果证明了“真实旧数据 + 当前 Go v6 migration + Rust 安装”链路，但不替代未经本地升级的原生 Go v6 生产快照。
+- 当前 Go v5 telemetry、Go v6 plain-contract 最小 fixture、生产形状 fixture、Go v1 legacy 显式升级和未建模字段策略记录在 [GO_COMPATIBILITY.md](GO_COMPATIBILITY.md)；Rust 已覆盖 Go schema import 的幂等 marker、schema v1→v3 与 v2→v3 迁移、部分 typed 表创建后的下一次启动修复，以及六类 `_v2` compatibility view 的事务性 typed writeback/delete。Go v1 源表改名后只读归档，空 `_v2` 表才执行 resolver/route 字段映射；已有 `_v2` 保持权威。未知 JSON 字段保留，`nodes_v2`、`inbounds_v2`、`node_tags_v2`、`route_lists_v2` 等 Go v6 compatibility JSON 边界统一 fail-closed，非法 legacy/Go v6 JSON 会回滚并在修复后重试；未建模的 Go v5 telemetry 表和数据保持不删除。仍需用更多真实生产库/异常中断注入补充文件级 WAL/损坏恢复。
+- Rust migration 在事务提交前校验 `yuhaiin_meta`、`yuhaiin_config` 以及 Rust-owned typed 表的列名、声明类型、可空性、主键位置和 FakeIP 唯一/二级索引；缺失的 FakeIP 反向唯一索引会在事务内安全补建；已有同名索引但列/唯一性不匹配时 fail-closed，保留原表和 schema version，修复后可重试。Go v6 importer 对实际导入字段的 ID、时间戳和 JSON 做 fail-closed 校验，同时保留精简旧 compatibility 表的列兼容；Go compatibility repository 的 JSON 读写也使用同一校验边界。Go `metadata.schema_version` 与 `migrate.version` 会逐行检查负数、NULL、错误类型和未来版本，并要求两个来源一致，避免一个合法来源掩盖另一个损坏来源。backup、restore 和 Go snapshot install 对 destination sidecar 做保护：缺失目标但存在 WAL/journal/锁 sidecar 时拒绝操作，失败路径不清理外部 destination sidecar。负 Rust schema version 会 fail-closed。Full Cone NAT 的 `full_cone=1` 兼容约束仍由 repository 的读写校验强制，避免破坏旧 Go/Rust 数据表。
+- 当前 `yuhaiin-store` 按职责拆分为 `src/lib.rs`（公开类型、ConfigStore 生命周期和基础事务）、`src/schema.rs`（Rust schema contract/SQLite introspection）、`src/migration.rs`（Go import/legacy upgrade）、`src/repository.rs`（typed/Go repository）、`src/sqlite.rs`（backend adapter）和 `src/fakeip.rs`（FakeIP runtime）；测试按 `src/tests/{storage,schema,go_import,snapshot,repository}.rs` 与 `src/fakeip_tests.rs` 分组。core 的 `nat.rs`/`tun.rs` 也将测试拆到 `nat_tests.rs`、`tun_test_support.rs`、`tun_unit_tests.rs`、`tun_proxy_tests.rs`、`tun_runtime_tests.rs`，避免协议实现文件继续膨胀；TUN 仍只采用 `tun-rs AsyncDevice + smoltcp` 一条路径，NAT 仍保持 endpoint-independent Full Cone 语义。
+- `rusqlite` bundled SQLite 是当前批准的生产后端；`sqlx-sqlite`、`libsql` 等候选不进入默认构建，除非重新通过真实文件兼容、资源占用、WAL/崩溃恢复和跨进程测试。
+- 如果必须打开一个由官方 SQLite/Go 生成的任意历史数据库，先用 fixture 验证 SQLite 文件格式、JSON/FTS/transaction/pragma 兼容性。当前 Go 的 `nodes_fts` 是可从 `nodes` 重建的派生索引，正式迁移前应由 Go/export bridge 生成一致快照并排除该 FTS5 shadow table，再交给 rusqlite；不满足时使用 Go 导出 NDJSON/SQL dump，再导入 Rust。Rust 侧的真实 snapshot 回归必须使用该 FTS-free export，并同时保留未处理原库的 fail-closed 回归。
+- 正式导出命令为 `GOEXPERIMENT=jsonv2,greenteagc go run ./cmd/yuhaiin-rust-export -source /path/to/state.db -output ~/.cache/yuhaiin-rust-check/go-state-<unique>.sqlite`。它用 `VACUUM INTO` 获取包含 WAL 已提交数据的一致副本，在副本事务中删除可重建的 FTS5 virtual table，执行 `quick_check`，生成带 schema/tool version、FakeIP 行数、移除表、字节数和 SHA-256 的 `.manifest.json`，并拒绝覆盖已有 output/manifest；source 不会被修改。停止 Go 写入者是迁移边界的一部分，不能把正在写入的 live file 当作静态 fixture。
+- Go snapshot 生成后，执行 `cargo run -p yuhaiin-store --all-features --offline --bin go_snapshot_migrate -- --source ~/.cache/yuhaiin-rust-check/go-state-<unique>.sqlite --destination ~/.cache/yuhaiin-rust-check/rust-state-<unique>.sqlite`。Rust 入口会自动校验同名 manifest、拒绝非空 WAL source，先在 sibling staging file 中完成 schema/import，再 checkpoint 并 atomic rename；destination 已存在、manifest/hash 不匹配、导入失败或 source 不符合 consistent snapshot 契约时不会覆盖最终 state。
+- `redb` 只作为可选的高速 cache、临时索引或未来的纯 Rust 替代后端，不能成为配置数据的唯一来源，也不能让 FakeIP 和配置 DB 产生两套不一致的事实源。
+- repository 通过本地 typed SQLite adapter 接入底层 backend；未来如果需要第二个 backend，再把该 adapter 提升为明确的 `DatabaseEngine` trait。当前 `ConfigStore::backup_to` 使用写锁内的 `VACUUM INTO` 生成一致快照，随后用 staging 数据库启动/完整性校验、checkpoint 和 atomic rename 安装；`restore_database` 要求运行中的目标 `ConfigStore` 先关闭，校验 backup 后再原子替换目标，损坏 backup 不会改动目标文件；`compact_if_needed` 读取 `freelist_count`，只有达到调用方阈值才执行 checkpoint/VACUUM。backup/restore、schema migration、transaction、vacuum/compact 和 corruption recovery 均有独立测试。
+
+#### 配置 repository 规则
+
+- `Database::open(path)` 只负责打开文件、设置 busy timeout/WAL 等策略、执行幂等 migrations 和返回连接句柄；不能在构造过程中启动 resolver、TUN 或下载 GeoIP。
+- 单个 repository 方法代表一个完整业务写事务，例如 `save_route_rule`、`save_resolver`、`save_tun_settings`、`save_fakeip_entry`；上层不能拿裸 connection 跨 crate 修改表。
+- SQLite 中的 bool 使用 `INTEGER NOT NULL CHECK (value IN (0, 1))`，enum 使用稳定的整数或字符串 code；JSON 只用于扩展字段，核心字段必须是可索引列。
+- 任何“配置写入 + runtime apply”流程先 commit SQLite，再构造新 runtime snapshot；新 snapshot 成功后原子替换，旧资源在锁外 close。runtime apply 失败不能回滚已经成功的配置写入，但必须记录 error/status，重启时可以重试。
+- `dns_hosts` 先通过 `ConfigRepository::list_go_dns_hosts()` 读取为兼容记录，再由上层通过 `HostsTable::insert_target()` 转换；HostsTable 同时可注入同步 `HostsDnsHandler` 和异步 packet handler，A/AAAA 命中静态地址或 alias 链，其他 record type 或未解析 alias 继续走 upstream。target 仍保留为字符串，store 层不擅自改变原始配置。
+- schema version、migration name、applied timestamp 和 source format 写在 `migrate`/`metadata`；migration 必须事务化、可重复探测，禁止依赖“当前表是否存在”推断半迁移状态。
+- backup 采用 SQLite consistent snapshot 或 repository export；恢复先写临时文件并执行 integrity check，再原子替换。恢复期间不能让运行中的 resolver/TUN 持有旧 DB connection。
+- 统计和连接历史属于可清理数据，不得与 route/DNS/TUN 配置共用不可回收的 transaction；提供 retention/compact 测试。
+
+### 5.3 DNS answer 行为
+
+`yuhaiin-fakeip` 只负责 answer transform，不负责选择 route：
+
+- A/AAAA：按 resolver policy 生成 fake address；IPv6 disabled 时返回空 AAAA。
+- FakeIP skip-check 关闭时，先请求 upstream，只有 upstream 有对应记录时才生成 fake answer。
+- PTR：把 `in-addr.arpa`/`ip6.arpa` 反解为 fakeip pool 的 domain；无映射时回源 resolver。
+- HTTPS/SVCB：从 upstream message 取 IP hint，写入对应 FakeIP pool 的正反向映射；返回给客户端前把 `ipv4hint`/`ipv6hint` 替换为 FakeIP，其他 target、priority、ALPN、ECH 和未知 SvcParam 原样保留，避免客户端绕过 FakeIP。
+- 非 A、AAAA、PTR、HTTPS、SVCB 查询直接交给 upstream。
+- hosts override 位于 resolver upstream 之前：已知 host 的 A/AAAA 返回配置地址（缺少对应 family 时返回空集合），alias 可沿有限链解析，未解析 alias 和未知 host 回源，PTR/HTTPS/SVCB 继续回源；同步、异步 handler 共用同一个可热更新 `HostsTable`，alias cycle 作为配置错误返回。
+- 非法 domain 返回 NXDOMAIN/输入错误，不把任意字符串写入 pool。
+
+`Raw` 变换必须保持 request ID、question、rcode、TTL 和 EDNS 相关字段的合法性，并增加固定 wire fixture 测试。
+
+### 5.4 旧数据迁移
+
+迁移顺序：
+
+1. 启动时读取迁移 metadata；已完成且 source fingerprint 未变化时跳过。
+2. 优先支持当前 Go SQLite fakeip schema（`fakeip_entries`、`fakeip_cursors`）。
+3. 支持旧 Pebble 的 `prefix.String()` bucket 以及历史 `fakedns_cache`/`fakedns_cachev6` 布局。
+4. 对每条记录检查 family、prefix、IP 是否合法，非法记录计数并跳过；不能让一条坏记录阻塞全库。
+5. 迁移写入 SQLite 的正向/反向索引和 cursor，单批事务提交。
+6. 完成后写 metadata；失败时不写完成标记，重启可幂等重试。
+7. 在新实现稳定前保留 Go 导出工具：将旧 SQLite/Pebble 转成版本化 NDJSON，再由 Rust `LegacyFakeIpExport::parse_ndjson`（IPv4）或 `LegacyFakeIpV6Export::parse_ndjson`（IPv6）完成严格校验，最后交给对应的事务性 importer 导入。这是无法安全解析旧 SQLite 文件时的后备路径；Rust 不直接打开 Pebble 文件。两个 address family 使用独立 marker、typed scope 和 cursor，迁移失败不会留下半成品。Go v6 `_v2` 配置导入还会主动校验 `data_json`，即使损坏数据库绕过原始 `json_valid` 约束，也必须 fail-closed 并在修复后重试。
+
+迁移不应在 resolver 的全局锁、DNS server listener 或 NAT source lock 中执行。先读取配置 snapshot，再创建 FakeIP manager，最后把 manager 注入 resolver；关闭旧 resolver/DB 必须在保护锁外执行。
+
+### 5.5 FakeIP 验收测试
+
+- 同一 domain 并发 1000 次只生成一个 IP。
+- IPv4/IPv6 两个 pool 相互隔离；prefix 改变后旧 entry 不命中。
+- cursor 重启后继续而非从头覆盖。
+- 池满、循环、过期复用、反查和错误 IP 全覆盖。
+- SQLite transaction 在中途注入错误后，正向/反向索引保持一致；跨进程 force-stop 不能留下未提交 FakeIP row。
+- Go 生成的 fakeip DNS request/response 与 Rust 结果逐字节或按允许字段比较。
+- 旧 SQLite/Pebble fixture 可重复导入，第二次导入不产生重复数据。
+- 配置 schema 从空库、旧版本库、缺失 migration marker 和部分失败 migration 恢复；重复启动不重复执行 migration。
+- DNS codec 与 FakeIP owner-future handler 已覆盖 A/AAAA/PTR/HTTPS/SVCB；SVCB/HTTPS target、priority、ALPN、ECH、未知 SvcParam 和 root target 可 round-trip，本地 `in-addr.arpa`/`ip6.arpa` 命中在调用 upstream 前返回，未知映射保留 upstream fallback；服务 binding 的 IPv4/IPv6 hint 会分别映射到对应 FakeIP pool。
+- SQLite busy timeout、并发读、单写者、WAL/checkpoint、VACUUM/compact、备份恢复和损坏数据库错误都要有测试。
+
+当前跨进程验收还覆盖 12 个 batch writer 与 6 个 reader 的 WAL 压力、FakeIP typed row
+force-stop，以及独立进程
+force-stop/reopen。`ConfigStore` 对每个文件数据库使用同目录 sidecar 的标准库
+`File::lock()` 串行化 startup/migration 和写事务，读操作仍可并发；对 busy/locked
+和 SQLite 并发 WAL/lock 的明确瞬态错误执行有界退避。持久化
+`quick_check`/WAL frame integrity 错误仍 fail-closed，不会被无限重试掩盖。测试
+runner 会串行调度不同数据库 fixture，避免测试进程复用相同的缓存路径；每个 fixture
+内的 writer/reader 仍保持真实并发。sidecar 文件随数据库
+路径生成，异常退出时由操作系统释放锁，测试清理它但不把它当作数据库内容。
+
+## 6. DNS resolver 与 server
+
+### 6.1 分层
+
+```text
+Resolver (LookupIP / Raw / Close)
+ ├── Cache + singleflight
+ ├── A/AAAA policy and parallel lookup
+ ├── Group (staggered fallback / first success)
+ ├── Transport: UDP / TCP / DoT / DoH2
+ └── optional FakeIP / Hosts wrapper
+```
+
+`Transport` 只接受已经编码的 DNS message，并返回解析后的 message；它不负责 route policy 和 fakeip。这样 UDP、DoH、TCP 都能共享 message/cache/TC fallback。
+
+### 6.2 Resolver client 行为
+
+- `LookupIP` 的 PreferIPv4/PreferIPv6 只查询对应 qtype；默认 A 和 AAAA 并行。
+- 两个 family 都失败时合并错误，但保留 family 信息。
+- raw cache key 至少为 normalized name + qtype；TTL 取答案中可用 TTL，最小 TTL/最大 TTL 由配置限制。
+- 同一个 raw query 使用 singleflight；超时的 caller 不能取消其他 caller 已经在用的 request，除非它是唯一 owner。
+- request ID 必须与 response ID 相同；question 不匹配视为协议错误。
+- response `TC` 时丢弃该答案并用 TCP/DoT 重试；TCP message 使用两字节 big-endian length。
+- HTTPS/SVCB answer 的 IPv4Hint/IPv6Hint 由 FakeIP wrapper 分别替换为 v4/v6 fake address；service binding 的其他字段和未知参数不丢失。
+- resolver close 要取消 transport worker、释放 UDP socket、停止 refresh worker 和关闭 HTTP2 pool。
+
+### 6.3 UDP transport（第一优先级）
+
+采用单个 transport 级 UDP socket 加 response dispatcher：
+
+```text
+query task -> bounded write channel (capacity ~200)
+                         |
+                    UDP socket
+                         |
+                read loop / parser
+                         |
+     (dns id, name, qtype) -> pending request
+```
+
+要求：
+
+- 远端是 domain 时通过注入的 bootstrap resolver 解析；不能调用正在初始化的 resolver 自身。
+- response map key 保留 Go 的 `id:name|qtype` 语义；同 ID 但 question 不同不能错误唤醒。
+- read timeout 后关闭 socket，下一次写请求再 lazy reconnect。
+- write 和 read 都有独立 deadline；ctx cancel 必须移除 pending request。
+- UDP message 大小受 `MaxSegmentSize` 限制；超大或无法 decode 的包丢弃并记录计数。
+- server 端 UDP 每个请求复制独立 bytes，并受 semaphore 限制，不能让单个客户端无限占用 task。
+
+### 6.4 DoH/HTTP2
+
+第一版实现 DoH POST：
+
+```text
+POST /dns-query
+Content-Type: application/dns-message
+Accept: application/dns-message
+body = packed DNS message
+```
+
+- 支持 URL 没有 path 时默认 `/dns-query`。
+- TLS ServerName 默认取 URL hostname，可被配置覆盖。
+- HTTP dial 使用 `Proxy::connect`，不能直接调用系统 `TcpStream::connect`，否则 route/proxy 和 bootstrap 规则会失效。
+- 使用 HTTP/2 connection pool、idle timeout、read-idle ping；response status 非 200、body 为空、超过上限或 DNS decode 失败都返回错误。
+- DoH client 发送 request body 前保持 request stream open；单次 query 只等待完整 response body，同时继续驱动 HTTP/2 connection，不等待服务端主动关闭长连接。这样既避免 `end_stream` 提前结束造成的 H2 frame error，也允许标准 keep-alive DoH server 正常返回。
+- GET/base64url 可以作为兼容扩展，但不是第一阶段的主路径。
+- DoH JSON API 只作为低优先级管理/诊断接口，不代替 wire-format DoH。
+
+### 6.5 DNS group
+
+保留 Go `Group` 的语义：第一个 transport 立即启动，后续 transport 默认间隔约 100ms 启动；前一个快速失败时可提前启动下一个。第一个成功且 `Rcode=Success` 的 response 胜出；若全部是非成功 response，保留第一个可用 fallback message。
+
+实现为一个 cancellation-aware coordinator，不让每个 transport 自己创建无界 task。关闭 group 时广播 cancel 并等待 children 退出。
+
+### 6.6 DNS server
+
+支持 UDP 和 TCP：
+
+- UDP：decode request、并发限制、调用 `resolver.raw`、恢复 request ID、encode response、写回源地址。
+- TCP：两字节长度前缀，读取完整 message，处理一次 request 后按当前 Go 行为关闭连接；以后可增加 keep-alive。
+- 每个 request 创建带 timeout 的 `FlowContext`；`force_fakeip` 写入 resolver policy，而不是修改全局 FakeIP 开关。
+- 空 question、非法 packet、超长 length、写回失败都必须是明确错误。
+- server close 要同时关闭 UDP/TCP listener，并等待 in-flight requests 或取消它们。
+
+### 6.7 DoQ/DoH3 后置
+
+为 `DnsTransport` 保留 `doq`/`doh3` 类型注册点，但默认不编译。它们需要同时回答：QUIC 实现、TLS provider、HTTP/3、0-RTT 和证书验证是否满足纯 Rust 审计；在此之前不能偷偷把 `quinn` 默认 crypto feature 带入主依赖。
+
+## 7. Trie 与 Router
+
+### 7.1 Trie 数据结构
+
+`yuhaiin-trie` 只包含数据结构和匹配语义，不依赖 Tokio、DNS 或 proxy。
+
+#### Domain trie
+
+- domain 按 label 反向插入：`www.example.com` 的查询顺序为 `com -> example -> www`。
+- 完整域名优先于父域名；父域规则能匹配子域名。
+- `*` 是单个 label 的 wildcard，必须严格实现当前 Go trie 的 wildcard fallback 语义。
+- 规范化大小写和尾点；不要把 `example.com.evil.com` 当成 `example.com`。
+- 插入、删除构造新 snapshot；查询无锁读取 `Arc<DomainTrie<T>>`。
+
+#### CIDR trie
+
+- IPv4、IPv6 分开根节点。
+- 查询返回最长匹配 prefix 的 mark。
+- insert/remove 后 snapshot 替换，不在查询中修改节点。
+- 覆盖 `/0`、host route、重叠 prefix、IPv4-mapped IPv6 和非法 prefix。
+
+#### Combined matcher
+
+```rust
+pub struct Matcher<T> {
+    pub domain: DomainTrie<T>,
+    pub cidr: CidrTrie<T>,
+}
+
+pub fn search(&self, endpoint: &Endpoint) -> Vec<T>;
+```
+
+如后续添加 process trie、MaxMindDB，使用新的 matcher source，不把数据塞进 domain/cidr 节点。
+
+### 7.2 Router 决策顺序
+
+保留当前 `Route::dispatch` 的阶段顺序：
+
+1. 创建/取得 flow context，执行 loopback/cycle guard。
+2. 读取进程信息（若平台能力存在）；没有平台能力时返回 unknown，而不是模拟 direct。
+3. 设置默认 resolver。
+4. 查询 geo/list snapshot，把命中的 list 写入 match history。
+5. 按 matcher 顺序运行：context route mode -> normal mode；第一个非 unspecified mode 胜出。
+6. 根据 resolve strategy 设置 resolver policy：only/prefer IPv4/IPv6。
+7. 根据 UDP proxy FQDN strategy 决定是否 resolve target。
+8. 选择 mode、tag、resolver；若 `resolve_locally` 且为 proxy，再显式把 domain 替换成 IP，同时保留 original domain。
+9. `Conn` 调用 proxy 的 stream，`PacketConn` 调用 proxy 的 datagram；block 使用 drop 或 reject policy，不通过 direct。
+
+`Dispatch` 是 NAT 和某些 transport 使用的“只把逻辑地址变成实际地址”接口，必须支持 `skip_route`。NAT 第一次建 flow 时可以 route，后续同一 destination 复用 dispatch/resolve cache，避免 UDP 每包重新决策。
+
+### 7.3 规则配置与生效
+
+规则表和 runtime matcher 分离：
+
+```text
+RuleStore -> RuleCompiler -> immutable MatcherSnapshot -> Router
+```
+
+规则保存可以立即持久化，但 runtime apply 可以延迟。保留 `apply_at`、版本号和成功清零的 status，便于 UI/控制面知道 list 何时真正生效。apply 过程不能在旧 snapshot 的读锁中 close/rebuild trie。
+
+### 7.4 MaxMindDB
+
+Go 端的 `pkg/net/trie/maxminddb` 只需要按 IP 查询国家 ISO code，并在目标是域名时先通过当前 flow resolver 得到候选 IP。Rust 版将它作为独立的 `yuhaiin-geo` provider：
+
+```rust
+pub trait GeoIp: Send + Sync {
+    fn lookup_ip(&self, ip: IpAddr) -> Result<Option<CountryCode>>;
+    fn lookup_endpoint(&self, ctx: &FlowContext, endpoint: &Endpoint)
+        -> BoxFuture<'_, Result<Option<CountryCode>>>;
+}
+```
+
+- 使用现成的 [`maxminddb`](https://docs.rs/maxminddb/latest/maxminddb/) crate；它支持 GeoIP2/GeoLite2，默认内存读取，`mmap` 是可选 feature，依赖树不需要 C library。
+- 数据文件不放进 SQLite blob；SQLite 只保存下载 URL、版本、sha256、文件路径、last refresh、error 状态。
+- 下载到临时文件，校验长度/sha256/MaxMind metadata 后 atomic rename；打开新 reader 成功后用 `Arc` 一次性替换旧 snapshot。
+- 下载失败、文件损坏或 schema 不匹配时保留旧 reader，SQLite 记录 error；不能因为 GeoIP 更新失败让 Router 没有任何 geo provider。
+- lookup 只返回纯数据 `CountryCode`；不把 MaxMind reader 的生命周期暴露给 route matcher。
+- 域名查询遵循当前行为：使用 flow 的 `RouteIPs`/resolver 得到候选地址，逐个查询，首个成功 country 胜出；不能为了 geo 查询再次进入完整 route 造成递归。
+- reader close 必须在 snapshot 替换完成且不再被引用后执行；不要持有 geo mutex 调用文件 I/O。
+
+MaxMindDB 测试至少包含：官方 test database fixture、IPv4/IPv6、未命中、损坏文件、并发 lookup、热替换期间旧 reader 可用、关闭后 lookup 返回明确错误，以及域名解析失败不影响普通 route。
+
+### 7.5 TUN 数据面
+
+TUN 不是一个普通 proxy wrapper，而是系统入口：
+
+```text
+OS TUN device
+      |
+  packet reader
+      |
+IPv4/IPv6 parser + checksum/MTU validation
+      |
+  TCP / UDP / ICMP dispatcher
+      |
+FlowContext -> Router -> Proxy/NAT
+      |
+  packet writer -> OS TUN device
+```
+
+Rust 侧拆成三层：
+
+1. `TunDevice`：设备创建、读写、batch、MTU、packet-info header、multi-queue、persist、close。
+2. `IpStack`：IP packet decode/encode、TCP/UDP/ICMP socket state、fragment/MTU 和 timer。
+3. `TunHandler`：把 TCP stream、UDP datagram、DNS request、ping 交给现有 Router/Proxy/NAT。
+
+#### 第一阶段唯一实现路径：tun-rs + smoltcp
+
+第一阶段不同时实现 tun2socket 和另一套用户态 stack。直接采用：
+
+```text
+tun-rs AsyncDevice
+        |
+smoltcp device adapter
+        |
+smoltcp Interface + TCP/UDP/ICMP sockets
+        |
+yuhaiin-tun adapter -> FlowContext -> Router -> Proxy/NAT
+```
+
+- `tun-rs` 负责创建/持有 TUN、异步读写、MTU、multi-queue、packet-info 和平台设备配置。
+- `smoltcp` 负责 IP/TCP/UDP/ICMP packet parsing、checksum、socket state machine、timer 和回包构造。
+- `yuhaiin-tun` 只做 adapter：把 smoltcp socket event 转成统一的 `StreamMeta`/`Packet`/`PingMeta`，把 Router/Proxy/NAT 的结果写回 smoltcp socket。
+- UDP tuple mapping、TCP connection lifetime、DNS request 识别、FakeIP、route block/direct/proxy 由 adapter 与现有 NAT/Router 组合完成，不再复制一套 tun2socket NAT。
+- `tun-routes` 是显式可选的系统 route 边界：`TunRouteLease` 先校验并规范化所有 route，再按顺序 add、失败时逆序 rollback、close 时逆序 remove；生产 Linux backend 使用纯 Rust `route_manager` netlink，不执行 `ip` shell 命令。route lease 只管理系统资源，不参与 NAT lookup；NAT 始终保持按 source/migrate ID 的 endpoint-independent Full Cone 语义。
+- 首版只启用 smoltcp 实际支持且测试通过的 IPv4/IPv6 TCP+UDP/ICMP 子集；缺失能力返回明确的 `Unsupported`，不悄悄切换到第二套 stack。
+
+这是“先用现成高性能库”的策略：先用真实 benchmark 和行为 fixture 验证 smoltcp。如果未来发现某项能力（例如特定 TCP option、分片、拥塞控制或平台 offload）无法满足，再把 `IpStackAdapter` 替换为自研实现；那是后续替换，不是第一阶段并行维护。
+
+当前 Go 的 gVisor/tun2socket 只作为行为参考和互操作测试对象：双栈 gateway、UDP timeout、DNS request 判定、MTU、回写、关闭顺序都要覆盖，但 Rust 不照搬两套实现。
+
+#### TUN 设备和平台边界
+
+- 首选评估 [`tun-rs`](https://docs.rs/tun-rs/latest/tun_rs/) 的 async API；它覆盖 Linux、macOS、Windows、Android、iOS、BSD，并提供 multi-queue、MTU、persist、owner/group 和 async device 能力。
+- TUN 创建最终仍然需要平台 fd/ioctl/driver API。第三方 crate 是否含 `libc`/系统 FFI 必须在 `cargo tree` 和源码审计中单独记录；“纯 Rust runtime”不等于可以忽略 OS ABI 边界。
+- 所有平台 unsafe/FFI 只能集中在 `yuhaiin-platform`/`yuhaiin-tun`，上层不得直接操作 fd、ioctl 或平台路由命令。
+- Linux 先覆盖 `/dev/net/tun`、netlink route、multi-queue、close-on-exec；Android 通过 VpnService/传入 fd；macOS 使用 utun；Windows 使用 Wintun 或传入已有 fd/handle。每个平台都要有 capability probe，缺能力时返回 Unsupported，不静默降级为普通 socket。
+- TUN portal、IPv4/IPv6 prefix、routes、MTU、gateway、DNS hijack、driver 和名称冲突处理写入 SQLite 配置，并在启动前做 prefix/MTU/route 校验。
+- 设备创建成功后再设置地址和 route；任一 post-up 步骤失败必须按反向顺序清理设备和已安装 route。`TunRuntime::close_routes` 可重复调用，失败删除会继续保留 route lease 供显式重试；`Drop` 只做最后一次 best-effort cleanup，平台 app 必须优先调用显式 close 并记录错误。
+
+#### TUN 测试
+
+- 无权限环境测试 `TunDevice` builder 的配置校验、packet-info offset、MTU、名称冲突和 close 顺序，不要求真实设备。
+- privileged CI 在 Linux 用 network namespace 创建临时 TUN，测试 tun-rs + smoltcp 的 IPv4/IPv6 TCP echo、UDP echo、DNS hijack、FakeIP、route block/direct/proxy 和回写。
+- 单独测试 malformed IP header、短 TCP/UDP/ICMP、错误 checksum、fragment、超 MTU、未知 protocol、队列满和 reader close。
+- 用 deterministic clock 测试 smoltcp TCP retransmission、socket timer、UDP mapping timeout、NAT idle timeout 和 TUN shutdown；不要依赖真实 sleep 才能判定。
+- TUN 与 Yuubinsya native UDP/UOT、SOCKS5 UDP、DoH endpoint、MaxMindDB domain lookup 做组合测试。
+
+当前 Rust 实现已覆盖无权限的 UDP、TCP SYN/SYN-ACK、ICMP echo 和 TX queue backpressure 单元测试，并提供 `yuhaiin-core` 的 `tun-smoke` binary。Podman 特权 namespace 已验证设备创建、真实 IPv6 控制包过滤、IPv4 ICMP ingress、smoltcp ICMP socket 收包、真实 checksum 回包和 Linux kernel ping echo（0% loss）。
+
+#### TUN 当前代码入口
+
+- `yuhaiin_core::tun::TunRuntime::open` 是最小设备入口，`open_with_routes` 是需要系统路由时的事务式启动入口；`TunRuntime::name()` 返回内核最终确认的接口名，`TunRuntime::shutdown` 提供显式的 route-before-fd-drop 关闭边界；不并行实现 tun2socket 或用户态第二套 IP stack。`open_with_routes` 的 route 配置失败会回收已创建设备并允许同名恢复；`tun-smoke` 的 `YUHAIIN_TUN_ROUTE_SMOKE=1` 会安装纯 Rust netlink route，便于在隔离 namespace 验收 shutdown、SIGKILL 和 route/device 清理；多进程验收还确认同名 TUN 不能被第二个 owner 抢占，首个 owner 终止后可重新启动。
+- `TunRuntime::install_routes` 接收注入式 backend；Linux 使用 `install_linux_routes` 创建 `route_manager` netlink backend。route add/delete 和 rollback 可以在无 root 的 fake backend 单测中验证，真实 netlink 验收放在隔离 network namespace，避免测试修改宿主路由。
+- `SmoltcpTunDevice` 的 RX/TX 队列有界，队满返回 `WouldBlock`，不会静默丢包或无限增长；TUN 是软件 checksum 边界，不能把 checksum capability 标成 `ignored`。
+- `add_ip_address`/`replace_ip_addresses` 只修改 smoltcp 地址集合，不偷偷修改 OS 路由；这让 gateway/service 地址分离可以由上层明确配置。
+- `TunProxyRuntime` 不会在 TUN packet event loop 内直接等待 pending async DNS resolver；`AsyncDnsHandler` 的 owner future 进入本地 `FuturesUnordered`，由 `poll_outputs` 逐步收割，并使用 `ProxyTimeouts.read` 作为 upstream timeout。超时和错误都会生成 `UdpClosed`，关闭时丢弃 pending future 并清理 Full Cone flow；`close_graceful` 会在 deadline 内继续轮询已完成的 DNS task。
+- `tun-smoke` 支持 `YUHAIIN_TUN_READ_ONCE=1` 验证真实 ingress，`YUHAIIN_TUN_ECHO=1` 验证 ICMPv4 socket、checksum 和 Linux kernel echo，`YUHAIIN_TUN_PROXY_ECHO=1` 验证真实 TUN TCP → `TunRuntime` → fixed async proxy → local echo，`YUHAIIN_TUN_DNS_ECHO=1` 验证真实 TUN DNS query → async handler hijack → UDP response 回写；`yuhaiin-store` 的 `tun-fakeip-smoke` 进一步验证真实 TUN DNS query → HTTP/2 DoH → `FakeIpAsyncDnsHandler` → SQLite FakeIP pool → FakeIP response 回写。临时 build target 和 fixture 统一放在 `/home/asutorufa/.cache/yuhaiin-rust-check`，不使用 `/tmp`。
+
+### 7.6 可运行的 HTTP/2 + Yuubinsya 链
+
+`yuhaiin-chain` 对用户提供的四段链采用显式结构：
+
+```text
+fixedv2 TCP address
+        -> TLS (Rustls RustCrypto provider, ALPN h2)
+        -> HTTP/2 CONNECT stream
+        -> Yuubinsya TCP header or UOT migrate/frame session
+```
+
+TLS server name 与 Go 兼容：`<bilibili_mcdn>.suffix` 会生成随机 `xy...xy.suffix`，不会把尖括号直接传给 Rustls；JSON 中经 HTML 转义的 `&lt;...&gt;` 也会规范化。HTTP/2 每个 CONNECT stream 使用 bounded duplex relay，h2 flow-control 由 relay 独占处理。Yuubinsya UOT 首先发送 `UdpWithMigrateId` header，读取 server 分配的 u64，再使用 `[Socks address][u16 length][payload]` frame。
+
+本地测试覆盖配置顺序校验、TLS SNI 规则、HTTP/2 双向 CONNECT relay/GOAWAY 重建、Yuubinsya TCP header、UOT client/server migrate/frame 和 Ping client/server probe。给定的远端配置还通过了真实互操作 smoke：
+
+```text
+YUHAIIN_CHAIN_TARGET=example.com:80 \
+YUHAIIN_CHAIN_PROBE=1 \
+/home/asutorufa/.cache/yuhaiin-rust-check/target/debug/chain-smoke CONFIG.json tcp
+# tcp-probe-reply-bytes=828
+
+YUHAIIN_CHAIN_TARGET=1.1.1.1:53 \
+YUHAIIN_CHAIN_PROBE=1 \
+/home/asutorufa/.cache/yuhaiin-rust-check/target/debug/chain-smoke CONFIG.json uot
+# uot-reply source=udp://1.1.1.1:53 bytes=61
+```
+
+这里的 `CONFIG.json` 只作为用户外部配置读取，密码和 CA 不复制进仓库。当前 `concurrency` 同时限制 bounded CONNECT pipe 容量；Rust 版已经有按 fixed endpoint 的 HTTP/2 pool、多 stream 复用、有 owner flush task 的有界 UOT coalesced writer、application-level drain、peer GOAWAY 观察和连接重建，且已有优雅 drain/session rollover 验收。由于 `h2 0.4` 的公开 client API 不提供主动发送 GOAWAY frame，Rust 版接受将 client-side GOAWAY 作为非阻塞延期，不调用私有 API 或引入 raw frame hack；当前关闭策略已满足使用需求，未来只有升级到公开支持该能力的 h2 API 才重新评估主动 GOAWAY。
+
+## 8. Proxy 迁移顺序与契约
+
+### 8.1 基础 proxy
+
+补充：Go 的 `fixed/fixedv2 -> yuubinsya` 且 `udp_over_stream=false` 节点现在由 core 的 native Yuubinsya UDP proxy 直接构造；它复用统一 resolver 解析 fixed endpoint，并且明确只提供 datagram，不会把 UDP 节点错误降级成 TCP stream。`udp_over_stream=true` 或包含 TLS/HTTP2 的链继续交给 `yuhaiin-chain`。
+
+`yuhaiin-chain` 现在也支持 Go 的简化 `fixed/fixedv2 -> yuubinsya(udp_over_stream=true)`：直接 TCP 建连后执行 migrate-ID handshake 和 UOT frame，支持 coalesce、域名 resolver、有限重连、proxy close 时回收活动 datagram 和原有 `AsyncProxy` datagram 契约；完整 `fixedv2 -> TLS -> HTTP/2 -> Yuubinsya` 继续使用 H2 pool，不改变既有链路。
+
+配置迁移先经过 `yuhaiin-store` 的 `GoProxyRuntimeConfig` 边界：它从 Go `nodes_v2` 的 `chain_types_json` 和 tagged `data_json` 选择可构造的基础 transport，保留有序 protocol layer、启用状态及完整原始 JSON。基础 direct/drop/fixed/HTTP CONNECT/SOCKS5 由 `yuhaiin-core::proxy_factory::BaseProxyConfig` 统一构造；fixed/fixedv2 的 Go 字面量 `{host, port}` 地址由 `yuhaiin-chain::parse_go_node` 归一化，`ChainClient::from_go_json`/`ChainProxy::from_go_json` 可直接从原始 Go node payload 构造当前 `fixedv2 -> TLS -> HTTP/2 -> Yuubinsya` runtime，并在连接时异步解析 fixed 上游域名。`yuhaiin-runtime::RuntimeBuilder` 现在读取这些 shared runtime structs，使用同一个 `Arc<dyn AsyncIpResolver>` 构造 direct/HTTP/SOCKS5 或 chain proxy；`RuntimeSnapshot::build_proxy_selector` 再把这些 shared proxy records 组装成 TUN 的 direct/proxy/bypass/drop selector，缺少 proxy 配置时 fail-closed；通过 `RuntimeController` 注册的 selector 会在 reload publish 前原子替换 proxy slots，失败时保留旧 snapshot。新 Rust store 也初始化 `nodes_v2`、`inbounds_v2`、`node_tags_v2`、`resolvers_v2`、`route_rules_v2`、`route_lists_v2`，fresh DB 可直接通过 repository 保存 Go compatibility records。基础 builder 的 `to_base_proxy_config_with_resolver` 允许 HTTP、SOCKS5 和 fixed 域名复用 hosts/FakeIP/cache policy。同步 `to_base_proxy_config` 仍保留系统 `ToSocketAddrs` 兼容入口。应用启动和配置 reload 不能让各 proxy 自己创建全局 resolver。当前不会把域名静默当作 `0.0.0.0` 或 direct。`GoProxyTransport::Unknown` 只表示“暂未实现的协议”，运行时 builder 必须显式报错或提供对应实现，禁止未知节点静默变成 direct。
+
+HTTP 层暂不复制一套 DTO：`GoProxyRuntimeConfig`、`GoProxyLayer`、resolver/route/FakeIP runtime structs 作为共享 wire model，使用稳定的 camelCase 字段；`data_json` 不参与序列化，proxy layer 的 password/secret/token/private_key 在 Serialize 时统一打码。未来 handler 只需加鉴权、分页和状态码映射，不改变这些核心模型或 SQLite repository。
+
+#### direct
+
+- TCP 使用 Happy Eyeballs；hostname 由 resolver 注入解析，不强制系统 resolver。
+- UDP 使用绑定地址、interface、目标 hint；目标是 domain 时先选一个 IP 作为 socket hint，但保留原目标供上层。
+- `close` 幂等；direct 不拥有全局 bootstrap resolver。
+
+#### fixed
+
+- 配置一个主地址和 alternate addresses。
+- 多地址连接采用 Happy Eyeballs，当前 Go 行为约 650ms stagger，并保存最近成功 index。
+- 主地址连续失败可按当前行为退避/刷新；不能把 alternate 失败永久缓存成成功。
+- fixed 可以包在另一个 proxy 上，也可以直接走 direct；这由构造时注入的 parent dialer 决定。
+
+#### drop
+
+- `connect` 返回一个可写但读端按 delay 后 EOF 的 fake stream；`send_to` 接受 payload 但不发到网络。
+- 按目标共享短期 delay cache，失败次数指数增长并有上限；ping 返回 block/drop error。
+- drop 不创建真实 socket，不应因为它被 route 选择而触发 DNS。
+
+### 8.2 TLS wrapper
+
+- 只包装 stream；datagram 原样委托 parent，除非后续明确实现 DTLS/QUIC。
+- 支持固定 SNI、多个 server name 随机池、CA、insecure、ALPN；握手必须绑定 caller context。
+- TLS config pool 只读共享；每个连接 clone 可变字段，不修改共享 config。
+- 默认纯 Rust 审计：`rustls` 使用 `default-features = false`；不得意外启用 `aws-lc-rs` 或 `ring`。RustCrypto provider 当前仍是实验性实现，正式发布前必须进行协议覆盖、性能、证书验证和安全评审；如果不能达到要求，TLS 功能必须明确标为未完成，而不是换成系统 C TLS。
+
+### 8.3 HTTP CONNECT proxy
+
+- 先通过 parent `connect` 建到 proxy endpoint。
+- 发送 HTTP/1.1 CONNECT，Host 为目标地址，可选 Basic `Proxy-Authorization`。
+- 必须检查完整 response status；非 2xx 关闭底层连接。
+- response body 和 buffered reader 的生命周期要挂在返回 stream 上，避免读掉 tunnel 后的字节。
+- 用户名/密码只在内存中使用，日志打码。
+
+### 8.4 SOCKS5
+
+- 实现 RFC 1928 method negotiation、username/password（RFC 1929）、CONNECT、UDP ASSOCIATE、BIND 的明确 unsupported response。
+- 地址 codec 支持 IPv4、IPv6、domain；保留 domain 传给远端的能力。
+- UDP ASSOCIATE 使用 SOCKS5 的 `RSV=0, FRAG=0, ATYP...` framing；要兼容当前 yuhaiin 的 `WithSocks5Prefix(true)`，为其提供 compatibility test，不要让通用 codec 把三个前缀字节误当成 payload。
+- TCP 控制连接关闭时，UDP association 一并关闭；读取 control stream 的 EOF 必须能停止 datagram。
+
+### 8.5 HTTP/2 proxy
+
+当前 Go 实现是明文 HTTP/2 prior knowledge CONNECT，不是 TLS-wrapped HTTP/2。Rust 版先保持这一点：
+
+- pool 内 stream 和 datagram 使用不同的 connection store。
+- 每条 connection 有 concurrency 上限；GOAWAY、连接错误或 Reserve 失败时移除并关闭。
+- CONNECT request 的 body 贯穿 tunnel 生命周期；不能因 parent request context 结束而过早关闭 body。
+- `http2` 自身不解析目标地址，目标由 parent proxy/route 决定。
+- 后续如需 TLS HTTP/2，作为新的 config/transport，不改变 prior-knowledge wire behavior。
+
+GOAWAY 兼容决策：peer GOAWAY 仍由 h2 connection driver 观察，active relay 会收到 shutdown signal，pool 会移除旧 connection 并为新 flow 建立 replacement；本地 client-side graceful close 使用上述 application-level drain。这样不会依赖 h2 私有结构，也不会为了一个控制帧破坏纯 Rust、可升级和可测试的 transport 边界。
+
+### 8.6 Yuubinsya
+
+Yuubinsya 要先写独立 codec，再写 client/server；不能在 client 中散落 magic number。
+
+#### 认证
+
+```text
+auth = SHA256(password bytes || "+s@1t")
+```
+
+比较必须 constant-time，长度和类型先检查；错误只返回 authentication failed。
+
+#### TCP header
+
+```text
+protocol: 1 byte
+if protocol == UDPWithMigrateID: migrate_id: u64 big endian
+auth: 32 bytes
+if TCP or Ping: SOCKS5 address
+```
+
+当前 protocol network bits：
+
+```text
+TCP             = 0b00000010
+Ping            = 0b00000100
+UDP             = 0b00000101   # legacy
+UDPWithMigrateID= 0b00000110
+```
+
+必须拒绝未知 protocol、短 header、错误 token、非法 address 和超过 deadline 的半连接。Rust 已提供异步 Ping/UOT server session 的 header 校验和 migration boundary；真实 listener 的约 16 秒 header deadline 仍应成为上层配置，而不是散落常量。
+
+#### 原生 UDP
+
+client/server 之间的 packet 格式：
+
+```text
+auth[32]
+optional socks5_prefix[0,0,0]
+destination socks5 address
+payload
+```
+
+Native UDP 使用底层 datagram；单包最大 payload 必须扣除 auth、prefix 和 address header。解码前先验证最小长度和 constant-time auth，不能 panic。
+
+#### UDP-over-TCP
+
+连接建立后，首包是带 migration ID 的 header。server 如果收到 ID=0 生成一个新的 ID，并回写 u64；client 保存它到 `FlowContext.udp_migrate_id`。
+
+随后每个 frame：
+
+```text
+destination socks5 address
+payload_len: u16 big endian
+payload[payload_len]
+```
+
+payload 不足时必须完整读取/丢弃剩余 frame；大于接收 buffer 时返回实际数据并丢弃尾部，不能把下一 frame 当成当前 payload。coalesce 是可选的 bounded batch writer，不能无界积压；实际 ChainUotSession 使用 owner flush task 在低流量时及时排空，达到 64 KiB/32 frame 仍立即 flush；flush 错误需要取消整个 packet connection。
+
+#### Ping
+
+- Ping header 携带目标地址；成功回写 u64 elapsed，失败回写全 `0xff` 八字节。Rust 已提供 client session、server accept 和 follow-up probe handler boundary。
+- client 可按 hostname 缓存 ping connection，空闲约 30 秒回收；同一连接同一时刻只允许一个 ping in flight。
+- server 读取后续 ping 每次约 30 秒 deadline；关闭时移除 cache。
+
+#### Yuubinsya server
+
+server 同时处理 TCP listener 和 UDP listener：
+
+- TCP header 决定 stream、UOT、ping；每个 accepted connection 独立 task。
+- UOT packet 转成 `Packet { source, destination, payload, migrate_id, write_back }` 交给 handler。
+- native UDP packet 同样交给 handler，write-back 用同一 packet codec。
+- server close 必须取消两个 accept/serve loop，并关闭 listener；不能只取消 context 留下阻塞的 accept。
+
+### 8.7 Proxy 兼容矩阵
+
+| Proxy | Stream | Datagram | Ping | 第一阶段 |
+| --- | --- | --- | --- | --- |
+| direct | 是 | 是 | 可选 | 必须 |
+| fixed | 是 | 是 | 委托 | 必须 |
+| drop | fake | fake | error | 必须 |
+| HTTP CONNECT | 是 | 否/委托 | 否/委托 | 必须 |
+| SOCKS5 | 是 | UDP ASSOCIATE | 可选 | 必须 |
+| TLS | wrapper | 委托 | 委托 | 必须 |
+| HTTP/2 prior knowledge | CONNECT stream | CONNECT stream | 委托 | 必须 |
+| Yuubinsya | 是 | native + UOT | 是 | 最高优先级 |
+
+## 9. NAT 迁移设计
+
+### 9.1 数据模型
+
+```text
+NatTable
+ └── FlowKey (migrate_id || source comparable)
+       └── SourceControl
+             ├── bounded sent queue
+             ├── bounded received queue
+             ├── one worker / one outbound datagram
+             ├── endpoint-independent translated mapping: source/migrate id -> one external endpoint
+             ├── dispatch cache: logical destination -> routed endpoint
+             ├── resolved cache: logical domain -> UDP socket address
+             ├── reverse NAT: returned endpoint -> original logical endpoint
+             └── idle/closed state
+```
+
+`SourceControl` 内部保持单 writer；这样可以保留 Go 实现中“同一个 UDP flow 尽量向同一个真实 IP 发包”的行为，同时减少锁。
+
+### 9.2 写入路径
+
+1. `NatTable::write` 检查 closed；确定 key。
+2. `get_or_create(key)` 创建 `SourceControl`，创建失败不插入半初始化对象。
+3. 把 packet 放入 bounded sent queue；满时递增 dropped counter 并返回 backpressure/drop error。
+4. worker 第一次处理 packet 时构造 flow context，设置 source、destination、inbound、UDP、resolver mode。
+5. 调用 proxy/router 的 `open_datagram`；保存 UDP migration ID 和 resolver snapshot。
+6. 对 destination 做 dispatch cache；是 domain 且允许 resolve 时，只解析一次并缓存实际 `SocketAddr`。
+7. 发送后设置 read deadline 为 UDP idle timeout；如果 logical target 与真实返回地址不同，写入 reverse NAT。
+
+Full-cone 约束：同一 `source`/`MigrateID` 的不同 logical destination 共享一个 translated endpoint；入站回包只按 translated endpoint 找 mapping，不按首次 outbound destination 或 remote peer 过滤。关闭一个 destination 只删除该 flow 引用，最后一个 destination 关闭后才释放 mapping。
+
+后续包优先走 `resolved_cache`；不能因为 FakeIP/domain 每次看起来不同而重新建立 remote datagram connection。
+
+### 9.3 回写路径
+
+- 每个 source control 有一个 read loop，从 remote datagram 读到 bounded received queue。
+- 如果曾经发生 reverse NAT，先用返回地址 comparable key 查原始 logical endpoint；否则直接使用 remote address。
+- write-back 使用创建 packet 时保存的 callback；回写连续失败超过阈值则关闭 flow。
+- 关闭/超时要释放所有 queued packet buffer；Rust 中用 owned `Bytes`/`BytesMut`，避免 Go refcount 等价物扩散到全局。
+
+### 9.4 Idle、迁移 ID 和 hash
+
+- `NatTable` 周期性扫描 source controls；只有 worker 已停止且 stop time 超过 `udp_idle_timeout` 才删除。
+- `MigrateID != 0` 优先于 source key；Yuubinsya UOT 和 NAT 必须共享同一 flow context 的 migration ID。
+- NAT 默认是 full-cone，而不是 restricted-cone；不能把 remote peer 写入 allowlist，也不能为同一 source 的每个 destination 分配独立 mapping。
+- 配置层同样只接受 Full Cone：新建 `nat_config` 使用 `CHECK (full_cone = 1)`，typed write 的 `full_cone=false` 和旧库中读到的受限值都会 fail-closed；当前没有 restricted-cone runtime，避免配置与数据面语义不一致。
+- `GenerateID` 使用服务启动时间作为 keyed hash key，对 `src.String()` 做 64-bit Blake2b；Rust 版固定 endian、输入规范化和测试向量，不能直接改用随机 UUID，否则跨语言调试和 fixture 不一致。
+- `MaxSegmentSize` 是全局协议上限；所有 Yuubinsya/NAT/DNS packet path 都使用一个 core 常量或注入配置，不能各自定义不同上限。
+
+### 9.5 NAT 验收测试
+
+- 同一 source 的并发 packet 只创建一个 SourceControl。
+- 同一 migration ID 即使 source 地址变化仍复用同一 flow。
+- bounded queue 满时可观测丢包，worker 恢复后不死锁。
+- domain target 只解析一次；FakeIP target 和真实 target 的 reverse NAT 能正确回写。
+- remote socket 超时会关闭 flow；table close 会关闭所有 children 并让新写入失败。
+- Yuubinsya native UDP、UOT、SOCKS5 UDP 与 NAT 组合测试。
+- loom 或等价模型测试覆盖 close/write/read 的竞争；特别检查“remove 后 worker 仍回写”的 use-after-close 逻辑错误。
+
+## 10. 分阶段实施计划
+
+### Phase 0：契约和 fixture（先做）
+
+- 建 workspace、lint、依赖审计和 `yuhaiin-core`。
+- 从 Go 测试提取 address codec、DNS message、Yuubinsya header/packet、FakeIP cursor 的 fixture。
+- 定义 `FlowContext`、`Proxy`、`Resolver`、`Datagram`、`Route` trait。
+- 交付标准：只有 core/codec 也能 `cargo test`，没有 Tokio/C TLS/SQLite 依赖；SQLite 只由 store/config 层承载。
+
+### Phase 1：FakeIP
+
+- `yuhaiin-trie` 的 domain/cidr 基础结构。
+- `yuhaiin-config` SQLite engine adapter、schema migrations、typed repositories 和 backup/export。
+- `yuhaiin-store` 的 SQLite fakeip schema、cursor、正反向索引和 touch worker；redb 只保留可选 backend/cache。
+- `yuhaiin-fakeip` answer transform、PTR、HTTPS/SVCB hints（已完成 codec、未知参数保留和双栈 hint 替换）。
+- 交付标准：本地 DNS fakeip 测试、重启测试、旧数据 fixture 导入测试、schema migration/rollback/backup 恢复测试通过。
+
+### Phase 2：DNS UDP、TCP fallback、DoH2、server
+
+- 先写 hickory-proto adapter 和 raw message model。
+- 实现 UDP single socket/pending dispatcher。
+- 实现 TCP length-prefix fallback，再实现 DoH2。Rust 版同时提供同步 `dns_tcp::TcpDnsClient`/`TcpDnsServer` 和纯 Tokio 的 `dns_tcp_async::AsyncTcpDnsClient`/`AsyncTcpDnsServer`/`AsyncTcpDnsHandler`；异步 server 支持同一连接多 frame、多个连接并发 accept 与 owner shutdown；runtime TCP resolver 使用异步实现，复用 DNS wire codec，并通过 loopback framing 与 runtime factory 查询回归。
+- 实现 UDP/TCP DNS server，接入 FakeIP。
+- UDP/TCP/DoH client 由 `dns_resolver::DnsResolver` 统一暴露，缓存和具体 DoH HTTP/proxy transport 通过注入边界组合；不把同步 socket 或 HTTP client 细节带入 Router/TUN。
+- `dns_resolver_async::AsyncDnsResolver` 以 query-level `AsyncDnsQuery` 组合异步 UDP 与 HTTP/2 DoH，并输出现有 packet-level `AsyncDnsHandler`；缓存、hosts、policy、FakeIP 可以继续按 handler 链组合。
+- 交付标准：Rust resolver/server 互通；Go resolver/server 互通；TC、超时、取消和并发限制通过。
+
+### Phase 3：Router
+
+- immutable domain/CIDR matcher snapshot。
+- route mode、resolver policy、list match history、dispatch/resolve local。
+- 接入 `yuhaiin-geo` 的 MaxMindDB provider；先使用 injected process provider，不把平台进程识别塞进 Router。
+- 交付标准：规则顺序、通配符、最长 CIDR、proxy FQDN strategy 与 Go fixture 一致。
+
+### Phase 4：基础 proxy
+
+- direct、fixed、drop。
+- HTTP CONNECT、SOCKS5 TCP/UDP。
+- TLS stream wrapper和HTTP/2 prior-knowledge pool。
+- 交付标准：所有 proxy 的 local echo、超时、关闭、auth、multi-address 和 pool test 通过。
+
+### Phase 5：Yuubinsya
+
+- codec -> native UDP -> TCP stream -> UOT/migration -> ping -> server。
+- 每一步都和 Go server/client 做互操作，而不是只做 Rust 两端自测。
+- 交付标准：密码错误、未知 protocol、short frame、coalesce、reconnect、migration ID、ping cache 全通过。
+
+### Phase 6：NAT
+
+- 先实现单 SourceControl，再实现 Table、idle scanner、reverse NAT。
+- 通过 Router/Proxy trait 注入实际 dialer。
+- 交付标准：direct、Yuubinsya native UDP/UOT、SOCKS5 UDP、FakeIP domain target 组合测试通过。
+
+### Phase 7：TUN 和平台网络入口
+
+- `yuhaiin-tun` 的 tun-rs device wrapper、smoltcp adapter、Linux namespace test、IPv4/IPv6 TCP/UDP/ICMP。
+- 接入 Router/NAT，完成 DNS hijack、FakeIP、route block/direct/proxy、portal 地址和回写。
+- 先用 benchmark 和 Go/gVisor 行为 fixture 验证 smoltcp；只有明确不满足时，才设计 `IpStackAdapter` 的自研替换，不并行实现 tun2socket。
+- 交付标准：无权限 unit test、Linux privileged integration test、Android/macOS/Windows capability probe 通过。
+
+### Phase 8：替换边界
+
+- 提供一个最小 app/harness，启动 SQLite config + DNS + FakeIP + MaxMindDB + Router + 选定 proxy + NAT + TUN。
+- 以 feature 或环境变量选择 Go/Rust backend，而不是同时修改所有控制面。
+- 先替换 SQLite/config、DNS/FakeIP，再替换 Yuubinsya/NAT，最后切换 TUN 数据面和平台集成。
+
+## 11. 纯 Rust 依赖政策
+
+### 11.1 建议 allowlist
+
+版本以 workspace lockfile 统一管理，不在文档中永久锁死“最新版本”；升级必须重新跑依赖审计。
+
+| 用途 | 首选 | 备注 |
+| --- | --- | --- |
+| runtime | `tokio` | 只在 io/transport 层使用 |
+| async utility | `futures`, `tokio-util` | cancellation、codec、stream |
+| bytes | `bytes` | packet ownership 和 buffer |
+| error/log | `thiserror`, `tracing` | 不用字符串 error 作为 API |
+| serialization | `serde` | 只用于 config/fixture，不用于 wire parser 的隐式兼容 |
+| DNS wire | `hickory-proto` | 低层 DNS message/record codec |
+| SQLite-compatible config DB | `rusqlite` + `bundled` | 经过真实 Go snapshot/WAL/跨进程测试的 SQLite amalgamation；通过 `yuhaiin-store::sqlite` typed adapter 隔离 C API，升级后复审 `libsqlite3-sys` 与构建产物 |
+| embedded cache | `redb` | 纯 Rust、事务型 KV；只能作为可选 cache/backend，不能替代 SQLite 配置事实源 |
+| trie/IP | `ipnet` + 自研 trie | 需要精确控制 wildcard/LPM 语义 |
+| MaxMindDB | `maxminddb` | 纯 Rust reader；`mmap` 可选，读 GeoIP2/GeoLite2 |
+| TUN device | `tun-rs` | async、多平台、multi-queue；平台 FFI/unsafe 仍需隔离审计 |
+| Linux route lifecycle | `route_manager` | 可选 `tun-routes` feature；通过纯 Rust netlink packet/client 管理 route，不绑定系统 `ip` 命令；底层 OS ABI 仍需 capability/权限测试 |
+| userspace IP stack | `smoltcp` | 第一阶段唯一 stack；raw/ICMP/TCP/UDP，需验证与 Go gVisor 行为差异 |
+| hash | `blake2`, RustCrypto crates | Yuubinsya token 使用 SHA-256 |
+| HTTP | `hyper`, `hyper-util`, `http-body-util` | 通过自定义 connector 走 Proxy |
+| TLS | `rustls`, `tokio-rustls` | 必须禁用默认 native/crypto backend |
+| pure TLS provider | `rustls-rustcrypto` 或自研 RustCrypto provider | 当前是 alpha/实验性，不能跳过上线前审计 |
+| testing | `proptest`, `loom`, `criterion` | protocol/property/concurrency/perf |
+
+### 11.2 明确禁止
+
+- `native-tls`、`openssl`、`openssl-sys`、`tokio-native-tls`。
+- `sqlite3`、`sqlx-sqlite`、`libsql` 及依赖系统 SQLite 的任何默认 feature；`rusqlite` + `bundled` 和对应 `libsqlite3-sys` 是本项目明确批准的数据库例外。
+- `ring`、`aws-lc-rs`、`aws-lc-sys` 作为默认或传递依赖；如某个低优先级 feature 必须使用它，必须隔离并在构建产物中明确标记，不得进入默认构建。
+- 依赖 `build.rs` 编译 C/C++/汇编的协议实现。
+- 未审计的 system resolver、system TLS、system proxy 自动 fallback。
+
+### 11.3 CI 审计
+
+CI 至少执行：
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo tree -e features
+cargo deny check bans licenses sources
+```
+
+另加一个脚本检查 Cargo metadata 中的 `links` 字段和依赖名：
+
+```text
+拒绝 links 非空；拒绝 native-tls/openssl/ring/aws-lc-sys/libsqlite3-sys；
+允许列表外的 build script 必须人工 review。
+```
+
+DoQ/DoH3 使用独立 CI job，不得因为测试 `--all-features` 把它们的 crypto backend 带入默认 release。
+
+### 11.4 依赖参考
+
+实现时以 crate 自己的文档和 lockfile 为准，以下链接用于确认本设计中的关键判断：
+
+- [`hickory-proto`](https://docs.rs/hickory-proto/latest/hickory_proto/)：低层 DNS message、record 和 binary codec。
+- [`redb`](https://docs.rs/redb/latest/redb/)：纯 Rust、事务型嵌入式 KV store。
+- [`rusqlite`](https://docs.rs/rusqlite/latest/rusqlite/)：成熟 SQLite binding；本项目使用其 `bundled` feature，避免依赖宿主机 SQLite 版本，并用 typed adapter 限制 API 扩散。
+- [`maxminddb`](https://docs.rs/maxminddb/latest/maxminddb/)：GeoIP2/GeoLite2 reader，支持可选 mmap。
+- [`tun-rs`](https://docs.rs/tun-rs/latest/tun_rs/)：跨平台 TUN/TAP 和 async device 候选。
+- [`smoltcp`](https://docs.rs/smoltcp/latest/smoltcp/)：纯 Rust 的 raw/ICMP/TCP/UDP userspace stack 候选。
+- [`rustls`](https://docs.rs/rustls/latest/rustls/)：支持可替换 `CryptoProvider`；默认 feature 会启用 `aws-lc-rs`，因此必须显式关闭。
+- [`rustls-rustcrypto`](https://docs.rs/rustls-rustcrypto/latest/rustls_rustcrypto/)：纯 Rust provider 方向，但当前文档明确标记为 alpha/不建议直接用于生产，必须先做安全和覆盖率评审。
+- [`quinn`](https://docs.rs/quinn/latest/quinn/)：DoQ/DoH3 的候选 QUIC 实现；默认标准 crypto 路径依赖 rustls/ring，所以不能直接进入本项目默认 feature。
+
+## 12. 测试、互操作和发布门槛
+
+### 12.1 测试层次
+
+1. Pure codec：不需要 runtime，不开端口，覆盖所有短包/坏包/边界。
+2. Local transport：loopback TCP/UDP、mock DNS、mock proxy，测试 deadline/cancel/close。
+3. Cross-language：Go server <-> Rust client，Rust server <-> Go client。
+4. Composition：Router + DNS + FakeIP + Proxy + NAT。
+5. Persistence：SQLite migrations、transaction rollback、backup/restore、concurrent readers、busy/locked、FakeIP cursor 和 crash recovery。
+6. Platform: TUN namespace、device capability probe、route apply/rollback；没有 root 的 CI 只跑 fake device 和 packet parser。
+7. Soak：长时间 UDP、HTTP2 pool、fakeip touch/flush、route snapshot reload、MaxMindDB reload。
+
+### 12.2 单元测试最低门槛
+
+每个 crate 都必须有不依赖外网、不依赖 root 的单元测试。最低覆盖如下：
+
+| crate/模块 | 必测内容 |
+| --- | --- |
+| `core` | Endpoint 规范化、domain/IP 区分、comparable key、错误分类、FlowContext clone/override |
+| `trie` | domain 反向 label、父域、wildcard、删除、IPv4/IPv6 LPM、重叠 prefix、snapshot 并发读取 |
+| `config` | 空库 bootstrap、每个 migration、重复 migration、失败回滚、JSON 校验、旧 schema、备份恢复、单写多读 |
+| `fakeip` | 并发同域、cursor、满池 LRU、prefix 隔离、正反向一致、touch flush、非法 entry、A/AAAA/PTR/HTTPS/SVCB hint transform |
+| `dns` | message pack/unpack、ID/question 匹配、A/AAAA/PTR/HTTPS/SVCB codec、target/root/未知 SvcParam 保留、A/AAAA 并行、TC fallback、UDP pending cancel、DoH status/body 限制、server length prefix |
+| `geo` | MaxMind fixture lookup、IPv4/IPv6、missing/corrupt database、decode country、snapshot replacement、close race |
+| `proxy codec` | SOCKS5 address、Yuubinsya header/auth/packet/frame、short/oversized/malformed input、constant-time auth path |
+| `proxy transport` | direct/fixed Happy Eyeballs、HTTP CONNECT、SOCKS5 auth/UDP、TLS handshake cancel、HTTP2 GOAWAY/pool、drop backoff |
+| `router` | matcher order、route mode、resolver policy、skip_route、resolve_locally、list apply snapshot、geo fallback |
+| `nat` | key selection、single SourceControl、bounded queue、dispatch/resolved/reverse cache、idle close、write-back failure |
+| `tun` | IP header/tuple parser、checksum、MTU/fragment、UDP mapping、gateway port、DNS request detection、device lifecycle |
+
+对每个 parser 增加至少一组 `proptest`：任意 bytes 不 panic；对 stateful 模块增加模型测试：reference map/table 与实现逐步执行结果一致。时间相关逻辑使用可注入 clock，禁止单元测试用 `sleep(1s)` 等待后台 worker。
+
+单元测试不等于集成测试：需要真实网络 namespace、权限、IPv6、TUN driver 或外部 MaxMind 下载的测试必须显式标记并单独 job；失败时报告为环境测试失败，不伪装成纯 Rust 单元测试通过。
+
+### 12.3 必须保存的 fixture
+
+- Domain trie：精确域名、父域、wildcard、大小写、尾点。
+- CIDR：IPv4/IPv6 重叠 prefix 和 LPM。
+- DNS：A、AAAA、PTR、HTTPS/SVCB、TC、NXDOMAIN、EDNS subnet。
+- Yuubinsya：四种 protocol byte、auth、TCP header、native UDP prefix、有/无 coalesce 的 UOT frame、migration ID、ping success/failure。
+- SOCKS5：IPv4/IPv6/domain address、CONNECT、UDP associate、auth failure。
+- FakeIP：prefix/cursor、满池复用、旧 schema import、正反向一致性。
+- SQLite：Go 当前 schema、旧版本 migration、`settings_kv`/`route_rules`/`dns_resolvers`/`fakeip_entries` 的最小数据库和损坏/半迁移数据库。
+- MaxMindDB：GeoLite/Country test database、缺失 country 字段和未知 record schema。
+- TUN：IPv4/IPv6 TCP/UDP/ICMP packet、fragment、checksum 错误、packet-info header 和不同 MTU。
+
+### 12.4 性能观测
+
+第一阶段不追求微优化，但必须暴露这些 metrics：
+
+- DNS query、命中/未命中、transport error、TC fallback、耗时。
+- FakeIP hit/miss、分配、复用、反查失败、touch flush error。
+- Router trie match duration、snapshot version、规则 apply delay。
+- Proxy connect/datagram/ping error、HTTP2 pool in-flight、Yuubinsya auth/frame error。
+- NAT active flows、queue depth、send/receive/drop、reverse NAT count、idle close。
+- SQLite migration duration、transaction rollback、busy/locked、checkpoint/compact、backup restore error。
+- TUN packet read/write/drop、MTU drop、TCP/UDP active flow、mapping allocation/reuse、route apply/rollback。
+- MaxMindDB lookup latency、hit/miss、reload success/failure、old snapshot lifetime。
+
+使用 `tracing` span 关联 flow key；禁止把密码、完整域名列表和用户原始 packet 写入 info 日志。
+
+当前 P1 观测边界：`yuhaiin-chain::ChainRuntimeStats::render_prometheus()` 和
+`ChainClient::prometheus_metrics()` 输出 HTTP/2 pool 的连接/stream gauge 与连接、
+失败、capacity rejection、stream open failure counter；`yuhaiin-core::nat::NatTable::stats()`
+和 `NatStats::render_prometheus()` 输出 Full Cone active binding、logical destination、
+reverse mapping、allocation/reuse、reverse lookup、translated rebind 和回收 counter。
+这些 API 只生成 pull-format snapshot，不启动 listener、后台 task 或全局 registry；HTTP
+端点、认证、采样周期和日志脱敏由上层 app 负责。这样 Android、macOS 和 Linux 可以共享
+数据面而不绑定某个 exporter/runtime。
+
+## 13. 主要风险和决策点
+
+| 风险 | 处理方式 |
+| --- | --- |
+| 纯 Rust TLS provider 还不成熟 | 使用 feature-gated `rustls-rustcrypto` 完成实际 client adapter；provider 可替换，未通过安全/互操作审计前不宣称生产可用 |
+| SQLite backend 兼容性/资源占用风险 | SQLite schema 作为稳定契约；用 Go 生成 FTS-free fixture 做 SQL/file/transaction 对比；rusqlite bundled 通过真实 snapshot、WAL、跨进程和资源 probe 后作为默认后端；纯 Rust backend 只作为未来可替换实验 |
+| 旧 SQLite/Pebble 数据格式复杂 | 优先导出 fixture；导入幂等、逐条校验、metadata 标记；不要阻塞主 resolver 锁 |
+| TUN 平台 FFI 和权限差异 | 平台 unsafe 集中隔离；Linux namespace 做真实测试；其他平台先做 capability probe 和 fd 注入测试 |
+| userspace IP stack 与 gVisor 行为不同 | 第一阶段只用 smoltcp；先补 adapter/配置和 fixture，确认无法满足后再替换 `IpStackAdapter`，不维护第二套并行数据面 |
+| MaxMindDB 更新损坏 | 下载临时文件、校验后原子替换；失败保留旧 snapshot，SQLite 仅记录错误 |
+| DNS/Proxy 递归解析 | 所有远端 endpoint 使用显式 bootstrap resolver 或 parent dialer；禁止隐藏系统 resolver |
+| Route snapshot 替换期间 close 旧资源 | 构造新资源 -> 原子替换 -> 锁外 close；禁止持锁 await |
+| UOT 长连接泄漏 | migration ID、idle deadline、cancel token 和 close test 必须一起实现 |
+| UDP 洪泛导致内存增长 | 所有 channel/ring/HTTP2 pool 有上限；满时可观测 drop/backpressure |
+| Go/Rust 地址语义不一致 | Domain endpoint 不能提前变 SocketAddr；保存 original target 和 resolved target 两个字段 |
+| “all features” 引入 C 依赖 | DoQ/DoH3/TLS provider 做 feature/CI 隔离，检查 `links` 和 native backend |
+
+## 14. 建议的第一批提交顺序
+
+```text
+1. workspace + core traits + error/address fixture
+2. trie domain/cidr + snapshot tests
+3. SQLite engine adapter + schema/migrations/repositories + persistence tests
+4. SQLite-backed fakeip pool + cursor/reverse lookup
+5. fakeip DNS transform + Go fixture interop
+6. DNS message/client + UDP transport + TCP fallback
+7. DoH2 + DNS server
+8. MaxMindDB provider + snapshot/reload tests
+9. router dispatch + route/list/geo snapshot
+10. direct/fixed/drop
+11. yuubinsya codec + native UDP
+12. yuubinsya TCP/UOT/migration/ping + server interop
+13. HTTP CONNECT/SOCKS5/TLS/HTTP2
+14. NAT table/source control + composition tests
+15. tun-rs device + smoltcp adapter + Linux namespace tests
+```
+
+每个提交都应可编译、可测试、可回退；不要在一个提交中同时加入新的协议、配置格式和平台集成。
+
+## 15. 最终验收场景
+
+迁移到可用状态前，至少手工/自动验证以下完整链路：
+
+1. Client -> Router -> FakeIP -> DNS UDP -> direct：域名返回 fake IPv4/IPv6，PTR 能恢复域名。
+2. Client -> Router -> DoH2：DoH endpoint 本身通过 bootstrap/指定 proxy 连接，不发生 DNS recursion。
+3. Client -> Router -> Yuubinsya TCP -> server -> direct TCP：认证、半关闭、超时和 server close 正常。
+4. Client -> Router -> Yuubinsya native UDP -> NAT -> destination：同一 flow 复用 socket，reply reverse NAT 正确。
+5. Client -> Router -> Yuubinsya UOT -> NAT：migration ID 从握手到 NAT 全程一致，coalesce 开关不改变 payload 语义。
+6. Client -> Router -> HTTP2 prior knowledge：多 stream、GOAWAY、连接池清理和 datagram/stream 分池正确。
+7. route list 热更新：旧请求继续使用旧 snapshot，新请求使用新 snapshot，apply status 最终清零。
+8. 进程重启：SQLite migration、FakeIP cursor、映射、NAT 清理、HTTP2 pool、resolver pending request、MaxMindDB snapshot 都没有脏状态导致启动卡死。
+9. TUN：Linux namespace 中 IPv4/IPv6 TCP、UDP、DNS hijack、FakeIP、direct/proxy/block 和回写都能完成；设备/route 失败会反向清理。
+10. 配置：修改 route/DNS/proxy/TUN/MaxMindDB 设置后，SQLite transaction 原子提交，重启后配置与 runtime snapshot 一致。
+
+这十个场景全部通过后，才把 Rust backend 作为默认数据面；在此之前不要用“能够连通一个网站”作为迁移完成标准。

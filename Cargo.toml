@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/yuhaiin-core",
+    "crates/yuhaiin-chain",
+    "crates/yuhaiin-store",
+    "crates/yuhaiin-trie",
+    "crates/yuhaiin-runtime",
+]
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-or-later"
+version = "0.1.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

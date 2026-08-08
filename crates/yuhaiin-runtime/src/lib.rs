@@ -1,0 +1,628 @@
+//! Application-neutral runtime assembly for configuration, DNS and proxies.
+//!
+//! The snapshot deliberately reuses the store's existing Go compatibility
+//! models. It is suitable for a future HTTP/yuhaiin-react handler without
+//! introducing a second DTO tree or exposing SQLite connections.
+
+mod controller;
+#[cfg(feature = "doh-tls")]
+mod doh_tls;
+#[cfg(feature = "doh-tls")]
+mod dot_tls;
+mod handle;
+mod proxy;
+mod resolver;
+mod route;
+#[cfg(feature = "doh-tls")]
+mod rustcrypto_resolver;
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use yuhaiin_core::dns_hosts::HostsTable;
+use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+use yuhaiin_core::dns_resolver_stack::AsyncHostsResolver;
+use yuhaiin_core::geo::GeoDb;
+use yuhaiin_core::nat::NatTable;
+use yuhaiin_core::{Error, ErrorKind, FlowContext, GeoLookup, ResolverPolicy, Result, RouteMode};
+use yuhaiin_store::fakeip::{FakeIpPool, FakeIpPoolOptions, FakeIpV6Pool};
+use yuhaiin_store::{
+    ConfigStore, FakeIpPools, FakeIpResolver, GoProxyRuntimeConfig, GoResolverRuntimeConfig,
+    GoRouteRuleRecord, GoRouteRuntimeConfig, MaxMindMetadataRecord, NatConfigRecord,
+};
+use yuhaiin_trie::router::{RouteDecision, RouterRuntime};
+
+pub use controller::RuntimeController;
+#[cfg(feature = "doh-tls")]
+pub use doh_tls::{RustCryptoH2Connector, RustCryptoTlsDialer, root_store as doh_root_store};
+#[cfg(feature = "doh-tls")]
+pub use dot_tls::RustCryptoDotResolverFactory;
+pub use handle::RuntimeHandle;
+pub use proxy::{ProxyBuild, RuntimeProxySelector};
+#[cfg(feature = "http2")]
+pub use resolver::H2DohResolverFactory;
+#[cfg(feature = "doh-tls")]
+pub use resolver::RustCryptoDohResolverFactory;
+pub use resolver::{
+    BuiltinResolverFactory, FallbackResolver, ResolverFailurePolicy, ResolverTransportFactory,
+    TimeoutResolver, parse_dns_server,
+};
+pub use route::{
+    compile_go_route_rules, compile_go_route_rules_with_geo, route_rule_from_go_record,
+};
+#[cfg(feature = "doh-tls")]
+pub use rustcrypto_resolver::RustCryptoResolverFactory;
+
+/// Runtime-only knobs that are not part of the persisted Go schema.
+#[derive(Debug, Clone)]
+pub struct RuntimeBuildOptions {
+    /// Apply the same bounded FakeIP options to both address families when
+    /// the persisted configuration does not provide a more specific value.
+    pub fakeip_options: Option<FakeIpPoolOptions>,
+    /// Preserve Go's mode that allocates FakeIP without checking upstream.
+    pub fakeip_skip_check_upstream: bool,
+    /// Fallback used when no persisted route rule matches.
+    pub route_fallback: RouteDecision,
+    /// Whether configured resolver IDs should retry through the main resolver
+    /// after a transport-level failure or an empty answer.
+    pub resolver_query_fallback: bool,
+    /// Whether one malformed/unavailable optional resolver prevents the whole
+    /// snapshot from being published.
+    pub resolver_failure_policy: ResolverFailurePolicy,
+}
+
+impl Default for RuntimeBuildOptions {
+    fn default() -> Self {
+        Self {
+            fakeip_options: None,
+            fakeip_skip_check_upstream: false,
+            route_fallback: RouteDecision {
+                mode: RouteMode::Direct,
+                resolver_policy: ResolverPolicy::default(),
+                priority: 0,
+            },
+            resolver_query_fallback: true,
+            resolver_failure_policy: ResolverFailurePolicy::FailBuild,
+        }
+    }
+}
+
+/// Immutable configuration/runtime snapshot published after a successful
+/// load. Existing flows can keep using an older snapshot during reload.
+#[derive(Clone)]
+pub struct RuntimeSnapshot {
+    pub resolver: Arc<dyn AsyncIpResolver>,
+    pub hosts: HostsTable,
+    pub fakeip: Option<FakeIpPools>,
+    pub resolvers: Vec<GoResolverRuntimeConfig>,
+    pub route: Option<GoRouteRuntimeConfig>,
+    pub route_rules: Vec<GoRouteRuleRecord>,
+    pub router: RouterRuntime,
+    pub resolver_by_id: BTreeMap<String, Arc<dyn AsyncIpResolver>>,
+    pub resolver_errors: BTreeMap<String, String>,
+    pub resolver_registry_enabled: bool,
+    pub geo_metadata: Vec<MaxMindMetadataRecord>,
+    pub geo: Option<Arc<dyn GeoLookup>>,
+    pub proxies: Vec<GoProxyRuntimeConfig>,
+    /// Persisted NAT policy shared by TUN and future management handlers.
+    /// The store rejects restricted NAT, so this is always endpoint-independent
+    /// Full Cone NAT for a successfully built snapshot.
+    pub nat: NatConfigRecord,
+}
+
+impl RuntimeSnapshot {
+    pub fn proxy_config(&self, id: &str) -> Option<&GoProxyRuntimeConfig> {
+        self.proxies.iter().find(|proxy| proxy.id == id)
+    }
+
+    pub fn require_proxy_config(&self, id: &str) -> Result<&GoProxyRuntimeConfig> {
+        self.proxy_config(id).ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("proxy runtime config {id:?} was not found"),
+            )
+        })
+    }
+
+    pub fn resolver_for(&self, id: &str) -> Option<Arc<dyn AsyncIpResolver>> {
+        self.resolver_by_id.get(id).cloned()
+    }
+
+    pub fn require_resolver(&self, id: &str) -> Result<Arc<dyn AsyncIpResolver>> {
+        if let Some(resolver) = self.resolver_for(id) {
+            return Ok(resolver);
+        }
+        if let Some(error) = self.resolver_errors.get(id) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!("resolver {id:?} is unavailable: {error}"),
+            ));
+        }
+        Err(Error::new(
+            ErrorKind::NotFound,
+            format!("resolver {id:?} is not present in the runtime registry"),
+        ))
+    }
+
+    /// Select the resolver named by Go route settings.  An empty ID means the
+    /// shared application resolver.  If no factory was supplied, the injected
+    /// shared resolver is intentionally used for every route ID; this keeps
+    /// the builder useful for callers that own transport construction.
+    pub fn resolver_for_route_mode(&self, mode: RouteMode) -> Result<Arc<dyn AsyncIpResolver>> {
+        let Some(route) = &self.route else {
+            return Ok(self.resolver.clone());
+        };
+        let id = match mode {
+            RouteMode::Proxy => route.proxy_resolver.trim(),
+            RouteMode::Direct | RouteMode::Bypass => route.direct_resolver.trim(),
+            RouteMode::Block => "",
+        };
+        if id.is_empty() || !self.resolver_registry_enabled {
+            return Ok(self.resolver.clone());
+        }
+        self.require_resolver(id)
+    }
+
+    /// Apply route mode/policy and return the resolver selected by the same
+    /// snapshot.  This is the small application-facing seam used by TUN and a
+    /// future HTTP/reload handler; it does not introduce another DTO layer.
+    pub fn apply_route_and_select_resolver(
+        &self,
+        context: &mut FlowContext,
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
+        let decision = self.apply_route(context);
+        self.resolver_for_route_mode(decision.mode)
+    }
+
+    pub fn apply_route(&self, context: &mut FlowContext) -> RouteDecision {
+        self.router.apply_to_context(context)
+    }
+
+    /// Create the NAT state and timeout that should be passed to
+    /// `TunProxyRuntime::with_nat`. This keeps the persisted idle timeout and
+    /// the Full Cone invariant in the same snapshot as the proxy selector.
+    pub fn new_full_cone_nat(&self) -> Result<(NatTable, Duration)> {
+        if !self.nat.full_cone {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "runtime only supports endpoint-independent Full Cone NAT",
+            ));
+        }
+        let millis = u64::try_from(self.nat.idle_timeout_ms)
+            .map_err(|_| Error::invalid("NAT idle timeout must be positive"))?;
+        if millis == 0 {
+            return Err(Error::invalid("NAT idle timeout must be positive"));
+        }
+        Ok((NatTable::new(), Duration::from_millis(millis)))
+    }
+}
+
+/// Builds one snapshot from a typed store and an already-created upstream
+/// resolver. The latter is injected because its UDP/DoH connector may itself
+/// depend on a proxy chain and must not be constructed recursively here.
+pub struct RuntimeBuilder {
+    store: ConfigStore,
+    upstream: Arc<dyn AsyncIpResolver>,
+    options: RuntimeBuildOptions,
+    resolver_factory: Option<Arc<dyn ResolverTransportFactory>>,
+}
+
+impl RuntimeBuilder {
+    pub fn new(store: ConfigStore, upstream: Arc<dyn AsyncIpResolver>) -> Self {
+        Self {
+            store,
+            upstream,
+            options: RuntimeBuildOptions::default(),
+            resolver_factory: None,
+        }
+    }
+
+    pub fn with_options(mut self, options: RuntimeBuildOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    pub fn with_resolver_factory(mut self, factory: Arc<dyn ResolverTransportFactory>) -> Self {
+        self.resolver_factory = Some(factory);
+        self
+    }
+
+    pub fn store(&self) -> &ConfigStore {
+        &self.store
+    }
+
+    pub async fn build(&self) -> Result<RuntimeSnapshot> {
+        let repository = self.store.repository();
+        let nat = repository.get_nat_config_or_default("default").await?;
+        let hosts = repository.load_go_dns_hosts_table().await?;
+        let resolvers = repository.list_go_resolver_runtime_configs().await?;
+        let route = repository.load_go_route_runtime_config().await?;
+        let route_rules = repository.list_go_route_rules().await?;
+        let proxies = repository.list_go_proxy_runtime_configs().await?;
+        let geo_metadata = repository.list_maxmind_metadata().await?;
+        let geo = geo_metadata
+            .first()
+            .map(|metadata| GeoDb::open(&metadata.path))
+            .transpose()?
+            .map(|database| Arc::new(database) as Arc<dyn GeoLookup>);
+
+        let fakeip_config = repository.load_go_fakeip_runtime_config().await?;
+        let fakeip = match fakeip_config {
+            Some(config) if config.enabled => {
+                let options = self.options.fakeip_options;
+                let ipv4 = Arc::new(match options {
+                    Some(options) => {
+                        FakeIpPool::open_with_options(self.store.clone(), config.ipv4, options)
+                            .await?
+                    }
+                    None => FakeIpPool::open(self.store.clone(), config.ipv4).await?,
+                });
+                let ipv6 = Arc::new(match options {
+                    Some(options) => {
+                        FakeIpV6Pool::open_with_options(self.store.clone(), config.ipv6, options)
+                            .await?
+                    }
+                    None => FakeIpV6Pool::open(self.store.clone(), config.ipv6).await?,
+                });
+                let pools = FakeIpPools::new(ipv4, ipv6);
+                Some(pools)
+            }
+            _ => None,
+        };
+
+        let resolver = wrap_resolver(
+            self.upstream.clone(),
+            &hosts,
+            fakeip.as_ref(),
+            self.options.fakeip_skip_check_upstream,
+        );
+        let mut resolver_by_id = BTreeMap::new();
+        let mut resolver_errors = BTreeMap::new();
+        let resolver_registry_enabled = self.resolver_factory.is_some();
+        if let Some(factory) = &self.resolver_factory {
+            for config in &resolvers {
+                match factory.build(config) {
+                    Ok(raw) => {
+                        let wrapped = wrap_resolver(
+                            raw,
+                            &hosts,
+                            fakeip.as_ref(),
+                            self.options.fakeip_skip_check_upstream,
+                        );
+                        let wrapped = if self.options.resolver_query_fallback {
+                            Arc::new(FallbackResolver::new(wrapped, resolver.clone()))
+                                as Arc<dyn AsyncIpResolver>
+                        } else {
+                            wrapped
+                        };
+                        resolver_by_id.insert(config.id.clone(), wrapped);
+                    }
+                    Err(error) => match self.options.resolver_failure_policy {
+                        ResolverFailurePolicy::FailBuild => return Err(error),
+                        ResolverFailurePolicy::KeepUnavailable => {
+                            resolver_errors.insert(config.id.clone(), error.to_string());
+                        }
+                    },
+                }
+            }
+        }
+        let router = compile_go_route_rules_with_geo(
+            &route_rules,
+            self.options.route_fallback.clone(),
+            geo.clone(),
+        )?;
+        Ok(RuntimeSnapshot {
+            resolver,
+            hosts,
+            fakeip,
+            resolvers,
+            route,
+            route_rules,
+            router,
+            resolver_by_id,
+            resolver_errors,
+            resolver_registry_enabled,
+            geo_metadata,
+            geo,
+            proxies,
+            nat,
+        })
+    }
+
+    pub async fn build_handle(&self) -> Result<RuntimeHandle> {
+        Ok(RuntimeHandle::new(self.build().await?))
+    }
+}
+
+fn wrap_resolver(
+    upstream: Arc<dyn AsyncIpResolver>,
+    hosts: &HostsTable,
+    fakeip: Option<&FakeIpPools>,
+    skip_check_upstream: bool,
+) -> Arc<dyn AsyncIpResolver> {
+    let upstream = match fakeip {
+        Some(pools) => Arc::new(FakeIpResolver::new(
+            upstream,
+            pools.clone(),
+            skip_check_upstream,
+        )) as Arc<dyn AsyncIpResolver>,
+        None => upstream,
+    };
+    Arc::new(AsyncHostsResolver::new(hosts.clone(), upstream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::net::Ipv4Addr;
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_core::{BoxFuture, DomainName, IpSet, ResolveStrategy};
+    use yuhaiin_store::GoUdpProxyFqdnStrategy;
+    use yuhaiin_trie::router::Router;
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut context = Context::from_waker(Waker::noop());
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    struct StaticResolver {
+        address: Ipv4Addr,
+    }
+
+    impl AsyncIpResolver for StaticResolver {
+        fn resolve<'a>(
+            &'a self,
+            _domain: &'a DomainName,
+            _strategy: ResolveStrategy,
+        ) -> BoxFuture<'a, Result<IpSet>> {
+            Box::pin(async {
+                Ok(IpSet {
+                    v4: vec![self.address],
+                    v6: Vec::new(),
+                })
+            })
+        }
+    }
+
+    #[test]
+    fn builder_publishes_one_shared_resolver_snapshot() {
+        let store = block_on(ConfigStore::open_memory()).unwrap();
+        let snapshot = block_on(
+            RuntimeBuilder::new(
+                store,
+                Arc::new(StaticResolver {
+                    address: Ipv4Addr::new(192, 0, 2, 55),
+                }),
+            )
+            .build(),
+        )
+        .unwrap();
+        let domain = DomainName::new("example.com").unwrap();
+        let resolved = block_on(
+            snapshot
+                .resolver
+                .resolve(&domain, ResolveStrategy::OnlyIpv4),
+        )
+        .unwrap();
+        assert_eq!(resolved.v4, vec![Ipv4Addr::new(192, 0, 2, 55)]);
+        assert!(snapshot.fakeip.is_none());
+        assert!(snapshot.proxies.is_empty());
+        assert!(snapshot.resolver_by_id.is_empty());
+    }
+
+    #[test]
+    fn empty_store_keeps_system_resolver_as_an_explicit_compatible_input() {
+        let store = block_on(ConfigStore::open_memory()).unwrap();
+        let builder = RuntimeBuilder::new(store, Arc::new(SystemAsyncIpResolver));
+        let snapshot = block_on(builder.build()).unwrap();
+        assert!(snapshot.route.is_none());
+        assert!(snapshot.resolvers.is_empty());
+    }
+
+    #[test]
+    fn runtime_snapshot_loads_full_cone_nat_timeout_for_tun_assembly() {
+        let store = block_on(ConfigStore::open_memory()).unwrap();
+        block_on(store.repository().put_nat_config(&NatConfigRecord {
+            key: "default".to_owned(),
+            full_cone: true,
+            idle_timeout_ms: 45_000,
+        }))
+        .unwrap();
+
+        let snapshot =
+            block_on(RuntimeBuilder::new(store, Arc::new(SystemAsyncIpResolver)).build()).unwrap();
+        assert!(snapshot.nat.full_cone);
+        assert_eq!(snapshot.nat.idle_timeout_ms, 45_000);
+        let (_table, timeout) = snapshot.new_full_cone_nat().unwrap();
+        assert_eq!(timeout, Duration::from_secs(45));
+
+        let mut restricted = snapshot.clone();
+        restricted.nat.full_cone = false;
+        assert!(restricted.new_full_cone_nat().is_err());
+    }
+
+    #[test]
+    fn builtin_resolver_factory_publishes_a_resolver_registry() {
+        let store = block_on(ConfigStore::open_memory()).unwrap();
+        let snapshot = block_on(
+            RuntimeBuilder::new(store, Arc::new(SystemAsyncIpResolver))
+                .with_resolver_factory(Arc::new(BuiltinResolverFactory::new(
+                    Duration::from_secs(1),
+                    8,
+                )))
+                .build(),
+        )
+        .unwrap();
+        assert!(snapshot.resolver_by_id.is_empty());
+    }
+
+    #[test]
+    fn route_settings_select_resolver_from_the_same_snapshot() {
+        let main = Arc::new(StaticResolver {
+            address: Ipv4Addr::new(192, 0, 2, 1),
+        }) as Arc<dyn AsyncIpResolver>;
+        let direct = Arc::new(StaticResolver {
+            address: Ipv4Addr::new(192, 0, 2, 2),
+        }) as Arc<dyn AsyncIpResolver>;
+        let proxy = Arc::new(StaticResolver {
+            address: Ipv4Addr::new(192, 0, 2, 3),
+        }) as Arc<dyn AsyncIpResolver>;
+        let mut resolver_by_id = BTreeMap::new();
+        resolver_by_id.insert("direct".to_owned(), direct);
+        resolver_by_id.insert("proxy".to_owned(), proxy);
+        let router = RouterRuntime::new(
+            Router::compile(
+                Vec::new(),
+                RouteDecision {
+                    mode: RouteMode::Proxy,
+                    resolver_policy: ResolverPolicy::default(),
+                    priority: 0,
+                },
+            )
+            .unwrap(),
+        );
+        let snapshot = RuntimeSnapshot {
+            resolver: main,
+            hosts: HostsTable::new(),
+            fakeip: None,
+            resolvers: Vec::new(),
+            route: Some(GoRouteRuntimeConfig {
+                direct_resolver: "direct".to_owned(),
+                proxy_resolver: "proxy".to_owned(),
+                resolve_locally: true,
+                udp_proxy_fqdn: GoUdpProxyFqdnStrategy::Resolve,
+            }),
+            route_rules: Vec::new(),
+            router,
+            resolver_by_id,
+            resolver_errors: BTreeMap::new(),
+            resolver_registry_enabled: true,
+            geo_metadata: Vec::new(),
+            geo: None,
+            proxies: Vec::new(),
+            nat: NatConfigRecord::default(),
+        };
+        let domain = DomainName::new("example.com").unwrap();
+        let mut context = FlowContext::new(yuhaiin_core::Endpoint::domain(
+            yuhaiin_core::Network::Tcp,
+            domain.clone(),
+            443,
+        ));
+        let resolver = snapshot
+            .apply_route_and_select_resolver(&mut context)
+            .unwrap();
+        assert_eq!(context.route_mode, RouteMode::Proxy);
+        assert_eq!(
+            block_on(resolver.resolve(&domain, ResolveStrategy::OnlyIpv4))
+                .unwrap()
+                .v4,
+            vec![Ipv4Addr::new(192, 0, 2, 3)]
+        );
+        assert_eq!(
+            block_on(
+                snapshot
+                    .resolver_for_route_mode(RouteMode::Direct)
+                    .unwrap()
+                    .resolve(&domain, ResolveStrategy::OnlyIpv4,)
+            )
+            .unwrap()
+            .v4,
+            vec![Ipv4Addr::new(192, 0, 2, 2)]
+        );
+    }
+
+    #[test]
+    fn rebuilding_store_publishes_new_route_snapshot_without_mutating_old_flows() {
+        let store = block_on(ConfigStore::open_memory()).unwrap();
+        let repository = store.repository();
+        let mut record = GoRouteRuleRecord {
+            id: "reload-rule".to_owned(),
+            name: "reload-rule".to_owned(),
+            priority: 10,
+            disabled: false,
+            action_mode: "direct".to_owned(),
+            match_type: "domain".to_owned(),
+            tag: "test".to_owned(),
+            updated_at: 1,
+            data_json: br#"{"match":{"domain":"example.com"},"mode":"direct"}"#.to_vec(),
+        };
+        block_on(repository.put_go_route_rule(&record)).unwrap();
+        let first = block_on(
+            RuntimeBuilder::new(
+                store.clone(),
+                Arc::new(StaticResolver {
+                    address: Ipv4Addr::new(192, 0, 2, 55),
+                }),
+            )
+            .build(),
+        )
+        .unwrap();
+
+        record.action_mode = "proxy".to_owned();
+        record.updated_at = 2;
+        record.data_json = br#"{"match":{"domain":"example.com"},"mode":"proxy"}"#.to_vec();
+        block_on(repository.put_go_route_rule(&record)).unwrap();
+        let second = block_on(
+            RuntimeBuilder::new(
+                store,
+                Arc::new(StaticResolver {
+                    address: Ipv4Addr::new(192, 0, 2, 55),
+                }),
+            )
+            .build(),
+        )
+        .unwrap();
+
+        let endpoint = yuhaiin_core::Endpoint::domain(
+            yuhaiin_core::Network::Tcp,
+            DomainName::new("example.com").unwrap(),
+            443,
+        );
+        let mut old_context = FlowContext::new(endpoint.clone());
+        let mut new_context = FlowContext::new(endpoint);
+        assert_eq!(first.apply_route(&mut old_context).mode, RouteMode::Direct);
+        assert_eq!(second.apply_route(&mut new_context).mode, RouteMode::Proxy);
+    }
+
+    #[test]
+    fn route_settings_repository_rows_are_loaded_by_runtime_reload() {
+        let store = block_on(ConfigStore::open_memory()).unwrap();
+        block_on(
+            store
+                .repository()
+                .put_go_route_settings(&yuhaiin_store::GoRouteSettingsRecord {
+                    id: 1,
+                    direct_resolver: "direct".to_owned(),
+                    proxy_resolver: "proxy".to_owned(),
+                    resolve_locally: true,
+                    udp_proxy_fqdn: 2,
+                }),
+        )
+        .unwrap();
+        let snapshot = block_on(
+            RuntimeBuilder::new(
+                store,
+                Arc::new(StaticResolver {
+                    address: Ipv4Addr::new(192, 0, 2, 55),
+                }),
+            )
+            .build(),
+        )
+        .unwrap();
+        let route = snapshot.route.unwrap();
+        assert_eq!(route.direct_resolver, "direct");
+        assert_eq!(route.proxy_resolver, "proxy");
+        assert!(route.resolve_locally);
+        assert_eq!(route.udp_proxy_fqdn, GoUdpProxyFqdnStrategy::SkipResolve);
+    }
+}
