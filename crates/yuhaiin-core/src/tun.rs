@@ -39,6 +39,10 @@ use crate::LocalBoxFuture;
 use crate::nat::{NatKey, NatTable};
 use crate::{Endpoint, Error, ErrorKind, Network, Result};
 
+pub use crate::flow::{Flow as TunFlow, FlowKey as TunFlowKey};
+#[cfg(feature = "async-proxy")]
+pub use crate::flow::{FlowDirection as TunFlowDirection, FlowObserver as TunFlowObserver};
+
 #[cfg(feature = "async-proxy")]
 use crate::dns::{AsyncDnsHandler, DnsHandler, answer_query};
 
@@ -371,77 +375,6 @@ pub enum IpPacketVersion {
 pub struct PacketInfo {
     pub version: IpPacketVersion,
     pub length: usize,
-}
-
-/// A flow tuple observed at the TUN boundary.
-///
-/// The source is the original application endpoint and the destination is the
-/// endpoint addressed by the application.  This is deliberately independent
-/// of the eventual proxy endpoint: Router/Proxy code must not lose the
-/// original tuple when a fixed or Yuubinsya transport is selected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TunFlowKey {
-    pub network: Network,
-    pub source: SocketAddr,
-    pub destination: SocketAddr,
-}
-
-impl TunFlowKey {
-    pub fn endpoint(&self) -> Endpoint {
-        Endpoint::ip(self.network, self.destination)
-    }
-
-    pub fn source_endpoint(&self) -> Endpoint {
-        Endpoint::ip(self.network, self.source)
-    }
-}
-
-/// Metadata handed from the packet engine to Router/NAT/Proxy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TunFlow {
-    pub key: TunFlowKey,
-}
-
-impl TunFlow {
-    pub fn context(&self) -> crate::FlowContext {
-        let mut context = crate::FlowContext::new(self.key.endpoint());
-        context.source = Some(self.key.source_endpoint());
-        context.network = self.key.network;
-        context
-    }
-}
-
-/// Direction of bytes observed at the TUN/application boundary.
-#[cfg(feature = "async-proxy")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TunFlowDirection {
-    /// Bytes sent by the application into the proxy runtime.
-    Upload,
-    /// Bytes received from the proxy runtime and written back to the TUN.
-    Download,
-}
-
-/// Lifecycle and byte observer for management-plane connection statistics.
-///
-/// The observer is deliberately a synchronous, allocation-tolerant boundary:
-/// packet processing must never await a management consumer. Implementations
-/// should keep callbacks bounded and may fan out to a lock-free/broadcast
-/// structure owned by the application layer.
-#[cfg(feature = "async-proxy")]
-pub trait TunFlowObserver: Send + Sync {
-    fn opened(&self, flow: TunFlow, context: crate::FlowContext);
-    fn bytes(&self, flow: TunFlowKey, direction: TunFlowDirection, bytes: usize);
-    fn closed(&self, flow: TunFlowKey);
-
-    /// Return whether the management plane has requested this flow to close.
-    ///
-    /// The default keeps observers source-compatible: applications that only
-    /// collect metrics do not need to implement a control path. The packet
-    /// runtime checks this at its normal polling boundary, so a management
-    /// request never runs transport code while the packet engine is borrowed.
-    fn close_requested(&self, _flow: TunFlowKey) -> bool {
-        false
-    }
 }
 
 /// Events emitted after `TunDispatcher::poll` has allowed smoltcp to consume

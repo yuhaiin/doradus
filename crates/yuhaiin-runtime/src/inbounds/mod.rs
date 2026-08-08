@@ -344,7 +344,9 @@ async fn serve_listener(
                 "http" | "mixed" => {
                     crate::proxy::http::serve(stream, peer, spec, selector, monitor).await
                 }
-                "yuubinsya" => crate::proxy::yuubinsya::serve(stream, spec, selector).await,
+                "yuubinsya" => {
+                    crate::proxy::yuubinsya::serve(stream, peer, spec, selector, monitor).await
+                }
                 other => Err(Error::new(
                     ErrorKind::Unsupported,
                     format!("inbound protocol {other:?} is not implemented"),

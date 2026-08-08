@@ -50,7 +50,13 @@ pub(crate) async fn serve(
         context.original_domain = destination.host().cloned();
         spec.annotate_context(&mut context);
         let proxy = selector.select(&context);
-        let outbound = proxy.connect(&context).await?;
+        let outbound = match proxy.connect(&context).await {
+            Ok(outbound) => outbound,
+            Err(error) => {
+                monitor.record_failure("http", &destination.to_string(), &error.to_string());
+                return Err(error);
+            }
+        };
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
@@ -77,7 +83,13 @@ pub(crate) async fn serve(
     context.source = Some(source);
     context.original_domain = destination.host().cloned();
     spec.annotate_context(&mut context);
-    let outbound = selector.select(&context).connect(&context).await?;
+    let outbound = match selector.select(&context).connect(&context).await {
+        Ok(outbound) => outbound,
+        Err(error) => {
+            monitor.record_failure("http", &destination.to_string(), &error.to_string());
+            return Err(error);
+        }
+    };
     let request = rewrite_forward_request(method, &origin_target, &headers)?;
     relay_counted_with_prefix(
         stream,

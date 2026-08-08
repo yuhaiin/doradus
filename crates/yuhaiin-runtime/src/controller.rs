@@ -35,13 +35,14 @@ impl RuntimeController {
         let builder = Arc::new(builder);
         let handle = RuntimeHandle::new(builder.build().await?);
         let (reload_events, _) = tokio::sync::broadcast::channel(32);
+        let monitor = Arc::new(ConnectionMonitor::load_with_store(builder.store().clone()).await?);
         Ok(Self {
             builder,
             handle,
             reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             reload_error: Arc::new(RwLock::new(None)),
             selectors: Arc::new(RwLock::new(Vec::new())),
-            monitor: Arc::new(ConnectionMonitor::new()),
+            monitor,
             reload_events,
             restore_request: Arc::new(RwLock::new(None)),
         })

@@ -109,6 +109,7 @@ pub(crate) async fn serve(
         Ok(outbound) => outbound,
         Err(error) => {
             write_socks_reply(&mut stream, 5).await?;
+            monitor.record_failure("socks5", &destination.to_string(), &error.to_string());
             return Err(error);
         }
     };

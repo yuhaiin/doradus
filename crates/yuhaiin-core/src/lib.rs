@@ -22,6 +22,7 @@ pub mod dns_tcp;
 pub mod dns_tcp_async;
 #[cfg(feature = "async-proxy")]
 pub mod dns_udp_async;
+pub mod flow;
 pub mod geo;
 pub use geo::GeoLookup;
 #[cfg(feature = "http2")]

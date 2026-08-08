@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -8,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
+use yuhaiin_core::flow::{Flow, FlowDirection, FlowKey, FlowObserver};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy};
 use yuhaiin_core::yuubinsya::{
     YuubinsyaHeader, YuubinsyaProtocol, decode_header, decode_uot_frame, encode_header,
@@ -408,6 +410,12 @@ pub struct YuubinsyaServerProxy {
     udp_open_lock: Mutex<()>,
 }
 
+struct ObservedInbound {
+    source: SocketAddr,
+    observer: Arc<dyn FlowObserver>,
+    annotate: Arc<dyn Fn(&mut FlowContext) + Send + Sync>,
+}
+
 impl YuubinsyaServerProxy {
     pub fn new(password_hash: [u8; 32], upstream: Arc<dyn AsyncProxy>) -> Self {
         Self {
@@ -425,7 +433,40 @@ impl YuubinsyaServerProxy {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let header_bytes = read_header_bytes(&mut stream).await?;
+        self.serve_inner(&mut stream, None).await
+    }
+
+    /// Serve an inbound stream while publishing the same lifecycle and byte
+    /// callbacks used by the TUN monitor. The chain crate owns protocol
+    /// framing; the application only supplies the source endpoint and a
+    /// context annotator for inbound/outbound metadata.
+    pub async fn serve_observed<S, F>(
+        &self,
+        mut stream: S,
+        source: SocketAddr,
+        observer: Arc<dyn FlowObserver>,
+        annotate: F,
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        F: Fn(&mut FlowContext) + Send + Sync + 'static,
+    {
+        self.serve_inner(
+            &mut stream,
+            Some(ObservedInbound {
+                source,
+                observer,
+                annotate: Arc::new(annotate),
+            }),
+        )
+        .await
+    }
+
+    async fn serve_inner<S>(&self, stream: &mut S, observed: Option<ObservedInbound>) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let header_bytes = read_header_bytes(&mut *stream).await?;
         let (header, _) = decode_header(&self.password_hash, &header_bytes)?;
         match header.protocol {
             YuubinsyaProtocol::Tcp => {
@@ -436,15 +477,39 @@ impl YuubinsyaServerProxy {
                     )
                 })?;
                 let mut inbound = AsyncYuubinsyaTcpSession {
-                    stream,
+                    stream: stream,
                     password_hash: self.password_hash,
                     write_shutdown: false,
                 };
-                let context = FlowContext::new(destination);
+                let mut context = FlowContext::new(destination.clone());
+                let flow = observed.as_ref().map(|observed| {
+                    context.source =
+                        Some(Endpoint::ip(yuhaiin_core::Network::Tcp, observed.source));
+                    (observed.annotate)(&mut context);
+                    FlowKey {
+                        network: yuhaiin_core::Network::Tcp,
+                        source: observed.source,
+                        destination: endpoint_socket_addr(&destination, observed.source),
+                    }
+                });
                 let mut outbound = self.upstream.connect(&context).await?;
-                tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
+                if let (Some(observed), Some(flow)) = (observed.as_ref(), flow) {
+                    observed.observer.opened(Flow { key: flow }, context);
+                    let result = copy_bidirectional_observed(
+                        &mut inbound,
+                        &mut outbound,
+                        Arc::clone(&observed.observer),
+                        flow,
+                    )
                     .await
-                    .map_err(io_error)?;
+                    .map_err(io_error);
+                    observed.observer.closed(flow);
+                    result?;
+                } else {
+                    tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
+                        .await
+                        .map_err(io_error)?;
+                }
                 Ok(())
             }
             YuubinsyaProtocol::Ping => {
@@ -478,7 +543,7 @@ impl YuubinsyaServerProxy {
                     .await
                     .map_err(io_error)?;
                 session.stream.flush().await.map_err(io_error)?;
-                self.serve_uot(&mut session).await
+                self.serve_uot(&mut session, observed.as_ref()).await
             }
             YuubinsyaProtocol::Udp => Err(Error::new(
                 ErrorKind::Unsupported,
@@ -496,7 +561,11 @@ impl YuubinsyaServerProxy {
         }
     }
 
-    async fn serve_uot<S>(&self, session: &mut AsyncYuubinsyaUotServerSession<S>) -> Result<()>
+    async fn serve_uot<S>(
+        &self,
+        session: &mut AsyncYuubinsyaUotServerSession<S>,
+        observed: Option<&ObservedInbound>,
+    ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -505,12 +574,46 @@ impl YuubinsyaServerProxy {
             .udp_session(session.migrate_id, destination.clone())
             .await?;
         let (sender, mut responses) = shared.register(destination.clone()).await;
+        let mut observed_flows = HashMap::<Endpoint, FlowKey>::new();
         let result: Result<()> = async {
+            if let Some(observed) = observed {
+                let mut context = FlowContext::new(destination.clone());
+                context.source = Some(Endpoint::ip(yuhaiin_core::Network::Udp, observed.source));
+                context.udp_migrate_id.store(session.migrate_id, Ordering::Release);
+                (observed.annotate)(&mut context);
+                let flow = FlowKey {
+                    network: yuhaiin_core::Network::Udp,
+                    source: observed.source,
+                    destination: endpoint_socket_addr(&destination, observed.source),
+                };
+                observed.observer.opened(Flow { key: flow }, context);
+                observed_flows.insert(destination.clone(), flow);
+                observed.observer.bytes(flow, FlowDirection::Upload, payload.len());
+            }
             shared.send_to(&payload, destination).await?;
             loop {
                 tokio::select! {
                     incoming = session.recv_from() => {
                         let (destination, payload) = incoming?;
+                        if let Some(observed) = observed {
+                            let flow = if let Some(flow) = observed_flows.get(&destination) {
+                                *flow
+                            } else {
+                                let mut context = FlowContext::new(destination.clone());
+                                context.source = Some(Endpoint::ip(yuhaiin_core::Network::Udp, observed.source));
+                                context.udp_migrate_id.store(session.migrate_id, Ordering::Release);
+                                (observed.annotate)(&mut context);
+                                let flow = FlowKey {
+                                    network: yuhaiin_core::Network::Udp,
+                                    source: observed.source,
+                                    destination: endpoint_socket_addr(&destination, observed.source),
+                                };
+                                observed.observer.opened(Flow { key: flow }, context);
+                                observed_flows.insert(destination.clone(), flow);
+                                flow
+                            };
+                            observed.observer.bytes(flow, FlowDirection::Upload, payload.len());
+                        }
                         shared.route(destination.clone(), &sender).await;
                         shared.send_to(&payload, destination).await?;
                     }
@@ -519,6 +622,11 @@ impl YuubinsyaServerProxy {
                             Some(ServerUdpMessage::Data { source, payload }) => {
                                 shared.touch();
                                 session.send_to(&source, &payload).await?;
+                                if let Some(observed) = observed {
+                                    if let Some(flow) = observed_flows.get(&source) {
+                                        observed.observer.bytes(*flow, FlowDirection::Download, payload.len());
+                                    }
+                                }
                             }
                             Some(ServerUdpMessage::Closed) | None => {
                                 return Err(Error::new(
@@ -532,6 +640,11 @@ impl YuubinsyaServerProxy {
             }
         }
         .await;
+        if let Some(observed) = observed {
+            for flow in observed_flows.into_values() {
+                observed.observer.closed(flow);
+            }
+        }
         shared.unregister_sender(&sender).await;
         result
     }
@@ -587,6 +700,70 @@ impl YuubinsyaServerProxy {
         for session in sessions {
             let _ = session.close().await;
         }
+    }
+}
+
+fn endpoint_socket_addr(endpoint: &Endpoint, source: SocketAddr) -> SocketAddr {
+    endpoint.addr().unwrap_or_else(|| {
+        SocketAddr::new(
+            match source.ip() {
+                IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            },
+            endpoint.port().unwrap_or(0),
+        )
+    })
+}
+
+async fn copy_bidirectional_observed<A, B>(
+    left: &mut A,
+    right: &mut B,
+    observer: Arc<dyn FlowObserver>,
+    flow: FlowKey,
+) -> std::io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut left_read, mut left_write) = tokio::io::split(left);
+    let (mut right_read, mut right_write) = tokio::io::split(right);
+    let upload = copy_observed(
+        &mut left_read,
+        &mut right_write,
+        Arc::clone(&observer),
+        flow,
+        FlowDirection::Upload,
+    );
+    let download = copy_observed(
+        &mut right_read,
+        &mut left_write,
+        observer,
+        flow,
+        FlowDirection::Download,
+    );
+    tokio::try_join!(upload, download).map(|_| ())
+}
+
+async fn copy_observed<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    observer: Arc<dyn FlowObserver>,
+    flow: FlowKey,
+    direction: FlowDirection,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0u8; 16 * 1024];
+    loop {
+        let length = reader.read(&mut buffer).await?;
+        if length == 0 {
+            writer.shutdown().await?;
+            return Ok(());
+        }
+        writer.write_all(&buffer[..length]).await?;
+        observer.bytes(flow, direction, length);
     }
 }
 
@@ -838,6 +1015,7 @@ mod tests {
     use tokio::io::duplex;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Notify;
+    use yuhaiin_core::flow::{FlowDirection, FlowObserver};
     use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
     use yuhaiin_core::{BoxFuture, DomainName, Network};
 
@@ -893,6 +1071,26 @@ mod tests {
 
         fn close(&self) -> BoxFuture<'_, Result<()>> {
             Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingObserver {
+        events: Arc<StdMutex<Vec<&'static str>>>,
+        bytes: Arc<AtomicUsize>,
+    }
+
+    impl FlowObserver for RecordingObserver {
+        fn opened(&self, _flow: Flow, _context: FlowContext) {
+            self.events.lock().unwrap().push("open");
+        }
+
+        fn bytes(&self, _flow: FlowKey, _direction: FlowDirection, bytes: usize) {
+            self.bytes.fetch_add(bytes, Ordering::AcqRel);
+        }
+
+        fn closed(&self, _flow: FlowKey) {
+            self.events.lock().unwrap().push("close");
         }
     }
 
@@ -1300,6 +1498,48 @@ mod tests {
         client.shutdown().await.unwrap();
         server_task.await.unwrap().unwrap();
         server.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observed_server_proxy_publishes_tcp_lifecycle_and_payload_bytes() {
+        let password = [19u8; 32];
+        let upstream = Arc::new(EchoUpstream {
+            opens: Arc::new(AtomicUsize::new(0)),
+            tcp_echo: true,
+            ping_ok: true,
+        });
+        let server = Arc::new(YuubinsyaServerProxy::new(password, upstream));
+        let observer = Arc::new(RecordingObserver::default());
+        let (client_io, server_io) = duplex(4096);
+        let server_task = {
+            let server = Arc::clone(&server);
+            let observer = Arc::clone(&observer);
+            tokio::spawn(async move {
+                server
+                    .serve_observed(
+                        server_io,
+                        "10.0.0.2:12345".parse().unwrap(),
+                        observer,
+                        |context| {
+                            context.inbound = Some("yuubinsya".to_owned());
+                            context.inbound_name = Some("test".to_owned());
+                        },
+                    )
+                    .await
+            })
+        };
+        let destination = Endpoint::ip(Network::Tcp, "192.0.2.10:443".parse().unwrap());
+        let mut client = AsyncYuubinsyaTcpSession::connect(client_io, password, destination)
+            .await
+            .unwrap();
+        client.write_all(b"observed").await.unwrap();
+        let mut response = [0u8; 8];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"observed");
+        client.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
+        assert_eq!(&*observer.events.lock().unwrap(), &["open", "close"]);
+        assert_eq!(observer.bytes.load(Ordering::Acquire), 16);
     }
 
     #[tokio::test(flavor = "current_thread")]

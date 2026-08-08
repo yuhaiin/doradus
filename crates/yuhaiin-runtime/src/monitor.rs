@@ -10,15 +10,31 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 use yuhaiin_core::tun::{TunFlow, TunFlowDirection, TunFlowKey, TunFlowObserver};
 use yuhaiin_core::{Endpoint, FlowContext, RouteMode};
+use yuhaiin_store::ConfigStore;
 
 const HISTORY_LIMIT: usize = 2048;
 const BUCKET_LIMIT: usize = 90 * 24 * 60;
+const PERSISTENCE_KEY: &str = "statistics.runtime";
+const PERSISTENCE_VERSION: u32 = 1;
+
+const TELEMETRY_DIMENSIONS: [&str; 9] = [
+    "protocol",
+    "inbound",
+    "source",
+    "addr",
+    "outbound",
+    "process",
+    "rule",
+    "tag",
+    "destination",
+];
 
 #[derive(Debug, Clone)]
 pub struct MonitorEvent {
@@ -41,15 +57,51 @@ struct MonitorState {
     total_download: u64,
     connections: HashMap<TunFlowKey, ConnectionEntry>,
     ids: HashMap<String, TunFlowKey>,
+    counters: BTreeMap<String, (u64, u64)>,
     buckets: BTreeMap<i64, (u64, u64)>,
+    telemetry: BTreeMap<(String, String), (u64, u64, u64)>,
     history: Vec<Value>,
+    failed_history: BTreeMap<(String, String, String), FailedEntry>,
     close_requests: Vec<TunFlowKey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FailedEntry {
+    protocol: String,
+    host: String,
+    process: String,
+    error: String,
+    time: i64,
+    count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedTelemetry {
+    dimension: String,
+    value: String,
+    download: u64,
+    upload: u64,
+    failures: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedMonitor {
+    version: u32,
+    next_id: u64,
+    total_upload: u64,
+    total_download: u64,
+    counters: BTreeMap<String, (u64, u64)>,
+    buckets: BTreeMap<i64, (u64, u64)>,
+    telemetry: Vec<PersistedTelemetry>,
+    history: Vec<Value>,
+    failed_history: Vec<FailedEntry>,
 }
 
 #[derive(Clone)]
 pub struct ConnectionMonitor {
     state: Arc<Mutex<MonitorState>>,
     events: broadcast::Sender<MonitorEvent>,
+    persistence: Option<Arc<Notify>>,
 }
 
 impl Default for ConnectionMonitor {
@@ -64,7 +116,50 @@ impl ConnectionMonitor {
         Self {
             state: Arc::new(Mutex::new(MonitorState::default())),
             events,
+            persistence: None,
         }
+    }
+
+    /// Load durable totals/history from the same SQLite store as the
+    /// configuration and periodically flush the in-memory counters back to
+    /// it. Active connections are deliberately not restored: a process
+    /// restart cannot prove that those sockets still exist.
+    pub async fn load_with_store(store: ConfigStore) -> yuhaiin_core::Result<Self> {
+        let monitor = Self::new();
+        if let Some(bytes) = store.get_config(PERSISTENCE_KEY).await? {
+            let persisted: PersistedMonitor = serde_json::from_slice(&bytes).map_err(|error| {
+                yuhaiin_core::Error::new(
+                    yuhaiin_core::ErrorKind::Storage,
+                    format!("statistics state is invalid JSON: {error}"),
+                )
+            })?;
+            if persisted.version != PERSISTENCE_VERSION {
+                return Err(yuhaiin_core::Error::new(
+                    yuhaiin_core::ErrorKind::Storage,
+                    format!("unsupported statistics state version {}", persisted.version),
+                ));
+            }
+            monitor.restore_persisted(persisted);
+        }
+
+        let notify = Arc::new(Notify::new());
+        let mut persistent = monitor.clone();
+        persistent.persistence = Some(notify.clone());
+        let writer_monitor = persistent.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tokio::select! {
+                    _ = notify.notified() => {},
+                    _ = interval.tick() => {},
+                }
+                let value = writer_monitor.persisted_json();
+                if let Ok(bytes) = serde_json::to_vec(&value) {
+                    let _ = store.put_config(PERSISTENCE_KEY, &bytes).await;
+                }
+            }
+        });
+        Ok(persistent)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<MonitorEvent> {
@@ -91,14 +186,14 @@ impl ConnectionMonitor {
     pub fn total_flow_value(&self) -> Value {
         let state = self.lock();
         let counters = state
-            .connections
-            .values()
-            .map(|entry| {
+            .counters
+            .iter()
+            .map(|(id, (download, upload))| {
                 (
-                    entry.id.clone(),
+                    id.clone(),
                     json!({
-                        "download": entry.download.to_string(),
-                        "upload": entry.upload.to_string(),
+                        "download": download.to_string(),
+                        "upload": upload.to_string(),
                     }),
                 )
             })
@@ -154,35 +249,15 @@ impl ConnectionMonitor {
     pub fn telemetry_value(&self) -> Value {
         let state = self.lock();
         let mut dimensions: BTreeMap<&str, BTreeMap<String, (u64, u64, u64)>> = BTreeMap::new();
-        for entry in state.connections.values() {
-            let Some(object) = entry.value.as_object() else {
-                continue;
-            };
-            for dimension in [
-                "protocol",
-                "inbound",
-                "source",
-                "addr",
-                "outbound",
-                "process",
-                "rule",
-                "tag",
-                "destination",
-            ] {
-                let value = object
-                    .get(dimension)
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or("unknown")
-                    .to_owned();
-                let item = dimensions
-                    .entry(dimension)
-                    .or_default()
-                    .entry(value)
-                    .or_default();
-                item.0 = item.0.saturating_add(entry.download);
-                item.1 = item.1.saturating_add(entry.upload);
-            }
+        for ((dimension, value), (download, upload, failures)) in &state.telemetry {
+            let item = dimensions
+                .entry(dimension.as_str())
+                .or_default()
+                .entry(value.clone())
+                .or_default();
+            item.0 = item.0.saturating_add(*download);
+            item.1 = item.1.saturating_add(*upload);
+            item.2 = item.2.saturating_add(*failures);
         }
         let groups = dimensions
             .into_iter()
@@ -202,7 +277,31 @@ impl ConnectionMonitor {
     }
 
     pub fn failed_history_value(&self) -> Value {
-        json!({"items": [], "dumpProcessEnabled": false})
+        let state = self.lock();
+        let mut items = state
+            .failed_history
+            .values()
+            .map(|entry| {
+                json!({
+                    "protocol": entry.protocol,
+                    "host": entry.host,
+                    "error": entry.error,
+                    "process": entry.process,
+                    "time": format_time(entry.time),
+                    "failedCount": entry.count.to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            right
+                .get("time")
+                .and_then(Value::as_str)
+                .cmp(&left.get("time").and_then(Value::as_str))
+        });
+        json!({
+            "items": items,
+            "dumpProcessEnabled": state.failed_history.values().any(|entry| !entry.process.is_empty()),
+        })
     }
 
     pub fn all_history_value(&self) -> Value {
@@ -230,6 +329,26 @@ impl ConnectionMonitor {
             }
         }
         count
+    }
+
+    pub fn record_failure(&self, protocol: &str, host: &str, error: &str) {
+        let mut state = self.lock();
+        let key = (protocol.to_owned(), host.to_owned(), String::new());
+        let entry = state
+            .failed_history
+            .entry(key)
+            .or_insert_with(|| FailedEntry {
+                protocol: protocol.to_owned(),
+                host: host.to_owned(),
+                process: String::new(),
+                error: error.to_owned(),
+                time: unix_seconds(),
+                count: 0,
+            });
+        entry.count = entry.count.saturating_add(1);
+        entry.error = error.to_owned();
+        entry.time = unix_seconds();
+        self.mark_dirty();
     }
 
     pub fn take_close_requests(&self) -> Vec<TunFlowKey> {
@@ -262,6 +381,7 @@ impl ConnectionMonitor {
         let id = state.next_id.to_string();
         let value = connection_value(&id, flow, &context);
         state.ids.insert(id.clone(), flow.key);
+        state.counters.entry(id.clone()).or_default();
         state.connections.insert(
             flow.key,
             ConnectionEntry {
@@ -272,6 +392,7 @@ impl ConnectionMonitor {
             },
         );
         drop(state);
+        self.mark_dirty();
         self.emit("connections_added", json!({"connections": [value]}));
     }
 
@@ -298,13 +419,57 @@ impl ConnectionMonitor {
             };
             state.buckets.remove(&first);
         }
+        let Some(id) = state.connections.get(&flow).map(|entry| entry.id.clone()) else {
+            drop(state);
+            self.mark_dirty();
+            return;
+        };
+        let object = state
+            .connections
+            .get(&flow)
+            .and_then(|entry| entry.value.as_object())
+            .cloned();
         let Some(entry) = state.connections.get_mut(&flow) else {
+            drop(state);
+            self.mark_dirty();
             return;
         };
         match direction {
-            TunFlowDirection::Upload => entry.upload = entry.upload.saturating_add(bytes),
-            TunFlowDirection::Download => entry.download = entry.download.saturating_add(bytes),
+            TunFlowDirection::Upload => {
+                entry.upload = entry.upload.saturating_add(bytes);
+            }
+            TunFlowDirection::Download => {
+                entry.download = entry.download.saturating_add(bytes);
+            }
         }
+        let counter = state.counters.entry(id).or_default();
+        match direction {
+            TunFlowDirection::Upload => counter.1 = counter.1.saturating_add(bytes),
+            TunFlowDirection::Download => counter.0 = counter.0.saturating_add(bytes),
+        }
+        let Some(object) = object else {
+            drop(state);
+            self.mark_dirty();
+            return;
+        };
+        for dimension in TELEMETRY_DIMENSIONS {
+            let value = object
+                .get(dimension)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unknown")
+                .to_owned();
+            let item = state
+                .telemetry
+                .entry((dimension.to_owned(), value))
+                .or_default();
+            match direction {
+                TunFlowDirection::Upload => item.1 = item.1.saturating_add(bytes),
+                TunFlowDirection::Download => item.0 = item.0.saturating_add(bytes),
+            }
+        }
+        drop(state);
+        self.mark_dirty();
     }
 
     fn close(&self, flow: TunFlowKey) {
@@ -325,7 +490,75 @@ impl ConnectionMonitor {
         }
         let id = entry.id;
         drop(state);
+        self.mark_dirty();
         self.emit("connections_removed", json!({"ids": [id]}));
+    }
+
+    fn mark_dirty(&self) {
+        if let Some(notify) = self.persistence.as_ref() {
+            notify.notify_one();
+        }
+    }
+
+    fn restore_persisted(&self, persisted: PersistedMonitor) {
+        let mut state = self.lock();
+        state.next_id = persisted.next_id;
+        state.total_upload = persisted.total_upload;
+        state.total_download = persisted.total_download;
+        state.counters = persisted.counters;
+        state.buckets = persisted.buckets;
+        state.history = persisted.history;
+        state.failed_history = persisted
+            .failed_history
+            .into_iter()
+            .map(|entry| {
+                (
+                    (
+                        entry.protocol.clone(),
+                        entry.host.clone(),
+                        entry.process.clone(),
+                    ),
+                    entry,
+                )
+            })
+            .collect();
+        state.telemetry = persisted
+            .telemetry
+            .into_iter()
+            .map(|entry| {
+                (
+                    (entry.dimension, entry.value),
+                    (entry.download, entry.upload, entry.failures),
+                )
+            })
+            .collect();
+    }
+
+    fn persisted_json(&self) -> PersistedMonitor {
+        let state = self.lock();
+        PersistedMonitor {
+            version: PERSISTENCE_VERSION,
+            next_id: state.next_id,
+            total_upload: state.total_upload,
+            total_download: state.total_download,
+            counters: state.counters.clone(),
+            buckets: state.buckets.clone(),
+            telemetry: state
+                .telemetry
+                .iter()
+                .map(
+                    |((dimension, value), (download, upload, failures))| PersistedTelemetry {
+                        dimension: dimension.clone(),
+                        value: value.clone(),
+                        download: *download,
+                        upload: *upload,
+                        failures: *failures,
+                    },
+                )
+                .collect(),
+            history: state.history.clone(),
+            failed_history: state.failed_history.values().cloned().collect(),
+        }
     }
 }
 
@@ -459,6 +692,25 @@ mod tests {
         assert_eq!(monitor.total_flow_value()["upload"], "7");
         assert_eq!(monitor.total_flow_value()["download"], "11");
         assert_eq!(monitor.total_flow_value()["counters"]["1"]["upload"], "7");
+        monitor.closed(flow.key);
+        assert_eq!(
+            monitor.connections_value()["connections"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            monitor.total_flow_value()["counters"]["1"]["download"],
+            "11"
+        );
+        assert_eq!(
+            monitor.telemetry_value()["groups"]
+                .as_array()
+                .unwrap()
+                .len(),
+            9
+        );
     }
 
     #[test]
@@ -483,5 +735,44 @@ mod tests {
         assert_eq!(monitor.request_close(&["1".to_owned()]), 1);
         assert_eq!(monitor.take_close_requests(), vec![flow.key]);
         assert!(monitor.take_close_requests().is_empty());
+    }
+
+    #[test]
+    fn monitor_records_coalesced_failed_history() {
+        let monitor = ConnectionMonitor::new();
+        monitor.record_failure("http", "example.com:443", "connection refused");
+        monitor.record_failure("http", "example.com:443", "timeout");
+        let history = monitor.failed_history_value();
+        assert_eq!(history["items"][0]["failedCount"], "2");
+        assert_eq!(history["items"][0]["error"], "timeout");
+    }
+
+    #[test]
+    fn monitor_persists_totals_and_history_through_the_config_store() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = ConfigStore::open_memory().await.unwrap();
+            let monitor = ConnectionMonitor::load_with_store(store.clone())
+                .await
+                .unwrap();
+            let (flow, context) = flow();
+            monitor.opened(flow, context);
+            monitor.bytes(flow.key, TunFlowDirection::Upload, 13);
+            monitor.closed(flow.key);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let reloaded = ConnectionMonitor::load_with_store(store).await.unwrap();
+            assert_eq!(reloaded.total_flow_value()["upload"], "13");
+            assert_eq!(
+                reloaded.all_history_value()["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        });
     }
 }

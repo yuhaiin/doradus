@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpStream;
@@ -16,12 +17,19 @@ use crate::{ConnectionMonitor, RuntimeProxySelector};
 
 pub(crate) async fn serve(
     stream: TcpStream,
+    peer: SocketAddr,
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
+    monitor: Arc<ConnectionMonitor>,
 ) -> Result<()> {
     let upstream: Arc<dyn AsyncProxy> = Arc::new(RoutedProxy { selector });
     let server = YuubinsyaServerProxy::new(derive_salt(spec.password.as_bytes()), upstream);
-    server.serve(stream).await
+    let annotate = spec.clone();
+    server
+        .serve_observed(stream, peer, monitor, move |context| {
+            annotate.annotate_context(context)
+        })
+        .await
 }
 
 pub(crate) async fn serve_udp(
