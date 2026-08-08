@@ -10,6 +10,7 @@ chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["
 hkdf = { version = "0.12.4", default-features = false }
 md-5 = { version = "0.10.6", default-features = false }
 rand = { version = "0.10.2", default-features = false, features = ["std", "thread_rng"] }
+futures-util = { version = "0.3.33", optional = true, default-features = false, features = ["std", "sink"] }
 sha2 = { version = "0.11.0", default-features = false }
 sha1 = { version = "0.10.7", default-features = false }
 tokio = { version = "1.50.0", default-features = false, features = ["io-util", "net", "rt", "sync", "time"] }
@@ -17,10 +18,12 @@ yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
 rustls = { version = "0.23.41", optional = true, default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = { version = "0.0.2-alpha", optional = true, default-features = false, features = ["std", "tls12", "zeroize"] }
 tokio-rustls = { version = "0.26.4", optional = true, default-features = false, features = ["tls12"] }
+tokio-tungstenite = { version = "0.28.0", optional = true, default-features = false, features = ["handshake"] }
 
 [features]
 default = []
 tls-rustcrypto = ["dep:rustls", "dep:rustls-rustcrypto", "dep:tokio-rustls"]
+websocket = ["dep:futures-util", "dep:tokio-tungstenite", "yuhaiin-core/websocket"]
 
 [lints]
 workspace = true

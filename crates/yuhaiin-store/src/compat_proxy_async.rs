@@ -48,7 +48,9 @@ impl GoProxyRuntimeConfig {
 
     fn ensure_base_transport(&self) -> Result<()> {
         if self.chain_types.iter().any(|kind| {
-            matches!(kind.to_ascii_lowercase().as_str(), "http2" | "websocket")
+            matches!(kind.to_ascii_lowercase().as_str(), "http2")
+                || (kind.eq_ignore_ascii_case("websocket")
+                    && !matches!(self.transport, GoProxyTransport::Vless))
                 || (kind.eq_ignore_ascii_case("tls")
                     && !matches!(
                         self.transport,

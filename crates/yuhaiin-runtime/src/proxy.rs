@@ -48,7 +48,9 @@ impl RuntimeSnapshot {
             ));
         }
 
-        let proxy = if is_chain_config(&config) {
+        let proxy = if is_vless_websocket_config(&config) {
+            build_vless_transport_proxy(&config, timeout, self.resolver.clone()).await?
+        } else if is_chain_config(&config) {
             let json = std::str::from_utf8(&config.data_json).map_err(|error| {
                 Error::new(
                     ErrorKind::InvalidInput,
@@ -311,6 +313,112 @@ fn is_chain_config(config: &GoProxyRuntimeConfig) -> bool {
     })
 }
 
+fn is_vless_websocket_config(config: &GoProxyRuntimeConfig) -> bool {
+    let has_websocket = config
+        .chain_types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("websocket"));
+    let has_vless = config
+        .chain_types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("vless"));
+    config.transport == yuhaiin_store::GoProxyTransport::Vless
+        && has_websocket
+        && has_vless
+        && config.chain_types.iter().all(|kind| {
+            matches!(
+                kind.to_ascii_lowercase().as_str(),
+                "fixed" | "fixedv2" | "tls" | "websocket" | "vless"
+            )
+        })
+}
+
+async fn build_vless_transport_proxy(
+    config: &GoProxyRuntimeConfig,
+    timeout: Duration,
+    resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let base = config
+        .to_base_proxy_config_with_resolver(timeout, resolver)
+        .await?;
+    let mut upstream: Arc<dyn AsyncProxy> = base.build()?;
+    if config
+        .chain_types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("tls"))
+    {
+        #[cfg(feature = "doh-tls")]
+        {
+            upstream = build_protocol_tls_proxy(config, upstream)?;
+        }
+        #[cfg(not(feature = "doh-tls"))]
+        {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "VLESS TLS transport requires the doh-tls feature",
+            ));
+        }
+    }
+    if config
+        .chain_types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("websocket"))
+    {
+        upstream = build_protocol_websocket_proxy(config, upstream)?;
+    }
+    let layer = config
+        .layers
+        .iter()
+        .find(|layer| layer.kind.eq_ignore_ascii_case("vless"))
+        .ok_or_else(|| Error::invalid("VLESS protocol layer is missing"))?;
+    let uuid = layer
+        .config
+        .get("uuid")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::invalid("VLESS UUID is missing"))?;
+    Ok(Arc::new(yuhaiin_protocol::vless::VlessProxy::new(
+        upstream, uuid,
+    )?))
+}
+
+#[cfg(feature = "websocket")]
+fn build_protocol_websocket_proxy(
+    config: &GoProxyRuntimeConfig,
+    upstream: Arc<dyn AsyncProxy>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let layer = config
+        .layers
+        .iter()
+        .find(|layer| layer.kind.eq_ignore_ascii_case("websocket"))
+        .ok_or_else(|| Error::invalid("WebSocket transport layer is missing"))?;
+    let host = layer
+        .config
+        .get("host")
+        .or_else(|| layer.config.get("hostname"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| Error::invalid("WebSocket transport host is missing"))?;
+    let path = layer
+        .config
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("/");
+    Ok(Arc::new(yuhaiin_protocol::websocket::WebSocketProxy::new(
+        upstream, host, path,
+    )?))
+}
+
+#[cfg(not(feature = "websocket"))]
+fn build_protocol_websocket_proxy(
+    _config: &GoProxyRuntimeConfig,
+    _upstream: Arc<dyn AsyncProxy>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    Err(Error::new(
+        ErrorKind::Unsupported,
+        "VLESS WebSocket transport requires the websocket feature",
+    ))
+}
+
 #[cfg(feature = "doh-tls")]
 fn build_protocol_tls_proxy(
     config: &GoProxyRuntimeConfig,
@@ -392,6 +500,7 @@ mod tests {
     use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyKind};
     use yuhaiin_core::{FlowContext, RouteMode};
     use yuhaiin_protocol::trojan::{self, Command};
+    use yuhaiin_store::GoProxyLayer;
     use yuhaiin_store::GoProxyTransport;
     use yuhaiin_trie::router::{RouteDecision, Router, RouterRuntime};
 
@@ -827,6 +936,47 @@ mod tests {
             block_on(snapshot(config).build_proxy("websocket-chain", Duration::from_secs(1)))
                 .unwrap();
         assert_eq!(built.config.id, "websocket-chain");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn runtime_builds_vless_over_websocket_transport_chain() {
+        let config = GoProxyRuntimeConfig {
+            id: "vless-websocket".to_owned(),
+            name: "vless-websocket".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec![
+                "fixedv2".to_owned(),
+                "websocket".to_owned(),
+                "vless".to_owned(),
+            ],
+            layers: vec![
+                GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({
+                        "addresses": [{"host": "127.0.0.1", "port": 40501}]
+                    }),
+                },
+                GoProxyLayer {
+                    kind: "websocket".to_owned(),
+                    config: serde_json::json!({"host": "localhost", "path": "/vless"}),
+                },
+                GoProxyLayer {
+                    kind: "vless".to_owned(),
+                    config: serde_json::json!({
+                        "uuid": "00000000-0000-0000-0000-000000000001"
+                    }),
+                },
+            ],
+            transport: GoProxyTransport::Vless,
+            data_json: serde_json::json!({}).to_string().into_bytes(),
+        };
+        let built =
+            block_on(snapshot(config).build_proxy("vless-websocket", Duration::from_secs(1)))
+                .unwrap();
+        assert_eq!(built.config.id, "vless-websocket");
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {

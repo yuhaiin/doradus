@@ -9,7 +9,7 @@
 
 > 当前实现快照：可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store`、`yuhaiin-geo`、`yuhaiin-protocol` 和 `yuhaiin-runtime` 七个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，MaxMindDB 位于独立的 `yuhaiin-geo`，协议 wire codec/可组合 transport 位于 `yuhaiin-protocol`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责应用层组装和原子 reload，`yuhaiin-runtime::api` 提供与现有 `yuhaiin-react` client 对齐的管理面，`yuhaiin-runtime::run_tun_device_until` 负责已创建设备的数据面生命周期，`src/bin/yuhaiin.rs` 只是桌面设备创建和进程 wiring 的一个 host。HTTP 层复用 Go compatibility records，不新增一套配置 DTO，也不把平台权限细节泄漏到上层。
 
-> 已实现的代码包括：SQLite 配置事务与 schema v3 typed repository、Go v6 fixture/import/字段差异报告、FakeIP IPv4/IPv6 分配/持久化/旧 snapshot 幂等导入与 A/AAAA/PTR/HTTPS/SVCB hint answer transform、域名/CIDR/Geo country Router snapshot publish/rollback、独立 `yuhaiin-geo` 的 MaxMindDB reader/校验下载/atomic refresh、带 TTL/容量淘汰的 DNS cache、同步/异步 UDP DNS client/server/policy/cancellation boundary、DoH transport boundary、注入 connector 的 HTTP/2 DoH framing、可直接接入异步 DNS/TUN packet pipeline 的 `H2DohDnsHandler`、可复用的 RustCrypto TCP→TLS→ALPN h2 DoH connector 和 DoT TCP framing resolver、同时组装 System/UDP/TCP/DoH/DoT 的 `RustCryptoResolverFactory`、hosts→upstream→FakeIP 的可注入异步 resolver stack、`yuhaiin-runtime` 的 Go compatibility snapshot 组装与 direct/HTTP/SOCKS5/Shadowsocks/Trojan/chain proxy 构造、direct/fixed/drop/HTTP CONNECT/SOCKS5、独立 `yuhaiin-protocol` 的 Shadowsocks/Trojan TCP/UDP codec、inbound/outbound wrapper 和 `fixedv2 -> TLS -> Shadowsocks/Trojan` transport 组合、feature-gated `rustls-rustcrypto` TLS client、共享 WebSocket byte-stream transport（standalone 与 WebSocket+HTTP/2 inbound/outbound）、Yuubinsya native UDP client/server socket、UOT/TCP/coalesce/Ping client/server session、full-cone NAT UDP relay、唯一的 `tun-rs AsyncDevice + smoltcp` TUN adapter，以及独立的 `yuhaiin-chain`（fixedv2 → 可选 TLS/WebSocket → HTTP/2 pool/CONNECT → Yuubinsya TCP/UOT/Ping）。TLS provider 仍是 alpha，DoQ/DoH3、WebSocket early-data/子协议和特权 Linux namespace/Android/macOS 验收仍是独立门槛，未用 C TLS 代替。
+> 已实现的代码包括：SQLite 配置事务与 schema v3 typed repository、Go v6 fixture/import/字段差异报告、FakeIP IPv4/IPv6 分配/持久化/旧 snapshot 幂等导入与 A/AAAA/PTR/HTTPS/SVCB hint answer transform、域名/CIDR/Geo country Router snapshot publish/rollback、独立 `yuhaiin-geo` 的 MaxMindDB reader/校验下载/atomic refresh、带 TTL/容量淘汰的 DNS cache、同步/异步 UDP DNS client/server/policy/cancellation boundary、DoH transport boundary、注入 connector 的 HTTP/2 DoH framing、可直接接入异步 DNS/TUN packet pipeline 的 `H2DohDnsHandler`、可复用的 RustCrypto TCP→TLS→ALPN h2 DoH connector 和 DoT TCP framing resolver、同时组装 System/UDP/TCP/DoH/DoT 的 `RustCryptoResolverFactory`、hosts→upstream→FakeIP 的可注入异步 resolver stack、`yuhaiin-runtime` 的 Go compatibility snapshot 组装与 direct/HTTP/SOCKS5/Shadowsocks/Trojan/VLESS/chain proxy 构造、direct/fixed/drop/HTTP CONNECT/SOCKS5、独立 `yuhaiin-protocol` 的 Shadowsocks/Trojan/VLESS TCP/UDP codec、inbound/outbound wrapper、TLS 和 WebSocket transport 组合、feature-gated `rustls-rustcrypto` TLS client、共享 WebSocket byte-stream transport（standalone、VLESS 和 WebSocket+HTTP/2 inbound/outbound）、Yuubinsya native UDP client/server socket、UOT/TCP/coalesce/Ping client/server session、full-cone NAT UDP relay、唯一的 `tun-rs AsyncDevice + smoltcp` TUN adapter，以及独立的 `yuhaiin-chain`（fixedv2 → 可选 TLS/WebSocket → HTTP/2 pool/CONNECT → Yuubinsya TCP/UOT/Ping）。TLS provider 仍是 alpha，DoQ/DoH3、WebSocket early-data/子协议和特权 Linux namespace/Android/macOS 验收仍是独立门槛，未用 C TLS 代替。
 
 ## 1. 目标、边界和完成定义
 
@@ -95,7 +95,7 @@ yuhaiin-rust/
 │   ├── yuhaiin-proxy/         # proxy trait、direct/fixed/drop 等基础实现
 │   ├── yuhaiin-proxy-yuubinsya/ # Yuubinsya wire codec、client、server
 │   ├── yuhaiin-proxy-http/    # HTTP CONNECT、HTTP/2、SOCKS5、TLS wrapper
-│   ├── yuhaiin-protocol/      # 可组合协议 wire codec/transport（Shadowsocks/Trojan）
+│   ├── yuhaiin-protocol/      # 可组合协议 wire codec/transport（Shadowsocks/Trojan/VLESS/WebSocket）
 │   ├── yuhaiin-chain/          # 当前可运行的 fixedv2 -> 可选 TLS/WebSocket -> HTTP/2 -> Yuubinsya 组合
 │   ├── yuhaiin-router/        # list snapshot、rule matcher、route dispatch
 │   ├── yuhaiin-nat/           # UDP NAT table/source control
@@ -919,6 +919,7 @@ server 同时处理 TCP listener 和 UDP listener：
 | TLS | wrapper | 委托 | 委托 | 必须 |
 | Shadowsocks AEAD | 是 | 加密 UDP packet | 委托 | 已实现（TCP/codec/Go 互操作） |
 | Trojan | 是 | UDP-over-TCP ASSOCIATE | 委托 | 已实现 |
+| VLESS | 是 | UDP-over-TCP length framing | 委托 | 已实现（TCP/UDP codec、inbound/outbound、WebSocket transport composition、Go wire 互操作） |
 | HTTP/2 prior knowledge | CONNECT stream | CONNECT stream | 委托 | 必须 |
 | Yuubinsya | 是 | native + UOT | 是 | 最高优先级 |
 
@@ -929,6 +930,14 @@ Shadowsocks AEAD 独立放在 `yuhaiin-protocol`：`ShadowsocksProxy` 包裹任�
 标准 salt + target-address + payload 形式。runtime 从 `nodes_v2` 的 tagged layer 读取
 `method/password`，可组合 `fixedv2 -> tls -> shadowsocks`；协议层不自己创建 resolver，
 也不把 ShadowsocksR 的 obfs/auth-chain 状态错误地当成普通 Shadowsocks。
+
+VLESS 同样独立放在 `yuhaiin-protocol`：`VlessProxy` 使用 v0 UUID、TCP request/response
+header 和固定目标的 UDP-over-TCP length frame，同时支持作为 inbound parser 将请求交给共享
+`RuntimeProxySelector`。runtime 可以把 fixed parent 依次包成 TLS、WebSocket，再包 VLESS；
+WebSocket 只负责 HTTP upgrade 和 byte-stream framing，不把 VLESS 逻辑复制到 transport 层。
+VLESS 的 UUID、IPv4/domain/IPv6 地址编码、TCP/UDP framing、Rust→Go wire 互操作和
+`fixedv2 -> websocket -> vless` runtime 构造均有自动化测试；HTTP/2 VLESS、early-data、
+XTLS/flow 等高级变体仍明确保持 unsupported，而不是静默降级。
 
 ## 9. NAT 迁移设计
 
