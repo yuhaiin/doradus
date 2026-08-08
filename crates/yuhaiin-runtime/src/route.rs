@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +16,12 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use yuhaiin_core::GeoLookup;
-use yuhaiin_core::{Error, ErrorKind, Network, ResolveStrategy, ResolverPolicy, Result};
+use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+use yuhaiin_core::proxy::{AsyncProxy, BoxAsyncStream};
+use yuhaiin_core::{
+    BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, ResolveStrategy,
+    ResolverPolicy, Result,
+};
 use yuhaiin_store::{GoRouteListRecord, GoRouteRuleRecord};
 use yuhaiin_trie::router::{RouteDecision, RouteRule, Router, RouterRuntime, RuleAction};
 
@@ -184,6 +190,65 @@ pub struct RouteListRefreshReport {
     pub errors: BTreeMap<String, Vec<String>>,
 }
 
+/// Connection boundary for route-list downloads.
+///
+/// The default compatibility entry point remains direct TCP, while the
+/// runtime API can inject the currently selected outbound proxy. Keeping this
+/// boundary here avoids coupling route parsing to a concrete proxy protocol
+/// and leaves room for a future downloader with redirect or cache policy.
+pub trait RouteListTransport: Send + Sync {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>>;
+}
+
+/// Adapts the shared async proxy and resolver abstractions to the route-list
+/// downloader. Resolving before `connect` makes the adapter work with direct,
+/// fixed, HTTP, SOCKS5, and chained proxies whose current implementations all
+/// accept an IP endpoint; the original URL host is still used for HTTP Host
+/// and TLS SNI.
+pub struct ProxyRouteListTransport {
+    proxy: Arc<dyn AsyncProxy>,
+    resolver: Arc<dyn AsyncIpResolver>,
+}
+
+impl ProxyRouteListTransport {
+    pub fn new(proxy: Arc<dyn AsyncProxy>, resolver: Arc<dyn AsyncIpResolver>) -> Self {
+        Self { proxy, resolver }
+    }
+}
+
+impl RouteListTransport for ProxyRouteListTransport {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        let proxy = self.proxy.clone();
+        let resolver = self.resolver.clone();
+        let mut context = context.clone();
+        Box::pin(async move {
+            if let Endpoint::Domain {
+                network,
+                host,
+                port,
+            } = context.destination.clone()
+            {
+                let addresses = resolver.resolve(&host, ResolveStrategy::Default).await?;
+                let address = addresses
+                    .v4
+                    .first()
+                    .copied()
+                    .map(IpAddr::V4)
+                    .or_else(|| addresses.v6.first().copied().map(IpAddr::V6))
+                    .ok_or_else(|| {
+                        Error::invalid(format!(
+                            "route-list host {} resolved to no address",
+                            host.as_str()
+                        ))
+                    })?;
+                context.destination = Endpoint::ip(network, SocketAddr::new(address, port));
+                context.network = network;
+            }
+            proxy.connect(&context).await
+        })
+    }
+}
+
 /// Download all configured HTTP(S) route-list sources into the persistent
 /// cache. Each successful response is written to a sibling `.part` file and
 /// atomically renamed, so a force-stop cannot leave a partially readable
@@ -191,6 +256,26 @@ pub struct RouteListRefreshReport {
 pub async fn refresh_route_list_caches(
     records: &[GoRouteListRecord],
     timeout: Duration,
+) -> RouteListRefreshReport {
+    refresh_route_list_caches_inner(records, timeout, None).await
+}
+
+/// Refresh route-list caches through an injected outbound transport.
+///
+/// This is the runtime equivalent of Go's `Lists.SetProxy`: management-plane
+/// downloads follow the selected node instead of silently bypassing it.
+pub async fn refresh_route_list_caches_with_transport(
+    records: &[GoRouteListRecord],
+    timeout: Duration,
+    transport: Arc<dyn RouteListTransport>,
+) -> RouteListRefreshReport {
+    refresh_route_list_caches_inner(records, timeout, Some(transport.as_ref())).await
+}
+
+async fn refresh_route_list_caches_inner(
+    records: &[GoRouteListRecord],
+    timeout: Duration,
+    transport: Option<&dyn RouteListTransport>,
 ) -> RouteListRefreshReport {
     let mut report = RouteListRefreshReport::default();
     for record in records {
@@ -224,7 +309,13 @@ pub async fn refresh_route_list_caches(
             if url.starts_with("file://") {
                 continue;
             }
-            match download_route_url(&url, timeout).await {
+            let download = match transport {
+                Some(transport) => {
+                    download_route_url_with_transport(&url, timeout, Some(transport)).await
+                }
+                None => download_route_url(&url, timeout).await,
+            };
+            match download {
                 Ok(bytes) => match write_route_list_cache(&url, &bytes) {
                     Ok(()) => report.refreshed += 1,
                     Err(error) => report
@@ -265,8 +356,42 @@ trait RouteDownloadStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> RouteDownloadStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 async fn download_route_url(url: &str, timeout: Duration) -> Result<Vec<u8>> {
+    download_route_url_with_transport(url, timeout, None).await
+}
+
+async fn download_route_url_with_transport(
+    url: &str,
+    timeout: Duration,
+    transport: Option<&dyn RouteListTransport>,
+) -> Result<Vec<u8>> {
     let (secure, host, port, path) = parse_http_url(url)?;
-    let mut stream: Box<dyn RouteDownloadStream> = if secure {
+    let mut stream: Box<dyn RouteDownloadStream> = if let Some(transport) = transport {
+        let context = FlowContext::new(Endpoint::domain(
+            Network::Tcp,
+            DomainName::new(&host)?,
+            port,
+        ));
+        let stream = transport.connect(&context).await?;
+        if secure {
+            #[cfg(feature = "doh-tls")]
+            {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                let dialer = crate::RustCryptoTlsDialer::from_root_store(roots, timeout)?;
+                Box::new(dialer.connect_boxed_stream(&host, stream).await?)
+            }
+            #[cfg(not(feature = "doh-tls"))]
+            {
+                let _ = stream;
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "https route-list refresh requires the doh-tls feature",
+                ));
+            }
+        } else {
+            Box::new(stream)
+        }
+    } else if secure {
         #[cfg(feature = "doh-tls")]
         {
             let mut roots = rustls::RootCertStore::empty();
@@ -1185,6 +1310,9 @@ fn invalid_port(id: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_core::proxy::FixedAsyncProxy;
     use yuhaiin_core::{Endpoint, Network};
     use yuhaiin_store::GoRouteListRecord;
 
@@ -1465,6 +1593,50 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(body, b"example.com");
+            server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn http_route_list_downloader_uses_injected_outbound_proxy() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 1024];
+                let length = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                assert!(request.starts_with("GET /rules HTTP/1.1"));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nproxy-route\n",
+                    )
+                    .await
+                    .unwrap();
+            });
+            let proxy = Arc::new(FixedAsyncProxy {
+                address,
+                timeout: Duration::from_secs(2),
+            });
+            let transport = Arc::new(ProxyRouteListTransport::new(
+                proxy,
+                Arc::new(SystemAsyncIpResolver),
+            ));
+            let body = download_route_url_with_transport(
+                &format!("http://{address}/rules"),
+                Duration::from_secs(2),
+                Some(transport.as_ref()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(body, b"proxy-route\n");
             server.await.unwrap();
         });
     }

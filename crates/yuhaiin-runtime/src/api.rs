@@ -16,11 +16,13 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
+use yuhaiin_core::proxy::{AsyncProxy, DirectAsyncProxy};
 use yuhaiin_core::{DomainName, Endpoint, FlowContext, Network};
 
 use yuhaiin_store::{
@@ -29,8 +31,8 @@ use yuhaiin_store::{
 };
 
 use crate::{
-    RouteListSnapshot, RuntimeController, expand_go_route_rule, latency::LatencyRequest,
-    log::log_batch_value, refresh_route_list_caches,
+    ProxyRouteListTransport, RouteListSnapshot, RuntimeController, expand_go_route_rule,
+    latency::LatencyRequest, log::log_batch_value, refresh_route_list_caches_with_transport,
 };
 
 #[derive(Clone)]
@@ -847,7 +849,19 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
         .repository()
         .list_go_route_lists()
         .await?;
-    let report = refresh_route_list_caches(&records, Duration::from_secs(90)).await;
+    let timeout = Duration::from_secs(90);
+    let proxy_id = crate::inbound::selected_proxy_id(&state.controller).await?;
+    let snapshot = state.controller.handle().load();
+    let proxy: Arc<dyn AsyncProxy> = match snapshot.build_proxy(&proxy_id, timeout).await {
+        Ok(build) => build.proxy,
+        Err(_error) if proxy_id == "direct" => Arc::new(DirectAsyncProxy { timeout }),
+        Err(error) => return Err(error.into()),
+    };
+    let transport = Arc::new(ProxyRouteListTransport::new(
+        proxy,
+        snapshot.resolver.clone(),
+    ));
+    let report = refresh_route_list_caches_with_transport(&records, timeout, transport).await;
     let refreshed_at = unix_millis();
     let activation = json!({
         "hostIndexRefreshAt": refreshed_at,

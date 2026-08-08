@@ -13,6 +13,7 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use yuhaiin_core::http2::H2DohConnector;
+use yuhaiin_core::proxy::BoxAsyncStream;
 use yuhaiin_core::{BoxFuture, Error, ErrorKind, Result};
 
 pub type RustCryptoTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
@@ -45,7 +46,6 @@ impl RustCryptoTlsDialer {
         port: u16,
         server_name: &str,
     ) -> Result<RustCryptoTlsStream> {
-        let server_name = tls_server_name(server_name)?;
         let stream = tokio::time::timeout(self.timeout, TcpStream::connect((host, port)))
             .await
             .map_err(|_| Error::new(ErrorKind::Timeout, "TLS TCP connect timed out"))?
@@ -53,6 +53,30 @@ impl RustCryptoTlsDialer {
         stream
             .set_nodelay(true)
             .map_err(|error| Error::new(ErrorKind::Io, format!("TLS TCP_NODELAY: {error}")))?;
+        self.connect_stream(server_name, stream).await
+    }
+
+    /// Complete a RustCrypto TLS handshake over an already established stream.
+    /// This is shared by proxy-aware management downloads and direct DoH/DoT
+    /// dialing, so TLS never needs to know how the underlying connection was
+    /// routed.
+    pub async fn connect_boxed_stream(
+        &self,
+        server_name: &str,
+        stream: BoxAsyncStream,
+    ) -> Result<tokio_rustls::client::TlsStream<BoxAsyncStream>> {
+        self.connect_stream(server_name, stream).await
+    }
+
+    async fn connect_stream<S>(
+        &self,
+        server_name: &str,
+        stream: S,
+    ) -> Result<tokio_rustls::client::TlsStream<S>>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let server_name = tls_server_name(server_name)?;
         tokio::time::timeout(self.timeout, self.tls.connect(server_name, stream))
             .await
             .map_err(|_| Error::new(ErrorKind::Timeout, "TLS handshake timed out"))?

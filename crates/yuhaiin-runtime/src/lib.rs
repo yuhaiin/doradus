@@ -58,9 +58,10 @@ pub use resolver::{
     TimeoutResolver, parse_dns_server,
 };
 pub use route::{
-    RouteListRefreshReport, RouteListSnapshot, compile_go_route_rules,
-    compile_go_route_rules_with_geo, compile_go_route_rules_with_lists, expand_go_route_rule,
-    load_route_lists, refresh_route_list_caches, route_list_cache_dir, route_list_cache_path,
+    ProxyRouteListTransport, RouteListRefreshReport, RouteListSnapshot, RouteListTransport,
+    compile_go_route_rules, compile_go_route_rules_with_geo, compile_go_route_rules_with_lists,
+    expand_go_route_rule, load_route_lists, refresh_route_list_caches,
+    refresh_route_list_caches_with_transport, route_list_cache_dir, route_list_cache_path,
     route_rule_from_go_record,
 };
 #[cfg(feature = "doh-tls")]
