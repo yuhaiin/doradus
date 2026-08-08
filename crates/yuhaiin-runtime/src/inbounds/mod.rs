@@ -361,8 +361,91 @@ async fn serve_listener(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
     use super::*;
+    use crate::{RuntimeBuilder, RuntimeController};
     use serde_json::json;
+    use yuhaiin_chain::AsyncYuubinsyaTcpSession;
+    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_core::{Endpoint, Network};
+    use yuhaiin_store::{ConfigStore, GoNodeRecord};
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(future)
+    }
+
+    async fn direct_runtime() -> (Arc<RuntimeProxySelector>, Arc<ConnectionMonitor>) {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let controller = RuntimeController::from_builder(RuntimeBuilder::new(
+            store,
+            Arc::new(SystemAsyncIpResolver),
+        ))
+        .await
+        .unwrap();
+        controller
+            .store()
+            .repository()
+            .put_go_node(&GoNodeRecord {
+                id: "direct".to_owned(),
+                name: "Direct".to_owned(),
+                group_name: "default".to_owned(),
+                origin: "test".to_owned(),
+                enabled: true,
+                chain_types_json: br#"["direct"]"#.to_vec(),
+                updated_at: 1,
+                data_json: br#"{"protocol":"direct"}"#.to_vec(),
+            })
+            .await
+            .unwrap();
+        controller.reload().await.unwrap();
+        let selector = controller
+            .build_proxy_selector("", "direct", "", "", Duration::from_secs(2))
+            .await
+            .unwrap();
+        (selector, controller.monitor())
+    }
+
+    async fn echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4096];
+                    loop {
+                        let Ok(size) = stream.read(&mut buffer).await else {
+                            break;
+                        };
+                        if size == 0 || stream.write_all(&buffer[..size]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        (address, task)
+    }
+
+    async fn read_headers(stream: &mut TcpStream) -> Vec<u8> {
+        let mut headers = Vec::new();
+        let mut byte = [0u8; 1];
+        while !headers.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            headers.push(byte[0]);
+        }
+        headers
+    }
 
     #[test]
     fn inbound_udp_mode_accepts_frontend_strings_and_legacy_booleans() {
@@ -377,5 +460,164 @@ mod tests {
         assert_eq!(UdpMode::from_value(Some(&json!(true))), UdpMode::Enabled);
         assert!(UdpMode::UdpOnly.udp_enabled());
         assert!(!UdpMode::UdpOnly.tcp_enabled());
+    }
+
+    #[test]
+    fn socks5_inbound_routes_a_real_tcp_flow_through_the_shared_outbound() {
+        block_on(async {
+            let (echo_address, echo_task) = echo_server().await;
+            let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let inbound_address = inbound_listener.local_addr().unwrap();
+            let (selector, monitor) = direct_runtime().await;
+            let listener_task = tokio::spawn(serve_listener(
+                inbound_listener,
+                InboundSpec {
+                    id: "socks-inbound".to_owned(),
+                    protocol: "socks5".to_owned(),
+                    listen: inbound_address,
+                    username: String::new(),
+                    password: String::new(),
+                    udp_mode: UdpMode::Disabled,
+                    protocol_udp: false,
+                    transports: vec!["normal".to_owned()],
+                    outbound_id: "direct".to_owned(),
+                },
+                selector,
+                monitor,
+            ));
+
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut client = TcpStream::connect(inbound_address).await.unwrap();
+                client.write_all(&[5, 1, 0]).await.unwrap();
+                let mut method = [0u8; 2];
+                client.read_exact(&mut method).await.unwrap();
+                assert_eq!(method, [5, 0]);
+
+                let ip = match echo_address.ip() {
+                    std::net::IpAddr::V4(ip) => ip.octets(),
+                    std::net::IpAddr::V6(_) => panic!("test echo server must be IPv4"),
+                };
+                let mut request = vec![5, 1, 0, 1];
+                request.extend_from_slice(&ip);
+                request.extend_from_slice(&echo_address.port().to_be_bytes());
+                client.write_all(&request).await.unwrap();
+                let mut reply = [0u8; 10];
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply[0..2], [5, 0]);
+
+                client.write_all(b"socks5-through-direct").await.unwrap();
+                let mut echoed = vec![0u8; 21];
+                client.read_exact(&mut echoed).await.unwrap();
+                assert_eq!(&echoed, b"socks5-through-direct");
+            })
+            .await;
+
+            listener_task.abort();
+            let _ = listener_task.await;
+            echo_task.abort();
+            let _ = echo_task.await;
+            result.unwrap();
+        });
+    }
+
+    #[test]
+    fn http_connect_inbound_routes_a_real_tcp_flow_through_the_shared_outbound() {
+        block_on(async {
+            let (echo_address, echo_task) = echo_server().await;
+            let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let inbound_address = inbound_listener.local_addr().unwrap();
+            let (selector, monitor) = direct_runtime().await;
+            let listener_task = tokio::spawn(serve_listener(
+                inbound_listener,
+                InboundSpec {
+                    id: "http-inbound".to_owned(),
+                    protocol: "http".to_owned(),
+                    listen: inbound_address,
+                    username: String::new(),
+                    password: String::new(),
+                    udp_mode: UdpMode::Disabled,
+                    protocol_udp: false,
+                    transports: vec!["normal".to_owned()],
+                    outbound_id: "direct".to_owned(),
+                },
+                selector,
+                monitor,
+            ));
+
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut client = TcpStream::connect(inbound_address).await.unwrap();
+                client
+                    .write_all(
+                        format!(
+                            "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+                            echo_address, echo_address
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let headers = read_headers(&mut client).await;
+                assert!(headers.starts_with(b"HTTP/1.1 200 Connection Established"));
+
+                client.write_all(b"http-through-direct").await.unwrap();
+                let mut echoed = vec![0u8; 19];
+                client.read_exact(&mut echoed).await.unwrap();
+                assert_eq!(&echoed, b"http-through-direct");
+            })
+            .await;
+
+            listener_task.abort();
+            let _ = listener_task.await;
+            echo_task.abort();
+            let _ = echo_task.await;
+            result.unwrap();
+        });
+    }
+
+    #[test]
+    fn yuubinsya_inbound_routes_a_real_tcp_flow_through_the_shared_outbound() {
+        block_on(async {
+            let (echo_address, echo_task) = echo_server().await;
+            let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let inbound_address = inbound_listener.local_addr().unwrap();
+            let (selector, monitor) = direct_runtime().await;
+            let listener_task = tokio::spawn(serve_listener(
+                inbound_listener,
+                InboundSpec {
+                    id: "yuubinsya-inbound".to_owned(),
+                    protocol: "yuubinsya".to_owned(),
+                    listen: inbound_address,
+                    username: String::new(),
+                    password: "test-password".to_owned(),
+                    udp_mode: UdpMode::Disabled,
+                    protocol_udp: false,
+                    transports: vec!["normal".to_owned()],
+                    outbound_id: "direct".to_owned(),
+                },
+                selector,
+                monitor,
+            ));
+
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let transport = TcpStream::connect(inbound_address).await.unwrap();
+                let password = yuhaiin_core::yuubinsya::derive_salt(b"test-password");
+                let destination = Endpoint::ip(Network::Tcp, echo_address);
+                let mut client =
+                    AsyncYuubinsyaTcpSession::connect(transport, password, destination)
+                        .await
+                        .unwrap();
+                client.write_all(b"yuubinsya-through-direct").await.unwrap();
+                let mut echoed = vec![0u8; 24];
+                client.read_exact(&mut echoed).await.unwrap();
+                assert_eq!(&echoed, b"yuubinsya-through-direct");
+            })
+            .await;
+
+            listener_task.abort();
+            let _ = listener_task.await;
+            echo_task.abort();
+            let _ = echo_task.await;
+            result.unwrap();
+        });
     }
 }

@@ -10,7 +10,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -142,12 +142,26 @@ struct ListQuery {
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/v2/info", get(info))
+        .route("/api/v2/update/check", post(update_check))
+        .route("/api/v2/update/apply", post(update_apply))
+        .route("/api/v2/update/status", get(update_status))
         .route("/api/v2/settings", get(settings_get).put(settings_put))
+        .route(
+            "/api/v2/backup/config",
+            get(backup_config_get).put(backup_config_put),
+        )
+        .route("/api/v2/backup/run", post(backup_run))
+        .route("/api/v2/backup/restore", post(backup_restore))
+        .route("/api/v2/tools/logs", get(tools_logs))
         .route("/api/v2/nodes", get(nodes_get).post(nodes_post))
+        .route("/api/v2/nodes/selected", get(nodes_selected))
+        .route("/api/v2/nodes/active", get(nodes_active))
         .route(
             "/api/v2/nodes/{id}",
             get(node_get).put(node_put).delete(node_delete),
         )
+        .route("/api/v2/nodes/{id}/use", post(node_use))
+        .route("/api/v2/nodes/{id}/latency", post(node_latency))
         .route("/api/v2/nodes/{id}/close", post(node_close))
         .route("/api/v2/inbounds", get(inbounds_get).post(inbounds_post))
         .route(
@@ -184,6 +198,21 @@ pub fn router(state: ApiState) -> Router {
             post(subscriptions_delete_preview),
         )
         .route("/api/v2/subscriptions/update", post(subscriptions_update))
+        .route("/api/v2/publishes", get(publishes))
+        .route(
+            "/api/v2/publishes/{name}",
+            put(publish_put).delete(publish_delete),
+        )
+        .route("/api/v2/publishes/{name}/resolve", post(publish_resolve))
+        .route(
+            "/api/v2/inbounds/config",
+            get(inbounds_config_get).put(inbounds_config_put),
+        )
+        .route("/api/v2/users", get(users_get).post(users_post))
+        .route(
+            "/api/v2/users/{id}",
+            get(user_get).put(user_put).delete(user_delete),
+        )
         .route(
             "/api/v2/route/config",
             get(route_config_get).put(route_config_put),
@@ -197,6 +226,15 @@ pub fn router(state: ApiState) -> Router {
             get(route_list_get)
                 .put(route_list_put)
                 .delete(route_list_delete),
+        )
+        .route(
+            "/api/v2/route/lists/config",
+            get(route_lists_config_get).put(route_lists_config_put),
+        )
+        .route("/api/v2/route/lists/refresh", post(route_lists_refresh))
+        .route(
+            "/api/v2/route/lists/activation",
+            get(route_lists_activation),
         )
         .route(
             "/api/v2/route/rules",
@@ -214,6 +252,8 @@ pub fn router(state: ApiState) -> Router {
             "/api/v2/route/rules/block-history",
             get(route_rules_block_history),
         )
+        .route("/api/v2/route/tags", get(tags_get))
+        .route("/api/v2/route/tags/{tag}", put(tag_put).delete(tag_delete))
         .route("/api/v2/route/apply", post(route_apply))
         .route("/api/v2/route/activation", get(route_activation))
         .route("/api/v2/resolver/hosts", get(hosts_get).put(hosts_put))
@@ -375,9 +415,7 @@ async fn rpc(
         }
         "route.rules.priority" => route_rules_priority_value(&state, &body).await,
         "route.rules.test" => route_rules_test_value(&state, &body).await,
-        "route.rules.block_history" => {
-            json_value(json!({ "items": [], "dumpProcessEnabled": false }))
-        }
+        "route.rules.block_history" => route_rules_block_history_value(&state).await,
         "route.apply" => route_apply_value(&state).await,
         "route.activation" => route_activation_value(&state).await,
         "route.tags.get" => tags_get_value(&state, &body).await,
@@ -391,6 +429,18 @@ async fn rpc(
 
 async fn info(State(state): State<ApiState>) -> ApiResult {
     info_value(&state)
+}
+
+async fn update_check(Json(value): Json<Value>) -> ApiResult {
+    update_check_value(&value)
+}
+
+async fn update_apply(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
+    update_apply_value(&state, &value).await
+}
+
+async fn update_status(State(state): State<ApiState>) -> ApiResult {
+    update_status_value(&state).await
 }
 
 fn info_value(state: &ApiState) -> ApiResult {
@@ -415,12 +465,36 @@ async fn settings_put(State(state): State<ApiState>, Json(value): Json<Value>) -
     write_config_json(&state, "settings", value).await
 }
 
+async fn backup_config_get(State(state): State<ApiState>) -> ApiResult {
+    read_config_json(&state, "backup.config", default_backup_config()).await
+}
+
+async fn backup_config_put(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
+    write_config_json(&state, "backup.config", value).await
+}
+
+async fn backup_run(State(state): State<ApiState>) -> ApiResult {
+    run_backup_value(&state).await
+}
+
+async fn backup_restore(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
+    restore_backup_value(&state, &value).await
+}
+
 async fn nodes_get(State(state): State<ApiState>, Query(query): Query<ListQuery>) -> ApiResult {
     nodes_get_value(&state, &serde_json::to_value(query).unwrap_or_default()).await
 }
 
 async fn nodes_post(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
     save_node_value(&state, value, None).await
+}
+
+async fn nodes_selected(State(state): State<ApiState>) -> ApiResult {
+    selected_nodes_value(&state).await
+}
+
+async fn nodes_active(State(state): State<ApiState>) -> ApiResult {
+    active_nodes_value(&state).await
 }
 
 async fn node_get(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
@@ -438,6 +512,19 @@ async fn node_put(
 
 async fn node_delete(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
     delete_node_value(&state, id).await
+}
+
+async fn node_use(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
+    select_node_value(&state, id).await
+}
+
+async fn node_latency(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(mut value): Json<Value>,
+) -> ApiResult {
+    set_string(&mut value, "id", id);
+    node_latency_value(&state, &value).await
 }
 
 async fn node_close(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
@@ -534,6 +621,10 @@ async fn connections_events(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+async fn tools_logs() -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
+    tools_logs_v2().await
+}
+
 async fn tools_logs_v2() -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
     let event = SseEvent::default()
         .event("log")
@@ -578,6 +669,65 @@ async fn subscriptions_update(
     Json(value): Json<Value>,
 ) -> ApiResult {
     subscriptions_update_value(&state, &value).await
+}
+
+async fn publishes(State(state): State<ApiState>) -> ApiResult {
+    publishes_get_value(&state).await
+}
+
+async fn publish_put(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    Json(mut value): Json<Value>,
+) -> ApiResult {
+    set_string(&mut value, "name", name);
+    publish_put_value(&state, value).await
+}
+
+async fn publish_delete(State(state): State<ApiState>, Path(name): Path<String>) -> ApiResult {
+    publish_delete_value(&state, name).await
+}
+
+async fn publish_resolve(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    Json(mut value): Json<Value>,
+) -> ApiResult {
+    set_string(&mut value, "name", name);
+    publish_resolve_value(&state, &value).await
+}
+
+async fn inbounds_config_get(State(state): State<ApiState>) -> ApiResult {
+    read_config_json(&state, "inbounds.config", default_inbound_config()).await
+}
+
+async fn inbounds_config_put(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
+    write_config_json(&state, "inbounds.config", value).await
+}
+
+async fn users_get(State(state): State<ApiState>, Query(query): Query<ListQuery>) -> ApiResult {
+    users_get_value(&state, &serde_json::to_value(query).unwrap_or_default()).await
+}
+
+async fn users_post(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
+    user_save_value(&state, value, None).await
+}
+
+async fn user_get(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
+    user_get_value(&state, id).await
+}
+
+async fn user_put(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(mut value): Json<Value>,
+) -> ApiResult {
+    set_string(&mut value, "id", id.clone());
+    user_save_value(&state, value, Some(id)).await
+}
+
+async fn user_delete(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
+    user_delete_value(&state, id).await
 }
 
 async fn inbounds_get(State(state): State<ApiState>, Query(query): Query<ListQuery>) -> ApiResult {
@@ -649,6 +799,25 @@ async fn route_lists_post(State(state): State<ApiState>, Json(value): Json<Value
     save_route_list_value(&state, value, None).await
 }
 
+async fn route_lists_config_get(State(state): State<ApiState>) -> ApiResult {
+    read_config_json(&state, "route.lists.config", default_route_list_config()).await
+}
+
+async fn route_lists_config_put(
+    State(state): State<ApiState>,
+    Json(value): Json<Value>,
+) -> ApiResult {
+    write_config_json(&state, "route.lists.config", value).await
+}
+
+async fn route_lists_refresh() -> ApiResult {
+    empty()
+}
+
+async fn route_lists_activation() -> ApiResult {
+    json_value(json!({"hostIndexRefreshAt": 0}))
+}
+
 async fn route_list_get(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
     get_route_list_value(&state, id).await
 }
@@ -713,6 +882,23 @@ async fn route_rules_test(State(state): State<ApiState>, Json(value): Json<Value
 
 async fn route_rules_block_history(State(state): State<ApiState>) -> ApiResult {
     route_rules_block_history_value(&state).await
+}
+
+async fn tags_get(State(state): State<ApiState>, Query(query): Query<ListQuery>) -> ApiResult {
+    tags_get_value(&state, &serde_json::to_value(query).unwrap_or_default()).await
+}
+
+async fn tag_put(
+    State(state): State<ApiState>,
+    Path(tag): Path<String>,
+    Json(mut value): Json<Value>,
+) -> ApiResult {
+    set_string(&mut value, "tag", tag);
+    tag_put_value(&state, value).await
+}
+
+async fn tag_delete(State(state): State<ApiState>, Path(tag): Path<String>) -> ApiResult {
+    tag_delete_value(&state, tag).await
 }
 
 async fn route_apply(State(state): State<ApiState>) -> ApiResult {
@@ -1324,7 +1510,7 @@ async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
     }
     let selected = matched
         .iter()
-        .max_by_key(|(_, rule)| rule.priority)
+        .min_by_key(|(_, rule)| rule.priority)
         .map(|(record, _)| raw_json(&record.data_json, json!({})));
     let tag = selected
         .as_ref()
@@ -2489,6 +2675,142 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(closed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn direct_legacy_management_routes_are_wired_to_shared_value_handlers() {
+        let state = state().await;
+        let app = router(state);
+
+        let request = |method: axum::http::Method, uri: &str, body: &'static str| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                axum::http::Method::POST,
+                "/api/v2/nodes",
+                r#"{"id":"direct","name":"Direct","chain":[{"type":"direct","direct":{}}]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for uri in [
+            "/api/v2/nodes/selected",
+            "/api/v2/nodes/active",
+            "/api/v2/inbounds/config",
+            "/api/v2/route/lists/config",
+            "/api/v2/route/lists/activation",
+            "/api/v2/publishes",
+            "/api/v2/users",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                axum::http::Method::POST,
+                "/api/v2/nodes/direct/use",
+                "{}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for (uri, body) in [
+            ("/api/v2/inbounds/config", r#"{"port":8188}"#),
+            ("/api/v2/route/lists/config", r#"{"refreshInterval":"1h"}"#),
+            (
+                "/api/v2/route/tags/mobile",
+                r#"{"type":"node","hash":"abc"}"#,
+            ),
+            ("/api/v2/publishes/public", r#"{"points":["direct"]}"#),
+            (
+                "/api/v2/users",
+                r#"{"name":"Alice","enabled":true,"credential":{"type":"token","token":"secret"}}"#,
+            ),
+        ] {
+            let method = if uri == "/api/v2/users" {
+                axum::http::Method::POST
+            } else {
+                axum::http::Method::PUT
+            };
+            let response = app
+                .clone()
+                .oneshot(request(method, uri, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "PUT/POST {uri}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                axum::http::Method::POST,
+                "/api/v2/publishes/public/resolve",
+                r#"{"name":"public"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for uri in [
+            "/api/v2/route/tags",
+            "/api/v2/route/tags/mobile",
+            "/api/v2/publishes/public",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(if uri.ends_with("mobile") || uri.ends_with("public") {
+                            axum::http::Method::DELETE
+                        } else {
+                            axum::http::Method::GET
+                        })
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "GET/DELETE {uri}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v2/route/lists/refresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::post("/api/v2/update/check")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"channel":"stable"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

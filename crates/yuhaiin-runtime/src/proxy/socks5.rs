@@ -85,7 +85,7 @@ pub(crate) async fn serve(
             "SOCKS5 command is not CONNECT",
         ));
     }
-    let destination = read_socks_endpoint(&mut stream, Network::Tcp).await?;
+    let destination = read_socks_endpoint(&mut stream, Network::Tcp, request[3]).await?;
     if request[1] == 3 {
         let bind_ip = if peer.is_ipv4() {
             IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
@@ -228,10 +228,12 @@ async fn serve_socks5_udp_loop(
     Ok(())
 }
 
-async fn read_socks_endpoint(stream: &mut TcpStream, network: Network) -> Result<Endpoint> {
-    let mut atyp = [0u8; 1];
-    stream.read_exact(&mut atyp).await.map_err(io_error)?;
-    match atyp[0] {
+async fn read_socks_endpoint(
+    stream: &mut TcpStream,
+    network: Network,
+    atyp: u8,
+) -> Result<Endpoint> {
+    match atyp {
         1 => {
             let mut address = [0u8; 4 + 2];
             stream.read_exact(&mut address).await.map_err(io_error)?;
