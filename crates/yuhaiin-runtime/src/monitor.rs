@@ -65,6 +65,7 @@ struct MonitorState {
     counters: BTreeMap<String, (u64, u64)>,
     buckets: BTreeMap<i64, (u64, u64)>,
     telemetry: BTreeMap<(String, String), (u64, u64, u64)>,
+    telemetry_buckets: BTreeMap<(i64, String, String), (u64, u64, u64)>,
     history: Vec<Value>,
     failed_history: BTreeMap<(String, String, String), FailedEntry>,
     block_history: BTreeMap<(String, String, String), BlockEntry>,
@@ -100,6 +101,16 @@ struct PersistedTelemetry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedTelemetryBucket {
+    bucket: i64,
+    dimension: String,
+    value: String,
+    download: u64,
+    upload: u64,
+    failures: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedMonitor {
     version: u32,
     next_id: u64,
@@ -108,6 +119,8 @@ struct PersistedMonitor {
     counters: BTreeMap<String, (u64, u64)>,
     buckets: BTreeMap<i64, (u64, u64)>,
     telemetry: Vec<PersistedTelemetry>,
+    #[serde(default)]
+    telemetry_buckets: Vec<PersistedTelemetryBucket>,
     history: Vec<Value>,
     failed_history: Vec<FailedEntry>,
     #[serde(default)]
@@ -244,6 +257,13 @@ impl ConnectionMonitor {
     }
 
     pub fn traffic_value(&self, interval: &str, from: Option<&str>, to: Option<&str>) -> Value {
+        let now = unix_seconds();
+        let end = parse_time(to).unwrap_or(now);
+        let start = parse_time(from).unwrap_or(end.saturating_sub(86_400));
+        self.traffic_value_range(interval, start, end)
+    }
+
+    pub fn traffic_value_range(&self, interval: &str, start: i64, end: i64) -> Value {
         let interval = match interval {
             "day" => "day",
             "month" => "month",
@@ -254,9 +274,6 @@ impl ConnectionMonitor {
             "month" => 2_592_000,
             _ => 3_600,
         };
-        let now = unix_seconds();
-        let end = parse_time(to).unwrap_or(now);
-        let start = parse_time(from).unwrap_or(end.saturating_sub(step * 24));
         let start = start.min(end);
         let first = start.div_euclid(step) * step;
         let last = end.div_euclid(step) * step;
@@ -285,21 +302,49 @@ impl ConnectionMonitor {
     }
 
     pub fn telemetry_value(&self) -> Value {
+        self.telemetry_value_range(0, i64::MAX, usize::MAX)
+    }
+
+    pub fn telemetry_value_range(&self, from: i64, to: i64, limit: usize) -> Value {
         let state = self.lock();
-        let mut dimensions: BTreeMap<&str, BTreeMap<String, (u64, u64, u64)>> = BTreeMap::new();
-        for ((dimension, value), (download, upload, failures)) in &state.telemetry {
-            let item = dimensions
-                .entry(dimension.as_str())
-                .or_default()
-                .entry(value.clone())
-                .or_default();
-            item.0 = item.0.saturating_add(*download);
-            item.1 = item.1.saturating_add(*upload);
-            item.2 = item.2.saturating_add(*failures);
+        let mut dimensions: BTreeMap<String, BTreeMap<String, (u64, u64, u64)>> = BTreeMap::new();
+        if state.telemetry_buckets.is_empty() {
+            for ((dimension, value), (download, upload, failures)) in &state.telemetry {
+                dimensions
+                    .entry(dimension.clone())
+                    .or_default()
+                    .insert(value.clone(), (*download, *upload, *failures));
+            }
+        } else {
+            for ((bucket, dimension, value), (download, upload, failures)) in
+                &state.telemetry_buckets
+            {
+                if *bucket < from || *bucket >= to {
+                    continue;
+                }
+                let item = dimensions
+                    .entry(dimension.clone())
+                    .or_default()
+                    .entry(value.clone())
+                    .or_default();
+                item.0 = item.0.saturating_add(*download);
+                item.1 = item.1.saturating_add(*upload);
+                item.2 = item.2.saturating_add(*failures);
+            }
         }
         let groups = dimensions
             .into_iter()
             .map(|(dimension, items)| {
+                let mut items = items.into_iter().collect::<Vec<_>>();
+                items.sort_by(|(left_value, left), (right_value, right)| {
+                    right
+                        .0
+                        .saturating_add(right.1)
+                        .cmp(&left.0.saturating_add(left.1))
+                        .then_with(|| right.2.cmp(&left.2))
+                        .then_with(|| left_value.cmp(right_value))
+                });
+                items.truncate(limit);
                 json!({
                     "dimension": dimension,
                     "items": items.into_iter().map(|(value, (download, upload, failures))| json!({
@@ -466,6 +511,23 @@ impl ConnectionMonitor {
         entry.count = entry.count.saturating_add(1);
         entry.error = error.to_owned();
         entry.time = unix_seconds();
+        let bucket = entry.time.div_euclid(3600) * 3600;
+        for (dimension, value) in [
+            ("protocol", protocol.to_owned()),
+            ("addr", host.to_owned()),
+            ("destination", host.to_owned()),
+        ] {
+            let item = state
+                .telemetry
+                .entry((dimension.to_owned(), value.clone()))
+                .or_default();
+            item.2 = item.2.saturating_add(1);
+            let item = state
+                .telemetry_buckets
+                .entry((bucket, dimension.to_owned(), value))
+                .or_default();
+            item.2 = item.2.saturating_add(1);
+        }
         self.mark_dirty();
     }
 
@@ -579,12 +641,35 @@ impl ConnectionMonitor {
                 .to_owned();
             let item = state
                 .telemetry
-                .entry((dimension.to_owned(), value))
+                .entry((dimension.to_owned(), value.clone()))
                 .or_default();
             match direction {
                 TunFlowDirection::Upload => item.1 = item.1.saturating_add(bytes),
                 TunFlowDirection::Download => item.0 = item.0.saturating_add(bytes),
             }
+            let item = state
+                .telemetry_buckets
+                .entry((now.div_euclid(3600) * 3600, dimension.to_owned(), value))
+                .or_default();
+            match direction {
+                TunFlowDirection::Upload => item.1 = item.1.saturating_add(bytes),
+                TunFlowDirection::Download => item.0 = item.0.saturating_add(bytes),
+            }
+        }
+        let telemetry_cutoff = now.saturating_sub(90 * 86_400);
+        while state
+            .telemetry_buckets
+            .first_key_value()
+            .is_some_and(|((bucket, _, _), _)| *bucket < telemetry_cutoff)
+        {
+            let Some(key) = state
+                .telemetry_buckets
+                .first_key_value()
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            state.telemetry_buckets.remove(&key);
         }
         drop(state);
         self.mark_dirty();
@@ -696,6 +781,16 @@ impl ConnectionMonitor {
                 )
             })
             .collect();
+        state.telemetry_buckets = persisted
+            .telemetry_buckets
+            .into_iter()
+            .map(|entry| {
+                (
+                    (entry.bucket, entry.dimension, entry.value),
+                    (entry.download, entry.upload, entry.failures),
+                )
+            })
+            .collect();
     }
 
     fn persisted_json(&self) -> PersistedMonitor {
@@ -717,6 +812,22 @@ impl ConnectionMonitor {
                         download: *download,
                         upload: *upload,
                         failures: *failures,
+                    },
+                )
+                .collect(),
+            telemetry_buckets: state
+                .telemetry_buckets
+                .iter()
+                .map(
+                    |((bucket, dimension, value), (download, upload, failures))| {
+                        PersistedTelemetryBucket {
+                            bucket: *bucket,
+                            dimension: dimension.clone(),
+                            value: value.clone(),
+                            download: *download,
+                            upload: *upload,
+                            failures: *failures,
+                        }
                     },
                 )
                 .collect(),
@@ -948,6 +1059,44 @@ mod tests {
     }
 
     #[test]
+    fn monitor_telemetry_respects_time_range_limit_and_failures() {
+        let monitor = ConnectionMonitor::new();
+        let (flow, context) = flow();
+        monitor.opened(flow, context);
+        monitor.bytes(flow.key, TunFlowDirection::Upload, 7);
+        monitor.bytes(flow.key, TunFlowDirection::Download, 11);
+        monitor.record_failure("http", "example.com:443", "timeout");
+
+        let now = unix_seconds();
+        let value = monitor.telemetry_value_range(now - 3_600, now + 3_600, 1);
+        let protocol = value["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|group| group["dimension"] == "protocol")
+            .unwrap();
+        assert_eq!(protocol["items"].as_array().unwrap().len(), 1);
+        assert_eq!(protocol["items"][0]["value"], "tcp");
+        assert_eq!(protocol["items"][0]["download"], "11");
+        assert_eq!(protocol["items"][0]["upload"], "7");
+
+        let failures = monitor.telemetry_value_range(now - 3_600, now + 3_600, 10);
+        let failure_protocol = failures["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|group| group["dimension"] == "protocol")
+            .unwrap();
+        assert!(
+            failure_protocol["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["value"] == "http" && item["failures"] == "1")
+        );
+    }
+
+    #[test]
     fn monitor_exposes_block_history_in_the_route_contract_shape() {
         let monitor = ConnectionMonitor::new();
         let (flow, mut context) = flow();
@@ -988,6 +1137,14 @@ mod tests {
 
             let reloaded = ConnectionMonitor::load_with_store(store).await.unwrap();
             assert_eq!(reloaded.total_flow_value()["upload"], "13");
+            let now = unix_seconds();
+            assert_eq!(
+                reloaded.telemetry_value_range(now - 3_600, now + 3_600, 10)["groups"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                9
+            );
             assert_eq!(
                 reloaded.all_history_value()["items"]
                     .as_array()

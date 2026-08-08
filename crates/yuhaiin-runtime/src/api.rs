@@ -18,6 +18,7 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -373,13 +374,33 @@ async fn rpc(
         "connections.total" => json_value(state.controller.monitor().total_flow_value()),
         "connections.traffic" => {
             let interval = string_or(&body, "interval", "hour");
-            json_value(state.controller.monitor().traffic_value(
-                &interval,
+            let (from, to) = required_stats_range(
                 body.get("from").and_then(Value::as_str),
                 body.get("to").and_then(Value::as_str),
-            ))
+            )?;
+            json_value(
+                state
+                    .controller
+                    .monitor()
+                    .traffic_value_range(&interval, from, to),
+            )
         }
-        "connections.telemetry" => json_value(state.controller.monitor().telemetry_value()),
+        "connections.telemetry" => {
+            let (from, to) = required_stats_range(
+                body.get("from").and_then(Value::as_str),
+                body.get("to").and_then(Value::as_str),
+            )?;
+            let limit = body.get("limit").and_then(Value::as_u64).unwrap_or(8);
+            if !(1..=50).contains(&limit) {
+                return Err(ApiError::bad("limit must be between 1 and 50"));
+            }
+            json_value(
+                state
+                    .controller
+                    .monitor()
+                    .telemetry_value_range(from, to, limit as usize),
+            )
+        }
         "connections.close" => close_connections_value(&state, body).await,
         "connections.failed_history" => {
             json_value(state.controller.monitor().failed_history_value())
@@ -567,19 +588,40 @@ struct TrafficQuery {
     to: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct TelemetryQuery {
+    from: Option<String>,
+    to: Option<String>,
+    limit: Option<u64>,
+}
+
 async fn connections_traffic(
     State(state): State<ApiState>,
     Query(query): Query<TrafficQuery>,
 ) -> ApiResult {
-    json_value(state.controller.monitor().traffic_value(
+    let (from, to) = required_stats_range(query.from.as_deref(), query.to.as_deref())?;
+    json_value(state.controller.monitor().traffic_value_range(
         query.interval.as_deref().unwrap_or("hour"),
-        query.from.as_deref(),
-        query.to.as_deref(),
+        from,
+        to,
     ))
 }
 
-async fn connections_telemetry(State(state): State<ApiState>) -> ApiResult {
-    json_value(state.controller.monitor().telemetry_value())
+async fn connections_telemetry(
+    State(state): State<ApiState>,
+    Query(query): Query<TelemetryQuery>,
+) -> ApiResult {
+    let (from, to) = required_stats_range(query.from.as_deref(), query.to.as_deref())?;
+    let limit = query.limit.unwrap_or(8);
+    if !(1..=50).contains(&limit) {
+        return Err(ApiError::bad("limit must be between 1 and 50"));
+    }
+    json_value(
+        state
+            .controller
+            .monitor()
+            .telemetry_value_range(from, to, limit as usize),
+    )
 }
 
 async fn connections_failed_history(State(state): State<ApiState>) -> ApiResult {
@@ -1947,6 +1989,19 @@ fn update_check_value(body: &Value) -> ApiResult {
     }))
 }
 
+fn required_stats_range(from: Option<&str>, to: Option<&str>) -> Result<(i64, i64), ApiError> {
+    let from = from.ok_or_else(|| ApiError::bad("from must be an RFC3339 timestamp"))?;
+    let to = to.ok_or_else(|| ApiError::bad("to must be an RFC3339 timestamp"))?;
+    let from = OffsetDateTime::parse(from, &Rfc3339)
+        .map_err(|_| ApiError::bad("from must be an RFC3339 timestamp"))?;
+    let to = OffsetDateTime::parse(to, &Rfc3339)
+        .map_err(|_| ApiError::bad("to must be an RFC3339 timestamp"))?;
+    if from >= to {
+        return Err(ApiError::bad("from must be before to"));
+    }
+    Ok((from.unix_timestamp(), to.unix_timestamp()))
+}
+
 async fn update_apply_value(state: &ApiState, value: &Value) -> ApiResult {
     let _ = write_config_json(state, "update.last_request", value.clone()).await?;
     empty()
@@ -3012,6 +3067,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn connection_statistics_require_go_compatible_ranges_and_limits() {
+        let state = state().await;
+        let app = router(state);
+
+        let missing_range = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v2/connections/traffic")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_range.status(), StatusCode::BAD_REQUEST);
+
+        let invalid_range = app
+            .clone()
+            .oneshot(
+                Request::get(
+                    "/api/v2/connections/traffic?from=2026-01-02T00:00:00Z&to=2026-01-01T00:00:00Z",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_range.status(), StatusCode::BAD_REQUEST);
+
+        let invalid_limit = app
+            .oneshot(
+                Request::get("/api/v2/connections/telemetry?from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:00Z&limit=51")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_limit.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
