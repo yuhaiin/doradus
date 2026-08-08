@@ -28,7 +28,7 @@ use yuhaiin_store::{
     GoRouteSettingsRecord,
 };
 
-use crate::RuntimeController;
+use crate::{RuntimeController, route_rule_from_go_record};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -194,6 +194,12 @@ pub fn router(state: ApiState) -> Router {
                 .put(route_rule_put)
                 .delete(route_rule_delete),
         )
+        .route("/api/v2/route/rules/priority", post(route_rules_priority))
+        .route("/api/v2/route/rules/test", post(route_rules_test))
+        .route(
+            "/api/v2/route/rules/block-history",
+            get(route_rules_block_history),
+        )
         .route("/api/v2/route/apply", post(route_apply))
         .route("/api/v2/route/activation", get(route_activation))
         .route("/api/v2/resolver/hosts", get(hosts_get).put(hosts_put))
@@ -353,7 +359,7 @@ async fn rpc(
             )
             .await
         }
-        "route.rules.priority" => empty(),
+        "route.rules.priority" => route_rules_priority_value(&state, &body).await,
         "route.rules.test" => json_value(json!({ "match": false, "mode": "direct" })),
         "route.rules.block_history" => {
             json_value(json!({ "items": [], "dumpProcessEnabled": false }))
@@ -625,6 +631,21 @@ async fn route_rule_delete(
     Path((name, index)): Path<(String, usize)>,
 ) -> ApiResult {
     delete_route_rule_value(&state, name, index).await
+}
+
+async fn route_rules_priority(
+    State(state): State<ApiState>,
+    Json(value): Json<Value>,
+) -> ApiResult {
+    route_rules_priority_value(&state, &value).await
+}
+
+async fn route_rules_test(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
+    route_rules_test_value(&state, &value).await
+}
+
+async fn route_rules_block_history(State(state): State<ApiState>) -> ApiResult {
+    route_rules_block_history_value(&state).await
 }
 
 async fn route_apply(State(state): State<ApiState>) -> ApiResult {
@@ -1166,6 +1187,122 @@ async fn delete_route_rule_value(state: &ApiState, name: String, index: usize) -
         })
         .await;
     result.map(|_| empty_json()).map_err(Into::into)
+}
+
+async fn route_rules_priority_value(state: &ApiState, value: &Value) -> ApiResult {
+    let source = value
+        .get("source")
+        .ok_or_else(|| ApiError::bad("source is required"))?;
+    let target = value
+        .get("target")
+        .ok_or_else(|| ApiError::bad("target is required"))?;
+    let source_name = required_string(source, "name")?;
+    let target_name = required_string(target, "name")?;
+    let operate = string_or(value, "operate", "exchange");
+    if !matches!(
+        operate.as_str(),
+        "" | "exchange" | "insert_before" | "insert_after"
+    ) {
+        return Err(ApiError::bad(format!(
+            "unknown priority operate {operate:?}"
+        )));
+    }
+
+    let result = state
+        .controller
+        .mutate_and_reload(move |store| async move {
+            store
+                .repository()
+                .change_go_route_rule_priority(&source_name, &target_name, &operate)
+                .await
+        })
+        .await;
+    result
+        .map(|_| empty_json())
+        .map_err(|error| match error.kind {
+            yuhaiin_core::ErrorKind::NotFound => ApiError::not_found(error.to_string()),
+            yuhaiin_core::ErrorKind::InvalidInput => ApiError::bad(error.to_string()),
+            _ => error.into(),
+        })
+}
+
+async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
+    let input = required_string(value, "host")?;
+    let (host, port) = split_rule_test_target(&input)?;
+    let destination = match host.parse() {
+        Ok(address) => Endpoint::ip(Network::Tcp, std::net::SocketAddr::new(address, port)),
+        Err(_) => Endpoint::domain(
+            Network::Tcp,
+            DomainName::new(&host).map_err(|error| ApiError::bad(error.to_string()))?,
+            port,
+        ),
+    };
+    let mut context = FlowContext::new(destination);
+    let snapshot = state.controller.handle().load();
+    let decision = snapshot.router.apply_to_context(&mut context);
+    let mode = match decision.mode {
+        yuhaiin_core::RouteMode::Direct => "direct",
+        yuhaiin_core::RouteMode::Proxy => "proxy",
+        yuhaiin_core::RouteMode::Bypass => "bypass",
+        yuhaiin_core::RouteMode::Block => "drop",
+    };
+    let mut matched = Vec::new();
+    for record in &snapshot.route_rules {
+        if let Some(rule) = route_rule_from_go_record(record)? {
+            let is_match = rule.matches(&context.effective_destination());
+            if is_match {
+                matched.push((record, rule));
+            }
+        }
+    }
+    let selected = matched
+        .iter()
+        .max_by_key(|(_, rule)| rule.priority)
+        .map(|(record, _)| raw_json(&record.data_json, json!({})));
+    let tag = selected
+        .as_ref()
+        .map(|value| string_or(value, "tag", ""))
+        .unwrap_or_default();
+    let resolver = selected
+        .as_ref()
+        .map(|value| string_or(value, "resolver", ""))
+        .unwrap_or_default();
+    json_value(json!({
+        "mode": mode,
+        "tag": tag,
+        "resolver": resolver,
+        "afterAddr": context.destination.to_string(),
+        "lists": [],
+        "ips": [],
+        "matchResult": [],
+    }))
+}
+
+fn split_rule_test_target(value: &str) -> std::result::Result<(String, u16), ApiError> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let (host, suffix) = rest
+            .split_once(']')
+            .ok_or_else(|| ApiError::bad("host has an invalid IPv6 authority"))?;
+        let port = suffix
+            .strip_prefix(':')
+            .map(|port| port.parse::<u16>())
+            .transpose()
+            .map_err(|error| ApiError::bad(format!("host port: {error}")))?
+            .unwrap_or(0);
+        return Ok((host.to_owned(), port));
+    }
+    if let Some((host, port)) = value.rsplit_once(':') {
+        if let Ok(port) = port.parse::<u16>() {
+            return Ok((host.to_owned(), port));
+        }
+    }
+    Ok((value.to_owned(), 0))
+}
+
+async fn route_rules_block_history_value(_state: &ApiState) -> ApiResult {
+    // The Rust route runtime does not yet have Go's optional process dumper;
+    // preserve the wire shape and make the absence explicit.
+    json_value(json!({"items": [], "dumpProcessEnabled": false}))
 }
 
 async fn route_apply_value(state: &ApiState) -> ApiResult {
@@ -1976,6 +2113,66 @@ mod tests {
             .unwrap();
         assert_eq!(listed.0["items"][0]["chain"][0]["type"], "direct");
         assert_eq!(state.controller.handle().revision(), 1);
+    }
+
+    #[tokio::test]
+    async fn route_priority_and_test_endpoints_use_persisted_rules() {
+        let state = state().await;
+        let _ = save_route_rule_value(
+            &state,
+            json!({
+                "name":"allow-example",
+                "mode":"direct",
+                "match":{"domain":"example.com"}
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let _ = save_route_rule_value(
+            &state,
+            json!({
+                "name":"drop-example",
+                "mode":"drop",
+                "match":{"domain":"example.com"}
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let priority = router(state.clone())
+            .oneshot(
+                Request::post("/api/v2/route/rules/priority")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"source":{"name":"drop-example","index":1},"target":{"name":"allow-example","index":0},"operate":"insert_before"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(priority.status(), StatusCode::OK);
+
+        let listed = route_rules_get_value(&state, &json!({"page":1,"pageSize":20}))
+            .await
+            .unwrap();
+        assert_eq!(listed.0["items"][0]["name"], "drop-example");
+
+        let tested = router(state)
+            .oneshot(
+                Request::post("/api/v2/route/rules/test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"host":"example.com:443"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tested.status(), StatusCode::OK);
+        let body = to_bytes(tested.into_body(), 1024 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["mode"], "drop");
+        assert!(value.get("matchResult").is_some());
     }
 
     #[tokio::test]

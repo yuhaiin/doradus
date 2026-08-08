@@ -185,6 +185,69 @@ fn typed_repository_rejects_invalid_nat_metadata() {
 }
 
 #[test]
+fn go_route_rule_priority_reorders_and_renumbers_atomically() {
+    let store = block_on(ConfigStore::open_memory()).unwrap();
+    let repository = store.repository();
+    for (priority, name) in [(0, "alpha"), (1, "beta"), (2, "gamma")] {
+        block_on(repository.put_go_route_rule(&GoRouteRuleRecord {
+            id: format!("{name}:0"),
+            name: name.to_owned(),
+            priority,
+            disabled: false,
+            action_mode: "direct".to_owned(),
+            match_type: "domain".to_owned(),
+            tag: name.to_owned(),
+            updated_at: 1,
+            data_json: format!(r#"{{"name":"{name}"}}"#).into_bytes(),
+        }))
+        .unwrap();
+    }
+
+    block_on(repository.change_go_route_rule_priority("alpha", "gamma", "exchange")).unwrap();
+    assert_eq!(
+        block_on(repository.list_go_route_rules())
+            .unwrap()
+            .into_iter()
+            .map(|record| record.name)
+            .collect::<Vec<_>>(),
+        ["gamma", "beta", "alpha"]
+    );
+
+    block_on(repository.change_go_route_rule_priority("alpha", "gamma", "insert_before")).unwrap();
+    assert_eq!(
+        block_on(repository.list_go_route_rules())
+            .unwrap()
+            .into_iter()
+            .map(|record| record.name)
+            .collect::<Vec<_>>(),
+        ["alpha", "gamma", "beta"]
+    );
+
+    block_on(repository.change_go_route_rule_priority("alpha", "beta", "insert_after")).unwrap();
+    let rules = block_on(repository.list_go_route_rules()).unwrap();
+    assert_eq!(
+        rules
+            .iter()
+            .map(|record| record.name.as_str())
+            .collect::<Vec<_>>(),
+        ["gamma", "beta", "alpha"]
+    );
+    assert_eq!(
+        rules
+            .iter()
+            .map(|record| record.priority)
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert!(
+        block_on(repository.change_go_route_rule_priority("missing", "beta", "exchange")).is_err()
+    );
+    assert!(
+        block_on(repository.change_go_route_rule_priority("alpha", "beta", "invalid")).is_err()
+    );
+}
+
+#[test]
 fn nat_config_defaults_to_full_cone_across_missing_delete_and_raw_legacy_rows() {
     let path = test_database_path();
     {

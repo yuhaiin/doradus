@@ -625,6 +625,95 @@ impl ConfigRepository {
         self.delete_go_compatibility_row("route_rules_v2", "id", id)
     }
 
+    /// Reorder Go route rules atomically and renumber their persisted
+    /// priorities.  The web API addresses rules by their user-visible name,
+    /// matching Go's v2 contract; IDs and JSON payloads remain untouched.
+    pub async fn change_go_route_rule_priority(
+        &self,
+        source_name: &str,
+        target_name: &str,
+        operate: &str,
+    ) -> Result<()> {
+        validate_id(source_name)?;
+        validate_id(target_name)?;
+        if !matches!(operate, "" | "exchange" | "insert_before" | "insert_after") {
+            return Err(Error::invalid(format!(
+                "unknown priority operate {operate:?}"
+            )));
+        }
+
+        self.store.with_write_transaction(|connection| {
+            require_go_table(connection, "route_rules_v2", &["id", "name", "priority"])?;
+            let rows = connection
+                .query("SELECT id, name FROM route_rules_v2 ORDER BY priority, id")
+                .map_err(storage_error)?;
+            let mut entries = rows
+                .iter()
+                .map(|row| {
+                    Ok((
+                        row_text(row, 0, "route_rules_v2.id")?,
+                        row_text(row, 1, "route_rules_v2.name")?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let source_index = entries
+                .iter()
+                .position(|(_, name)| name == source_name)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::NotFound,
+                        format!("route rule {source_name} not found"),
+                    )
+                })?;
+            let target_index = entries
+                .iter()
+                .position(|(_, name)| name == target_name)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::NotFound,
+                        format!("route rule {target_name} not found"),
+                    )
+                })?;
+
+            match operate {
+                "" | "exchange" => entries.swap(source_index, target_index),
+                "insert_before" | "insert_after" => {
+                    let source = entries.remove(source_index);
+                    let target_index = entries
+                        .iter()
+                        .position(|(_, name)| name == target_name)
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::NotFound,
+                                format!("route rule {target_name} not found"),
+                            )
+                        })?;
+                    let insert_at = if operate == "insert_after" {
+                        target_index + 1
+                    } else {
+                        target_index
+                    };
+                    entries.insert(insert_at, source);
+                }
+                _ => unreachable!("priority operation was validated above"),
+            }
+
+            for (priority, (id, _)) in entries.iter().enumerate() {
+                connection
+                    .execute_with_params(
+                        "UPDATE route_rules_v2 SET priority = ?1 WHERE id = ?2",
+                        &[
+                            SqliteValue::from(priority as i64),
+                            SqliteValue::from(id.as_str()),
+                        ],
+                    )
+                    .map_err(storage_error)?;
+            }
+            Ok(())
+        })
+    }
+
     pub async fn delete_go_route_list(&self, name: &str) -> Result<bool> {
         self.delete_go_compatibility_row("route_lists_v2", "name", name)
     }

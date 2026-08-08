@@ -135,7 +135,10 @@ impl Router {
         candidates
             .iter()
             .filter(|rule| rule.matches_with_geo(endpoint, self.geo.as_deref()))
-            .max_by_key(|rule| rule.priority)
+            // Go's route matcher walks rules in persisted priority order and
+            // stops at the first match.  Lower priority values therefore win;
+            // this is also what makes the UI's drag-and-drop order effective.
+            .next()
             .map(|rule| RouteDecision {
                 mode: rule.action.into(),
                 resolver_policy: rule.resolver_policy,
@@ -154,7 +157,7 @@ impl Router {
             return packet;
         };
         let domain = self.decide(&context.effective_destination());
-        if domain.priority >= packet.priority {
+        if domain.priority <= packet.priority {
             domain
         } else {
             packet
@@ -321,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn router_prefers_higher_priority_matching_rule() {
+    fn router_prefers_lower_priority_matching_rule() {
         let router = Router::compile(
             vec![
                 rule("example.com", RuleAction::Direct, 1),
@@ -340,8 +343,8 @@ mod tests {
             443,
         );
         let decision = router.decide(&endpoint);
-        assert_eq!(decision.mode, RouteMode::Proxy);
-        assert!(decision.resolver_policy.use_fake_ip);
+        assert_eq!(decision.mode, RouteMode::Direct);
+        assert!(!decision.resolver_policy.use_fake_ip);
     }
 
     #[test]
@@ -402,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn fakeip_context_uses_the_highest_priority_of_ip_and_domain_rules() {
+    fn fakeip_context_uses_the_first_priority_of_ip_and_domain_rules() {
         let mut cidr = rule("198.18.0.0/15", RuleAction::Proxy, 10);
         cidr.network = Some(Network::Udp);
         cidr.port = Some((443, 443));
@@ -423,7 +426,7 @@ mod tests {
             "198.18.0.1:443".parse().unwrap(),
         ));
         context.original_domain = Some(DomainName::new("example.com").unwrap());
-        assert_eq!(router.decide_context(&context).mode, RouteMode::Direct);
+        assert_eq!(router.decide_context(&context).mode, RouteMode::Proxy);
     }
 
     #[test]
