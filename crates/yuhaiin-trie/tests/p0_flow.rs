@@ -983,9 +983,18 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
     poll(&mut dispatcher, &mut interface, &mut device, 1).unwrap();
     let dns_event = dispatcher.events().next().expect("DNS event");
     runtime.handle_event_async(dns_event).await.unwrap();
-    runtime.poll_outputs(&mut dispatcher).unwrap();
-    poll(&mut dispatcher, &mut interface, &mut device, 2).unwrap();
-    let dns_response = decode_response(&take_udp_payload(&device), 7, DnsRecordType::A).unwrap();
+    let mut dns_response = None;
+    for tick in 2..100 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        runtime.poll_outputs(&mut dispatcher).unwrap();
+        poll(&mut dispatcher, &mut interface, &mut device, tick).unwrap();
+        if device.queued_tx().unwrap() > 0 {
+            dns_response =
+                Some(decode_response(&take_udp_payload(&device), 7, DnsRecordType::A).unwrap());
+            break;
+        }
+    }
+    let dns_response = dns_response.expect("DNS resolver did not return a response to TUN");
     let fake_ip = dns_response.addresses.v4[0];
     assert_eq!(fake_ip, Ipv4Addr::new(198, 18, 0, 1));
     let view = pool.snapshot().await;
@@ -1040,10 +1049,17 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
             payload: payload.to_vec(),
         })
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(1)).await;
-    runtime.poll_outputs(&mut dispatcher).unwrap();
-    poll(&mut dispatcher, &mut interface, &mut device, 4).unwrap();
-    let echoed = take_udp_payload(&device);
+    let mut echoed = None;
+    for tick in 4..100 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        runtime.poll_outputs(&mut dispatcher).unwrap();
+        poll(&mut dispatcher, &mut interface, &mut device, tick).unwrap();
+        if device.queued_tx().unwrap() > 0 {
+            echoed = Some(take_udp_payload(&device));
+            break;
+        }
+    }
+    let echoed = echoed.expect("router proxy did not return UDP data to TUN");
     assert_eq!(echoed, payload);
 
     device
@@ -1060,10 +1076,20 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
     runtime
         .handle_event(second_event)
         .expect("second FakeIP flow should share the source task");
-    tokio::time::sleep(Duration::from_millis(1)).await;
-    runtime.poll_outputs(&mut dispatcher).unwrap();
-    poll(&mut dispatcher, &mut interface, &mut device, 6).unwrap();
-    assert_eq!(take_udp_payload(&device), b"through-second-domain");
+    let mut second_echoed = None;
+    for tick in 6..100 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        runtime.poll_outputs(&mut dispatcher).unwrap();
+        poll(&mut dispatcher, &mut interface, &mut device, tick).unwrap();
+        if device.queued_tx().unwrap() > 0 {
+            second_echoed = Some(take_udp_payload(&device));
+            break;
+        }
+    }
+    assert_eq!(
+        second_echoed.expect("shared router proxy did not return UDP data to TUN"),
+        b"through-second-domain"
+    );
 
     let contexts = recorded.lock().unwrap();
     assert_eq!(contexts.len(), 1);

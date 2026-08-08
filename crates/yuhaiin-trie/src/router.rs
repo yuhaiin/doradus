@@ -182,6 +182,15 @@ impl Router {
         endpoint: &Endpoint,
         context: Option<&FlowContext>,
     ) -> RouteDecision {
+        self.matched_decision(endpoint, context)
+            .unwrap_or_else(|| self.fallback.clone())
+    }
+
+    fn matched_decision(
+        &self,
+        endpoint: &Endpoint,
+        context: Option<&FlowContext>,
+    ) -> Option<RouteDecision> {
         let candidates = self.rules.search(endpoint);
         self.global_rules
             .iter()
@@ -196,7 +205,6 @@ impl Router {
                 resolver_policy: rule.resolver_policy,
                 priority: rule.priority,
             })
-            .unwrap_or_else(|| self.fallback.clone())
     }
 
     /// Evaluate both the packet tuple and a FakeIP-restored hostname.  A
@@ -204,15 +212,16 @@ impl Router {
     /// domain rule must also be able to override the fallback.  The normal
     /// rule priority decides when both forms match.
     pub fn decide_context(&self, context: &yuhaiin_core::FlowContext) -> RouteDecision {
-        let packet = self.decide_with_context(&context.destination, Some(context));
+        let packet = self.matched_decision(&context.destination, Some(context));
         let Some(_) = context.original_domain else {
-            return packet;
+            return packet.unwrap_or_else(|| self.fallback.clone());
         };
-        let domain = self.decide_with_context(&context.effective_destination(), Some(context));
-        if domain.priority <= packet.priority {
-            domain
-        } else {
-            packet
+        let domain = self.matched_decision(&context.effective_destination(), Some(context));
+        match (packet, domain) {
+            (Some(packet), Some(domain)) if domain.priority <= packet.priority => domain,
+            (Some(packet), _) => packet,
+            (None, Some(domain)) => domain,
+            (None, None) => self.fallback.clone(),
         }
     }
 }
@@ -468,6 +477,28 @@ mod tests {
         domain.port = Some((443, 443));
         let router = Router::compile(
             vec![cidr, domain],
+            RouteDecision {
+                mode: RouteMode::Block,
+                resolver_policy: ResolverPolicy::default(),
+                priority: 0,
+            },
+        )
+        .unwrap();
+        let mut context = yuhaiin_core::FlowContext::new(Endpoint::ip(
+            Network::Udp,
+            "198.18.0.1:443".parse().unwrap(),
+        ));
+        context.original_domain = Some(DomainName::new("example.com").unwrap());
+        assert_eq!(router.decide_context(&context).mode, RouteMode::Proxy);
+    }
+
+    #[test]
+    fn fakeip_context_does_not_let_domain_fallback_override_a_cidr_match() {
+        let mut cidr = rule("198.18.0.0/15", RuleAction::Proxy, 10);
+        cidr.network = Some(Network::Udp);
+        cidr.port = Some((443, 443));
+        let router = Router::compile(
+            vec![cidr],
             RouteDecision {
                 mode: RouteMode::Block,
                 resolver_policy: ResolverPolicy::default(),
