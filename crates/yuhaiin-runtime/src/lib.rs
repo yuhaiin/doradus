@@ -7,6 +7,7 @@
 #[cfg(feature = "http-api")]
 pub mod api;
 mod controller;
+mod data_plane;
 #[cfg(feature = "doh-tls")]
 mod doh_tls;
 #[cfg(feature = "doh-tls")]
@@ -41,6 +42,9 @@ use yuhaiin_store::{
 use yuhaiin_trie::router::{RouteDecision, RouterRuntime};
 
 pub use controller::RuntimeController;
+pub use data_plane::{RuntimeDnsHandler, run_dns_supervisor};
+#[cfg(feature = "tun")]
+pub use data_plane::{TunRuntimeConfig, load_tun_config, run_tun_device_until};
 #[cfg(feature = "doh-tls")]
 pub use doh_tls::{RustCryptoH2Connector, RustCryptoTlsDialer, root_store as doh_root_store};
 #[cfg(feature = "doh-tls")]
