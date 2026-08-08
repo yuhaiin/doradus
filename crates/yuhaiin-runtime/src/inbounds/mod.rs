@@ -223,7 +223,11 @@ async fn start_listeners(
                     let socket = yuhaiin_core::proxy::YuubinsyaUdpServer::bind(
                         spec.listen,
                         yuhaiin_core::yuubinsya::derive_salt(spec.password.as_bytes()),
-                        true,
+                        // Go's Yuubinsya inbound uses the native packet
+                        // format without the SOCKS5 three-byte prefix.  The
+                        // prefix is only used when Yuubinsya wraps a SOCKS5
+                        // UDP association.
+                        false,
                     )
                     .await?;
                     let logs = monitor.logs();

@@ -725,6 +725,8 @@ YUHAIIN_CHAIN_PROBE=1 \
 # uot-reply source=udp://1.1.1.1:53 bytes=61
 ```
 
+另外，`crates/yuhaiin-chain/tests/interop/yuubinsya_go_client.go` 使用 Go 仓库里的真实 `fixed` 和 `yuubinsya` client，由 ignored Rust 集成测试启动 Rust Yuubinsya server，实际验收 TCP、UDP-over-TCP、native authenticated UDP 和 Ping 四条路径。Go 的 Yuubinsya server/client 默认 native UDP packet 不带 SOCKS5 三字节 prefix，因此 Rust runtime 的 Yuubinsya inbound 也使用无 prefix 模式；SOCKS5 UDP association 的 prefix 仍由对应 SOCKS5 boundary 单独启用。
+
 这里的 `CONFIG.json` 只作为用户外部配置读取，密码和 CA 不复制进仓库。当前 `concurrency` 同时限制 bounded CONNECT pipe 容量；Rust 版已经有按 fixed endpoint 的 HTTP/2 pool、多 stream 复用、有 owner flush task 的有界 UOT coalesced writer、application-level drain、peer GOAWAY 观察和连接重建，且已有优雅 drain/session rollover 验收。由于 `h2 0.4` 的公开 client API 不提供主动发送 GOAWAY frame，Rust 版接受将 client-side GOAWAY 作为非阻塞延期，不调用私有 API 或引入 raw frame hack；当前关闭策略已满足使用需求，未来只有升级到公开支持该能力的 h2 API 才重新评估主动 GOAWAY。
 
 ## 7.7 第一版管理 HTTP 与服务进程
