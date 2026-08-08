@@ -7,9 +7,9 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
-> 当前实现快照：可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store` 和 `yuhaiin-runtime` 五个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责应用层组装和原子 reload，`yuhaiin-runtime::api` 提供与现有 `yuhaiin-react` client 对齐的管理面，`src/bin/yuhaiin.rs` 提供可直接运行的服务进程。HTTP 层复用 Go compatibility records，不新增一套配置 DTO，也不把平台权限细节泄漏到上层。
+> 当前实现快照：可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store`、`yuhaiin-geo` 和 `yuhaiin-runtime` 六个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，MaxMindDB 位于独立的 `yuhaiin-geo`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责应用层组装和原子 reload，`yuhaiin-runtime::api` 提供与现有 `yuhaiin-react` client 对齐的管理面，`src/bin/yuhaiin.rs` 提供可直接运行的服务进程。HTTP 层复用 Go compatibility records，不新增一套配置 DTO，也不把平台权限细节泄漏到上层。
 
-> 已实现的代码包括：SQLite 配置事务与 schema v3 typed repository、Go v6 fixture/import/字段差异报告、FakeIP IPv4/IPv6 分配/持久化/旧 snapshot 幂等导入与 A/AAAA/PTR/HTTPS/SVCB hint answer transform、域名/CIDR/Geo country Router snapshot publish/rollback、带 TTL/容量淘汰的 DNS cache、同步/异步 UDP DNS client/server/policy/cancellation boundary、DoH transport boundary、注入 connector 的 HTTP/2 DoH framing、可直接接入异步 DNS/TUN packet pipeline 的 `H2DohDnsHandler`、可复用的 RustCrypto TCP→TLS→ALPN h2 DoH connector 和 DoT TCP framing resolver、同时组装 System/UDP/TCP/DoH/DoT 的 `RustCryptoResolverFactory`、hosts→upstream→FakeIP 的可注入异步 resolver stack、`yuhaiin-runtime` 的 Go compatibility snapshot 组装与 direct/HTTP/SOCKS5/chain proxy 构造、direct/fixed/drop/HTTP CONNECT/SOCKS5、feature-gated `rustls-rustcrypto` TLS client、Yuubinsya native UDP client/server socket、UOT/TCP/coalesce/Ping client/server session、full-cone NAT UDP relay、MaxMindDB reader、唯一的 `tun-rs AsyncDevice + smoltcp` TUN adapter，以及独立的 `yuhaiin-chain`（fixedv2 → TLS → HTTP/2 pool/CONNECT → Yuubinsya TCP/UOT/Ping）。TLS provider 仍是 alpha，DoQ/DoH3 和特权 Linux namespace/Android/macOS 验收仍是独立门槛，未用 C TLS 代替。
+> 已实现的代码包括：SQLite 配置事务与 schema v3 typed repository、Go v6 fixture/import/字段差异报告、FakeIP IPv4/IPv6 分配/持久化/旧 snapshot 幂等导入与 A/AAAA/PTR/HTTPS/SVCB hint answer transform、域名/CIDR/Geo country Router snapshot publish/rollback、独立 `yuhaiin-geo` 的 MaxMindDB reader/校验下载/atomic refresh、带 TTL/容量淘汰的 DNS cache、同步/异步 UDP DNS client/server/policy/cancellation boundary、DoH transport boundary、注入 connector 的 HTTP/2 DoH framing、可直接接入异步 DNS/TUN packet pipeline 的 `H2DohDnsHandler`、可复用的 RustCrypto TCP→TLS→ALPN h2 DoH connector 和 DoT TCP framing resolver、同时组装 System/UDP/TCP/DoH/DoT 的 `RustCryptoResolverFactory`、hosts→upstream→FakeIP 的可注入异步 resolver stack、`yuhaiin-runtime` 的 Go compatibility snapshot 组装与 direct/HTTP/SOCKS5/chain proxy 构造、direct/fixed/drop/HTTP CONNECT/SOCKS5、feature-gated `rustls-rustcrypto` TLS client、Yuubinsya native UDP client/server socket、UOT/TCP/coalesce/Ping client/server session、full-cone NAT UDP relay、唯一的 `tun-rs AsyncDevice + smoltcp` TUN adapter，以及独立的 `yuhaiin-chain`（fixedv2 → TLS → HTTP/2 pool/CONNECT → Yuubinsya TCP/UOT/Ping）。TLS provider 仍是 alpha，DoQ/DoH3 和特权 Linux namespace/Android/macOS 验收仍是独立门槛，未用 C TLS 代替。
 
 ## 1. 目标、边界和完成定义
 
@@ -170,7 +170,7 @@ matcher fail-closed。DoH 已提供 `RustCryptoDohResolverFactory` 的直连 TCP
 DNS，避免 DoH bootstrap 反向进入自身 proxy chain。启用 runtime `http2` feature 后，`H2DohResolverFactory` 复用 core
 `H2DohClient`，由上层注入 TLS/proxy connector；
 `RuntimeBuilder` 同时读取
-`maxmind_metadata` 的第一条记录，用 `GeoDb` 加载纯 Rust MaxMindDB 并注入 route snapshot；
+`maxmind_metadata` 的第一条记录，用独立 `yuhaiin-geo::GeoDatabaseManager` 加载纯 Rust MaxMindDB 并注入 route snapshot；
 reload 时旧 snapshot 继续持有旧 reader，不会被新 reader 提前关闭。
 
 ### 3.3 生命周期和并发原则
@@ -691,7 +691,7 @@ yuhaiin-tun adapter -> FlowContext -> Router -> Proxy/NAT
 
 #### TUN 当前代码入口
 
-- `yuhaiin_core::tun::TunRuntime::open` 是最小设备入口，`open_with_routes` 是需要系统路由时的事务式启动入口；`TunRuntime::name()` 返回内核最终确认的接口名，`TunRuntime::shutdown` 提供显式的 route-before-fd-drop 关闭边界；不并行实现 tun2socket 或用户态第二套 IP stack。`open_with_routes` 的 route 配置失败会回收已创建设备并允许同名恢复；`tun-smoke` 的 `YUHAIIN_TUN_ROUTE_SMOKE=1` 会安装纯 Rust netlink route，便于在隔离 namespace 验收 shutdown、SIGKILL 和 route/device 清理；多进程验收还确认同名 TUN 不能被第二个 owner 抢占，首个 owner 终止后可重新启动。
+- `yuhaiin_core::tun::TunRuntime::open` 是桌面最小设备入口，`TunRuntime::from_async_device` 是 Android/iOS `VpnService`/PacketTunnelProvider 外部 fd 注入入口，`open_with_routes` 是需要系统路由时的事务式启动入口；`TunRuntime::name()` 返回内核最终确认的接口名或外部设备配置名，`TunRuntime::shutdown` 提供显式的 route-before-fd-drop 关闭边界；不并行实现 tun2socket 或用户态第二套 IP stack。`open_with_routes` 的 route 配置失败会回收已创建设备并允许同名恢复；`tun-smoke` 的 `YUHAIIN_TUN_ROUTE_SMOKE=1` 会安装纯 Rust netlink route，便于在隔离 namespace 验收 shutdown、SIGKILL 和 route/device 清理；多进程验收还确认同名 TUN 不能被第二个 owner 抢占，首个 owner 终止后可重新启动。
 - `TunRuntime::install_routes` 接收注入式 backend；Linux 使用 `install_linux_routes` 创建 `route_manager` netlink backend。route add/delete 和 rollback 可以在无 root 的 fake backend 单测中验证，真实 netlink 验收放在隔离 network namespace，避免测试修改宿主路由。
 - `SmoltcpTunDevice` 的 RX/TX 队列有界，队满返回 `WouldBlock`，不会静默丢包或无限增长；TUN 是软件 checksum 边界，不能把 checksum capability 标成 `ignored`。
 - `add_ip_address`/`replace_ip_addresses` 只修改 smoltcp 地址集合，不偷偷修改 OS 路由；这让 gateway/service 地址分离可以由上层明确配置。

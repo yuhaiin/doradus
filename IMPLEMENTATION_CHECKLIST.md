@@ -44,9 +44,9 @@
 | P1-NAT-ROUTE | P1 | NAT/TUN 系统资源生命周期 | Full Cone mapping、跨进程 force-stop、端口重绑和第二代 runtime、route lease、真实 TUN shutdown、SIGKILL 清理、无 `CAP_NET_ADMIN` fail-closed，以及多进程 TUN 名称独占/重启均已完成；后续仅保留 P2 Linux 的 MTU/fragment、设备不存在、namespace teardown 和多队列验收。 |
 | P-END-DATA | P-END | 更多真实 Go 生产快照与逐版本 migration 故障注入 | 当前功能、兼容 fixture、事务回滚、重启/force-stop 和已有 Go v5/v6 direct-open 验收已足够支撑主线；后续补未经本地升级的生产组合、未知字段样本和逐版本异常注入，不阻塞 P1 业务数据面。 |
 | P2-LINUX | P2 | Linux route lifecycle 与能力探测 | TUN namespace 基础验收已有；仍需 MTU/fragment、多队列、设备不存在、无权限、namespace teardown 及所有 post-up 失败的反向回滚。 |
-| P2-ANDROID | P2 | Android VpnService 路径 | 仍需 Android target 构建、传入 fd、权限/MTU/IPv4/IPv6 route、前后台切换、强制终止恢复，以及最小 JNI/FFI 审计。 |
-| P2-MACOS | P2 | macOS utun 路径 | 仍需 utun fd、系统 route、权限/签名/启动卸载、异常退出恢复；上层继续复用同一个 `tun-rs + smoltcp` dispatcher。 |
-| P2-GEO | P2 | MaxMindDB 生产链路 | reader、坏库、IPv4-mapped IPv6 和 Router country rule 已有；仍需固定版本 GeoLite/官方 test fixture、下载长度与 hash 校验、atomic replace、并发热替换、旧 reader 生命周期和重启恢复。 |
+| P2-ANDROID | P2 | Android VpnService 路径 | Rust core 已提供 `TunRuntime::from_async_device` 注入边界，Android `/proc` socket→pid/uid/exe matcher 也复用 Linux 实现；仍需 Android target 构建、VpnService fd/JNI 桥接、权限/MTU/IPv4/IPv6 route、前后台切换和强制终止恢复。 |
+| P2-MACOS | P2 | macOS utun 路径 | `tun-rs + smoltcp` 的 `aarch64-apple-darwin` core 编译边界已通过，仍需 utun 实机 fd/系统 route、权限/签名/启动卸载、异常退出恢复；上层继续复用同一个 dispatcher。 |
+| P2-GEO | P2 | MaxMindDB 生产链路 | `yuhaiin-geo` 已完成：官方固定 GeoLite2 test fixture 覆盖 v4/v6/mapped/miss/坏库，下载长度/hash 校验、目录 fsync + atomic replace、并发热替换、旧 reader 生命周期、启动恢复和 selected-outbound API refresh 均有测试；仅更多真实生产库组合归入 P-END。 |
 | P2-SOAK | P2 | 性能、内存、电量与长稳基线 | 仍需 Go/Rust 同场景吞吐、延迟、RSS、分配、wakeups、FakeIP/SQLite 增长、Android 电量和长时间 soak 报告；在报告前不宣称 Rust 性能收益。 |
 | P2-AUDIT | P2 | 安全、依赖与发布审计 | 仍需 TLS provider 互操作/证书验证、依赖 license、纯 Rust/C binding、日志脱敏、release profile、交叉编译和 reproducible build 审计。 |
 | P2-API | P2 | 管理 HTTP 与前端对接 | 第一版 RPC/前端兼容边界已完成；本轮补充 route-list 内容加载、真实 itemCount/errorCount/preview、HTTP(S) refresh、`~/.cache/yuhaiin-rust/rules` 原子缓存、Go 嵌套 host/network/port/geoip/all/any/not/process/inbound 规则进入 immutable Router snapshot，并通过 runtime/API/本地 HTTP server 回归；`not` 使用 DNF 变体和编译后的域名/CIDR exclusion trie，并有 De Morgan、负 network/port/context 回归；node latency 已接入 proxy-aware HTTP/TCP/IP/STUN；route-list refresh 现在读取 selected node 并经共享 outbound transport 下载，直连兼容入口仍保留。仍需平台进程枚举、DoQ latency 和更多真实 Go 生产列表 fixture。 |
@@ -103,15 +103,15 @@ P1 的明确边界：Full Cone NAT、rusqlite bundled 后端、真实 Go v5 FTS-
 - [~] **P2-LINUX-01：** 第一版使用 `TunConfig::mtu` 严格校验并由 tun-rs 配置设备；MTU/fragment 的真实设备矩阵仍需目标环境补测。
 - [~] **P2-LINUX-02：** route lease、启动失败 rollback、设备消失和 namespace 基础路径已有测试；外部删除/极端 teardown 矩阵仍需目标环境补测。
 - [~] **P2-LINUX-03：** 第一版明确使用单队列，`queue_capacity` 有界并可配置；多队列能力探测保留为后续优化。
-- [ ] **P2-ANDROID-01：** 构建 Android target，接入 `VpnService` fd，验证权限、MTU、IPv4/IPv6 route、前后台切换和重启。
+- [~] **P2-ANDROID-01：** Rust 已提供 `TunRuntime::from_async_device`，桌面设备创建与 Android 外部 `VpnService` fd 已在接口层分开；仍需安装 Android target 后构建、完成 fd/JNI 桥接，并验证权限、MTU、IPv4/IPv6 route、前后台切换和重启。
 - [ ] **P2-ANDROID-02：** 验收 Android 强制终止恢复、fd/数据库锁清理，并完成最小 JNI/FFI 边界审计。
-- [ ] **P2-MACOS-01：** 接入 utun fd、系统 route、权限/签名和启动/卸载生命周期。
+- [~] **P2-MACOS-01：** `tun-rs` 已覆盖 utun 创建/AsyncDevice，Rust core 的 `aarch64-apple-darwin` 编译边界已通过；仍需实机系统 route、权限/签名和启动/卸载生命周期。
 - [ ] **P2-MACOS-02：** 验收 macOS 异常退出、断电/强制退出后的 route、socket、配置和旧 reader 恢复。
 
 #### P2 Geo、稳定性与发布
 
-- [ ] **P2-GEO-01：** 加入脱敏、固定版本的 MaxMindDB/GeoLite fixture，覆盖命中、未命中、坏库和 IPv4-mapped IPv6。
-- [ ] **P2-GEO-02：** 实现并测试下载长度/hash 校验、临时文件原子替换、并发热替换、旧 reader 生命周期和重启恢复。
+- [x] **P2-GEO-01：** `crates/yuhaiin-geo/tests/fixtures/GeoLite2-Country-Test.mmdb` 为固定官方 fixture，覆盖 IPv4、IPv6、IPv4-mapped IPv6、未命中和坏库；Geo country lookup 已注入 immutable Router snapshot。
+- [x] **P2-GEO-02：** `GeoDatabaseManager` 已完成 bounded download、可选长度/hash 校验、MaxMind decode、同目录临时文件、文件/目录 sync、atomic rename、并发 generation、旧 snapshot 保持和启动 metadata 恢复；runtime API refresh 复用 selected outbound 并把 metadata 写回 SQLite。
 - [ ] **P2-SOAK-01：** 建立 Go/Rust 同场景 TCP/UDP 吞吐、延迟、RSS、分配、wakeups、连接数和 SQLite/FakeIP 增长基线。
 - [ ] **P2-SOAK-02：** 在真实 Android 设备上补电量、后台存活、前后台切换和长时间运行报告；在报告前不宣称 Rust 性能或省电收益。
 - [ ] **P2-AUDIT-01：** 审计 TLS provider 互操作、密码套件、证书验证、日志脱敏和凭据/token 泄漏风险。
@@ -122,7 +122,7 @@ P1 的明确边界：Full Cone NAT、rusqlite bundled 后端、真实 Go v5 FTS-
 - [x] **P2-API-01：** `POST /api/v2/rpc/nodes.post|get`、`resolvers.post|get`、`route.rules.post|get`、`resolver.hosts.put|get` 和 `route.config.put|get` 与前端扁平 JSON request body 兼容。
 - [x] **P2-API-02：** API 写入统一经过 SQLite typed compatibility table/config key 和 `RuntimeController::mutate_and_reload`；构建失败不替换旧 snapshot。
 - [x] **P2-API-03：** 节点、入站、resolver、route rule/list 原始 JSON 保存在兼容记录 `data_json`，未知字段不因 HTTP DTO 转换丢失；列表响应包含前端需要的 `items/page/pageSize/total`。
-- [~] **P2-API-04：** route list 已从“只保存 JSON”推进到 runtime 内容：local/file/缓存 remote、HTTP(S) refresh、`~/.cache/yuhaiin-rust/rules` 原子替换、itemCount/errorCount/preview 和 host/network/port/geoip/all/any/not/process/inbound 规则展开均有实现与测试；`not` 使用 DNF 变体和编译后的域名/CIDR exclusion trie，并有 De Morgan、负 network/port/context 回归；process/inbound matcher 已按 `FlowContext` 的 inbound/process metadata 参与 immutable Router 决策，Linux TUN 已接入纯 Rust `/proc` socket→pid/uid/exe resolver，route-list refresh 已通过 `RouteListTransport` 使用 selected outbound，Android/macOS 原生进程枚举、真实生产列表 fixture 和更完整平台验收仍待补齐。
+- [~] **P2-API-04：** route list 已从“只保存 JSON”推进到 runtime 内容：local/file/缓存 remote、HTTP(S) refresh、`~/.cache/yuhaiin-rust/rules` 原子替换、itemCount/errorCount/preview 和 host/network/port/geoip/all/any/not/process/inbound 规则展开均有实现与测试；`not` 使用 DNF 变体和编译后的域名/CIDR exclusion trie，并有 De Morgan、负 network/port/context 回归；process/inbound matcher 已按 `FlowContext` 的 inbound/process metadata 参与 immutable Router 决策，Linux/Android TUN 已接入纯 Rust `/proc` socket→pid/uid/exe resolver，route-list refresh 已通过 `RouteListTransport` 使用 selected outbound，macOS 原生进程枚举、真实生产列表 fixture 和更完整平台验收仍待补齐。
 - [x] **P2-API-05：** `/api/v2/nodes/{id}/latency` 与 RPC `node.latency` 已复用同一 `AsyncProxy` 构造链；独立 latency 模块支持 HTTP/TCP、IP body、STUN UDP/TCP（含 STUN XOR address 与 TCP length-prefix），响应字段与 Go contract 对齐；DoQ/DoH3 仍按低优先级延期。
 - [x] **P2-BINARY-01：** `yuhaiin` binary 直接启动 HTTP listener；默认创建内置 direct node，支持 `YUHAIIN_DB`、`YUHAIIN_HTTP`、`YUHAIIN_TUN`，生命周期由 Ctrl-C/watch shutdown 收敛。
 - [x] **P2-BINARY-02：** 启用 TUN 时使用单一路径 `tun-rs AsyncDevice + smoltcp`，selector/NAT/DNS handler 来自同一个 runtime snapshot；可选 UDP DNS server 使用同一 resolver snapshot。

@@ -1,8 +1,8 @@
 //! Inbound proxy listeners and their connection into the shared outbound
 //! selector.
 //!
-//! TUN is only one inbound. This module owns the normal TCP variants of the
-//! Go inbound contract: SOCKS5, HTTP CONNECT and Yuubinsya. Each accepted
+//! TUN is one inbound among several. This module owns the normal TCP variants
+//! of the Go inbound contract: SOCKS5, HTTP CONNECT and Yuubinsya. Each accepted
 //! request is converted into the same [`FlowContext`] used by TUN, then routed
 //! through the live `RuntimeProxySelector`; listeners therefore observe
 //! direct/proxy/bypass/drop changes after a reload without duplicating proxy

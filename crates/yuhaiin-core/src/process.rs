@@ -3,12 +3,13 @@
 //! Process lookup is deliberately a small, synchronous boundary.  The TUN
 //! runtime only calls it when a flow is opened, so a platform implementation
 //! can inspect the operating system without putting a blocking lookup inside
-//! the proxy I/O task.  Linux uses the proc filesystem and all other
+//! the proxy I/O task. Linux and Android use the proc filesystem; all other
 //! platforms safely fall back to `None` until they provide their native
 //! socket-ownership implementation.
 
 use std::io;
 use std::net::SocketAddr;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -40,31 +41,31 @@ pub trait ProcessResolver: Send + Sync {
 
 /// Construct the resolver supported by the current target.
 pub fn default_process_resolver() -> Option<Arc<dyn ProcessResolver>> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         return Some(Arc::new(LinuxProcResolver::default()));
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         None
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[derive(Debug, Clone)]
 pub struct LinuxProcResolver {
     proc_root: std::path::PathBuf,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl Default for LinuxProcResolver {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl LinuxProcResolver {
     pub fn new() -> Self {
         Self {
@@ -171,7 +172,7 @@ impl LinuxProcResolver {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl ProcessResolver for LinuxProcResolver {
     fn resolve(
         &self,
@@ -183,7 +184,7 @@ impl ProcessResolver for LinuxProcResolver {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SocketEntry {
     local: SocketAddr,
@@ -192,7 +193,7 @@ struct SocketEntry {
     inode: u64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl SocketEntry {
     fn matches(&self, network: Network, source: SocketAddr, destination: SocketAddr) -> bool {
         if self.local.port() != source.port()
@@ -214,12 +215,12 @@ impl SocketEntry {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn same_or_unspecified(left: SocketAddr, right: SocketAddr) -> bool {
     left.ip() == right.ip() || left.ip().is_unspecified()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn parse_socket_table(text: &str, ipv6: bool) -> io::Result<Vec<SocketEntry>> {
     let mut entries = Vec::new();
     for line in text.lines().skip(1) {
@@ -251,7 +252,7 @@ fn parse_socket_table(text: &str, ipv6: bool) -> io::Result<Vec<SocketEntry>> {
     Ok(entries)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn parse_proc_endpoint(value: &str, ipv6: bool) -> io::Result<SocketAddr> {
     let (address, port) = value.split_once(':').ok_or_else(|| {
         io::Error::new(
@@ -311,7 +312,7 @@ fn parse_proc_endpoint(value: &str, ipv6: bool) -> io::Result<SocketAddr> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn read_process_uid(process_dir: &Path) -> io::Result<u32> {
     let status = std::fs::read_to_string(process_dir.join("status"))?;
     let uid = status
@@ -327,7 +328,7 @@ fn read_process_uid(process_dir: &Path) -> io::Result<u32> {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn read_process_path(process_dir: &Path) -> io::Result<String> {
     match std::fs::read_link(process_dir.join("exe")) {
         Ok(path) => Ok(path.to_string_lossy().into_owned()),
@@ -338,7 +339,7 @@ fn read_process_path(process_dir: &Path) -> io::Result<String> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[cfg(test)]
 mod tests {
     use super::*;

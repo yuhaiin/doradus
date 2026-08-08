@@ -23,7 +23,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "async-proxy")]
 use std::time::Duration;
-use tun_rs::{AsyncDevice, DeviceBuilder};
+use tun_rs::AsyncDevice;
+#[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
+use tun_rs::DeviceBuilder;
 
 #[cfg(feature = "async-proxy")]
 use tokio::sync::mpsc;
@@ -34,11 +36,14 @@ use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
 
 #[cfg(feature = "async-proxy")]
+use crate::Endpoint;
+#[cfg(feature = "async-proxy")]
 use crate::LocalBoxFuture;
 #[cfg(feature = "async-proxy")]
 use crate::nat::{NatKey, NatTable};
+#[cfg(feature = "async-proxy")]
 use crate::process::{ProcessResolver, default_process_resolver};
-use crate::{Endpoint, Error, ErrorKind, Network, Result};
+use crate::{Error, ErrorKind, Network, Result};
 
 pub use crate::flow::{Flow as TunFlow, FlowKey as TunFlowKey};
 #[cfg(feature = "async-proxy")]
@@ -2097,23 +2102,23 @@ pub struct TunRuntime {
     smoltcp_device: SmoltcpTunDevice,
     interface: Interface,
     buffer: Vec<u8>,
+    #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
+    configured_name: Option<String>,
 }
 
 impl TunRuntime {
-    pub fn open(config: TunConfig) -> io::Result<Self> {
+    /// Assemble the packet engine around an already-created asynchronous TUN.
+    ///
+    /// Desktop callers normally use [`Self::open`]. Android/iOS VPN hosts
+    /// create the device through their platform API and pass ownership of the
+    /// resulting `tun-rs::AsyncDevice` here. This keeps the platform fd/FFI
+    /// boundary outside smoltcp and avoids a second packet-stack path.
+    pub fn from_async_device(config: TunConfig, device: AsyncDevice) -> io::Result<Self> {
         config
             .validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let mut builder = DeviceBuilder::new().mtu(config.mtu as u16);
-        if let Some(name) = config.name.as_deref() {
-            builder = builder.name(name);
-        }
-        if let Some((address, prefix)) = config.ipv4 {
-            builder = builder.ipv4(address, prefix, None);
-        }
-        for (address, prefix) in &config.ipv6 {
-            builder = builder.ipv6(*address, *prefix);
-        }
+        #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
+        let configured_name = config.name.clone();
         let mut smoltcp_device = SmoltcpTunDevice::new(config.mtu, config.queue_capacity)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let mut interface = Interface::new(
@@ -2131,7 +2136,6 @@ impl TunRuntime {
                 let _ = addresses.push(IpCidr::new(IpAddress::Ipv6(*address), *prefix));
             });
         }
-        let device = builder.build_async()?;
         Ok(Self {
             #[cfg(feature = "tun-routes")]
             route_lease: None,
@@ -2139,7 +2143,39 @@ impl TunRuntime {
             smoltcp_device,
             interface,
             buffer: vec![0; config.mtu.max(65535)],
+            #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
+            configured_name,
         })
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
+    pub fn open(config: TunConfig) -> io::Result<Self> {
+        config
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let mut builder = DeviceBuilder::new().mtu(config.mtu as u16);
+        if let Some(name) = config.name.as_deref() {
+            builder = builder.name(name);
+        }
+        if let Some((address, prefix)) = config.ipv4 {
+            builder = builder.ipv4(address, prefix, None);
+        }
+        for (address, prefix) in &config.ipv6 {
+            builder = builder.ipv6(*address, *prefix);
+        }
+        let device = builder.build_async()?;
+        Self::from_async_device(config, device)
+    }
+
+    /// Mobile platforms receive their TUN from the host VPN API rather than
+    /// creating a desktop device. Callers must provide that device through
+    /// [`Self::from_async_device`].
+    #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
+    pub fn open(_config: TunConfig) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this platform requires an injected TUN device",
+        ))
     }
 
     /// Open a TUN device and install its owned routes as one startup
@@ -2173,7 +2209,17 @@ impl TunRuntime {
     /// authority on the final name. Exposing the resolved value lets route
     /// ownership and teardown diagnostics refer to the same device.
     pub fn name(&self) -> io::Result<String> {
-        self.device.name()
+        #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
+        {
+            return Ok(self
+                .configured_name
+                .clone()
+                .unwrap_or_else(|| "fd".to_owned()));
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
+        {
+            self.device.name()
+        }
     }
 
     /// Install and own a reversible route set for this TUN device.
