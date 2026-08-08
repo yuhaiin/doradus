@@ -14,6 +14,7 @@ mod dot_tls;
 mod handle;
 #[path = "inbounds/mod.rs"]
 pub mod inbound;
+pub mod latency;
 pub mod log;
 pub mod monitor;
 mod proxy;

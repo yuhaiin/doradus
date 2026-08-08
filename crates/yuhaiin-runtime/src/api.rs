@@ -29,8 +29,8 @@ use yuhaiin_store::{
 };
 
 use crate::{
-    RouteListSnapshot, RuntimeController, expand_go_route_rule, log::log_batch_value,
-    refresh_route_list_caches,
+    RouteListSnapshot, RuntimeController, expand_go_route_rule, latency::LatencyRequest,
+    log::log_batch_value, refresh_route_list_caches,
 };
 
 #[derive(Clone)]
@@ -1807,7 +1807,6 @@ async fn update_status_value(state: &ApiState) -> ApiResult {
 
 async fn node_latency_value(state: &ApiState, value: &Value) -> ApiResult {
     let id = required_string(value, "id")?;
-    let target = latency_target(value)?;
     let timeout = Duration::from_millis(
         value
             .get("timeoutMs")
@@ -1823,83 +1822,11 @@ async fn node_latency_value(state: &ApiState, value: &Value) -> ApiResult {
         .await
         .map_err(ApiError::from)?
         .proxy;
-    let context = FlowContext::new(target);
-    let started = std::time::Instant::now();
-    let result = tokio::time::timeout(timeout, proxy.connect(&context)).await;
-    match result {
-        Ok(Ok(stream)) => {
-            drop(stream);
-            json_value(json!({
-                "ok": true,
-                "latencyMs": started.elapsed().as_millis().min(i64::MAX as u128) as i64,
-            }))
-        }
+    let request: LatencyRequest = serde_json::from_value(value.clone())?;
+    match tokio::time::timeout(timeout, crate::latency::probe(proxy, request, timeout)).await {
+        Ok(Ok(response)) => json_value(serde_json::to_value(response)?),
         Ok(Err(error)) => json_value(json!({"ok": false, "error": error.to_string()})),
         Err(_) => json_value(json!({"ok": false, "error": "latency probe timed out"})),
-    }
-}
-
-fn latency_target(value: &Value) -> std::result::Result<Endpoint, ApiError> {
-    let kind = string_or(value, "type", "tcp").to_ascii_lowercase();
-    if !matches!(kind.as_str(), "tcp" | "ip") {
-        return Err(ApiError::unavailable(format!(
-            "latency probe type {kind:?} is not implemented"
-        )));
-    }
-    let url = string_or(
-        value,
-        "url",
-        if kind == "ip" {
-            "http://ip.sb"
-        } else {
-            "https://clients3.google.com/generate_204"
-        },
-    );
-    let (authority, default_port) = if let Some(rest) = url.strip_prefix("https://") {
-        (rest.split('/').next().unwrap_or_default(), 443)
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        (rest.split('/').next().unwrap_or_default(), 80)
-    } else {
-        (url.split('/').next().unwrap_or_default(), 443)
-    };
-    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
-        let (host, rest) = rest
-            .split_once(']')
-            .ok_or_else(|| ApiError::bad("latency URL has an invalid IPv6 authority"))?;
-        let port = rest
-            .strip_prefix(':')
-            .map(|port| port.parse::<u16>())
-            .transpose()
-            .map_err(|error| ApiError::bad(format!("latency URL port: {error}")))?
-            .unwrap_or(default_port);
-        (host, port)
-    } else if let Some((host, port)) = authority.rsplit_once(':') {
-        if host.contains(':') {
-            (authority, default_port)
-        } else {
-            (
-                host,
-                port.parse::<u16>()
-                    .map_err(|error| ApiError::bad(format!("latency URL port: {error}")))?,
-            )
-        }
-    } else {
-        (authority, default_port)
-    };
-    if host.is_empty() {
-        return Err(ApiError::bad("latency URL host is empty"));
-    }
-    if let Ok(address) = host.parse() {
-        Ok(Endpoint::ip(
-            Network::Tcp,
-            std::net::SocketAddr::new(address, port),
-        ))
-    } else {
-        Ok(Endpoint::domain(
-            Network::Tcp,
-            DomainName::new(host).map_err(ApiError::from)?,
-            port,
-        ))
     }
 }
 
