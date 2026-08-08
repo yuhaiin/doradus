@@ -1,0 +1,20 @@
+[package]
+name = "yuhaiin-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2 = { version = "0.11.0", default-features = false }
+tokio = { version = "1.50.0", default-features = false, features = ["io-util", "net", "rt", "sync", "time"] }
+yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
+rustls = { version = "0.23.41", optional = true, default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = { version = "0.0.2-alpha", optional = true, default-features = false, features = ["std", "tls12", "zeroize"] }
+tokio-rustls = { version = "0.26.4", optional = true, default-features = false, features = ["tls12"] }
+
+[features]
+default = []
+tls-rustcrypto = ["dep:rustls", "dep:rustls-rustcrypto", "dep:tokio-rustls"]
+
+[lints]
+workspace = true

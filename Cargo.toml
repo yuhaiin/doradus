@@ -4,6 +4,7 @@ members = [
     "crates/yuhaiin-core",
     "crates/yuhaiin-chain",
     "crates/yuhaiin-geo",
+    "crates/yuhaiin-protocol",
     "crates/yuhaiin-store",
     "crates/yuhaiin-trie",
     "crates/yuhaiin-runtime",

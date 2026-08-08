@@ -307,7 +307,11 @@ fn io_error(error: std::io::Error) -> Error {
     Error::new(ErrorKind::Io, error.to_string())
 }
 
-fn encode_endpoint(endpoint: &Endpoint, output: &mut Vec<u8>) -> Result<()> {
+/// Encode the SOCKS-style address used by Yuubinsya and Trojan.
+///
+/// Keeping this representation in the shared core avoids subtly different
+/// domain/IPv4/IPv6 handling in each protocol adapter.
+pub fn encode_endpoint(endpoint: &Endpoint, output: &mut Vec<u8>) -> Result<()> {
     let (host, port) = match endpoint {
         Endpoint::Ip { addr, .. } => (Some(addr.ip()), addr.port()),
         Endpoint::Domain { port, .. } => (None, *port),
@@ -335,7 +339,8 @@ fn encode_endpoint(endpoint: &Endpoint, output: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-fn decode_endpoint(packet: &[u8], cursor: &mut usize, network: Network) -> Result<Endpoint> {
+/// Decode a SOCKS-style address and advance `cursor` past the address.
+pub fn decode_endpoint(packet: &[u8], cursor: &mut usize, network: Network) -> Result<Endpoint> {
     let address_type = take(packet, cursor, 1)?[0];
     let host = match address_type {
         1 => IpAddr::V4(Ipv4Addr::from(

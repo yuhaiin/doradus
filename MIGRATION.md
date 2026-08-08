@@ -7,9 +7,9 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
-> 当前实现快照：可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store`、`yuhaiin-geo` 和 `yuhaiin-runtime` 六个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，MaxMindDB 位于独立的 `yuhaiin-geo`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责应用层组装和原子 reload，`yuhaiin-runtime::api` 提供与现有 `yuhaiin-react` client 对齐的管理面，`yuhaiin-runtime::run_tun_device_until` 负责已创建设备的数据面生命周期，`src/bin/yuhaiin.rs` 只是桌面设备创建和进程 wiring 的一个 host。HTTP 层复用 Go compatibility records，不新增一套配置 DTO，也不把平台权限细节泄漏到上层。
+> 当前实现快照：可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store`、`yuhaiin-geo`、`yuhaiin-protocol` 和 `yuhaiin-runtime` 七个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，MaxMindDB 位于独立的 `yuhaiin-geo`，协议 wire codec/可组合 transport 位于 `yuhaiin-protocol`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责应用层组装和原子 reload，`yuhaiin-runtime::api` 提供与现有 `yuhaiin-react` client 对齐的管理面，`yuhaiin-runtime::run_tun_device_until` 负责已创建设备的数据面生命周期，`src/bin/yuhaiin.rs` 只是桌面设备创建和进程 wiring 的一个 host。HTTP 层复用 Go compatibility records，不新增一套配置 DTO，也不把平台权限细节泄漏到上层。
 
-> 已实现的代码包括：SQLite 配置事务与 schema v3 typed repository、Go v6 fixture/import/字段差异报告、FakeIP IPv4/IPv6 分配/持久化/旧 snapshot 幂等导入与 A/AAAA/PTR/HTTPS/SVCB hint answer transform、域名/CIDR/Geo country Router snapshot publish/rollback、独立 `yuhaiin-geo` 的 MaxMindDB reader/校验下载/atomic refresh、带 TTL/容量淘汰的 DNS cache、同步/异步 UDP DNS client/server/policy/cancellation boundary、DoH transport boundary、注入 connector 的 HTTP/2 DoH framing、可直接接入异步 DNS/TUN packet pipeline 的 `H2DohDnsHandler`、可复用的 RustCrypto TCP→TLS→ALPN h2 DoH connector 和 DoT TCP framing resolver、同时组装 System/UDP/TCP/DoH/DoT 的 `RustCryptoResolverFactory`、hosts→upstream→FakeIP 的可注入异步 resolver stack、`yuhaiin-runtime` 的 Go compatibility snapshot 组装与 direct/HTTP/SOCKS5/chain proxy 构造、direct/fixed/drop/HTTP CONNECT/SOCKS5、feature-gated `rustls-rustcrypto` TLS client、共享 WebSocket byte-stream transport（standalone 与 WebSocket+HTTP/2 inbound/outbound）、Yuubinsya native UDP client/server socket、UOT/TCP/coalesce/Ping client/server session、full-cone NAT UDP relay、唯一的 `tun-rs AsyncDevice + smoltcp` TUN adapter，以及独立的 `yuhaiin-chain`（fixedv2 → 可选 TLS/WebSocket → HTTP/2 pool/CONNECT → Yuubinsya TCP/UOT/Ping）。TLS provider 仍是 alpha，DoQ/DoH3、WebSocket early-data/子协议和特权 Linux namespace/Android/macOS 验收仍是独立门槛，未用 C TLS 代替。
+> 已实现的代码包括：SQLite 配置事务与 schema v3 typed repository、Go v6 fixture/import/字段差异报告、FakeIP IPv4/IPv6 分配/持久化/旧 snapshot 幂等导入与 A/AAAA/PTR/HTTPS/SVCB hint answer transform、域名/CIDR/Geo country Router snapshot publish/rollback、独立 `yuhaiin-geo` 的 MaxMindDB reader/校验下载/atomic refresh、带 TTL/容量淘汰的 DNS cache、同步/异步 UDP DNS client/server/policy/cancellation boundary、DoH transport boundary、注入 connector 的 HTTP/2 DoH framing、可直接接入异步 DNS/TUN packet pipeline 的 `H2DohDnsHandler`、可复用的 RustCrypto TCP→TLS→ALPN h2 DoH connector 和 DoT TCP framing resolver、同时组装 System/UDP/TCP/DoH/DoT 的 `RustCryptoResolverFactory`、hosts→upstream→FakeIP 的可注入异步 resolver stack、`yuhaiin-runtime` 的 Go compatibility snapshot 组装与 direct/HTTP/SOCKS5/Trojan/chain proxy 构造、direct/fixed/drop/HTTP CONNECT/SOCKS5、独立 `yuhaiin-protocol` 的 Trojan TCP/UDP codec、inbound/outbound wrapper 和 `fixedv2 -> TLS -> Trojan` transport 组合、feature-gated `rustls-rustcrypto` TLS client、共享 WebSocket byte-stream transport（standalone 与 WebSocket+HTTP/2 inbound/outbound）、Yuubinsya native UDP client/server socket、UOT/TCP/coalesce/Ping client/server session、full-cone NAT UDP relay、唯一的 `tun-rs AsyncDevice + smoltcp` TUN adapter，以及独立的 `yuhaiin-chain`（fixedv2 → 可选 TLS/WebSocket → HTTP/2 pool/CONNECT → Yuubinsya TCP/UOT/Ping）。TLS provider 仍是 alpha，DoQ/DoH3、WebSocket early-data/子协议和特权 Linux namespace/Android/macOS 验收仍是独立门槛，未用 C TLS 代替。
 
 ## 1. 目标、边界和完成定义
 
@@ -95,6 +95,7 @@ yuhaiin-rust/
 │   ├── yuhaiin-proxy/         # proxy trait、direct/fixed/drop 等基础实现
 │   ├── yuhaiin-proxy-yuubinsya/ # Yuubinsya wire codec、client、server
 │   ├── yuhaiin-proxy-http/    # HTTP CONNECT、HTTP/2、SOCKS5、TLS wrapper
+│   ├── yuhaiin-protocol/      # 可组合协议 wire codec/transport（当前 Trojan）
 │   ├── yuhaiin-chain/          # 当前可运行的 fixedv2 -> 可选 TLS/WebSocket -> HTTP/2 -> Yuubinsya 组合
 │   ├── yuhaiin-router/        # list snapshot、rule matcher、route dispatch
 │   ├── yuhaiin-nat/           # UDP NAT table/source control
@@ -773,6 +774,8 @@ cargo run -p yuhaiin-runtime --bin yuhaiin --all-features
 
 `yuhaiin-chain` 现在也支持 Go 的简化 `fixed/fixedv2 -> yuubinsya(udp_over_stream=true)`：直接 TCP 建连后执行 migrate-ID handshake 和 UOT frame，支持 coalesce、域名 resolver、有限重连、proxy close 时回收活动 datagram 和原有 `AsyncProxy` datagram 契约；完整 `fixedv2 -> TLS -> HTTP/2 -> Yuubinsya` 继续使用 H2 pool，不改变既有链路。
 
+Trojan 独立放在 `yuhaiin-protocol`：`TrojanProxy` 可包裹任意已连接的 `AsyncProxy`，支持 Go wire-compatible 的 lowercase SHA-224 password token、TCP CONNECT、UDP ASSOCIATE frame 和有界 payload；runtime 的 inbound 只负责读取 request、注入 `FlowContext`、选择 outbound 和记录 connection/traffic。常用的 `fixedv2 -> tls -> trojan` 由独立 RustCrypto TLS wrapper 组合，不把 TLS 状态写进 Trojan codec；MUX command 保持显式 unsupported，不静默当成 CONNECT。
+
 配置迁移先经过 `yuhaiin-store` 的 `GoProxyRuntimeConfig` 边界：它从 Go `nodes_v2` 的 `chain_types_json` 和 tagged `data_json` 选择可构造的基础 transport，保留有序 protocol layer、启用状态及完整原始 JSON。基础 direct/drop/fixed/HTTP CONNECT/SOCKS5 由 `yuhaiin-core::proxy_factory::BaseProxyConfig` 统一构造；fixed/fixedv2 的 Go 字面量 `{host, port}` 地址由 `yuhaiin-chain::parse_go_node` 归一化，`ChainClient::from_go_json`/`ChainProxy::from_go_json` 可直接从原始 Go node payload 构造当前 `fixedv2 -> 可选 TLS/WebSocket -> HTTP/2 -> Yuubinsya` runtime，并在连接时异步解析 fixed 上游域名。`yuhaiin-runtime::RuntimeBuilder` 现在读取这些 shared runtime structs，使用同一个 `Arc<dyn AsyncIpResolver>` 构造 direct/HTTP/SOCKS5 或 chain proxy；`RuntimeSnapshot::build_proxy_selector` 再把这些 shared proxy records 组装成 TUN 的 direct/proxy/bypass/drop selector，缺少 proxy 配置时 fail-closed；通过 `RuntimeController` 注册的 selector 会在 reload publish 前原子替换 proxy slots，失败时保留旧 snapshot。新 Rust store 也初始化 `nodes_v2`、`inbounds_v2`、`node_tags_v2`、`resolvers_v2`、`route_rules_v2`、`route_lists_v2`，fresh DB 可直接通过 repository 保存 Go compatibility records。基础 builder 的 `to_base_proxy_config_with_resolver` 允许 HTTP、SOCKS5 和 fixed 域名复用 hosts/FakeIP/cache policy。同步 `to_base_proxy_config` 仍保留系统 `ToSocketAddrs` 兼容入口。应用启动和配置 reload 不能让各 proxy 自己创建全局 resolver。当前不会把域名静默当作 `0.0.0.0` 或 direct。`GoProxyTransport::Unknown` 只表示“暂未实现的协议”，运行时 builder 必须显式报错或提供对应实现，禁止未知节点静默变成 direct。
 
 HTTP 层暂不复制一套 DTO：`GoProxyRuntimeConfig`、`GoProxyLayer`、resolver/route/FakeIP runtime structs 作为共享 wire model，使用稳定的 camelCase 字段；`data_json` 不参与序列化，proxy layer 的 password/secret/token/private_key 在 Serialize 时统一打码。未来 handler 只需加鉴权、分页和状态码映射，不改变这些核心模型或 SQLite repository。
@@ -914,6 +917,7 @@ server 同时处理 TCP listener 和 UDP listener：
 | HTTP CONNECT | 是 | 否/委托 | 否/委托 | 必须 |
 | SOCKS5 | 是 | UDP ASSOCIATE | 可选 | 必须 |
 | TLS | wrapper | 委托 | 委托 | 必须 |
+| Trojan | 是 | UDP-over-TCP ASSOCIATE | 委托 | 已实现 |
 | HTTP/2 prior knowledge | CONNECT stream | CONNECT stream | 委托 | 必须 |
 | Yuubinsya | 是 | native + UOT | 是 | 最高优先级 |
 

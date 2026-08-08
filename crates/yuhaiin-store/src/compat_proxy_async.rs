@@ -48,10 +48,9 @@ impl GoProxyRuntimeConfig {
 
     fn ensure_base_transport(&self) -> Result<()> {
         if self.chain_types.iter().any(|kind| {
-            matches!(
-                kind.to_ascii_lowercase().as_str(),
-                "tls" | "http2" | "websocket"
-            )
+            matches!(kind.to_ascii_lowercase().as_str(), "http2" | "websocket")
+                || (kind.eq_ignore_ascii_case("tls")
+                    && !matches!(self.transport, GoProxyTransport::Trojan))
         }) {
             return Err(Error::new(
                 ErrorKind::Unsupported,
@@ -83,6 +82,7 @@ impl GoProxyRuntimeConfig {
             GoProxyTransport::Fixed
             | GoProxyTransport::HttpProxy
             | GoProxyTransport::Socks5
+            | GoProxyTransport::Trojan
             | GoProxyTransport::Yuubinsya => Some(fixed_endpoint(&self.layers)),
             _ => None,
         }
@@ -112,6 +112,9 @@ impl GoProxyRuntimeConfig {
                     password: optional_string(config, "password"),
                 }
             }
+            GoProxyTransport::Trojan => BaseProxyKind::Fixed {
+                address: address.ok_or_else(|| Error::invalid("Trojan proxy has no endpoint"))?,
+            },
             GoProxyTransport::Yuubinsya => {
                 let config = layer_config(&self.layers, "yuubinsya")?;
                 let password = required_string(config, "password")?;
@@ -145,6 +148,7 @@ fn transport_name(transport: &GoProxyTransport) -> &str {
         GoProxyTransport::Fixed => "fixed",
         GoProxyTransport::HttpProxy => "http",
         GoProxyTransport::Socks5 => "socks5",
+        GoProxyTransport::Trojan => "trojan",
         GoProxyTransport::Yuubinsya => "yuubinsya",
         GoProxyTransport::Tls => "tls",
         GoProxyTransport::Http2 => "http2",

@@ -20,6 +20,8 @@ pub(crate) mod http;
 pub(crate) mod socks4a;
 #[path = "proxy/socks5.rs"]
 pub(crate) mod socks5;
+#[path = "proxy/trojan.rs"]
+pub(crate) mod trojan;
 #[cfg(feature = "websocket")]
 #[path = "proxy/websocket.rs"]
 pub(crate) mod websocket;
@@ -55,6 +57,42 @@ impl RuntimeSnapshot {
                 json,
                 self.resolver.clone(),
             )?) as Arc<dyn AsyncProxy>
+        } else if matches!(config.transport, yuhaiin_store::GoProxyTransport::Trojan) {
+            let base = config
+                .to_base_proxy_config_with_resolver(timeout, self.resolver.clone())
+                .await?;
+            let mut upstream = base.build()?;
+            if config
+                .chain_types
+                .iter()
+                .any(|kind| kind.eq_ignore_ascii_case("tls"))
+            {
+                #[cfg(feature = "doh-tls")]
+                {
+                    upstream = build_trojan_tls_proxy(&config, upstream)?;
+                }
+                #[cfg(not(feature = "doh-tls"))]
+                {
+                    return Err(Error::new(
+                        ErrorKind::Unsupported,
+                        "Trojan TLS requires the doh-tls feature",
+                    ));
+                }
+            }
+            let layer = config
+                .layers
+                .iter()
+                .find(|layer| layer.kind.eq_ignore_ascii_case("trojan"))
+                .ok_or_else(|| Error::invalid("Trojan proxy has no trojan layer"))?;
+            let password = layer
+                .config
+                .get("password")
+                .and_then(serde_json::Value::as_str)
+                .filter(|password| !password.is_empty())
+                .ok_or_else(|| Error::invalid("Trojan proxy password is empty"))?;
+            Arc::new(yuhaiin_protocol::trojan::TrojanProxy::new(
+                upstream, password,
+            )) as Arc<dyn AsyncProxy>
         } else {
             let base = config
                 .to_base_proxy_config_with_resolver(timeout, self.resolver.clone())
@@ -197,12 +235,19 @@ impl AsyncProxySelector for RuntimeProxySelector {
 }
 
 fn is_chain_config(config: &GoProxyRuntimeConfig) -> bool {
-    if config.chain_types.iter().any(|kind| {
-        matches!(
-            kind.to_ascii_lowercase().as_str(),
-            "tls" | "http2" | "websocket"
-        )
-    }) {
+    if config
+        .chain_types
+        .iter()
+        .any(|kind| matches!(kind.to_ascii_lowercase().as_str(), "http2" | "websocket"))
+    {
+        return true;
+    }
+    if config
+        .chain_types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("tls"))
+        && !matches!(config.transport, yuhaiin_store::GoProxyTransport::Trojan)
+    {
         return true;
     }
     config.chain_types.iter().any(|kind| {
@@ -217,15 +262,87 @@ fn is_chain_config(config: &GoProxyRuntimeConfig) -> bool {
     })
 }
 
+#[cfg(feature = "doh-tls")]
+fn build_trojan_tls_proxy(
+    config: &GoProxyRuntimeConfig,
+    upstream: Arc<dyn AsyncProxy>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    use base64::Engine;
+    use rustls::RootCertStore;
+    use rustls::pki_types::CertificateDer;
+
+    let layer = config
+        .layers
+        .iter()
+        .find(|layer| layer.kind.eq_ignore_ascii_case("tls"))
+        .ok_or_else(|| Error::invalid("Trojan TLS layer is missing"))?;
+    let server_name = layer
+        .config
+        .get("servernames")
+        .or_else(|| layer.config.get("serverNames"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|values| values.iter().find_map(serde_json::Value::as_str))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::invalid("Trojan TLS layer requires servernames"))?;
+    let mut roots = RootCertStore::empty();
+    if let Some(certificates) = layer
+        .config
+        .get("ca_cert")
+        .or_else(|| layer.config.get("caCert"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for certificate in certificates {
+            let encoded = certificate
+                .as_str()
+                .ok_or_else(|| Error::invalid("Trojan TLS ca_cert must contain strings"))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("Trojan TLS ca_cert: {error}"),
+                    )
+                })?;
+            roots.add(CertificateDer::from(bytes)).map_err(|error| {
+                Error::new(ErrorKind::Protocol, format!("Trojan TLS CA: {error}"))
+            })?;
+        }
+    }
+    if roots.is_empty() {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    let next_protocols = layer
+        .config
+        .get("next_protos")
+        .or_else(|| layer.config.get("nextProtos"))
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(Arc::new(yuhaiin_protocol::tls::RustCryptoTlsProxy::new(
+        upstream,
+        roots,
+        server_name,
+        &next_protocols,
+    )?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::RuntimeSnapshot;
     use std::sync::Arc;
     use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_core::proxy::FixedAsyncProxy;
     use yuhaiin_core::proxy::{AsyncProxySelector, YuubinsyaUdpServer};
     use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyKind};
     use yuhaiin_core::{FlowContext, RouteMode};
+    use yuhaiin_protocol::trojan::{self, Command};
     use yuhaiin_store::GoProxyTransport;
     use yuhaiin_trie::router::{RouteDecision, Router, RouterRuntime};
 
@@ -313,6 +430,123 @@ mod tests {
         context.route_mode = RouteMode::Direct;
         let direct = selector.select(&context);
         assert!(!Arc::ptr_eq(&selected, &direct));
+    }
+
+    #[tokio::test]
+    async fn trojan_outbound_wraps_fixed_parent_and_preserves_connect_payload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let hash = trojan::password_hash(b"secret");
+            let request = trojan::read_request(&mut stream, &hash).await.unwrap();
+            assert_eq!(request.command, Command::Connect);
+            let mut payload = [0u8; 5];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut payload)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, &payload)
+                .await
+                .unwrap();
+        });
+        let parent: Arc<dyn AsyncProxy> = Arc::new(FixedAsyncProxy {
+            address,
+            timeout: Duration::from_secs(2),
+        });
+        let proxy = yuhaiin_protocol::trojan::TrojanProxy::new(parent, "secret");
+        let destination = yuhaiin_core::Endpoint::domain(
+            yuhaiin_core::Network::Tcp,
+            yuhaiin_core::DomainName::new("example.com").unwrap(),
+            443,
+        );
+        let context = yuhaiin_core::FlowContext::new(destination);
+        let mut stream = proxy.connect(&context).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"hello")
+            .await
+            .unwrap();
+        let mut echoed = [0u8; 5];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut echoed)
+            .await
+            .unwrap();
+        assert_eq!(&echoed, b"hello");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn go_trojan_layer_builds_a_runtime_proxy_without_dropping_unknown_fields() {
+        let address: std::net::SocketAddr = "127.0.0.1:24443".parse().unwrap();
+        let config = GoProxyRuntimeConfig {
+            id: "trojan".to_owned(),
+            name: "trojan".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned(), "trojan".to_owned()],
+            layers: vec![
+                yuhaiin_store::GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({"addresses":[{"host":"127.0.0.1","port":address.port()}]}),
+                },
+                yuhaiin_store::GoProxyLayer {
+                    kind: "trojan".to_owned(),
+                    config: serde_json::json!({"password":"secret","futureField":true}),
+                },
+            ],
+            transport: GoProxyTransport::Trojan,
+            data_json: serde_json::to_vec(&serde_json::json!({"chain":[]})).unwrap(),
+        };
+        let built = snapshot(config)
+            .build_proxy("trojan", Duration::from_secs(2))
+            .await
+            .unwrap();
+        let context = yuhaiin_core::FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        assert!(built.proxy.connect(&context).await.is_err());
+    }
+
+    #[cfg(feature = "doh-tls")]
+    #[tokio::test]
+    async fn go_trojan_layer_builds_tls_transport_before_protocol_wrapper() {
+        let config = GoProxyRuntimeConfig {
+            id: "trojan-tls".to_owned(),
+            name: "trojan-tls".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned(), "tls".to_owned(), "trojan".to_owned()],
+            layers: vec![
+                yuhaiin_store::GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({"addresses":[{"host":"127.0.0.1","port":24443}]}),
+                },
+                yuhaiin_store::GoProxyLayer {
+                    kind: "tls".to_owned(),
+                    config: serde_json::json!({"servernames":["example.com"]}),
+                },
+                yuhaiin_store::GoProxyLayer {
+                    kind: "trojan".to_owned(),
+                    config: serde_json::json!({"password":"secret"}),
+                },
+            ],
+            transport: GoProxyTransport::Trojan,
+            data_json: Vec::new(),
+        };
+        let built = snapshot(config)
+            .build_proxy("trojan-tls", Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(
+            built
+                .proxy
+                .ping(&FlowContext::new(yuhaiin_core::Endpoint::ip(
+                    yuhaiin_core::Network::Tcp,
+                    "192.0.2.1:443".parse().unwrap(),
+                )))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

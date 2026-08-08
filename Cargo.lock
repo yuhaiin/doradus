@@ -3060,6 +3060,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "yuhaiin-protocol"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+ "rustls-rustcrypto",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-rustls",
+ "yuhaiin-core",
+]
+
+[[package]]
 name = "yuhaiin-runtime"
 version = "0.1.0"
 dependencies = [
@@ -3086,6 +3098,7 @@ dependencies = [
  "yuhaiin-chain",
  "yuhaiin-core",
  "yuhaiin-geo",
+ "yuhaiin-protocol",
  "yuhaiin-store",
  "yuhaiin-trie",
 ]

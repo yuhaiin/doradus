@@ -40,6 +40,7 @@ pub enum GoProxyTransport {
     Fixed,
     HttpProxy,
     Socks5,
+    Trojan,
     Yuubinsya,
     Tls,
     Http2,
@@ -167,6 +168,7 @@ fn parse_proxy_transport(value: &str) -> GoProxyTransport {
         "fixed" | "simple" | "fixedv2" => GoProxyTransport::Fixed,
         "http" | "http_proxy" => GoProxyTransport::HttpProxy,
         "socks5" => GoProxyTransport::Socks5,
+        "trojan" => GoProxyTransport::Trojan,
         "yuubinsya" => GoProxyTransport::Yuubinsya,
         "tls" => GoProxyTransport::Tls,
         "http2" => GoProxyTransport::Http2,
@@ -187,6 +189,7 @@ fn select_proxy_transport(chain_types: &[String], layers: &[GoProxyLayer]) -> Go
     for preferred in [
         "yuubinsya",
         "socks5",
+        "trojan",
         "http",
         "http_proxy",
         "drop",

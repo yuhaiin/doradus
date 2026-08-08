@@ -1078,6 +1078,7 @@ where
         "socks5" => crate::proxy::socks5::serve(stream, peer, spec, selector, monitor).await,
         "http" => crate::proxy::http::serve(stream, peer, spec, selector, monitor).await,
         "mixed" => serve_mixed(stream, peer, spec, selector, monitor).await,
+        "trojan" => crate::proxy::trojan::serve(stream, peer, spec, selector, monitor).await,
         "yuubinsya" => crate::proxy::yuubinsya::serve(stream, peer, spec, selector, monitor).await,
         other => Err(Error::new(
             ErrorKind::Unsupported,
@@ -1174,6 +1175,7 @@ mod tests {
     use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
     use yuhaiin_core::process::ProcessInfo;
     use yuhaiin_core::{Endpoint, Network};
+    use yuhaiin_protocol::trojan::{self, Command};
     use yuhaiin_store::{ConfigStore, GoNodeRecord};
 
     #[cfg(feature = "doh-tls")]
@@ -1283,6 +1285,90 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             headers.push(byte[0]);
         }
         headers
+    }
+
+    #[tokio::test]
+    async fn trojan_inbound_routes_a_real_tcp_flow_through_shared_outbound() {
+        let (selector, monitor) = direct_runtime().await;
+        let (echo_address, echo_task) = echo_server().await;
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let spec = InboundSpec {
+            id: "trojan-inbound".to_owned(),
+            protocol: "trojan".to_owned(),
+            listen: "127.0.0.1:19080".parse().unwrap(),
+            username: String::new(),
+            password: "secret".to_owned(),
+            udp_mode: UdpMode::Disabled,
+            protocol_udp: false,
+            transports: vec!["normal".to_owned()],
+            outbound_id: "direct".to_owned(),
+        };
+        let task = tokio::spawn(crate::proxy::trojan::serve(
+            server,
+            "127.0.0.1:41001".parse().unwrap(),
+            spec,
+            selector,
+            monitor,
+        ));
+        let destination = Endpoint::ip(Network::Tcp, echo_address);
+        let hash = trojan::password_hash(b"secret");
+        trojan::write_request(&mut client, &hash, Command::Connect, &destination)
+            .await
+            .unwrap();
+        client.write_all(b"trojan-inbound").await.unwrap();
+        let mut response = [0u8; 14];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"trojan-inbound");
+        client.shutdown().await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        echo_task.abort();
+    }
+
+    #[tokio::test]
+    async fn trojan_associate_routes_udp_frames_through_shared_outbound() {
+        let (selector, monitor) = direct_runtime().await;
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_address = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 1024];
+            let (length, peer) = echo.recv_from(&mut buffer).await.unwrap();
+            echo.send_to(&buffer[..length], peer).await.unwrap();
+        });
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let spec = InboundSpec {
+            id: "trojan-udp-inbound".to_owned(),
+            protocol: "trojan".to_owned(),
+            listen: "127.0.0.1:19081".parse().unwrap(),
+            username: String::new(),
+            password: "secret".to_owned(),
+            udp_mode: UdpMode::Enabled,
+            protocol_udp: true,
+            transports: vec!["normal".to_owned()],
+            outbound_id: "direct".to_owned(),
+        };
+        let task = tokio::spawn(crate::proxy::trojan::serve(
+            server,
+            "127.0.0.1:41002".parse().unwrap(),
+            spec,
+            selector,
+            monitor,
+        ));
+        let destination = Endpoint::ip(Network::Udp, echo_address);
+        let hash = trojan::password_hash(b"secret");
+        trojan::write_request(&mut client, &hash, Command::Associate, &destination)
+            .await
+            .unwrap();
+        trojan::write_udp_frame(&mut client, &destination, b"trojan-udp")
+            .await
+            .unwrap();
+        let mut payload = [0u8; 64];
+        let (length, _source) = trojan::read_udp_frame(&mut client, &mut payload)
+            .await
+            .unwrap();
+        assert_eq!(&payload[..length], b"trojan-udp");
+        client.shutdown().await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        echo_task.await.unwrap();
     }
 
     #[test]

@@ -17,6 +17,7 @@ doh-tls = [
     "dep:rustls-pemfile",
     "dep:tokio-rustls",
     "yuhaiin-core/tls-rustcrypto",
+    "yuhaiin-protocol/tls-rustcrypto",
     "dep:webpki-roots",
 ]
 websocket = ["dep:futures-util", "dep:tokio-tungstenite", "yuhaiin-core/websocket"]
@@ -43,6 +44,7 @@ tokio-tungstenite = { version = "0.28.0", optional = true, default-features = fa
 yuhaiin-chain = { path = "../yuhaiin-chain" }
 yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
 yuhaiin-geo = { path = "../yuhaiin-geo" }
+yuhaiin-protocol = { path = "../yuhaiin-protocol" }
 yuhaiin-store = { path = "../yuhaiin-store", features = ["async-dns"] }
 yuhaiin-trie = { path = "../yuhaiin-trie", features = ["async-proxy"] }
 
