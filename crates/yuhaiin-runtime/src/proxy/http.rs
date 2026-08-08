@@ -2,8 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use base64::Engine;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use yuhaiin_core::proxy::AsyncProxySelector;
 use yuhaiin_core::tun::TunFlowKey;
@@ -15,13 +14,16 @@ use crate::{ConnectionMonitor, RuntimeProxySelector};
 
 const MAX_HEADERS: usize = 64 * 1024;
 
-pub(crate) async fn serve(
-    mut stream: TcpStream,
+pub(crate) async fn serve<S>(
+    mut stream: S,
     peer: SocketAddr,
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let headers = read_headers(&mut stream).await?;
     let mut lines = headers.split("\r\n");
     let request = lines
@@ -109,7 +111,10 @@ pub(crate) async fn serve(
     .map_err(io_error)
 }
 
-async fn read_headers(stream: &mut TcpStream) -> Result<String> {
+async fn read_headers<S>(stream: &mut S) -> Result<String>
+where
+    S: AsyncRead + Unpin,
+{
     let mut bytes = Vec::with_capacity(1024);
     let mut one = [0u8; 1];
     while bytes.len() < MAX_HEADERS {

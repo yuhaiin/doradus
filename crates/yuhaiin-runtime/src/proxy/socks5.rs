@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
@@ -14,13 +14,16 @@ use super::common::{UdpFlowId, UdpFlowState, UdpReply, io_error, relay_counted, 
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
-pub(crate) async fn serve(
-    mut stream: TcpStream,
+pub(crate) async fn serve<S>(
+    mut stream: S,
     peer: SocketAddr,
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut greeting = [0u8; 2];
     stream.read_exact(&mut greeting).await.map_err(io_error)?;
     if greeting[0] != 5 {
@@ -228,11 +231,10 @@ async fn serve_socks5_udp_loop(
     Ok(())
 }
 
-async fn read_socks_endpoint(
-    stream: &mut TcpStream,
-    network: Network,
-    atyp: u8,
-) -> Result<Endpoint> {
+async fn read_socks_endpoint<S>(stream: &mut S, network: Network, atyp: u8) -> Result<Endpoint>
+where
+    S: AsyncRead + Unpin,
+{
     match atyp {
         1 => {
             let mut address = [0u8; 4 + 2];
@@ -375,18 +377,20 @@ fn encode_socks_endpoint(packet: &mut Vec<u8>, target: &Endpoint) -> Result<()> 
     Ok(())
 }
 
-async fn write_socks_reply(stream: &mut TcpStream, code: u8) -> Result<()> {
+async fn write_socks_reply<S>(stream: &mut S, code: u8) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     stream
         .write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0])
         .await
         .map_err(io_error)
 }
 
-async fn write_socks_reply_endpoint(
-    stream: &mut TcpStream,
-    code: u8,
-    address: SocketAddr,
-) -> Result<()> {
+async fn write_socks_reply_endpoint<S>(stream: &mut S, code: u8, address: SocketAddr) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let mut reply = Vec::with_capacity(22);
     reply.extend_from_slice(&[5, code, 0]);
     encode_socks_endpoint(&mut reply, &Endpoint::ip(Network::Tcp, address))?;

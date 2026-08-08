@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 use yuhaiin_chain::YuubinsyaServerProxy;
@@ -15,13 +15,16 @@ use super::common::{RoutedProxy, UdpFlowId, UdpFlowState, UdpReply, udp_flow_key
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
-pub(crate) async fn serve(
-    stream: TcpStream,
+pub(crate) async fn serve<S>(
+    stream: S,
     peer: SocketAddr,
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let upstream: Arc<dyn AsyncProxy> = Arc::new(RoutedProxy { selector });
     let server = YuubinsyaServerProxy::new(derive_salt(spec.password.as_bytes()), upstream);
     let annotate = spec.clone();
