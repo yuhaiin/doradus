@@ -9,9 +9,12 @@
 //! construction logic.
 
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 
@@ -825,12 +828,83 @@ where
 {
     match protocol.as_str() {
         "socks5" => crate::proxy::socks5::serve(stream, peer, spec, selector, monitor).await,
-        "http" | "mixed" => crate::proxy::http::serve(stream, peer, spec, selector, monitor).await,
+        "http" => crate::proxy::http::serve(stream, peer, spec, selector, monitor).await,
+        "mixed" => serve_mixed(stream, peer, spec, selector, monitor).await,
         "yuubinsya" => crate::proxy::yuubinsya::serve(stream, peer, spec, selector, monitor).await,
         other => Err(Error::new(
             ErrorKind::Unsupported,
             format!("inbound protocol {other:?} is not implemented"),
         )),
+    }
+}
+
+async fn serve_mixed<S>(
+    mut stream: S,
+    peer: SocketAddr,
+    spec: InboundSpec,
+    selector: Arc<RuntimeProxySelector>,
+    monitor: Arc<ConnectionMonitor>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut first = [0u8; 1];
+    stream
+        .read_exact(&mut first)
+        .await
+        .map_err(crate::proxy::common::io_error)?;
+    let stream = PrefixedIo {
+        prefix: Some(first[0]),
+        inner: stream,
+    };
+    if first[0] == 5 {
+        crate::proxy::socks5::serve(stream, peer, spec, selector, monitor).await
+    } else {
+        crate::proxy::http::serve(stream, peer, spec, selector, monitor).await
+    }
+}
+
+/// Re-inject the protocol discriminator consumed by a mixed inbound before
+/// handing the connection to the normal protocol server. The wrapper keeps
+/// protocol detection separate from SOCKS5/HTTP framing and preserves writes
+/// on the original stream.
+struct PrefixedIo<S> {
+    prefix: Option<u8>,
+    inner: S,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Some(prefix) = self.prefix.take() {
+            if buffer.remaining() > 0 {
+                buffer.put_slice(&[prefix]);
+                return Poll::Ready(Ok(()));
+            }
+            self.prefix = Some(prefix);
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buffer)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, bytes)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -1021,6 +1095,80 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 let mut echoed = vec![0u8; 21];
                 client.read_exact(&mut echoed).await.unwrap();
                 assert_eq!(&echoed, b"socks5-through-direct");
+            })
+            .await;
+
+            listener_task.abort();
+            let _ = listener_task.await;
+            echo_task.abort();
+            let _ = echo_task.await;
+            result.unwrap();
+        });
+    }
+
+    #[test]
+    fn mixed_inbound_dispatches_socks5_and_http_to_the_shared_outbound() {
+        block_on(async {
+            let (echo_address, echo_task) = echo_server().await;
+            let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let inbound_address = inbound_listener.local_addr().unwrap();
+            let (selector, monitor) = direct_runtime().await;
+            let listener_task = tokio::spawn(serve_listener(
+                inbound_listener,
+                InboundSpec {
+                    id: "mixed-inbound".to_owned(),
+                    protocol: "mixed".to_owned(),
+                    listen: inbound_address,
+                    username: String::new(),
+                    password: String::new(),
+                    udp_mode: UdpMode::Disabled,
+                    protocol_udp: false,
+                    transports: vec!["normal".to_owned()],
+                    outbound_id: "direct".to_owned(),
+                },
+                selector,
+                monitor,
+                None,
+            ));
+
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut socks = TcpStream::connect(inbound_address).await.unwrap();
+                socks.write_all(&[5, 1, 0]).await.unwrap();
+                let mut method = [0u8; 2];
+                socks.read_exact(&mut method).await.unwrap();
+                assert_eq!(method, [5, 0]);
+                let ip = match echo_address.ip() {
+                    std::net::IpAddr::V4(ip) => ip.octets(),
+                    std::net::IpAddr::V6(_) => panic!("test echo server must be IPv4"),
+                };
+                let mut request = vec![5, 1, 0, 1];
+                request.extend_from_slice(&ip);
+                request.extend_from_slice(&echo_address.port().to_be_bytes());
+                socks.write_all(&request).await.unwrap();
+                let mut reply = [0u8; 10];
+                socks.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply[0..2], [5, 0]);
+                socks.write_all(b"mixed-socks").await.unwrap();
+                let mut echoed = [0u8; 11];
+                socks.read_exact(&mut echoed).await.unwrap();
+                assert_eq!(&echoed, b"mixed-socks");
+
+                let mut http = TcpStream::connect(inbound_address).await.unwrap();
+                http.write_all(
+                    format!(
+                        "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+                        echo_address, echo_address
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+                let response = read_headers(&mut http).await;
+                assert!(response.starts_with(b"HTTP/1.1 200"));
+                http.write_all(b"mixed-http").await.unwrap();
+                let mut echoed = [0u8; 10];
+                http.read_exact(&mut echoed).await.unwrap();
+                assert_eq!(&echoed, b"mixed-http");
             })
             .await;
 

@@ -32,17 +32,30 @@ where
     let mut fields = request.split_whitespace();
     let method = fields.next().unwrap_or_default();
     let target = fields.next().unwrap_or_default();
-    if !authorized_http(&headers, &spec.username, &spec.password) {
-        stream
-            .write_all(
-                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\nConnection: close\r\n\r\n",
-            )
-            .await
-            .map_err(io_error)?;
-        return Err(Error::new(
-            ErrorKind::Protocol,
-            "HTTP proxy authentication failed",
-        ));
+    match http_authorization(&headers, &spec.username, &spec.password) {
+        HttpAuthorization::Allowed => {}
+        HttpAuthorization::Missing => {
+            stream
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .map_err(io_error)?;
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "HTTP proxy authentication is required",
+            ));
+        }
+        HttpAuthorization::Invalid => {
+            stream
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+                .await
+                .map_err(io_error)?;
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "HTTP proxy authentication failed",
+            ));
+        }
     }
     if method.eq_ignore_ascii_case("CONNECT") {
         let destination = parse_authority(target, Network::Tcp)?;
@@ -241,24 +254,35 @@ fn header_value<'a>(headers: &'a str, wanted: &str) -> Option<&'a str> {
     })
 }
 
-fn authorized_http(headers: &str, username: &str, password: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpAuthorization {
+    Allowed,
+    Missing,
+    Invalid,
+}
+
+fn http_authorization(headers: &str, username: &str, password: &str) -> HttpAuthorization {
     if username.is_empty() && password.is_empty() {
-        return true;
+        return HttpAuthorization::Allowed;
     }
     let expected =
         base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
-    headers.lines().any(|line| {
+    let Some(token) = headers.lines().find_map(|line| {
         let Some((name, value)) = line.split_once(':') else {
-            return false;
+            return None;
         };
         if !name.eq_ignore_ascii_case("Proxy-Authorization") {
-            return false;
+            return None;
         }
-        value
-            .trim()
-            .strip_prefix("Basic ")
-            .is_some_and(|token| token == expected)
-    })
+        value.trim().strip_prefix("Basic ")
+    }) else {
+        return HttpAuthorization::Missing;
+    };
+    if token == expected {
+        HttpAuthorization::Allowed
+    } else {
+        HttpAuthorization::Invalid
+    }
 }
 
 #[cfg(test)]
@@ -312,7 +336,21 @@ mod tests {
     fn proxy_authorization_header_name_is_case_insensitive() {
         let token = base64::engine::general_purpose::STANDARD.encode("u:p");
         let headers = format!("GET / HTTP/1.1\r\nproxy-authorization: Basic {token}\r\n\r\n");
-        assert!(authorized_http(&headers, "u", "p"));
-        assert!(!authorized_http(&headers, "u", "wrong"));
+        assert_eq!(
+            http_authorization(&headers, "u", "p"),
+            HttpAuthorization::Allowed
+        );
+        assert_eq!(
+            http_authorization(&headers, "u", "wrong"),
+            HttpAuthorization::Invalid
+        );
+    }
+
+    #[test]
+    fn proxy_authorization_distinguishes_missing_from_invalid() {
+        assert_eq!(
+            http_authorization("GET / HTTP/1.1\r\n\r\n", "u", "p"),
+            HttpAuthorization::Missing
+        );
     }
 }
