@@ -360,7 +360,7 @@ async fn download_route_url(url: &str, timeout: Duration) -> Result<Vec<u8>> {
     download_route_url_with_transport(url, timeout, None).await
 }
 
-async fn download_route_url_with_transport(
+pub async fn download_route_url_with_transport(
     url: &str,
     timeout: Duration,
     transport: Option<&dyn RouteListTransport>,

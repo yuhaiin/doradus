@@ -30,9 +30,9 @@ use std::time::Duration;
 use yuhaiin_core::dns_hosts::HostsTable;
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::dns_resolver_stack::AsyncHostsResolver;
-use yuhaiin_core::geo::GeoDb;
 use yuhaiin_core::nat::NatTable;
 use yuhaiin_core::{Error, ErrorKind, FlowContext, GeoLookup, ResolverPolicy, Result, RouteMode};
+use yuhaiin_geo::{GeoDatabaseManager, GeoMetadata};
 use yuhaiin_store::fakeip::{FakeIpPool, FakeIpPoolOptions, FakeIpV6Pool};
 use yuhaiin_store::{
     ConfigStore, FakeIpPools, FakeIpResolver, GoProxyRuntimeConfig, GoResolverRuntimeConfig,
@@ -60,9 +60,9 @@ pub use resolver::{
 pub use route::{
     ProxyRouteListTransport, RouteListRefreshReport, RouteListSnapshot, RouteListTransport,
     compile_go_route_rules, compile_go_route_rules_with_geo, compile_go_route_rules_with_lists,
-    expand_go_route_rule, load_route_lists, refresh_route_list_caches,
-    refresh_route_list_caches_with_transport, route_list_cache_dir, route_list_cache_path,
-    route_rule_from_go_record,
+    download_route_url_with_transport, expand_go_route_rule, load_route_lists,
+    refresh_route_list_caches, refresh_route_list_caches_with_transport, route_list_cache_dir,
+    route_list_cache_path, route_rule_from_go_record,
 };
 #[cfg(feature = "doh-tls")]
 pub use rustcrypto_resolver::RustCryptoResolverFactory;
@@ -257,11 +257,24 @@ impl RuntimeBuilder {
         let route_lists = load_route_lists(&route_list_records);
         let proxies = repository.list_go_proxy_runtime_configs().await?;
         let geo_metadata = repository.list_maxmind_metadata().await?;
+        let geo_manager = GeoDatabaseManager::new();
         let geo = geo_metadata
             .first()
-            .map(|metadata| GeoDb::open(&metadata.path))
+            .map(|metadata| {
+                geo_manager
+                    .load(GeoMetadata {
+                        id: metadata.id.clone(),
+                        path: metadata.path.clone().into(),
+                        sha256: metadata.sha256.clone(),
+                        size: u64::try_from(metadata.size).map_err(|_| {
+                            Error::invalid("MaxMind metadata size cannot be negative")
+                        })?,
+                        updated_at: metadata.updated_at,
+                    })
+                    .map(|snapshot| snapshot.database())
+            })
             .transpose()?
-            .map(|database| Arc::new(database) as Arc<dyn GeoLookup>);
+            .map(|database| database as Arc<dyn GeoLookup>);
 
         let fakeip_config = match repository.load_go_fakeip_runtime_config().await? {
             Some(config) => Some(config),

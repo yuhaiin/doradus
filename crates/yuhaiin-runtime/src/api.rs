@@ -23,16 +23,18 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 use yuhaiin_core::proxy::{AsyncProxy, DirectAsyncProxy};
-use yuhaiin_core::{DomainName, Endpoint, FlowContext, Network};
+use yuhaiin_core::{BoxFuture, DomainName, Endpoint, FlowContext, Network};
+use yuhaiin_geo::{GeoDatabaseManager, GeoDownloadTransport, GeoRefreshRequest};
 
 use yuhaiin_store::{
     GoInboundRecord, GoNodeRecord, GoResolverRecord, GoRouteListRecord, GoRouteRuleRecord,
-    GoRouteSettingsRecord, GoSubscriptionLinkRecord,
+    GoRouteSettingsRecord, GoSubscriptionLinkRecord, MaxMindMetadataRecord,
 };
 
 use crate::{
-    ProxyRouteListTransport, RouteListSnapshot, RuntimeController, expand_go_route_rule,
-    latency::LatencyRequest, log::log_batch_value, refresh_route_list_caches_with_transport,
+    ProxyRouteListTransport, RouteListSnapshot, RouteListTransport, RuntimeController,
+    download_route_url_with_transport, expand_go_route_rule, latency::LatencyRequest,
+    log::log_batch_value, refresh_route_list_caches_with_transport,
 };
 
 #[derive(Clone)]
@@ -838,6 +840,105 @@ async fn route_lists_refresh(State(state): State<ApiState>) -> ApiResult {
     route_lists_refresh_value(&state).await
 }
 
+struct RouteGeoDownloadTransport {
+    route: Arc<dyn RouteListTransport>,
+    timeout: Duration,
+}
+
+impl GeoDownloadTransport for RouteGeoDownloadTransport {
+    fn download<'a>(&'a self, url: &'a str) -> BoxFuture<'a, yuhaiin_core::Result<Vec<u8>>> {
+        let route = Arc::clone(&self.route);
+        let timeout = self.timeout;
+        let url = url.to_owned();
+        Box::pin(async move {
+            download_route_url_with_transport(&url, timeout, Some(route.as_ref())).await
+        })
+    }
+}
+
+fn geo_cache_path() -> PathBuf {
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from(".cache"));
+    root.join("yuhaiin-rust").join("geo").join("Country.mmdb")
+}
+
+fn optional_sha256(value: &Value) -> Option<Vec<u8>> {
+    let value = value.as_str()?.trim();
+    if value.len() != 64 {
+        return None;
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect()
+}
+
+async fn refresh_geo_database(
+    state: &ApiState,
+    route: Arc<dyn RouteListTransport>,
+    timeout: Duration,
+) -> std::result::Result<Option<MaxMindMetadataRecord>, yuhaiin_core::Error> {
+    let config = state
+        .controller
+        .store()
+        .get_config("route.lists.config")
+        .await?
+        .map(|bytes| raw_json(&bytes, default_route_list_config()))
+        .unwrap_or_else(default_route_list_config);
+    let geo_config = config.get("maxMindDbGeoIp").unwrap_or(&Value::Null);
+    let Some(url) = geo_config.get("downloadUrl").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if url.trim().is_empty() {
+        return Ok(None);
+    }
+    let current = state
+        .controller
+        .store()
+        .repository()
+        .list_maxmind_metadata()
+        .await?
+        .into_iter()
+        .next();
+    let path = current
+        .as_ref()
+        .map(|metadata| PathBuf::from(&metadata.path))
+        .unwrap_or_else(geo_cache_path);
+    let expected_size = geo_config
+        .get("size")
+        .and_then(Value::as_u64)
+        .filter(|size| *size != 0);
+    let expected_sha256 = geo_config.get("sha256").and_then(optional_sha256);
+    let manager = GeoDatabaseManager::new();
+    let snapshot = manager
+        .refresh(
+            GeoRefreshRequest {
+                id: current
+                    .as_ref()
+                    .map(|metadata| metadata.id.clone())
+                    .unwrap_or_else(|| "geoip".to_owned()),
+                path,
+                url: url.to_owned(),
+                expected_sha256,
+                expected_size,
+                updated_at: unix_millis(),
+            },
+            &RouteGeoDownloadTransport { route, timeout },
+        )
+        .await?;
+    let metadata = snapshot.metadata();
+    Ok(Some(MaxMindMetadataRecord {
+        id: metadata.id.clone(),
+        path: metadata.path.to_string_lossy().into_owned(),
+        sha256: metadata.sha256.clone(),
+        size: i64::try_from(metadata.size)
+            .map_err(|_| yuhaiin_core::Error::invalid("GeoIP file is too large to persist"))?,
+        updated_at: metadata.updated_at,
+    }))
+}
+
 async fn route_lists_activation(State(state): State<ApiState>) -> ApiResult {
     route_lists_activation_value(&state).await
 }
@@ -861,7 +962,22 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
         proxy,
         snapshot.resolver.clone(),
     ));
-    let report = refresh_route_list_caches_with_transport(&records, timeout, transport).await;
+    let report = refresh_route_list_caches_with_transport(
+        &records,
+        timeout,
+        Arc::clone(&transport) as Arc<dyn RouteListTransport>,
+    )
+    .await;
+    let (geo_metadata, geo_error) = match refresh_geo_database(
+        state,
+        Arc::clone(&transport) as Arc<dyn RouteListTransport>,
+        timeout,
+    )
+    .await
+    {
+        Ok(metadata) => (metadata, None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     let refreshed_at = unix_millis();
     let activation = json!({
         "hostIndexRefreshAt": refreshed_at,
@@ -870,9 +986,39 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
         "errors": report.errors,
     });
     let bytes = serde_json::to_vec(&activation)?;
+    let mut list_config = state
+        .controller
+        .store()
+        .get_config("route.lists.config")
+        .await?
+        .map(|bytes| raw_json(&bytes, default_route_list_config()))
+        .unwrap_or_else(default_route_list_config);
+    if let Some(object) = list_config.as_object_mut() {
+        object.insert(
+            "lastRefreshTime".to_owned(),
+            Value::String(refreshed_at.to_string()),
+        );
+        if let Some(geo) = object
+            .entry("maxMindDbGeoIp".to_owned())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+        {
+            geo.insert(
+                "error".to_owned(),
+                Value::String(geo_error.clone().unwrap_or_default()),
+            );
+        }
+    }
+    let list_config_bytes = serde_json::to_vec(&list_config)?;
     state
         .controller
         .mutate_and_reload(move |store| async move {
+            if let Some(metadata) = geo_metadata {
+                store.repository().put_maxmind_metadata(&metadata).await?;
+            }
+            store
+                .put_config("route.lists.config", &list_config_bytes)
+                .await?;
             store.put_config(ROUTE_LIST_ACTIVATION_KEY, &bytes).await
         })
         .await?;
@@ -2675,6 +2821,99 @@ mod tests {
                 .unwrap()
                 .contains("example.test")
         );
+    }
+
+    #[tokio::test]
+    async fn route_list_refresh_downloads_geoip_through_runtime_and_persists_metadata() {
+        let state = state().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture: &'static [u8] =
+            include_bytes!("../../yuhaiin-geo/tests/fixtures/GeoLite2-Country-Test.mmdb");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut request)
+                .await
+                .unwrap();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                fixture.len()
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut stream, header.as_bytes())
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, fixture)
+                .await
+                .unwrap();
+        });
+
+        let unique_path = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+            .unwrap_or_else(|| PathBuf::from(".cache"))
+            .join("yuhaiin-rust")
+            .join("geo-tests")
+            .join(format!("api-{}.mmdb", std::process::id()));
+        let _ = write_config_json(
+            &state,
+            "route.lists.config",
+            json!({
+                "refreshInterval":"0",
+                "maxMindDbGeoIp":{"downloadUrl":format!("http://{address}/Country.mmdb"),"error":""}
+            }),
+        )
+        .await
+        .unwrap();
+        state
+            .controller
+            .store()
+            .repository()
+            .put_maxmind_metadata(&MaxMindMetadataRecord {
+                id: "geoip".to_owned(),
+                path: unique_path.to_string_lossy().into_owned(),
+                sha256: Vec::new(),
+                size: 0,
+                updated_at: 0,
+            })
+            .await
+            .unwrap();
+
+        let _ = route_lists_refresh_value(&state).await.unwrap();
+        server.await.unwrap();
+
+        let metadata = state
+            .controller
+            .store()
+            .repository()
+            .list_maxmind_metadata()
+            .await
+            .unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].size, fixture.len() as i64);
+        assert_eq!(metadata[0].sha256.len(), 32);
+        assert_eq!(
+            state
+                .controller
+                .handle()
+                .load()
+                .geo
+                .as_ref()
+                .unwrap()
+                .country_code("2.125.160.217".parse().unwrap())
+                .unwrap(),
+            Some("GB".to_owned())
+        );
+        let config = state
+            .controller
+            .store()
+            .get_config("route.lists.config")
+            .await
+            .unwrap()
+            .map(|bytes| raw_json(&bytes, default_route_list_config()))
+            .unwrap();
+        assert_eq!(config["maxMindDbGeoIp"]["error"], "");
+        let _ = std::fs::remove_file(unique_path);
     }
 
     #[tokio::test]

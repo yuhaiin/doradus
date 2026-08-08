@@ -2930,7 +2930,6 @@ dependencies = [
  "h2",
  "hickory-proto",
  "http",
- "maxminddb",
  "route_manager",
  "rustls",
  "rustls-rustcrypto",
@@ -2938,6 +2937,15 @@ dependencies = [
  "smoltcp",
  "tokio",
  "tun-rs",
+]
+
+[[package]]
+name = "yuhaiin-geo"
+version = "0.1.0"
+dependencies = [
+ "maxminddb",
+ "sha2 0.11.0",
+ "yuhaiin-core",
 ]
 
 [[package]]
@@ -2964,6 +2972,7 @@ dependencies = [
  "webpki-roots",
  "yuhaiin-chain",
  "yuhaiin-core",
+ "yuhaiin-geo",
  "yuhaiin-store",
  "yuhaiin-trie",
 ]

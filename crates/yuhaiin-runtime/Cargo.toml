@@ -39,6 +39,7 @@ webpki-roots = { version = "1.0.3", optional = true }
 tokio-rustls = { version = "0.26.4", optional = true, default-features = false, features = ["tls12"] }
 yuhaiin-chain = { path = "../yuhaiin-chain" }
 yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
+yuhaiin-geo = { path = "../yuhaiin-geo" }
 yuhaiin-store = { path = "../yuhaiin-store", features = ["async-dns"] }
 yuhaiin-trie = { path = "../yuhaiin-trie", features = ["async-proxy"] }
 
