@@ -163,6 +163,36 @@ fn fresh_store_supports_go_v6_compatibility_writes() {
 }
 
 #[test]
+fn subscription_links_use_the_go_table_and_preserve_unknown_fields() {
+    let store = block_on(ConfigStore::open_memory()).unwrap();
+    let repository = store.repository();
+    block_on(
+        repository.put_go_subscription_links(&[GoSubscriptionLinkRecord {
+            name: "  prod  ".to_owned(),
+            url: "  https://example.test/sub  ".to_owned(),
+            link_type: String::new(),
+            updated_at: 7,
+            data_json: br#"{"name":"ignored","url":"ignored","future":true}"#.to_vec(),
+        }]),
+    )
+    .unwrap();
+
+    let links = block_on(repository.list_go_subscription_links()).unwrap();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].name, "prod");
+    assert_eq!(links[0].url, "https://example.test/sub");
+    assert_eq!(links[0].link_type, "reserve");
+    let json: serde_json::Value = serde_json::from_slice(&links[0].data_json).unwrap();
+    assert_eq!(json["future"], true);
+    assert!(block_on(repository.delete_go_subscription_links(&["prod".to_owned()])).is_ok());
+    assert!(
+        block_on(repository.list_go_subscription_links())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn typed_repository_rejects_invalid_nat_metadata() {
     let store = block_on(ConfigStore::open_memory()).unwrap();
     let repository = store.repository();

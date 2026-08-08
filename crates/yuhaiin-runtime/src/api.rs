@@ -25,7 +25,7 @@ use yuhaiin_core::{DomainName, Endpoint, FlowContext, Network};
 
 use yuhaiin_store::{
     GoInboundRecord, GoNodeRecord, GoResolverRecord, GoRouteListRecord, GoRouteRuleRecord,
-    GoRouteSettingsRecord,
+    GoRouteSettingsRecord, GoSubscriptionLinkRecord,
 };
 
 use crate::{RuntimeController, route_rule_from_go_record};
@@ -148,6 +148,7 @@ pub fn router(state: ApiState) -> Router {
             "/api/v2/nodes/{id}",
             get(node_get).put(node_put).delete(node_delete),
         )
+        .route("/api/v2/nodes/{id}/close", post(node_close))
         .route("/api/v2/inbounds", get(inbounds_get).post(inbounds_post))
         .route(
             "/api/v2/inbounds/{id}",
@@ -169,7 +170,20 @@ pub fn router(state: ApiState) -> Router {
             get(connections_failed_history),
         )
         .route("/api/v2/connections/history", get(connections_history))
+        .route("/api/v2/tools/interfaces", get(tools_interfaces))
+        .route("/api/v2/tools/licenses", get(tools_licenses))
         .route("/api/v2/tools/logs/v2", get(tools_logs_v2))
+        .route(
+            "/api/v2/subscriptions",
+            get(subscriptions_get)
+                .put(subscriptions_put)
+                .delete(subscriptions_delete),
+        )
+        .route(
+            "/api/v2/subscriptions/delete-preview",
+            post(subscriptions_delete_preview),
+        )
+        .route("/api/v2/subscriptions/update", post(subscriptions_update))
         .route(
             "/api/v2/route/config",
             get(route_config_get).put(route_config_put),
@@ -268,7 +282,7 @@ async fn rpc(
         "node.put" => save_node_value(&state, body, None).await,
         "node.delete" => delete_node_value(&state, required_string(&body, "id")?).await,
         "node.use" => select_node_value(&state, required_string(&body, "id")?).await,
-        "node.close" => empty(),
+        "node.close" => node_close_value(&state, required_string(&body, "id")?).await,
         "node.latency" => node_latency_value(&state, &body).await,
         "inbounds.config.get" => {
             read_config_json(&state, "inbounds.config", default_inbound_config()).await
@@ -293,8 +307,8 @@ async fn rpc(
         "subscriptions.get" => subscriptions_get_value(&state).await,
         "subscriptions.put" => subscriptions_put_value(&state, body).await,
         "subscriptions.delete" => subscriptions_delete_value(&state, &body).await,
-        "subscriptions.delete_preview" => json_value(json!({"nodes": 0, "users": 0})),
-        "subscriptions.update" => empty(),
+        "subscriptions.delete_preview" => subscriptions_delete_preview_value(&state, &body).await,
+        "subscriptions.update" => subscriptions_update_value(&state, &body).await,
         "publishes" => publishes_get_value(&state).await,
         "publish.put" => publish_put_value(&state, body).await,
         "publish.delete" => publish_delete_value(&state, required_string(&body, "name")?).await,
@@ -360,7 +374,7 @@ async fn rpc(
             .await
         }
         "route.rules.priority" => route_rules_priority_value(&state, &body).await,
-        "route.rules.test" => json_value(json!({ "match": false, "mode": "direct" })),
+        "route.rules.test" => route_rules_test_value(&state, &body).await,
         "route.rules.block_history" => {
             json_value(json!({ "items": [], "dumpProcessEnabled": false }))
         }
@@ -424,6 +438,22 @@ async fn node_put(
 
 async fn node_delete(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
     delete_node_value(&state, id).await
+}
+
+async fn node_close(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
+    node_close_value(&state, id).await
+}
+
+async fn node_close_value(state: &ApiState, id: String) -> ApiResult {
+    if id.trim().is_empty() {
+        return Err(ApiError::bad("node id is required"));
+    }
+    state
+        .controller
+        .close_node(&id)
+        .await
+        .map_err(ApiError::from)?;
+    empty()
 }
 
 async fn connections_get(State(state): State<ApiState>) -> ApiResult {
@@ -511,6 +541,43 @@ async fn tools_logs_v2() -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent
         .unwrap_or_else(|_| SseEvent::default());
     Sse::new(tokio_stream::iter(vec![Ok::<SseEvent, Infallible>(event)]))
         .keep_alive(KeepAlive::default())
+}
+
+async fn tools_interfaces() -> ApiResult {
+    tools_interfaces_value()
+}
+
+async fn tools_licenses() -> ApiResult {
+    tools_licenses_value()
+}
+
+async fn subscriptions_get(State(state): State<ApiState>) -> ApiResult {
+    subscriptions_get_value(&state).await
+}
+
+async fn subscriptions_put(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
+    subscriptions_put_value(&state, value).await
+}
+
+async fn subscriptions_delete(
+    State(state): State<ApiState>,
+    Json(value): Json<Value>,
+) -> ApiResult {
+    subscriptions_delete_value(&state, &value).await
+}
+
+async fn subscriptions_delete_preview(
+    State(state): State<ApiState>,
+    Json(value): Json<Value>,
+) -> ApiResult {
+    subscriptions_delete_preview_value(&state, &value).await
+}
+
+async fn subscriptions_update(
+    State(state): State<ApiState>,
+    Json(value): Json<Value>,
+) -> ApiResult {
+    subscriptions_update_value(&state, &value).await
 }
 
 async fn inbounds_get(State(state): State<ApiState>, Query(query): Query<ListQuery>) -> ApiResult {
@@ -1599,45 +1666,217 @@ async fn restore_backup_value(state: &ApiState, value: &Value) -> ApiResult {
 }
 
 fn tools_interfaces_value() -> ApiResult {
-    json_value(json!({"interfaces": []}))
+    json_value(json!({"interfaces": discover_interfaces()}))
 }
 
 fn tools_licenses_value() -> ApiResult {
-    json_value(json!({"yuhaiin": [], "android": []}))
+    // Keep the contract useful on every platform.  The Rust backend owns this
+    // entry; dependency notices can be added to the same static list as the
+    // workspace grows, without making the API shape platform-dependent.
+    json_value(json!({
+        "yuhaiin": [{
+            "name": "yuhaiin-rust",
+            "url": "https://github.com/Asutorufa/yuhaiin",
+            "license": "GPL-3.0-or-later",
+            "licenseUrl": "https://github.com/Asutorufa/yuhaiin/blob/main/LICENSE"
+        }],
+        "android": []
+    }))
 }
 
 async fn subscriptions_get_value(state: &ApiState) -> ApiResult {
-    Ok(Json(
-        json!({"items": config_items(state, "subscriptions.items").await?}),
-    ))
+    let records = state
+        .controller
+        .store()
+        .repository()
+        .list_go_subscription_links()
+        .await?;
+    if !records.is_empty() {
+        return Ok(Json(json!({
+            "items": records.into_iter().map(subscription_json).collect::<Vec<_>>()
+        })));
+    }
+    // Read the pre-table compatibility key once so an in-progress Rust
+    // migration does not make existing local links disappear from the UI.
+    Ok(Json(json!({
+        "items": config_items(state, "subscriptions.items").await?
+    })))
 }
 
 async fn subscriptions_put_value(state: &ApiState, value: Value) -> ApiResult {
-    let items = value
-        .get("items")
-        .and_then(Value::as_array)
-        .cloned()
-        .ok_or_else(|| ApiError::bad("subscriptions requires an items array"))?;
-    write_config_json(state, "subscriptions.items", json!({"items": items})).await
+    let records = subscription_records(&value)?;
+    state
+        .controller
+        .mutate_and_reload(move |store| async move {
+            store.repository().put_go_subscription_links(&records).await
+        })
+        .await?;
+    empty()
 }
 
 async fn subscriptions_delete_value(state: &ApiState, value: &Value) -> ApiResult {
-    let names = value
+    let names = subscription_names(value, "subscriptions delete")?;
+    let delete_nodes = bool_or(value, "deleteNodes", false);
+    let delete_users = bool_or(value, "deleteUsers", false);
+    if delete_users {
+        return Err(ApiError::unavailable(
+            "subscription user deletion is not yet available",
+        ));
+    }
+    let groups = names.clone();
+    state
+        .controller
+        .mutate_and_reload(move |store| async move {
+            store
+                .repository()
+                .delete_go_subscription_links(&names)
+                .await?;
+            if delete_nodes {
+                store
+                    .repository()
+                    .delete_go_nodes_by_groups(&groups)
+                    .await?;
+            }
+            Ok(())
+        })
+        .await?;
+    empty()
+}
+
+async fn subscriptions_delete_preview_value(state: &ApiState, value: &Value) -> ApiResult {
+    let names = subscription_names(value, "subscriptions delete preview")?;
+    let nodes = state
+        .controller
+        .store()
+        .repository()
+        .count_go_nodes_by_groups(&names)
+        .await?;
+    Ok(Json(json!({"nodes": nodes, "users": 0})))
+}
+
+async fn subscriptions_update_value(_state: &ApiState, value: &Value) -> ApiResult {
+    let names = subscription_names(value, "subscriptions update")?;
+    if names.is_empty() {
+        return Err(ApiError::bad(
+            "subscription update requires at least one link name or an implemented refresh worker",
+        ));
+    }
+    Err(ApiError::unavailable(format!(
+        "subscription refresh is not implemented for: {}",
+        names.join(", ")
+    )))
+}
+
+fn subscription_records(value: &Value) -> Result<Vec<GoSubscriptionLinkRecord>, ApiError> {
+    let items = value
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::bad("subscriptions requires an items array"))?;
+    items
+        .iter()
+        .map(|item| {
+            let object = item
+                .as_object()
+                .ok_or_else(|| ApiError::bad("subscription item must be an object"))?;
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let url = object
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let link_type = object
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("reserve")
+                .trim()
+                .to_owned();
+            Ok(GoSubscriptionLinkRecord {
+                name,
+                url,
+                link_type,
+                updated_at: 0,
+                data_json: serde_json::to_vec(item)?,
+            })
+        })
+        .collect()
+}
+
+fn subscription_names(value: &Value, operation: &str) -> Result<Vec<String>, ApiError> {
+    value
         .get("names")
         .and_then(Value::as_array)
-        .ok_or_else(|| ApiError::bad("subscriptions delete requires a names array"))?
+        .ok_or_else(|| ApiError::bad(format!("{operation} requires a names array")))?
         .iter()
-        .filter_map(Value::as_str)
-        .collect::<std::collections::HashSet<_>>();
-    let items = config_items(state, "subscriptions.items")
-        .await?
-        .into_iter()
-        .filter(|item| {
-            !names.contains(&item.get("name").and_then(Value::as_str).unwrap_or_default())
+        .map(|name| {
+            name.as_str()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| ApiError::bad(format!("{operation} names must be strings")))
         })
+        .collect()
+}
+
+fn subscription_json(record: GoSubscriptionLinkRecord) -> Value {
+    let mut value = raw_json(&record.data_json, json!({}));
+    set_string(&mut value, "name", record.name);
+    set_string(&mut value, "url", record.url);
+    set_string(&mut value, "type", record.link_type);
+    value
+}
+
+fn discover_interfaces() -> Vec<Value> {
+    let mut names = std::fs::read_dir("/sys/class/net")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
         .collect::<Vec<_>>();
-    let _ = write_config_json(state, "subscriptions.items", json!({"items": items})).await?;
-    empty()
+    names.sort();
+    let mut addresses = std::collections::BTreeMap::<String, Vec<String>>::new();
+    if let Ok(content) = std::fs::read_to_string("/proc/net/if_inet6") {
+        for line in content.lines() {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 6 || fields[0].len() != 32 {
+                continue;
+            }
+            let mut bytes = [0u8; 16];
+            let mut valid = true;
+            for (index, chunk) in fields[0].as_bytes().chunks_exact(2).enumerate() {
+                let Ok(text) = std::str::from_utf8(chunk) else {
+                    valid = false;
+                    break;
+                };
+                let Ok(byte) = u8::from_str_radix(text, 16) else {
+                    valid = false;
+                    break;
+                };
+                bytes[index] = byte;
+            }
+            if valid {
+                addresses
+                    .entry(fields[5].to_owned())
+                    .or_default()
+                    .push(std::net::Ipv6Addr::from(bytes).to_string());
+            }
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            json!({
+                "name": name,
+                "addresses": addresses.remove(&name).unwrap_or_default()
+            })
+        })
+        .collect()
 }
 
 async fn publishes_get_value(state: &ApiState) -> ApiResult {
@@ -2173,6 +2412,83 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["mode"], "drop");
         assert!(value.get("matchResult").is_some());
+    }
+
+    #[tokio::test]
+    async fn direct_subscription_tools_and_node_close_routes_match_frontend_contracts() {
+        let state = state().await;
+        let app = router(state);
+
+        let saved = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v2/subscriptions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"items":[{"name":"prod","url":"https://example.test/sub","type":"base64","future":true}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v2/subscriptions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed: Value =
+            serde_json::from_slice(&to_bytes(listed.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(listed["items"][0]["name"], "prod");
+        assert_eq!(listed["items"][0]["future"], true);
+
+        let preview = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v2/subscriptions/delete-preview")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"names":["prod"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        let preview: Value =
+            serde_json::from_slice(&to_bytes(preview.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(preview, json!({"nodes": 0, "users": 0}));
+
+        let interfaces = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v2/tools/interfaces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(interfaces.status(), StatusCode::OK);
+        let interfaces: Value =
+            serde_json::from_slice(&to_bytes(interfaces.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert!(interfaces["interfaces"].is_array());
+
+        let closed = app
+            .oneshot(
+                Request::post("/api/v2/nodes/prod/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(closed.status(), StatusCode::OK);
     }
 
     #[tokio::test]

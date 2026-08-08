@@ -255,6 +255,17 @@ pub struct GoRouteListRecord {
     pub data_json: Vec<u8>,
 }
 
+/// A subscription link stored in Go's `subscriptions` table. Canonical fields
+/// are exposed for validation while `data_json` preserves future fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoSubscriptionLinkRecord {
+    pub name: String,
+    pub url: String,
+    pub link_type: String,
+    pub updated_at: i64,
+    pub data_json: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub struct ConfigRepository {
     store: ConfigStore,

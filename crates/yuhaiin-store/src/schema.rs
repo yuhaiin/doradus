@@ -46,6 +46,7 @@ pub(super) fn verify_integrity(connection: &Connection) -> Result<()> {
         "fakeip_cursors",
         "resolvers_v2",
         "route_rules_v2",
+        "subscriptions",
     ];
     for table in CRITICAL_TABLES {
         if !table_exists(connection, table) {
@@ -191,6 +192,11 @@ pub(super) fn typed_schema_sql() -> &'static str {
         source_type TEXT NOT NULL,
         updated_at INTEGER NOT NULL,
         data_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS subscriptions (
+        name TEXT PRIMARY KEY,
+        updated_at INTEGER NOT NULL,
+        data_json TEXT NOT NULL CHECK (json_valid(data_json))
     );"
 }
 
@@ -290,6 +296,14 @@ pub(super) fn validate_typed_schema(connection: &Connection) -> Result<()> {
                 ("cursor_ip", "BLOB", true, 0),
                 ("cursor_idx", "INTEGER", true, 0),
                 ("updated_at", "INTEGER", true, 0),
+            ],
+        ),
+        (
+            "subscriptions",
+            &[
+                ("name", "TEXT", false, 1),
+                ("updated_at", "INTEGER", true, 0),
+                ("data_json", "TEXT", true, 0),
             ],
         ),
     ];

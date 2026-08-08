@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, RwLock, Weak},
 };
 
-use yuhaiin_core::Result;
+use yuhaiin_core::{Error, ErrorKind, Result};
 use yuhaiin_store::{ConfigMutation, ConfigStore};
 
 use crate::{
@@ -58,6 +58,18 @@ impl RuntimeController {
 
     pub fn monitor(&self) -> Arc<ConnectionMonitor> {
         self.monitor.clone()
+    }
+
+    /// Close the runtime instance associated with a node without deleting its
+    /// persisted configuration.  Rust proxy instances are held by immutable
+    /// selector snapshots rather than a Go-style node map; publishing a fresh
+    /// snapshot drops those slot instances while existing flows retain their
+    /// current `Arc` until they finish.
+    pub async fn close_node(&self, id: &str) -> Result<()> {
+        if id.trim().is_empty() {
+            return Err(Error::new(ErrorKind::InvalidInput, "node id is empty"));
+        }
+        self.reload().await.map(|_| ())
     }
 
     pub fn subscribe_reload(&self) -> tokio::sync::broadcast::Receiver<()> {
