@@ -42,7 +42,7 @@ use yuhaiin_store::{
 use yuhaiin_trie::router::{RouteDecision, RouterRuntime};
 
 pub use controller::RuntimeController;
-pub use data_plane::{RuntimeDnsHandler, run_dns_supervisor};
+pub use data_plane::{RuntimeDnsHandler, run_dns_supervisor, wait_for_shutdown_or_reload};
 #[cfg(feature = "tun")]
 pub use data_plane::{TunRuntimeConfig, load_tun_config, run_tun_device_until};
 #[cfg(feature = "doh-tls")]

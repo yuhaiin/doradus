@@ -250,7 +250,10 @@ fn parse_ipv6(value: &Value) -> Option<(Ipv6Addr, u8)> {
     ))
 }
 
-async fn wait_for_shutdown_or_reload(
+/// Wait until either process shutdown or a successfully published runtime
+/// reload.  Device supervisors use this while disabled so an API change can
+/// enable them without restarting the service.
+pub async fn wait_for_shutdown_or_reload(
     controller: &RuntimeController,
     mut shutdown: watch::Receiver<bool>,
 ) -> bool {
@@ -271,6 +274,9 @@ fn io_error(error: impl std::fmt::Display) -> Error {
 #[cfg(all(test, feature = "tun"))]
 mod tests {
     use super::*;
+    use crate::RuntimeBuilder;
+    use std::sync::Arc;
+    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
     use yuhaiin_store::ConfigStore;
 
     #[tokio::test]
@@ -312,5 +318,28 @@ mod tests {
         assert!(!config.enabled);
         assert!(config.tun.ipv4.is_none());
         assert!(config.tun.ipv6.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_supervisor_waits_for_reload_instead_of_only_shutdown() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let controller = crate::RuntimeController::from_builder(RuntimeBuilder::new(
+            store,
+            Arc::new(SystemAsyncIpResolver),
+        ))
+        .await
+        .unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let waiting_controller = controller.clone();
+        let waiting = tokio::spawn(async move {
+            wait_for_shutdown_or_reload(&waiting_controller, shutdown_rx).await
+        });
+        tokio::task::yield_now().await;
+        controller.reload().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!result);
     }
 }

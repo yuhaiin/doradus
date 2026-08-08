@@ -18,7 +18,7 @@ use yuhaiin_runtime::BuiltinResolverFactory;
 use yuhaiin_runtime::api::ApiState;
 use yuhaiin_runtime::{
     RuntimeBuilder, RuntimeController, inbound, load_tun_config, run_dns_supervisor,
-    run_tun_device_until,
+    run_tun_device_until, wait_for_shutdown_or_reload,
 };
 use yuhaiin_store::{ConfigStore, GoNodeRecord, restore_database};
 
@@ -138,13 +138,12 @@ async fn ensure_direct_node(store: &ConfigStore) -> Result<()> {
 #[cfg(feature = "tun")]
 async fn run_tun_supervisor(
     controller: RuntimeController,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     loop {
         let config = load_tun_config(controller.store()).await?;
         if !config.enabled {
-            let _ = shutdown.changed().await;
-            if *shutdown.borrow() {
+            if wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
                 return Ok(());
             }
             continue;
