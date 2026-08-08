@@ -57,7 +57,10 @@ impl RuntimeSnapshot {
                 json,
                 self.resolver.clone(),
             )?) as Arc<dyn AsyncProxy>
-        } else if matches!(config.transport, yuhaiin_store::GoProxyTransport::Trojan) {
+        } else if matches!(
+            config.transport,
+            yuhaiin_store::GoProxyTransport::Shadowsocks | yuhaiin_store::GoProxyTransport::Trojan
+        ) {
             let base = config
                 .to_base_proxy_config_with_resolver(timeout, self.resolver.clone())
                 .await?;
@@ -69,30 +72,47 @@ impl RuntimeSnapshot {
             {
                 #[cfg(feature = "doh-tls")]
                 {
-                    upstream = build_trojan_tls_proxy(&config, upstream)?;
+                    upstream = build_protocol_tls_proxy(&config, upstream)?;
                 }
                 #[cfg(not(feature = "doh-tls"))]
                 {
                     return Err(Error::new(
                         ErrorKind::Unsupported,
-                        "Trojan TLS requires the doh-tls feature",
+                        "protocol TLS requires the doh-tls feature",
                     ));
                 }
             }
             let layer = config
                 .layers
                 .iter()
-                .find(|layer| layer.kind.eq_ignore_ascii_case("trojan"))
-                .ok_or_else(|| Error::invalid("Trojan proxy has no trojan layer"))?;
+                .find(|layer| {
+                    layer.kind.eq_ignore_ascii_case(match config.transport {
+                        yuhaiin_store::GoProxyTransport::Shadowsocks => "shadowsocks",
+                        _ => "trojan",
+                    })
+                })
+                .ok_or_else(|| Error::invalid("proxy protocol layer is missing"))?;
             let password = layer
                 .config
                 .get("password")
                 .and_then(serde_json::Value::as_str)
                 .filter(|password| !password.is_empty())
-                .ok_or_else(|| Error::invalid("Trojan proxy password is empty"))?;
-            Arc::new(yuhaiin_protocol::trojan::TrojanProxy::new(
-                upstream, password,
-            )) as Arc<dyn AsyncProxy>
+                .ok_or_else(|| Error::invalid("proxy protocol password is empty"))?;
+            match config.transport {
+                yuhaiin_store::GoProxyTransport::Shadowsocks => {
+                    let method = layer
+                        .config
+                        .get("method")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| Error::invalid("Shadowsocks method is missing"))?;
+                    Arc::new(yuhaiin_protocol::shadowsocks::ShadowsocksProxy::new(
+                        upstream, method, password,
+                    )?) as Arc<dyn AsyncProxy>
+                }
+                _ => Arc::new(yuhaiin_protocol::trojan::TrojanProxy::new(
+                    upstream, password,
+                )) as Arc<dyn AsyncProxy>,
+            }
         } else {
             let base = config
                 .to_base_proxy_config_with_resolver(timeout, self.resolver.clone())
@@ -246,7 +266,10 @@ fn is_chain_config(config: &GoProxyRuntimeConfig) -> bool {
         .chain_types
         .iter()
         .any(|kind| kind.eq_ignore_ascii_case("tls"))
-        && !matches!(config.transport, yuhaiin_store::GoProxyTransport::Trojan)
+        && !matches!(
+            config.transport,
+            yuhaiin_store::GoProxyTransport::Trojan | yuhaiin_store::GoProxyTransport::Shadowsocks
+        )
     {
         return true;
     }
@@ -263,7 +286,7 @@ fn is_chain_config(config: &GoProxyRuntimeConfig) -> bool {
 }
 
 #[cfg(feature = "doh-tls")]
-fn build_trojan_tls_proxy(
+fn build_protocol_tls_proxy(
     config: &GoProxyRuntimeConfig,
     upstream: Arc<dyn AsyncProxy>,
 ) -> Result<Arc<dyn AsyncProxy>> {
@@ -275,7 +298,7 @@ fn build_trojan_tls_proxy(
         .layers
         .iter()
         .find(|layer| layer.kind.eq_ignore_ascii_case("tls"))
-        .ok_or_else(|| Error::invalid("Trojan TLS layer is missing"))?;
+        .ok_or_else(|| Error::invalid("protocol TLS layer is missing"))?;
     let server_name = layer
         .config
         .get("servernames")
@@ -283,7 +306,7 @@ fn build_trojan_tls_proxy(
         .and_then(serde_json::Value::as_array)
         .and_then(|values| values.iter().find_map(serde_json::Value::as_str))
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::invalid("Trojan TLS layer requires servernames"))?;
+        .ok_or_else(|| Error::invalid("protocol TLS layer requires servernames"))?;
     let mut roots = RootCertStore::empty();
     if let Some(certificates) = layer
         .config
@@ -300,11 +323,11 @@ fn build_trojan_tls_proxy(
                 .map_err(|error| {
                     Error::new(
                         ErrorKind::InvalidInput,
-                        format!("Trojan TLS ca_cert: {error}"),
+                        format!("protocol TLS ca_cert: {error}"),
                     )
                 })?;
             roots.add(CertificateDer::from(bytes)).map_err(|error| {
-                Error::new(ErrorKind::Protocol, format!("Trojan TLS CA: {error}"))
+                Error::new(ErrorKind::Protocol, format!("protocol TLS CA: {error}"))
             })?;
         }
     }
@@ -497,6 +520,43 @@ mod tests {
         };
         let built = snapshot(config)
             .build_proxy("trojan", Duration::from_secs(2))
+            .await
+            .unwrap();
+        let context = yuhaiin_core::FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        assert!(built.proxy.connect(&context).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn go_shadowsocks_layer_builds_a_runtime_proxy_without_dropping_unknown_fields() {
+        let config = GoProxyRuntimeConfig {
+            id: "shadowsocks".to_owned(),
+            name: "shadowsocks".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned(), "shadowsocks".to_owned()],
+            layers: vec![
+                yuhaiin_store::GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({"addresses":[{"host":"127.0.0.1","port":24444}]}),
+                },
+                yuhaiin_store::GoProxyLayer {
+                    kind: "shadowsocks".to_owned(),
+                    config: serde_json::json!({
+                        "method":"AEAD_AES_256_GCM",
+                        "password":"secret",
+                        "futureField":true
+                    }),
+                },
+            ],
+            transport: GoProxyTransport::Shadowsocks,
+            data_json: serde_json::to_vec(&serde_json::json!({"chain":[]})).unwrap(),
+        };
+        let built = snapshot(config)
+            .build_proxy("shadowsocks", Duration::from_secs(2))
             .await
             .unwrap();
         let context = yuhaiin_core::FlowContext::new(yuhaiin_core::Endpoint::ip(

@@ -4,6 +4,7 @@
 //! runtime owns listener policy and flow metadata; this crate owns bytes on
 //! the wire and wrappers which can be composed around an [`AsyncProxy`].
 
+pub mod shadowsocks;
 #[cfg(feature = "tls-rustcrypto")]
 pub mod tls;
 pub mod trojan;
