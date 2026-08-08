@@ -861,6 +861,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     match protocol.as_str() {
+        "socks4a" => crate::proxy::socks4a::serve(stream, peer, spec, selector, monitor).await,
         "socks5" => crate::proxy::socks5::serve(stream, peer, spec, selector, monitor).await,
         "http" => crate::proxy::http::serve(stream, peer, spec, selector, monitor).await,
         "mixed" => serve_mixed(stream, peer, spec, selector, monitor).await,
@@ -891,7 +892,9 @@ where
         prefix: Some(first[0]),
         inner: stream,
     };
-    if first[0] == 5 {
+    if first[0] == 4 {
+        crate::proxy::socks4a::serve(stream, peer, spec, selector, monitor).await
+    } else if first[0] == 5 {
         crate::proxy::socks5::serve(stream, peer, spec, selector, monitor).await
     } else {
         crate::proxy::http::serve(stream, peer, spec, selector, monitor).await
@@ -1225,7 +1228,63 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
     }
 
     #[test]
-    fn mixed_inbound_dispatches_socks5_and_http_to_the_shared_outbound() {
+    fn socks4a_inbound_routes_a_real_tcp_flow_through_the_shared_outbound() {
+        block_on(async {
+            let (echo_address, echo_task) = echo_server().await;
+            let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let inbound_address = inbound_listener.local_addr().unwrap();
+            let (selector, monitor) = direct_runtime().await;
+            let listener_task = tokio::spawn(serve_listener(
+                inbound_listener,
+                InboundSpec {
+                    id: "socks4a-inbound".to_owned(),
+                    protocol: "socks4a".to_owned(),
+                    listen: inbound_address,
+                    username: String::new(),
+                    password: String::new(),
+                    udp_mode: UdpMode::Disabled,
+                    protocol_udp: false,
+                    transports: vec!["normal".to_owned()],
+                    outbound_id: "direct".to_owned(),
+                },
+                selector,
+                monitor,
+                None,
+            ));
+
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut client = TcpStream::connect(inbound_address).await.unwrap();
+                let ip = match echo_address.ip() {
+                    std::net::IpAddr::V4(ip) => ip.octets(),
+                    std::net::IpAddr::V6(_) => panic!("test echo server must be IPv4"),
+                };
+                let mut request = vec![4, 1];
+                request.extend_from_slice(&echo_address.port().to_be_bytes());
+                request.extend_from_slice(&ip);
+                request.extend_from_slice(b"rust-test");
+                request.push(0);
+                client.write_all(&request).await.unwrap();
+                let mut reply = [0u8; 8];
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply[0..2], [0, 90]);
+
+                client.write_all(b"socks4a-through-direct").await.unwrap();
+                let mut echoed = vec![0u8; 22];
+                client.read_exact(&mut echoed).await.unwrap();
+                assert_eq!(&echoed, b"socks4a-through-direct");
+            })
+            .await;
+
+            listener_task.abort();
+            let _ = listener_task.await;
+            echo_task.abort();
+            let _ = echo_task.await;
+            result.unwrap();
+        });
+    }
+
+    #[test]
+    fn mixed_inbound_dispatches_socks4a_socks5_and_http_to_the_shared_outbound() {
         block_on(async {
             let (echo_address, echo_task) = echo_server().await;
             let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1270,6 +1329,25 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 let mut echoed = [0u8; 11];
                 socks.read_exact(&mut echoed).await.unwrap();
                 assert_eq!(&echoed, b"mixed-socks");
+
+                let mut socks4a = TcpStream::connect(inbound_address).await.unwrap();
+                let ip = match echo_address.ip() {
+                    std::net::IpAddr::V4(ip) => ip.octets(),
+                    std::net::IpAddr::V6(_) => panic!("test echo server must be IPv4"),
+                };
+                let mut request = vec![4, 1];
+                request.extend_from_slice(&echo_address.port().to_be_bytes());
+                request.extend_from_slice(&ip);
+                request.extend_from_slice(b"mixed-test");
+                request.push(0);
+                socks4a.write_all(&request).await.unwrap();
+                let mut reply = [0u8; 8];
+                socks4a.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply[0..2], [0, 90]);
+                socks4a.write_all(b"mixed-socks4a").await.unwrap();
+                let mut echoed = [0u8; 13];
+                socks4a.read_exact(&mut echoed).await.unwrap();
+                assert_eq!(&echoed, b"mixed-socks4a");
 
                 let mut http = TcpStream::connect(inbound_address).await.unwrap();
                 http.write_all(
