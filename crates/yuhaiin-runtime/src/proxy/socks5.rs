@@ -103,6 +103,7 @@ pub(crate) async fn serve(
     let mut context = FlowContext::new(destination.clone());
     context.source = Some(source);
     context.original_domain = destination.host().cloned();
+    spec.annotate_context(&mut context);
     let proxy = selector.select(&context);
     let outbound = match proxy.connect(&context).await {
         Ok(outbound) => outbound,
@@ -174,6 +175,7 @@ async fn serve_socks5_udp_loop(
                     let mut context = FlowContext::new(target.clone());
                     context.source = Some(source.clone());
                     context.original_domain = target.host().cloned();
+                    spec.annotate_context(&mut context);
                     let key = udp_flow_key(peer, &target);
                     let datagram = selector.select(&context).open_datagram(&context).await?;
                     let datagram: Arc<dyn AsyncDatagram> = Arc::from(datagram);

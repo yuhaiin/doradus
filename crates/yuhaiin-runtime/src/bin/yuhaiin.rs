@@ -23,7 +23,7 @@ use yuhaiin_core::{Error, ErrorKind, LocalBoxFuture, ResolveStrategy, Result};
 use yuhaiin_runtime::BuiltinResolverFactory;
 use yuhaiin_runtime::api::ApiState;
 use yuhaiin_runtime::{RuntimeBuilder, RuntimeController, inbound, parse_dns_server};
-use yuhaiin_store::{ConfigStore, GoNodeRecord};
+use yuhaiin_store::{ConfigStore, GoNodeRecord, restore_database};
 
 #[cfg(feature = "tun")]
 use yuhaiin_core::tun::{TunConfig, TunDispatcher, TunRuntime};
@@ -104,8 +104,6 @@ async fn run() -> Result<()> {
         )));
     }
     let controller = RuntimeController::from_builder(builder).await?;
-    let state = ApiState::new(controller.clone());
-
     let listen = env_string("YUHAIIN_HTTP", "127.0.0.1:18080")
         .parse::<SocketAddr>()
         .map_err(|error| Error::invalid(format!("YUHAIIN_HTTP is invalid: {error}")))?;
@@ -113,6 +111,7 @@ async fn run() -> Result<()> {
         .await
         .map_err(|error| Error::new(ErrorKind::Io, format!("bind HTTP API: {error}")))?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let state = ApiState::new(controller.clone()).with_shutdown(shutdown_tx.clone());
     let signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
@@ -120,9 +119,11 @@ async fn run() -> Result<()> {
     });
 
     #[cfg(feature = "tun")]
-    let tun_task = spawn_tun_task(controller.clone(), shutdown_rx.clone()).await?;
+    let tun_task =
+        tokio::task::spawn_local(run_tun_supervisor(controller.clone(), shutdown_rx.clone()));
 
-    let dns_task = spawn_dns_task(controller.clone(), shutdown_rx.clone()).await?;
+    let dns_task =
+        tokio::task::spawn_local(run_dns_supervisor(controller.clone(), shutdown_rx.clone()));
     let inbound_task =
         tokio::task::spawn_local(inbound::run_until(controller.clone(), shutdown_rx.clone()));
 
@@ -145,6 +146,9 @@ async fn run() -> Result<()> {
     }
     if let Err(error) = inbound_task.await.map_err(join_error)? {
         eprintln!("inbound task stopped: {error}");
+    }
+    if let Some(source) = controller.take_restore_request() {
+        restore_database(source, &database).await?;
     }
     api_result.map_err(io_error)
 }
@@ -169,44 +173,51 @@ async fn ensure_direct_node(store: &ConfigStore) -> Result<()> {
 }
 
 #[cfg(feature = "tun")]
-async fn spawn_tun_task(
+async fn run_tun_supervisor(
     controller: RuntimeController,
     shutdown: watch::Receiver<bool>,
-) -> Result<tokio::task::JoinHandle<std::io::Result<()>>> {
-    let config = load_tun_config(&controller.store()).await?;
-    if !config.enabled {
-        return Ok(tokio::spawn(async { Ok(()) }));
-    }
-    let proxy_id = config
-        .proxy_id
-        .clone()
-        .or_else(|| futures_proxy_id(&controller))
-        .unwrap_or_else(|| "direct".to_owned());
-    let mut proxy_runtime = controller
-        .build_tun_proxy_runtime_with_dns(
-            &config.direct_id,
-            &proxy_id,
-            &config.bypass_id,
-            &config.drop_id,
-            Duration::from_secs(30),
-            config.channel_capacity,
-            Some(Arc::new(RuntimeDnsHandler {
-                resolver: controller.handle().load().resolver.clone(),
-            })),
-        )
-        .await?;
-    let mut tun = TunRuntime::open(config.tun).map_err(io_error)?;
-    let mut dispatcher = TunDispatcher::new(64 * 1024, 64 * 1024, 2048)?;
-    let future = async move {
+) -> Result<()> {
+    loop {
+        let config = load_tun_config(controller.store()).await?;
+        if !config.enabled {
+            if wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+                return Ok(());
+            }
+            continue;
+        }
+        let proxy_id = match config.proxy_id.clone() {
+            Some(proxy_id) if !proxy_id.trim().is_empty() => proxy_id,
+            _ => inbound::selected_proxy_id(&controller).await?,
+        };
+        let mut proxy_runtime = controller
+            .build_tun_proxy_runtime_with_dns(
+                &config.direct_id,
+                &proxy_id,
+                &config.bypass_id,
+                &config.drop_id,
+                Duration::from_secs(30),
+                config.channel_capacity,
+                Some(Arc::new(RuntimeDnsHandler {
+                    resolver: controller.handle().load().resolver.clone(),
+                })),
+            )
+            .await?;
+        let mut tun = TunRuntime::open(config.tun).map_err(io_error)?;
+        let mut dispatcher = TunDispatcher::new(64 * 1024, 64 * 1024, 2048)?;
         tun.run_dispatcher_until(
             &mut dispatcher,
             &mut proxy_runtime,
             Duration::from_millis(10),
-            wait_for_shutdown(shutdown),
+            async {
+                let _ = wait_for_shutdown_or_reload(&controller, shutdown.clone()).await;
+            },
         )
         .await
-    };
-    Ok(tokio::task::spawn_local(future))
+        .map_err(io_error)?;
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+    }
 }
 
 #[cfg(feature = "tun")]
@@ -307,19 +318,6 @@ fn parse_ipv6(value: &Value) -> Option<(Ipv6Addr, u8)> {
     ))
 }
 
-#[cfg(feature = "tun")]
-fn futures_proxy_id(controller: &RuntimeController) -> Option<String> {
-    // The snapshot is immutable and cheap to inspect; selecting the first
-    // enabled node gives the binary a useful zero-configuration path.
-    controller
-        .handle()
-        .load()
-        .proxies
-        .iter()
-        .find(|proxy| proxy.enabled)
-        .map(|proxy| proxy.id.clone())
-}
-
 fn default_database_path() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -344,6 +342,20 @@ async fn wait_for_shutdown(mut receiver: watch::Receiver<bool>) {
     while receiver.changed().await.is_ok() && !*receiver.borrow() {}
 }
 
+async fn wait_for_shutdown_or_reload(
+    controller: &RuntimeController,
+    mut shutdown: watch::Receiver<bool>,
+) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+    let mut reload = controller.subscribe_reload();
+    tokio::select! {
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+        changed = reload.recv() => changed.is_err() && *shutdown.borrow(),
+    }
+}
+
 fn io_error(error: impl std::fmt::Display) -> Error {
     Error::new(ErrorKind::Io, error.to_string())
 }
@@ -351,31 +363,41 @@ fn join_error(error: tokio::task::JoinError) -> Error {
     io_error(error)
 }
 
-async fn spawn_dns_task(
+async fn run_dns_supervisor(
     controller: RuntimeController,
     shutdown: watch::Receiver<bool>,
-) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    let server = controller
-        .store()
-        .get_config("resolver.server")
-        .await?
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| {
-            value
-                .get("server")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
+) -> Result<()> {
+    loop {
+        let server = controller
+            .store()
+            .get_config("resolver.server")
+            .await?
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| {
+                value
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|server| !server.trim().is_empty());
+        let Some(server) = server else {
+            if wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+                return Ok(());
+            }
+            continue;
+        };
+        let address = parse_dns_server(&server, 53, "api-dns")?;
+        let handler = RuntimeDnsHandler {
+            resolver: controller.handle().load().resolver.clone(),
+        };
+        let dns =
+            yuhaiin_core::dns_udp_async::AsyncUdpDnsServer::bind(address, handler, 4096).await?;
+        dns.serve_until(async {
+            let _ = wait_for_shutdown_or_reload(&controller, shutdown.clone()).await;
         })
-        .filter(|server| !server.trim().is_empty());
-    let Some(server) = server else {
-        return Ok(tokio::spawn(async { Ok(()) }));
-    };
-    let address = parse_dns_server(&server, 53, "api-dns")?;
-    let handler = RuntimeDnsHandler {
-        resolver: controller.handle().load().resolver.clone(),
-    };
-    let dns = yuhaiin_core::dns_udp_async::AsyncUdpDnsServer::bind(address, handler, 4096).await?;
-    Ok(tokio::task::spawn_local(async move {
-        dns.serve_until(wait_for_shutdown(shutdown)).await
-    }))
+        .await?;
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+    }
 }

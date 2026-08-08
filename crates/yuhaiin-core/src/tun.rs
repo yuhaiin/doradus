@@ -432,6 +432,16 @@ pub trait TunFlowObserver: Send + Sync {
     fn opened(&self, flow: TunFlow, context: crate::FlowContext);
     fn bytes(&self, flow: TunFlowKey, direction: TunFlowDirection, bytes: usize);
     fn closed(&self, flow: TunFlowKey);
+
+    /// Return whether the management plane has requested this flow to close.
+    ///
+    /// The default keeps observers source-compatible: applications that only
+    /// collect metrics do not need to implement a control path. The packet
+    /// runtime checks this at its normal polling boundary, so a management
+    /// request never runs transport code while the packet engine is borrowed.
+    fn close_requested(&self, _flow: TunFlowKey) -> bool {
+        false
+    }
 }
 
 /// Events emitted after `TunDispatcher::poll` has allowed smoltcp to consume
@@ -1164,6 +1174,7 @@ impl TunProxyRuntime {
     }
 
     pub fn poll_outputs(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
+        self.apply_close_requests(dispatcher)?;
         self.poll_async_dns()?;
         let mut count = 0;
         while let Ok(output) = self.output_rx.try_recv() {
@@ -1252,6 +1263,28 @@ impl TunProxyRuntime {
         }
         self.dns_tasks.retain(|task| !task.is_finished());
         Ok(count)
+    }
+
+    fn apply_close_requests(&mut self, dispatcher: &mut TunDispatcher) -> Result<()> {
+        let Some(observer) = &self.observer else {
+            return Ok(());
+        };
+        let requested = self
+            .tracked_flows
+            .iter()
+            .copied()
+            .filter(|flow| observer.close_requested(*flow))
+            .collect::<Vec<_>>();
+        for flow in requested {
+            self.remove_flow_task(&flow);
+            if flow.network == Network::Tcp {
+                let _ = dispatcher.abort_tcp(flow);
+            } else if flow.network == Network::Udp {
+                let _ = dispatcher.close_udp(flow);
+            }
+            self.untrack_flow(&flow)?;
+        }
+        Ok(())
     }
 
     /// Poll locally-owned async DNS futures without awaiting a pending
@@ -1462,12 +1495,16 @@ impl TunProxyRuntime {
     }
 
     fn untrack_flow(&mut self, flow: &TunFlowKey) -> Result<()> {
+        if !self.tracked_flows.remove(flow) {
+            return Ok(());
+        }
         let Some(nat) = &self.nat else {
-            self.tracked_flows.remove(flow);
+            if let Some(observer) = &self.observer {
+                observer.closed(*flow);
+            }
             return Ok(());
         };
         let _ = nat.table.remove(&nat_key(*flow))?;
-        self.tracked_flows.remove(flow);
         if let Some(observer) = &self.observer {
             observer.closed(*flow);
         }
@@ -1476,11 +1513,13 @@ impl TunProxyRuntime {
 
     fn clear_tracked_flows(&mut self) {
         let flows = self.tracked_flows.drain().collect::<Vec<_>>();
-        let Some(nat) = &self.nat else {
-            return;
-        };
         for flow in flows {
-            let _ = nat.table.remove(&nat_key(flow));
+            if let Some(nat) = &self.nat {
+                let _ = nat.table.remove(&nat_key(flow));
+            }
+            if let Some(observer) = &self.observer {
+                observer.closed(flow);
+            }
         }
     }
 }

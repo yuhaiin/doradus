@@ -236,6 +236,10 @@ impl ConnectionMonitor {
         std::mem::take(&mut self.lock().close_requests)
     }
 
+    pub fn close_requested(&self, flow: TunFlowKey) -> bool {
+        self.lock().close_requests.contains(&flow)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, MonitorState> {
         self.state
             .lock()
@@ -337,6 +341,10 @@ impl TunFlowObserver for ConnectionMonitor {
     fn closed(&self, flow: TunFlowKey) {
         self.close(flow);
     }
+
+    fn close_requested(&self, flow: TunFlowKey) -> bool {
+        self.close_requested(flow)
+    }
 }
 
 fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
@@ -348,15 +356,21 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         .as_ref()
         .map(ToString::to_string)
         .unwrap_or_default();
+    let inbound = context.inbound.as_deref().unwrap_or("tun");
+    let inbound_name = context.inbound_name.as_deref().unwrap_or("TUN");
+    let outbound = context
+        .outbound
+        .as_deref()
+        .unwrap_or_else(|| route_mode(context.route_mode));
     json!({
         "id": id,
         "addr": destination,
         "network": {"connType": flow.key.network.to_string(), "underlyingType": ""},
         "source": source,
-        "inbound": "tun",
-        "inboundName": "TUN",
+        "inbound": inbound,
+        "inboundName": inbound_name,
         "interface": "",
-        "outbound": route_mode(context.route_mode),
+        "outbound": outbound,
         "localAddr": source,
         "destination": original,
         "fakeIp": "",
@@ -364,8 +378,8 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         "domain": domain,
         "ip": context.destination.addr().map(|addr| addr.ip().to_string()).unwrap_or_default(),
         "tag": "",
-        "nodeId": "",
-        "nodeName": "",
+        "nodeId": context.outbound.as_deref().unwrap_or_default(),
+        "nodeName": context.outbound_name.as_deref().unwrap_or_default(),
         "protocol": flow.key.network.to_string(),
         "process": "",
         "pid": "",

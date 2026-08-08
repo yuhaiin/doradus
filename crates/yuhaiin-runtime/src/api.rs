@@ -16,9 +16,12 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::time::Duration;
+use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
+use yuhaiin_core::{DomainName, Endpoint, FlowContext, Network};
 
 use yuhaiin_store::{
     GoInboundRecord, GoNodeRecord, GoResolverRecord, GoRouteListRecord, GoRouteRuleRecord,
@@ -31,6 +34,7 @@ use crate::RuntimeController;
 pub struct ApiState {
     pub controller: RuntimeController,
     pub version: String,
+    shutdown: Option<watch::Sender<bool>>,
 }
 
 impl ApiState {
@@ -38,7 +42,19 @@ impl ApiState {
         Self {
             controller,
             version: env!("CARGO_PKG_VERSION").to_owned(),
+            shutdown: None,
         }
+    }
+
+    pub fn with_shutdown(mut self, shutdown: watch::Sender<bool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    fn request_shutdown(&self) -> bool {
+        self.shutdown
+            .as_ref()
+            .is_some_and(|shutdown| shutdown.send(true).is_ok())
     }
 }
 
@@ -247,7 +263,7 @@ async fn rpc(
         "node.delete" => delete_node_value(&state, required_string(&body, "id")?).await,
         "node.use" => select_node_value(&state, required_string(&body, "id")?).await,
         "node.close" => empty(),
-        "node.latency" => unsupported("node latency is not implemented in the lite runtime"),
+        "node.latency" => node_latency_value(&state, &body).await,
         "inbounds.config.get" => {
             read_config_json(&state, "inbounds.config", default_inbound_config()).await
         }
@@ -1315,6 +1331,104 @@ async fn update_status_value(state: &ApiState) -> ApiResult {
     }))
 }
 
+async fn node_latency_value(state: &ApiState, value: &Value) -> ApiResult {
+    let id = required_string(value, "id")?;
+    let target = latency_target(value)?;
+    let timeout = Duration::from_millis(
+        value
+            .get("timeoutMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(10_000)
+            .clamp(100, 120_000),
+    );
+    let proxy = state
+        .controller
+        .handle()
+        .load()
+        .build_proxy(&id, timeout)
+        .await
+        .map_err(ApiError::from)?
+        .proxy;
+    let context = FlowContext::new(target);
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(timeout, proxy.connect(&context)).await;
+    match result {
+        Ok(Ok(stream)) => {
+            drop(stream);
+            json_value(json!({
+                "ok": true,
+                "latencyMs": started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+            }))
+        }
+        Ok(Err(error)) => json_value(json!({"ok": false, "error": error.to_string()})),
+        Err(_) => json_value(json!({"ok": false, "error": "latency probe timed out"})),
+    }
+}
+
+fn latency_target(value: &Value) -> std::result::Result<Endpoint, ApiError> {
+    let kind = string_or(value, "type", "tcp").to_ascii_lowercase();
+    if !matches!(kind.as_str(), "tcp" | "ip") {
+        return Err(ApiError::unavailable(format!(
+            "latency probe type {kind:?} is not implemented"
+        )));
+    }
+    let url = string_or(
+        value,
+        "url",
+        if kind == "ip" {
+            "http://ip.sb"
+        } else {
+            "https://clients3.google.com/generate_204"
+        },
+    );
+    let (authority, default_port) = if let Some(rest) = url.strip_prefix("https://") {
+        (rest.split('/').next().unwrap_or_default(), 443)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (rest.split('/').next().unwrap_or_default(), 80)
+    } else {
+        (url.split('/').next().unwrap_or_default(), 443)
+    };
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, rest) = rest
+            .split_once(']')
+            .ok_or_else(|| ApiError::bad("latency URL has an invalid IPv6 authority"))?;
+        let port = rest
+            .strip_prefix(':')
+            .map(|port| port.parse::<u16>())
+            .transpose()
+            .map_err(|error| ApiError::bad(format!("latency URL port: {error}")))?
+            .unwrap_or(default_port);
+        (host, port)
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.contains(':') {
+            (authority, default_port)
+        } else {
+            (
+                host,
+                port.parse::<u16>()
+                    .map_err(|error| ApiError::bad(format!("latency URL port: {error}")))?,
+            )
+        }
+    } else {
+        (authority, default_port)
+    };
+    if host.is_empty() {
+        return Err(ApiError::bad("latency URL host is empty"));
+    }
+    if let Ok(address) = host.parse() {
+        Ok(Endpoint::ip(
+            Network::Tcp,
+            std::net::SocketAddr::new(address, port),
+        ))
+    } else {
+        Ok(Endpoint::domain(
+            Network::Tcp,
+            DomainName::new(host).map_err(ApiError::from)?,
+            port,
+        ))
+    }
+}
+
 async fn run_backup_value(state: &ApiState) -> ApiResult {
     let destination = backup_destination()?;
     state
@@ -1326,10 +1440,25 @@ async fn run_backup_value(state: &ApiState) -> ApiResult {
     Ok(Json(json!({})))
 }
 
-async fn restore_backup_value(_state: &ApiState, _value: &Value) -> ApiResult {
-    Err(ApiError::unavailable(
-        "database restore requires restarting the Rust service with the selected backup",
-    ))
+async fn restore_backup_value(state: &ApiState, value: &Value) -> ApiResult {
+    let source = string_or_any(value, &["path", "source", "file"]);
+    if source.trim().is_empty() {
+        return Err(ApiError::bad("backup restore requires path/source/file"));
+    }
+    let source = PathBuf::from(source);
+    if !source.is_file() {
+        return Err(ApiError::not_found(format!(
+            "backup does not exist: {}",
+            source.display()
+        )));
+    }
+    if !state.request_shutdown() {
+        return Err(ApiError::unavailable(
+            "database restore requires the managed Rust service lifecycle",
+        ));
+    }
+    state.controller.request_restore(source);
+    json_value(json!({"accepted": true, "restart": true}))
 }
 
 fn tools_interfaces_value() -> ApiResult {
@@ -1794,9 +1923,6 @@ fn empty_json() -> Json<Value> {
 }
 fn empty() -> ApiResult {
     Ok(empty_json())
-}
-fn unsupported(message: impl Into<String>) -> ApiResult {
-    Err(ApiError::unavailable(message))
 }
 fn default_route_config() -> Value {
     json!({"directResolver":"", "proxyResolver":"", "resolveLocally":false, "udpProxyFqdnStrategy":"default"})

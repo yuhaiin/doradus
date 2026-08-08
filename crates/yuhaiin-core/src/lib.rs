@@ -276,6 +276,13 @@ pub struct FlowContext {
     pub route_mode: RouteMode,
     pub resolver_policy: ResolverPolicy,
     pub original_domain: Option<DomainName>,
+    /// Management-plane identity of the component that accepted the flow.
+    /// These fields are optional so packet-only callers do not need a second
+    /// DTO or synthetic values.
+    pub inbound: Option<String>,
+    pub inbound_name: Option<String>,
+    pub outbound: Option<String>,
+    pub outbound_name: Option<String>,
     pub skip_route: bool,
     pub udp_migrate_id: Arc<AtomicU64>,
 }
@@ -290,6 +297,10 @@ impl FlowContext {
             route_mode: RouteMode::Proxy,
             resolver_policy: ResolverPolicy::default(),
             original_domain: None,
+            inbound: None,
+            inbound_name: None,
+            outbound: None,
+            outbound_name: None,
             skip_route: false,
             udp_migrate_id: Arc::new(AtomicU64::new(0)),
         }

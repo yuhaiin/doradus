@@ -45,6 +45,7 @@ pub(crate) async fn serve_udp(
                     let mut context = FlowContext::new(target.clone());
                     context.source = Some(peer.clone());
                     context.original_domain = target.host().cloned();
+                    spec.annotate_context(&mut context);
                     let key = udp_flow_key(peer_addr, &target);
                     let datagram = selector.select(&context).open_datagram(&context).await?;
                     let datagram: Arc<dyn AsyncDatagram> = Arc::from(datagram);

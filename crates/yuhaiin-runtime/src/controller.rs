@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    path::PathBuf,
     sync::{Arc, RwLock, Weak},
 };
 
@@ -25,6 +26,7 @@ pub struct RuntimeController {
     selectors: Arc<RwLock<Vec<Weak<RuntimeProxySelector>>>>,
     monitor: Arc<ConnectionMonitor>,
     reload_events: tokio::sync::broadcast::Sender<()>,
+    restore_request: Arc<RwLock<Option<PathBuf>>>,
 }
 
 impl RuntimeController {
@@ -41,6 +43,7 @@ impl RuntimeController {
             selectors: Arc::new(RwLock::new(Vec::new())),
             monitor: Arc::new(ConnectionMonitor::new()),
             reload_events,
+            restore_request: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -58,6 +61,20 @@ impl RuntimeController {
 
     pub fn subscribe_reload(&self) -> tokio::sync::broadcast::Receiver<()> {
         self.reload_events.subscribe()
+    }
+
+    pub fn request_restore(&self, source: PathBuf) {
+        *self
+            .restore_request
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(source);
+    }
+
+    pub fn take_restore_request(&self) -> Option<PathBuf> {
+        self.restore_request
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     /// Build and register a TUN proxy selector. The controller refreshes all

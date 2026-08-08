@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 
-use yuhaiin_core::{Error, ErrorKind, Result};
+use yuhaiin_core::{Error, ErrorKind, FlowContext, Result};
 use yuhaiin_store::GoInboundRecord;
 
 use crate::{ConnectionMonitor, RuntimeController, RuntimeProxySelector};
@@ -30,6 +30,7 @@ pub(crate) struct InboundSpec {
     pub(crate) udp_mode: UdpMode,
     pub(crate) protocol_udp: bool,
     pub(crate) transports: Vec<String>,
+    pub(crate) outbound_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,28 +112,21 @@ async fn start_listeners(
     controller: &RuntimeController,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
     let records = controller.store().repository().list_go_inbounds().await?;
-    let proxy_id = controller
-        .store()
-        .repository()
-        .list_go_nodes()
-        .await?
-        .into_iter()
-        .find(|node| node.enabled)
-        .map(|node| node.id)
-        .unwrap_or_else(|| "direct".to_owned());
+    let proxy_id = selected_proxy_id(controller).await?;
     let selector = controller
         .build_proxy_selector("", &proxy_id, "", "", Duration::from_secs(30))
         .await?;
     let monitor = controller.monitor();
     let mut listeners = Vec::new();
     for record in records.into_iter().filter(|record| record.enabled) {
-        let spec = match InboundSpec::from_record(record) {
+        let mut spec = match InboundSpec::from_record(record) {
             Ok(spec) => spec,
             Err(error) => {
                 eprintln!("skip inbound: {error}");
                 continue;
             }
         };
+        spec.outbound_id = proxy_id.clone();
         if !spec.transports.is_empty()
             && spec
                 .transports
@@ -205,6 +199,30 @@ async fn start_listeners(
     Ok(listeners)
 }
 
+pub async fn selected_proxy_id(controller: &RuntimeController) -> Result<String> {
+    let nodes = controller.store().repository().list_go_nodes().await?;
+    let selected = controller
+        .store()
+        .get_config("selected.node")
+        .await?
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    Ok(selected
+        .filter(|id| nodes.iter().any(|node| node.enabled && node.id == *id))
+        .or_else(|| {
+            nodes
+                .into_iter()
+                .find(|node| node.enabled)
+                .map(|node| node.id)
+        })
+        .unwrap_or_else(|| "direct".to_owned()))
+}
+
 async fn abort_listeners(listeners: &mut Vec<tokio::task::JoinHandle<()>>) {
     for listener in listeners.drain(..) {
         listener.abort();
@@ -274,7 +292,16 @@ impl InboundSpec {
             udp_mode,
             protocol_udp,
             transports,
+            outbound_id: String::new(),
         })
+    }
+
+    pub(crate) fn annotate_context(&self, context: &mut FlowContext) {
+        context.inbound = Some(self.protocol.clone());
+        context.inbound_name = Some(self.id.clone());
+        if !self.outbound_id.is_empty() {
+            context.outbound = Some(self.outbound_id.clone());
+        }
     }
 }
 

@@ -65,9 +65,28 @@ where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    relay_counted_with_prefix(left, right, flow, context, monitor, &[]).await
+}
+
+pub(crate) async fn relay_counted_with_prefix<A, B>(
+    left: A,
+    right: B,
+    flow: TunFlowKey,
+    context: FlowContext,
+    monitor: Arc<ConnectionMonitor>,
+    prefix: &[u8],
+) -> std::io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     monitor.opened(TunFlow { key: flow }, context);
     let (mut left_read, mut left_write) = split(left);
     let (mut right_read, mut right_write) = split(right);
+    if !prefix.is_empty() {
+        right_write.write_all(prefix).await?;
+        monitor.bytes(flow, TunFlowDirection::Upload, prefix.len());
+    }
     let upload = copy_counted(
         &mut left_read,
         &mut right_write,
