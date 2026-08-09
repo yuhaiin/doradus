@@ -1650,13 +1650,22 @@ async fn selected_node_id(state: &ApiState, key: &str) -> Result<Option<String>,
     if selected.is_some() || key == LEGACY_SELECTED_NODE_KEY {
         return Ok(selected);
     }
-    Ok(state
+    let legacy = state
         .controller
         .store()
         .get_config(LEGACY_SELECTED_NODE_KEY)
         .await?
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned)))
+        .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned));
+    if legacy.is_some() {
+        return Ok(legacy);
+    }
+    Ok(state
+        .controller
+        .store()
+        .repository()
+        .get_go_selected_node_id(key)
+        .await?)
 }
 
 async fn selected_node_record(
@@ -1694,13 +1703,18 @@ async fn select_node_value(state: &ApiState, id: String) -> ApiResult {
     if !records.iter().any(|record| record.id == id) {
         return Err(ApiError::not_found(format!("node {id:?} was not found")));
     }
+    let selected_id = id.clone();
     let bytes = serde_json::to_vec(&json!({"id": id}))?;
     state
         .controller
         .mutate_and_reload(move |store| async move {
             store.put_config(SELECTED_TCP_NODE_KEY, &bytes).await?;
             store.put_config(SELECTED_UDP_NODE_KEY, &bytes).await?;
-            store.put_config(LEGACY_SELECTED_NODE_KEY, &bytes).await
+            store.put_config(LEGACY_SELECTED_NODE_KEY, &bytes).await?;
+            store
+                .repository()
+                .put_go_selected_node_ids(&selected_id)
+                .await
         })
         .await?;
     Ok(empty_json())
@@ -3960,6 +3974,57 @@ mod tests {
         let selected = selected_nodes_value(&state).await.unwrap();
         assert_eq!(selected.0["tcp"]["id"], "udp-node");
         assert_eq!(selected.0["udp"]["id"], "udp-node");
+    }
+
+    #[tokio::test]
+    async fn node_selection_reads_and_updates_go_metadata_strings() {
+        let state = state().await;
+        for id in ["tcp-node", "udp-node"] {
+            let _ = save_node_value(
+                &state,
+                json!({
+                    "id": id,
+                    "name": id,
+                    "enabled": true,
+                    "chain": [{"type":"direct","direct":{}}]
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        state
+            .controller
+            .store()
+            .repository()
+            .put_go_selected_node_ids("tcp-node")
+            .await
+            .unwrap();
+        let selected = selected_nodes_value(&state).await.unwrap();
+        assert_eq!(selected.0["tcp"]["id"], "tcp-node");
+        assert_eq!(selected.0["udp"]["id"], "tcp-node");
+
+        let _ = select_node_value(&state, "udp-node".to_owned())
+            .await
+            .unwrap();
+        let repository = state.controller.store().repository();
+        assert_eq!(
+            repository
+                .get_go_selected_node_id(SELECTED_TCP_NODE_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("udp-node")
+        );
+        assert_eq!(
+            repository
+                .get_go_selected_node_id(SELECTED_UDP_NODE_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("udp-node")
+        );
     }
 
     #[tokio::test]

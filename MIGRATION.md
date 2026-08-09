@@ -19,7 +19,7 @@
 
 > 2026-08-09 管理 API 错误分类：Rust API 的核心 `ErrorKind` 现在在统一边界按 Go v2 RPC 语义映射：`InvalidInput/Unsupported` 为 400 `bad_request`，`NotFound` 为 404，`Closed/Timeout` 为 503 `unavailable`，I/O、协议和存储错误保留 500 `internal_error`。新增状态分类回归，避免有效的前端参数错误被误报为服务器故障。
 
-> 2026-08-09 节点选择契约：Go 的 `node.use` 与 `nodes.selected` 使用独立的 `selected_tcp_node_v2` / `selected_udp_node_v2` 选择，并在一次 use 操作中同时更新 TCP、UDP。Rust API 现在在配置 overlay 中持久化两套选择，`nodes.selected` 分别返回两套节点；入站 outbound 选择优先读取 TCP 选择，并保留旧 `selected.node` 单选择作为读取回退。无选择时管理 API 不再擅自把第一个 enabled 节点伪装成已选节点；数据面仍按 Go 运行时语义回退到可用 enabled 节点或 direct。新增独立 TCP/UDP selection、use 返回空对象和双写回读单测。
+> 2026-08-09 节点选择契约：Go 的 `node.use` 与 `nodes.selected` 使用独立的 `selected_tcp_node_v2` / `selected_udp_node_v2` 选择，并在一次 use 操作中同时更新 TCP、UDP。Rust API 现在在配置 overlay 中持久化两套选择，也读取/回写 Go `metadata` 表中的原始字符串；`nodes.selected` 分别返回两套节点；入站 outbound 选择优先读取 TCP 选择，并保留旧 `selected.node` 单选择作为读取回退。无选择时管理 API 不再擅自把第一个 enabled 节点伪装成已选节点；数据面仍按 Go 运行时语义回退到可用 enabled 节点或 direct。新增独立 TCP/UDP selection、use 返回空对象和双写回读单测。
 
 > 2026-08-09 节点 active 状态契约：Go `nodes.active` 暴露的是 `NodeRuntime` 已注册的 proxy entries，不是节点表中所有 `enabled` 行。Rust 现在从 `RuntimeController` 的 live selector registry 汇总实际 proxy slot 的节点 ID，过滤已释放 selector 后返回 active nodes；新增 selector 创建、释放和 idle enabled node 不出现在 active 列表的回归。
 
@@ -1538,3 +1538,16 @@ Rust 现在明确支持这个“仅新增用户/订阅关联表”的 v7 形状�
 workspace ignored 测试第一次直接在宿主运行时，两个 `p0_tun` netem 测试因 `tc qdisc` 返回 `Operation not permitted` 失败；随后在独立的 rootless user/network namespace 中重新运行同一 `p0_tun` 测试，`chain_datagram_survives_kernel_loopback_loss` 和 matrix 两项均通过。该结果证明测试本身和内核 loopback loss 路径可运行，但仍不替代 Android/macOS TUN、真实宿主 CAP_NET_ADMIN 下的透明转发与长期 MTU/fragment 验收。
 
 前端 generated.ts 的 88 个 RPC operation 已完成静态集合核对；`connections.events` 和 `tools.logs` 是 Go 明确标记的 streaming endpoint，Rust 使用直接 SSE route，不应作为普通 JSON RPC 缺失。剩余 API 缺口是生产数据库上的逐字段 response、错误语义和 reload/apply side-effect 快照，而不是 operation 路由集合缺失。
+
+## 32. 2026-08-09 schema-7 生产节点选择双副本回归
+
+使用真实 Go 数据库 `/home/asutorufa/Documents/Programming/yuhaiin/tmp/v2/state.db` 的独立副本，分别启动 Go 与 Rust 服务；副本和日志位于 `~/.cache/yuhaiin-rust/api-compare-selected-20260809`，没有读取写回原始数据库，也没有使用 `/tmp`。源库确认 schema 7 同时存在 `nodes`、`nodes_v2`，并在 Go `metadata` 中以纯字符串保存：
+
+```text
+selected_tcp_node_v2 = a549f6c7-3ba1-42bc-9708-3a069f5e61b2
+selected_udp_node_v2 = a549f6c7-3ba1-42bc-9708-3a069f5e61b2
+```
+
+修复前 Rust `nodes.selected` 返回 `{}`，原因是只读取 `yuhaiin_config` 中形如 `{"id": ...}` 的 JSON。修复后 Rust 在缺少 overlay 时从 `metadata` 回读两个 ID，真实副本的 `nodes.selected` 已返回与 Go 相同的 TCP/UDP 节点；通过 Rust `node.use` 后，两个 Go metadata key 也都写回相同的原始 ID，重读仍返回选中节点。新增 API 单测覆盖 metadata-only 读取和 use 双写。
+
+同一快照中 `resolvers.get` 的 6 条记录及有效 `page/page_size` 分页总数一致；route list 的 remote cache 统计仍会因副本缓存文件和网络环境不同而不同，不能据此宣称逐字段完全一致。生产管理面剩余工作仍是逐操作 response/error/reload side-effect 差异快照。

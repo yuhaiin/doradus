@@ -14,6 +14,64 @@ fn validate_route_resolver_name(value: &str, field: &str) -> Result<()> {
 }
 
 impl ConfigRepository {
+    /// Read a selected node id from Go's raw compatibility metadata.
+    ///
+    /// Go stores these values as plain strings in `metadata`, while the
+    /// native Rust configuration uses JSON objects in `yuhaiin_config`.
+    /// Keeping the compatibility lookup here prevents the API layer from
+    /// depending on SQLite table details and allows fresh Rust databases
+    /// (where the table is still bootstrapped) and imported Go databases to
+    /// share the same behavior.
+    pub async fn get_go_selected_node_id(&self, key: &str) -> Result<Option<String>> {
+        if !matches!(key, "selected_tcp_node_v2" | "selected_udp_node_v2") {
+            return Err(Error::invalid(format!(
+                "unsupported Go selected-node metadata key {key:?}"
+            )));
+        }
+        let connection = self.store.lock_connection()?;
+        if !table_exists(&connection, "metadata") {
+            return Ok(None);
+        }
+        let rows = connection
+            .query_with_params(
+                "SELECT value FROM metadata WHERE key = ?1",
+                &[SqliteValue::from(key)],
+            )
+            .map_err(storage_error)?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let value = row_text(row, 0, "metadata.value")?;
+        if value.trim().is_empty() {
+            return Ok(None);
+        }
+        validate_id(&value)?;
+        Ok(Some(value))
+    }
+
+    /// Keep Go's selected-node metadata in sync when the frontend changes
+    /// the active node. Go uses one id for both TCP and UDP selection.
+    pub async fn put_go_selected_node_ids(&self, id: &str) -> Result<()> {
+        validate_id(id)?;
+        let connection = self.store.lock_connection()?;
+        if !table_exists(&connection, "metadata") {
+            return Ok(());
+        }
+        drop(connection);
+        self.store.with_write_transaction(|connection| {
+            require_go_table(connection, "metadata", &["key", "value"])?;
+            for key in ["selected_tcp_node_v2", "selected_udp_node_v2"] {
+                connection
+                    .execute_with_params(
+                        "INSERT OR REPLACE INTO metadata(key, value) VALUES (?1, ?2)",
+                        &[SqliteValue::from(key), SqliteValue::from(id)],
+                    )
+                    .map_err(storage_error)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Read Go's global settings KV table without converting it into a second
     /// lossy settings schema. Unknown sections remain available to future
     /// callers and malformed JSON is rejected for the same fail-closed
