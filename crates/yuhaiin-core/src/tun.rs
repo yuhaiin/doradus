@@ -627,7 +627,12 @@ impl TunDispatcher {
         );
         socket
             .listen(IpListenEndpoint {
-                addr: Some(tuple.destination.ip().into()),
+                // A TUN gateway must accept destinations that are not local
+                // interface addresses. smoltcp keeps the packet's actual
+                // local endpoint on the established socket, so a wildcard
+                // listener preserves the original destination in the flow
+                // key while allowing ordinary Internet routes.
+                addr: None,
                 port: tuple.destination.port(),
             })
             .map_err(|error| {
@@ -2304,6 +2309,11 @@ impl TunRuntime {
             &mut smoltcp_device,
             Instant::from_millis(0),
         );
+        // A TUN gateway receives packets for arbitrary routed destinations;
+        // they are not necessarily assigned to the TUN interface itself.
+        // smoltcp's AnyIP mode accepts those packets while retaining the
+        // original destination endpoint for the dispatcher flow key.
+        interface.set_any_ip(true);
         if let Some((address, prefix)) = config.ipv4 {
             interface.update_ip_addrs(|addresses| {
                 let _ = addresses.push(IpCidr::new(IpAddress::Ipv4(address), prefix));

@@ -2097,3 +2097,28 @@ Podman privileged/network=none、release、同一 loopback echo fixture 的实�
 
 这证明当前 Linux TUN inbound 的长流背压不再依赖无界积压；Android/macOS 设备和真实
 透明网络路径仍按 checklist 的平台状态单独验收。
+
+## 59. 2026-08-10 runtime-owned TUN routed proxy smoke
+
+运行时 TUN smoke 现在不再只验证设备创建/关闭，而是启动真实 runtime inbound，创建
+`198.18.0.2:18080` 的内核 TCP 流，经过 route fallback=proxy、选中的 fixed outbound，
+再回到同一 Podman 容器内的 loopback echo server。fixture 显式安装
+`198.18.0.2/32`，日志与 SQLite 状态仍只保存在
+`~/.cache/yuhaiin-rust/integration/tun-service`，不使用 `/tmp`。
+
+为支持真实 TUN 的任意 routed destination，smoltcp interface 启用 AnyIP，TCP dispatcher
+使用 wildcard listener；flow key 仍保留原始目标 endpoint，因此 direct/fixed/后续协议链
+可以按目标地址路由。没有 route rule 时 runtime 的生产 fallback 仍是 direct，smoke 通过
+明确的 `RuntimeBuildOptions.route_fallback=proxy` 验证“配置的 selected outbound”而不是
+依赖隐式默认值。
+
+新增回归单测覆盖 AnyIP 下非本地 interface 地址的 TCP SYN；
+`scripts/integration/tun-service.sh` 现在把 Podman 输出写到 cache 中，即使命令失败也会
+直接打印日志。实际结果：
+
+```text
+test tun::tun_unit_tests::tcp_listener_accepts_routed_destination_with_any_ip ... ok
+runtime-tun-opened name=yrtun0
+runtime-tun-traffic-ok
+runtime-tun-closed name=yrtun0
+```

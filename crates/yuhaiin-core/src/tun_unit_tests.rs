@@ -347,6 +347,42 @@ fn tcp_listener_accepts_syn_and_emits_syn_ack() {
 }
 
 #[test]
+fn tcp_listener_accepts_routed_destination_with_any_ip() {
+    let local = Ipv4Address::new(198, 18, 0, 1);
+    let remote = Ipv4Address::new(198, 18, 0, 2);
+    let destination = Ipv4Address::new(203, 0, 113, 7);
+    let mut device = SmoltcpTunDevice::new(1500, 8).unwrap();
+    let mut interface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    interface.set_any_ip(true);
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(IpAddress::Ipv4(local), 15))
+            .unwrap();
+    });
+    let mut dispatcher = TunDispatcher::new(1024, 1024, 4).unwrap();
+    device
+        .enqueue_rx(tcp_syn_packet(remote, destination, 41001, 443, 100))
+        .unwrap();
+
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(1))
+        .unwrap();
+
+    let response = device.take_tx().unwrap().unwrap();
+    let ip = Ipv4Packet::new_checked(&response).unwrap();
+    let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+    assert_eq!(ip.dst_addr(), remote);
+    assert_eq!(tcp.src_port(), 443);
+    assert_eq!(tcp.dst_port(), 41001);
+    assert!(tcp.syn());
+    assert!(tcp.ack());
+}
+
+#[test]
 fn icmp_socket_round_trips_echo_request_and_reply() {
     let local = Ipv4Address::new(10, 0, 0, 1);
     let remote = Ipv4Address::new(10, 0, 0, 2);
