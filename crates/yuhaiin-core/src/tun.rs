@@ -1086,7 +1086,8 @@ impl TunProxyRuntime {
             TunEvent::TcpOpened { flow } => {
                 self.track_flow(flow.key)?;
                 self.remove_task(&flow.key);
-                let context = self.context_for_flow(flow);
+                let mut context = self.context_for_flow(flow);
+                self.selector.route_context(&mut context);
                 if let Some(observer) = &self.observer {
                     observer.opened(flow, context.clone());
                 }
@@ -1118,7 +1119,8 @@ impl TunProxyRuntime {
             TunEvent::UdpDatagram { flow, payload } => {
                 let first = !self.tracked_flows.contains(&flow.key);
                 self.track_flow(flow.key)?;
-                let context = self.context_for_flow(flow);
+                let mut context = self.context_for_flow(flow);
+                self.selector.route_context(&mut context);
                 if first && let Some(observer) = &self.observer {
                     observer.opened(flow, context.clone());
                 }

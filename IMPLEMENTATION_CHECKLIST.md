@@ -28,6 +28,7 @@
 - [x] 统计持久化生命周期：`ConnectionMonitor` 拥有可等待的 SQLite writer，服务在 inbound/DNS owner 收敛后执行 final flush 并等待 writer，再进行 backup restore；单测和 Podman 立即退出/重启 smoke 均验证最后一条 history、traffic 不依赖 2 秒周期即可读回
 - [x] TUN inbound 服务级验收：管理 API 写入 Go `inbounds_v2` 的 `empty/tun` 后，privileged `--network=none` runtime 通过 `inbound::run_until` 真实创建命名 TUN；`/sys/class/net`、SIGTERM graceful shutdown、设备消失和同名设备重新打开均通过，supervisor 失败也会进入 monitor 日志
 - [x] 连接元数据契约：普通 HTTP/SOCKS5/Yuubinsya inbound 的 `component` 保持空值，TUN flow 才输出 `component=tun` 并默认 `inbound=tun/inboundName=TUN`；monitor 序列化与 TUN 上下文注入均有回归测试
+- [x] 路由解释元数据链：`RouterRuntime` 会把选中的 Go rule/tag/host-process list/Geo 写入共享 `FlowContext`，runtime selector 提供统一 `route_context` 钩子，HTTP/SOCKS4A/SOCKS5/Trojan/VLESS/Yuubinsya/TUN 在代理选择前调用；monitor 与 `route.rules.test` 输出 Go 兼容的 `matchHistory`/`lists`/`resolver`/`geo`，并有 trie、route compiler、monitor 单测
 
 ## 未完成项与下一阶段计划
 
@@ -234,10 +235,11 @@ P0 结论：当前“可扩展的最小数据面”已经具备可运行实现�
   - P-END：更多真实 Go 生产库快照和剩余未建模兼容表的异常 migration 注入；24 writer/10 reader 的跨进程长时间压力已通过，当前 `nodes_v2`、`resolvers_v2`、`route_rules_v2`、`inbounds_v2`、`node_tags_v2`、`route_lists_v2` 和 `settings_json` 已有逐表/逐 JSON 边界失败回滚矩阵。
   - 完成条件：新库初始化、逐版本 migration、事务提交、异常中断恢复、force-stop 后重启读回全部有测试；旧 Go 配置至少有一套真实 fixture 和字段差异报告。
 
-- [x] **Router runtime、热更新和 resolver policy**
+- [x] **Router runtime、热更新、resolver policy 和连接解释元数据**
   - 当前：域名 Trie、CIDR LPM Trie、组合 lookup、country Geo lookup、优先级、不可变 compiled snapshot 的 publish/rollback 和 resolver policy 应用已完成。
   - 已完成：非法规则编译失败时不会持有写锁或替换当前 snapshot，旧 flow/new flow snapshot 与并发 publish 已有回归；长压力为 50,000 次 publish、8 个 reader 各 50,000 次 lookup，动态 selector 另有 8 个 reader 各 50,000 次 proxy selection。
   - 已完成：Geo country rule 通过 `Arc<dyn GeoLookup>` 接入 IP route dispatch；无数据库、未命中和查询错误均回 fallback，`RouterRuntime` 发布新 snapshot 时可同时替换 Geo reader；FakeIP DNS→TUN→Router→动态 proxy selector 的生产形态集成、旧 flow 保留原 proxy 与新 flow 观察新 snapshot 的对照回归均已通过。
+  - 已完成：选中的 rule name、tag、列表名称、列表匹配结果和 Geo country 会随 `FlowContext` 进入普通 inbound/TUN monitor；runtime selector 的 route-context 钩子保证“实际选择的 proxy”和 connections API 的解释字段使用同一个快照；`route.rules.test` 不再固定返回空 `lists`/`matchResult`。
   - 完成条件：规则增删改、并发 lookup、热更新和失败回滚都有测试；旧 flow 使用旧快照，新 flow 使用新快照；规则优先级和域名规范化与 Go 行为有对照 fixture。
 
 - [~] **NAT 与 proxy/TUN 的完整生命周期**
@@ -335,6 +337,7 @@ cargo test --workspace
 - `cargo test -p yuhaiin-runtime --all-features --offline --lib -- --nocapture`：通过（24 tests）；RuntimeBuilder/RuntimeHandle/RuntimeController 生成、ConfigMutation 和 typed repository mutation 持久化后 reload、revision 条件 publish、原子 `load_with_revision`、防陈旧 reload 覆盖、失败时保留旧 snapshot 与 `last_reload_error()` 状态，注册 proxy selector 在 reload 成功时原子刷新、代理构建失败时保留旧 snapshot，ResolverTransportFactory 内置 System/UDP/TCP 构造和数字 DNS server 解析，route rule domain/CIDR/action/network/port/policy 编译、禁用/不支持 matcher fail-closed，HTTP/2 DoH factory，RuntimeSnapshot 基础 proxy 构造和 direct/proxy/bypass/drop selector 组装回归通过
 - `cargo test -p yuhaiin-runtime --all-features --offline data_plane -- --nocapture`：通过（5 tests）；外部 TUN host 可读取共享 `tun.runtime` 配置，Go `inbounds_v2` TUN record 可读取 portal/route/name，默认配置保持禁用且不会在加载阶段创建设备；disabled supervisor 会在成功 runtime reload 后唤醒，不必重启服务
 - Podman runtime smoke：通过；Debian testing host-network 容器内启动 `target/debug/yuhaiin`，API 创建 HTTP inbound 后，宿主机 HTTP proxy 请求成功，`connections.history` 记录 `http -> direct`，`connections.total` 记录 upload/download，重启容器后 inbound/history 从 SQLite 读回；状态目录位于 `~/.cache/yuhaiin-rust-podman.*`
+- Podman route metadata smoke：通过；Debian testing host-network 容器内创建 HTTP inbound、CIDR route rule 和延迟 upstream，在真实请求保持 live 的窗口读取 `/api/v2/connections`，确认 `tag`、`matchHistory[0].ruleName`、`mode=direct` 与实际选择一致；另以 `route/rules/test` 验证 host-list 的 `lists`/`matchResult` 非空。测试状态目录位于 `~/.cache`。
 - `cargo test -p yuhaiin-runtime --all-features --offline --lib -- --nocapture`：通过（27 tests）；除既有 runtime/controller/route/proxy 回归外，新增验证 builtin TCP resolver 经纯 Tokio DNS TCP server 完成真实 loopback 查询
 - `cargo test -p yuhaiin-runtime --offline --lib -- --nocapture`：通过（13 tests）；追加 route settings 的 direct/proxy resolver 选择、primary resolver 失败/空结果回退，以及同一 ConfigStore 重建新 snapshot 后旧/新 route 行为隔离回归
 - `cargo test -p yuhaiin-runtime --all-features --offline --lib -- --nocapture`：通过（15 tests）；额外覆盖 `H2DohResolverFactory` 使用注入 connector 构造缓存 DoH resolver，以及 route_settings repository reload 读取

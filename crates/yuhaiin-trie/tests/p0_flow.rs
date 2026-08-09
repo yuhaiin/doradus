@@ -444,6 +444,9 @@ impl AsyncProxy for DuplexProxy {
 
 fn route_rule(pattern: &str) -> RouteRule {
     RouteRule {
+        rule_name: String::new(),
+        tag: String::new(),
+        list_names: Vec::new(),
         pattern: pattern.to_owned(),
         action: RuleAction::Proxy,
         network: Some(Network::Udp),

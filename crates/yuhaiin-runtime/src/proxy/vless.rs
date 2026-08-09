@@ -38,6 +38,7 @@ where
     context.source = Some(Endpoint::ip(Network::Tcp, peer));
     context.original_domain = destination.host().cloned();
     spec.annotate_context(&mut context);
+    selector.route_context(&mut context);
     match request.command {
         Command::Tcp => {
             let flow = TunFlowKey {
@@ -82,6 +83,7 @@ where
     context.source = Some(Endpoint::ip(Network::Udp, peer));
     context.original_domain = destination.host().cloned();
     spec.annotate_context(&mut context);
+    selector.route_context(&mut context);
     let flow = udp_flow_key(peer, &destination);
     let datagram: Arc<dyn AsyncDatagram> =
         Arc::from(selector.select(&context).open_datagram(&context).await?);

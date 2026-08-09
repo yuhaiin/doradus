@@ -733,6 +733,9 @@ pub fn expand_go_route_rule(
         .into_iter()
         .map(|variant| {
             Ok(RouteRule {
+                rule_name: record.name.clone(),
+                tag: record.tag.clone(),
+                list_names: variant.list_names,
                 pattern: variant.pattern.unwrap_or_default(),
                 action,
                 network: variant.network,
@@ -799,6 +802,9 @@ fn route_rule_from_root(record: &GoRouteRuleRecord, root: &Value) -> Result<Opti
     })?;
 
     Ok(Some(RouteRule {
+        rule_name: record.name.clone(),
+        tag: record.tag.clone(),
+        list_names: Vec::new(),
         pattern,
         action,
         network,
@@ -846,6 +852,7 @@ struct RuleVariant {
     process_names: Option<Vec<String>>,
     excluded_process_names: Option<Vec<String>>,
     excluded_patterns: Vec<String>,
+    list_names: Vec<String>,
 }
 
 fn parse_rule_expression(
@@ -919,6 +926,7 @@ fn parse_rule_expression_inner(
             if negated {
                 Ok(vec![RuleVariant {
                     excluded_patterns: patterns.to_vec(),
+                    list_names: vec![name],
                     ..RuleVariant::default()
                 }])
             } else {
@@ -926,6 +934,7 @@ fn parse_rule_expression_inner(
                     .iter()
                     .map(|pattern| RuleVariant {
                         pattern: Some(pattern.clone()),
+                        list_names: vec![name.clone()],
                         ..RuleVariant::default()
                     })
                     .collect())
@@ -1046,11 +1055,13 @@ fn parse_rule_expression_inner(
             Ok(vec![if negated {
                 RuleVariant {
                     excluded_process_names: Some(names),
+                    list_names: vec![name],
                     ..Default::default()
                 }
             } else {
                 RuleVariant {
                     process_names: Some(names),
+                    list_names: vec![name],
                     ..Default::default()
                 }
             }])
@@ -1143,6 +1154,10 @@ fn combine_all(
                 excluded_geo_countries.extend(right.excluded_geo_countries.iter().cloned());
                 excluded_geo_countries.sort_unstable_by_key(|country| country.to_ascii_lowercase());
                 excluded_geo_countries.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+                let mut list_names = left.list_names.clone();
+                list_names.extend(right.list_names.iter().cloned());
+                list_names.sort();
+                list_names.dedup();
                 combined.push(RuleVariant {
                     pattern: left.pattern.clone().or_else(|| right.pattern.clone()),
                     network,
@@ -1156,6 +1171,7 @@ fn combine_all(
                     excluded_inbound_names,
                     excluded_process_names,
                     excluded_patterns,
+                    list_names,
                 });
             }
         }
@@ -1627,6 +1643,17 @@ mod tests {
             .to_vec(),
         };
         let lists = load_route_lists(&[list]);
+        let expanded = expand_go_route_rule(
+            &record(
+                r#"{"mode":"proxy","rules":[{"type":"host","host":{"list":"domains"}}]}"#,
+                "proxy",
+                "all",
+            ),
+            &lists,
+        )
+        .unwrap();
+        assert!(!expanded.is_empty());
+        assert_eq!(expanded[0].list_names, vec!["domains"]);
         let router = compile_go_route_rules_with_lists(
             &[record(
                 r#"{"mode":"proxy","rules":[{"type":"host","host":{"list":"domains"}}]}"#,

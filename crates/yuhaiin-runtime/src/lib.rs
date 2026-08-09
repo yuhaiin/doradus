@@ -196,7 +196,16 @@ impl RuntimeSnapshot {
     }
 
     pub fn apply_route(&self, context: &mut FlowContext) -> RouteDecision {
-        self.router.apply_to_context(context)
+        let decision = self.router.apply_to_context(context);
+        context.resolver = self.route.as_ref().and_then(|route| {
+            let id = match decision.mode {
+                RouteMode::Proxy => route.proxy_resolver.trim(),
+                RouteMode::Direct | RouteMode::Bypass => route.direct_resolver.trim(),
+                RouteMode::Block => "",
+            };
+            (!id.is_empty()).then(|| id.to_owned())
+        });
+        decision
     }
 
     /// Create the NAT state and timeout that should be passed to

@@ -53,6 +53,7 @@ where
     context.source = Some(source);
     context.original_domain = destination.host().cloned();
     spec.annotate_context(&mut context);
+    selector.route_context(&mut context);
 
     let proxy = selector.select(&context);
     let outbound = match proxy.connect(&context).await {

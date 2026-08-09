@@ -955,7 +955,7 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         "hosts": "",
         "domain": domain,
         "ip": context.destination.addr().map(|addr| addr.ip().to_string()).unwrap_or_default(),
-        "tag": "",
+        "tag": context.tag.as_deref().unwrap_or_default(),
         "nodeId": context.outbound.as_deref().unwrap_or_default(),
         "nodeName": context.outbound_name.as_deref().unwrap_or_default(),
         "protocol": flow.key.network.to_string(),
@@ -967,11 +967,21 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         "component": context.component.as_deref().unwrap_or_default(),
         "udpMigrateId": context.udp_migrate_id.load(std::sync::atomic::Ordering::Relaxed).to_string(),
         "mode": route_mode(context.route_mode),
-        "matchHistory": [],
-        "resolver": "",
-        "geo": "",
+        "matchHistory": context
+            .match_history
+            .iter()
+            .map(|entry| json!({
+                "ruleName": entry.rule_name,
+                "history": entry.history.iter().map(|item| json!({
+                    "listName": item.list_name,
+                    "matched": item.matched,
+                })).collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+        "resolver": context.resolver.as_deref().unwrap_or_default(),
+        "geo": context.geo.as_deref().unwrap_or_default(),
         "outboundGeo": "",
-        "lists": [],
+        "lists": context.lists,
     })
 }
 
@@ -1075,6 +1085,36 @@ mod tests {
         assert_eq!(connection["pid"], "42");
         assert_eq!(connection["uid"], "1000");
         assert_eq!(connection["component"], "");
+    }
+
+    #[test]
+    fn monitor_preserves_route_explainability_metadata_in_connections() {
+        let monitor = ConnectionMonitor::new();
+        let (flow, mut context) = flow();
+        context.tag = Some("streaming".to_owned());
+        context.resolver = Some("secure-dns".to_owned());
+        context.geo = Some("CN".to_owned());
+        context.lists = vec!["media-hosts".to_owned()];
+        context.match_history = vec![yuhaiin_core::MatchHistoryEntry {
+            rule_name: "media-rule".to_owned(),
+            history: vec![yuhaiin_core::MatchResult {
+                list_name: "media-hosts".to_owned(),
+                matched: true,
+            }],
+        }];
+        monitor.opened(flow, context);
+
+        let connection = &monitor.connections_value()["connections"][0];
+        assert_eq!(connection["tag"], "streaming");
+        assert_eq!(connection["resolver"], "secure-dns");
+        assert_eq!(connection["geo"], "CN");
+        assert_eq!(connection["lists"][0], "media-hosts");
+        assert_eq!(connection["matchHistory"][0]["ruleName"], "media-rule");
+        assert_eq!(
+            connection["matchHistory"][0]["history"][0]["listName"],
+            "media-hosts"
+        );
+        assert_eq!(connection["matchHistory"][0]["history"][0]["matched"], true);
     }
 
     #[test]

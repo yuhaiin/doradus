@@ -279,6 +279,11 @@ pub trait AsyncProxy: Send + Sync {
 
 #[cfg(feature = "async-proxy")]
 pub trait AsyncProxySelector: Send + Sync {
+    /// Annotate a mutable flow with the route snapshot used for selection.
+    /// Static selectors intentionally leave this as a no-op; runtime-backed
+    /// selectors use it to keep management metadata and proxy choice aligned.
+    fn route_context(&self, _context: &mut FlowContext) {}
+
     fn select(&self, context: &FlowContext) -> Arc<dyn AsyncProxy>;
 }
 

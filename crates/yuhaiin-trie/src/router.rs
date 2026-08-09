@@ -3,7 +3,10 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use yuhaiin_core::{Endpoint, FlowContext, GeoLookup, Network, ResolverPolicy, RouteMode};
+use yuhaiin_core::{
+    Endpoint, FlowContext, GeoLookup, MatchHistoryEntry, MatchResult, Network, ResolverPolicy,
+    RouteMode,
+};
 
 #[cfg(feature = "async-proxy")]
 use yuhaiin_core::proxy::{AsyncProxy, AsyncProxySelector};
@@ -30,6 +33,11 @@ impl From<RuleAction> for RouteMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteRule {
+    /// Stable Go rule name used by the management and telemetry contracts.
+    pub rule_name: String,
+    pub tag: String,
+    /// Names of Go host/process lists contributing to this expanded rule.
+    pub list_names: Vec<String>,
     pub pattern: String,
     pub action: RuleAction,
     pub network: Option<Network>,
@@ -255,6 +263,19 @@ impl Router {
         endpoint: &Endpoint,
         context: Option<&FlowContext>,
     ) -> Option<RouteDecision> {
+        self.matched_rule(endpoint, context)
+            .map(|rule| RouteDecision {
+                mode: rule.action.into(),
+                resolver_policy: rule.resolver_policy,
+                priority: rule.priority,
+            })
+    }
+
+    fn matched_rule<'a>(
+        &'a self,
+        endpoint: &Endpoint,
+        context: Option<&FlowContext>,
+    ) -> Option<&'a RouteRule> {
         let candidates = self.rules.search(endpoint);
         self.global_rules
             .iter()
@@ -264,11 +285,20 @@ impl Router {
             // stops at the first match.  Lower priority values therefore win;
             // this is also what makes the UI's drag-and-drop order effective.
             .min_by_key(|rule| rule.priority)
-            .map(|rule| RouteDecision {
-                mode: rule.action.into(),
-                resolver_policy: rule.resolver_policy,
-                priority: rule.priority,
-            })
+    }
+
+    fn selected_rule<'a>(&'a self, context: &FlowContext) -> Option<&'a RouteRule> {
+        let packet = self.matched_rule(&context.destination, Some(context));
+        let Some(_) = context.original_domain else {
+            return packet;
+        };
+        let domain = self.matched_rule(&context.effective_destination(), Some(context));
+        match (packet, domain) {
+            (Some(packet), Some(domain)) if domain.priority <= packet.priority => Some(domain),
+            (Some(packet), _) => Some(packet),
+            (None, Some(domain)) => Some(domain),
+            (None, None) => None,
+        }
     }
 
     /// Evaluate both the packet tuple and a FakeIP-restored hostname.  A
@@ -287,6 +317,60 @@ impl Router {
             (None, Some(domain)) => domain,
             (None, None) => self.fallback.clone(),
         }
+    }
+
+    /// Apply the same route decision as `decide_context` and retain the
+    /// selected rule's explainability metadata on the flow.
+    pub fn apply_to_context(&self, context: &mut FlowContext) -> RouteDecision {
+        let decision = self
+            .selected_rule(context)
+            .map(|rule| RouteDecision {
+                mode: rule.action.into(),
+                resolver_policy: rule.resolver_policy,
+                priority: rule.priority,
+            })
+            .unwrap_or_else(|| self.fallback.clone());
+        if context.skip_route {
+            return decision;
+        }
+
+        context.route_mode = decision.mode;
+        context.resolver_policy = decision.resolver_policy;
+        context.tag = None;
+        context.match_history.clear();
+        context.lists.clear();
+        context.geo = None;
+        if let Some(rule) = self.selected_rule(context) {
+            context.tag = (!rule.tag.is_empty()).then(|| rule.tag.clone());
+            context.lists = rule.list_names.clone();
+            context.lists.sort();
+            context.lists.dedup();
+            if !rule.rule_name.is_empty() {
+                context.match_history.push(MatchHistoryEntry {
+                    rule_name: rule.rule_name.clone(),
+                    history: rule
+                        .list_names
+                        .iter()
+                        .map(|list_name| MatchResult {
+                            list_name: list_name.clone(),
+                            matched: true,
+                        })
+                        .collect(),
+                });
+            }
+        }
+        if let (Some(geo), Some(address)) = (
+            self.geo.as_deref(),
+            context
+                .effective_destination()
+                .addr()
+                .map(|address| address.ip()),
+        ) {
+            if let Ok(Some(country)) = geo.country_code(address) {
+                context.geo = Some(country);
+            }
+        }
+        decision
     }
 }
 
@@ -338,12 +422,7 @@ impl RouterRuntime {
     }
 
     pub fn apply_to_context(&self, context: &mut yuhaiin_core::FlowContext) -> RouteDecision {
-        let decision = self.snapshot().decide_context(context);
-        if !context.skip_route {
-            context.route_mode = decision.mode;
-            context.resolver_policy = decision.resolver_policy;
-        }
-        decision
+        self.snapshot().apply_to_context(context)
     }
 }
 
@@ -362,6 +441,10 @@ pub struct RoutedProxySelector {
 
 #[cfg(feature = "async-proxy")]
 impl AsyncProxySelector for RoutedProxySelector {
+    fn route_context(&self, context: &mut FlowContext) {
+        self.router.apply_to_context(context);
+    }
+
     fn select(&self, context: &yuhaiin_core::FlowContext) -> Arc<dyn AsyncProxy> {
         let mode = if context.skip_route {
             context.route_mode
@@ -389,6 +472,10 @@ pub struct RuntimeRoutedProxySelector {
 
 #[cfg(feature = "async-proxy")]
 impl AsyncProxySelector for RuntimeRoutedProxySelector {
+    fn route_context(&self, context: &mut FlowContext) {
+        self.router.apply_to_context(context);
+    }
+
     fn select(&self, context: &yuhaiin_core::FlowContext) -> Arc<dyn AsyncProxy> {
         let mode = if context.skip_route {
             context.route_mode
@@ -434,6 +521,9 @@ mod tests {
 
     fn rule(pattern: &str, action: RuleAction, priority: i32) -> RouteRule {
         RouteRule {
+            rule_name: String::new(),
+            tag: String::new(),
+            list_names: Vec::new(),
             pattern: pattern.to_owned(),
             action,
             network: None,
@@ -478,6 +568,39 @@ mod tests {
         let decision = router.decide(&endpoint);
         assert_eq!(decision.mode, RouteMode::Direct);
         assert!(!decision.resolver_policy.use_fake_ip);
+    }
+
+    #[test]
+    fn route_metadata_follows_the_selected_rule_and_geo_snapshot() {
+        let mut selected = rule("198.51.100.0/24", RuleAction::Proxy, 10);
+        selected.rule_name = "media-rule".to_owned();
+        selected.tag = "streaming".to_owned();
+        selected.list_names = vec!["media-hosts".to_owned(), "media-hosts".to_owned()];
+        let router = Router::compile(
+            vec![selected],
+            RouteDecision {
+                mode: RouteMode::Direct,
+                resolver_policy: ResolverPolicy::default(),
+                priority: 100,
+            },
+        )
+        .unwrap()
+        .with_geo_lookup(Arc::new(StaticGeo { code: Some("CN") }));
+        let mut context = FlowContext::new(Endpoint::ip(
+            Network::Tcp,
+            "198.51.100.7:443".parse().unwrap(),
+        ));
+
+        router.apply_to_context(&mut context);
+
+        assert_eq!(context.route_mode, RouteMode::Proxy);
+        assert_eq!(context.tag.as_deref(), Some("streaming"));
+        assert_eq!(context.lists, vec!["media-hosts"]);
+        assert_eq!(context.geo.as_deref(), Some("CN"));
+        assert_eq!(context.match_history.len(), 1);
+        assert_eq!(context.match_history[0].rule_name, "media-rule");
+        assert_eq!(context.match_history[0].history[0].list_name, "media-hosts");
+        assert!(context.match_history[0].history[0].matched);
     }
 
     #[test]

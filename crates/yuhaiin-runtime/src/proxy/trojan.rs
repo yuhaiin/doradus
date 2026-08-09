@@ -45,6 +45,7 @@ where
     context.source = Some(Endpoint::ip(Network::Tcp, peer));
     context.original_domain = destination.host().cloned();
     spec.annotate_context(&mut context);
+    selector.route_context(&mut context);
     let flow = TunFlowKey {
         network: Network::Tcp,
         source: peer,
@@ -102,6 +103,7 @@ where
                     context.source = Some(Endpoint::ip(Network::Udp, peer));
                     context.original_domain = target.host().cloned();
                     spec.annotate_context(&mut context);
+                    selector.route_context(&mut context);
                     let flow = TunFlowKey {
                         network: Network::Udp,
                         source: peer,

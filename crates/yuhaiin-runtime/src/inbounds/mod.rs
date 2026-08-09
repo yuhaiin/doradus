@@ -1439,8 +1439,10 @@ where
         "vless" => crate::proxy::vless::serve(stream, peer, spec, selector, monitor).await,
         "yuubinsya" => {
             if let Some(server) = yuubinsya_server {
-                crate::proxy::yuubinsya::serve_with_server(stream, peer, spec, server, monitor)
-                    .await
+                crate::proxy::yuubinsya::serve_with_server(
+                    stream, peer, spec, selector, server, monitor,
+                )
+                .await
             } else {
                 crate::proxy::yuubinsya::serve(stream, peer, spec, selector, monitor).await
             }

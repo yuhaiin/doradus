@@ -24,6 +24,7 @@
 > 2026-08-09 TUN inbound 服务级验收：先通过管理 API 写入 Go `inbounds_v2` 的 `empty/tun` 记录，再在 privileged、`--network=none` 的 Debian testing 容器中复用同一 SQLite 启动 runtime；容器内 `/sys/class/net/<tun-name>` 证实 TUN 由 `inbound::run_until` 持有，Podman SIGTERM 后设备消失且 exit code 为 0，随后独立 TUN probe 可重新打开同名设备。测试状态目录使用 `~/.cache/yuhaiin-rust-*`。
 >
 > 2026-08-09 连接元数据契约修复：monitor 不再把所有 `TunFlow` 统一序列化为 `component=tun`；普通 inbound 的 component 为空，只有 TUN runtime 注入 `component=tun`，并保留 TUN 的默认 inbound 标识。新增普通 inbound/TUN 双路径回归。
+> 2026-08-09 路由解释元数据链补齐：`RouterRuntime` 现在把命中的 Go rule name、tag、host/process list、match history 和 Geo country 写回共享 `FlowContext`；runtime selector 增加统一的可变 `route_context` 钩子，HTTP/SOCKS4A/SOCKS5/Trojan/VLESS/Yuubinsya/TUN 都在选择 outbound 前调用，因此普通连接与 TUN 连接的实际 proxy 选择、`connections` 实时字段和 `route.rules.test` 使用同一条路由快照。`resolver` 同步记录 route settings 选择的 resolver ID。新增 trie、route compiler、monitor 回归；Podman Debian testing host-network smoke 进一步创建真实 HTTP inbound 和 CIDR route rule，延迟 upstream 期间读取 `/api/v2/connections`，确认 live connection 返回 `tag=local-test`、`matchHistory[0].ruleName=local-rule`、`mode=direct`，再完成真实 HTTP 请求。
 
 ## 1. 目标、边界和完成定义
 

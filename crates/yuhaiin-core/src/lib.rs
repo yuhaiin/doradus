@@ -280,6 +280,14 @@ pub struct FlowContext {
     pub route_mode: RouteMode,
     pub resolver_policy: ResolverPolicy,
     pub original_domain: Option<DomainName>,
+    /// The rule selected by the route snapshot. This is deliberately kept on
+    /// the flow rather than in the monitor so protocol adapters and future
+    /// observability consumers see the same decision.
+    pub tag: Option<String>,
+    pub match_history: Vec<MatchHistoryEntry>,
+    pub lists: Vec<String>,
+    pub resolver: Option<String>,
+    pub geo: Option<String>,
     /// Management-plane identity of the component that accepted the flow.
     /// These fields are optional so packet-only callers do not need a second
     /// DTO or synthetic values.
@@ -308,6 +316,11 @@ impl FlowContext {
             route_mode: RouteMode::Proxy,
             resolver_policy: ResolverPolicy::default(),
             original_domain: None,
+            tag: None,
+            match_history: Vec::new(),
+            lists: Vec::new(),
+            resolver: None,
+            geo: None,
             component: None,
             inbound: None,
             inbound_name: None,
@@ -333,6 +346,18 @@ impl FlowContext {
         };
         Endpoint::domain(self.network, domain.clone(), port)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchHistoryEntry {
+    pub rule_name: String,
+    pub history: Vec<MatchResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchResult {
+    pub list_name: String,
+    pub matched: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

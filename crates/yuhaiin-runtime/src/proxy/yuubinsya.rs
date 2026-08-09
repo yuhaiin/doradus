@@ -41,14 +41,15 @@ pub(crate) async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let server = new_server(&spec, selector);
-    serve_with_server(stream, peer, spec, server, monitor).await
+    let server = new_server(&spec, Arc::clone(&selector));
+    serve_with_server(stream, peer, spec, selector, server, monitor).await
 }
 
 pub(crate) async fn serve_with_server<S>(
     stream: S,
     peer: SocketAddr,
     spec: InboundSpec,
+    selector: Arc<RuntimeProxySelector>,
     server: Arc<YuubinsyaServerProxy>,
     monitor: Arc<ConnectionMonitor>,
 ) -> Result<()>
@@ -56,9 +57,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let annotate = spec.clone();
+    let route = selector;
     server
         .serve_observed(stream, peer, monitor, move |context| {
-            annotate.annotate_context(context)
+            annotate.annotate_context(context);
+            // The server owns the routed upstream, so this callback is the
+            // mutable point where management metadata is attached.
+            route.route_context(context);
         })
         .await
 }
@@ -86,6 +91,7 @@ pub(crate) async fn serve_udp(
                     context.source = Some(peer.clone());
                     context.original_domain = target.host().cloned();
                     spec.annotate_context(&mut context);
+                    selector.route_context(&mut context);
                     let key = udp_flow_key(peer_addr, &target);
                     let datagram = selector.select(&context).open_datagram(&context).await?;
                     let datagram: Arc<dyn AsyncDatagram> = Arc::from(datagram);

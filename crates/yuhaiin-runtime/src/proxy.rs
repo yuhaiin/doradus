@@ -422,6 +422,14 @@ impl RuntimeProxySelector {
 }
 
 impl AsyncProxySelector for RuntimeProxySelector {
+    fn route_context(&self, context: &mut FlowContext) {
+        let current = self
+            .current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        current.route_context(context);
+    }
+
     fn select(&self, context: &FlowContext) -> Arc<dyn AsyncProxy> {
         let current = self
             .current

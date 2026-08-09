@@ -1890,7 +1890,7 @@ async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
     };
     let mut context = FlowContext::new(destination);
     let snapshot = state.controller.handle().load();
-    let decision = snapshot.router.apply_to_context(&mut context);
+    let decision = snapshot.apply_route(&mut context);
     let mode = match decision.mode {
         yuhaiin_core::RouteMode::Direct => "direct",
         yuhaiin_core::RouteMode::Proxy => "proxy",
@@ -1911,22 +1911,37 @@ async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
         .iter()
         .min_by_key(|(_, rule)| rule.priority)
         .map(|(record, _)| raw_json(&record.data_json, json!({})));
-    let tag = selected
-        .as_ref()
-        .map(|value| string_or(value, "tag", ""))
-        .unwrap_or_default();
-    let resolver = selected
-        .as_ref()
-        .map(|value| string_or(value, "resolver", ""))
-        .unwrap_or_default();
+    let tag = context.tag.clone().unwrap_or_else(|| {
+        selected
+            .as_ref()
+            .map(|value| string_or(value, "tag", ""))
+            .unwrap_or_default()
+    });
+    let resolver = context.resolver.clone().unwrap_or_else(|| {
+        selected
+            .as_ref()
+            .map(|value| string_or(value, "resolver", ""))
+            .unwrap_or_default()
+    });
+    let match_result = context
+        .match_history
+        .iter()
+        .flat_map(|entry| entry.history.iter())
+        .map(|item| {
+            json!({
+                "listName": item.list_name,
+                "matched": item.matched,
+            })
+        })
+        .collect::<Vec<_>>();
     json_value(json!({
         "mode": mode,
         "tag": tag,
         "resolver": resolver,
         "afterAddr": context.destination.to_string(),
-        "lists": [],
+        "lists": context.lists,
         "ips": [],
-        "matchResult": [],
+        "matchResult": match_result,
     }))
 }
 
