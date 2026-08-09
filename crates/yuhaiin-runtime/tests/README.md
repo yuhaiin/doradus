@@ -53,6 +53,12 @@ The current scenarios cover:
   API-layer fixture, invokes `node_latency` with a real UDP DNS server, and
   checks the selected proxy datagram path and DNS transaction in Podman. Logs
   are kept under `~/.cache/yuhaiin-rust/integration/node-latency-dns`.
+- `stats_concurrency.rs` starts the real runtime process, keeps an HTTP inbound
+  flow active while concurrent readers query connections, totals, traffic,
+  telemetry, history, and failed-history, then restarts the same SQLite state
+  and verifies persisted traffic/history remain readable. The reusable Podman
+  entry point is `scripts/integration/stats-concurrency.sh`; logs are kept
+  under `~/.cache/yuhaiin-rust/integration/stats-concurrency`.
 - standalone Go HTTP/2 transport wire compatibility is covered separately in
   `crates/yuhaiin-chain/tests/standalone_http2.rs`: fixed endpoint resolution,
   plaintext prior-knowledge H2, `CONNECT http://localhost`, raw bidirectional

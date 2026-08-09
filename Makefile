@@ -41,7 +41,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke \
+.PHONY: help build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -59,6 +59,7 @@ help:
 		'make doh-source-smoke   run DoH/DoT source-bind smoke in Podman' \
 		'make socks5-udp-associate-smoke run real SOCKS5 UDP chain smoke in Podman' \
 		'make node-latency-dns-smoke run API DNS latency chain smoke in Podman' \
+		'make stats-concurrency-smoke run concurrent statistics/restart smoke in Podman' \
 		'make run ARGS="..."    run the runtime binary with arguments' \
 		'make version            run the binary version command' \
 		'make check              cargo check for the whole workspace' \
@@ -110,6 +111,9 @@ socks5-udp-associate-smoke:
 
 node-latency-dns-smoke:
 	./scripts/integration/node-latency-dns.sh
+
+stats-concurrency-smoke:
+	./scripts/integration/stats-concurrency.sh
 
 build-chain-smoke:
 	$(CARGO) build $(CARGO_COMMON_ARGS) -p yuhaiin-chain --bin chain-smoke

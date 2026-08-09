@@ -423,7 +423,7 @@ async fn serve_udp_echo(socket: tokio::net::UdpSocket, mut shutdown: watch::Rece
 
 async fn handle_target(mut stream: TcpStream) {
     let mut buffer = vec![0u8; 16 * 1024];
-    let Ok(length) = stream.read(&mut buffer).await else {
+    let Ok(mut length) = stream.read(&mut buffer).await else {
         return;
     };
     if length == 0 {
@@ -434,7 +434,18 @@ async fn handle_target(mut stream: TcpStream) {
             .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .await;
     } else {
-        let _ = stream.write_all(&buffer[..length]).await;
+        loop {
+            if stream.write_all(&buffer[..length]).await.is_err() {
+                return;
+            }
+            let Ok(next_length) = stream.read(&mut buffer).await else {
+                return;
+            };
+            if next_length == 0 {
+                return;
+            }
+            length = next_length;
+        }
     }
 }
 
@@ -903,7 +914,9 @@ impl ServiceProcess {
     pub async fn start(db: &Path) -> Self {
         let api_address = reserve_loopback().await;
         let diagnostics = Arc::new(Mutex::new(String::new()));
-        let mut child = Command::new(env!("CARGO_BIN_EXE_yuhaiin"))
+        let runtime_binary = std::env::var_os("YUHAIIN_RUNTIME_BIN")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_yuhaiin").into());
+        let mut child = Command::new(runtime_binary)
             .env("YUHAIIN_DB", db)
             .env("YUHAIIN_HTTP", api_address.to_string())
             .env("YUHAIIN_QUIET", "1")

@@ -1949,3 +1949,30 @@ test api::tests::direct_node_latency_dns_uses_the_selected_proxy_datagram ... ok
 
 这补齐了当前 checklist 中 node latency 的基础 DNS/UDP 网络闭环；更复杂 outbound、失败
 重试和长生命周期统计仍属于后续增强项。
+
+## 52. 2026-08-10 concurrent statistics process smoke
+
+为补充统计项的进程级证据，新增 `tests/stats_concurrency.rs` 和
+`scripts/integration/stats-concurrency.sh`。测试启动真实 runtime 子进程，建立 HTTP
+inbound → HTTP outbound 的长连接，在流量持续更新期间并发读取以下管理接口：
+
+- `connections`
+- `connections/total`
+- `connections/traffic`
+- `connections/telemetry`
+- `connections/history`
+- `connections/failed-history`
+
+流量连接关闭后，测试停止 runtime，再用同一个 SQLite 状态重启并确认最终 traffic/history
+仍可读取。Podman 入口使用 Debian testing host-network，构建产物和日志均位于
+`~/.cache/yuhaiin-rust/integration/stats-concurrency`，没有使用 `/tmp`。
+
+实际执行结果：
+
+```text
+test concurrent_stats_readers_survive_flow_updates_and_restart ... ok
+[stats-concurrency] passed
+```
+
+这只证明 Rust runtime 自身的并发 reader、流量更新和重启读回边界；它不替代 Go 进程并发
+读写、生产数据库逐字段快照及升级期间锁竞争验收，因此 checklist 的统计项仍保持 `[~]`。
