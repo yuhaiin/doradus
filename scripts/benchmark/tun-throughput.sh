@@ -8,6 +8,10 @@ scenario_dir="${YUHAIIN_TUN_BENCH_DIR:-${cache_root}/benchmarks/tun-throughput}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 bytes="${YUHAIIN_TUN_BENCH_BYTES:-4194304}"
 binary="${target_dir}/release/tun-smoke"
+debug_env=()
+if [[ -n "${YUHAIIN_TUN_DEBUG:-}" ]]; then
+  debug_env=(-e YUHAIIN_TUN_DEBUG=1)
+fi
 
 mkdir -p "${scenario_dir}"
 
@@ -30,6 +34,7 @@ podman run --rm --privileged --network=none \
   -e YUHAIIN_TUN_NAME=yrtun-bench0 \
   -e YUHAIIN_TUN_PROXY_THROUGHPUT=1 \
   -e YUHAIIN_TUN_BENCH_BYTES="${bytes}" \
+  "${debug_env[@]}" \
   --entrypoint /usr/local/bin/tun-smoke \
   "${image}" \
   2>&1 | tee "${scenario_dir}/podman.log"

@@ -5331,9 +5331,9 @@ mod tests {
     #[tokio::test]
     async fn every_generated_frontend_rpc_operation_has_a_route() {
         // Keep this inventory synchronized with yuhaiin-react/src/api/generated.ts.
-        // connections.events is intentionally excluded: it is a GET/SSE
-        // endpoint. tools.logs and tools.logs.v2 also have GET/SSE aliases,
-        // but their JSON-RPC routes remain part of this inventory.
+        // The generated operation inventory also contains connections.events;
+        // its useful transport is GET/SSE, but the JSON-RPC route must still
+        // remain registered so the frontend operation set has one boundary.
         const OPERATIONS: &[&str] = &[
             "backup.config.get",
             "backup.config.put",
@@ -5341,6 +5341,7 @@ mod tests {
             "backup.run",
             "connections",
             "connections.close",
+            "connections.events",
             "connections.failed_history",
             "connections.history",
             "connections.telemetry",
@@ -5423,10 +5424,27 @@ mod tests {
             "users.get",
             "users.post",
         ];
-        assert_eq!(OPERATIONS.len(), 87);
+        assert_eq!(OPERATIONS.len(), 88);
 
         let app = router(state().await);
         for operation in OPERATIONS {
+            if *operation == "connections.events" {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::get("/api/v2/connections/events")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "generated frontend streaming operation {operation} is not routed",
+                );
+                continue;
+            }
             let response = app
                 .clone()
                 .oneshot(

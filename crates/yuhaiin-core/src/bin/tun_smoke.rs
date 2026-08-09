@@ -322,6 +322,7 @@ fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
     async_runtime.block_on(async move {
         let target = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let target_address = target.local_addr()?;
+        let (target_release_tx, target_release_rx) = tokio::sync::oneshot::channel::<()>();
         let target_task = tokio::spawn(async move {
             let (mut stream, _) = target.accept().await?;
             let mut buffer = vec![0u8; 64 * 1024];
@@ -342,6 +343,7 @@ fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
                 tokio::io::AsyncWriteExt::write_all(&mut stream, &buffer[..length]).await?;
                 remaining -= length;
             }
+            let _ = target_release_rx.await;
             Ok::<(), std::io::Error>(())
         });
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -354,24 +356,21 @@ fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
                     Duration::from_secs(10),
                 )?;
                 stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-                stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+                let mut writer_stream = stream.try_clone()?;
+                writer_stream.set_write_timeout(Some(Duration::from_secs(10)))?;
                 let payload = vec![0x5a; 64 * 1024];
                 let started = Instant::now();
                 #[cfg(target_os = "linux")]
                 let mut usage = ProcessUsage::default();
-                let mut sent = 0usize;
-                while sent < total_bytes {
-                    let length = (total_bytes - sent).min(payload.len());
-                    stream.write_all(&payload[..length])?;
-                    sent += length;
-                    #[cfg(target_os = "linux")]
-                    if let Some(reading) = read_process_usage() {
-                        usage.peak_rss_kib = usage.peak_rss_kib.max(reading.rss_kib);
-                        usage.samples = usage.samples.saturating_add(1);
-                        usage.first_cpu_ticks.get_or_insert(reading.cpu_ticks);
-                        usage.last_cpu_ticks = Some(reading.cpu_ticks);
+                let writer = std::thread::spawn(move || -> std::io::Result<()> {
+                    let mut sent = 0usize;
+                    while sent < total_bytes {
+                        let length = (total_bytes - sent).min(payload.len());
+                        writer_stream.write_all(&payload[..length])?;
+                        sent += length;
                     }
-                }
+                    writer_stream.shutdown(std::net::Shutdown::Write)
+                });
                 let mut received = 0usize;
                 let mut response = vec![0u8; 64 * 1024];
                 while received < total_bytes {
@@ -397,7 +396,10 @@ fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
                         usage.last_cpu_ticks = Some(reading.cpu_ticks);
                     }
                 }
-                stream.shutdown(std::net::Shutdown::Write)?;
+                let _ = target_release_tx.send(());
+                writer
+                    .join()
+                    .map_err(|_| std::io::Error::other("TUN benchmark writer thread panicked"))??;
                 #[cfg(target_os = "linux")]
                 let (peak_rss_kib, cpu_ticks, proc_samples) =
                     (usage.peak_rss_kib, usage.cpu_ticks(), usage.samples);

@@ -55,6 +55,13 @@ use crate::dns::{AsyncDnsHandler, DnsHandler, answer_query};
 #[cfg(feature = "async-proxy")]
 use crate::proxy::{AsyncProxy, AsyncProxySelector};
 
+#[cfg(feature = "async-proxy")]
+fn tun_debug(message: impl std::fmt::Display) {
+    if std::env::var_os("YUHAIIN_TUN_DEBUG").is_some() {
+        eprintln!("yuhaiin-rust: tun-debug: {message}");
+    }
+}
+
 pub const DEFAULT_MTU: usize = 1500;
 pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
 
@@ -696,7 +703,10 @@ impl TunDispatcher {
                 self.events.push_back(TunEvent::TcpOpened { flow });
             }
             while socket.can_recv() {
-                let mut payload = vec![0; socket.recv_capacity()];
+                // `recv_capacity` is the remaining socket buffer, not the
+                // size of the next packet. Keep each event bounded so a fast
+                // TUN stream cannot allocate one large Vec per segment.
+                let mut payload = vec![0; socket.recv_capacity().min(64 * 1024)];
                 match socket.recv_slice(&mut payload) {
                     Ok(length) if length != 0 => {
                         payload.truncate(length);
@@ -1111,10 +1121,12 @@ impl TunProxyRuntime {
                 self.send_command_or_cleanup(&flow.key, ProxyCommand::Data(payload))?;
             }
             TunEvent::TcpHalfClosed { flow } => {
+                tun_debug(format!("TUN TCP half-closed flow={:?}", flow.key));
                 self.touch_flow(flow.key)?;
                 self.send_command_or_cleanup(&flow.key, ProxyCommand::Shutdown)?;
             }
             TunEvent::TcpClosed { flow } => {
+                tun_debug(format!("TUN TCP socket closed flow={:?}", flow.key));
                 self.remove_task(&flow.key);
                 self.untrack_flow(&flow.key)?;
             }
@@ -1239,7 +1251,10 @@ impl TunProxyRuntime {
                     if let Some(observer) = &self.observer {
                         observer.bytes(flow, TunFlowDirection::Download, payload.len());
                     }
-                    if dispatcher.write_tcp(flow, &payload).is_err() {
+                    if let Err(error) = dispatcher.write_tcp(flow, &payload) {
+                        tun_debug(format!(
+                            "TCP output backpressure/close flow={flow:?}: {error}"
+                        ));
                         self.pending_tcp.entry(flow).or_default().push_back(payload);
                         break;
                     }
@@ -1268,6 +1283,7 @@ impl TunProxyRuntime {
                     }
                 }
                 ProxyOutput::TcpClosed { flow } => {
+                    tun_debug(format!("TCP proxy task closed flow={flow:?}"));
                     let _ = dispatcher.close_tcp(flow);
                     self.pending_tcp.remove(&flow);
                     self.remove_task(&flow);
@@ -1298,7 +1314,12 @@ impl TunProxyRuntime {
             .map(|(flow, _)| *flow)
             .collect();
         for flow in finished_tcp {
-            if self.tasks.remove(&flow).is_some() {
+            if let Some(task) = self.tasks.remove(&flow) {
+                if let Some(Err(error)) = task.join.now_or_never() {
+                    tun_debug(format!(
+                        "TCP proxy task ended with join error flow={flow:?}: {error}"
+                    ));
+                }
                 let _ = dispatcher.close_tcp(flow);
                 self.untrack_flow(&flow)?;
             }
@@ -1644,10 +1665,12 @@ async fn run_tcp_proxy(
     let stream = match tokio::time::timeout(timeouts.connect, proxy.connect(&context)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(_)) => {
+            tun_debug(format!("TCP proxy connect failed flow={flow:?}"));
             let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
             return;
         }
         Err(_) => {
+            tun_debug(format!("TCP proxy connect timed out flow={flow:?}"));
             let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
             return;
         }
@@ -1661,14 +1684,17 @@ async fn run_tcp_proxy(
             result = tokio::time::timeout(timeouts.read, tokio::io::AsyncReadExt::read(&mut reader, &mut buffer)) => {
                 match result {
                     Ok(Ok(0)) => {
+                        tun_debug(format!("TCP proxy remote EOF flow={flow:?}"));
                         let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
                         return;
                     }
                     Ok(Err(_)) => {
+                        tun_debug(format!("TCP proxy remote read failed flow={flow:?}"));
                         let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
                         return;
                     }
                     Err(_) => {
+                        tun_debug(format!("TCP proxy remote read timed out flow={flow:?}"));
                         let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
                         return;
                     }
@@ -1679,6 +1705,7 @@ async fn run_tcp_proxy(
                             ProxyOutput::TcpData { flow, payload: buffer[..length].to_vec() },
                             timeouts.idle,
                         ).await {
+                            tun_debug(format!("TCP proxy output channel timed out flow={flow:?}"));
                             let _ = tokio::time::timeout(
                                 timeouts.write,
                                 tokio::io::AsyncWriteExt::shutdown(&mut writer),
@@ -1698,6 +1725,7 @@ async fn run_tcp_proxy(
                         )
                         .await;
                         if !matches!(write, Ok(Ok(()))) {
+                            tun_debug(format!("TCP proxy remote write failed flow={flow:?}"));
                             let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
                             return;
                         }
@@ -1715,6 +1743,7 @@ async fn run_tcp_proxy(
                 }
             }
             _ = &mut idle => {
+                tun_debug(format!("TCP proxy idle timeout flow={flow:?}"));
                 let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
                 return;
             }

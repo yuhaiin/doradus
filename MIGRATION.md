@@ -1584,8 +1584,9 @@ Rust binary 在当前环境的 musl loader 初始化阶段会段错误，因此 
 
 此前虽然已经静态核对 React `generated.ts` 的 88 个 operation，但单个 operation
 后续被删路由时，workspace 测试不会自动报警。现在 `yuhaiin-runtime` 的 API 单测维护
-React operation inventory：87 个 JSON-RPC operation 逐个发空 JSON 请求并断言不能返回
-404；`connections.events`、`tools/logs` 和 `tools/logs/v2` 的直接 GET/SSE 路由另外断言
+React operation inventory：88 个 operation 已按真实传输逐项检查，其中 87 个 JSON-RPC
+operation 逐个发空 JSON 请求并断言不能返回 404，`connections.events`、`tools/logs` 和
+`tools/logs/v2` 的直接 GET/SSE 路由另外断言
 200 及 `text/event-stream`。该测试不要求 mutation 的空参数成功，因此不会掩盖参数校验；
 它专门保证前端可见 operation 仍然进入 Rust handler。`cargo test -p yuhaiin-runtime
 every_generated_frontend_rpc_operation_has_a_route --all-features` 已通过。
