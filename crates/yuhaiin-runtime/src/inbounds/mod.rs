@@ -300,6 +300,85 @@ async fn start_listeners(
                 continue;
             }
         };
+        if spec.protocol.eq_ignore_ascii_case("tproxy")
+            || spec.protocol.eq_ignore_ascii_case("redir")
+        {
+            if spec.udp_mode.udp_enabled() && spec.protocol.eq_ignore_ascii_case("tproxy") {
+                monitor.warn(format!(
+                    "start UDP inbound {}: Linux transparent UDP requires TPROXY ancillary data and CAP_NET_ADMIN",
+                    spec.id
+                ));
+            } else if spec.udp_mode.udp_enabled() {
+                monitor.warn(format!(
+                    "ignore UDP inbound {}: Go redir contract disables UDP",
+                    spec.id
+                ));
+            }
+            if tls_acceptor.is_some() {
+                monitor.warn(format!(
+                    "skip inbound {}: transparent TLS transport is not implemented yet",
+                    spec.id
+                ));
+                continue;
+            }
+            if spec.transports.iter().any(|transport| {
+                !transport.eq_ignore_ascii_case("normal") && !transport.eq_ignore_ascii_case("tls")
+            }) {
+                monitor.warn(format!(
+                    "skip inbound {}: transparent listener transport is not implemented",
+                    spec.id
+                ));
+                continue;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let is_tproxy = spec.protocol.eq_ignore_ascii_case("tproxy");
+                let udp_enabled = spec.udp_mode.udp_enabled();
+                let udp_spec = spec.clone();
+                let protocol = spec.protocol.clone();
+                let listener_spec = spec;
+                let listener_selector = selector.clone();
+                let listener_monitor = monitor.clone();
+                let logs = listener_monitor.logs();
+                listeners.push(tokio::spawn(async move {
+                    if let Err(error) = crate::proxy::transparent::serve_listener(
+                        listener_spec.listen,
+                        protocol,
+                        listener_spec,
+                        listener_selector,
+                        listener_monitor,
+                    )
+                    .await
+                    {
+                        logs.error(format!("transparent inbound listener stopped: {error}"));
+                    }
+                }));
+                if udp_enabled && is_tproxy {
+                    let selector = selector.clone();
+                    let monitor = monitor.clone();
+                    let spec = udp_spec;
+                    let logs = monitor.logs();
+                    listeners.push(tokio::spawn(async move {
+                        if let Err(error) = crate::proxy::transparent::serve_udp_listener(
+                            spec.listen,
+                            spec,
+                            selector,
+                            monitor,
+                        )
+                        .await
+                        {
+                            logs.error(format!("transparent UDP listener stopped: {error}"));
+                        }
+                    }));
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            monitor.warn(format!(
+                "skip inbound {}: tproxy/redir require Linux socket support",
+                spec.id
+            ));
+            continue;
+        }
         if has_transport(&spec.transports, "websocket") {
             if spec.udp_mode.udp_enabled() {
                 monitor.warn(format!(
@@ -581,20 +660,37 @@ impl InboundSpec {
             .pointer("/network/type")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(record.network_type.as_str());
-        if !network_type.eq_ignore_ascii_case("tcp_udp") {
+        let protocol_value = value.pointer("/protocol").cloned().unwrap_or_default();
+        let section = protocol_value.get(&protocol).cloned().unwrap_or_default();
+        if !network_type.eq_ignore_ascii_case("tcp_udp")
+            && !network_type.eq_ignore_ascii_case("empty")
+        {
             return Err(Error::new(
                 ErrorKind::Unsupported,
                 format!("inbound network {network_type:?} is not a TCP listener"),
             ));
         }
-        let listen_text = value
-            .pointer("/network/tcp_udp/host")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
+        let listen_text = if network_type.eq_ignore_ascii_case("empty") {
+            section
+                .get("host")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+        } else {
+            value
+                .pointer("/network/tcp_udp/host")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+        };
         let listen = parse_listen_addr(listen_text)?;
-        let protocol_value = value.pointer("/protocol").cloned().unwrap_or_default();
-        let section = protocol_value.get(&protocol).cloned().unwrap_or_default();
-        let udp_mode = UdpMode::from_value(value.pointer("/network/tcp_udp/udp"));
+        let udp_mode = if network_type.eq_ignore_ascii_case("empty") {
+            if protocol.eq_ignore_ascii_case("tproxy") {
+                UdpMode::Enabled
+            } else {
+                UdpMode::Disabled
+            }
+        } else {
+            UdpMode::from_value(value.pointer("/network/tcp_udp/udp"))
+        };
         let username = section
             .get("username")
             .and_then(serde_json::Value::as_str)
@@ -1875,7 +1971,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             assert!(headers.starts_with("GET /base/health HTTP/1.1\r\n"));
             assert!(headers.contains("Host: 127.0.0.1:"));
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nreverse-ok!")
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nreverse-ok!")
                 .await
                 .unwrap();
             stream.shutdown().await.unwrap();
@@ -1971,6 +2067,24 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         assert_eq!(reverse_http.path, "/base");
         assert_eq!(reverse_http.authority, "api.example");
         assert_eq!(reverse_http.target.port(), Some(443));
+
+        let tproxy = InboundSpec::from_record(GoInboundRecord {
+            id: "tproxy".to_owned(),
+            name: "TProxy".to_owned(),
+            enabled: true,
+            network_type: "empty".to_owned(),
+            protocol_type: "tproxy".to_owned(),
+            transport_types_json: br#"[]"#.to_vec(),
+            updated_at: 1,
+            data_json: br#"{
+                "network":{"type":"empty"},
+                "protocol":{"type":"tproxy","tproxy":{"host":"127.0.0.1:12345"}}
+            }"#
+            .to_vec(),
+        })
+        .unwrap();
+        assert_eq!(tproxy.listen, "127.0.0.1:12345".parse().unwrap());
+        assert_eq!(tproxy.udp_mode, UdpMode::Enabled);
     }
 
     #[tokio::test]

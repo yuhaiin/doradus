@@ -102,7 +102,7 @@ flowchart LR
 | `[x]` | WebSocket transport | 是 | 是 | `core::websocket`, runtime/protocol |
 | `[x]` | protocol wrappers | inbound/outbound 共用 | inbound/outbound 共用 | `yuhaiin-protocol` |
 | `[x]` | Go 低频 inbound：`reverse_http` / `reverse_tcp` | 是；目标地址/URL 解析后复用共享 router、outbound、relay 和 monitor | reverse TCP 原始流、reverse HTTP 请求改写/原始流回退均有 loopback 单测；HTTPS target 受 `doh-tls` feature 控制 | 继续补 Go fixture 互操作 |
-| `[~]` | Linux 透明 inbound：`tproxy` / `redir` | 否；当前会记录并跳过 | 需要 Linux 原始目标地址 ancillary/socket redirect 能力、权限边界和 Podman 验收；不属于 Tailscale 等复杂协议，不能永久遗漏 | 先做 Linux capability probe，再实现 TCP/UDP 原始目标地址适配与 fail-closed 测试 |
+| `[~]` | Linux 透明 inbound：`tproxy` / `redir` | TCP 已接入；TPROXY UDP 已接入；redir 按 Go contract 禁用 UDP | Linux TCP 使用 `IP_TRANSPARENT`、`SO_ORIGINAL_DST`/`IP6T_SO_ORIGINAL_DST`，TPROXY UDP 使用原目标 ancillary；仍需 CAP_NET_ADMIN、iptables/nftables 和 Podman 网络命名空间验收；TLS/WS 等透明 transport fail-closed | 用 Podman + TPROXY/REDIRECT 规则做真实 TCP/UDP acceptance，再补权限失败和多 flow 回归 |
 
 ### 6.2 连接链路与策略
 
@@ -197,4 +197,4 @@ podman run --rm --network=host \
 3. 补发布切换/rollback 手册：binary 替换、SQLite backup、失败回滚、旧 Go 并行运行和状态目录锁。
 4. 对现有 frontend generated operations 做一次逐项 route/schema 快照比对；subscription 维持明确的 deferred 状态。
 5. 每完成一项，只修改本模块表格、验收命令和 `MIGRATION.md` 的一条 dated entry，不再把所有历史细节堆回本文件。
-6. 补齐 Linux `tproxy`/`redir`：先做 capability/权限探测，再接入原始目标地址和 UDP 透明转发测试。
+6. 验收 Linux `tproxy`/`redir`：用 Podman 网络命名空间和 iptables/nftables 规则覆盖 TCP 原目标、TPROXY UDP ancillary、redir IPv4/IPv6、权限失败及多 flow 生命周期。

@@ -24,6 +24,9 @@ pub(crate) mod reverse;
 pub(crate) mod socks4a;
 #[path = "proxy/socks5.rs"]
 pub(crate) mod socks5;
+#[cfg(target_os = "linux")]
+#[path = "proxy/transparent.rs"]
+pub(crate) mod transparent;
 #[path = "proxy/trojan.rs"]
 pub(crate) mod trojan;
 #[path = "proxy/vless.rs"]
