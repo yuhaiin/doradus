@@ -69,6 +69,60 @@ fn failed_go_import_rolls_back_and_retries_after_schema_repair() {
     );
     remove_database_artifacts(&path);
 }
+
+#[test]
+fn additive_go_schema_v7_is_opened_without_dropping_subscription_tables() {
+    let path = test_database_path();
+    {
+        let connection = Connection::open(path.to_str().unwrap()).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../tests/fixtures/go_sqlite_v6_production_snapshot.sql"
+            ))
+            .unwrap();
+        connection
+            .execute_batch(
+                "UPDATE metadata SET value = '7' WHERE key = 'schema_version';
+                 INSERT INTO migrate (version, name, applied_at)
+                     VALUES (7, 'subscription_node_user_links', 0);
+                 CREATE TABLE subscription_nodes_v2 (
+                     subscription_name TEXT NOT NULL,
+                     node_id TEXT NOT NULL,
+                     PRIMARY KEY (subscription_name, node_id)
+                 );
+                 INSERT INTO subscription_nodes_v2 (subscription_name, node_id)
+                     VALUES ('remote', 'node-1');",
+            )
+            .unwrap();
+    }
+
+    let store = block_on(ConfigStore::open(&path)).unwrap();
+    assert_eq!(
+        block_on(store.repository().list_proxy_nodes())
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(store);
+
+    let connection = Connection::open(path.to_str().unwrap()).unwrap();
+    assert!(table_exists(&connection, "subscription_nodes_v2"));
+    assert_eq!(
+        connection
+            .query("SELECT COUNT(*) FROM subscription_nodes_v2")
+            .unwrap()[0]
+            .get(0),
+        Some(&SqliteValue::Integer(1))
+    );
+    assert_eq!(
+        connection
+            .query("SELECT value FROM yuhaiin_meta WHERE key = 'go_schema_version'")
+            .unwrap()[0]
+            .get(0),
+        Some(&SqliteValue::Integer(7))
+    );
+    remove_database_artifacts(&path);
+}
 #[test]
 fn go_route_udp_proxy_fqdn_codes_preserve_known_and_unknown_semantics() {
     let base = GoRouteSettingsRecord {
@@ -380,7 +434,7 @@ fn future_go_schema_version_fails_closed_and_retries_after_contract_upgrade() {
             ))
             .unwrap();
         connection
-            .execute("UPDATE metadata SET value = '7' WHERE key = 'schema_version'")
+            .execute("UPDATE metadata SET value = '8' WHERE key = 'schema_version'")
             .unwrap();
     }
 
@@ -389,7 +443,7 @@ fn future_go_schema_version_fails_closed_and_retries_after_contract_upgrade() {
         Err(error) => error,
     };
     assert_eq!(error.kind, ErrorKind::Storage);
-    assert!(error.message.contains("unsupported Go schema version 7"));
+    assert!(error.message.contains("unsupported Go schema version 8"));
     {
         let connection = Connection::open(path.to_str().unwrap()).unwrap();
         assert!(!meta_flag(&connection, "go_schema_imported"));
@@ -430,7 +484,7 @@ fn future_go_migration_version_without_metadata_fails_closed_and_retries() {
         connection
             .execute_batch(
                 "DELETE FROM metadata WHERE key = 'schema_version';
-                 UPDATE migrate SET version = 7 WHERE version = 6;",
+                 UPDATE migrate SET version = 8 WHERE version = 6;",
             )
             .unwrap();
     }
@@ -440,12 +494,12 @@ fn future_go_migration_version_without_metadata_fails_closed_and_retries() {
         Err(error) => error,
     };
     assert_eq!(error.kind, ErrorKind::Storage);
-    assert!(error.message.contains("unsupported Go schema version 7"));
+    assert!(error.message.contains("unsupported Go schema version 8"));
     {
         let connection = Connection::open(path.to_str().unwrap()).unwrap();
         assert!(!meta_flag(&connection, "go_schema_imported"));
         connection
-            .execute("UPDATE migrate SET version = 6 WHERE version = 7")
+            .execute("UPDATE migrate SET version = 6 WHERE version = 8")
             .unwrap();
     }
 
@@ -506,9 +560,9 @@ fn go_metadata_and_migrate_versions_must_agree_and_be_supported() {
     let cases = [
         (
             "INSERT INTO migrate (version, name, applied_at)
-                 VALUES (7, 'future_version', 0);",
-            "DELETE FROM migrate WHERE version = 7;",
-            "unsupported Go schema version 7",
+                 VALUES (8, 'future_version', 0);",
+            "DELETE FROM migrate WHERE version = 8;",
+            "unsupported Go schema version 8",
         ),
         (
             "UPDATE metadata SET value = '5' WHERE key = 'schema_version';",

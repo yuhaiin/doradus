@@ -1520,3 +1520,13 @@ Rust 现在把字符串单值规范化为 `(port, port)`，仍拒绝空值、非
 - 带 RFC3339 `from/to` 的 `/api/v2/connections/traffic` 和 `telemetry`。
 
 状态副本和启动目录均位于 `~/.cache/yuhaiin-rust`，未使用 `/tmp`；原始 Go 数据库没有被写入。该 smoke 证明真实生产 route JSON 能完成启动和管理面读取，但不等价于已经覆盖所有节点协议的出站连通性，也不替代 Go/Rust 并发写入、异常终止和未建模表的逐字段快照验收。
+
+## 30. 2026-08-09 schema-7 接管与生产 history 合并
+
+本机另有一份真实 Go schema-7 状态：`metadata.schema_version=7`，包含 206 个 `nodes_v2`、13 个用户和 73 条 `subscription_nodes_v2` 关联。虽然当前 Go checkout 的迁移列表以 v6 为主，这份旧生产状态仍可被 Go 的 `Bootstrap` 打开；Rust 原先在读取 metadata/migrate 时直接拒绝 v7，无法完成直接替换。
+
+Rust 现在明确支持这个“仅新增用户/订阅关联表”的 v7 形状：共享 v2 表继续导入，Rust 暂不实现订阅刷新，但未知订阅表不删除、不重建，后续仍可由 Go 读取。实际接管后 `/api/v2/info`、settings、nodes、inbounds、resolvers、route/rules、connections/total 均返回 200。
+
+同一 smoke 还暴露了统计边界：历史 checkpoint 中存在多个相同 `(protocol, addr, process)` 的旧记录，Go 的 `connection_history` 主键不允许直接写入重复行。Rust 现在在 checkpoint 恢复、history API 和 Go projection 前统一合并 count，并保留最新连接详情/时间；修复后真实 schema-7 状态优雅停止成功，最终 `connection_history` 无重复主键，checkpoint history 从 1270 条归并为 1258 条。
+
+这次验证使用的副本和响应文件均位于 `~/.cache/yuhaiin-rust`，未修改 Go 原始数据库，也没有使用 `/tmp`。schema-8 及更高版本仍 fail-closed，直到完成对应表结构和枚举语义审计。

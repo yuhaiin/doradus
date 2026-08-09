@@ -551,7 +551,7 @@ impl ConnectionMonitor {
 
     pub fn all_history_value(&self) -> Value {
         let state = self.lock();
-        let mut items = state.history.clone();
+        let mut items = coalesce_history(state.history.clone());
         items.sort_by(|left, right| {
             history_time(right)
                 .cmp(&history_time(left))
@@ -559,7 +559,7 @@ impl ConnectionMonitor {
         });
         json!({
             "items": items,
-            "dumpProcessEnabled": state.history.iter().any(|item| {
+            "dumpProcessEnabled": items.iter().any(|item| {
                 item.get("connection")
                     .and_then(|connection| connection.get("process"))
                     .and_then(Value::as_str)
@@ -945,7 +945,7 @@ impl ConnectionMonitor {
         // compatibility, but start the live counter map empty like Go.
         state.counters.clear();
         state.buckets = persisted.buckets;
-        state.history = persisted.history;
+        state.history = coalesce_history(persisted.history);
         state.failed_history = persisted
             .failed_history
             .into_iter()
@@ -1005,16 +1005,19 @@ impl ConnectionMonitor {
             entry.0 = entry.0.saturating_add(bucket.download);
             entry.1 = entry.1.saturating_add(bucket.upload);
         }
-        for history in persisted.history {
-            let Ok(connection) = serde_json::from_slice::<Value>(&history.connection_json) else {
-                continue;
-            };
-            state.history.push(json!({
-                "connection": connection,
-                "count": history.count.to_string(),
-                "time": format_time(history.last_seen),
-            }));
-        }
+        let history = persisted
+            .history
+            .into_iter()
+            .filter_map(|history| {
+                let connection = serde_json::from_slice::<Value>(&history.connection_json).ok()?;
+                Some(json!({
+                    "connection": connection,
+                    "count": history.count.to_string(),
+                    "time": format_time(history.last_seen),
+                }))
+            })
+            .collect();
+        state.history = coalesce_history(history);
         state.history.sort_by_key(history_time);
         if state.history.len() > HISTORY_LIMIT {
             let excess = state.history.len() - HISTORY_LIMIT;
@@ -1076,8 +1079,7 @@ impl ConnectionMonitor {
                     download,
                 })
                 .collect(),
-            history: state
-                .history
+            history: coalesce_history(state.history.clone())
                 .iter()
                 .filter_map(|item| {
                     let connection = item.get("connection")?;
@@ -1097,11 +1099,7 @@ impl ConnectionMonitor {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_owned(),
-                        count: item
-                            .get("count")
-                            .and_then(Value::as_str)
-                            .and_then(|value| value.parse().ok())
-                            .unwrap_or(1),
+                        count: history_count(item),
                         last_seen: history_time(item),
                         connection_json: serde_json::to_vec(connection).ok()?,
                     })
@@ -1176,7 +1174,7 @@ impl ConnectionMonitor {
                     },
                 )
                 .collect(),
-            history: state.history.clone(),
+            history: coalesce_history(state.history.clone()),
             failed_history: state.failed_history.values().cloned().collect(),
             block_history: state.block_history.values().cloned().collect(),
         }
@@ -1346,6 +1344,44 @@ fn history_key(item: &Value) -> (String, String, String) {
             .unwrap_or_default()
             .to_owned(),
     )
+}
+
+fn history_count(item: &Value) -> u64 {
+    item.get("count")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            item.get("count")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(1)
+}
+
+/// Older Rust checkpoints can contain duplicate history rows after taking
+/// over a Go database. Go's SQLite projection keys history by
+/// `(protocol, addr, process_name)`, so normalize that key before exposing
+/// the API or writing the projection back.
+fn coalesce_history(items: Vec<Value>) -> Vec<Value> {
+    let mut merged = BTreeMap::<(String, String, String), Value>::new();
+    for item in items {
+        let key = history_key(&item);
+        if let Some(existing) = merged.get_mut(&key) {
+            let count = history_count(existing).saturating_add(history_count(&item));
+            if history_time(&item) >= history_time(existing) {
+                *existing = item;
+            }
+            existing["count"] = Value::String(count.to_string());
+        } else {
+            merged.insert(key, item);
+        }
+    }
+    let mut items = merged.into_values().collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        history_time(right)
+            .cmp(&history_time(left))
+            .then_with(|| history_key(left).cmp(&history_key(right)))
+    });
+    items
 }
 
 fn history_time(item: &Value) -> i64 {
@@ -1591,6 +1627,45 @@ mod tests {
         let history = monitor.all_history_value();
         assert_eq!(history["items"].as_array().unwrap().len(), 1);
         assert_eq!(history["items"][0]["count"], "2");
+    }
+
+    #[test]
+    fn monitor_coalesces_duplicate_checkpoint_history_before_go_projection() {
+        let monitor = ConnectionMonitor::new();
+        {
+            let mut state = monitor.lock();
+            state.history = vec![
+                json!({
+                    "connection": {
+                        "protocol": "",
+                        "addr": "example.com:443",
+                        "process": "browser"
+                    },
+                    "count": "2",
+                    "time": "2024-01-01T00:00:00Z"
+                }),
+                json!({
+                    "connection": {
+                        "protocol": "",
+                        "addr": "example.com:443",
+                        "process": "browser"
+                    },
+                    "count": "3",
+                    "time": "2024-01-02T00:00:00Z"
+                }),
+            ];
+        }
+
+        let snapshot = monitor.go_statistics_snapshot();
+        assert_eq!(snapshot.history.len(), 1);
+        assert_eq!(snapshot.history[0].count, 5);
+        assert_eq!(
+            monitor.all_history_value()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

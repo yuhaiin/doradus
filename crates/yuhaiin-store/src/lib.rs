@@ -53,11 +53,12 @@ pub use statistics::{
 pub use status::StorageStatus;
 
 const SCHEMA_VERSION: i64 = 3;
-// Go's current plain-contract schema is migration version 6.  A newer Go
-// schema may change table shape or enum semantics; importing it as v6 would
-// be a silent compatibility downgrade, so it must fail closed until the
-// corresponding contract is audited.
-const MAX_SUPPORTED_GO_SCHEMA_VERSION: i64 = 6;
+// Go schema 7 is an additive user/subscription-link migration. Rust does not
+// implement subscription refresh yet, but it can safely open the database,
+// import the shared v2 tables, and preserve the extra Go tables untouched.
+// Later versions still fail closed until their table/enum contracts are
+// audited.
+const MAX_SUPPORTED_GO_SCHEMA_VERSION: i64 = 7;
 pub const DEFAULT_NAT_IDLE_TIMEOUT_MS: i64 = 30_000;
 const BUSY_RETRY_ATTEMPTS: usize = 64;
 const BUSY_RETRY_MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
