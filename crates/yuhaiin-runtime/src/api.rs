@@ -1896,7 +1896,7 @@ async fn route_rules_get_value(state: &ApiState, input: &Value) -> ApiResult {
     )))
 }
 
-async fn get_route_rule_value(state: &ApiState, name: String, index: usize) -> ApiResult {
+async fn get_route_rule_value(state: &ApiState, name: String, _index: usize) -> ApiResult {
     let records = state
         .controller
         .store()
@@ -1905,8 +1905,7 @@ async fn get_route_rule_value(state: &ApiState, name: String, index: usize) -> A
         .await?;
     records
         .into_iter()
-        .filter(|record| record.name == name)
-        .nth(index)
+        .find(|record| record.name == name)
         .map(|record| Json(raw_json(&record.data_json, json!({"name": record.name}))))
         .ok_or_else(|| ApiError::not_found("route rule not found"))
 }
@@ -1923,8 +1922,21 @@ async fn save_route_rule_value(
         .repository()
         .list_go_route_rules()
         .await?;
-    let index =
-        index.unwrap_or_else(|| current.iter().filter(|record| record.name == name).count());
+    let existing = current.iter().find(|record| record.name == name);
+    let replace_legacy_id = existing.is_some_and(|record| record.id != name);
+    let priority = existing.map(|record| record.priority).unwrap_or_else(|| {
+        let requested = index.map(|value| value as i64).unwrap_or_default();
+        if requested > 0 {
+            requested
+        } else {
+            current
+                .iter()
+                .map(|record| record.priority)
+                .max()
+                .unwrap_or_default()
+                .saturating_add(1)
+        }
+    });
     set_string(&mut value, "name", name.clone());
     let returned = value.clone();
     let (match_type, pattern) = route_match(&value);
@@ -1946,9 +1958,12 @@ async fn save_route_rule_value(
         }
     }
     let record = GoRouteRuleRecord {
-        id: format!("{name}:{index}"),
+        // Go's v2 store uses the public rule name as the compatibility row
+        // id.  The URL index is only a legacy routing parameter; making it
+        // part of the id creates duplicate rules on every PUT.
+        id: name.clone(),
         name: name.clone(),
-        priority: index as i64,
+        priority,
         disabled: bool_or(&value, "disabled", false),
         action_mode: string_or(&value, "mode", "direct"),
         match_type,
@@ -1962,30 +1977,34 @@ async fn save_route_rule_value(
     state
         .controller
         .mutate_and_reload(move |store| async move {
+            if replace_legacy_id {
+                store
+                    .repository()
+                    .delete_go_route_rule_by_name(&record.name)
+                    .await?;
+            }
             store.repository().put_go_route_rule(&record).await
         })
         .await?;
     Ok(Json(returned))
 }
 
-async fn delete_route_rule_value(state: &ApiState, name: String, index: usize) -> ApiResult {
+async fn delete_route_rule_value(state: &ApiState, name: String, _index: usize) -> ApiResult {
     let records = state
         .controller
         .store()
         .repository()
         .list_go_route_rules()
         .await?;
-    let record = records
-        .into_iter()
-        .filter(|record| record.name == name)
-        .nth(index)
-        .ok_or_else(|| ApiError::not_found("route rule not found"))?;
+    if !records.iter().any(|record| record.name == name) {
+        return Err(ApiError::not_found("route rule not found"));
+    }
     let result = state
         .controller
         .mutate_and_reload(move |store| async move {
             store
                 .repository()
-                .delete_go_route_rule(&record.id)
+                .delete_go_route_rule_by_name(&name)
                 .await
                 .map(|_| ())
         })
@@ -3351,6 +3370,85 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["mode"], "drop");
         assert!(value.get("matchResult").is_some());
+    }
+
+    #[tokio::test]
+    async fn route_rule_url_index_does_not_create_duplicate_rules() {
+        let state = state().await;
+        let app = router(state.clone());
+        let created = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v2/route/rules")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"browser","mode":"direct","match":{"domain":"example.com"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+
+        let updated = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v2/route/rules/browser/999")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"mode":"drop","match":{"domain":"example.com"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+
+        let listed = route_rules_get_value(&state, &json!({"page":1,"pageSize":20}))
+            .await
+            .unwrap();
+        let browser_rules = listed.0["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["name"] == "browser")
+            .collect::<Vec<_>>();
+        assert_eq!(browser_rules.len(), 1);
+        assert_eq!(browser_rules[0]["index"], 1);
+
+        let fetched = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v2/route/rules/browser/0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let fetched: Value =
+            serde_json::from_slice(&to_bytes(fetched.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(fetched["mode"], "drop");
+
+        let deleted = app
+            .oneshot(
+                Request::delete("/api/v2/route/rules/browser/123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let listed = route_rules_get_value(&state, &json!({"page":1,"pageSize":20}))
+            .await
+            .unwrap();
+        assert!(
+            !listed.0["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"] == "browser")
+        );
     }
 
     #[tokio::test]

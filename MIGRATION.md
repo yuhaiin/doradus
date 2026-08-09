@@ -11,6 +11,10 @@
 
 > 2026-08-09 Go statistics takeover bridge：`yuhaiin-store` 新增 Go 统计表的 typed projection boundary。Rust 启动时在没有 `statistics.runtime` checkpoint 的情况下读取 `statistics_kv`、`traffic_hourly`、`connection_history`、`failed_connection_history` 以及 v6 telemetry dimension 表；`ConnectionMonitor` 的 history 按 Go 的 `(protocol, addr, process)` key 合并，并保留 `dumpProcessEnabled`、计数、最近时间和 JSON connection。正常 `shutdown()` 先写 Rust checkpoint，再在同一个 SQLite 写事务中替换 Go 兼容统计投影，使旧 Go 管理面可以继续看到最终 totals/traffic/history/telemetry。频繁写入仍使用紧凑 checkpoint，故 force-abort 后“checkpoint 可恢复”与“Go 统计表已更新”是两个明确边界，生产库版本矩阵和异常中断验证继续列在 checklist。
 
+> 2026-08-09 统计运行期投影：保留 2 秒级紧凑 `statistics.runtime` checkpoint 作为 crash recovery；checkpoint 成功后首次触发 Go 表投影，之后最多每 30 秒重写一次 `statistics_kv`、traffic/history/failure/telemetry 投影，避免每个 flow 都重写整套 Go 表。最终 shutdown 仍执行一次完整原子投影；异常中断时 Go 表只保证最近一次低频投影，完整恢复以 checkpoint 为准，跨进程可见性仍需 Podman/进程级验证。
+
+> 2026-08-09 路由规则 API 兼容性：GET/DELETE 忽略旧 URL 中的 `index`，PUT 更新已有名称时保留原 `priority`，并以公开 `name` 作为 Go 兼容表的 canonical `id`；删除按 `name` 完成并重新编号。这样前端重复编辑同一规则不会生成 `name:index` 重复行，旧数据中的非 canonical id 也会在更新时收敛。
+
 > 2026-08-09 管理列表 query 契约收口：Rust API 不再对 nodes、inbounds、resolvers、route lists、route rules 统一搜索整个 JSON，而是按 Go handler 的字段集合过滤，并在过滤后计算分页 `total`。节点只搜索 `id/name/group/origin/chain.type`，入站只搜索 `id/name/network.type/protocol.type`，resolver 搜索 `id/type/host/subnet/tlsServerName`，路由列表/规则分别使用 Go 的四个字段。查询仍保持大小写不敏感、分页字段兼容 camelCase；列表 API 的完整 response/error/reload 语义逐项验收仍在 checklist。
 
 > 2026-08-09 runtime socket policy：`useDefaultInterface/netInterface` 已在 immutable snapshot 中解析为接口 IPv4/IPv6 source addresses；统一 `SocketPolicyProxy` 将策略传递到 direct/fixed、HTTP CONNECT、SOCKS5、协议 wrapper、HTTP/2 Yuubinsya、直连 UOT 和 native UDP socket。连接建立按目标地址族选择 source address，selector reload 会替换策略而不影响旧 flow。新增 FlowContext/connector/runtime reload 回归，`cargo test -p yuhaiin-core --all-features --offline --lib` 通过 121 项，`cargo test -p yuhaiin-runtime --all-features --offline --lib` 通过 137 项；inbound listen socket 的平台专用绑定仍保留为平台验收项。

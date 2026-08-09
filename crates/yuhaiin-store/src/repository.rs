@@ -1001,6 +1001,57 @@ impl ConfigRepository {
         self.delete_go_compatibility_row("route_rules_v2", "id", id)
     }
 
+    /// Delete a Go route-rule contract by its public name and renumber the
+    /// remaining priorities, matching the v2 Go store.  The API addresses a
+    /// rule by name; the compatibility row id is an import detail and may not
+    /// equal that name in older snapshots.
+    pub async fn delete_go_route_rule_by_name(&self, name: &str) -> Result<bool> {
+        validate_id(name)?;
+        self.store.with_write_transaction(|connection| {
+            require_go_table(connection, "route_rules_v2", &["id", "name", "priority"])?;
+            let changed = connection
+                .execute_with_params(
+                    "DELETE FROM route_rules_v2 WHERE name = ?1",
+                    &[SqliteValue::from(name)],
+                )
+                .map_err(storage_error)?;
+            if changed == 0 {
+                return Ok(false);
+            }
+
+            let rows = connection
+                .query("SELECT name FROM route_rules_v2 ORDER BY priority, id")
+                .map_err(storage_error)?;
+            let names = rows
+                .iter()
+                .map(|row| row_text(row, 0, "route_rules_v2.name"))
+                .collect::<Result<Vec<_>>>()?;
+            for (index, rule_name) in names.iter().enumerate() {
+                connection
+                    .execute_with_params(
+                        "UPDATE route_rules_v2 SET priority = ?1 WHERE name = ?2",
+                        &[
+                            SqliteValue::from(-((index as i64) + 1)),
+                            SqliteValue::from(rule_name.as_str()),
+                        ],
+                    )
+                    .map_err(storage_error)?;
+            }
+            for (index, rule_name) in names.iter().enumerate() {
+                connection
+                    .execute_with_params(
+                        "UPDATE route_rules_v2 SET priority = ?1 WHERE name = ?2",
+                        &[
+                            SqliteValue::from((index as i64) + 1),
+                            SqliteValue::from(rule_name.as_str()),
+                        ],
+                    )
+                    .map_err(storage_error)?;
+            }
+            Ok(true)
+        })
+    }
+
     /// Reorder Go route rules atomically and renumber their persisted
     /// priorities.  The web API addresses rules by their user-visible name,
     /// matching Go's v2 contract; IDs and JSON payloads remain untouched.

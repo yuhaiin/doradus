@@ -346,6 +346,33 @@ fn go_route_rule_priority_reorders_and_renumbers_atomically() {
 }
 
 #[test]
+fn go_route_rule_delete_uses_public_name_and_renumbers_legacy_ids() {
+    let store = block_on(ConfigStore::open_memory()).unwrap();
+    let repository = store.repository();
+    for (id, name, priority) in [("legacy-alpha", "alpha", 3), ("beta", "beta", 9)] {
+        block_on(repository.put_go_route_rule(&GoRouteRuleRecord {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            priority,
+            disabled: false,
+            action_mode: "direct".to_owned(),
+            match_type: "domain".to_owned(),
+            tag: "default".to_owned(),
+            updated_at: 1,
+            data_json: format!(r#"{{"name":"{name}"}}"#).into_bytes(),
+        }))
+        .unwrap();
+    }
+
+    assert!(block_on(repository.delete_go_route_rule_by_name("alpha")).unwrap());
+    let rules = block_on(repository.list_go_route_rules()).unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].name, "beta");
+    assert_eq!(rules[0].priority, 1);
+    assert!(!block_on(repository.delete_go_route_rule_by_name("missing")).unwrap());
+}
+
+#[test]
 fn nat_config_defaults_to_full_cone_across_missing_delete_and_raw_legacy_rows() {
     let path = test_database_path();
     {

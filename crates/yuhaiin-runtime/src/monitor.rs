@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -30,6 +30,7 @@ use crate::RuntimeLog;
 
 const HISTORY_LIMIT: usize = 2048;
 const BUCKET_LIMIT: usize = 90 * 24 * 60;
+const GO_STATISTICS_PROJECTION_INTERVAL: Duration = Duration::from_secs(30);
 const PERSISTENCE_KEY: &str = "statistics.runtime";
 const PERSISTENCE_VERSION: u32 = 1;
 
@@ -260,6 +261,8 @@ impl ConnectionMonitor {
         let worker_persistence = persistence.clone();
         let worker = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(2));
+            let mut last_go_projection = Instant::now();
+            let mut project_go_statistics = true;
             loop {
                 tokio::select! {
                     _ = worker_persistence.dirty.notified() => {},
@@ -272,10 +275,25 @@ impl ConnectionMonitor {
                 }
                 let value = writer_monitor.persisted_json();
                 if let Ok(bytes) = serde_json::to_vec(&value) {
-                    let _ = worker_persistence
+                    let checkpoint_written = worker_persistence
                         .store
                         .put_config(PERSISTENCE_KEY, &bytes)
-                        .await;
+                        .await
+                        .is_ok();
+                    if checkpoint_written
+                        && (project_go_statistics
+                            || last_go_projection.elapsed() >= GO_STATISTICS_PROJECTION_INTERVAL)
+                    {
+                        // Keep the compact checkpoint as the crash-recovery
+                        // path, but refresh Go's public tables infrequently so
+                        // another Go/Rust management process can observe
+                        // recent totals without rewriting the tables per flow.
+                        let _ = worker_persistence
+                            .store
+                            .replace_go_statistics(&writer_monitor.go_statistics_snapshot());
+                        last_go_projection = Instant::now();
+                        project_go_statistics = false;
+                    }
                 }
             }
         });
