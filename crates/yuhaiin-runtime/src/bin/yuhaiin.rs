@@ -74,7 +74,7 @@ async fn run() -> Result<()> {
         .with_optional_auth(username, password);
     let signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        wait_for_process_shutdown().await;
         let _ = signal_tx.send(true);
     });
 
@@ -148,6 +148,28 @@ async fn wait_for_shutdown(mut receiver: watch::Receiver<bool>) {
         return;
     }
     while receiver.changed().await.is_ok() && !*receiver.borrow() {}
+}
+
+async fn wait_for_process_shutdown() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = sigterm.recv() => {},
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn io_error(error: impl std::fmt::Display) -> Error {

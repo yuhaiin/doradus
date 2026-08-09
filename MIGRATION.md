@@ -20,6 +20,7 @@
 > 2026-08-09 Podman runtime smoke：用 `cargo build -p yuhaiin-runtime --bin yuhaiin --all-features --offline` 构建 binary，在 Debian testing `--network=host` 容器中通过 API 创建 HTTP inbound；宿主机经 `127.0.0.1:18083` 访问本地 HTTP server，验证 API reload、HTTP inbound→direct outbound、history/traffic 统计。停止并重启同一容器后，`inbounds.get` 和 `connections.history` 均从 SQLite 读回。容器状态目录使用 `~/.cache/yuhaiin-rust-podman.*`，不使用 `/tmp`。
 > 2026-08-09 Podman live management smoke：在 Debian testing `--network=host` 容器中让 HTTP upstream 延迟响应，真实验证 `/api/v2/connections` 返回 live connection、非法 close ID 返回 `400`、合法 `connections/close` 返回 `200` 并使 relay 退出，随后 `/connections` 为空且 `/connections/history` 使用 Go 兼容的 `items` 形状；EventSource 收到初始 `connections_added`、建立连接的 `connections_added` 和关闭后的 `connections_removed`。另通过 `/api/v2/inbounds/{id}` PUT reload 验证旧 inbound 端口变为 `000`、新端口返回 `200`。测试临时目录均在 `~/.cache/yuhaiin-rust-*`。
 > 2026-08-09 统计持久化生命周期收口：`ConnectionMonitor` 现在拥有 SQLite persistence worker，并提供显式 `shutdown()`；inbound/DNS owner 收敛后，binary 会先执行 final flush、等待 writer 退出，再处理 backup restore，避免短连接/低流量统计丢失或与恢复竞态。新增回归不等待 2 秒周期即可重启读回最后一条 history/traffic；Podman Debian testing host-network smoke 已验证服务立即 SIGINT 退出后同一 SQLite 直接读回 history 和 total。
+> 2026-08-09 服务信号生命周期收口：Unix binary 同时监听 SIGINT 和 SIGTERM，并复用同一个 shutdown watch；Podman `stop --time 10` 已验证 inbound owner、DNS owner、统计 final flush 完成后以 exit code 0 退出，不再因只监听 Ctrl-C 而退化到 SIGKILL。
 
 ## 1. 目标、边界和完成定义
 
