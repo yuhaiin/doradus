@@ -4,7 +4,7 @@
 //! `PacketTunnelProvider`, and future embedders can create their platform TUN
 //! device themselves and hand the owned [`TunRuntime`] to the same runner.
 
-#[cfg(all(feature = "tun", feature = "tun-routes"))]
+#[cfg(all(feature = "tun", feature = "tun-routes", target_os = "linux"))]
 use std::net::IpAddr;
 #[cfg(feature = "tun")]
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -271,7 +271,7 @@ fn parse_ipv6_string(value: &Value) -> Option<(Ipv6Addr, u8)> {
     Some((address.parse().ok()?, prefix.parse().ok()?))
 }
 
-#[cfg(all(feature = "tun", feature = "tun-routes"))]
+#[cfg(all(feature = "tun", feature = "tun-routes", target_os = "linux"))]
 fn parse_tun_routes(routes: &[String]) -> Result<Vec<yuhaiin_core::tun::TunRoute>> {
     routes
         .iter()

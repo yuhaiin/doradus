@@ -25,6 +25,8 @@ mod route;
 #[cfg(feature = "doh-tls")]
 mod rustcrypto_resolver;
 mod settings;
+#[cfg(feature = "update")]
+pub mod update;
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;

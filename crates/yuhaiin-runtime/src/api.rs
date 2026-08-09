@@ -36,6 +36,7 @@ use yuhaiin_store::{
     GoRouteSettingsRecord, GoSubscriptionLinkRecord, MaxMindMetadataRecord,
 };
 
+use crate::update::UpdateService;
 use crate::{
     ProxyRouteListTransport, RouteListSnapshot, RouteListTransport, RuntimeController,
     download_route_url_with_transport, expand_go_route_rule, interfaces::discover_interfaces,
@@ -46,6 +47,7 @@ use crate::{
 pub struct ApiState {
     pub controller: RuntimeController,
     pub version: String,
+    pub update: Arc<UpdateService>,
     shutdown: Option<watch::Sender<bool>>,
     auth: Option<ApiAuth>,
 }
@@ -84,9 +86,14 @@ impl ApiAuth {
 
 impl ApiState {
     pub fn new(controller: RuntimeController) -> Self {
+        #[cfg(test)]
+        let update = Arc::new(UpdateService::test_stub());
+        #[cfg(not(test))]
+        let update = Arc::new(UpdateService::new());
         Self {
             controller,
             version: env!("CARGO_PKG_VERSION").to_owned(),
+            update,
             shutdown: None,
             auth: None,
         }
@@ -519,7 +526,7 @@ async fn rpc(
     };
     match operation.as_str() {
         "info" => info_value(&state),
-        "update.check" => update_check_value(&body),
+        "update.check" => update_check_value(&state, &body).await,
         "update.apply" => update_apply_value(&state, &body).await,
         "update.status" => update_status_value(&state).await,
         "settings.get" => settings_get_value(&state).await,
@@ -672,8 +679,8 @@ async fn info(State(state): State<ApiState>) -> ApiResult {
     info_value(&state)
 }
 
-async fn update_check(Json(value): Json<Value>) -> ApiResult {
-    update_check_value(&value)
+async fn update_check(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
+    update_check_value(&state, &value).await
 }
 
 async fn update_apply(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
@@ -2218,23 +2225,12 @@ async fn tag_delete_value(state: &ApiState, tag: String) -> ApiResult {
     empty()
 }
 
-fn update_check_value(body: &Value) -> ApiResult {
+async fn update_check_value(state: &ApiState, body: &Value) -> ApiResult {
     let channel = string_or(&body, "channel", "stable");
-    json_value(json!({
-        "supported": false,
-        "channel": channel,
-        "currentVersion": env!("CARGO_PKG_VERSION"),
-        "targetVersion": "",
-        "targetTag": "",
-        "prerelease": false,
-        "releaseUrl": "",
-        "releaseNotes": "",
-        "publishedAt": "",
-        "assetName": "",
-        "assetSha256": "",
-        "updateAvailable": false,
-        "reason": "self-update is managed by the package/runtime supervisor"
-    }))
+    match state.update.check(&channel).await {
+        Ok(result) => json_value(serde_json::to_value(result).unwrap_or_else(|_| json!({}))),
+        Err(error) => Err(ApiError::unavailable(error)),
+    }
 }
 
 fn required_stats_range(from: Option<&str>, to: Option<&str>) -> Result<(i64, i64), ApiError> {
@@ -2251,27 +2247,18 @@ fn required_stats_range(from: Option<&str>, to: Option<&str>) -> Result<(i64, i6
 }
 
 async fn update_apply_value(state: &ApiState, value: &Value) -> ApiResult {
-    let _ = write_config_json(state, "update.last_request", value.clone()).await?;
+    let channel = string_or(value, "channel", "stable");
+    let target_tag = required_string(value, "targetTag")?;
+    state
+        .update
+        .apply(&channel, &target_tag)
+        .await
+        .map_err(ApiError::unavailable)?;
     empty()
 }
 
 async fn update_status_value(state: &ApiState) -> ApiResult {
-    let error = state
-        .controller
-        .store()
-        .get_config("update.error")
-        .await?
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_default();
-    json_value(json!({
-        "running": false,
-        "stage": "idle",
-        "progress": 0,
-        "bytesDownloaded": 0,
-        "totalBytes": 0,
-        "error": error
-    }))
+    json_value(serde_json::to_value(state.update.status()).unwrap_or_else(|_| json!({})))
 }
 
 async fn node_latency_value(state: &ApiState, value: &Value) -> ApiResult {
@@ -3503,7 +3490,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        // The route remains valid when the host has no release-service
+        // connectivity; in that case the network error is intentionally
+        // surfaced as 503 instead of returning a fabricated update result.
+        assert!(matches!(
+            response.status(),
+            StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE
+        ));
     }
 
     #[tokio::test]

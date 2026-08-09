@@ -21,6 +21,22 @@ use yuhaiin_store::{ConfigStore, GoNodeRecord, restore_database};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    let mut args = std::env::args_os();
+    let _program = args.next();
+    if args.next().as_deref() == Some(std::ffi::OsStr::new("update-helper")) {
+        let target = args
+            .next()
+            .ok_or_else(|| Error::invalid("update-helper target is missing"))?;
+        let staged = args
+            .next()
+            .ok_or_else(|| Error::invalid("update-helper staged path is missing"))?;
+        yuhaiin_runtime::update::run_update_helper(
+            std::path::Path::new(&target),
+            std::path::Path::new(&staged),
+        )
+        .map_err(|error| Error::new(ErrorKind::Io, error))?;
+        return Ok(());
+    }
     tokio::task::LocalSet::new().run_until(run()).await
 }
 
