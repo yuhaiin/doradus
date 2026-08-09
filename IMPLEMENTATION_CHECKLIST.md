@@ -92,7 +92,7 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | `[x]` | direct / drop / fixed | — / fixed listener 边界 | 是 | `core::proxy`, `proxy_factory` |
 | `[x]` | HTTP proxy / CONNECT | 是 | 是 | `runtime::inbound`, `core::proxy` |
-| `[x]` | SOCKS5 | 是 | 是 | `runtime::inbound`, `core::proxy` |
+| `[x]` | SOCKS5 | 是 | 是 | `runtime::inbound`, `core::proxy`；outbound 已覆盖 TCP CONNECT + UDP ASSOCIATE、认证和 domain framing |
 | `[x]` | SOCKS4A | 是 | — | `runtime/src/proxy/socks4a.rs` |
 | `[x]` | TLS transport | 是 | 是 | `runtime::doh_tls`, `protocol::tls` |
 | `[x]` | HTTP/2 transport | 是 | 是 | `chain`, runtime HTTP2 inbound |
@@ -110,6 +110,7 @@ flowchart LR
 | `[x]` | HTTP/2 pool | fixed endpoint、TLS identity、ALPN、multi-stream/multi-connection、idle/drain、GOAWAY replacement、metrics | h2 公共 API 无法主动发送 client GOAWAY，保持 application-level drain |
 | `[x]` | Yuubinsya reliability | migrate ID、coalesce、bounded retry/replay、UOT/native UDP、ping、服务端 demux、TLS/H2 listener | 主动 GOAWAY 同上；继续 Go 低版本 fixture |
 | `[x]` | outbound source interface | `SocketPolicyProxy` 统一覆盖 direct/fixed/HTTP CONNECT/SOCKS5、protocol wrappers、HTTP/2 Yuubinsya、direct UOT 和 native UDP；reload 替换 policy；UDP/TCP/DoH/DoT resolver dialer 也复用同一 source-address policy | inbound listen socket 的平台专用绑定仍需按平台验收 |
+| `[x]` | node latency DNS/UDP | `runtime::latency` | `dns`/`udp` 经由共享 `AsyncProxy::open_datagram` 发起 DNS A 查询并校验事务 ID；默认 resolver/target 与 Go 兼容；DoQ 继续延期 | 增加远端节点和 Podman 网络环境的长期回归 |
 | `[~]` | 低频/复杂 Go 协议 | 现有可用协议已优先完成；Tailscale、WireGuard、Reality、Mux、QUIC 等不纳入当前 Rust 主路径 | 仅在实际前端配置/需求出现时评估，不伪装为已兼容 |
 | `延期` | Shadowsocks / ShadowsocksR | 仓库已有部分历史实现，但当前范围不以它们为替换门槛 | 按用户决定暂不继续扩展；后续可删除或单独维护 |
 
@@ -188,7 +189,7 @@ podman run --rm --network=host \
 
 ## 12. 下一步执行顺序
 
-1. 为 DNS UDP/TCP/DoH/DoT 增加 Podman source-address 回归；内置 resolver 已完成 policy 接入，自定义 factory 仍可按需覆写扩展入口。
+1. 为 DNS UDP/TCP/DoH/DoT、SOCKS5 UDP ASSOCIATE 和 node latency DNS/UDP 增加 Podman source-address/网络回归；内置 resolver 已完成 policy 接入，自定义 factory 仍可按需覆写扩展入口。
 2. 补 Android/macOS target、权限、TUN fd/route 生命周期和实际资源消耗验收。
 3. 补发布切换/rollback 手册：binary 替换、SQLite backup、失败回滚、旧 Go 并行运行和状态目录锁。
 4. 对现有 frontend generated operations 做一次逐项 route/schema 快照比对；subscription 维持明确的 deferred 状态。

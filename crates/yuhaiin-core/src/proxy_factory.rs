@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::proxy::{
     AsyncProxy, BlockingStreamProxy, DirectAsyncProxy, DropAsyncProxy, FixedAsyncProxy,
-    HttpProxyConnector, Socks5Connector, StreamConnector, YuubinsyaUdpProxy,
+    HttpProxyConnector, Socks5AsyncProxy, StreamConnector, YuubinsyaUdpProxy,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -75,12 +75,12 @@ impl BaseProxyConfig {
                 proxy,
                 username,
                 password,
-            } => Arc::new(blocking_connector(Socks5Connector {
+            } => Arc::new(Socks5AsyncProxy {
                 proxy: *proxy,
                 timeout: self.timeout,
                 username: username.clone(),
                 password: password.clone(),
-            })),
+            }),
             BaseProxyKind::YuubinsyaUdp {
                 server,
                 password_hash,

@@ -7,10 +7,11 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use yuhaiin_core::dns::{DnsRecordType, decode_response, encode_query};
 use yuhaiin_core::proxy::{AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
@@ -99,6 +100,7 @@ struct HttpReply {
 }
 
 static TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(1);
+static DNS_TRANSACTION_COUNTER: AtomicU16 = AtomicU16::new(1);
 
 pub async fn probe(
     proxy: Arc<dyn AsyncProxy>,
@@ -125,7 +127,8 @@ pub async fn probe(
         }
         "ip" => probe_ip(proxy, request, timeout).await,
         "stun" | "stun_tcp" => probe_stun(proxy, request, timeout).await,
-        "doq" | "dns" | "udp" => Err(Error::new(
+        "dns" | "udp" => probe_dns(proxy, request, timeout).await,
+        "doq" => Err(Error::new(
             ErrorKind::Unsupported,
             format!("latency probe type {probe_type:?} is not implemented; DoQ remains deferred"),
         )),
@@ -157,6 +160,20 @@ impl LatencyRequest {
         } else {
             "stun.l.google.com:19302".to_owned()
         }
+    }
+
+    fn dns_host_or_default(&self) -> String {
+        if !self.host.trim().is_empty() {
+            return self.host.trim().to_owned();
+        }
+        "223.5.5.5:53".to_owned()
+    }
+
+    fn dns_target_or_default(&self) -> String {
+        if !self.target_domain.trim().is_empty() {
+            return self.target_domain.trim().to_owned();
+        }
+        "www.google.com".to_owned()
     }
 }
 
@@ -365,6 +382,34 @@ async fn probe_stun(
         stun: Some(values),
         error: String::new(),
     })
+}
+
+async fn probe_dns(
+    proxy: Arc<dyn AsyncProxy>,
+    request: LatencyRequest,
+    timeout: Duration,
+) -> Result<LatencyResponse> {
+    let (host, port) = parse_host_port(&request.dns_host_or_default(), 53)?;
+    let resolver = endpoint(Network::Udp, &host, port)?;
+    let context = FlowContext::new(resolver.clone());
+    let domain = DomainName::new(&request.dns_target_or_default())?;
+    let id = DNS_TRANSACTION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let packet = encode_query(id, &domain, DnsRecordType::A)?;
+    let started = std::time::Instant::now();
+    let datagram = tokio::time::timeout(timeout, proxy.open_datagram(&context))
+        .await
+        .map_err(|_| Error::new(ErrorKind::Timeout, "DNS UDP open timed out"))??;
+    tokio::time::timeout(timeout, datagram.send_to(&packet, resolver))
+        .await
+        .map_err(|_| Error::new(ErrorKind::Timeout, "DNS UDP write timed out"))??;
+
+    let mut buffer = vec![0u8; 4096];
+    let (length, _) = tokio::time::timeout(timeout, datagram.recv_from(&mut buffer))
+        .await
+        .map_err(|_| Error::new(ErrorKind::Timeout, "DNS UDP response timed out"))??;
+    decode_response(&buffer[..length], id, DnsRecordType::A)?;
+    datagram.close().await?;
+    Ok(success(started.elapsed()))
 }
 
 async fn read_stun_tcp(stream: &mut BoxAsyncStream, timeout: Duration) -> Result<Vec<u8>> {
@@ -830,6 +875,48 @@ mod tests {
         .unwrap();
         assert!(response.ok);
         assert_eq!(response.stun.unwrap().xor_mapped_address, "127.0.0.1:3478");
+    }
+
+    #[tokio::test]
+    async fn dns_udp_probe_uses_proxy_datagram_and_validates_response() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut query = [0u8; 4096];
+            let (length, peer) = socket.recv_from(&mut query).await.unwrap();
+            assert!(length >= 12);
+            let mut response = Vec::with_capacity(length + 16);
+            response.extend_from_slice(&query[..2]);
+            response.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
+            response.extend_from_slice(&query[12..length]);
+            response.extend_from_slice(&[
+                0xc0, 0x0c, // compressed owner name
+                0, 1, // A
+                0, 1, // IN
+                0, 0, 0, 60, // TTL
+                0, 4, // IPv4 address length
+                1, 2, 3, 4,
+            ]);
+            socket.send_to(&response, peer).await.unwrap();
+        });
+
+        let response = probe(
+            Arc::new(yuhaiin_core::proxy::DirectAsyncProxy {
+                timeout: Duration::from_secs(1),
+            }),
+            LatencyRequest {
+                probe_type: "dns".to_owned(),
+                host: address.to_string(),
+                target_domain: "example.com".to_owned(),
+                ..LatencyRequest::default()
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(response.ok);
+        assert!(response.latency_ms >= 0);
+        server.await.unwrap();
     }
 
     #[tokio::test]

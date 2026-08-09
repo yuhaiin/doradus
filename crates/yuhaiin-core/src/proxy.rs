@@ -7,15 +7,18 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
-use crate::{Endpoint, Error, ErrorKind, Result};
+use crate::{DomainName, Endpoint, Error, ErrorKind, Result};
 
 #[cfg(feature = "async-proxy")]
 use crate::{BoxFuture, FlowContext, Network};
+
+#[cfg(feature = "async-proxy")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub trait StreamConnector: Send + Sync {
     fn connect(&self, destination: &Endpoint) -> Result<TcpStream>;
@@ -616,6 +619,371 @@ impl AsyncProxy for BlockingStreamProxy {
     }
 }
 
+/// Native asynchronous SOCKS5 proxy.
+///
+/// The synchronous connector above remains the small reusable TCP handshake
+/// boundary used by callers that only need a blocking stream. Runtime
+/// outbound proxies use this implementation so SOCKS5 UDP ASSOCIATE shares
+/// the same `AsyncProxy` contract as direct and Yuubinsya datagrams.
+#[cfg(feature = "async-proxy")]
+#[derive(Clone)]
+pub struct Socks5AsyncProxy {
+    pub proxy: SocketAddr,
+    pub timeout: Duration,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+#[cfg(feature = "async-proxy")]
+impl AsyncProxy for Socks5AsyncProxy {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        let destination = context.effective_destination();
+        let local_bind = context.local_bind_for(self.proxy);
+        let proxy = self.clone();
+        Box::pin(async move {
+            let result = tokio::time::timeout(proxy.timeout, async move {
+                let mut stream = connect_tokio_tcp(proxy.proxy, local_bind, proxy.timeout).await?;
+                socks5_authenticate(
+                    &mut stream,
+                    proxy.username.as_deref(),
+                    proxy.password.as_deref(),
+                )
+                .await?;
+                socks5_request(&mut stream, 1, &destination).await?;
+                Ok::<_, Error>(stream)
+            })
+            .await
+            .map_err(|_| Error::new(ErrorKind::Timeout, "SOCKS5 CONNECT timed out"))??;
+            Ok(Box::new(result) as BoxAsyncStream)
+        })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+        let proxy = self.clone();
+        let local_bind = context.local_bind_for(self.proxy).unwrap_or_else(|| {
+            if self.proxy.is_ipv4() {
+                "0.0.0.0:0".parse().expect("valid IPv4 wildcard")
+            } else {
+                "[::]:0".parse().expect("valid IPv6 wildcard")
+            }
+        });
+        Box::pin(async move {
+            let result = tokio::time::timeout(proxy.timeout, async move {
+                let mut control =
+                    connect_tokio_tcp(proxy.proxy, Some(local_bind), proxy.timeout).await?;
+                socks5_authenticate(
+                    &mut control,
+                    proxy.username.as_deref(),
+                    proxy.password.as_deref(),
+                )
+                .await?;
+                let unspecified = if proxy.proxy.is_ipv4() {
+                    SocketAddr::from(([0, 0, 0, 0], 0))
+                } else {
+                    SocketAddr::from(([0u16; 8], 0))
+                };
+                let reply =
+                    socks5_request(&mut control, 3, &Endpoint::ip(Network::Udp, unspecified))
+                        .await?;
+                let relay = if reply.ip().is_unspecified() {
+                    SocketAddr::new(proxy.proxy.ip(), reply.port())
+                } else {
+                    reply
+                };
+                if relay.is_ipv4() != local_bind.is_ipv4() {
+                    return Err(Error::new(
+                        ErrorKind::Protocol,
+                        "SOCKS5 UDP relay and local bind use different address families",
+                    ));
+                }
+                let socket = tokio::net::UdpSocket::bind(local_bind)
+                    .await
+                    .map_err(|error| {
+                        Error::new(ErrorKind::Io, format!("bind SOCKS5 UDP socket: {error}"))
+                    })?;
+                Ok::<_, Error>(Socks5UdpDatagram {
+                    socket,
+                    relay,
+                    control: Mutex::new(Some(control)),
+                })
+            })
+            .await
+            .map_err(|_| Error::new(ErrorKind::Timeout, "SOCKS5 UDP ASSOCIATE timed out"))??;
+            Ok(Box::new(result) as Box<dyn AsyncDatagram>)
+        })
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[cfg(feature = "async-proxy")]
+async fn socks5_authenticate(
+    stream: &mut tokio::net::TcpStream,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<()> {
+    let has_auth = username.is_some() && password.is_some();
+    let methods: &[u8] = if has_auth { &[0, 2] } else { &[0] };
+    stream
+        .write_all(&[5, methods.len() as u8])
+        .await
+        .map_err(io_error)?;
+    stream.write_all(methods).await.map_err(io_error)?;
+    let mut selected = [0; 2];
+    stream.read_exact(&mut selected).await.map_err(io_error)?;
+    match selected[1] {
+        0 => {}
+        2 if has_auth => {
+            let username = username.unwrap_or_default();
+            let password = password.unwrap_or_default();
+            if username.len() > 255 || password.len() > 255 {
+                return Err(Error::invalid("SOCKS5 credentials are too long"));
+            }
+            let mut auth = vec![1, username.len() as u8];
+            auth.extend_from_slice(username.as_bytes());
+            auth.push(password.len() as u8);
+            auth.extend_from_slice(password.as_bytes());
+            stream.write_all(&auth).await.map_err(io_error)?;
+            let mut response = [0; 2];
+            stream.read_exact(&mut response).await.map_err(io_error)?;
+            if response != [1, 0] {
+                return Err(Error::new(
+                    ErrorKind::Protocol,
+                    "SOCKS5 authentication failed",
+                ));
+            }
+        }
+        _ => {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "SOCKS5 no acceptable method",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "async-proxy")]
+async fn socks5_request(
+    stream: &mut tokio::net::TcpStream,
+    command: u8,
+    destination: &Endpoint,
+) -> Result<SocketAddr> {
+    let (atyp, address) = socks_address(destination)?;
+    let mut request = vec![5, command, 0, atyp];
+    request.extend_from_slice(&address);
+    request.extend_from_slice(&destination.port().unwrap_or_default().to_be_bytes());
+    stream.write_all(&request).await.map_err(io_error)?;
+
+    let mut head = [0; 4];
+    stream.read_exact(&mut head).await.map_err(io_error)?;
+    if head[1] != 0 {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            format!("SOCKS5 request failed with code {}", head[1]),
+        ));
+    }
+    let (host, port) = match head[3] {
+        1 => {
+            let mut bytes = [0; 4];
+            stream.read_exact(&mut bytes).await.map_err(io_error)?;
+            (
+                IpAddr::V4(bytes.into()).to_string(),
+                read_u16(stream).await?,
+            )
+        }
+        4 => {
+            let mut bytes = [0; 16];
+            stream.read_exact(&mut bytes).await.map_err(io_error)?;
+            (
+                IpAddr::V6(bytes.into()).to_string(),
+                read_u16(stream).await?,
+            )
+        }
+        3 => {
+            let mut length = [0; 1];
+            stream.read_exact(&mut length).await.map_err(io_error)?;
+            let mut bytes = vec![0; usize::from(length[0])];
+            stream.read_exact(&mut bytes).await.map_err(io_error)?;
+            let host = String::from_utf8(bytes)
+                .map_err(|_| Error::new(ErrorKind::Protocol, "SOCKS5 reply domain is invalid"))?;
+            (host, read_u16(stream).await?)
+        }
+        _ => {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "invalid SOCKS5 reply address type",
+            ));
+        }
+    };
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(address, port));
+    }
+    tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|error| Error::new(ErrorKind::Io, format!("resolve SOCKS5 relay: {error}")))?
+        .next()
+        .ok_or_else(|| Error::new(ErrorKind::Protocol, "SOCKS5 relay resolved to no address"))
+}
+
+#[cfg(feature = "async-proxy")]
+async fn read_u16(stream: &mut tokio::net::TcpStream) -> Result<u16> {
+    let mut bytes = [0; 2];
+    stream.read_exact(&mut bytes).await.map_err(io_error)?;
+    Ok(u16::from_be_bytes(bytes))
+}
+
+#[cfg(feature = "async-proxy")]
+struct Socks5UdpDatagram {
+    socket: tokio::net::UdpSocket,
+    relay: SocketAddr,
+    // SOCKS5 keeps the TCP control connection open for the lifetime of the
+    // UDP association. The mutex is only needed to make the datagram object
+    // satisfy the shared AsyncDatagram Send + Sync contract; no I/O is done
+    // through it after the handshake.
+    control: Mutex<Option<tokio::net::TcpStream>>,
+}
+
+#[cfg(feature = "async-proxy")]
+impl AsyncDatagram for Socks5UdpDatagram {
+    fn send_to<'a>(&'a self, payload: &'a [u8], target: Endpoint) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            if target.network() != Network::Udp {
+                return Err(Error::invalid("SOCKS5 UDP target has wrong network"));
+            }
+            let (atyp, address) = socks_address(&target)?;
+            let mut packet = Vec::with_capacity(4 + address.len() + 2 + payload.len());
+            packet.extend_from_slice(&[0, 0, 0, atyp]);
+            packet.extend_from_slice(&address);
+            packet.extend_from_slice(&target.port().unwrap_or_default().to_be_bytes());
+            packet.extend_from_slice(payload);
+            self.socket
+                .send_to(&packet, self.relay)
+                .await
+                .map_err(|error| Error::new(ErrorKind::Io, format!("SOCKS5 UDP send: {error}")))?;
+            Ok(payload.len())
+        })
+    }
+
+    fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
+        Box::pin(async move {
+            let mut packet = vec![0; 64 * 1024];
+            let length = self.socket.recv(&mut packet).await.map_err(|error| {
+                Error::new(ErrorKind::Io, format!("SOCKS5 UDP receive: {error}"))
+            })?;
+            if length < 4 || packet[0..2] != [0, 0] {
+                return Err(Error::new(
+                    ErrorKind::Protocol,
+                    "invalid SOCKS5 UDP response header",
+                ));
+            }
+            if packet[2] != 0 {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "fragmented SOCKS5 UDP responses are not supported",
+                ));
+            }
+            let (target, offset) = decode_socks5_udp_endpoint(&packet[..length])?;
+            let payload = &packet[offset..length];
+            if buffer.len() < payload.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "SOCKS5 UDP payload exceeds receive buffer",
+                ));
+            }
+            buffer[..payload.len()].copy_from_slice(payload);
+            Ok((payload.len(), target))
+        })
+    }
+
+    fn local_addr(&self) -> Result<Endpoint> {
+        self.socket
+            .local_addr()
+            .map(|address| Endpoint::ip(Network::Udp, address))
+            .map_err(|error| {
+                Error::new(ErrorKind::Io, format!("SOCKS5 UDP local address: {error}"))
+            })
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        if let Ok(mut control) = self.control.lock() {
+            control.take();
+        }
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[cfg(feature = "async-proxy")]
+fn decode_socks5_udp_endpoint(packet: &[u8]) -> Result<(Endpoint, usize)> {
+    if packet.len() < 4 {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "SOCKS5 UDP packet is too short",
+        ));
+    }
+    let atyp = packet[3];
+    let mut offset = 4;
+    let host = match atyp {
+        1 => {
+            let end = offset + 4;
+            let bytes = packet.get(offset..end).ok_or_else(|| {
+                Error::new(ErrorKind::Protocol, "SOCKS5 UDP IPv4 address is truncated")
+            })?;
+            offset = end;
+            IpAddr::V4(std::net::Ipv4Addr::from(
+                <[u8; 4]>::try_from(bytes).expect("validated IPv4 length"),
+            ))
+            .to_string()
+        }
+        4 => {
+            let end = offset + 16;
+            let bytes = packet.get(offset..end).ok_or_else(|| {
+                Error::new(ErrorKind::Protocol, "SOCKS5 UDP IPv6 address is truncated")
+            })?;
+            offset = end;
+            IpAddr::V6(std::net::Ipv6Addr::from(
+                <[u8; 16]>::try_from(bytes).expect("validated IPv6 length"),
+            ))
+            .to_string()
+        }
+        3 => {
+            let length = usize::from(*packet.get(offset).ok_or_else(|| {
+                Error::new(ErrorKind::Protocol, "SOCKS5 UDP domain length is missing")
+            })?);
+            offset += 1;
+            let end = offset + length;
+            let bytes = packet
+                .get(offset..end)
+                .ok_or_else(|| Error::new(ErrorKind::Protocol, "SOCKS5 UDP domain is truncated"))?;
+            offset = end;
+            String::from_utf8(bytes.to_vec())
+                .map_err(|_| Error::new(ErrorKind::Protocol, "SOCKS5 UDP domain is invalid"))?
+        }
+        _ => {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "invalid SOCKS5 UDP address type",
+            ));
+        }
+    };
+    let port_end = offset + 2;
+    let port_bytes = packet
+        .get(offset..port_end)
+        .ok_or_else(|| Error::new(ErrorKind::Protocol, "SOCKS5 UDP port is truncated"))?;
+    let port = u16::from_be_bytes(port_bytes.try_into().expect("validated port length"));
+    offset = port_end;
+    let endpoint = match host.parse::<IpAddr>() {
+        Ok(address) => Endpoint::ip(Network::Udp, SocketAddr::new(address, port)),
+        Err(_) => Endpoint::domain(Network::Udp, DomainName::new(&host)?, port),
+    };
+    Ok((endpoint, offset))
+}
+
 #[cfg(feature = "async-proxy")]
 struct TokioDatagram {
     socket: tokio::net::UdpSocket,
@@ -1203,6 +1571,105 @@ mod tests {
         stream.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"hello");
         server.join().unwrap();
+    }
+
+    #[cfg(feature = "async-proxy")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_socks5_udp_associate_round_trips_authenticated_domain() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_address = relay.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut control, _) = listener.accept().await.unwrap();
+
+            let mut greeting = [0u8; 4];
+            control.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 2, 0, 2]);
+            control.write_all(&[5, 2]).await.unwrap();
+
+            let mut auth = [0u8; 1];
+            control.read_exact(&mut auth).await.unwrap();
+            assert_eq!(auth[0], 1);
+            let mut username_length = [0u8; 1];
+            control.read_exact(&mut username_length).await.unwrap();
+            let mut username = vec![0u8; usize::from(username_length[0])];
+            control.read_exact(&mut username).await.unwrap();
+            let mut password_length = [0u8; 1];
+            control.read_exact(&mut password_length).await.unwrap();
+            let mut password = vec![0u8; usize::from(password_length[0])];
+            control.read_exact(&mut password).await.unwrap();
+            assert_eq!(username, b"user");
+            assert_eq!(password, b"pass");
+            control.write_all(&[1, 0]).await.unwrap();
+
+            let mut request = [0u8; 10];
+            control.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request[..4], &[5, 3, 0, 1]);
+            control
+                .write_all(&[
+                    5,
+                    0,
+                    0,
+                    1,
+                    127,
+                    0,
+                    0,
+                    1,
+                    relay_address.port().to_be_bytes()[0],
+                    relay_address.port().to_be_bytes()[1],
+                ])
+                .await
+                .unwrap();
+
+            let mut packet = [0u8; 2048];
+            let (length, peer) = relay.recv_from(&mut packet).await.unwrap();
+            assert!(length >= 12);
+            assert_eq!(&packet[..4], &[0, 0, 0, 3]);
+            let host_length = usize::from(packet[4]);
+            let host_end = 5 + host_length;
+            assert_eq!(&packet[5..host_end], b"example.com");
+            let port = u16::from_be_bytes([packet[host_end], packet[host_end + 1]]);
+            assert_eq!(port, 53);
+            assert_eq!(&packet[host_end + 2..length], b"ping");
+
+            let mut response = vec![0, 0, 0, 3, 11];
+            response.extend_from_slice(b"example.com");
+            response.extend_from_slice(&53u16.to_be_bytes());
+            response.extend_from_slice(b"pong");
+            relay.send_to(&response, peer).await.unwrap();
+
+            let mut closed = [0u8; 1];
+            let _ = control.read(&mut closed).await;
+        });
+
+        let proxy = Socks5AsyncProxy {
+            proxy: proxy_address,
+            timeout: Duration::from_secs(1),
+            username: Some("user".to_owned()),
+            password: Some("pass".to_owned()),
+        };
+        let target = Endpoint::domain(Network::Udp, DomainName::new("example.com").unwrap(), 53);
+        let mut context = FlowContext::new(target.clone());
+        context
+            .local_bind_addresses
+            .push("127.0.0.2".parse().unwrap());
+        let datagram = proxy.open_datagram(&context).await.unwrap();
+        assert_eq!(
+            datagram.local_addr().unwrap().addr().unwrap().ip(),
+            "127.0.0.2".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(datagram.send_to(b"ping", target.clone()).await.unwrap(), 4);
+
+        let mut buffer = [0u8; 64];
+        let (length, response_target) = datagram.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..length], b"pong");
+        assert_eq!(response_target, target);
+        datagram.close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[cfg(feature = "async-proxy")]
