@@ -108,19 +108,12 @@ pub async fn run_until(
     controller: RuntimeController,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    // TUN is an inbound in Go's runtime model. Keep its device owner under
-    // this supervisor so API reload/shutdown has one inbound lifecycle for
-    // TUN, TCP listeners, UDP listeners and their accepted flows.
-    #[cfg(feature = "tun")]
-    let tun_task =
-        tokio::task::spawn_local(run_tun_supervisor(controller.clone(), shutdown.clone()));
-
     let mut reload = controller.subscribe_reload();
     let mut listeners = Vec::new();
     let result = async {
         loop {
             abort_listeners(&mut listeners).await;
-            listeners = start_listeners(&controller).await?;
+            listeners = start_listeners(&controller, shutdown.clone()).await?;
             if *shutdown.borrow() {
                 break;
             }
@@ -142,61 +135,12 @@ pub async fn run_until(
     .await;
     abort_listeners(&mut listeners).await;
 
-    #[cfg(feature = "tun")]
-    if result.is_ok() {
-        if let Err(error) = tun_task.await.map_err(|error| {
-            Error::new(
-                ErrorKind::Io,
-                format!("TUN inbound supervisor task: {error}"),
-            )
-        })? {
-            controller
-                .monitor()
-                .error(format!("TUN inbound supervisor stopped: {error}"));
-        }
-    } else {
-        tun_task.abort();
-        let _ = tun_task.await;
-    }
-    result
-}
-
-#[cfg(feature = "tun")]
-async fn run_tun_supervisor(
-    controller: RuntimeController,
-    shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    let log_controller = controller.clone();
-    log_controller
-        .monitor()
-        .info("TUN inbound supervisor started");
-    let result = async {
-        loop {
-            let config = crate::load_tun_config(controller.store()).await?;
-            if !config.enabled {
-                if crate::wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
-                    return Ok(());
-                }
-                continue;
-            }
-            let tun = crate::data_plane::open_tun(&config)?;
-            crate::run_tun_device_until(controller.clone(), tun, config, shutdown.clone()).await?;
-            if *shutdown.borrow() {
-                return Ok(());
-            }
-        }
-    }
-    .await;
-    if let Err(error) = &result {
-        log_controller
-            .monitor()
-            .error(format!("TUN inbound supervisor stopped: {error}"));
-    }
     result
 }
 
 async fn start_listeners(
     controller: &RuntimeController,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
     let records = controller.store().repository().list_go_inbounds().await?;
     let proxy_id = selected_proxy_id(controller).await?;
@@ -205,6 +149,41 @@ async fn start_listeners(
         .await?;
     let monitor = controller.monitor();
     let mut listeners = Vec::new();
+    #[cfg(not(feature = "tun"))]
+    let _ = &shutdown;
+
+    // A Go TUN record is an inbound, even though it owns a device instead of
+    // a TCP/UDP socket. Keep its task in this same owner collection so reload,
+    // shutdown and abort use exactly the same lifecycle as SOCKS5/HTTP and
+    // Yuubinsya listeners.
+    #[cfg(feature = "tun")]
+    {
+        let tun_config = crate::load_tun_config(controller.store()).await?;
+        if tun_config.enabled {
+            let task_controller = controller.clone();
+            let task_monitor = monitor.clone();
+            let task_shutdown = shutdown.clone();
+            listeners.push(tokio::task::spawn_local(async move {
+                task_monitor.info("TUN inbound started");
+                match crate::data_plane::open_tun(&tun_config) {
+                    Ok(tun) => {
+                        if let Err(error) = crate::run_tun_device_until(
+                            task_controller,
+                            tun,
+                            tun_config,
+                            task_shutdown,
+                        )
+                        .await
+                        {
+                            task_monitor.error(format!("TUN inbound stopped: {error}"));
+                        }
+                    }
+                    Err(error) => task_monitor.error(format!("TUN inbound open failed: {error}")),
+                }
+            }));
+        }
+    }
+
     for record in records
         .into_iter()
         .filter(|record| record.enabled && !record.protocol_type.eq_ignore_ascii_case("tun"))

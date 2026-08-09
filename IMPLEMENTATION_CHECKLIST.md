@@ -128,7 +128,7 @@ flowchart LR
 | 状态 | 功能 | 位置 | 当前结果 | 剩余工作 |
 | --- | --- | --- | --- | --- |
 | `[x]` | 单一路径 TUN | `core::tun` | `tun-rs AsyncDevice + smoltcp`；不并行实现 tun2socket 和用户态 stack 两条路径 |
-| `[x]` | inbound owner | `runtime::inbound::run_until` | TUN 与 SOCKS5/HTTP/Yuubinsya/UDP listener 共同启动、reload、shutdown、abort |
+| `[x]` | inbound owner | `runtime::inbound::run_until` | TUN record 会在同一个 inbound listener task 集合中创建 device；与 SOCKS5/HTTP/Yuubinsya/UDP listener 共同 reload、shutdown、abort，不再由独立 supervisor 管理 |
 | `[x]` | TCP/UDP/ICMP | `core::tun` | dispatcher、proxy bridge、DNS hijack、FakeIP reverse、NAT、bounded queue/backpressure |
 | `[x]` | Linux Podman | `tun-smoke`, `p0_tun`, `tun_fakeip_smoke` | privileged/network=none 创建、route、DNS/FakeIP、proxy echo、SIGTERM 和设备重开 |
 | `[~]` | 设备异常与 namespace | 测试已有设备消失、kernel cleanup、同名重开基础覆盖 | 继续补 namespace teardown、真实 MTU/fragment 长矩阵 |
