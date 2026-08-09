@@ -1,12 +1,12 @@
 //! Proxy construction from the shared runtime snapshot.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use yuhaiin_chain::ChainProxy;
-use yuhaiin_core::proxy::{AsyncProxy, AsyncProxySelector};
+use yuhaiin_core::proxy::{AsyncProxy, AsyncProxySelector, DropAsyncProxy};
 use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyKind};
 use yuhaiin_core::{Error, ErrorKind, FlowContext, GeoLookup, Result};
 use yuhaiin_store::GoProxyRuntimeConfig;
@@ -484,6 +484,7 @@ pub struct RuntimeProxySelector {
     bypass_id: String,
     drop_id: String,
     timeout: Duration,
+    closed_nodes: RwLock<BTreeSet<String>>,
     metadata: RwLock<ProxyContextMetadata>,
     settings: RwLock<crate::RuntimeSettings>,
 }
@@ -497,6 +498,10 @@ struct ProxyContextMetadata {
 
 impl RuntimeProxySelector {
     pub(crate) fn active_node_ids(&self) -> Vec<String> {
+        let closed_nodes = self
+            .closed_nodes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         [
             self.direct_id.as_str(),
             self.proxy_id.as_str(),
@@ -504,7 +509,7 @@ impl RuntimeProxySelector {
             self.drop_id.as_str(),
         ]
         .into_iter()
-        .filter(|id| !id.is_empty())
+        .filter(|id| !id.is_empty() && !closed_nodes.contains(*id))
         .map(str::to_owned)
         .collect()
     }
@@ -527,6 +532,7 @@ impl RuntimeProxySelector {
             bypass_id: bypass_id.to_owned(),
             drop_id: drop_id.to_owned(),
             timeout,
+            closed_nodes: RwLock::new(BTreeSet::new()),
             metadata: RwLock::new(
                 snapshot
                     .proxy_context_metadata(direct_id, proxy_id, bypass_id, drop_id)
@@ -568,6 +574,10 @@ impl RuntimeProxySelector {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *current = next.selector;
+        self.closed_nodes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         *self
             .metadata
             .write()
@@ -576,6 +586,44 @@ impl RuntimeProxySelector {
             .settings
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.settings;
+    }
+
+    /// Close every slot that currently points at `id`, then make new flows
+    /// fail closed until the next successful runtime reload. Existing flows
+    /// keep their selected `Arc`, so closing the old instances also mirrors
+    /// Go's `ProxyStore.Delete` behavior for those flows.
+    pub(crate) async fn close_node(&self, id: &str) {
+        let mut old_proxies = Vec::new();
+        {
+            let mut current = self
+                .current
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut closed_nodes = self
+                .closed_nodes
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            macro_rules! close_slot {
+                ($slot_id:expr, $slot:expr) => {
+                    if $slot_id == id {
+                        old_proxies.push(Arc::clone($slot));
+                        *$slot = Arc::new(DropAsyncProxy);
+                    }
+                };
+            }
+            close_slot!(&self.direct_id, &mut current.direct);
+            close_slot!(&self.proxy_id, &mut current.proxy);
+            close_slot!(&self.bypass_id, &mut current.bypass);
+            close_slot!(&self.drop_id, &mut current.drop);
+            if !old_proxies.is_empty() {
+                closed_nodes.insert(id.to_owned());
+            }
+        }
+
+        for proxy in old_proxies {
+            let _ = proxy.close().await;
+        }
     }
 
     pub(crate) fn relay_buffer_size(&self) -> usize {

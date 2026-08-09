@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, RwLock, Weak},
 };
 
-use yuhaiin_core::{Error, ErrorKind, Result};
+use yuhaiin_core::Result;
 use yuhaiin_store::{ConfigMutation, ConfigStore};
 
 use crate::data_plane::inbound_dns_handler;
@@ -76,15 +76,18 @@ impl RuntimeController {
     }
 
     /// Close the runtime instance associated with a node without deleting its
-    /// persisted configuration.  Rust proxy instances are held by immutable
-    /// selector snapshots rather than a Go-style node map; publishing a fresh
-    /// snapshot drops those slot instances while existing flows retain their
-    /// current `Arc` until they finish.
+    /// persisted configuration. Existing selectors replace matching slots by
+    /// a fail-closed proxy and close the previous instances; a later
+    /// successful reload reconstructs the slots from persisted configuration.
     pub async fn close_node(&self, id: &str) -> Result<()> {
         if id.trim().is_empty() {
-            return Err(Error::new(ErrorKind::InvalidInput, "node id is empty"));
+            return Ok(());
         }
-        self.reload().await.map(|_| ())
+        let _guard = self.reload_lock.lock().await;
+        for selector in self.live_selectors() {
+            selector.close_node(id).await;
+        }
+        Ok(())
     }
 
     pub fn subscribe_reload(&self) -> tokio::sync::broadcast::Receiver<()> {
@@ -335,7 +338,7 @@ mod tests {
 
     use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
     use yuhaiin_core::proxy::AsyncProxySelector;
-    use yuhaiin_core::{Endpoint, FlowContext, Network, RouteMode};
+    use yuhaiin_core::{Endpoint, ErrorKind, FlowContext, Network, RouteMode};
     use yuhaiin_store::{
         ConfigMutation, ConfigStore, GoNodeRecord, GoRouteRuleRecord, MaxMindMetadataRecord,
     };
@@ -492,6 +495,59 @@ mod tests {
         block_on(controller.reload()).unwrap();
         let after_successful_reload = selector.select(&context);
         assert!(!Arc::ptr_eq(&before, &after_successful_reload));
+    }
+
+    #[test]
+    fn close_node_closes_live_slots_without_deleting_config_and_reload_reopens_them() {
+        let controller = controller();
+        block_on(controller.store().repository().put_go_node(&GoNodeRecord {
+            id: "proxy".to_owned(),
+            name: "proxy".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types_json: br#"["direct"]"#.to_vec(),
+            updated_at: 1,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        }))
+        .unwrap();
+        block_on(controller.reload()).unwrap();
+        let selector = block_on(controller.build_proxy_selector(
+            "",
+            "proxy",
+            "",
+            "",
+            std::time::Duration::from_secs(1),
+        ))
+        .unwrap();
+        assert_eq!(controller.active_proxy_ids(), vec!["proxy"]);
+
+        let mut context =
+            FlowContext::new(Endpoint::ip(Network::Tcp, "192.0.2.1:443".parse().unwrap()));
+        context.route_mode = RouteMode::Proxy;
+        context.skip_route = true;
+        let old_proxy = selector.select(&context);
+
+        block_on(controller.close_node("proxy")).unwrap();
+        assert!(controller.active_proxy_ids().is_empty());
+        let error = match block_on(selector.select(&context).connect(&context)) {
+            Ok(_) => panic!("closed node unexpectedly accepted a new connection"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, ErrorKind::Closed);
+        assert!(
+            block_on(controller.store().repository().list_go_nodes())
+                .unwrap()
+                .iter()
+                .any(|node| node.id == "proxy")
+        );
+
+        block_on(controller.close_node("")).unwrap();
+        block_on(controller.close_node("missing")).unwrap();
+        block_on(controller.reload()).unwrap();
+        assert_eq!(controller.active_proxy_ids(), vec!["proxy"]);
+        let reopened = selector.select(&context);
+        assert!(!Arc::ptr_eq(&old_proxy, &reopened));
     }
 
     #[test]
