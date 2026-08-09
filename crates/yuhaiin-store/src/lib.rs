@@ -183,6 +183,14 @@ pub struct GoSettingsKvRecord {
     pub value_json: String,
 }
 
+/// The single-row Go `backup_settings` contract. Keep the original JSON so
+/// Rust can round-trip S3 fields it does not actively use yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoBackupSettingsRecord {
+    pub updated_at: i64,
+    pub data_json: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoNodeRecord {
     pub id: String,

@@ -33,17 +33,16 @@ use yuhaiin_core::{BoxFuture, DomainName, Endpoint, FlowContext, Network};
 use yuhaiin_geo::{GeoDatabaseManager, GeoDownloadTransport, GeoRefreshRequest};
 
 use yuhaiin_store::{
-    GoInboundRecord, GoNodeRecord, GoResolverRecord, GoRouteListRecord, GoRouteRuleRecord,
-    GoRouteSettingsRecord, GoSettingsKvRecord, GoSubscriptionLinkRecord, InboundSettings,
-    MaxMindMetadataRecord,
+    GoBackupSettingsRecord, GoInboundRecord, GoNodeRecord, GoResolverRecord, GoRouteListRecord,
+    GoRouteRuleRecord, GoRouteSettingsRecord, GoSettingsKvRecord, GoSubscriptionLinkRecord,
+    InboundSettings, MaxMindMetadataRecord,
 };
 
 use crate::update::UpdateService;
 use crate::{
     ProxyRouteListTransport, RouteListSnapshot, RouteListTransport, RuntimeController,
-    RuntimeSettings, download_route_url_with_transport, expand_go_route_rule,
-    interfaces::discover_interfaces, latency::LatencyRequest, log::log_batch_value,
-    refresh_route_list_caches_with_transport,
+    download_route_url_with_transport, expand_go_route_rule, interfaces::discover_interfaces,
+    latency::LatencyRequest, log::log_batch_value, refresh_route_list_caches_with_transport,
 };
 
 // Go keeps TCP and UDP node selection independently in metadata.  Keep the
@@ -576,10 +575,8 @@ async fn rpc(
         "update.status" => update_status_value(&state).await,
         "settings.get" => settings_get_value(&state).await,
         "settings.put" => write_config_json(&state, "settings", body).await,
-        "backup.config.get" => {
-            read_config_json(&state, "backup.config", default_backup_config()).await
-        }
-        "backup.config.put" => write_config_json(&state, "backup.config", body).await,
+        "backup.config.get" => backup_config_get_value(&state).await,
+        "backup.config.put" => backup_config_put_value(&state, body).await,
         "backup.run" => run_backup_value(&state).await,
         "backup.restore" => restore_backup_value(&state, &body).await,
         "tools.interfaces" => tools_interfaces_value(),
@@ -751,16 +748,22 @@ async fn settings_get(State(state): State<ApiState>) -> ApiResult {
 }
 
 async fn settings_get_value(state: &ApiState) -> ApiResult {
-    if state
+    if let Some(bytes) = state.controller.store().get_config("settings").await? {
+        return json_value(canonical_settings_value(&raw_json(
+            &bytes,
+            default_settings(),
+        )));
+    }
+    let values = state
         .controller
         .store()
-        .get_config("settings")
-        .await?
-        .is_some()
-    {
-        return read_config_json(state, "settings", default_settings()).await;
+        .repository()
+        .list_go_settings_kv()
+        .await?;
+    if !values.is_empty() {
+        return json_value(settings_value_from_go_kv(&values));
     }
-    json_value(state.controller.handle().load().settings.to_json())
+    json_value(default_settings())
 }
 
 async fn settings_put(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
@@ -768,11 +771,41 @@ async fn settings_put(State(state): State<ApiState>, Json(value): Json<Value>) -
 }
 
 async fn backup_config_get(State(state): State<ApiState>) -> ApiResult {
-    read_config_json(&state, "backup.config", default_backup_config()).await
+    backup_config_get_value(&state).await
 }
 
 async fn backup_config_put(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
-    write_config_json(&state, "backup.config", value).await
+    backup_config_put_value(&state, value).await
+}
+
+async fn backup_config_get_value(state: &ApiState) -> ApiResult {
+    if let Some(record) = state
+        .controller
+        .store()
+        .repository()
+        .get_go_backup_settings()
+        .await?
+    {
+        return json_value(raw_json(&record.data_json, default_backup_config()));
+    }
+    read_config_json(state, "backup.config", default_backup_config()).await
+}
+
+async fn backup_config_put_value(state: &ApiState, value: Value) -> ApiResult {
+    let bytes = serde_json::to_vec(&value)?;
+    let updated_at = unix_seconds();
+    let record = GoBackupSettingsRecord {
+        updated_at,
+        data_json: bytes.clone(),
+    };
+    state
+        .controller
+        .mutate_and_reload(move |store| async move {
+            store.put_config("backup.config", &bytes).await?;
+            store.repository().put_go_backup_settings(&record).await
+        })
+        .await?;
+    json_value(value)
 }
 
 async fn backup_run(State(state): State<ApiState>) -> ApiResult {
@@ -1530,17 +1563,30 @@ async fn save_node_value(state: &ApiState, value: Value, _index: Option<usize>) 
         "" => "default".to_owned(),
         group => group.to_owned(),
     };
+    // `nodes_v2.data_json` is also consumed directly by Go's plain-contract
+    // reader. Keep the persisted JSON in the same canonical shape as the
+    // response and the typed columns; otherwise a normal frontend request
+    // without `origin` can be returned successfully by Rust but makes Go's
+    // node decoder fail with `node origin is empty` after rollback.
+    let node_name = string_or(&value, "name", &id);
+    let enabled = bool_or(&value, "enabled", true);
+    let mut persisted_value = value;
+    set_string(&mut persisted_value, "id", id.clone());
+    set_string(&mut persisted_value, "name", node_name);
+    set_string(&mut persisted_value, "group", group_name.clone());
+    set_string(&mut persisted_value, "origin", "manual");
+    set_bool(&mut persisted_value, "enabled", enabled);
     let record = GoNodeRecord {
         id: id.clone(),
-        name: string_or(&value, "name", &id),
+        name: string_or(&persisted_value, "name", &id),
         group_name,
         // NodeRuntime.Save in Go intentionally marks every API save as a
         // manually managed node, regardless of the request's origin.
         origin: "manual".to_owned(),
-        enabled: bool_or(&value, "enabled", true),
+        enabled,
         chain_types_json: serde_json::to_vec(&chain_types)?,
         updated_at: unix_seconds(),
-        data_json: serde_json::to_vec(&value)?,
+        data_json: serde_json::to_vec(&persisted_value)?,
     };
     state
         .controller
@@ -3026,10 +3072,14 @@ async fn read_config_json(state: &ApiState, key: &str, default: Value) -> ApiRes
 }
 
 async fn write_config_json(state: &ApiState, key: &str, value: Value) -> ApiResult {
+    let value = if key == "settings" {
+        canonical_settings_value(&value)
+    } else {
+        value
+    };
     let bytes = serde_json::to_vec(&value)?;
     let key = key.to_owned();
-    let settings_kv =
-        (key == "settings").then(|| crate::RuntimeSettings::from_value(&value).to_go_settings_kv());
+    let settings_kv = (key == "settings").then(|| settings_kv_from_contract(&value));
     state
         .controller
         .mutate_and_reload(move |store| async move {
@@ -3443,11 +3493,186 @@ fn default_route_config() -> Value {
     json!({"directResolver":"", "proxyResolver":"", "resolveLocally":false, "udpProxyFqdnStrategy":"default"})
 }
 fn default_settings() -> Value {
-    let mut value = RuntimeSettings::default().to_json();
-    if let Some(object) = value.as_object_mut() {
-        object.insert("backup".to_owned(), default_backup_config());
+    // This is the HTTP contract default from Go's SettingsStore.Load. It is
+    // deliberately separate from RuntimeSettings::default: the runtime uses
+    // conservative operational defaults, while the Go management contract
+    // returns zero values for unset scalar settings (except pprof).
+    json!({
+        "ipv6": false,
+        "useDefaultInterface": false,
+        "netInterface": "",
+        "pprof": true,
+        "systemProxy": {"http": false, "socks5": false},
+        "logcat": {
+            "level": "verbose",
+            "save": false,
+            "ignoreTimeoutError": false,
+            "ignoreDnsError": false
+        },
+        "advanced": {
+            "udpBufferSize": 0,
+            "relayBufferSize": 0,
+            "udpRingbufferSize": 0,
+            "happyEyeballsSemaphore": 0
+        },
+        "backup": {
+            "instanceName": "",
+            "interval": 0,
+            "lastBackupHash": ""
+        }
+    })
+}
+
+fn canonical_settings_value(value: &Value) -> Value {
+    let mut result = default_settings();
+    for (path, predicate) in [
+        ("/ipv6", Value::is_boolean as fn(&Value) -> bool),
+        ("/useDefaultInterface", Value::is_boolean),
+        ("/netInterface", Value::is_string),
+        ("/pprof", Value::is_boolean),
+        ("/systemProxy/http", Value::is_boolean),
+        ("/systemProxy/socks5", Value::is_boolean),
+        ("/logcat/level", Value::is_string),
+        ("/logcat/save", Value::is_boolean),
+        ("/logcat/ignoreTimeoutError", Value::is_boolean),
+        ("/logcat/ignoreDnsError", Value::is_boolean),
+        ("/advanced/udpBufferSize", Value::is_number),
+        ("/advanced/relayBufferSize", Value::is_number),
+        ("/advanced/udpRingbufferSize", Value::is_number),
+        ("/advanced/happyEyeballsSemaphore", Value::is_number),
+    ] {
+        if let (Some(source), Some(destination)) = (value.pointer(path), result.pointer_mut(path))
+            && predicate(source)
+        {
+            *destination = source.clone();
+        }
     }
-    value
+    result
+}
+
+fn settings_value_from_go_kv(values: &[GoSettingsKvRecord]) -> Value {
+    let mut result = default_settings();
+    for record in values {
+        let Ok(value) = serde_json::from_str::<Value>(&record.value_json) else {
+            continue;
+        };
+        let path = match (record.section.as_str(), record.key.as_str()) {
+            ("general", "ipv6") => "/ipv6",
+            ("general", "use_default_interface") => "/useDefaultInterface",
+            ("general", "net_interface") => "/netInterface",
+            ("general", "pprof") => "/pprof",
+            ("system_proxy", "http") => "/systemProxy/http",
+            ("system_proxy", "socks5") => "/systemProxy/socks5",
+            ("logcat", "save") => "/logcat/save",
+            ("logcat", "ignore_dns_error") => "/logcat/ignoreDnsError",
+            ("logcat", "ignore_timeout_error") => "/logcat/ignoreTimeoutError",
+            ("advanced", "udp_buffer_size") => "/advanced/udpBufferSize",
+            ("advanced", "relay_buffer_size") => "/advanced/relayBufferSize",
+            ("advanced", "udp_ringbuffer_size") => "/advanced/udpRingbufferSize",
+            ("advanced", "happyeyeballs_semaphore") => "/advanced/happyEyeballsSemaphore",
+            ("logcat", "level") => {
+                if let Some(destination) = result.pointer_mut("/logcat/level") {
+                    *destination = Value::String(log_level_from_json(&value));
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        let accepts = if path == "/netInterface" {
+            value.is_string()
+        } else if path.starts_with("/advanced/") {
+            value.is_number()
+        } else {
+            value.is_boolean()
+        };
+        if accepts {
+            if let Some(destination) = result.pointer_mut(path) {
+                *destination = value;
+            }
+        }
+    }
+    result
+}
+
+fn settings_kv_from_contract(value: &Value) -> Vec<GoSettingsKvRecord> {
+    let entries = [
+        ("general", "ipv6", "/ipv6"),
+        ("general", "use_default_interface", "/useDefaultInterface"),
+        ("general", "net_interface", "/netInterface"),
+        ("general", "pprof", "/pprof"),
+        ("system_proxy", "http", "/systemProxy/http"),
+        ("system_proxy", "socks5", "/systemProxy/socks5"),
+        ("logcat", "save", "/logcat/save"),
+        ("logcat", "ignore_dns_error", "/logcat/ignoreDnsError"),
+        (
+            "logcat",
+            "ignore_timeout_error",
+            "/logcat/ignoreTimeoutError",
+        ),
+        ("advanced", "udp_buffer_size", "/advanced/udpBufferSize"),
+        ("advanced", "relay_buffer_size", "/advanced/relayBufferSize"),
+        (
+            "advanced",
+            "udp_ringbuffer_size",
+            "/advanced/udpRingbufferSize",
+        ),
+        (
+            "advanced",
+            "happyeyeballs_semaphore",
+            "/advanced/happyEyeballsSemaphore",
+        ),
+    ];
+    let mut result = entries
+        .into_iter()
+        .filter_map(|(section, key, path)| {
+            let value = value.pointer(path)?;
+            Some(GoSettingsKvRecord {
+                section: section.to_owned(),
+                key: key.to_owned(),
+                value_json: serde_json::to_string(value).ok()?,
+            })
+        })
+        .collect::<Vec<_>>();
+    let level = value
+        .pointer("/logcat/level")
+        .and_then(Value::as_str)
+        .map(log_level_code)
+        .unwrap_or(0);
+    result.push(GoSettingsKvRecord {
+        section: "logcat".to_owned(),
+        key: "level".to_owned(),
+        value_json: level.to_string(),
+    });
+    result
+}
+
+fn log_level_code(level: &str) -> i64 {
+    match level {
+        "verbose" => 0,
+        "debug" => 1,
+        "info" => 2,
+        "warning" => 3,
+        "error" => 4,
+        "fatal" => 5,
+        _ => 2,
+    }
+}
+
+fn log_level_from_json(value: &Value) -> String {
+    let code = value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        .unwrap_or(0);
+    match code {
+        0 => "verbose",
+        1 => "debug",
+        2 => "info",
+        3 => "warning",
+        4 => "error",
+        5 => "fatal",
+        _ => "info",
+    }
+    .to_owned()
 }
 fn default_route_list_config() -> Value {
     json!({"refreshInterval":"0","lastRefreshTime":"0","error":"","hostIndexDisk":false,"maxMindDbGeoIp":{"downloadUrl":"","error":""}})
@@ -3471,6 +3696,88 @@ mod tests {
     use tower::ServiceExt;
     use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
     use yuhaiin_store::ConfigStore;
+
+    #[test]
+    fn settings_contract_uses_go_defaults_and_ignores_backup_payload() {
+        let value = canonical_settings_value(&json!({
+            "ipv6": true,
+            "pprof": false,
+            "logcat": {"level": "info"},
+            "advanced": {"udpBufferSize": 65536},
+            "backup": {"instanceName": "must-not-be-in-settings"},
+            "unknown": true,
+        }));
+        assert_eq!(value["ipv6"], true);
+        assert_eq!(value["pprof"], false);
+        assert_eq!(value["advanced"]["udpBufferSize"], 65536);
+        assert_eq!(value["backup"]["instanceName"], "");
+        assert!(value.get("unknown").is_none());
+
+        let rows = settings_kv_from_contract(&value);
+        assert!(rows.iter().any(|row| {
+            row.section == "advanced" && row.key == "udp_buffer_size" && row.value_json == "65536"
+        }));
+        assert_eq!(settings_value_from_go_kv(&rows)["logcat"]["level"], "info");
+    }
+
+    #[tokio::test]
+    async fn settings_and_backup_rpc_round_trip_go_storage_shapes() {
+        let app = router(state().await);
+        let settings_response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v2/rpc/settings.put")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"ipv6":true,"advanced":{"udpBufferSize":65536},"backup":{"instanceName":"ignored"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settings_response.status(), StatusCode::OK);
+        let settings: Value = serde_json::from_slice(
+            &to_bytes(settings_response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["advanced"]["udpBufferSize"], 65536);
+        assert_eq!(settings["backup"]["instanceName"], "");
+
+        let backup = json!({
+            "instanceName":"rust-instance",
+            "s3":{"enabled":true,"bucket":"bucket"},
+            "interval":3600,
+            "lastBackupHash":"hash"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v2/rpc/backup.config.put")
+                    .header("content-type", "application/json")
+                    .body(Body::from(backup.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::post("/api/v2/rpc/backup.config.get")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let persisted: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(persisted["instanceName"], "rust-instance");
+        assert_eq!(persisted["s3"]["bucket"], "bucket");
+    }
 
     async fn state() -> ApiState {
         let store = ConfigStore::open_memory().await.unwrap();
@@ -3535,7 +3842,7 @@ mod tests {
     #[tokio::test]
     async fn node_rpc_round_trips_frontend_shape_and_publishes_reload() {
         let state = state().await;
-        let value = json!({"id":"direct","name":"Direct","group":"","origin":"rust","enabled":true,"chain":[{"type":"direct","direct":{}}]});
+        let value = json!({"id":"direct","name":"Direct","group":"","enabled":true,"chain":[{"type":"direct","direct":{}}]});
         let saved = save_node_value(&state, value.clone(), None).await.unwrap();
         assert_eq!(saved.0["id"], "direct");
         assert_eq!(saved.0["origin"], "manual");
@@ -3544,6 +3851,18 @@ mod tests {
             .unwrap();
         assert_eq!(listed.0["items"][0]["chain"][0]["type"], "direct");
         assert_eq!(listed.0["items"][0]["origin"], "manual");
+        let stored = state
+            .controller
+            .store()
+            .repository()
+            .list_go_nodes()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|node| node.id == "direct")
+            .unwrap();
+        let stored_json: Value = serde_json::from_slice(&stored.data_json).unwrap();
+        assert_eq!(stored_json["origin"], "manual");
         assert_eq!(state.controller.handle().revision(), 1);
     }
 

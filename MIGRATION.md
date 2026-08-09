@@ -1496,3 +1496,13 @@ Rust 现在在关闭 flow 时删除 live counter；恢复旧版 `statistics.runt
 现在 native Rust 初始化会直接创建 Go runtime 仍会读取的兼容表，并记录 Go migration 1--6、legacy migration marker 和 `schema_version=6`；Go v1-v6 的 DDL 不会在同一份 native 数据库上重复执行。旧 Rust 库升级时还会幂等补齐 `route_rules`/`dns_resolvers` 的 nullable Go projection columns。该处理保留 `rusqlite + bundled SQLite`，没有重新引入 fsqlite。
 
 本轮验收：`cargo test --workspace --all-features --offline --quiet` 全部通过；其中 store 为 113 passed/4 ignored，runtime 为 183 passed。独立 `~/.cache/yuhaiin-rust` fresh Rust state 已被 Go binary 重新打开，日志出现 `plain model migration finished`，且没有缺失兼容表告警；旧 Rust state 也已实际完成 projection column upgrade 后被 Go 重新打开。该 smoke 覆盖的是启动、migration 和表存在性边界；非空生产库中 route/resolver projection 的逐行语义、统计最终投影和真实 rollback 仍需使用生产形状 fixture 继续验收，不能据此宣称完整双向数据等价。
+
+## 28. 2026-08-09 settings/backup 双向进程级接管
+
+对照 Go `SettingsStore.Load/Save` 与 `BackupStore.Get/Save`，Rust 管理面不再把 settings 的 `backup` reference 和完整 `backup.config` 混为一层：settings API 使用 Go contract 默认值、只投影已知字段、写入 Go `settings_kv`；backup config API 使用 Go 的单行 `backup_settings`，保留完整 `data_json` 以避免丢失 S3 或未来字段。Rust 的私有 `yuhaiin_config` 仍作为没有 Go 表时的 fallback。
+
+新增 repository/API 单测，并用真实独立 SQLite 做双向进程级验证：
+
+- Rust 写入 settings（含 `65536/65535/5000/0` 边界值）和 S3 backup 后，Go 重新打开同一库，读回 settings 与完整 backup config。
+- Go 写入 settings 与 backup config 后，Rust 重新打开同一库，读回字段、数值和 `backup` reference 形状。
+- 测试状态目录均位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`；现有 `backup.run/restore` 的真实 S3 上传和跨发行版 service-manager 验收仍保持在 checklist。

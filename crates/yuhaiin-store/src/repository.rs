@@ -96,6 +96,60 @@ impl ConfigRepository {
         })
     }
 
+    /// Read Go's single-row backup contract without projecting away S3 or
+    /// future fields. Older databases may not have the table yet, in which
+    /// case callers use their private compatibility fallback.
+    pub async fn get_go_backup_settings(&self) -> Result<Option<GoBackupSettingsRecord>> {
+        let connection = self.store.lock_connection()?;
+        if !table_exists(&connection, "backup_settings") {
+            return Ok(None);
+        }
+        let rows = connection
+            .query(
+                "SELECT updated_at, data_json
+                 FROM backup_settings WHERE id = 1",
+            )
+            .map_err(storage_error)?;
+        rows.first()
+            .map(|row| {
+                let data_json = row_blob_or_text(row, 1, "backup_settings.data_json")?;
+                validate_json_bytes(&data_json, "backup_settings.data_json")?;
+                Ok(GoBackupSettingsRecord {
+                    updated_at: row_integer(row, 0, "backup_settings.updated_at")?,
+                    data_json,
+                })
+            })
+            .transpose()
+    }
+
+    /// Persist the Go backup option as one atomic row while retaining fields
+    /// that are currently only understood by the Go implementation.
+    pub async fn put_go_backup_settings(&self, record: &GoBackupSettingsRecord) -> Result<()> {
+        validate_go_timestamp(record.updated_at)?;
+        validate_json_bytes(&record.data_json, "backup_settings.data_json")?;
+        self.store.with_write_transaction(|connection| {
+            require_go_table(
+                connection,
+                "backup_settings",
+                &["id", "updated_at", "data_json"],
+            )?;
+            connection
+                .execute_with_params(
+                    "INSERT INTO backup_settings(id, updated_at, data_json)
+                     VALUES (1, ?1, ?2)
+                     ON CONFLICT(id) DO UPDATE SET
+                       updated_at = excluded.updated_at,
+                       data_json = excluded.data_json",
+                    &[
+                        SqliteValue::from(record.updated_at),
+                        SqliteValue::from(record.data_json.as_slice()),
+                    ],
+                )
+                .map(|_| ())
+                .map_err(storage_error)
+        })
+    }
+
     /// Read the Go v6 inbound metadata without taking ownership of the source
     /// table. The paired `put_go_inbound` method writes only the known columns
     /// and preserves `data_json` supplied by the caller.

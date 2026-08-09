@@ -222,6 +222,11 @@ fn fresh_store_supports_go_v6_compatibility_writes() {
         data_json: br#"{"domains":["example.com"]}"#.to_vec(),
     }))
     .unwrap();
+    block_on(repository.put_go_backup_settings(&GoBackupSettingsRecord {
+        updated_at: 7,
+        data_json: br#"{"instanceName":"instance","s3":{"enabled":false}}"#.to_vec(),
+    }))
+    .unwrap();
 
     assert_eq!(block_on(repository.list_go_inbounds()).unwrap().len(), 1);
     assert_eq!(block_on(repository.list_go_nodes()).unwrap().len(), 1);
@@ -229,6 +234,14 @@ fn fresh_store_supports_go_v6_compatibility_writes() {
     assert_eq!(block_on(repository.list_go_resolvers()).unwrap().len(), 1);
     assert_eq!(block_on(repository.list_go_route_rules()).unwrap().len(), 1);
     assert_eq!(block_on(repository.list_go_route_lists()).unwrap().len(), 1);
+    let backup = block_on(repository.get_go_backup_settings())
+        .unwrap()
+        .unwrap();
+    assert_eq!(backup.updated_at, 7);
+    assert_eq!(
+        backup.data_json,
+        br#"{"instanceName":"instance","s3":{"enabled":false}}"#
+    );
 }
 
 #[test]
