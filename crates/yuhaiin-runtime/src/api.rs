@@ -1537,20 +1537,21 @@ async fn save_node_value(state: &ApiState, value: Value, _index: Option<usize>) 
         id: id.clone(),
         name: string_or(&value, "name", &id),
         group_name,
-        origin: string_or(&value, "origin", "rust-api"),
+        // NodeRuntime.Save in Go intentionally marks every API save as a
+        // manually managed node, regardless of the request's origin.
+        origin: "manual".to_owned(),
         enabled: bool_or(&value, "enabled", true),
         chain_types_json: serde_json::to_vec(&chain_types)?,
         updated_at: unix_seconds(),
         data_json: serde_json::to_vec(&value)?,
     };
-    let returned = value.clone();
     state
         .controller
         .mutate_and_reload(
             move |store| async move { store.repository().put_go_node(&record).await },
         )
         .await?;
-    Ok(Json(returned))
+    get_node_value(state, id).await
 }
 
 async fn delete_node_value(state: &ApiState, id: String) -> ApiResult {
@@ -1707,14 +1708,16 @@ async fn save_inbound_value(state: &ApiState, value: Value, _index: Option<usize
         updated_at: unix_seconds(),
         data_json: serde_json::to_vec(&value)?,
     };
-    let returned = value.clone();
     state
         .controller
         .mutate_and_reload(
             move |store| async move { store.repository().put_go_inbound(&record).await },
         )
         .await?;
-    Ok(Json(returned))
+    // Go's saveInbound calls Inbounds.Get after Save, so the response is the
+    // persisted contract (including any fields normalized by the store), not
+    // the request JSON verbatim.
+    get_inbound_value(state, id).await
 }
 
 async fn delete_inbound_value(state: &ApiState, id: String) -> ApiResult {
@@ -1771,7 +1774,7 @@ async fn get_resolver_value(state: &ApiState, id: String) -> ApiResult {
 async fn save_resolver_value(state: &ApiState, value: Value, _index: Option<usize>) -> ApiResult {
     let id = required_string(&value, "id")?;
     let resolver_type = string_or(&value, "type", "udp");
-    let host = string_or(
+    let mut host = string_or(
         &value,
         "host",
         if resolver_type == "system" {
@@ -1780,15 +1783,26 @@ async fn save_resolver_value(state: &ApiState, value: Value, _index: Option<usiz
             ""
         },
     );
+    if resolver_type == "system" && host.trim().is_empty() {
+        host = "system default".to_owned();
+    }
     if resolver_type != "system" && host.trim().is_empty() {
         return Err(ApiError::bad("resolver host is empty"));
     }
+    let normalized_id = id.trim().to_owned();
+    let mut persisted_value = value.clone();
+    set_string(&mut persisted_value, "id", normalized_id.clone());
+    set_string(&mut persisted_value, "type", resolver_type.clone());
+    set_string(&mut persisted_value, "host", host.clone());
+    if resolver_type == "system" {
+        set_bool(&mut persisted_value, "system", true);
+    }
     let record = GoResolverRecord {
-        id: id.clone(),
+        id: normalized_id,
         resolver_type,
         host,
         updated_at: unix_seconds(),
-        data_json: serde_json::to_vec(&value)?,
+        data_json: serde_json::to_vec(&persisted_value)?,
     };
     let returned = value.clone();
     state
@@ -3249,11 +3263,65 @@ mod tests {
         let value = json!({"id":"direct","name":"Direct","group":"","origin":"rust","enabled":true,"chain":[{"type":"direct","direct":{}}]});
         let saved = save_node_value(&state, value.clone(), None).await.unwrap();
         assert_eq!(saved.0["id"], "direct");
+        assert_eq!(saved.0["origin"], "manual");
         let listed = nodes_get_value(&state, &json!({"page":1,"page_size":0}))
             .await
             .unwrap();
         assert_eq!(listed.0["items"][0]["chain"][0]["type"], "direct");
+        assert_eq!(listed.0["items"][0]["origin"], "manual");
         assert_eq!(state.controller.handle().revision(), 1);
+    }
+
+    #[tokio::test]
+    async fn inbound_save_returns_persisted_contract_and_resolver_storage_normalizes_system() {
+        let state = state().await;
+        let inbound = json!({
+            "id": "api-tun",
+            "name": "API TUN",
+            "enabled": false,
+            "network": {"type": "empty", "empty": {}},
+            "transports": [],
+            "protocol": {
+                "type": "tun",
+                "tun": {
+                    "name": "tun://api-tun",
+                    "mtu": 9000,
+                    "portal": "198.18.0.1/15",
+                    "portalV6": "fc00::1/18",
+                    "skipMulticast": true,
+                    "driver": "gvisor",
+                    "routes": [],
+                    "excludes": []
+                }
+            }
+        });
+        let saved = save_inbound_value(&state, inbound, None).await.unwrap();
+        assert_eq!(saved.0["id"], "api-tun");
+        assert_eq!(saved.0["name"], "API TUN");
+        assert_eq!(saved.0["protocol"]["type"], "tun");
+
+        let response = save_resolver_value(
+            &state,
+            json!({"id": " system ", "type": "system", "host": ""}),
+            None,
+        )
+        .await
+        .unwrap();
+        // The Go controller returns the request contract from SaveContract;
+        // normalization is observable through List/Get afterward.
+        assert_eq!(response.0["id"], " system ");
+        let listed = resolvers_get_value(&state, &json!({"page": 1, "page_size": 0}))
+            .await
+            .unwrap();
+        let system = listed.0["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "system")
+            .unwrap();
+        assert_eq!(system["type"], "system");
+        assert_eq!(system["host"], "system default");
+        assert_eq!(system["system"], true);
     }
 
     #[tokio::test]
