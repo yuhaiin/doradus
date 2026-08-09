@@ -36,7 +36,7 @@ flowchart LR
 
 | 状态 | 模块 | Rust 位置 | 当前结果 | 剩余工作 |
 | --- | --- | --- | --- | --- |
-| `[x]` | workspace 分层 | `crates/yuhaiin-core`, `chain`, `protocol`, `store`, `geo`, `trie`, `runtime` | 共用类型、proxy/transport、存储、路由、运行时边界已拆开；HTTP API 复用 store/runtime struct | Android/macOS 的 target 与权限验收 |
+| `[x]` | workspace 分层 | `crates/yuhaiin-core`, `chain`, `protocol`, `store`, `geo`, `trie`, `runtime` | 共用类型、proxy/transport、存储、路由、运行时边界已拆开；HTTP API 复用 store/runtime struct | Android/macOS 的权限、TUN fd/route 和实机验收 |
 | `[x]` | Flow/Proxy contract | `yuhaiin-core::FlowContext`, `proxy::{AsyncProxy,AsyncDatagram,AsyncProxySelector}` | TCP、UDP、ping、close、取消、timeout、backpressure 统一到一个可扩展边界 | 少数协议专属错误语义继续补齐 |
 | `[x]` | 纯 Rust 网络基础 | core 的 DNS/TUN/NAT/protocol，以及 `socket2` | 默认不引入 TLS/OpenSSL/C 网络绑定；SQLite bundled C binding 是批准的例外 | 不为不需要的 Go 包机械复刻 |
 
@@ -151,7 +151,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | `[x]` | Linux desktop | binary、SQLite、HTTP API、DNS、inbound owner、TUN、Podman smoke | 持续增加真实生产配置回归 |
 | `[x]` | Linux container | Podman host-network / privileged network=none smoke | 已有；每次新增数据面模块继续复用 `~/.cache` 状态目录 |
-| `[~]` | Android | `yuhaiin-core` 的 `async-proxy,tun` 已通过 `aarch64-linux-android` target check；runtime 仍依赖 bundled SQLite 的 NDK C compiler | 安装 Android NDK/`aarch64-linux-android-clang` 后完成 runtime target check；VpnService fd、权限、电量/内存实测 |
+| `[~]` | Android | `yuhaiin-core` 与 `yuhaiin-runtime --all-features` 均已通过 `aarch64-linux-android` target check；bundled SQLite 使用 `/opt/android-ndk/.../aarch64-linux-android35-clang` | VpnService fd、权限、电量/内存实测；继续补 Android 原生 route/生命周期验收 |
 | `[~]` | macOS | `yuhaiin-core` 的 `async-proxy,tun` 已通过 `aarch64-apple-darwin` target check；runtime 仍需 macOS SDK/clang 编译 bundled SQLite | macOS SDK/clang runtime target check；utun、LaunchDaemon、权限、SIGTERM/route 实机验收 |
 | `[ ]` | 发布替换手册 | 架构和 API 已稳定 | 补 binary 迁移、state backup/rollback、旧 Go 并行/切换步骤 |
 
