@@ -288,11 +288,14 @@ impl ConnectionMonitor {
                         // path, but refresh Go's public tables infrequently so
                         // another Go/Rust management process can observe
                         // recent totals without rewriting the tables per flow.
-                        let _ = worker_persistence
+                        if worker_persistence
                             .store
-                            .replace_go_statistics(&writer_monitor.go_statistics_snapshot());
-                        last_go_projection = Instant::now();
-                        project_go_statistics = false;
+                            .replace_go_statistics(&writer_monitor.go_statistics_snapshot())
+                            .is_ok()
+                        {
+                            last_go_projection = Instant::now();
+                            project_go_statistics = false;
+                        }
                     }
                 }
             }
@@ -1322,8 +1325,13 @@ fn history_time(item: &Value) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+
     use super::*;
     use yuhaiin_core::{Endpoint, Network};
+    use yuhaiin_store::ConfigStore;
 
     fn flow() -> (TunFlow, FlowContext) {
         let key = TunFlowKey {
@@ -1336,6 +1344,31 @@ mod tests {
             flow,
             FlowContext::new(Endpoint::ip(key.network, key.destination)),
         )
+    }
+
+    fn monitor_test_database_path() -> PathBuf {
+        let cache = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+            .expect("a cache directory is required for the monitor test");
+        let directory = cache.join("yuhaiin-rust-monitor-tests");
+        fs::create_dir_all(&directory).unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        directory.join(format!("go-projection-{}-{nonce}.db", std::process::id()))
+    }
+
+    fn remove_monitor_test_database(path: &Path) {
+        for suffix in ["", "-journal", "-wal", "-shm", "-yuhaiin-write-lock"] {
+            let target = if suffix.is_empty() {
+                path.to_path_buf()
+            } else {
+                PathBuf::from(format!("{}{}", path.display(), suffix))
+            };
+            let _ = fs::remove_file(target);
+        }
     }
 
     #[test]
@@ -1641,6 +1674,39 @@ mod tests {
             );
             reloaded.shutdown().await.unwrap();
         });
+    }
+
+    #[tokio::test]
+    async fn monitor_projects_go_statistics_for_an_independent_reader_before_shutdown() {
+        let path = monitor_test_database_path();
+        remove_monitor_test_database(&path);
+        let writer_store = ConfigStore::open(&path).await.unwrap();
+        let reader_store = ConfigStore::open(&path).await.unwrap();
+        let monitor = ConnectionMonitor::load_with_store(writer_store)
+            .await
+            .unwrap();
+        let (flow, context) = flow();
+        monitor.opened(flow, context);
+        monitor.bytes(flow.key, TunFlowDirection::Upload, 23);
+        monitor.closed(flow.key);
+
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let statistics = reader_store.load_go_statistics().unwrap();
+                if statistics.total_upload == 23 && statistics.history.len() == 1 {
+                    break statistics;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("independent reader should observe the runtime Go projection");
+        assert_eq!(observed.total_upload, 23);
+        assert_eq!(observed.history[0].count, 1);
+
+        monitor.shutdown().await.unwrap();
+        drop(reader_store);
+        remove_monitor_test_database(&path);
     }
 
     #[test]

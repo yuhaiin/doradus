@@ -13,6 +13,8 @@
 
 > 2026-08-09 统计运行期投影：保留 2 秒级紧凑 `statistics.runtime` checkpoint 作为 crash recovery；checkpoint 成功后首次触发 Go 表投影，之后最多每 30 秒重写一次 `statistics_kv`、traffic/history/failure/telemetry 投影，避免每个 flow 都重写整套 Go 表。最终 shutdown 仍执行一次完整原子投影；异常中断时 Go 表只保证最近一次低频投影，完整恢复以 checkpoint 为准，跨进程可见性仍需 Podman/进程级验证。
 
+> 2026-08-09 统计投影重试：Go 兼容表投影只有在 `replace_go_statistics` 成功后才推进 30 秒节流时间点；SQLite 暂时锁冲突或其他写入失败不会被误记为成功，后续 checkpoint 会继续尝试。新增独立文件库 reader 回归，在 monitor shutdown 前验证另一 `ConfigStore` 已能读到 totals/history。
+
 > 2026-08-09 路由规则 API 兼容性：GET/DELETE 忽略旧 URL 中的 `index`，PUT 更新已有名称时保留原 `priority`，并以公开 `name` 作为 Go 兼容表的 canonical `id`；删除按 `name` 完成并重新编号。这样前端重复编辑同一规则不会生成 `name:index` 重复行，旧数据中的非 canonical id 也会在更新时收敛。
 
 > 2026-08-09 管理列表 query 契约收口：Rust API 不再对 nodes、inbounds、resolvers、route lists、route rules 统一搜索整个 JSON，而是按 Go handler 的字段集合过滤，并在过滤后计算分页 `total`。节点只搜索 `id/name/group/origin/chain.type`，入站只搜索 `id/name/network.type/protocol.type`，resolver 搜索 `id/type/host/subnet/tlsServerName`，路由列表/规则分别使用 Go 的四个字段。查询仍保持大小写不敏感、分页字段兼容 camelCase；列表 API 的完整 response/error/reload 语义逐项验收仍在 checklist。
