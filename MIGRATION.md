@@ -1530,3 +1530,11 @@ Rust 现在明确支持这个“仅新增用户/订阅关联表”的 v7 形状�
 同一 smoke 还暴露了统计边界：历史 checkpoint 中存在多个相同 `(protocol, addr, process)` 的旧记录，Go 的 `connection_history` 主键不允许直接写入重复行。Rust 现在在 checkpoint 恢复、history API 和 Go projection 前统一合并 count，并保留最新连接详情/时间；修复后真实 schema-7 状态优雅停止成功，最终 `connection_history` 无重复主键，checkpoint history 从 1270 条归并为 1258 条。
 
 这次验证使用的副本和响应文件均位于 `~/.cache/yuhaiin-rust`，未修改 Go 原始数据库，也没有使用 `/tmp`。schema-8 及更高版本仍 fail-closed，直到完成对应表结构和枚举语义审计。
+
+## 31. 2026-08-09 Go 协议互操作与 namespace TUN netem
+
+本机 `go version` 为 `go1.26.5-X:nodwarf5`，显式运行此前默认 `#[ignore]` 的跨语言测试，所有已覆盖的 wire contract 均通过：AEAD TCP/UDP 双向各 1 项、Trojan、VLESS、VMess、Shadowsocks、HTTP obfs、ShadowsocksR、WebSocket/HTTP2 和 Yuubinsya listener 均无失败。测试的 Go 构建临时目录使用 `~/.cache/yuhaiin-rust` 下的路径，没有使用 `/tmp`。
+
+workspace ignored 测试第一次直接在宿主运行时，两个 `p0_tun` netem 测试因 `tc qdisc` 返回 `Operation not permitted` 失败；随后在独立的 rootless user/network namespace 中重新运行同一 `p0_tun` 测试，`chain_datagram_survives_kernel_loopback_loss` 和 matrix 两项均通过。该结果证明测试本身和内核 loopback loss 路径可运行，但仍不替代 Android/macOS TUN、真实宿主 CAP_NET_ADMIN 下的透明转发与长期 MTU/fragment 验收。
+
+前端 generated.ts 的 88 个 RPC operation 已完成静态集合核对；`connections.events` 和 `tools.logs` 是 Go 明确标记的 streaming endpoint，Rust 使用直接 SSE route，不应作为普通 JSON RPC 缺失。剩余 API 缺口是生产数据库上的逐字段 response、错误语义和 reload/apply side-effect 快照，而不是 operation 路由集合缺失。

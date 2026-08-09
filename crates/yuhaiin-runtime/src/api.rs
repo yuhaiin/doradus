@@ -5104,4 +5104,31 @@ mod tests {
             .unwrap();
         assert_ne!(preflight.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[tokio::test]
+    async fn connections_event_stream_starts_with_go_snapshot_event() {
+        let app = router(state().await);
+        let response = app
+            .oneshot(
+                Request::get("/api/v2/connections/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+
+        let mut body = response.into_body();
+        let first = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        let first = String::from_utf8_lossy(&first);
+        assert!(first.contains("event: connections_added"));
+        assert!(first.contains(r#""connections":[]"#));
+    }
 }
