@@ -12,8 +12,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use yuhaiin_core::dns::{DnsRecordType, decode_response, encode_query};
+use yuhaiin_core::dns_resolver_async::{AsyncIpResolver, SystemAsyncIpResolver};
 use yuhaiin_core::proxy::{AsyncProxy, BoxAsyncStream};
-use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use yuhaiin_core::{
+    DomainName, Endpoint, Error, ErrorKind, FlowContext, IpSet, Network, ResolveStrategy, Result,
+};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -104,6 +107,22 @@ static DNS_TRANSACTION_COUNTER: AtomicU16 = AtomicU16::new(1);
 
 pub async fn probe(
     proxy: Arc<dyn AsyncProxy>,
+    request: LatencyRequest,
+    timeout: Duration,
+) -> Result<LatencyResponse> {
+    probe_with_resolver(proxy, Arc::new(SystemAsyncIpResolver), request, timeout).await
+}
+
+/// Probe a node through the runtime's configured resolver.
+///
+/// Go's IP latency endpoint resolves the URL host twice, once with a
+/// PreferIPv4 policy and once with PreferIPv6, before handing an IP endpoint
+/// to the selected proxy.  Keeping the resolver as an explicit dependency
+/// makes that behavior testable and avoids silently falling back to the
+/// management process resolver.
+pub async fn probe_with_resolver(
+    proxy: Arc<dyn AsyncProxy>,
+    resolver: Arc<dyn AsyncIpResolver>,
     mut request: LatencyRequest,
     timeout: Duration,
 ) -> Result<LatencyResponse> {
@@ -125,7 +144,7 @@ pub async fn probe(
                     })??;
             Ok(success(reply.elapsed))
         }
-        "ip" => probe_ip(proxy, request, timeout).await,
+        "ip" => probe_ip(proxy, resolver, request, timeout).await,
         "stun" | "stun_tcp" => probe_stun(proxy, request, timeout).await,
         "dns" | "udp" => probe_dns(proxy, request, timeout).await,
         "doq" => Err(Error::new(
@@ -189,13 +208,21 @@ fn success(elapsed: Duration) -> LatencyResponse {
 
 async fn probe_ip(
     proxy: Arc<dyn AsyncProxy>,
+    resolver: Arc<dyn AsyncIpResolver>,
     request: LatencyRequest,
     timeout: Duration,
 ) -> Result<LatencyResponse> {
     let target = request.url_or_default(true);
     let (v4, v6) = tokio::join!(
-        http_probe(&proxy, &target, &request, timeout),
-        http_probe(&proxy, &target, &request, timeout),
+        probe_ip_family(
+            Arc::clone(&proxy),
+            Arc::clone(&resolver),
+            &target,
+            &request,
+            timeout,
+            false,
+        ),
+        probe_ip_family(proxy, resolver, &target, &request, timeout, true),
     );
     let mut ip = IpLatency::default();
     if let Ok(reply) = v4 {
@@ -229,14 +256,77 @@ async fn probe_ip(
     })
 }
 
+async fn probe_ip_family(
+    proxy: Arc<dyn AsyncProxy>,
+    resolver: Arc<dyn AsyncIpResolver>,
+    target: &str,
+    request: &LatencyRequest,
+    timeout: Duration,
+    ipv6: bool,
+) -> Result<HttpReply> {
+    let parsed = parse_http_target(target)?;
+    let address = if let Ok(ip) = parsed.host.parse::<IpAddr>() {
+        if ip.is_ipv6() != ipv6 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "IP latency URL literal has the wrong address family",
+            ));
+        }
+        SocketAddr::new(ip, parsed.port)
+    } else {
+        let domain = DomainName::new(&parsed.host)?;
+        let strategy = if ipv6 {
+            ResolveStrategy::OnlyIpv6
+        } else {
+            ResolveStrategy::OnlyIpv4
+        };
+        let addresses = tokio::time::timeout(timeout, resolver.resolve(&domain, strategy))
+            .await
+            .map_err(|_| Error::new(ErrorKind::Timeout, "IP latency DNS resolution timed out"))??;
+        SocketAddr::new(
+            select_ip(&addresses, ipv6).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "IP latency host has no IPv{} address",
+                        if ipv6 { 6 } else { 4 }
+                    ),
+                )
+            })?,
+            parsed.port,
+        )
+    };
+    http_probe_at(&proxy, target, request, timeout, Some(address)).await
+}
+
+fn select_ip(addresses: &IpSet, ipv6: bool) -> Option<IpAddr> {
+    if ipv6 {
+        addresses.v6.first().copied().map(IpAddr::V6)
+    } else {
+        addresses.v4.first().copied().map(IpAddr::V4)
+    }
+}
+
 async fn http_probe(
     proxy: &Arc<dyn AsyncProxy>,
     url: &str,
     request: &LatencyRequest,
     timeout: Duration,
 ) -> Result<HttpReply> {
+    http_probe_at(proxy, url, request, timeout, None).await
+}
+
+async fn http_probe_at(
+    proxy: &Arc<dyn AsyncProxy>,
+    url: &str,
+    request: &LatencyRequest,
+    timeout: Duration,
+    address: Option<SocketAddr>,
+) -> Result<HttpReply> {
     let target = parse_http_target(url)?;
-    let endpoint = endpoint(Network::Tcp, &target.host, target.port)?;
+    let endpoint = address
+        .map(|address| Endpoint::ip(Network::Tcp, address))
+        .unwrap_or(endpoint(Network::Tcp, &target.host, target.port)?);
     let context = FlowContext::new(endpoint);
     let started = std::time::Instant::now();
     let stream = tokio::time::timeout(timeout, proxy.connect(&context))
@@ -664,6 +754,93 @@ mod tests {
 
     struct EchoProxy;
 
+    #[derive(Clone)]
+    struct StaticResolver {
+        addresses: IpSet,
+    }
+
+    impl AsyncIpResolver for StaticResolver {
+        fn resolve<'a>(
+            &'a self,
+            _domain: &'a DomainName,
+            strategy: ResolveStrategy,
+        ) -> BoxFuture<'a, Result<IpSet>> {
+            let mut addresses = self.addresses.clone();
+            match strategy {
+                ResolveStrategy::OnlyIpv4 => addresses.v6.clear(),
+                ResolveStrategy::OnlyIpv6 => addresses.v4.clear(),
+                ResolveStrategy::Default
+                | ResolveStrategy::PreferIpv4
+                | ResolveStrategy::PreferIpv6 => {}
+            }
+            Box::pin(async move { Ok(addresses) })
+        }
+    }
+
+    struct RecordingEchoProxy {
+        destinations: Arc<std::sync::Mutex<Vec<Endpoint>>>,
+    }
+
+    impl AsyncProxy for RecordingEchoProxy {
+        fn connect<'a>(
+            &'a self,
+            context: &'a FlowContext,
+        ) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+            let destination = context.effective_destination();
+            self.destinations
+                .lock()
+                .expect("recording proxy mutex poisoned")
+                .push(destination.clone());
+            Box::pin(async move {
+                let (client, mut server) = tokio::io::duplex(4096);
+                let value = if destination.addr().is_some_and(|address| address.is_ipv6()) {
+                    "2001:db8::7"
+                } else {
+                    "203.0.113.7"
+                };
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 512];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let Ok(count) = server.read(&mut chunk).await else {
+                            return;
+                        };
+                        if count == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..count]);
+                        if request.len() > 8192 {
+                            return;
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}\n",
+                        value.len() + 1,
+                        value
+                    );
+                    let _ = server.write_all(response.as_bytes()).await;
+                });
+                Ok(Box::new(client) as BoxAsyncStream)
+            })
+        }
+
+        fn open_datagram<'a>(
+            &'a self,
+            _context: &'a FlowContext,
+        ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+            Box::pin(async {
+                Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "recording proxy has no datagram transport",
+                ))
+            })
+        }
+
+        fn close(&self) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     impl AsyncProxy for EchoProxy {
         fn connect<'a>(
             &'a self,
@@ -936,8 +1113,14 @@ mod tests {
         assert!(http.ok);
         assert!(http.latency_ms >= 0);
 
-        let ip = probe(
+        let ip = probe_with_resolver(
             proxy,
+            Arc::new(StaticResolver {
+                addresses: IpSet {
+                    v4: vec![Ipv4Addr::new(192, 0, 2, 7)],
+                    v6: Vec::new(),
+                },
+            }),
             LatencyRequest {
                 probe_type: "ip".to_owned(),
                 url: "http://example.test/ip".to_owned(),
@@ -948,6 +1131,48 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ip.ip.unwrap().ipv4, "203.0.113.7");
+    }
+
+    #[tokio::test]
+    async fn ip_probe_resolves_and_connects_one_endpoint_per_family() {
+        let destinations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy: Arc<dyn AsyncProxy> = Arc::new(RecordingEchoProxy {
+            destinations: Arc::clone(&destinations),
+        });
+        let response = probe_with_resolver(
+            proxy,
+            Arc::new(StaticResolver {
+                addresses: IpSet {
+                    v4: vec![Ipv4Addr::new(192, 0, 2, 7)],
+                    v6: vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7)],
+                },
+            }),
+            LatencyRequest {
+                probe_type: "ip".to_owned(),
+                url: "http://example.test/ip".to_owned(),
+                ..LatencyRequest::default()
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        let ip = response.ip.unwrap();
+        assert_eq!(ip.ipv4, "203.0.113.7");
+        assert_eq!(ip.ipv6, "2001:db8::7");
+        let destinations = destinations
+            .lock()
+            .expect("recording proxy mutex poisoned")
+            .clone();
+        assert_eq!(destinations.len(), 2);
+        assert!(
+            destinations
+                .iter()
+                .any(|destination| { destination.addr() == Some("192.0.2.7:80".parse().unwrap()) })
+        );
+        assert!(destinations.iter().any(|destination| {
+            destination.addr() == Some("[2001:db8::7]:80".parse().unwrap())
+        }));
     }
 
     #[tokio::test]

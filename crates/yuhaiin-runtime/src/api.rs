@@ -2283,16 +2283,20 @@ async fn node_latency_value(state: &ApiState, value: &Value) -> ApiResult {
             .unwrap_or(10_000)
             .clamp(100, 120_000),
     );
-    let proxy = state
-        .controller
-        .handle()
-        .load()
+    let snapshot = state.controller.handle().load();
+    let resolver = snapshot.resolver.clone();
+    let proxy = snapshot
         .build_proxy(&id, timeout)
         .await
         .map_err(ApiError::from)?
         .proxy;
     let request: LatencyRequest = serde_json::from_value(value.clone())?;
-    match tokio::time::timeout(timeout, crate::latency::probe(proxy, request, timeout)).await {
+    match tokio::time::timeout(
+        timeout,
+        crate::latency::probe_with_resolver(proxy, resolver, request, timeout),
+    )
+    .await
+    {
         Ok(Ok(response)) => json_value(serde_json::to_value(response)?),
         Ok(Err(error)) => json_value(json!({"ok": false, "error": error.to_string()})),
         Err(_) => json_value(json!({"ok": false, "error": "latency probe timed out"})),

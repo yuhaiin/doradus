@@ -110,7 +110,7 @@ flowchart LR
 | `[x]` | HTTP/2 pool | fixed endpoint、TLS identity、ALPN、multi-stream/multi-connection、idle/drain、GOAWAY replacement、metrics | h2 公共 API 无法主动发送 client GOAWAY，保持 application-level drain |
 | `[x]` | Yuubinsya reliability | migrate ID、coalesce、bounded retry/replay、UOT/native UDP、ping、服务端 demux、TLS/H2 listener | 主动 GOAWAY 同上；继续 Go 低版本 fixture |
 | `[x]` | outbound source interface | `SocketPolicyProxy` 统一覆盖 direct/fixed/HTTP CONNECT/SOCKS5、protocol wrappers、HTTP/2 Yuubinsya、direct UOT 和 native UDP；reload 替换 policy；UDP/TCP/DoH/DoT resolver dialer 也复用同一 source-address policy | inbound listen socket 的平台专用绑定仍需按平台验收 |
-| `[x]` | node latency DNS/UDP | `runtime::latency` | `dns`/`udp` 经由共享 `AsyncProxy::open_datagram` 发起 DNS A 查询并校验事务 ID；默认 resolver/target 与 Go 兼容；DoQ 继续延期 | 增加远端节点和 Podman 网络环境的长期回归 |
+| `[x]` | node latency DNS/UDP/IP | `runtime::latency` | `dns`/`udp` 经由共享 `AsyncProxy::open_datagram` 发起 DNS A 查询并校验事务 ID；`ip` 通过运行时 resolver 并行解析 A/AAAA，再将具体 IPv4/IPv6 endpoint 交给 proxy，同时保留 Host/SNI；默认 resolver/target 与 Go 兼容；DoQ 继续延期 | 增加远端节点和 Podman 网络环境的长期回归 |
 | `[~]` | 低频/复杂 Go 协议 | 现有可用协议已优先完成；Tailscale、WireGuard、Reality、Mux、QUIC 等不纳入当前 Rust 主路径 | 仅在实际前端配置/需求出现时评估，不伪装为已兼容 |
 | `延期` | Shadowsocks / ShadowsocksR | 仓库已有部分历史实现，但当前范围不以它们为替换门槛 | 按用户决定暂不继续扩展；后续可删除或单独维护 |
 
