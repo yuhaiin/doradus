@@ -69,6 +69,42 @@ fn schema_v1_migrates_to_typed_v3_without_losing_legacy_config() {
 }
 
 #[test]
+fn fresh_rust_database_records_go_schema_as_completed() {
+    let path = test_database_path();
+    let store = block_on(ConfigStore::open(&path)).unwrap();
+    drop(store);
+
+    let connection = Connection::open(path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        connection
+            .query("SELECT value FROM metadata WHERE key = 'schema_version'")
+            .unwrap()[0]
+            .get(0),
+        Some(&SqliteValue::Text("6".to_owned().into()))
+    );
+    assert_eq!(
+        connection.query("SELECT COUNT(*) FROM migrate").unwrap()[0].get(0),
+        Some(&SqliteValue::Integer(6))
+    );
+    assert_eq!(
+        connection
+            .query("SELECT value FROM metadata WHERE key = 'plain_model_migration_done'")
+            .unwrap()[0]
+            .get(0),
+        Some(&SqliteValue::Text("1".to_owned().into()))
+    );
+    assert!(table_exists(&connection, "inbound_settings"));
+    assert_eq!(
+        connection
+            .query("SELECT value FROM yuhaiin_meta WHERE key = 'go_schema_imported'")
+            .unwrap()[0]
+            .get(0),
+        Some(&SqliteValue::Integer(1))
+    );
+    remove_database_artifacts(&path);
+}
+
+#[test]
 fn schema_v2_adds_geo_country_without_losing_existing_route_rules() {
     let path = test_database_path();
     {

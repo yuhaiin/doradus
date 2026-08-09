@@ -110,9 +110,10 @@ fn inbound_settings_use_go_defaults_and_rust_overlay() {
         block_on(repository.get_inbound_settings()).unwrap(),
         settings
     );
-    assert_eq!(
-        block_on(store.get_config("inbounds.config")).unwrap(),
-        Some(serde_json::to_vec(&settings).unwrap())
+    assert!(
+        block_on(store.get_config("inbounds.config"))
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -123,7 +124,7 @@ fn inbound_settings_prefer_and_update_the_legacy_go_row() {
         .with_write_transaction(|connection| {
             connection
                 .execute_batch(
-                    "CREATE TABLE inbound_settings (
+                    "CREATE TABLE IF NOT EXISTS inbound_settings (
                          id INTEGER PRIMARY KEY NOT NULL,
                          hijack_dns INTEGER NOT NULL,
                          hijack_dns_fakeip INTEGER NOT NULL,

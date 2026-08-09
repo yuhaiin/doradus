@@ -49,7 +49,7 @@ flowchart LR
 | `[x]` | schema/migration | `schema.rs`, `migration.rs` | Rust schema v3、Go v1/v5/v6 compatibility、未来版本 fail-closed、事务回滚/修复重试 |
 | `[x]` | typed repository | `repository.rs` | nodes、inbounds、resolvers、routes、lists、tags、settings、NAT、MaxMind、FakeIP 读写；未知 Go JSON 保留 |
 | `[x]` | 并发与异常终止 | `src/tests`, `tests/cross_process` | WAL 多进程 writer/reader、未提交事务 force-stop、sidecar lock、损坏库 fail-closed |
-| `[~]` | 真实生产库兼容覆盖 | store tests | 已有真实 Go v5/v6-shaped fixture 和 415MB 导出；Go fresh `state.db` 已由 Rust 实际接管并通过 API smoke；仍需持续增加未建模生产表/异常快照 |
+| `[~]` | 真实生产库兼容覆盖 | store tests | 已有真实 Go v5/v6-shaped fixture 和 415MB 导出；Go fresh `state.db` 已由 Rust 接管并通过 API smoke，native Rust fresh state 也已由 Go 反向打开并完成 migration startup smoke；仍需用非空生产形状 fixture 验证 route/resolver projection 逐行语义、未建模表和异常快照 |
 | `延期` | fsqlite | — | 已停止实验；性能、内存和生态不满足要求，不再作为候选后端 |
 
 ## 3. FakeIP
@@ -202,5 +202,5 @@ podman run --rm --network=host \
 4. 对现有 frontend generated operations 做一次逐项 route/schema 快照比对；四个核心只读 RPC 已与 Go fresh state 实际收到 200 并核对顶层字段，subscription 维持明确的 deferred 状态；剩余是完整 operation、生产数据和 mutation/reload side effect 快照。
 5. 每完成一项，只修改本模块表格、验收命令和 `MIGRATION.md` 的一条 dated entry，不再把所有历史细节堆回本文件。
 6. 完成 Linux `tproxy`/`redir` 验收：在真正的 network namespace/宿主机 CAP_NET_ADMIN 环境覆盖 TPROXY UDP ancillary、redir IPv4/IPv6、权限失败及多 flow 生命周期；Podman REDIRECT TCP 已有可重复验收记录。
-7. 补统计兼容验收：Go fresh state 的 Rust takeover 已通过；仍需用真实 Go v6/生产形状数据库验证 Rust 最终 flush 后 Go 读取，以及 force-abort/进程崩溃时 checkpoint 与 Go 表之间的恢复边界。
+7. 补统计兼容验收：Go fresh state 的 Rust takeover、native Rust state 的 Go reverse-open startup smoke 已通过；仍需用真实 Go v6/生产形状数据库验证 Rust 最终 flush 后 Go 读取，以及 force-abort/进程崩溃时 checkpoint 与 Go 表之间的恢复边界。
 8. 补管理 API 契约验收：逐个执行 generated client 的 list/detail/mutation 操作，记录 Rust 与 Go 的 response 字段、分页、query 过滤、错误状态和 reload side effect 差异；node/inbound/resolver 保存响应、route detail 默认值、route activation 合并及过期清理已有回归，继续覆盖剩余错误语义、长生命周期 apply 和真实 frontend snapshot。

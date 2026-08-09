@@ -88,7 +88,7 @@ sudo launchctl kickstart -kp "$domain"
 
 ## 5. 回滚
 
-回滚必须先停止新进程。先恢复 binary，再恢复同一发布前的 SQLite backup；不要让旧 Go binary 读取新 Rust 尚未验证的 schema 或 checkpoint。
+回滚必须先停止新进程。Rust native state 现在会记录 Go migration v6 metadata，并创建 Go runtime 所需的兼容表；fresh state 和旧 Rust state 已通过 Go 重新打开的启动级 smoke。但非空生产库的 route/resolver projection 逐行语义、统计最终投影和完整 rollback 仍未全部验证，因此发布时仍应先恢复 binary，再恢复同一发布前的 SQLite backup，不要把启动级兼容 smoke 当作生产数据级回滚保证。
 
 ```bash
 sudo systemctl stop yuhaiin.service
@@ -109,7 +109,7 @@ Rust 的 `update-helper` 在安装失败或 service restart 非零时会尝试�
 
 - Go 和 Rust 可以并行读取独立数据库副本，用于 API/协议对照；不能同时写同一个 `state.db`。
 - 做兼容对照时，复制已经停止并完成 SQLite backup 的数据库到 `~/.cache/yuhaiin-rust/compare/`，分别启动两个 runtime。
-- Rust 的 `statistics.runtime` checkpoint 是异常退出恢复路径；最终 Go-compatible statistics projection 会在正常 shutdown 时写回。切换期间应等待 Rust `/api/v2/info` 健康检查成功后再关闭旧服务的自动重启策略。
+- Rust 的 `statistics.runtime` checkpoint 是异常退出恢复路径；最终 Go-compatible statistics projection 会在正常 shutdown 时写回。切换期间应等待 Rust `/api/v2/info` 健康检查成功后再关闭旧服务的自动重启策略，并保留发布前 backup，直到 Go reverse-open 和生产形状数据验收完成。
 - 发现 `SQLITE_BUSY`、sidecar lock 或 migration lock 时停止切换，不要删除 lock/WAL 文件；先确认没有遗留进程，再按备份恢复流程处理。
 
 ## 7. 验收顺序

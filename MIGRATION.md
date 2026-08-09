@@ -1488,3 +1488,11 @@ Rust 现在在关闭 flow 时删除 live counter；恢复旧版 `statistics.runt
 在独立 `~/.cache/yuhaiin-rust/api-read-matrix-<pid>` 状态目录启动 Rust service，fresh state 下实际调用 generated client 对应的 31 个核心只读 RPC：info、settings、backup、tools、nodes、inbounds、resolvers、hosts/FakeDNS/server、subscriptions get、publishes、users、connections 统计/历史、route activation/config/lists/rules/tags，全部收到 HTTP 200。统计请求使用真实 RFC3339 时间范围和 limit 边界，不是只发空 body。
 
 另一份独立 fresh state 完成 hosts put/get、route config put/get、resolver create/get/delete、node create/get/use/selected/close/delete、disabled inbound create/get/delete、前端真实形状的 local route list create/get/delete、route rule create/get/delete；每个 mutation 均收到 200 且 reload 后读取到持久化结果。一次故意缺少 Go priority API 所需 `source`/`target` 的请求收到 400，确认错误分类而非把非法请求当成功。订阅 refresh/delete-users 仍按范围明确延期。
+
+## 27. 2026-08-09 native Rust SQLite reverse-open compatibility
+
+此前 Rust fresh state 只创建了 Rust typed tables，没有记录 Go `metadata`/`migrate` 的已应用版本。Go 打开该数据库时会把现有 Rust 表误判为尚未迁移的数据库，并在 Go v1 DDL 中重复创建 `dns_resolvers`，最终以 `table dns_resolvers already exists` 失败。
+
+现在 native Rust 初始化会直接创建 Go runtime 仍会读取的兼容表，并记录 Go migration 1--6、legacy migration marker 和 `schema_version=6`；Go v1-v6 的 DDL 不会在同一份 native 数据库上重复执行。旧 Rust 库升级时还会幂等补齐 `route_rules`/`dns_resolvers` 的 nullable Go projection columns。该处理保留 `rusqlite + bundled SQLite`，没有重新引入 fsqlite。
+
+本轮验收：`cargo test --workspace --all-features --offline --quiet` 全部通过；其中 store 为 113 passed/4 ignored，runtime 为 183 passed。独立 `~/.cache/yuhaiin-rust` fresh Rust state 已被 Go binary 重新打开，日志出现 `plain model migration finished`，且没有缺失兼容表告警；旧 Rust state 也已实际完成 projection column upgrade 后被 Go 重新打开。该 smoke 覆盖的是启动、migration 和表存在性边界；非空生产库中 route/resolver projection 的逐行语义、统计最终投影和真实 rollback 仍需使用生产形状 fixture 继续验收，不能据此宣称完整双向数据等价。

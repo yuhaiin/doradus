@@ -149,8 +149,8 @@ fn storage_status_is_reusable_by_reload_and_management_callers() {
     assert!(status.page_count > 0);
     assert!(status.freelist_pages >= 0);
     assert!(status.journal_mode == "memory" || status.journal_mode == "wal");
-    assert!(!status.go_schema_imported);
-    assert!(status.go_schema_version.is_none());
+    assert!(status.go_schema_imported);
+    assert_eq!(status.go_schema_version, Some(6));
     assert!(status.full_cone_nat);
 }
 

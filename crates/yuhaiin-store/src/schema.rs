@@ -113,12 +113,27 @@ pub(super) fn typed_schema_sql() -> &'static str {
         action TEXT NOT NULL,
         priority INTEGER NOT NULL,
         geo_country TEXT,
-        resolver_policy BLOB NOT NULL
+        resolver_policy BLOB NOT NULL,
+        -- Nullable Go v1 projection columns. They keep Go's legacy readers
+        -- harmless on a native Rust database without changing Rust's typed
+        -- contract.
+        name TEXT,
+        disabled INTEGER,
+        updated_at INTEGER,
+        data_json TEXT
     );
     CREATE TABLE IF NOT EXISTS dns_resolvers (
         id TEXT PRIMARY KEY NOT NULL,
         kind TEXT NOT NULL,
-        config BLOB NOT NULL
+        config BLOB NOT NULL,
+        -- Nullable Go v1 projection columns; Rust's canonical resolver
+        -- contract remains id/kind/config.
+        name TEXT,
+        resolver_type INTEGER,
+        host TEXT,
+        subnet TEXT,
+        tls_servername TEXT,
+        data_json TEXT
     );
     CREATE TABLE IF NOT EXISTS route_settings (
         id INTEGER PRIMARY KEY NOT NULL,
@@ -197,7 +212,213 @@ pub(super) fn typed_schema_sql() -> &'static str {
         name TEXT PRIMARY KEY,
         updated_at INTEGER NOT NULL,
         data_json TEXT NOT NULL CHECK (json_valid(data_json))
-    );"
+    );
+    CREATE TABLE IF NOT EXISTS inbound_settings (
+        id                INTEGER PRIMARY KEY CHECK (id = 1),
+        hijack_dns        INTEGER NOT NULL,
+        hijack_dns_fakeip INTEGER NOT NULL,
+        sniff_enabled     INTEGER NOT NULL
+    );
+    -- Go's completed node migration still compares this legacy table with
+    -- nodes_v2 on startup. Keep an empty, correctly shaped compatibility
+    -- table in a native Rust database so that check is deterministic.
+    CREATE TABLE IF NOT EXISTS nodes (
+        id           INTEGER PRIMARY KEY,
+        hash         TEXT NOT NULL UNIQUE,
+        group_name   TEXT NOT NULL,
+        name         TEXT NOT NULL,
+        origin       INTEGER NOT NULL,
+        selected_tcp INTEGER NOT NULL DEFAULT 0 CHECK (selected_tcp IN (0, 1)),
+        selected_udp INTEGER NOT NULL DEFAULT 0 CHECK (selected_udp IN (0, 1)),
+        search_text  TEXT NOT NULL DEFAULT '',
+        updated_at   INTEGER NOT NULL,
+        data_json    TEXT NOT NULL CHECK (json_valid(data_json))
+    );
+    CREATE TABLE IF NOT EXISTS android_extra_preferences (
+        key         TEXT PRIMARY KEY,
+        value_json  TEXT NOT NULL,
+        updated_at  INTEGER NOT NULL,
+        CHECK (json_valid(value_json))
+    );
+    CREATE TABLE IF NOT EXISTS settings_kv (
+        section      TEXT NOT NULL,
+        key          TEXT NOT NULL,
+        value_json   TEXT NOT NULL CHECK (json_valid(value_json)),
+        updated_at   INTEGER NOT NULL,
+        PRIMARY KEY (section, key)
+    );
+    CREATE TABLE IF NOT EXISTS dns_settings (
+        id                       INTEGER PRIMARY KEY CHECK (id = 1),
+        server                   TEXT NOT NULL DEFAULT '',
+        fakedns_enabled          INTEGER NOT NULL,
+        fakedns_ipv4_range       TEXT NOT NULL DEFAULT '',
+        fakedns_ipv6_range       TEXT NOT NULL DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS dns_hosts (
+        host   TEXT PRIMARY KEY,
+        target TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS dns_fakedns_lists (
+        kind  TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY (kind, value)
+    );
+    CREATE TABLE IF NOT EXISTS inbounds (
+        name          TEXT PRIMARY KEY,
+        enabled       INTEGER NOT NULL,
+        inbound_type  TEXT NOT NULL,
+        listen_host   TEXT NOT NULL DEFAULT '',
+        updated_at    INTEGER NOT NULL,
+        data_json     TEXT NOT NULL CHECK (json_valid(data_json))
+    );
+    CREATE TABLE IF NOT EXISTS node_tags (
+        tag_name    TEXT NOT NULL,
+        target_kind TEXT NOT NULL CHECK (target_kind IN ('node', 'tag')),
+        target_id   TEXT NOT NULL,
+        updated_at  INTEGER NOT NULL,
+        PRIMARY KEY (tag_name, target_kind, target_id)
+    );
+    CREATE TABLE IF NOT EXISTS route_lists (
+        name       TEXT PRIMARY KEY,
+        kind       TEXT NOT NULL DEFAULT '',
+        updated_at INTEGER NOT NULL,
+        data_json  TEXT NOT NULL CHECK (json_valid(data_json))
+    );
+    CREATE TABLE IF NOT EXISTS route_list_refresh (
+        name              TEXT PRIMARY KEY,
+        refresh_interval  INTEGER NOT NULL,
+        last_refresh_time INTEGER NOT NULL DEFAULT 0,
+        last_error        TEXT NOT NULL DEFAULT '',
+        FOREIGN KEY (name) REFERENCES route_lists(name) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS backup_settings (
+        id         INTEGER PRIMARY KEY CHECK (id = 1),
+        updated_at INTEGER NOT NULL,
+        data_json  TEXT NOT NULL CHECK (json_valid(data_json))
+    );
+    CREATE TABLE IF NOT EXISTS connection_sessions (
+        id             INTEGER PRIMARY KEY,
+        opened_at      INTEGER NOT NULL,
+        last_seen_at   INTEGER NOT NULL,
+        closed_at      INTEGER,
+        state          TEXT NOT NULL CHECK (state IN ('open', 'closed', 'interrupted')),
+        protocol       INTEGER NOT NULL,
+        process_name   TEXT NOT NULL DEFAULT '',
+        inbound        TEXT NOT NULL DEFAULT '',
+        inbound_name   TEXT NOT NULL DEFAULT '',
+        outbound       TEXT NOT NULL DEFAULT '',
+        network        TEXT NOT NULL DEFAULT '',
+        destination    TEXT NOT NULL DEFAULT '',
+        host           TEXT NOT NULL DEFAULT '',
+        upload_bytes   INTEGER NOT NULL DEFAULT 0,
+        download_bytes INTEGER NOT NULL DEFAULT 0,
+        summary_json   TEXT NOT NULL CHECK (json_valid(summary_json))
+    );
+    CREATE TABLE IF NOT EXISTS settings_json (
+        id         INTEGER PRIMARY KEY CHECK (id = 1),
+        version    INTEGER NOT NULL,
+        data_json  TEXT NOT NULL CHECK (json_valid(data_json)),
+        updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS publishes (
+        name       TEXT PRIMARY KEY,
+        updated_at INTEGER NOT NULL,
+        data_json  TEXT NOT NULL CHECK (json_valid(data_json))
+    );
+    CREATE TABLE IF NOT EXISTS traffic_dimension_daily (
+        bucket_start_utc INTEGER NOT NULL,
+        value_id          INTEGER NOT NULL,
+        upload_bytes      INTEGER NOT NULL DEFAULT 0,
+        download_bytes    INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bucket_start_utc, value_id)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS failure_dimension_daily (
+        bucket_start_utc INTEGER NOT NULL,
+        value_id          INTEGER NOT NULL,
+        failed_count      INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bucket_start_utc, value_id)
+    ) WITHOUT ROWID;"
+}
+
+/// Mark a native Rust database as already having Go's plain-contract
+/// migrations. Rust creates the v2 contract tables directly; replaying Go's
+/// v1-v6 DDL during a rollback would try to recreate names such as
+/// `dns_resolvers` with an incompatible shape.
+pub(super) fn bootstrap_go_compatibility_metadata(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS metadata (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS migrate (
+                version    INTEGER PRIMARY KEY,
+                name       TEXT NOT NULL,
+                applied_at INTEGER NOT NULL
+            );",
+        )
+        .map_err(storage_error)?;
+
+    connection
+        .execute_with_params(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES (?1, ?2)",
+            &[SqliteValue::from("schema_version"), SqliteValue::from("6")],
+        )
+        .map_err(storage_error)?;
+
+    for (version, name) in [
+        (1_i64, "initial_schema"),
+        (2, "fakeip_cache"),
+        (3, "plain_contract_model"),
+        (4, "plain_route_lists"),
+        (5, "telemetry_dimensions"),
+        (6, "compact_telemetry_dimensions"),
+    ] {
+        connection
+            .execute_with_params(
+                "INSERT OR REPLACE INTO migrate(version, name, applied_at)
+                 VALUES (?1, ?2, 0)",
+                &[SqliteValue::from(version), SqliteValue::from(name)],
+            )
+            .map_err(storage_error)?;
+    }
+
+    for key in [
+        "plain_model_migration_done",
+        "plain_inbounds_migration_done",
+        "plain_nodes_migration_done",
+        "plain_subscriptions_migration_done",
+        "plain_resolvers_migration_done",
+        "plain_route_rules_migration_done",
+        "plain_route_lists_migration_done",
+        "plain_route_tags_migration_done",
+        "legacy_config_import_done",
+        "legacy_android_protobuf_config_repair_done",
+        "legacy_android_preferences_import_done",
+        "legacy_node_import_done",
+        "plain_inbound_transport_recovery_v1_done",
+        "plain_node_chain_recovery_v1_done",
+        "plain_backup_migration_done",
+        "plain_statistic_json_migration_done",
+        "legacy_settings_kv_normalization_done",
+    ] {
+        connection
+            .execute_with_params(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES (?1, '1')",
+                &[SqliteValue::from(key)],
+            )
+            .map_err(storage_error)?;
+    }
+
+    for (key, value) in [("go_schema_imported", 1_i64), ("go_schema_version", 6)] {
+        connection
+            .execute_with_params(
+                "INSERT OR REPLACE INTO yuhaiin_meta(key, value) VALUES (?1, ?2)",
+                &[SqliteValue::from(key), SqliteValue::from(value)],
+            )
+            .map_err(storage_error)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

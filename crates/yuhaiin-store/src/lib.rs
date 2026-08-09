@@ -30,8 +30,8 @@ use migration::{
 #[cfg(test)]
 use migration::{meta_flag, table_row_count};
 use schema::{
-    configure_connection, prepare_go_legacy_tables, table_has_column, typed_schema_sql,
-    validate_typed_schema, verify_integrity,
+    bootstrap_go_compatibility_metadata, configure_connection, prepare_go_legacy_tables,
+    table_has_column, typed_schema_sql, validate_typed_schema, verify_integrity,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -376,6 +376,8 @@ impl ConfigStore {
 
     fn migrate(&self) -> Result<()> {
         let connection = self.lock_connection()?;
+        let had_go_schema =
+            table_exists(&connection, "metadata") && table_exists(&connection, "migrate");
         connection
             .execute("BEGIN IMMEDIATE")
             .map_err(storage_error)?;
@@ -423,12 +425,33 @@ impl ConfigStore {
             connection
                 .execute_batch(typed_schema_sql())
                 .map_err(storage_error)?;
+            for (table, column, definition) in [
+                ("route_rules", "name", "name TEXT"),
+                ("route_rules", "disabled", "disabled INTEGER"),
+                ("route_rules", "updated_at", "updated_at INTEGER"),
+                ("route_rules", "data_json", "data_json TEXT"),
+                ("dns_resolvers", "name", "name TEXT"),
+                ("dns_resolvers", "resolver_type", "resolver_type INTEGER"),
+                ("dns_resolvers", "host", "host TEXT"),
+                ("dns_resolvers", "subnet", "subnet TEXT"),
+                ("dns_resolvers", "tls_servername", "tls_servername TEXT"),
+                ("dns_resolvers", "data_json", "data_json TEXT"),
+            ] {
+                if !table_has_column(&connection, table, column)? {
+                    connection
+                        .execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))
+                        .map_err(storage_error)?;
+                }
+            }
             if !table_has_column(&connection, "route_rules", "geo_country")? {
                 connection
                     .execute("ALTER TABLE route_rules ADD COLUMN geo_country TEXT")
                     .map_err(storage_error)?;
             }
             validate_typed_schema(&connection)?;
+            if !had_go_schema {
+                bootstrap_go_compatibility_metadata(&connection)?;
+            }
             connection
                 .execute_with_params(
                     "UPDATE yuhaiin_meta SET value = ?1 WHERE key = 'schema_version'",
