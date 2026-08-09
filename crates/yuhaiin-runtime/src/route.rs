@@ -1360,7 +1360,10 @@ fn parse_port(value: Option<&Value>, id: &str) -> Result<Option<(u16, u16)>> {
     } else if let Some(range) = value.as_str() {
         let mut values = range.split('-');
         let start = values.next().and_then(|value| value.trim().parse().ok());
-        let end = values.next().and_then(|value| value.trim().parse().ok());
+        let end = values
+            .next()
+            .map(|value| value.trim().parse().ok())
+            .unwrap_or(start);
         if values.next().is_some() || start.is_none() || end.is_none() {
             return Err(invalid_port(id));
         }
@@ -1615,6 +1618,32 @@ mod tests {
         assert_eq!(rule.port, Some((53, 853)));
         assert_eq!(rule.resolver_policy.strategy, ResolveStrategy::OnlyIpv4);
         assert!(!rule.resolver_policy.use_fake_ip);
+    }
+
+    #[test]
+    fn go_single_port_string_is_a_single_port_range() {
+        let router = compile_go_route_rules_with_lists(
+            &[record(
+                r#"{"mode":"proxy","rules":[{"type":"port","port":{"ports":"6969"}}]}"#,
+                "proxy",
+                "all",
+            )],
+            &RouteListSnapshot::default(),
+            RouteDecision {
+                mode: yuhaiin_core::RouteMode::Direct,
+                resolver_policy: ResolverPolicy::default(),
+                priority: 100,
+            },
+            None,
+        )
+        .unwrap();
+        let matching = Endpoint::ip(Network::Tcp, "192.0.2.1:6969".parse().unwrap());
+        let other = Endpoint::ip(Network::Tcp, "192.0.2.1:6970".parse().unwrap());
+        assert_eq!(
+            router.decide(&matching).mode,
+            yuhaiin_core::RouteMode::Proxy
+        );
+        assert_eq!(router.decide(&other).mode, yuhaiin_core::RouteMode::Direct);
     }
 
     #[test]

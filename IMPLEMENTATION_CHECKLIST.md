@@ -49,7 +49,7 @@ flowchart LR
 | `[x]` | schema/migration | `schema.rs`, `migration.rs` | Rust schema v3、Go v1/v5/v6 compatibility、未来版本 fail-closed、事务回滚/修复重试 |
 | `[x]` | typed repository | `repository.rs` | nodes、inbounds、resolvers、routes、lists、tags、settings、NAT、MaxMind、FakeIP 读写；未知 Go JSON 保留 |
 | `[x]` | 并发与异常终止 | `src/tests`, `tests/cross_process` | WAL 多进程 writer/reader、未提交事务 force-stop、sidecar lock、损坏库 fail-closed |
-| `[~]` | 真实生产库兼容覆盖 | store tests | 已有真实 Go v5/v6-shaped fixture 和 415MB 导出；Go fresh `state.db` 已由 Rust 接管并通过 API smoke，native Rust fresh state 也已由 Go 反向打开并完成 migration startup smoke；Rust/Go 非空 nodes、resolvers、inbounds、route rules/lists、settings_kv 和 `backup_settings` 已完成双向进程级读回；仍需用非空生产形状 fixture 验证 route/resolver projection 逐行语义、未建模表和异常快照 |
+| `[~]` | 真实生产库兼容覆盖 | store tests | 已有真实 Go v5/v6-shaped fixture 和 415MB 导出；Go fresh `state.db` 已由 Rust 接管并通过 API smoke，native Rust fresh state 也已由 Go 反向打开并完成 migration startup smoke；Rust/Go 非空 nodes、resolvers、inbounds、route rules/lists、settings_kv 和 `backup_settings` 已完成双向进程级读回；2026-08-09 又用 sibling Go 的真实 schema-4 状态（206 nodes、12 inbounds、6 resolvers、6 route rules、11 route lists、统计/backup 数据）启动 Rust 并实际读取管理面与统计接口；仍需用非空生产形状 fixture 验证 route/resolver projection 逐行语义、未建模表和异常快照 |
 | `延期` | fsqlite | — | 已停止实验；性能、内存和生态不满足要求，不再作为候选后端 |
 
 ## 3. FakeIP
@@ -80,7 +80,7 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | `[x]` | domain trie | `yuhaiin-trie` | parent、wildcard、优先级、规范化、网络/端口约束 |
 | `[x]` | CIDR trie | `yuhaiin-trie` | IPv4/IPv6 longest-prefix lookup、随机对照回归 |
-| `[x]` | runtime router | `runtime/src/route.rs`, `trie::router` | immutable snapshot、publish/rollback、resolver policy、direct/proxy/bypass/block |
+| `[x]` | runtime router | `runtime/src/route.rs`, `trie::router` | immutable snapshot、publish/rollback、resolver policy、direct/proxy/bypass/block；兼容 Go route expression 中单端口字符串（例如 `"6969"`）并保持真正非法范围 fail-closed |
 | `[x]` | connection explainability | `FlowContext`, monitor | rule/tag/list/matchHistory/resolver/geo 与实际 proxy 选择共用同一 snapshot |
 | `[x]` | MaxMindDB | `crates/yuhaiin-geo` | reader、坏库错误、校验下载、atomic refresh、IPv4-mapped IPv6、route 注入、真实 `Country-without-asn.mmdb` 查询验收均已完成；fixture 保存在 `~/.cache/yuhaiin-rust-maxmind`，SHA-256 为 `1d900f73aa4644d255793548319410ff559ef9294a662ec1a0354f106c794155` | 后续只需按发布策略更新并重新验收数据库 |
 

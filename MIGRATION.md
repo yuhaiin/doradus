@@ -1506,3 +1506,17 @@ Rust 现在在关闭 flow 时删除 live counter；恢复旧版 `statistics.runt
 - Rust 写入 settings（含 `65536/65535/5000/0` 边界值）和 S3 backup 后，Go 重新打开同一库，读回 settings 与完整 backup config。
 - Go 写入 settings 与 backup config 后，Rust 重新打开同一库，读回字段、数值和 `backup` reference 形状。
 - 测试状态目录均位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`；现有 `backup.run/restore` 的真实 S3 上传和跨发行版 service-manager 验收仍保持在 checklist。
+
+## 29. 2026-08-09 非空生产 schema-4 接管与单端口规则兼容
+
+从 sibling Go checkout 的真实非空 schema-4 `state.db` 制作只读副本到 `~/.cache/yuhaiin-rust` 后，Rust 首次启动暴露了一个实际 Go 数据兼容问题：`route_rules_v2` 的 `direct` 规则包含 `{"type":"port","port":{"ports":"6969"}}`。Go 的 `NewPort` 把没有连字符的字符串当作单个端口，Rust 原先只接受 `start-end`，因此错误退出并没有启动 HTTP listener。
+
+Rust 现在把字符串单值规范化为 `(port, port)`，仍拒绝空值、非数字、超过 `u16`、多余连字符和反向范围；新增 runtime router 回归验证 `6969` 命中而 `6970` 不命中。修复后使用同一份副本启动 `target/debug/yuhaiin`，实际读取并收到成功响应的接口包括：
+
+- `/api/v2/info`、`settings`、`backup/config`；
+- `/api/v2/nodes`（206 条）、`inbounds`（12 条）、`resolvers`（6 条）；
+- `/api/v2/route/rules`（6 条）、`route/lists`（11 条）；
+- `/api/v2/connections/total`、`history`、`failed-history`；
+- 带 RFC3339 `from/to` 的 `/api/v2/connections/traffic` 和 `telemetry`。
+
+状态副本和启动目录均位于 `~/.cache/yuhaiin-rust`，未使用 `/tmp`；原始 Go 数据库没有被写入。该 smoke 证明真实生产 route JSON 能完成启动和管理面读取，但不等价于已经覆盖所有节点协议的出站连通性，也不替代 Go/Rust 并发写入、异常终止和未建模表的逐字段快照验收。
