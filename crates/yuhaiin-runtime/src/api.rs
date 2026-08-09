@@ -34,7 +34,8 @@ use yuhaiin_geo::{GeoDatabaseManager, GeoDownloadTransport, GeoRefreshRequest};
 
 use yuhaiin_store::{
     GoInboundRecord, GoNodeRecord, GoResolverRecord, GoRouteListRecord, GoRouteRuleRecord,
-    GoRouteSettingsRecord, GoSubscriptionLinkRecord, InboundSettings, MaxMindMetadataRecord,
+    GoRouteSettingsRecord, GoSettingsKvRecord, GoSubscriptionLinkRecord, InboundSettings,
+    MaxMindMetadataRecord,
 };
 
 use crate::update::UpdateService;
@@ -675,10 +676,8 @@ async fn rpc(
         "route.list.get" => get_route_list_value(&state, required_string(&body, "id")?).await,
         "route.list.put" => save_route_list_value(&state, body, None).await,
         "route.list.delete" => delete_route_list_value(&state, required_string(&body, "id")?).await,
-        "route.lists.config.get" => {
-            read_config_json(&state, "route.lists.config", default_route_list_config()).await
-        }
-        "route.lists.config.put" => write_config_json(&state, "route.lists.config", body).await,
+        "route.lists.config.get" => route_lists_config_get_value(&state).await,
+        "route.lists.config.put" => route_lists_config_put_value(&state, body).await,
         "route.lists.refresh" => route_lists_refresh_value(&state).await,
         "route.lists.activation" => route_lists_activation_value(&state).await,
         "route.rules.get" => route_rules_get_value(&state, &body).await,
@@ -1166,14 +1165,14 @@ async fn route_lists_post(State(state): State<ApiState>, Json(value): Json<Value
 }
 
 async fn route_lists_config_get(State(state): State<ApiState>) -> ApiResult {
-    read_config_json(&state, "route.lists.config", default_route_list_config()).await
+    route_lists_config_get_value(&state).await
 }
 
 async fn route_lists_config_put(
     State(state): State<ApiState>,
     Json(value): Json<Value>,
 ) -> ApiResult {
-    write_config_json(&state, "route.lists.config", value).await
+    route_lists_config_put_value(&state, value).await
 }
 
 const ROUTE_LIST_ACTIVATION_KEY: &str = "route.lists.activation";
@@ -1223,13 +1222,7 @@ async fn refresh_geo_database(
     route: Arc<dyn RouteListTransport>,
     timeout: Duration,
 ) -> std::result::Result<Option<MaxMindMetadataRecord>, yuhaiin_core::Error> {
-    let config = state
-        .controller
-        .store()
-        .get_config("route.lists.config")
-        .await?
-        .map(|bytes| raw_json(&bytes, default_route_list_config()))
-        .unwrap_or_else(default_route_list_config);
+    let config = load_route_list_config_value(state).await?;
     let geo_config = config.get("maxMindDbGeoIp").unwrap_or(&Value::Null);
     let Some(url) = geo_config.get("downloadUrl").and_then(Value::as_str) else {
         return Ok(None);
@@ -1330,13 +1323,7 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
         "errors": report.errors,
     });
     let bytes = serde_json::to_vec(&activation)?;
-    let mut list_config = state
-        .controller
-        .store()
-        .get_config("route.lists.config")
-        .await?
-        .map(|bytes| raw_json(&bytes, default_route_list_config()))
-        .unwrap_or_else(default_route_list_config);
+    let mut list_config = load_route_list_config_value(state).await?;
     if let Some(object) = list_config.as_object_mut() {
         object.insert(
             "lastRefreshTime".to_owned(),
@@ -1354,6 +1341,7 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
         }
     }
     let list_config_bytes = serde_json::to_vec(&list_config)?;
+    let list_settings = route_list_config_settings(&list_config)?;
     state
         .controller
         .mutate_and_reload(move |store| async move {
@@ -1362,6 +1350,10 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
             }
             store
                 .put_config("route.lists.config", &list_config_bytes)
+                .await?;
+            store
+                .repository()
+                .put_go_settings_kv(&list_settings)
                 .await?;
             store.put_config(ROUTE_LIST_ACTIVATION_KEY, &bytes).await
         })
@@ -2877,6 +2869,151 @@ fn backup_destination() -> Result<PathBuf, ApiError> {
     Ok(directory.join(format!("state-{}.sqlite", unix_seconds())))
 }
 
+async fn route_lists_config_get_value(state: &ApiState) -> ApiResult {
+    json_value(load_route_list_config_value(state).await?)
+}
+
+async fn route_lists_config_put_value(state: &ApiState, value: Value) -> ApiResult {
+    let refresh_interval = required_string(&value, "refreshInterval")?
+        .parse::<u64>()
+        .map_err(|error| {
+            ApiError::bad(format!(
+                "refreshInterval must be an unsigned integer: {error}"
+            ))
+        })?;
+    let last_refresh_time = string_or(&value, "lastRefreshTime", "0")
+        .parse::<u64>()
+        .unwrap_or(0);
+    let geo = value
+        .get("maxMindDbGeoIp")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let normalized = json!({
+        "refreshInterval": refresh_interval.to_string(),
+        "lastRefreshTime": last_refresh_time.to_string(),
+        "error": string_or(&value, "error", ""),
+        "hostIndexDisk": bool_or(&value, "hostIndexDisk", false),
+        "maxMindDbGeoIp": {
+            "downloadUrl": string_or(&geo, "downloadUrl", ""),
+            "error": string_or(&geo, "error", ""),
+        },
+    });
+    let settings = route_list_config_settings(&normalized)?;
+    let bytes = serde_json::to_vec(&normalized)?;
+    state
+        .controller
+        .mutate_and_reload(move |store| async move {
+            store.put_config("route.lists.config", &bytes).await?;
+            store.repository().put_go_settings_kv(&settings).await
+        })
+        .await?;
+    Ok(Json(normalized))
+}
+
+async fn load_route_list_config_value(
+    state: &ApiState,
+) -> std::result::Result<Value, yuhaiin_core::Error> {
+    let settings = state
+        .controller
+        .store()
+        .repository()
+        .list_go_settings_kv()
+        .await?;
+    if let Some(value) = route_list_config_from_go_settings(&settings) {
+        return Ok(value);
+    }
+    Ok(state
+        .controller
+        .store()
+        .get_config("route.lists.config")
+        .await?
+        .map(|bytes| raw_json(&bytes, default_route_list_config()))
+        .unwrap_or_else(default_route_list_config))
+}
+
+fn route_list_config_from_go_settings(rows: &[GoSettingsKvRecord]) -> Option<Value> {
+    let refresh = rows
+        .iter()
+        .find(|row| row.section == "route_extra" && row.key == "refresh_config")
+        .map(|row| raw_json(row.value_json.as_bytes(), json!({})));
+    let geo = rows
+        .iter()
+        .find(|row| row.section == "route_extra" && row.key == "maxminddb_geoip")
+        .map(|row| raw_json(row.value_json.as_bytes(), json!({})));
+    if refresh.is_none() && geo.is_none() {
+        return None;
+    }
+    let refresh = refresh.unwrap_or_else(|| json!({}));
+    let geo = geo.unwrap_or_else(|| json!({}));
+    Some(json!({
+        "refreshInterval": json_u64_string(&refresh, "refresh_interval"),
+        "lastRefreshTime": json_u64_string(&refresh, "last_refresh_time"),
+        "error": string_or(&refresh, "error", ""),
+        "hostIndexDisk": bool_or(&refresh, "host_index_disk", true),
+        "maxMindDbGeoIp": {
+            "downloadUrl": string_or(&geo, "download_url", ""),
+            "error": string_or(&geo, "error", ""),
+        },
+    }))
+}
+
+fn route_list_config_settings(
+    value: &Value,
+) -> std::result::Result<Vec<GoSettingsKvRecord>, yuhaiin_core::Error> {
+    let refresh_interval = value
+        .get("refreshInterval")
+        .and_then(Value::as_str)
+        .unwrap_or("0")
+        .parse::<u64>()
+        .map_err(|error| yuhaiin_core::Error::invalid(format!("refreshInterval: {error}")))?;
+    let last_refresh_time = value
+        .get("lastRefreshTime")
+        .and_then(Value::as_str)
+        .unwrap_or("0")
+        .parse::<u64>()
+        .unwrap_or(0);
+    let geo = value.get("maxMindDbGeoIp").unwrap_or(&Value::Null);
+    let refresh_json = serde_json::to_string(&json!({
+        "refresh_interval": refresh_interval,
+        "last_refresh_time": last_refresh_time,
+        "error": string_or(value, "error", ""),
+        "host_index_disk": bool_or(value, "hostIndexDisk", false),
+    }))
+    .map_err(|error| {
+        yuhaiin_core::Error::invalid(format!("encode route refresh config: {error}"))
+    })?;
+    let geo_json = serde_json::to_string(&json!({
+        "download_url": string_or(geo, "downloadUrl", ""),
+        "error": string_or(geo, "error", ""),
+    }))
+    .map_err(|error| yuhaiin_core::Error::invalid(format!("encode MaxMind config: {error}")))?;
+    Ok(vec![
+        GoSettingsKvRecord {
+            section: "route_extra".to_owned(),
+            key: "refresh_config".to_owned(),
+            value_json: refresh_json,
+        },
+        GoSettingsKvRecord {
+            section: "route_extra".to_owned(),
+            key: "maxminddb_geoip".to_owned(),
+            value_json: geo_json,
+        },
+    ])
+}
+
+fn json_u64_string(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+        .unwrap_or(0)
+        .to_string()
+}
+
 async fn read_config_json(state: &ApiState, key: &str, default: Value) -> ApiResult {
     let value = state
         .controller
@@ -4039,6 +4176,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_list_config_matches_go_canonical_settings_and_contract() {
+        let state = state().await;
+        let canonical = route_list_config_from_go_settings(&[
+            GoSettingsKvRecord {
+                section: "route_extra".to_owned(),
+                key: "refresh_config".to_owned(),
+                value_json: r#"{"refresh_interval":3600,"last_refresh_time":42,"error":"old","host_index_disk":true}"#.to_owned(),
+            },
+            GoSettingsKvRecord {
+                section: "route_extra".to_owned(),
+                key: "maxminddb_geoip".to_owned(),
+                value_json: r#"{"download_url":"https://geo.example/Country.mmdb","error":""}"#.to_owned(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(canonical["refreshInterval"], "3600");
+        assert_eq!(canonical["lastRefreshTime"], "42");
+        assert_eq!(canonical["hostIndexDisk"], true);
+        assert_eq!(
+            canonical["maxMindDbGeoIp"]["downloadUrl"],
+            "https://geo.example/Country.mmdb"
+        );
+
+        let saved = route_lists_config_put_value(
+            &state,
+            json!({
+                "refreshInterval":"7200",
+                "lastRefreshTime":"not-a-number",
+                "error":"",
+                "hostIndexDisk":true,
+                "maxMindDbGeoIp":{"downloadUrl":"https://geo.example/new.mmdb","error":""},
+                "unknown":"discarded"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.0["refreshInterval"], "7200");
+        assert_eq!(saved.0["lastRefreshTime"], "0");
+        assert!(saved.0.get("unknown").is_none());
+        assert_eq!(
+            route_lists_config_get_value(&state).await.unwrap().0,
+            saved.0
+        );
+    }
+
+    #[tokio::test]
     async fn direct_subscription_tools_and_node_close_routes_match_frontend_contracts() {
         let state = state().await;
         let app = router(state);
@@ -4228,7 +4411,10 @@ mod tests {
                 "/api/v2/inbounds/config",
                 r#"{"hijackDns":true,"hijackDnsFakeIp":true,"sniff":true}"#,
             ),
-            ("/api/v2/route/lists/config", r#"{"refreshInterval":"1h"}"#),
+            (
+                "/api/v2/route/lists/config",
+                r#"{"refreshInterval":"3600"}"#,
+            ),
             (
                 "/api/v2/route/tags/mobile",
                 r#"{"type":"node","hash":"abc"}"#,
