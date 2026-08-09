@@ -7,6 +7,8 @@ use std::{
 use yuhaiin_core::{Error, ErrorKind, Result};
 use yuhaiin_store::{ConfigMutation, ConfigStore};
 
+use crate::data_plane::inbound_dns_handler;
+use crate::monitor::SocketDnsHandler;
 use crate::{
     ConnectionMonitor, RuntimeBuilder, RuntimeHandle, RuntimeProxySelector, RuntimeSnapshot,
 };
@@ -37,6 +39,10 @@ impl RuntimeController {
         let (reload_events, _) = tokio::sync::broadcast::channel(32);
         let monitor = Arc::new(ConnectionMonitor::load_with_store(builder.store().clone()).await?);
         monitor.set_sniff_enabled(initial_snapshot.inbound_settings.sniff);
+        monitor.set_dns_handler(
+            inbound_dns_handler(&initial_snapshot)
+                .map(|handler| handler as Arc<dyn SocketDnsHandler>),
+        );
         let handle = RuntimeHandle::new(initial_snapshot);
         Ok(Self {
             builder,
@@ -277,6 +283,9 @@ impl RuntimeController {
             selector.replace(proxy);
         }
         self.monitor.set_sniff_enabled(next.inbound_settings.sniff);
+        self.monitor.set_dns_handler(
+            inbound_dns_handler(&next).map(|handler| handler as Arc<dyn SocketDnsHandler>),
+        );
         let _ = self.reload_events.send(());
         self.set_reload_error("");
         Ok(next)

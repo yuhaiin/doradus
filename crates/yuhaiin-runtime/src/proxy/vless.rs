@@ -17,7 +17,7 @@ use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 use yuhaiin_protocol::vless::{self, Command};
 
-use super::common::{relay_counted_with_buffer, udp_flow_key};
+use super::common::{answer_dns_packet, relay_counted_with_buffer, udp_flow_key};
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -125,6 +125,16 @@ where
                         return Err(Error::invalid("VLESS UDP payload is too large"));
                     }
                     reader.read_exact(&mut packet[..length]).await.map_err(io_error)?;
+                    if destination.port() == Some(53) {
+                        if let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await {
+                            if let Ok(response) = answer {
+                                let mut writer = writer.lock().await;
+                                writer.write_u16(response.len() as u16).await.map_err(io_error)?;
+                                writer.write_all(&response).await.map_err(io_error)?;
+                            }
+                            continue;
+                        }
+                    }
                     datagram.send_to(&packet[..length], destination.clone()).await?;
                     monitor.bytes(flow, TunFlowDirection::Upload, length);
                 }

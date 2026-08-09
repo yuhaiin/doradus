@@ -29,8 +29,8 @@ use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 use super::common::{
-    UdpFlowId, UdpFlowState, UdpReply, close_udp_flows, io_error, relay_counted_with_buffer,
-    udp_flow_key,
+    UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows, io_error,
+    relay_counted_with_buffer, udp_flow_key,
 };
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -93,6 +93,14 @@ pub(crate) async fn serve_udp_listener(
             received = recv_udp(&socket, &mut packet) => {
                 let (length, peer, destination) = received?;
                 let target = Endpoint::ip(Network::Udp, destination);
+                if target.port() == Some(53) {
+                    if let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await {
+                        if let Ok(response) = answer {
+                            send_udp_reply(&response, destination, peer).await?;
+                        }
+                        continue;
+                    }
+                }
                 let id = UdpFlowId { peer, target: target.clone() };
                 let state = if let Some(state) = flows.get(&id) {
                     state

@@ -17,8 +17,8 @@ use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 use super::common::{
-    UdpFlowId, UdpFlowState, UdpReply, close_udp_flows, io_error, relay_counted_with_buffer,
-    udp_flow_key,
+    UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows, io_error,
+    relay_counted_with_buffer, udp_flow_key,
 };
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -184,6 +184,15 @@ pub(crate) async fn serve_socks5_udp_loop(
                     }
                 } else {
                     client = Some(peer);
+                }
+                if target.port() == Some(53) {
+                    if let Some(answer) = answer_dns_packet(&monitor, payload).await {
+                        if let Ok(response) = answer {
+                            let packet = encode_socks_udp_packet(&target, &response)?;
+                            socket.send_to(&packet, peer).await.map_err(io_error)?;
+                        }
+                        continue;
+                    }
                 }
                 let id = UdpFlowId { peer, target: target.clone() };
                 let state = if let Some(state) = flows.get(&id) {

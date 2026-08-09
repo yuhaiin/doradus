@@ -5,17 +5,18 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
-use yuhaiin_chain::YuubinsyaServerProxy;
+use yuhaiin_chain::{YuubinsyaDnsHandler, YuubinsyaServerProxy};
 use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection as TunFlowDirection, FlowObserver as TunFlowObserver,
     FlowObserverGuard,
 };
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncProxySelector, YuubinsyaUdpServer};
 use yuhaiin_core::yuubinsya::derive_salt;
-use yuhaiin_core::{Error, FlowContext, Result};
+use yuhaiin_core::{BoxFuture, Error, FlowContext, Result};
 
 use super::common::{
-    RoutedProxy, UdpFlowId, UdpFlowState, UdpReply, close_udp_flows, udp_flow_key,
+    RoutedProxy, UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows,
+    udp_flow_key,
 };
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -29,6 +30,14 @@ pub(crate) fn new_server(
         derive_salt(spec.password.as_bytes()),
         upstream,
     ))
+}
+
+struct ChainDnsHandler(Arc<dyn crate::monitor::SocketDnsHandler>);
+
+impl YuubinsyaDnsHandler for ChainDnsHandler {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        self.0.answer(packet)
+    }
 }
 
 pub(crate) async fn serve<S>(
@@ -58,13 +67,22 @@ where
 {
     let annotate = spec.clone();
     let route = selector;
+    let dns_handler = monitor
+        .socket_dns_handler()
+        .map(|handler| Arc::new(ChainDnsHandler(handler)) as Arc<dyn YuubinsyaDnsHandler>);
     server
-        .serve_observed(stream, peer, monitor, move |context| {
-            annotate.annotate_context(context);
-            // The server owns the routed upstream, so this callback is the
-            // mutable point where management metadata is attached.
-            route.route_context(context);
-        })
+        .serve_observed_with_dns(
+            stream,
+            peer,
+            monitor,
+            move |context| {
+                annotate.annotate_context(context);
+                // The server owns the routed upstream, so this callback is the
+                // mutable point where management metadata is attached.
+                route.route_context(context);
+            },
+            dns_handler,
+        )
         .await
 }
 
@@ -85,6 +103,14 @@ pub(crate) async fn serve_udp(
             received = server.recv_from(&mut packet) => {
                 let (length, target, peer) = received?;
                 let peer_addr = peer.addr().ok_or_else(|| Error::invalid("Yuubinsya UDP peer has no IP address"))?;
+                if target.port() == Some(53) {
+                    if let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await {
+                        if let Ok(response) = answer {
+                            server.send_to(&response, target, peer.clone()).await?;
+                        }
+                        continue;
+                    }
+                }
                 let id = UdpFlowId { peer: peer_addr, target: target.clone() };
                 let state = if let Some(state) = flows.get(&id) {
                     state

@@ -18,13 +18,13 @@ use yuhaiin_core::dns::{
 };
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::dns_tcp_async::AsyncTcpDnsServer;
+use yuhaiin_core::{BoxFuture, LocalBoxFuture, ResolveStrategy, Result};
 #[cfg(feature = "tun")]
 use yuhaiin_core::{Error, ErrorKind};
-use yuhaiin_core::{LocalBoxFuture, ResolveStrategy, Result};
 #[cfg(feature = "tun")]
 use yuhaiin_store::GoInboundRecord;
 
-use crate::{RuntimeController, parse_dns_server};
+use crate::{RuntimeController, RuntimeSnapshot, parse_dns_server};
 
 const DEFAULT_DNS_SERVER: &str = "127.0.0.1:5353";
 
@@ -40,36 +40,62 @@ pub struct RuntimeDnsHandler {
 
 impl AsyncDnsHandler for RuntimeDnsHandler {
     fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(self.answer_impl(packet))
+    }
+}
+
+impl RuntimeDnsHandler {
+    async fn answer_impl(&self, packet: &[u8]) -> Result<Vec<u8>> {
         let question = match decode_query(packet) {
             Ok(question) => question,
-            Err(error) => return Box::pin(async move { Err(error) }),
+            Err(error) => return Err(error),
         };
-        Box::pin(async move {
-            let addresses = self
-                .resolver
-                .resolve(
-                    &question.domain,
-                    match question.record_type {
-                        DnsRecordType::A => ResolveStrategy::OnlyIpv4,
-                        DnsRecordType::Aaaa => ResolveStrategy::OnlyIpv6,
-                        _ => ResolveStrategy::Default,
-                    },
-                )
-                .await?;
-            if let Some(fakeip) = &self.fakeip {
-                fakeip.snapshot().await;
-            }
-            encode_response(
-                packet,
-                &DnsResponse {
-                    addresses,
-                    ptr_names: Vec::new(),
-                    service_bindings: Vec::new(),
-                    minimum_ttl: Some(30),
+        let addresses = self
+            .resolver
+            .resolve(
+                &question.domain,
+                match question.record_type {
+                    DnsRecordType::A => ResolveStrategy::OnlyIpv4,
+                    DnsRecordType::Aaaa => ResolveStrategy::OnlyIpv6,
+                    _ => ResolveStrategy::Default,
                 },
             )
-        })
+            .await?;
+        if let Some(fakeip) = &self.fakeip {
+            fakeip.snapshot().await;
+        }
+        encode_response(
+            packet,
+            &DnsResponse {
+                addresses,
+                ptr_names: Vec::new(),
+                service_bindings: Vec::new(),
+                minimum_ttl: Some(30),
+            },
+        )
     }
+}
+
+impl crate::monitor::SocketDnsHandler for RuntimeDnsHandler {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(self.answer_impl(packet))
+    }
+}
+
+/// Build the one DNS handler used by all inbound owners. Keeping this at the
+/// snapshot boundary makes reloads choose the same resolver/FakeIP policy for
+/// socket DNS and TUN DNS instead of letting each protocol invent its own.
+pub(crate) fn inbound_dns_handler(snapshot: &RuntimeSnapshot) -> Option<Arc<RuntimeDnsHandler>> {
+    snapshot.inbound_settings.hijack_dns.then(|| {
+        Arc::new(RuntimeDnsHandler {
+            resolver: if snapshot.inbound_settings.hijack_dns_fakeip {
+                snapshot.resolver.clone()
+            } else {
+                snapshot.dns_resolver.clone()
+            },
+            fakeip: snapshot.fakeip.clone(),
+        })
+    })
 }
 
 #[cfg(feature = "tun")]
@@ -363,16 +389,8 @@ pub async fn run_tun_device_until_ref(
         _ => crate::inbound::selected_proxy_id(&controller).await?,
     };
     let snapshot = controller.handle().load();
-    let async_dns_handler = snapshot.inbound_settings.hijack_dns.then(|| {
-        Arc::new(RuntimeDnsHandler {
-            resolver: if snapshot.inbound_settings.hijack_dns_fakeip {
-                snapshot.resolver.clone()
-            } else {
-                snapshot.dns_resolver.clone()
-            },
-            fakeip: snapshot.fakeip.clone(),
-        }) as Arc<dyn yuhaiin_core::dns::AsyncDnsHandler>
-    });
+    let async_dns_handler = inbound_dns_handler(&snapshot)
+        .map(|handler| handler as Arc<dyn yuhaiin_core::dns::AsyncDnsHandler>);
     let mut proxy_runtime = controller
         .build_tun_proxy_runtime_with_dns(
             &config.direct_id,

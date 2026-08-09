@@ -15,12 +15,18 @@ use yuhaiin_core::yuubinsya::{
     YuubinsyaHeader, YuubinsyaProtocol, decode_header, decode_uot_frame, encode_header,
     encode_uot_frame,
 };
-use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Result};
+use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Result};
 
 pub(crate) const MAX_UOT_COALESCE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_UOT_COALESCE_FRAMES: usize = 32;
 const SERVER_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SERVER_UDP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Optional DNS boundary for the Yuubinsya inbound session. The chain crate
+/// owns Yuubinsya framing; the embedding runtime owns resolver policy.
+pub trait YuubinsyaDnsHandler: Send + Sync {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>>;
+}
 
 /// A Yuubinsya TCP stream after the authenticated destination header has been
 /// sent. The remaining bytes are transparent TCP payload.
@@ -438,7 +444,7 @@ impl YuubinsyaServerProxy {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_inner(&mut stream, None).await
+        self.serve_inner(&mut stream, None, None).await
     }
 
     /// Serve an inbound stream while publishing the same lifecycle and byte
@@ -447,10 +453,26 @@ impl YuubinsyaServerProxy {
     /// context annotator for inbound/outbound metadata.
     pub async fn serve_observed<S, F>(
         &self,
+        stream: S,
+        source: SocketAddr,
+        observer: Arc<dyn FlowObserver>,
+        annotate: F,
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        F: Fn(&mut FlowContext) + Send + Sync + 'static,
+    {
+        self.serve_observed_with_dns(stream, source, observer, annotate, None)
+            .await
+    }
+
+    pub async fn serve_observed_with_dns<S, F>(
+        &self,
         mut stream: S,
         source: SocketAddr,
         observer: Arc<dyn FlowObserver>,
         annotate: F,
+        dns_handler: Option<Arc<dyn YuubinsyaDnsHandler>>,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -463,11 +485,17 @@ impl YuubinsyaServerProxy {
                 observer,
                 annotate: Arc::new(annotate),
             }),
+            dns_handler,
         )
         .await
     }
 
-    async fn serve_inner<S>(&self, stream: &mut S, observed: Option<ObservedInbound>) -> Result<()>
+    async fn serve_inner<S>(
+        &self,
+        stream: &mut S,
+        observed: Option<ObservedInbound>,
+        dns_handler: Option<Arc<dyn YuubinsyaDnsHandler>>,
+    ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -497,7 +525,39 @@ impl YuubinsyaServerProxy {
                         destination: endpoint_socket_addr(&destination, observed.source),
                     }
                 });
+                let mut prefix = Vec::new();
+                if destination.port() == Some(53) {
+                    if let Some(handler) = dns_handler.as_deref() {
+                        match intercept_dns_tcp(&mut inbound, handler).await? {
+                            DnsTcpDecision::Answered { upload, download } => {
+                                if let (Some(observed), Some(flow)) = (observed.as_ref(), flow) {
+                                    let _observation = FlowObserverGuard::open(
+                                        Arc::clone(&observed.observer),
+                                        Flow { key: flow },
+                                        context,
+                                    );
+                                    observed.observer.bytes(flow, FlowDirection::Upload, upload);
+                                    observed.observer.bytes(
+                                        flow,
+                                        FlowDirection::Download,
+                                        download,
+                                    );
+                                }
+                                return Ok(());
+                            }
+                            DnsTcpDecision::Forward(bytes) => prefix = bytes,
+                        }
+                    }
+                }
                 let mut outbound = self.upstream.connect(&context).await?;
+                if !prefix.is_empty() {
+                    outbound.write_all(&prefix).await.map_err(io_error)?;
+                    if let (Some(observed), Some(flow)) = (observed.as_ref(), flow) {
+                        observed
+                            .observer
+                            .bytes(flow, FlowDirection::Upload, prefix.len());
+                    }
+                }
                 if let (Some(observed), Some(flow)) = (observed.as_ref(), flow) {
                     let _observation = FlowObserverGuard::open(
                         Arc::clone(&observed.observer),
@@ -551,7 +611,8 @@ impl YuubinsyaServerProxy {
                     .await
                     .map_err(io_error)?;
                 session.stream.flush().await.map_err(io_error)?;
-                self.serve_uot(&mut session, observed.as_ref()).await
+                self.serve_uot(&mut session, observed.as_ref(), dns_handler.as_deref())
+                    .await
             }
             YuubinsyaProtocol::Udp => Err(Error::new(
                 ErrorKind::Unsupported,
@@ -573,11 +634,22 @@ impl YuubinsyaServerProxy {
         &self,
         session: &mut AsyncYuubinsyaUotServerSession<S>,
         observed: Option<&ObservedInbound>,
+        dns_handler: Option<&dyn YuubinsyaDnsHandler>,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let (destination, payload) = session.recv_from().await?;
+        let (mut destination, mut payload) = session.recv_from().await?;
+        while destination.port() == Some(53) {
+            let Some(handler) = dns_handler else {
+                break;
+            };
+            let Some(response) = answer_dns_packet(handler, &payload).await? else {
+                break;
+            };
+            session.send_to(&destination, &response).await?;
+            (destination, payload) = session.recv_from().await?;
+        }
         let shared = self
             .udp_session(session.migrate_id, destination.clone())
             .await?;
@@ -613,6 +685,14 @@ impl YuubinsyaServerProxy {
                 tokio::select! {
                     incoming = session.recv_from() => {
                         let (destination, payload) = incoming?;
+                        if destination.port() == Some(53) {
+                            if let Some(handler) = dns_handler {
+                                if let Some(response) = answer_dns_packet(handler, &payload).await? {
+                                    session.send_to(&destination, &response).await?;
+                                    continue;
+                                }
+                            }
+                        }
                         if let Some(observed) = observed {
                             let flow = if let Some(flow) = observed_flows.get(&destination) {
                                 flow.flow
@@ -729,6 +809,61 @@ impl YuubinsyaServerProxy {
             let _ = session.close().await;
         }
     }
+}
+
+enum DnsTcpDecision {
+    Forward(Vec<u8>),
+    Answered { upload: usize, download: usize },
+}
+
+async fn intercept_dns_tcp<S>(
+    stream: &mut S,
+    handler: &dyn YuubinsyaDnsHandler,
+) -> Result<DnsTcpDecision>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut length = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut length))
+        .await
+        .map_err(|_| Error::new(ErrorKind::Timeout, "Yuubinsya DNS over TCP query timed out"))?
+        .map_err(io_error)?;
+    let length = usize::from(u16::from_be_bytes(length));
+    let mut packet = vec![0u8; length];
+    stream.read_exact(&mut packet).await.map_err(io_error)?;
+    let mut framed = Vec::with_capacity(length + 2);
+    framed.extend_from_slice(&(length as u16).to_be_bytes());
+    framed.extend_from_slice(&packet);
+    if yuhaiin_core::dns::decode_query(&packet).is_err() {
+        return Ok(DnsTcpDecision::Forward(framed));
+    }
+    let response = handler.answer(&packet).await?;
+    if response.len() > usize::from(u16::MAX) {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "Yuubinsya DNS over TCP response is too large",
+        ));
+    }
+    stream
+        .write_all(&(response.len() as u16).to_be_bytes())
+        .await
+        .map_err(io_error)?;
+    stream.write_all(&response).await.map_err(io_error)?;
+    stream.flush().await.map_err(io_error)?;
+    Ok(DnsTcpDecision::Answered {
+        upload: framed.len(),
+        download: response.len() + 2,
+    })
+}
+
+async fn answer_dns_packet(
+    handler: &dyn YuubinsyaDnsHandler,
+    packet: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    if yuhaiin_core::dns::decode_query(packet).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(handler.answer(packet).await?))
 }
 
 fn endpoint_socket_addr(endpoint: &Endpoint, source: SocketAddr) -> SocketAddr {
@@ -1046,6 +1181,15 @@ mod tests {
     use yuhaiin_core::flow::{FlowDirection, FlowObserver};
     use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
     use yuhaiin_core::{BoxFuture, DomainName, Network};
+
+    struct EchoDnsHandler;
+
+    impl YuubinsyaDnsHandler for EchoDnsHandler {
+        fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+            let response = packet.to_vec();
+            Box::pin(async move { Ok(response) })
+        }
+    }
 
     #[derive(Clone)]
     struct EchoUpstream {
@@ -1568,6 +1712,101 @@ mod tests {
         server_task.await.unwrap().unwrap();
         assert_eq!(&*observer.events.lock().unwrap(), &["open", "close"]);
         assert_eq!(observer.bytes.load(Ordering::Acquire), 16);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observed_yuubinsya_tcp_hijacks_dns_before_upstream_connect() {
+        let password = [21u8; 32];
+        let upstream = Arc::new(EchoUpstream {
+            opens: Arc::new(AtomicUsize::new(0)),
+            tcp_echo: false,
+            ping_ok: false,
+        });
+        let server = Arc::new(YuubinsyaServerProxy::new(password, upstream));
+        let observer = Arc::new(RecordingObserver::default());
+        let (client_io, server_io) = duplex(4096);
+        let server_task = {
+            let server = Arc::clone(&server);
+            let observer = Arc::clone(&observer);
+            tokio::spawn(async move {
+                server
+                    .serve_observed_with_dns(
+                        server_io,
+                        "10.0.0.2:12346".parse().unwrap(),
+                        observer,
+                        |_| {},
+                        Some(Arc::new(EchoDnsHandler)),
+                    )
+                    .await
+            })
+        };
+        let destination = Endpoint::ip(Network::Tcp, "192.0.2.10:53".parse().unwrap());
+        let mut client = AsyncYuubinsyaTcpSession::connect(client_io, password, destination)
+            .await
+            .unwrap();
+        let query = yuhaiin_core::dns::encode_query(
+            19,
+            &DomainName::new("example.com").unwrap(),
+            yuhaiin_core::dns::DnsRecordType::A,
+        )
+        .unwrap();
+        client
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(&query).await.unwrap();
+        let mut length = [0u8; 2];
+        client.read_exact(&mut length).await.unwrap();
+        let mut response = vec![0u8; usize::from(u16::from_be_bytes(length))];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, query);
+        assert!(server_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observed_yuubinsya_uot_hijacks_dns_without_opening_datagram() {
+        let password = [22u8; 32];
+        let opens = Arc::new(AtomicUsize::new(0));
+        let upstream = Arc::new(EchoUpstream {
+            opens: Arc::clone(&opens),
+            tcp_echo: false,
+            ping_ok: false,
+        });
+        let server = Arc::new(YuubinsyaServerProxy::new(password, upstream));
+        let observer = Arc::new(RecordingObserver::default());
+        let (client_io, server_io) = duplex(4096);
+        let server_task = {
+            let server = Arc::clone(&server);
+            let observer = Arc::clone(&observer);
+            tokio::spawn(async move {
+                server
+                    .serve_observed_with_dns(
+                        server_io,
+                        "10.0.0.2:12347".parse().unwrap(),
+                        observer,
+                        |_| {},
+                        Some(Arc::new(EchoDnsHandler)),
+                    )
+                    .await
+            })
+        };
+        let mut client = AsyncYuubinsyaUotSession::connect(client_io, password, 0, false)
+            .await
+            .unwrap();
+        let destination = Endpoint::ip(Network::Udp, "192.0.2.10:53".parse().unwrap());
+        let query = yuhaiin_core::dns::encode_query(
+            20,
+            &DomainName::new("example.com").unwrap(),
+            yuhaiin_core::dns::DnsRecordType::A,
+        )
+        .unwrap();
+        client.send_to(&destination, &query).await.unwrap();
+        let (response_target, response) = client.recv_from().await.unwrap();
+        assert_eq!(response_target, destination);
+        assert_eq!(response, query);
+        assert_eq!(opens.load(Ordering::Acquire), 0);
+        client.shutdown().await.unwrap();
+        let _ = server_task.await;
     }
 
     #[tokio::test(flavor = "current_thread")]

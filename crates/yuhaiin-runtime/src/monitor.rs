@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
     FlowObserver as TunFlowObserver,
 };
-use yuhaiin_core::{Endpoint, FlowContext, RouteMode};
+use yuhaiin_core::{BoxFuture, Endpoint, FlowContext, RouteMode};
 use yuhaiin_store::ConfigStore;
 
 use crate::RuntimeLog;
@@ -41,6 +41,13 @@ const TELEMETRY_DIMENSIONS: [&str; 9] = [
     "tag",
     "destination",
 ];
+
+/// Socket inbound tasks are spawned on Tokio's multithread executor. This
+/// runtime-local boundary deliberately requires a Send future while the core
+/// TUN API keeps its more permissive LocalBoxFuture contract.
+pub(crate) trait SocketDnsHandler: Send + Sync {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, yuhaiin_core::Result<Vec<u8>>>;
+}
 
 #[derive(Debug, Clone)]
 pub struct MonitorEvent {
@@ -139,6 +146,7 @@ struct PersistedMonitor {
 pub struct ConnectionMonitor {
     state: Arc<Mutex<MonitorState>>,
     sniff_enabled: Arc<AtomicBool>,
+    dns_handler: Arc<RwLock<Option<Arc<dyn SocketDnsHandler>>>>,
     events: broadcast::Sender<MonitorEvent>,
     close_events: broadcast::Sender<TunFlowKey>,
     logs: RuntimeLog,
@@ -158,6 +166,7 @@ impl ConnectionMonitor {
         Self {
             state: Arc::new(Mutex::new(MonitorState::default())),
             sniff_enabled: Arc::new(AtomicBool::new(true)),
+            dns_handler: Arc::new(RwLock::new(None)),
             events,
             close_events,
             logs: RuntimeLog::new(),
@@ -174,6 +183,39 @@ impl ConnectionMonitor {
 
     pub fn set_sniff_enabled(&self, enabled: bool) {
         self.sniff_enabled.store(enabled, Ordering::Release);
+    }
+
+    /// Install the current inbound DNS handler for socket and TUN adapters.
+    /// The handler is swapped atomically with the published runtime snapshot;
+    /// in-flight packets keep the cloned handler they already started with.
+    pub(crate) fn set_dns_handler(&self, handler: Option<Arc<dyn SocketDnsHandler>>) {
+        *self
+            .dns_handler
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = handler;
+    }
+
+    pub(crate) fn dns_hijack_enabled(&self) -> bool {
+        self.dns_handler
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    pub(crate) fn socket_dns_handler(&self) -> Option<Arc<dyn SocketDnsHandler>> {
+        self.dns_handler
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) async fn answer_dns(&self, packet: &[u8]) -> Option<yuhaiin_core::Result<Vec<u8>>> {
+        let handler = self
+            .dns_handler
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        Some(handler.answer(packet).await)
     }
 
     /// Load durable totals/history from the same SQLite store as the

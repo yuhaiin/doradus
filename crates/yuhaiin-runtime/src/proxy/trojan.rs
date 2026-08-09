@@ -15,7 +15,7 @@ use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 use yuhaiin_protocol::trojan::{self, Command};
 
-use super::common::{relay_counted_with_buffer, relay_counted_with_prefix};
+use super::common::{answer_dns_packet, relay_counted_with_buffer, relay_counted_with_prefix};
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -105,6 +105,19 @@ where
         tokio::select! {
             received = trojan::read_udp_frame(&mut reader, &mut packet) => {
                 let (length, target) = received?;
+                if target.port() == Some(53) {
+                    if let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await {
+                        if let Ok(response) = answer {
+                            trojan::write_udp_frame(
+                                &mut *writer.lock().await,
+                                &target,
+                                &response,
+                            )
+                            .await?;
+                        }
+                        continue;
+                    }
+                }
                 let (datagram, flow) = if let Some(state) = flows.get(&target) {
                     (Arc::clone(&state.datagram), state.key)
                 } else {

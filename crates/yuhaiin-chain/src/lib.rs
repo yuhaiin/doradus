@@ -27,7 +27,8 @@ pub use h2_server::YuubinsyaH2Server;
 pub use h2_tunnel::H2PoolStats;
 pub use session::{
     AsyncYuubinsyaPingServerSession, AsyncYuubinsyaPingSession, AsyncYuubinsyaTcpSession,
-    AsyncYuubinsyaUotServerSession, AsyncYuubinsyaUotSession, YuubinsyaServerProxy,
+    AsyncYuubinsyaUotServerSession, AsyncYuubinsyaUotSession, YuubinsyaDnsHandler,
+    YuubinsyaServerProxy,
 };
 
 use std::collections::{HashMap, VecDeque};
