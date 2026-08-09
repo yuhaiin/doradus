@@ -58,7 +58,7 @@ help:
 		'make build-tun-smoke    build the privileged TUN smoke binary' \
 		'make build-tun-service-smoke build the runtime-owned TUN smoke binary' \
 		'make tun-service-smoke run the runtime-owned TUN lifecycle and echo smoke' \
-		'make transparent-service-smoke run isolated REDIRECT TCP inbound smoke' \
+		'make transparent-service-smoke run REDIRECT TCP smoke; rootless Podman records TPROXY skip' \
 		'make api-contract-smoke run the frontend management API process contract in Podman' \
 		'make api-reload-flow-smoke verify mutation reloads the real data plane and survives restart' \
 		'make go-api-parity-smoke compare public API responses against a Go state snapshot' \

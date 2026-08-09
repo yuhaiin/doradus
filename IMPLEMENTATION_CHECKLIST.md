@@ -50,7 +50,7 @@
 | --- | --- | --- | --- |
 | SQLite / 生产库 | `[~]` | 增加更多生产版本快照；逐表核对 route/resolver projection；补异常关闭后的未建模表检查 | 默认 3 份真实快照已通过 `make production-parity-smoke`；store fixture tests |
 | FakeIP | `[~]` | 增加真实生产 FakeIP 表快照，并验证双栈池容量/TTL/重启后的分配稳定性 | FakeIP store tests + Go state takeover |
-| Linux transparent inbound | `[~]` | 在具备 `CAP_NET_ADMIN` 的独立 namespace 中验证 TPROXY UDP、redir IPv4/IPv6 和多 flow teardown | `make transparent-service-smoke` 已真实验证隔离 namespace REDIRECT TCP：非 root client → Rust redir → `SO_ORIGINAL_DST` → direct outbound → echo，并检查 upload/download counters、shutdown；同时验证 `IP_TRANSPARENT`/原目标 ancillary socket capability。剩余是 TPROXY UDP 策略路由、IPv4/IPv6 redir 和多 flow teardown |
+| Linux transparent inbound | `[~]` | 在具备 `CAP_NET_ADMIN` 的独立 namespace 中验证 TPROXY UDP、redir IPv4/IPv6 和多 flow teardown | 默认 `make transparent-service-smoke` 已真实验证隔离 namespace REDIRECT TCP：非 root client → Rust redir → `SO_ORIGINAL_DST` → direct outbound → echo，并检查 upload/download counters、shutdown；rootless Podman 会明确输出 TPROXY skip。强制 gate `YUHAIIN_TPROXY_ENABLED=1 make transparent-service-smoke` 已确认规则命中但 rootless 用户 namespace 无法把非本地 UDP 交给透明 socket；剩余是 rootful/宿主机 `CAP_NET_ADMIN` 的 TPROXY UDP、IPv4/IPv6 redir 和多 flow teardown |
 | TUN / NAT | `[~]` | 增加 MTU/fragment/namespace teardown 矩阵；补 Android VpnService fd 和 macOS utun 实机验收 | `tun-service.sh`、`p0_tun`、平台设备日志 |
 | API / reload | `[~]` | 已覆盖 node mutation 后新连接切换出口、latency、traffic/history 和同库重启读回；继续用真实 Go handler 做剩余错误字段/response 快照，并补 inbound/route mutation 长生命周期 | `api-reload-flow.sh`、`api-contract.sh`、`go-api-parity.sh` |
 | connections / statistics | `[~]` | 增加更多 production telemetry 快照；逐字段核对长时间范围与升级期间锁竞争 | `stats-concurrency.sh`、`go-rust-stats.sh` |
@@ -261,8 +261,11 @@ scripts/integration/tun-service.sh
 # Same smoke through the Makefile entry point:
 make tun-service-smoke
 
-# Isolated Linux transparent inbound: REDIRECT TCP + TPROXY socket capability:
+# Isolated Linux transparent inbound: REDIRECT TCP; rootless Podman records a TPROXY skip:
 make transparent-service-smoke
+
+# Required full TPROXY UDP gate; needs rootful Podman or a host namespace with CAP_NET_ADMIN:
+YUHAIIN_TPROXY_ENABLED=1 make transparent-service-smoke
 
 # Frontend management API process contract and reload/observer smoke:
 scripts/integration/api-contract.sh

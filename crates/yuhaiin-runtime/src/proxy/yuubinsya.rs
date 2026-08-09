@@ -15,8 +15,8 @@ use yuhaiin_core::yuubinsya::derive_salt;
 use yuhaiin_core::{BoxFuture, Error, FlowContext, Result};
 
 use super::common::{
-    RoutedProxy, UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows,
-    udp_flow_key,
+    RoutedProxy, UDP_IDLE_TIMEOUT, UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet,
+    close_udp_flows, reap_expired_udp_flows, udp_flow_key,
 };
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -97,6 +97,7 @@ pub(crate) async fn serve_udp(
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
     let mut flows = HashMap::<UdpFlowId, UdpFlowState>::new();
     let mut close_events = monitor.subscribe_close_requests();
+    let mut idle_tick = tokio::time::interval(UDP_IDLE_TIMEOUT);
     let mut packet = vec![0u8; udp_buffer_size];
     loop {
         tokio::select! {
@@ -149,11 +150,15 @@ pub(crate) async fn serve_udp(
                         datagram,
                         key,
                         peer,
+                        last_seen: std::time::Instant::now(),
                         _observation: observation,
                     })
                 };
                 state.datagram.send_to(&packet[..length], target).await?;
                 monitor.bytes(state.key, TunFlowDirection::Upload, length);
+                if let Some(state) = flows.get_mut(&id) {
+                    state.last_seen = std::time::Instant::now();
+                }
             }
             close_event = close_events.recv() => {
                 match close_event {
@@ -168,6 +173,12 @@ pub(crate) async fn serve_udp(
                 let Some(state) = flows.get(&reply.id) else { continue; };
                 server.send_to(&reply.payload, reply.target, state.peer.clone()).await?;
                 monitor.bytes(state.key, TunFlowDirection::Download, reply.payload.len());
+                if let Some(state) = flows.get_mut(&reply.id) {
+                    state.last_seen = std::time::Instant::now();
+                }
+            }
+            _ = idle_tick.tick() => {
+                reap_expired_udp_flows(&mut flows).await;
             }
             else => break,
         }

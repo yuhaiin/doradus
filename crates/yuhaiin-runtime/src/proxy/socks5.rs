@@ -17,8 +17,8 @@ use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 use super::common::{
-    UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows, io_error,
-    relay_counted_with_buffer, udp_flow_key,
+    UDP_IDLE_TIMEOUT, UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows,
+    io_error, reap_expired_udp_flows, relay_counted_with_buffer, udp_flow_key,
 };
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -167,6 +167,7 @@ pub(crate) async fn serve_socks5_udp_loop(
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
     let mut flows = HashMap::<UdpFlowId, UdpFlowState>::new();
     let mut close_events = monitor.subscribe_close_requests();
+    let mut idle_tick = tokio::time::interval(UDP_IDLE_TIMEOUT);
     let mut client = None;
     let mut packet = vec![0u8; udp_buffer_size];
     loop {
@@ -234,11 +235,15 @@ pub(crate) async fn serve_socks5_udp_loop(
                         datagram,
                         key,
                         peer: source,
+                        last_seen: std::time::Instant::now(),
                         _observation: observation,
                     })
                 };
                 state.datagram.send_to(payload, target).await?;
                 monitor.bytes(state.key, TunFlowDirection::Upload, payload.len());
+                if let Some(state) = flows.get_mut(&id) {
+                    state.last_seen = std::time::Instant::now();
+                }
             }
             close_event = close_events.recv() => {
                 match close_event {
@@ -255,6 +260,12 @@ pub(crate) async fn serve_socks5_udp_loop(
                 let packet = encode_socks_udp_packet(&reply.target, &reply.payload)?;
                 socket.send_to(&packet, client).await.map_err(io_error)?;
                 monitor.bytes(state.key, TunFlowDirection::Download, reply.payload.len());
+                if let Some(state) = flows.get_mut(&reply.id) {
+                    state.last_seen = std::time::Instant::now();
+                }
+            }
+            _ = idle_tick.tick() => {
+                reap_expired_udp_flows(&mut flows).await;
             }
             else => break,
         }

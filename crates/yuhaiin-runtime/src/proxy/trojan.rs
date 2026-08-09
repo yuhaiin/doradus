@@ -15,7 +15,10 @@ use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 use yuhaiin_protocol::trojan::{self, Command};
 
-use super::common::{answer_dns_packet, relay_counted_with_buffer, relay_counted_with_prefix};
+use super::common::{
+    UDP_IDLE_TIMEOUT, answer_dns_packet, relay_counted_with_buffer, relay_counted_with_prefix,
+    udp_flow_expired,
+};
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -81,6 +84,7 @@ struct UdpReply {
 struct UdpFlowState {
     datagram: Arc<dyn AsyncDatagram>,
     key: TunFlowKey,
+    last_seen: std::time::Instant,
     _observation: FlowObserverGuard,
 }
 
@@ -100,6 +104,7 @@ where
     let udp_ringbuffer_size = selector.udp_ringbuffer_size().max(1);
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
     let mut flows = HashMap::<Endpoint, UdpFlowState>::new();
+    let mut idle_tick = tokio::time::interval(UDP_IDLE_TIMEOUT);
     let mut packet = vec![0u8; udp_buffer_size];
     loop {
         tokio::select! {
@@ -153,13 +158,18 @@ where
                         UdpFlowState {
                             datagram: Arc::clone(&datagram),
                             key: flow,
+                            last_seen: std::time::Instant::now(),
                             _observation: observation,
                         },
                     );
                     (datagram, flow)
                 };
+                let target_id = target.clone();
                 datagram.send_to(&packet[..length], target).await?;
                 monitor.bytes(flow, yuhaiin_core::flow::FlowDirection::Upload, length);
+                if let Some(state) = flows.get_mut(&target_id) {
+                    state.last_seen = std::time::Instant::now();
+                }
             }
             Some(reply) = reply_rx.recv() => {
                 if !flows.contains_key(&reply.id) { continue; }
@@ -170,6 +180,23 @@ where
                         yuhaiin_core::flow::FlowDirection::Download,
                         reply.payload.len(),
                     );
+                    if let Some(state) = flows.get_mut(&reply.id) {
+                        state.last_seen = std::time::Instant::now();
+                    }
+                }
+            }
+            _ = idle_tick.tick() => {
+                let now = std::time::Instant::now();
+                let expired = flows
+                    .iter()
+                    .filter(|(_, state)| udp_flow_expired(state.last_seen, now, UDP_IDLE_TIMEOUT))
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                for id in expired {
+                    if let Some(state) = flows.remove(&id) {
+                        let _ = state.datagram.close().await;
+                        drop(state);
+                    }
                 }
             }
             else => break,

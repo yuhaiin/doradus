@@ -18,6 +18,9 @@ use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, 
 
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
+/// Matches Go's `configuration.UDPIdleTimeout` (90 seconds).
+pub(crate) const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct UdpFlowId {
     pub(crate) peer: SocketAddr,
@@ -28,6 +31,7 @@ pub(crate) struct UdpFlowState {
     pub(crate) datagram: Arc<dyn AsyncDatagram>,
     pub(crate) key: TunFlowKey,
     pub(crate) peer: Endpoint,
+    pub(crate) last_seen: std::time::Instant,
     pub(crate) _observation: FlowObserverGuard,
 }
 
@@ -52,6 +56,31 @@ pub(crate) async fn close_udp_flows(
             drop(state);
         }
     }
+}
+
+pub(crate) fn udp_flow_expired(
+    last_seen: std::time::Instant,
+    now: std::time::Instant,
+    timeout: Duration,
+) -> bool {
+    now.saturating_duration_since(last_seen) >= timeout
+}
+
+pub(crate) async fn reap_expired_udp_flows(flows: &mut HashMap<UdpFlowId, UdpFlowState>) -> usize {
+    let now = std::time::Instant::now();
+    let ids = flows
+        .iter()
+        .filter(|(_, state)| udp_flow_expired(state.last_seen, now, UDP_IDLE_TIMEOUT))
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let count = ids.len();
+    for id in ids {
+        if let Some(state) = flows.remove(&id) {
+            let _ = state.datagram.close().await;
+            drop(state);
+        }
+    }
+    count
 }
 
 #[derive(Clone)]
@@ -335,7 +364,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     use tokio::io::duplex;
+
+    #[test]
+    fn udp_flow_expiration_matches_idle_timeout_boundary() {
+        let now = Instant::now();
+        assert!(!udp_flow_expired(
+            now - UDP_IDLE_TIMEOUT + Duration::from_millis(1),
+            now,
+            UDP_IDLE_TIMEOUT,
+        ));
+        assert!(udp_flow_expired(
+            now - UDP_IDLE_TIMEOUT,
+            now,
+            UDP_IDLE_TIMEOUT,
+        ));
+        assert!(!udp_flow_expired(
+            now + Duration::from_secs(1),
+            now,
+            UDP_IDLE_TIMEOUT,
+        ));
+    }
 
     struct EchoDnsHandler;
 

@@ -29,8 +29,8 @@ use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 use super::common::{
-    UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows, io_error,
-    relay_counted_with_buffer, udp_flow_key,
+    UDP_IDLE_TIMEOUT, UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows,
+    io_error, reap_expired_udp_flows, relay_counted_with_buffer, udp_flow_key,
 };
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -82,16 +82,24 @@ pub(crate) async fn serve_udp_listener(
     monitor: Arc<ConnectionMonitor>,
 ) -> Result<()> {
     let socket = bind_udp_socket(listen)?;
+    monitor.info(format!("transparent UDP listener ready at {listen}"));
     let udp_buffer_size = selector.udp_buffer_size().max(512);
     let udp_ringbuffer_size = selector.udp_ringbuffer_size().max(1);
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
     let mut flows = HashMap::<UdpFlowId, UdpFlowState>::new();
     let mut close_events = monitor.subscribe_close_requests();
+    let mut idle_tick = tokio::time::interval(UDP_IDLE_TIMEOUT);
     let mut packet = vec![0u8; udp_buffer_size];
     loop {
         tokio::select! {
             received = recv_udp(&socket, &mut packet) => {
-                let (length, peer, destination) = received?;
+                let (length, peer, destination) = match received {
+                    Ok(received) => received,
+                    Err(error) => {
+                        monitor.error(format!("transparent UDP receive failed: {error}"));
+                        return Err(error);
+                    }
+                };
                 let target = Endpoint::ip(Network::Udp, destination);
                 if target.port() == Some(53) {
                     if let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await {
@@ -111,8 +119,17 @@ pub(crate) async fn serve_udp_listener(
                     spec.annotate_context(&mut context);
                     selector.route_context(&mut context);
                     let key = udp_flow_key(peer, &target);
-                    let datagram: Arc<dyn AsyncDatagram> =
-                        Arc::from(selector.select(&context).open_datagram(&context).await?);
+                    let datagram: Arc<dyn AsyncDatagram> = match selector
+                        .select(&context)
+                        .open_datagram(&context)
+                        .await
+                    {
+                        Ok(datagram) => Arc::from(datagram),
+                        Err(error) => {
+                            monitor.error(format!("transparent UDP open outbound failed: {error}"));
+                            return Err(error);
+                        }
+                    };
                     let observation =
                         FlowObserverGuard::open(monitor.clone(), TunFlow { key }, context);
                     let receiver = Arc::clone(&datagram);
@@ -139,11 +156,18 @@ pub(crate) async fn serve_udp_listener(
                         datagram,
                         key,
                         peer: source,
+                        last_seen: std::time::Instant::now(),
                         _observation: observation,
                     })
                 };
-                state.datagram.send_to(&packet[..length], target).await?;
+                if let Err(error) = state.datagram.send_to(&packet[..length], target).await {
+                    monitor.error(format!("transparent UDP send outbound failed: {error}"));
+                    return Err(error);
+                }
                 monitor.bytes(state.key, TunFlowDirection::Upload, length);
+                if let Some(state) = flows.get_mut(&id) {
+                    state.last_seen = std::time::Instant::now();
+                }
             }
             close_event = close_events.recv() => {
                 match close_event {
@@ -156,8 +180,17 @@ pub(crate) async fn serve_udp_listener(
                 let Some(state) = flows.get(&reply.id) else { continue; };
                 let Some(client) = state.peer.addr() else { continue; };
                 let original_target = state.key.destination;
-                send_udp_reply(&reply.payload, original_target, client).await?;
+                if let Err(error) = send_udp_reply(&reply.payload, original_target, client).await {
+                    monitor.error(format!("transparent UDP send reply failed: {error}"));
+                    return Err(error);
+                }
                 monitor.bytes(state.key, TunFlowDirection::Download, reply.payload.len());
+                if let Some(state) = flows.get_mut(&reply.id) {
+                    state.last_seen = std::time::Instant::now();
+                }
+            }
+            _ = idle_tick.tick() => {
+                reap_expired_udp_flows(&mut flows).await;
             }
             else => break,
         }
