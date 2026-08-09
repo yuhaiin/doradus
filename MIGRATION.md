@@ -1824,3 +1824,29 @@ router/selector 的 direct 出口连接 loopback echo target。
 ```bash
 cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
 ```
+
+## 47. 2026-08-10 runtime-owned TUN process smoke
+
+此前的 `tun-smoke`、`tun-fakeip-smoke` 和 `p0_tun` 已经覆盖 core 设备、DNS/FakeIP、NAT
+以及局部 packet relay，但缺少一个可直接证明“真实 runtime binary 把 TUN 当作 inbound
+并由同一个 owner 负责关闭”的可复用入口。本轮新增：
+
+- `crates/yuhaiin-runtime/src/bin/tun_service_smoke.rs`：写入 Go-shaped `inbounds_v2`
+  TUN record 和 direct node，创建 `RuntimeController`，调用生产路径
+  `inbound::run_until`，等待 `/sys/class/net/<name>` 出现，再通过同一个 shutdown
+  receiver 关闭 listener owner，并确认设备已消失；没有复制第二套 TUN 实现。
+- `scripts/integration/tun-service.sh`：构建该真实 runtime binary，在 Debian testing
+  的 Podman `--privileged --network=none` 中运行，SQLite fixture 和构建产物都位于
+  `~/.cache/yuhaiin-rust`，不使用 `/tmp`；重复运行会复用同一 state 目录。
+- `Makefile` 新增 `build-tun-service-smoke`，便于本地或 CI 单独构建验收二进制。
+
+实际执行结果：
+
+```text
+runtime-tun-opening name=yrtun0 database=/state/state.sqlite
+runtime-tun-opened name=yrtun0
+runtime-tun-closed name=yrtun0
+```
+
+这项强化了 Linux TUN inbound 的进程级证据，但不改变 Android/macOS 的 `[~]` 状态；
+外部 `VpnService`/utun fd、权限、route 和资源实测仍需对应平台环境。

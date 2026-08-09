@@ -31,6 +31,11 @@ The current scenarios cover:
 - authenticated SOCKS5 TCP inbound and Yuubinsya TCP inbound → direct echo in
   the same real runtime process, including protocol handshakes and live
   inbound/outbound metadata.
+- `scripts/integration/tun-service.sh` builds the real
+  `tun-service-smoke` runtime binary, writes a Go-shaped TUN inbound to a
+  reusable SQLite state directory, and runs the same `inbound::run_until`
+  owner in a privileged Podman `--network=none` container. It checks that the
+  kernel TUN device appears and is removed by the common shutdown path.
 - standalone Go HTTP/2 transport wire compatibility is covered separately in
   `crates/yuhaiin-chain/tests/standalone_http2.rs`: fixed endpoint resolution,
   plaintext prior-knowledge H2, `CONNECT http://localhost`, raw bidirectional
@@ -52,6 +57,12 @@ scenario directory for inspection or a Podman job, set an explicit cache path:
 ```bash
 YUHAIIN_INTEGRATION_DIR="$HOME/.cache/yuhaiin-rust/integration-reusable" \
   cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
+```
+
+The runtime-owned TUN process smoke uses the same cache convention:
+
+```bash
+scripts/integration/tun-service.sh
 ```
 
 The fixtures only use loopback sockets. A container runner should use

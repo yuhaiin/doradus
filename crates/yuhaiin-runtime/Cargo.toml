@@ -65,6 +65,11 @@ name = "yuhaiin"
 path = "src/bin/yuhaiin.rs"
 required-features = ["http-api"]
 
+[[bin]]
+name = "tun-service-smoke"
+path = "src/bin/tun_service_smoke.rs"
+required-features = ["tun"]
+
 [dev-dependencies]
 bytes = "1.12.1"
 h2 = "0.4.15"
