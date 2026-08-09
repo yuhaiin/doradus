@@ -11,6 +11,7 @@ fn validates_and_classifies_ip_packets() {
         PacketInfo {
             version: IpPacketVersion::V4,
             length: 20,
+            fragmented: false,
         }
     );
     let mut ipv6 = [0u8; 40];
@@ -24,6 +25,7 @@ fn validates_and_classifies_ip_packets() {
         PacketInfo {
             version: IpPacketVersion::V6,
             length: 40,
+            fragmented: false,
         }
     );
     assert!(inspect_ip_packet(&[0x45, 0, 0]).is_err());
@@ -61,6 +63,43 @@ fn queue_device_exposes_ip_medium_and_bounded_rx() {
 }
 
 #[test]
+fn fragmented_packets_are_preserved_but_each_fragment_must_fit_mtu() {
+    let mut packet = vec![
+        0x45, 0, 0, 24, 0, 1, 0x20, 0, 64, 17, 0, 0, 10, 0, 0, 1, 8, 8, 8, 8, 1, 2, 3, 4,
+    ];
+    let info = inspect_ip_packet(&packet).unwrap();
+    assert!(info.fragmented);
+
+    let device = SmoltcpTunDevice::new(576, 2).unwrap();
+    assert!(device.enqueue_rx(packet.clone()).unwrap());
+
+    packet[2..4].copy_from_slice(&577u16.to_be_bytes());
+    packet.resize(577, 0);
+    assert!(inspect_ip_packet(&packet).is_ok());
+    assert!(device.enqueue_rx(packet).is_err());
+}
+
+#[test]
+fn ipv6_fragment_header_is_classified_without_reassembly() {
+    let mut packet = vec![0u8; 48];
+    packet[0] = 0x60;
+    packet[6] = 44;
+    packet[7] = 64;
+    packet[40] = 17;
+    packet[42] = 0;
+    packet[43] = 1;
+    assert!(inspect_ip_packet(&packet).unwrap().fragmented);
+}
+
+#[test]
+fn tx_token_drops_packets_larger_than_mtu() {
+    let mut device = SmoltcpTunDevice::new(576, 2).unwrap();
+    let token = phy::Device::transmit(&mut device, Instant::from_millis(0)).unwrap();
+    phy::TxToken::consume(token, 577, |_| ());
+    assert_eq!(device.queued_tx().unwrap(), 0);
+}
+
+#[test]
 fn config_rejects_invalid_mtu_and_queue() {
     let mut config = TunConfig::default();
     config.mtu = 100;
@@ -68,6 +107,32 @@ fn config_rejects_invalid_mtu_and_queue() {
     config.mtu = DEFAULT_MTU;
     config.queue_capacity = 0;
     assert!(config.validate().is_err());
+}
+
+#[cfg(all(feature = "tun-routes", target_os = "linux"))]
+#[test]
+fn linux_capability_probe_only_accepts_the_effective_capability_bit() {
+    assert!(has_capability(1_u128 << CAP_NET_ADMIN, CAP_NET_ADMIN));
+    assert!(!has_capability(0, CAP_NET_ADMIN));
+    assert!(!has_capability(1_u128 << 11, CAP_NET_ADMIN));
+}
+
+#[cfg(all(feature = "tun-routes", target_os = "linux"))]
+#[test]
+fn linux_capability_probe_is_read_only_and_well_formed() {
+    let capabilities = probe_linux_capabilities();
+    assert!(matches!(
+        capabilities.tun_device,
+        CapabilityState::Available | CapabilityState::Unavailable
+    ));
+    assert!(matches!(
+        capabilities.route_control,
+        CapabilityState::Available | CapabilityState::Unavailable
+    ));
+    assert!(matches!(
+        capabilities.multi_queue,
+        CapabilityState::Available | CapabilityState::Unavailable | CapabilityState::Unknown
+    ));
 }
 
 #[cfg(feature = "tun-routes")]

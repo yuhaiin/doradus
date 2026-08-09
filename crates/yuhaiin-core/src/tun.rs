@@ -349,9 +349,16 @@ pub struct TunCapabilities {
 }
 
 /// Probe Linux capabilities without creating a device or changing routes.
-/// Multi-queue is intentionally reported as `Unknown`: proving it by opening
-/// a real multi-queue device would itself mutate system state, so it is only
-/// confirmed after a caller explicitly requests it during device creation.
+///
+/// Route control is only reported as available when the process has
+/// `CAP_NET_ADMIN` in its effective capability set and a read-only netlink
+/// probe succeeds.  Merely being able to dump routes is not enough: an
+/// unprivileged process can often list routes but cannot create the route
+/// lease required by the TUN runtime.
+///
+/// Multi-queue is probed from the tun driver's read-only module parameter.
+/// If the driver is built in, the parameter can be absent; that remains
+/// `Unknown` rather than claiming support without opening a real device.
 #[cfg(all(feature = "tun-routes", target_os = "linux"))]
 pub fn probe_linux_capabilities() -> TunCapabilities {
     let tun_device = if Path::new("/dev/net/tun").exists() {
@@ -359,15 +366,48 @@ pub fn probe_linux_capabilities() -> TunCapabilities {
     } else {
         CapabilityState::Unavailable
     };
-    let route_control =
-        match route_manager::RouteManager::new().and_then(|mut manager| manager.list()) {
+    let route_control = match read_effective_capabilities() {
+        Some(capabilities) if !has_capability(capabilities, CAP_NET_ADMIN) => {
+            CapabilityState::Unavailable
+        }
+        _ => match route_manager::RouteManager::new().and_then(|mut manager| manager.list()) {
             Ok(_) => CapabilityState::Available,
             Err(_) => CapabilityState::Unavailable,
-        };
+        },
+    };
     TunCapabilities {
         tun_device,
         route_control,
-        multi_queue: CapabilityState::Unknown,
+        multi_queue: read_multi_queue_capability(),
+    }
+}
+
+#[cfg(all(feature = "tun-routes", target_os = "linux"))]
+const CAP_NET_ADMIN: u8 = 12;
+
+#[cfg(all(feature = "tun-routes", target_os = "linux"))]
+fn read_effective_capabilities() -> Option<u128> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let value = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:\t"))?;
+    u128::from_str_radix(value.trim(), 16).ok()
+}
+
+#[cfg(all(feature = "tun-routes", target_os = "linux"))]
+fn has_capability(capabilities: u128, capability: u8) -> bool {
+    capabilities & (1_u128 << capability) != 0
+}
+
+#[cfg(all(feature = "tun-routes", target_os = "linux"))]
+fn read_multi_queue_capability() -> CapabilityState {
+    match std::fs::read_to_string("/sys/module/tun/parameters/multi_queue") {
+        Ok(value) => match value.trim() {
+            "Y" | "y" | "1" => CapabilityState::Available,
+            "N" | "n" | "0" => CapabilityState::Unavailable,
+            _ => CapabilityState::Unknown,
+        },
+        Err(_) => CapabilityState::Unknown,
     }
 }
 
@@ -381,6 +421,12 @@ pub enum IpPacketVersion {
 pub struct PacketInfo {
     pub version: IpPacketVersion,
     pub length: usize,
+    /// Whether this packet is one fragment of an IPv4/IPv6 datagram.
+    ///
+    /// The first implementation deliberately preserves fragments and does
+    /// not add a second reassembly engine.  MTU validation is applied to each
+    /// wire fragment, which matches the TUN device contract.
+    pub fragmented: bool,
 }
 
 /// Events emitted after `TunDispatcher::poll` has allowed smoltcp to consume
@@ -1888,14 +1934,16 @@ pub fn inspect_ip_packet(packet: &[u8]) -> Result<PacketInfo> {
     }
     let version = IpVersion::of_packet(packet)
         .map_err(|_| Error::invalid("TUN packet is not IPv4 or IPv6"))?;
-    match version {
+    let fragmented = match version {
         IpVersion::Ipv4 => {
-            smoltcp::wire::Ipv4Packet::new_checked(packet)
+            let packet = smoltcp::wire::Ipv4Packet::new_checked(packet)
                 .map_err(|_| Error::invalid("malformed IPv4 packet"))?;
+            packet.more_frags() || packet.frag_offset() != 0
         }
         IpVersion::Ipv6 => {
-            smoltcp::wire::Ipv6Packet::new_checked(packet)
+            let packet = smoltcp::wire::Ipv6Packet::new_checked(packet)
                 .map_err(|_| Error::invalid("malformed IPv6 packet"))?;
+            ipv6_has_fragment_header(packet.into_inner())
         }
     };
     Ok(PacketInfo {
@@ -1904,7 +1952,70 @@ pub fn inspect_ip_packet(packet: &[u8]) -> Result<PacketInfo> {
             IpVersion::Ipv6 => IpPacketVersion::V6,
         },
         length: packet.len(),
+        fragmented,
     })
+}
+
+/// Validate a packet against the TUN MTU without attempting reassembly.
+///
+/// A fragmented IP datagram is represented by multiple wire packets, and
+/// each packet must fit the interface MTU independently.  This helper keeps
+/// that behavior explicit for both real `AsyncDevice` reads and injected
+/// devices used by Android/iOS hosts.
+pub fn inspect_ip_packet_with_mtu(packet: &[u8], mtu: usize) -> Result<PacketInfo> {
+    if !(576..=9216).contains(&mtu) {
+        return Err(Error::invalid("TUN MTU must be between 576 and 9216"));
+    }
+    let info = inspect_ip_packet(packet)?;
+    if info.length > mtu {
+        return Err(Error::invalid("TUN packet exceeds configured MTU"));
+    }
+    Ok(info)
+}
+
+fn ipv6_has_fragment_header(bytes: &[u8]) -> bool {
+    let mut next_header = bytes[6];
+    let mut offset = 40usize;
+
+    // Hop-by-hop, routing and destination options are all TLV extension
+    // headers whose length is expressed in eight-octet units.  AH uses
+    // four-octet units.  Stop at ESP/unknown headers rather than guessing
+    // offsets from attacker-controlled bytes.
+    for _ in 0..16 {
+        match next_header {
+            44 => {
+                if offset + 8 > bytes.len() {
+                    return false;
+                }
+                let fragment = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]);
+                return fragment & 0xfff9 != 0;
+            }
+            0 | 43 | 60 => {
+                if offset + 2 > bytes.len() {
+                    return false;
+                }
+                let header_len = (bytes[offset + 1] as usize + 1) * 8;
+                if header_len < 8 || offset + header_len > bytes.len() {
+                    return false;
+                }
+                next_header = bytes[offset];
+                offset += header_len;
+            }
+            51 => {
+                if offset + 2 > bytes.len() {
+                    return false;
+                }
+                let header_len = (bytes[offset + 1] as usize + 2) * 4;
+                if header_len < 12 || offset + header_len > bytes.len() {
+                    return false;
+                }
+                next_header = bytes[offset];
+                offset += header_len;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 #[derive(Debug, Default)]
@@ -1956,6 +2067,7 @@ impl phy::RxToken for QueueRxToken {
 pub struct QueueTxToken {
     queue: Arc<Mutex<PacketQueue>>,
     timestamp: Instant,
+    mtu: usize,
 }
 
 impl phy::TxToken for QueueTxToken {
@@ -1965,9 +2077,11 @@ impl phy::TxToken for QueueTxToken {
     {
         let mut packet = vec![0u8; len];
         let result = f(&mut packet);
-        if let Ok(mut queue) = self.queue.lock() {
-            if queue.tx.len() < queue.capacity {
-                queue.tx.push_back(packet);
+        if len <= self.mtu {
+            if let Ok(mut queue) = self.queue.lock() {
+                if queue.tx.len() < queue.capacity {
+                    queue.tx.push_back(packet);
+                }
             }
         }
         let _ = self.timestamp;
@@ -1998,7 +2112,7 @@ impl SmoltcpTunDevice {
     }
 
     pub fn enqueue_rx(&self, packet: Vec<u8>) -> Result<bool> {
-        inspect_ip_packet(&packet)?;
+        inspect_ip_packet_with_mtu(&packet, self.mtu)?;
         self.queue
             .lock()
             .map(|mut queue| queue.push_rx(packet))
@@ -2078,6 +2192,7 @@ impl phy::Device for SmoltcpTunDevice {
             QueueTxToken {
                 queue: Arc::clone(&self.queue),
                 timestamp,
+                mtu: self.mtu,
             },
         ))
     }
@@ -2091,6 +2206,7 @@ impl phy::Device for SmoltcpTunDevice {
         Some(QueueTxToken {
             queue: Arc::clone(&self.queue),
             timestamp,
+            mtu: self.mtu,
         })
     }
 }

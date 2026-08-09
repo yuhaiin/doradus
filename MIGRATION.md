@@ -678,7 +678,7 @@ yuhaiin-tun adapter -> FlowContext -> Router -> Proxy/NAT
 - 首选评估 [`tun-rs`](https://docs.rs/tun-rs/latest/tun_rs/) 的 async API；它覆盖 Linux、macOS、Windows、Android、iOS、BSD，并提供 multi-queue、MTU、persist、owner/group 和 async device 能力。
 - TUN 创建最终仍然需要平台 fd/ioctl/driver API。第三方 crate 是否含 `libc`/系统 FFI 必须在 `cargo tree` 和源码审计中单独记录；“纯 Rust runtime”不等于可以忽略 OS ABI 边界。
 - 所有平台 unsafe/FFI 只能集中在 `yuhaiin-platform`/`yuhaiin-tun`，上层不得直接操作 fd、ioctl 或平台路由命令。
-- Linux 先覆盖 `/dev/net/tun`、netlink route、multi-queue、close-on-exec；Android 通过 VpnService/传入 fd；macOS 使用 utun；Windows 使用 Wintun 或传入已有 fd/handle。每个平台都要有 capability probe，缺能力时返回 Unsupported，不静默降级为普通 socket。
+- Linux 先覆盖 `/dev/net/tun`、netlink route、multi-queue、close-on-exec；Android 通过 VpnService/传入 fd；macOS 使用 utun；Windows 使用 Wintun 或传入已有 fd/handle。每个平台都要有 capability probe，缺能力时返回 Unsupported，不静默降级为普通 socket。当前 Linux probe 只读检查 `/dev/net/tun`、effective `CAP_NET_ADMIN`、route dump 和 tun driver 的 `multi_queue` 参数；不通过创建设备来探测，未知能力保持 `Unknown`。
 - TUN portal、IPv4/IPv6 prefix、routes、MTU、gateway、DNS hijack、driver 和名称冲突处理写入 SQLite 配置，并在启动前做 prefix/MTU/route 校验。
 - 设备创建成功后再设置地址和 route；任一 post-up 步骤失败必须按反向顺序清理设备和已安装 route。`TunRuntime::close_routes` 可重复调用，失败删除会继续保留 route lease 供显式重试；`Drop` 只做最后一次 best-effort cleanup，平台 app 必须优先调用显式 close 并记录错误。
 
@@ -686,11 +686,11 @@ yuhaiin-tun adapter -> FlowContext -> Router -> Proxy/NAT
 
 - 无权限环境测试 `TunDevice` builder 的配置校验、packet-info offset、MTU、名称冲突和 close 顺序，不要求真实设备。
 - privileged CI 在 Linux 用 network namespace 创建临时 TUN，测试 tun-rs + smoltcp 的 IPv4/IPv6 TCP echo、UDP echo、DNS hijack、FakeIP、route block/direct/proxy 和回写。
-- 单独测试 malformed IP header、短 TCP/UDP/ICMP、错误 checksum、fragment、超 MTU、未知 protocol、队列满和 reader close。
+- 单独测试 malformed IP header、短 TCP/UDP/ICMP、错误 checksum、fragment、超 MTU、未知 protocol、队列满和 reader close。当前 packet adapter 会分类 IPv4/IPv6 fragment，保留每个合法 fragment，不做第二套重组；ingress/egress 对每个 wire fragment 执行 MTU 边界检查。
 - 用 deterministic clock 测试 smoltcp TCP retransmission、socket timer、UDP mapping timeout、NAT idle timeout 和 TUN shutdown；不要依赖真实 sleep 才能判定。
 - TUN 与 Yuubinsya native UDP/UOT、SOCKS5 UDP、DoH endpoint、MaxMindDB domain lookup 做组合测试。
 
-当前 Rust 实现已覆盖无权限的 UDP、TCP SYN/SYN-ACK、ICMP echo 和 TX queue backpressure 单元测试，并提供 `yuhaiin-core` 的 `tun-smoke` binary。Podman 特权 namespace 已验证设备创建、真实 IPv6 控制包过滤、IPv4 ICMP ingress、smoltcp ICMP socket 收包、真实 checksum 回包和 Linux kernel ping echo（0% loss）。
+当前 Rust 实现已覆盖无权限的 UDP、TCP SYN/SYN-ACK、ICMP echo、IPv4/IPv6 fragment 分类、per-fragment MTU、超 MTU TX 丢弃和 TX queue backpressure 单元测试，并提供 `yuhaiin-core` 的 `tun-smoke` binary。Podman 特权 namespace 已验证设备创建、真实 IPv6 控制包过滤、IPv4 ICMP ingress、smoltcp ICMP socket 收包、真实 checksum 回包和 Linux kernel ping echo（0% loss）。
 
 #### TUN 当前代码入口
 
