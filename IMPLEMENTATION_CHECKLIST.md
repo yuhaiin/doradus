@@ -105,7 +105,7 @@ flowchart LR
 | `[x]` | protocol wrappers | inbound/outbound 共用 | inbound/outbound 共用 | `yuhaiin-protocol` |
 | `[x]` | Go inbound protocol aliases / noop | `none` accept-and-close；`mix`、`reverseHttp`、`reverseTcp` 旧 JSON 拼写归一化并保留 section 配置 | 与 Go contract oneof 的兼容字段回归 | `runtime::inbounds::normalize_inbound_protocol` |
 | `[x]` | Go 低频 inbound：`reverse_http` / `reverse_tcp` | 是；目标地址/URL 解析后复用共享 router、outbound、relay 和 monitor | reverse TCP 原始流、reverse HTTP 请求改写/原始流回退均有 loopback 单测；HTTPS target 受 `doh-tls` feature 控制 | 继续补 Go fixture 互操作 |
-| `[~]` | Linux 透明 inbound：`tproxy` / `redir` | TCP 已接入；TPROXY UDP 已接入；redir 按 Go contract 禁用 UDP | Linux TCP 使用 `IP_TRANSPARENT`、`SO_ORIGINAL_DST`/`IP6T_SO_ORIGINAL_DST`；TPROXY UDP 使用原目标 ancillary；IPv4 原目标字节序已有回归。Podman 中 REDIRECT TCP 已真实回环成功；rootless Podman veth 即使 privileged 也未将非本地 TPROXY 包交给透明 socket，故 UDP 仍保留环境受限状态；TLS/WS 等透明 transport fail-closed | 用真实 Linux network namespace/宿主机 CAP_NET_ADMIN 重跑 TPROXY UDP ancillary、redir IPv4/IPv6、权限失败及多 flow 生命周期；Podman REDIRECT TCP 验收已完成 |
+| `[~]` | Linux 透明 inbound：`tproxy` / `redir` | TCP 已接入；TPROXY UDP 已接入；redir 按 Go contract 禁用 UDP | Linux TCP 使用 `IP_TRANSPARENT`、`SO_ORIGINAL_DST`/`IP6T_SO_ORIGINAL_DST`；TPROXY UDP 使用原目标 ancillary；IPv4/IPv6 原目标 ancillary 已用本机 Linux socket 回归。Podman 中 REDIRECT TCP 已真实回环成功；rootless Podman veth 即使 privileged 也未将非本地 TPROXY 包交给透明 socket，故 UDP 仍保留环境受限状态；TLS/WS 等透明 transport fail-closed | 用真实 Linux network namespace/宿主机 CAP_NET_ADMIN 重跑 TPROXY UDP ancillary、redir IPv4/IPv6、权限失败及多 flow 生命周期；Podman REDIRECT TCP 验收已完成 |
 
 ### 6.2 连接链路与策略
 

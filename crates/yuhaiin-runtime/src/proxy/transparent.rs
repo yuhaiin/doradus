@@ -425,6 +425,7 @@ fn capability_error(option: &str, error: std::io::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn redir_listener_binds_an_ephemeral_tcp_port_without_transparent_capability() {
@@ -436,5 +437,56 @@ mod tests {
     fn original_destination_ipv4_decodes_network_order() {
         let raw = u32::from_ne_bytes([10, 254, 0, 3]);
         assert_eq!(decode_original_ipv4(raw), Ipv4Addr::new(10, 254, 0, 3));
+    }
+
+    #[test]
+    fn recv_udp_now_reads_linux_ipv4_original_destination_ancillary() {
+        let receiver = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        setsockopt(&receiver, sockopt::Ipv4OrigDstAddr, &true).unwrap();
+        receiver
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let destination = receiver.local_addr().unwrap().as_socket().unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(b"ipv4-orig-dst", destination).unwrap();
+
+        let mut payload = [0u8; 64];
+        let (length, peer, original) = recv_until_ready(&receiver, &mut payload);
+        assert_eq!(&payload[..length], b"ipv4-orig-dst");
+        assert_eq!(peer.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(original, destination);
+    }
+
+    #[test]
+    fn recv_udp_now_reads_linux_ipv6_original_destination_ancillary() {
+        let receiver = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        setsockopt(&receiver, sockopt::Ipv6OrigDstAddr, &true).unwrap();
+        receiver
+            .bind(&"[::1]:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let destination = receiver.local_addr().unwrap().as_socket().unwrap();
+        let sender = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        sender.send_to(b"ipv6-orig-dst", destination).unwrap();
+
+        let mut payload = [0u8; 64];
+        let (length, peer, original) = recv_until_ready(&receiver, &mut payload);
+        assert_eq!(&payload[..length], b"ipv6-orig-dst");
+        assert_eq!(peer.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(original, destination);
+    }
+
+    fn recv_until_ready(socket: &Socket, payload: &mut [u8]) -> (usize, SocketAddr, SocketAddr) {
+        for _ in 0..100 {
+            match recv_udp_now(socket, payload) {
+                Ok(result) => return result,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("receive original destination ancillary: {error}"),
+            }
+        }
+        panic!("timed out waiting for original destination ancillary");
     }
 }

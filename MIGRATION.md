@@ -1443,3 +1443,7 @@ cargo test -p yuhaiin-protocol --tests --offline -- --ignored --nocapture
 新增 `docs/RELEASE_REPLACEMENT.md`，把 Rust binary 直接替换现有 Go service 时的边界写成可执行流程：Android `aarch64` 使用 `/opt/android-ndk/.../aarch64-linux-android35-clang`，状态库先停服务再做 SQLite backup/quick-check，systemd 与 launchd 分别执行 stop/bootout、binary 替换、启动和 `/api/v2/info` 健康检查；回滚同时覆盖 binary 与数据库 backup。
 
 文档明确 Go/Rust 只能使用独立数据库副本并行做对照，不能同时写同一个 `state.db`；WAL、`state.db-wal`、`state.db-shm` 和 sidecar lock 不得在未确认进程退出前手工删除。Windows service 与真实发行版 service manager 仍保留为现场验收项。
+
+## 20. 2026-08-09 transparent UDP ancillary coverage
+
+`yuhaiin-runtime::proxy::transparent` 新增 Linux 本机 socket 回归：启用 `IP_ORIGDSTADDR` 与 `IPV6_ORIGDSTADDR`，分别发送 IPv4/IPv6 UDP packet，并通过真实 `recvmsg` ancillary 解析 peer、payload 和 original destination。该测试不修改宿主路由，也不伪装成完整 TPROXY 网络 namespace 验收；需要 `CAP_NET_ADMIN` 的非本地转发、iptables/nftables 和多 flow 生命周期仍按 checklist 单独执行。
