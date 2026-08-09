@@ -21,7 +21,10 @@ use yuhaiin_core::flow::{
     FlowObserver as TunFlowObserver,
 };
 use yuhaiin_core::{BoxFuture, Endpoint, FlowContext, RouteMode};
-use yuhaiin_store::ConfigStore;
+use yuhaiin_store::{
+    ConfigStore, GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsSnapshot,
+    GoTelemetryBucketRecord, GoTrafficBucketRecord,
+};
 
 use crate::RuntimeLog;
 
@@ -238,6 +241,9 @@ impl ConnectionMonitor {
                 ));
             }
             monitor.restore_persisted(persisted);
+        } else {
+            let statistics = store.load_go_statistics()?;
+            monitor.restore_go_statistics(statistics)?;
         }
 
         let dirty = Arc::new(Notify::new());
@@ -310,7 +316,13 @@ impl ConnectionMonitor {
                 format!("statistics state serialization: {error}"),
             )
         })?;
-        persistence.store.put_config(PERSISTENCE_KEY, &bytes).await
+        persistence
+            .store
+            .put_config(PERSISTENCE_KEY, &bytes)
+            .await?;
+        persistence
+            .store
+            .replace_go_statistics(&self.go_statistics_snapshot())
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<MonitorEvent> {
@@ -500,7 +512,21 @@ impl ConnectionMonitor {
 
     pub fn all_history_value(&self) -> Value {
         let state = self.lock();
-        json!({"items": state.history, "dumpProcessEnabled": false})
+        let mut items = state.history.clone();
+        items.sort_by(|left, right| {
+            history_time(right)
+                .cmp(&history_time(left))
+                .then_with(|| history_key(left).cmp(&history_key(right)))
+        });
+        json!({
+            "items": items,
+            "dumpProcessEnabled": state.history.iter().any(|item| {
+                item.get("connection")
+                    .and_then(|connection| connection.get("process"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|process| !process.is_empty())
+            }),
+        })
     }
 
     pub fn block_history_value(&self) -> Value {
@@ -825,12 +851,31 @@ impl ConnectionMonitor {
         }
         state.ids.remove(&entry.id);
         state.close_requests.retain(|pending| *pending != flow);
-        state.history.push(json!({
-            "connection": entry.value,
-            "count": "1",
-            "time": format_time(unix_seconds()),
-        }));
+        let now = unix_seconds();
+        let key = history_key(&json!({"connection": entry.value.clone()}));
+        if let Some(existing) = state
+            .history
+            .iter_mut()
+            .find(|item| history_key(item) == key)
+        {
+            let count = existing
+                .get("count")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0)
+                .saturating_add(1);
+            existing["connection"] = entry.value;
+            existing["count"] = Value::String(count.to_string());
+            existing["time"] = Value::String(format_time(now));
+        } else {
+            state.history.push(json!({
+                "connection": entry.value,
+                "count": "1",
+                "time": format_time(now),
+            }));
+        }
         if state.history.len() > HISTORY_LIMIT {
+            state.history.sort_by_key(history_time);
             let excess = state.history.len() - HISTORY_LIMIT;
             state.history.drain(..excess);
         }
@@ -902,6 +947,148 @@ impl ConnectionMonitor {
                 )
             })
             .collect();
+    }
+
+    fn restore_go_statistics(&self, persisted: GoStatisticsSnapshot) -> yuhaiin_core::Result<()> {
+        let mut state = self.lock();
+        state.total_upload = persisted.total_upload;
+        state.total_download = persisted.total_download;
+        for bucket in persisted.traffic {
+            let entry = state.buckets.entry(bucket.bucket).or_default();
+            entry.0 = entry.0.saturating_add(bucket.download);
+            entry.1 = entry.1.saturating_add(bucket.upload);
+        }
+        for history in persisted.history {
+            let Ok(connection) = serde_json::from_slice::<Value>(&history.connection_json) else {
+                continue;
+            };
+            state.history.push(json!({
+                "connection": connection,
+                "count": history.count.to_string(),
+                "time": format_time(history.last_seen),
+            }));
+        }
+        state.history.sort_by_key(history_time);
+        if state.history.len() > HISTORY_LIMIT {
+            let excess = state.history.len() - HISTORY_LIMIT;
+            state.history.drain(..excess);
+        }
+        for failure in persisted.failed_history {
+            state.failed_history.insert(
+                (
+                    failure.protocol.clone(),
+                    failure.host.clone(),
+                    failure.process.clone(),
+                ),
+                FailedEntry {
+                    protocol: failure.protocol,
+                    host: failure.host,
+                    process: failure.process,
+                    error: failure.error,
+                    time: failure.last_seen,
+                    count: failure.count,
+                },
+            );
+        }
+        for item in persisted.telemetry {
+            let aggregate = state
+                .telemetry
+                .entry((item.dimension.clone(), item.value.clone()))
+                .or_default();
+            aggregate.0 = aggregate.0.saturating_add(item.download);
+            aggregate.1 = aggregate.1.saturating_add(item.upload);
+            aggregate.2 = aggregate.2.saturating_add(item.failures);
+            let bucket = state
+                .telemetry_buckets
+                .entry((item.bucket, item.dimension, item.value))
+                .or_default();
+            bucket.0 = bucket.0.saturating_add(item.download);
+            bucket.1 = bucket.1.saturating_add(item.upload);
+            bucket.2 = bucket.2.saturating_add(item.failures);
+        }
+        Ok(())
+    }
+
+    fn go_statistics_snapshot(&self) -> GoStatisticsSnapshot {
+        let state = self.lock();
+        let mut traffic = BTreeMap::<i64, (u64, u64)>::new();
+        for (bucket, (download, upload)) in &state.buckets {
+            let hour = bucket.div_euclid(3_600) * 3_600;
+            let entry = traffic.entry(hour).or_default();
+            entry.0 = entry.0.saturating_add(*upload);
+            entry.1 = entry.1.saturating_add(*download);
+        }
+        GoStatisticsSnapshot {
+            total_download: state.total_download,
+            total_upload: state.total_upload,
+            traffic: traffic
+                .into_iter()
+                .map(|(bucket, (upload, download))| GoTrafficBucketRecord {
+                    bucket,
+                    upload,
+                    download,
+                })
+                .collect(),
+            history: state
+                .history
+                .iter()
+                .filter_map(|item| {
+                    let connection = item.get("connection")?;
+                    Some(GoConnectionHistoryRecord {
+                        protocol: connection
+                            .get("protocol")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        addr: connection
+                            .get("addr")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        process: connection
+                            .get("process")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        count: item
+                            .get("count")
+                            .and_then(Value::as_str)
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(1),
+                        last_seen: history_time(item),
+                        connection_json: serde_json::to_vec(connection).ok()?,
+                    })
+                })
+                .collect(),
+            failed_history: state
+                .failed_history
+                .values()
+                .map(|entry| GoFailedHistoryRecord {
+                    protocol: entry.protocol.clone(),
+                    host: entry.host.clone(),
+                    process: entry.process.clone(),
+                    count: entry.count,
+                    last_seen: entry.time,
+                    error: entry.error.clone(),
+                })
+                .collect(),
+            telemetry: state
+                .telemetry_buckets
+                .iter()
+                .map(
+                    |((bucket, dimension, value), (download, upload, failures))| {
+                        GoTelemetryBucketRecord {
+                            bucket: *bucket,
+                            dimension: dimension.clone(),
+                            value: value.clone(),
+                            download: *download,
+                            upload: *upload,
+                            failures: *failures,
+                        }
+                    },
+                )
+                .collect(),
+        }
     }
 
     fn persisted_json(&self) -> PersistedMonitor {
@@ -1087,6 +1274,34 @@ fn parse_time(value: Option<&str>) -> Option<i64> {
         .map(|time| time.unix_timestamp())
 }
 
+fn history_key(item: &Value) -> (String, String, String) {
+    let connection = item.get("connection").unwrap_or(item);
+    (
+        connection
+            .get("protocol")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        connection
+            .get("addr")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        connection
+            .get("process")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    )
+}
+
+fn history_time(item: &Value) -> i64 {
+    item.get("time")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_time(Some(value)))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,6 +1477,20 @@ mod tests {
     }
 
     #[test]
+    fn monitor_coalesces_connection_history_by_go_key() {
+        let monitor = ConnectionMonitor::new();
+        let (flow, context) = flow();
+        monitor.opened(flow, context.clone());
+        monitor.closed(flow.key);
+        monitor.opened(flow, context);
+        monitor.closed(flow.key);
+
+        let history = monitor.all_history_value();
+        assert_eq!(history["items"].as_array().unwrap().len(), 1);
+        assert_eq!(history["items"][0]["count"], "2");
+    }
+
+    #[test]
     fn monitor_preserves_close_requests_until_data_plane_consumes_them() {
         let monitor = ConnectionMonitor::new();
         let (flow, context) = flow();
@@ -1393,6 +1622,44 @@ mod tests {
                 1
             );
             reloaded.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn monitor_takes_over_go_statistics_when_runtime_checkpoint_is_absent() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = ConfigStore::open_memory().await.unwrap();
+            store
+                .replace_go_statistics(&GoStatisticsSnapshot {
+                    total_download: 23,
+                    total_upload: 19,
+                    history: vec![GoConnectionHistoryRecord {
+                        protocol: "tcp".to_owned(),
+                        addr: "203.0.113.10:443".to_owned(),
+                        process: "/usr/bin/browser".to_owned(),
+                        count: 4,
+                        last_seen: 1_700_000_000,
+                        connection_json: br#"{
+                            "protocol":"tcp",
+                            "addr":"203.0.113.10:443",
+                            "process":"/usr/bin/browser"
+                        }"#
+                        .to_vec(),
+                    }],
+                    ..GoStatisticsSnapshot::default()
+                })
+                .unwrap();
+
+            let monitor = ConnectionMonitor::load_with_store(store).await.unwrap();
+            assert_eq!(monitor.total_flow_value()["download"], "23");
+            assert_eq!(monitor.total_flow_value()["upload"], "19");
+            assert_eq!(monitor.all_history_value()["items"][0]["count"], "4");
+            assert_eq!(monitor.all_history_value()["dumpProcessEnabled"], true);
+            monitor.shutdown().await.unwrap();
         });
     }
 }

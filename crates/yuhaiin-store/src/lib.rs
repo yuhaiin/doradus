@@ -22,6 +22,7 @@ mod repository;
 mod resolver;
 mod schema;
 mod sqlite;
+mod statistics;
 mod status;
 use migration::{
     import_go_schema, require_go_table, table_exists, validate_go_texts, validate_go_timestamp,
@@ -45,6 +46,10 @@ pub use compat_runtime::{
 };
 #[cfg(feature = "async-dns")]
 pub use resolver::{FakeIpPools, FakeIpResolver};
+pub use statistics::{
+    GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsSnapshot,
+    GoTelemetryBucketRecord, GoTrafficBucketRecord,
+};
 pub use status::StorageStatus;
 
 const SCHEMA_VERSION: i64 = 3;

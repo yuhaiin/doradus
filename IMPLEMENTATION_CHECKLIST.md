@@ -146,7 +146,7 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | `[x]` | 前端 API/RPC | `runtime/src/api.rs` | 对齐现有 generated client；settings、nodes、inbounds、DNS、hosts/FakeDNS、route、TUN、connections 等共用 store/runtime struct；`inbounds.config` 返回/保存 Go 三项布尔设置并触发原子 reload |
 | `[x]` | live connections | `monitor`, `connections` API/SSE | 建立、更新、关闭、数字 ID close、EventSource added/removed |
-| `[x]` | history/traffic/statistics | `monitor`, SQLite persistence | history、total、traffic flush；正常关闭、SIGTERM、force abort 后读回 |
+| `[~]` | history/traffic/statistics | `monitor`, SQLite persistence | Rust checkpoint 负责频繁 crash recovery；无 checkpoint 时可接管 Go 的 `statistics_kv`、`traffic_hourly`、`connection_history`、`failed_connection_history` 和 telemetry 表；正常 shutdown 会原子写回 Go 兼容统计投影，history 按 Go key 合并 | 生产库更多版本/异常中断 fixture；周期性 Go 表投影和 force-abort 后 Go 表可见性仍需单独验收 |
 | `[x]` | runtime reload | `RuntimeController` | 配置先构建新 snapshot，失败保留旧 snapshot；selector/inbound/DNS 按 owner 收敛 |
 | `[~]` | 软件更新 | `runtime/src/update.rs`, `/api/v2/update/*` | releases 分页、stable/beta/main、平台 asset、checksum、进度状态、`~/.cache` 下载和 Unix detached helper；RustCrypto reqwest 无 native TLS | 不同发行版 service manager 的现场升级/回滚验收 |
 | `[x]` | pprof | `pprof-rs` Rust-native profiler、`/debug/pprof/` index 和 `/debug/pprof/profile?seconds=N` protobuf profile endpoint；沿用 settings `pprof` gate，禁用时返回 404 | profile 格式遵循 Rust `pprof` crate，不承诺 Go wire compatibility |
@@ -202,3 +202,4 @@ podman run --rm --network=host \
 4. 对现有 frontend generated operations 做一次逐项 route/schema 快照比对；subscription 维持明确的 deferred 状态。
 5. 每完成一项，只修改本模块表格、验收命令和 `MIGRATION.md` 的一条 dated entry，不再把所有历史细节堆回本文件。
 6. 完成 Linux `tproxy`/`redir` 验收：在真正的 network namespace/宿主机 CAP_NET_ADMIN 环境覆盖 TPROXY UDP ancillary、redir IPv4/IPv6、权限失败及多 flow 生命周期；Podman REDIRECT TCP 已有可重复验收记录。
+7. 补统计兼容验收：用真实 Go v6/生产形状数据库验证 Rust takeover、最终 flush 后 Go 读取，以及 force-abort/进程崩溃时 checkpoint 与 Go 表之间的恢复边界。

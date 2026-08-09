@@ -428,6 +428,61 @@ fn opens_sparse_go_v5_fixture_preserving_empty_and_unmodeled_tables_across_reope
 }
 
 #[test]
+fn loads_statistics_from_go_v6_production_shape() {
+    let path = test_database_path();
+    {
+        let connection = Connection::open(path.to_str().unwrap()).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../tests/fixtures/go_sqlite_v6_production_snapshot.sql"
+            ))
+            .unwrap();
+    }
+
+    let store = block_on(ConfigStore::open(&path)).unwrap();
+    let statistics = store.load_go_statistics().unwrap();
+    assert_eq!(statistics.total_download, 0);
+    assert_eq!(statistics.total_upload, 0);
+    assert_eq!(statistics.traffic.len(), 0);
+    assert_eq!(statistics.history.len(), 0);
+    assert_eq!(statistics.failed_history.len(), 0);
+    assert_eq!(statistics.telemetry.len(), 2);
+    assert_eq!(statistics.telemetry[0].bucket, 0);
+    assert_eq!(statistics.telemetry[0].download, 200);
+    assert_eq!(statistics.telemetry[0].failures, 3);
+    assert_eq!(statistics.telemetry[1].bucket, 1000);
+    assert_eq!(statistics.telemetry[1].upload, 10);
+    assert_eq!(statistics.telemetry[1].failures, 2);
+    store.replace_go_statistics(&statistics).unwrap();
+    assert_eq!(store.load_go_statistics().unwrap(), statistics);
+    drop(store);
+    remove_database_artifacts(&path);
+}
+
+#[test]
+fn loads_and_replaces_legacy_go_v5_telemetry_tables() {
+    let path = test_database_path();
+    {
+        let connection = Connection::open(path.to_str().unwrap()).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../tests/fixtures/go_sqlite_v5_telemetry.sql"
+            ))
+            .unwrap();
+    }
+
+    let store = block_on(ConfigStore::open(&path)).unwrap();
+    let statistics = store.load_go_statistics().unwrap();
+    assert_eq!(statistics.telemetry.len(), 3);
+    assert_eq!(statistics.telemetry[0].dimension, "source");
+    assert_eq!(statistics.telemetry[0].failures, 3);
+    store.replace_go_statistics(&statistics).unwrap();
+    assert_eq!(store.load_go_statistics().unwrap(), statistics);
+    drop(store);
+    remove_database_artifacts(&path);
+}
+
+#[test]
 fn upgrades_go_v1_legacy_tables_with_explicit_mapping_and_archival_writeback() {
     let path = test_database_path();
     {
