@@ -1322,8 +1322,9 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
         Err(error) => (None, Some(error.to_string())),
     };
     let refreshed_at = unix_millis();
+    let host_index_refresh_at = refreshed_at.saturating_add(60_000);
     let activation = json!({
-        "hostIndexRefreshAt": refreshed_at,
+        "hostIndexRefreshAt": host_index_refresh_at,
         "lastRefreshAt": refreshed_at,
         "refreshed": report.refreshed,
         "errors": report.errors,
@@ -1373,13 +1374,17 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
 }
 
 async fn route_lists_activation_value(state: &ApiState) -> ApiResult {
-    let value = state
+    let mut value = state
         .controller
         .store()
         .get_config(ROUTE_LIST_ACTIVATION_KEY)
         .await?
         .map(|bytes| raw_json(&bytes, json!({"hostIndexRefreshAt": 0})))
         .unwrap_or_else(|| json!({"hostIndexRefreshAt": 0}));
+    let refresh_at = effective_activation_at(&value, "hostIndexRefreshAt");
+    if let Some(object) = value.as_object_mut() {
+        object.insert("hostIndexRefreshAt".to_owned(), json!(refresh_at));
+    }
     json_value(value)
 }
 
@@ -2283,16 +2288,18 @@ async fn route_activation_value(state: &ApiState) -> ApiResult {
         .map(|bytes| raw_json(&bytes, json!({"hostIndexRefreshAt": 0})))
         .unwrap_or_else(|| json!({"hostIndexRefreshAt": 0}));
     let value = json!({
-        "hostIndexRefreshAt": list_value
-            .get("hostIndexRefreshAt")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-        "ruleApplyAt": rule_value
-            .get("ruleApplyAt")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
+        "hostIndexRefreshAt": effective_activation_at(&list_value, "hostIndexRefreshAt"),
+        "ruleApplyAt": effective_activation_at(&rule_value, "ruleApplyAt"),
     });
     json_value(value)
+}
+
+fn effective_activation_at(value: &Value, field: &str) -> i64 {
+    value
+        .get(field)
+        .and_then(Value::as_i64)
+        .filter(|at| *at > unix_millis())
+        .unwrap_or(0)
 }
 
 fn pending_route_list_activation() -> Value {
@@ -3728,6 +3735,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_activation_expiry_matches_go_timer_lifecycle() {
+        let state = state().await;
+        state
+            .controller
+            .store()
+            .put_config(
+                ROUTE_ACTIVATION_KEY,
+                &serde_json::to_vec(&json!({
+                    "hostIndexRefreshAt": 0,
+                    "ruleApplyAt": unix_millis() - 1,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        state
+            .controller
+            .store()
+            .put_config(
+                ROUTE_LIST_ACTIVATION_KEY,
+                &serde_json::to_vec(&json!({
+                    "hostIndexRefreshAt": unix_millis() - 1,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let expired_rules = route_activation_value(&state).await.unwrap();
+        assert_eq!(expired_rules.0["hostIndexRefreshAt"], 0);
+        assert_eq!(expired_rules.0["ruleApplyAt"], 0);
+        let expired_lists = route_lists_activation_value(&state).await.unwrap();
+        assert_eq!(expired_lists.0["hostIndexRefreshAt"], 0);
+
+        state
+            .controller
+            .store()
+            .put_config(
+                ROUTE_ACTIVATION_KEY,
+                &serde_json::to_vec(&pending_route_rule_activation()).unwrap(),
+            )
+            .await
+            .unwrap();
+        let pending = route_activation_value(&state).await.unwrap();
+        assert!(pending.0["ruleApplyAt"].as_i64().unwrap() > unix_millis());
+    }
+
+    #[tokio::test]
     async fn route_rule_url_index_does_not_create_duplicate_rules() {
         let state = state().await;
         let app = router(state.clone());
@@ -3940,6 +3995,14 @@ mod tests {
 
         let _ = route_lists_refresh_value(&state).await.unwrap();
         server.await.unwrap();
+
+        let activation = route_lists_activation_value(&state).await.unwrap();
+        assert!(
+            activation.0["hostIndexRefreshAt"]
+                .as_i64()
+                .unwrap_or_default()
+                > unix_millis()
+        );
 
         let metadata = state
             .controller
