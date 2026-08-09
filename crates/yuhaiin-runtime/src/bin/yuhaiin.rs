@@ -29,8 +29,18 @@ struct RunOptions {
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(error) = main_result().await {
+        eprintln!("yuhaiin-rust: fatal: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn main_result() -> Result<()> {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.is_empty() {
+        console_notice("no command supplied; starting the service (same as `run`)");
+    }
     if args
         .first()
         .map(|arg| arg == "update-helper")
@@ -74,11 +84,13 @@ async fn run(options: RunOptions) -> Result<()> {
         .database
         .or_else(|| std::env::var_os("YUHAIIN_DB").map(PathBuf::from))
         .unwrap_or_else(default_database_path);
+    console_notice(format!("starting; database={}", database.display()));
     if let Some(parent) = database.parent() {
         std::fs::create_dir_all(parent).map_err(io_error)?;
     }
     let store = ConfigStore::open(&database).await?;
     ensure_direct_node(&store).await?;
+    console_notice("configuration database opened");
 
     let upstream: Arc<dyn AsyncIpResolver> = Arc::new(SystemAsyncIpResolver);
     let mut builder = RuntimeBuilder::new(store.clone(), upstream);
@@ -108,15 +120,21 @@ async fn run(options: RunOptions) -> Result<()> {
         )));
     }
     let controller = RuntimeController::from_builder(builder).await?;
+    let logs = controller.monitor().logs();
+    if console_logs_enabled() {
+        logs.enable_console();
+    }
     let listen = options
         .listen
         .or_else(|| std::env::var("YUHAIIN_HTTP").ok())
         .unwrap_or_else(|| "0.0.0.0:50051".to_owned())
         .parse::<SocketAddr>()
         .map_err(|error| Error::invalid(format!("YUHAIIN_HTTP is invalid: {error}")))?;
+    console_notice(format!("binding HTTP API on {listen}"));
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|error| Error::new(ErrorKind::Io, format!("bind HTTP API: {error}")))?;
+    console_notice(format!("HTTP API listening on http://{listen}"));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let username = options
         .username
@@ -151,8 +169,8 @@ async fn run(options: RunOptions) -> Result<()> {
     let api_result = api_task
         .await
         .map_err(|error| Error::new(ErrorKind::Io, format!("HTTP API task: {error}")))?;
+    console_notice("shutdown requested; stopping runtime tasks");
     let _ = shutdown_tx.send(true);
-    let logs = controller.monitor().logs();
 
     if let Err(error) = dns_task.await.map_err(join_error)? {
         logs.error(format!("DNS task stopped: {error}"));
@@ -164,7 +182,11 @@ async fn run(options: RunOptions) -> Result<()> {
     if let Some(source) = controller.take_restore_request() {
         restore_database(source, &database).await?;
     }
-    api_result.map_err(io_error)
+    let result = api_result.map_err(io_error);
+    if result.is_ok() {
+        console_notice("stopped");
+    }
+    result
 }
 
 async fn ensure_direct_node(store: &ConfigStore) -> Result<()> {
@@ -252,8 +274,18 @@ fn required_option_value(
 
 fn print_help() {
     println!(
-        "Usage: yuhaiin-rust [run] [options]\n\nOptions:\n  -host, --host ADDR       HTTP listen address (default 0.0.0.0:50051)\n  -path, --path DIR        Go-compatible data directory (DIR/state.db)\n  -u, --username NAME      HTTP Basic Auth username\n  -p, --password PASSWORD  HTTP Basic Auth password\n  -eweb, --external-web DIR  Accepted for Go service-command compatibility\n  -nfs-mode                Accepted for Go service-command compatibility\n  version                  Print version\n  update-helper TARGET STAGED  Apply a staged update"
+        "Usage: yuhaiin-rust [run] [options]\n\nNo command is equivalent to `run` and starts the service.\nConsole logs are enabled by default; set YUHAIIN_QUIET=1 to disable them.\n\nOptions:\n  -host, --host ADDR       HTTP listen address (default 0.0.0.0:50051)\n  -path, --path DIR        Go-compatible data directory (DIR/state.db)\n  -u, --username NAME      HTTP Basic Auth username\n  -p, --password PASSWORD  HTTP Basic Auth password\n  -eweb, --external-web DIR  Accepted for Go service-command compatibility\n  -nfs-mode                Accepted for Go service-command compatibility\n  version                  Print version\n  update-helper TARGET STAGED  Apply a staged update"
     );
+}
+
+fn console_logs_enabled() -> bool {
+    std::env::var_os("YUHAIIN_QUIET").is_none()
+}
+
+fn console_notice(message: impl std::fmt::Display) {
+    if console_logs_enabled() {
+        eprintln!("yuhaiin-rust: {message}");
+    }
 }
 
 #[cfg(test)]
@@ -298,6 +330,11 @@ mod tests {
         assert!(parse_run_options(&args(&["-host"])).is_err());
         assert!(parse_run_options(&args(&["--unknown"])).is_err());
         assert!(parse_run_options(&args(&["run", "positional"])).is_err());
+    }
+
+    #[test]
+    fn empty_arguments_mean_default_run() {
+        assert_eq!(parse_run_options(&[]), Ok(RunOptions::default()));
     }
 }
 

@@ -8,6 +8,8 @@
 //! broadcast channel and bounded retention.
 
 use std::collections::VecDeque;
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -21,6 +23,7 @@ const SUBSCRIBER_CAPACITY: usize = 128;
 pub struct RuntimeLog {
     state: Arc<Mutex<VecDeque<String>>>,
     events: broadcast::Sender<Vec<String>>,
+    console: Arc<AtomicBool>,
 }
 
 impl Default for RuntimeLog {
@@ -35,7 +38,18 @@ impl RuntimeLog {
         Self {
             state: Arc::new(Mutex::new(VecDeque::with_capacity(RETENTION))),
             events,
+            console: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Mirror runtime log records to stderr for a foreground service process.
+    ///
+    /// The management API still receives the same bounded in-memory stream;
+    /// this flag only adds a process-local diagnostic sink. It is disabled by
+    /// default so library users and tests do not unexpectedly write to the
+    /// terminal.
+    pub fn enable_console(&self) {
+        self.console.store(true, Ordering::Relaxed);
     }
 
     /// Publish one or more complete lines in the same `time= level= msg=`
@@ -114,6 +128,13 @@ impl RuntimeLog {
             }
             while state.len() > RETENTION {
                 state.pop_front();
+            }
+        }
+        if self.console.load(Ordering::Relaxed) {
+            let stderr = std::io::stderr();
+            let mut stderr = stderr.lock();
+            for line in &lines {
+                let _ = writeln!(stderr, "{line}");
             }
         }
         let _ = self.events.send(lines);
