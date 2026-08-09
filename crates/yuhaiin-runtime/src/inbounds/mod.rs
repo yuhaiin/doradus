@@ -39,6 +39,7 @@ fn has_transport(transports: &[String], kind: &str) -> bool {
 }
 
 fn supports_socks5_udp(protocol: &str, protocol_udp: bool) -> bool {
+    let protocol = protocol.trim();
     (protocol.eq_ignore_ascii_case("mixed") || protocol.eq_ignore_ascii_case("mix"))
         || (protocol.eq_ignore_ascii_case("socks5") && protocol_udp)
 }
@@ -536,126 +537,124 @@ async fn start_listeners(
             let selector = selector.clone();
             let monitor = monitor.clone();
             let spec = spec.clone();
-            match spec.protocol.as_str() {
-                "yuubinsya" => {
-                    if tls_acceptor.is_some() {
-                        monitor.warn(format!(
-                            "skip UDP inbound {}: TLS transport only wraps TCP listeners",
-                            spec.id
-                        ));
-                        continue;
-                    }
-                    let password_hash =
-                        yuhaiin_core::yuubinsya::derive_salt(spec.password.as_bytes());
-                    let socket = if let Some(password) = spec.aead_password.clone() {
-                        let raw = match UdpSocket::bind(spec.listen).await {
-                            Ok(socket) => socket,
-                            Err(error) => {
-                                monitor.error(format!(
-                                    "skip UDP inbound {}: bind AEAD Yuubinsya UDP {}: {error}",
-                                    spec.id, spec.listen
-                                ));
-                                continue;
-                            }
-                        };
-                        yuhaiin_core::proxy::YuubinsyaUdpServer::new(
-                            Box::new(yuhaiin_protocol::aead::AeadUdpServer::new(
-                                raw,
-                                password,
-                                spec.aead_method,
-                            )),
-                            password_hash,
-                            false,
-                        )
-                    } else {
-                        // Go's Yuubinsya inbound uses the native packet
-                        // format without the SOCKS5 three-byte prefix.  The
-                        // prefix is only used when Yuubinsya wraps a SOCKS5
-                        // UDP association.
-                        match yuhaiin_core::proxy::YuubinsyaUdpServer::bind(
-                            spec.listen,
-                            password_hash,
-                            false,
-                        )
-                        .await
-                        {
-                            Ok(socket) => socket,
-                            Err(error) => {
-                                monitor.error(format!(
-                                    "skip UDP inbound {}: bind Yuubinsya UDP {}: {error}",
-                                    spec.id, spec.listen
-                                ));
-                                continue;
-                            }
-                        }
-                    };
-                    let logs = monitor.logs();
-                    listeners.push(tokio::spawn(async move {
-                        if let Err(error) =
-                            crate::proxy::yuubinsya::serve_udp(socket, spec, selector, monitor)
-                                .await
-                        {
-                            logs.error(format!("Yuubinsya UDP listener stopped: {error}"));
-                        }
-                    }));
+            let protocol = spec.protocol.trim();
+            if protocol.eq_ignore_ascii_case("yuubinsya") {
+                if tls_acceptor.is_some() {
+                    monitor.warn(format!(
+                        "skip UDP inbound {}: TLS transport only wraps TCP listeners",
+                        spec.id
+                    ));
+                    continue;
                 }
-                "socks5" | "mixed" => {
-                    if !supports_socks5_udp(&spec.protocol, spec.protocol_udp) {
-                        monitor.warn(format!(
-                            "skip UDP inbound {}: protocol {:?} has no UDP mode",
-                            spec.id, spec.protocol
-                        ));
-                        continue;
-                    }
-                    if tls_acceptor.is_some() {
-                        monitor.warn(format!(
-                            "skip UDP inbound {}: TLS transport only wraps TCP listeners",
-                            spec.id
-                        ));
-                        continue;
-                    }
-                    let socket = match UdpSocket::bind(spec.listen).await {
+                let password_hash = yuhaiin_core::yuubinsya::derive_salt(spec.password.as_bytes());
+                let socket = if let Some(password) = spec.aead_password.clone() {
+                    let raw = match UdpSocket::bind(spec.listen).await {
                         Ok(socket) => socket,
                         Err(error) => {
                             monitor.error(format!(
-                                "skip UDP inbound {}: bind SOCKS5 UDP {}: {error}",
+                                "skip UDP inbound {}: bind AEAD Yuubinsya UDP {}: {error}",
                                 spec.id, spec.listen
                             ));
                             continue;
                         }
                     };
-                    let logs = monitor.logs();
-                    if let Some(password) = spec.aead_password.clone() {
-                        let socket = crate::proxy::socks5::AeadUdpSocket::new(
-                            socket,
+                    yuhaiin_core::proxy::YuubinsyaUdpServer::new(
+                        Box::new(yuhaiin_protocol::aead::AeadUdpServer::new(
+                            raw,
                             password,
                             spec.aead_method,
-                        );
-                        listeners.push(tokio::spawn(async move {
-                            if let Err(error) = crate::proxy::socks5::serve_udp_socket(
-                                socket, spec, selector, monitor,
-                            )
-                            .await
-                            {
-                                logs.error(format!("AEAD SOCKS5 UDP listener stopped: {error}"));
-                            }
-                        }));
-                    } else {
-                        listeners.push(tokio::spawn(async move {
-                            if let Err(error) = crate::proxy::socks5::serve_udp_socket(
-                                socket, spec, selector, monitor,
-                            )
-                            .await
-                            {
-                                logs.error(format!("SOCKS5 UDP listener stopped: {error}"));
-                            }
-                        }));
+                        )),
+                        password_hash,
+                        false,
+                    )
+                } else {
+                    // Go's Yuubinsya inbound uses the native packet
+                    // format without the SOCKS5 three-byte prefix.  The
+                    // prefix is only used when Yuubinsya wraps a SOCKS5
+                    // UDP association.
+                    match yuhaiin_core::proxy::YuubinsyaUdpServer::bind(
+                        spec.listen,
+                        password_hash,
+                        false,
+                    )
+                    .await
+                    {
+                        Ok(socket) => socket,
+                        Err(error) => {
+                            monitor.error(format!(
+                                "skip UDP inbound {}: bind Yuubinsya UDP {}: {error}",
+                                spec.id, spec.listen
+                            ));
+                            continue;
+                        }
                     }
+                };
+                let logs = monitor.logs();
+                listeners.push(tokio::spawn(async move {
+                    if let Err(error) =
+                        crate::proxy::yuubinsya::serve_udp(socket, spec, selector, monitor).await
+                    {
+                        logs.error(format!("Yuubinsya UDP listener stopped: {error}"));
+                    }
+                }));
+            } else if protocol.eq_ignore_ascii_case("socks5")
+                || protocol.eq_ignore_ascii_case("mixed")
+                || protocol.eq_ignore_ascii_case("mix")
+            {
+                if !supports_socks5_udp(&spec.protocol, spec.protocol_udp) {
+                    monitor.warn(format!(
+                        "skip UDP inbound {}: protocol {:?} has no UDP mode",
+                        spec.id, spec.protocol
+                    ));
+                    continue;
                 }
-                _ => monitor.warn(format!(
+                if tls_acceptor.is_some() {
+                    monitor.warn(format!(
+                        "skip UDP inbound {}: TLS transport only wraps TCP listeners",
+                        spec.id
+                    ));
+                    continue;
+                }
+                let socket = match UdpSocket::bind(spec.listen).await {
+                    Ok(socket) => socket,
+                    Err(error) => {
+                        monitor.error(format!(
+                            "skip UDP inbound {}: bind SOCKS5 UDP {}: {error}",
+                            spec.id, spec.listen
+                        ));
+                        continue;
+                    }
+                };
+                let logs = monitor.logs();
+                if let Some(password) = spec.aead_password.clone() {
+                    let socket = crate::proxy::socks5::AeadUdpSocket::new(
+                        socket,
+                        password,
+                        spec.aead_method,
+                    );
+                    listeners.push(tokio::spawn(async move {
+                        if let Err(error) =
+                            crate::proxy::socks5::serve_udp_socket(socket, spec, selector, monitor)
+                                .await
+                        {
+                            logs.error(format!("AEAD SOCKS5 UDP listener stopped: {error}"));
+                        }
+                    }));
+                } else {
+                    listeners.push(tokio::spawn(async move {
+                        if let Err(error) =
+                            crate::proxy::socks5::serve_udp_socket(socket, spec, selector, monitor)
+                                .await
+                        {
+                            logs.error(format!("SOCKS5 UDP listener stopped: {error}"));
+                        }
+                    }));
+                }
+            } else {
+                monitor.warn(format!(
                     "skip UDP inbound {}: protocol {:?} has no UDP mode",
                     spec.id, spec.protocol
-                )),
+                ));
             }
         }
     }
@@ -2535,6 +2534,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
     #[test]
     fn mixed_inbound_inherits_go_socks5_udp_mode() {
         assert!(supports_socks5_udp("mixed", false));
+        assert!(supports_socks5_udp("  MIXED  ", false));
         assert!(supports_socks5_udp("mix", true));
         assert!(supports_socks5_udp("socks5", true));
         assert!(!supports_socks5_udp("socks5", false));

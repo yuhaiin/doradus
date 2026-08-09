@@ -461,16 +461,22 @@ pub struct DirectAsyncProxy {
 impl AsyncProxy for DirectAsyncProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         let destination = context.proxy_destination();
+        let preferred_ipv4 = context
+            .local_bind_addresses
+            .first()
+            .map(|address| address.is_ipv4());
         Box::pin(async move {
-            let address = destination.addr().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unsupported,
-                    "direct async proxy requires an already-resolved IP endpoint",
-                )
-            })?;
-            let stream =
-                connect_tokio_tcp(address, context.local_bind_for(address), self.timeout).await?;
-            Ok(Box::new(stream) as BoxAsyncStream)
+            let addresses = resolve_direct_addresses(&destination, preferred_ipv4).await?;
+            let mut last_error = None;
+            for address in addresses {
+                match connect_tokio_tcp(address, context.local_bind_for(address), self.timeout)
+                    .await
+                {
+                    Ok(stream) => return Ok(Box::new(stream) as BoxAsyncStream),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| Error::invalid("direct destination has no address")))
         })
     }
 
@@ -479,13 +485,16 @@ impl AsyncProxy for DirectAsyncProxy {
         context: &'a FlowContext,
     ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
         let destination = context.proxy_destination();
+        let preferred_ipv4 = context
+            .local_bind_addresses
+            .first()
+            .map(|address| address.is_ipv4());
         Box::pin(async move {
-            let address = destination.addr().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unsupported,
-                    "direct async datagram requires an already-resolved IP endpoint",
-                )
-            })?;
+            let address = resolve_direct_addresses(&destination, preferred_ipv4)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::invalid("direct destination has no address"))?;
             let bind_address: SocketAddr = match address {
                 std::net::SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
                 std::net::SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
@@ -501,6 +510,50 @@ impl AsyncProxy for DirectAsyncProxy {
     fn close(&self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async { Ok(()) })
     }
+}
+
+/// Resolve a domain only when a caller reaches the low-level direct transport
+/// without the runtime's configured resolver wrapper. Runtime traffic still
+/// resolves through `ResolvingProxy` first, so hosts/FakeIP/route resolver
+/// policy remain authoritative; this fallback prevents standalone direct
+/// users from failing merely because they supplied a domain endpoint.
+#[cfg(feature = "async-proxy")]
+async fn resolve_direct_addresses(
+    destination: &Endpoint,
+    preferred_ipv4: Option<bool>,
+) -> Result<Vec<SocketAddr>> {
+    if let Some(address) = destination.addr() {
+        return Ok(vec![address]);
+    }
+    let host = destination
+        .host()
+        .ok_or_else(|| Error::invalid("direct destination has no host"))?;
+    let port = destination
+        .port()
+        .ok_or_else(|| Error::invalid("direct destination has no port"))?;
+    let addresses = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("resolve direct destination {host}:{port}: {error}"),
+            )
+        })?;
+    let addresses = addresses.collect::<Vec<_>>();
+    let preferred = addresses
+        .iter()
+        .copied()
+        .filter(|address| preferred_ipv4.is_none_or(|ipv4| address.is_ipv4() == ipv4))
+        .collect::<Vec<_>>();
+    if !preferred.is_empty() {
+        return Ok(preferred);
+    }
+    if !addresses.is_empty() {
+        return Ok(addresses);
+    }
+    Err(Error::invalid(format!(
+        "direct destination {host}:{port} resolved to no usable address"
+    )))
 }
 
 #[cfg(feature = "async-proxy")]
@@ -1402,6 +1455,31 @@ mod tests {
             "127.0.0.2".parse::<std::net::IpAddr>().unwrap()
         );
         assert_eq!(handle.join().unwrap(), stream.local_addr().unwrap());
+    }
+
+    #[cfg(feature = "async-proxy")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_async_proxy_resolves_domain_when_called_without_runtime_wrapper() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut payload = [0u8; 13];
+            stream.read_exact(&mut payload).await.unwrap();
+            payload
+        });
+
+        let context = FlowContext::new(Endpoint::domain(
+            Network::Tcp,
+            DomainName::new("localhost").unwrap(),
+            address.port(),
+        ));
+        let proxy = DirectAsyncProxy {
+            timeout: Duration::from_secs(1),
+        };
+        let mut stream = proxy.connect(&context).await.unwrap();
+        stream.write_all(b"direct-domain").await.unwrap();
+        assert_eq!(server.await.unwrap(), *b"direct-domain");
     }
 
     #[test]
