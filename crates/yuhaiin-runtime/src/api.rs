@@ -2404,7 +2404,36 @@ async fn fakedns_get_value(state: &ApiState) -> ApiResult {
     {
         return Ok(Json(raw_json(&value, default_fakedns())));
     }
-    let value = state.controller.store().repository().list_go_dns_settings().await?.into_iter().next().map(|record| json!({"enabled": record.fakedns_enabled, "ipv4Range": record.fakedns_ipv4_range, "ipv6Range": record.fakedns_ipv6_range, "whitelist": [], "skipCheckList": []})).unwrap_or_else(default_fakedns);
+    let repository = state.controller.store().repository();
+    let settings = repository.list_go_dns_settings().await?;
+    let lists = repository.list_go_dns_fakedns_lists().await?;
+    let mut value = settings
+        .into_iter()
+        .next()
+        .map(|record| {
+            json!({
+                "enabled": record.fakedns_enabled,
+                "ipv4Range": record.fakedns_ipv4_range,
+                "ipv6Range": record.fakedns_ipv6_range,
+                "whitelist": [],
+                "skipCheckList": [],
+            })
+        })
+        .unwrap_or_else(default_fakedns);
+    let mut whitelist = Vec::new();
+    let mut skip_check_list = Vec::new();
+    for list in lists {
+        match list.kind.as_str() {
+            "whitelist" => whitelist.push(Value::String(list.value)),
+            "skip_check" => skip_check_list.push(Value::String(list.value)),
+            _ => {}
+        }
+    }
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("fake DNS settings must be an object"))?;
+    object.insert("whitelist".to_owned(), Value::Array(whitelist));
+    object.insert("skipCheckList".to_owned(), Value::Array(skip_check_list));
     Ok(Json(value))
 }
 
@@ -3302,12 +3331,25 @@ fn route_list_item_json(record: GoRouteListRecord, route_lists: &RouteListSnapsh
     );
     let name = string_or(&value, "name", &record.name);
     let entries = route_lists.values(&name).unwrap_or_default();
-    let preview = entries.first().cloned().unwrap_or_default();
+    let source = value.get("source").cloned().unwrap_or_default();
+    let source_type = string_or(&source, "type", &record.source_type);
+    let preview = if source_type == "local" {
+        source
+            .get("local")
+            .and_then(|local| local.get("lists"))
+            .and_then(Value::as_array)
+            .and_then(|values| values.first())
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        entries.first().cloned().unwrap_or_default()
+    };
     let error_count = u32::from(route_lists.error(&name).is_some());
     json!({
         "name": name,
         "type": string_or(&value, "type", &record.list_type),
-        "source": string_or(&value.get("source").cloned().unwrap_or_default(), "type", &record.source_type),
+        "source": source_type,
         "itemCount": entries.len(),
         "errorCount": error_count,
         "preview": preview,

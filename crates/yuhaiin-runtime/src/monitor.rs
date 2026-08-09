@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, watch};
 
 use yuhaiin_core::flow::{
@@ -29,12 +29,27 @@ use yuhaiin_store::{
 use crate::RuntimeLog;
 
 const HISTORY_LIMIT: usize = 2048;
+const GO_HISTORY_SIZE: usize = 1000;
 const BUCKET_LIMIT: usize = 90 * 24 * 60;
 const GO_STATISTICS_PROJECTION_INTERVAL: Duration = Duration::from_secs(30);
 const GO_STATISTICS_PROJECTION_RETRY_INITIAL: Duration = Duration::from_secs(2);
 const GO_STATISTICS_PROJECTION_RETRY_MAX: Duration = Duration::from_secs(60);
 const PERSISTENCE_KEY: &str = "statistics.runtime";
 const PERSISTENCE_VERSION: u32 = 1;
+// The Go API always returns this complete, stable dimension list. Empty
+// groups are part of the public response contract even though new telemetry
+// entries are only recorded for non-empty dimensions.
+const GO_TELEMETRY_DIMENSIONS: [&str; 9] = [
+    "protocol",
+    "inbound",
+    "source",
+    "addr",
+    "outbound",
+    "process",
+    "rule",
+    "tag",
+    "destination",
+];
 
 /// Socket inbound tasks are spawned on Tokio's multithread executor. This
 /// runtime-local boundary deliberately requires a Send future while the core
@@ -442,7 +457,7 @@ impl ConnectionMonitor {
             .take(10_000)
             .map(|(bucket, (download, upload))| {
                 json!({
-                "start": format_time(bucket),
+                "start": format_time_utc(bucket),
                 "download": download.to_string(),
                 "upload": upload.to_string(),
                 })
@@ -482,30 +497,44 @@ impl ConnectionMonitor {
                 item.2 = item.2.saturating_add(*failures);
             }
         }
-        let groups = dimensions
+        let telemetry_group = |dimension: String, items: BTreeMap<String, (u64, u64, u64)>| {
+            let mut items = items.into_iter().collect::<Vec<_>>();
+            items.sort_by(|(left_value, left), (right_value, right)| {
+                right
+                    .0
+                    .saturating_add(right.1)
+                    .cmp(&left.0.saturating_add(left.1))
+                    .then_with(|| right.2.cmp(&left.2))
+                    .then_with(|| left_value.cmp(right_value))
+            });
+            items.truncate(limit);
+            json!({
+                "dimension": dimension,
+                "items": items.into_iter().map(|(value, (download, upload, failures))| json!({
+                    "value": value,
+                    "download": download.to_string(),
+                    "upload": upload.to_string(),
+                    "failures": failures.to_string(),
+                })).collect::<Vec<_>>(),
+            })
+        };
+        let mut groups = GO_TELEMETRY_DIMENSIONS
             .into_iter()
-            .map(|(dimension, items)| {
-                let mut items = items.into_iter().collect::<Vec<_>>();
-                items.sort_by(|(left_value, left), (right_value, right)| {
-                    right
-                        .0
-                        .saturating_add(right.1)
-                        .cmp(&left.0.saturating_add(left.1))
-                        .then_with(|| right.2.cmp(&left.2))
-                        .then_with(|| left_value.cmp(right_value))
-                });
-                items.truncate(limit);
-                json!({
-                    "dimension": dimension,
-                    "items": items.into_iter().map(|(value, (download, upload, failures))| json!({
-                        "value": value,
-                        "download": download.to_string(),
-                        "upload": upload.to_string(),
-                        "failures": failures.to_string(),
-                    })).collect::<Vec<_>>(),
-                })
+            .map(|dimension| {
+                telemetry_group(
+                    dimension.to_owned(),
+                    dimensions.remove(dimension).unwrap_or_default(),
+                )
             })
             .collect::<Vec<_>>();
+        // Preserve forward compatibility if a newer persisted store contains
+        // a dimension unknown to this version. Known Go dimensions retain
+        // their canonical order above.
+        groups.extend(
+            dimensions
+                .into_iter()
+                .map(|(dimension, items)| telemetry_group(dimension, items)),
+        );
         json!({"groups": groups})
     }
 
@@ -531,6 +560,7 @@ impl ConnectionMonitor {
                 .and_then(Value::as_str)
                 .cmp(&left.get("time").and_then(Value::as_str))
         });
+        items.truncate(GO_HISTORY_SIZE);
         json!({
             "items": items,
             "dumpProcessEnabled": state.failed_history.values().any(|entry| !entry.process.is_empty()),
@@ -545,6 +575,7 @@ impl ConnectionMonitor {
                 .cmp(&history_time(left))
                 .then_with(|| history_key(left).cmp(&history_key(right)))
         });
+        items.truncate(GO_HISTORY_SIZE);
         json!({
             "items": items,
             "dumpProcessEnabled": items.iter().any(|item| {
@@ -1445,6 +1476,16 @@ fn unix_seconds() -> i64 {
 fn format_time(seconds: i64) -> String {
     OffsetDateTime::from_unix_timestamp(seconds)
         .ok()
+        .and_then(|time| {
+            let offset = UtcOffset::local_offset_at(time).unwrap_or(UtcOffset::UTC);
+            time.to_offset(offset).format(&Rfc3339).ok()
+        })
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
+}
+
+fn format_time_utc(seconds: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()
         .and_then(|time| time.format(&Rfc3339).ok())
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
 }
@@ -1601,7 +1642,16 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            5
+            GO_TELEMETRY_DIMENSIONS.len()
+        );
+        assert_eq!(
+            monitor.telemetry_value()["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|group| group["dimension"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            GO_TELEMETRY_DIMENSIONS.to_vec()
         );
     }
 
@@ -2009,7 +2059,7 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .len(),
-                5
+                GO_TELEMETRY_DIMENSIONS.len()
             );
             assert_eq!(
                 reloaded.all_history_value()["items"]

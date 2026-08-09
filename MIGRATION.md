@@ -2153,3 +2153,23 @@ source。failure telemetry 复用同一维度构造，避免正常流量和失�
 验证结果：monitor 相关 23 个单测通过，真实 `service_chain` 7 个测试通过，统计并发读者、
 流量更新、停止和 SQLite 重启读回测试通过。此次只使用项目 cache-owned target 和测试目录，
 没有使用 `/tmp`。
+
+## 62. 2026-08-10 Go/Rust management API expanded parity
+
+在 §60 的生产 schema-7 对照基础上，`scripts/integration/go-api-parity.sh` 现在先把源库复制到
+`~/.cache/yuhaiin-rust/integration/.../prepared`，由一次临时 Rust takeover 创建缺失的 Go v6
+telemetry 表，再给 Go/Rust 各自独立副本。这样不会修改源库，也不会把旧 Go v5 telemetry 表的
+缺失误报成 HTTP API 差异。
+
+本轮逐项通过了 25 个稳定管理面响应：info、settings、nodes、resolvers、inbounds、connections
+及 total/traffic/telemetry/failed-history/history、hosts/FakeDNS/server、route activation/config/
+lists/rules/tags，以及 interfaces/licenses。对照中修复了几项真实兼容差异：
+
+- telemetry 公共返回始终保留 Go 规定的 9 个维度和顺序，空维度返回空 `items`；内部写入仍只保留非空 dimension。
+- failed/all history 按 Go 的 1000 条上限返回；history 使用本地时区 RFC3339，traffic bucket 继续使用 UTC。
+- FakeDNS 从 `dns_fakedns_lists` 按 Go 的 rowid 插入顺序恢复 `whitelist`/`skipCheckList`。
+- route list 的 local preview 保留配置数组第一项。remote list 的 itemCount/errorCount/preview 依赖 Go 的 Pebble
+  网络缓存或 Rust 的 `~/.cache/yuhaiin-rust/rules`，脚本只比较其稳定 control-plane 字段；licenses 是构建依赖清单，
+  interfaces 只规范化宿主机枚举顺序，SSE `tools.logs` 由已有流式测试覆盖。
+
+本轮 workspace 未使用 `/tmp`；对照日志和副本均位于 `~/.cache/yuhaiin-rust`。

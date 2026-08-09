@@ -581,7 +581,10 @@ impl ConfigRepository {
             return Ok(Vec::new());
         }
         let rows = connection
-            .query("SELECT kind, value FROM dns_fakedns_lists ORDER BY kind, value")
+            // Go exposes the insertion order of these lists through its
+            // resolver store, and callers rely on that order when comparing
+            // or round-tripping configuration.
+            .query("SELECT kind, value FROM dns_fakedns_lists ORDER BY rowid")
             .map_err(storage_error)?;
         rows.iter()
             .map(|row| {
