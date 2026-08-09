@@ -136,6 +136,15 @@ fn hosts_aliases_follow_chains_and_unresolved_aliases_use_upstream() {
 fn hosts_alias_cycles_are_rejected_and_target_loading_accepts_ip_or_domain() {
     let hosts = HostsTable::new();
     hosts
+        .insert_target(DomainName::new("example.com").unwrap(), "example.com")
+        .unwrap();
+    assert_eq!(
+        hosts
+            .resolve(&DomainName::new("example.com").unwrap())
+            .unwrap(),
+        None
+    );
+    hosts
         .insert_target(DomainName::new("ip.example").unwrap(), "192.0.2.20")
         .unwrap();
     hosts

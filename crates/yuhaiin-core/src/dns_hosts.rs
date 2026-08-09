@@ -83,7 +83,15 @@ impl HostsTable {
         if let Ok(address) = target.parse::<IpAddr>() {
             return self.insert_ip(domain, address);
         }
-        self.insert_alias(domain, DomainName::new(target)?)
+        let target = DomainName::new(target)?;
+        // Go stores a self-mapping as a valid no-op hosts override (the
+        // fresh database currently contains `example.com -> example.com`).
+        // Keep that legacy row loadable without turning it into an alias
+        // cycle; normal resolution falls through to the upstream resolver.
+        if domain == target {
+            return Ok(());
+        }
+        self.insert_alias(domain, target)
     }
 
     pub fn insert_alias(&self, domain: DomainName, target: DomainName) -> Result<()> {

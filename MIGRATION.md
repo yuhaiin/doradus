@@ -1470,3 +1470,9 @@ connections.total
 结果确认：Rust 与 Go 的四个响应都保持相同的顶层 JSON 契约（info、settings、分页 nodes、字符串计数器/空 counters），可由现有 React generated client 解码。空库默认值的差异是有意的：Rust 初始化内置 `direct` node，并将 advanced buffer 使用运行时默认值；Go 的 fresh state 返回空 node 列表和 zero advanced values。这里验证的是路径、状态码和字段形状，不把默认值差异误报为协议不兼容；生产库逐表、逐字段和 mutation/reload side effect 快照仍是 checklist 的未完成项。
 
 首次尝试旧的 `/api/v2/info`、`/api/v2/settings` 路径得到 Go 静态文件 fallback 的 404，随后按 Go `v2RoutePattern` 修正为 RPC 路径。该记录保留这个陷阱，避免后续把旧路由 404 当成服务启动失败。
+
+## 24. 2026-08-09 Go fresh SQLite takeover
+
+用上一个 Go RPC smoke 生成的独立 `state.db`，在 Go 进程退出后直接启动 Rust binary；Rust 首次启动曾因严格拒绝 `dns_hosts` 中 Go fresh state 自带的 `example.com -> example.com` self-mapping 而失败。Go 将这类记录当作合法 no-op，Rust 现在在 `insert_target` 兼容加载时忽略该 self-mapping，普通 alias cycle 仍由解析阶段拒绝。
+
+修复后 Rust 成功打开并接管同一 Go fresh state，实际请求 `/api/v2/info`、`/api/v2/settings`、`/api/v2/nodes`、`/api/v2/connections/total` 均收到 HTTP 200，并通过 SIGTERM 正常退出。该回归覆盖了真实 Go SQLite 文件的 hosts/migration/open/runtime 初始化边界；生产库中的更多 hosts、route、resolver、统计异常快照仍需按 checklist 扩充。
