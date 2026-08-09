@@ -15,5 +15,14 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 version = "0.1.0"
 
+# The workspace is validated repeatedly in a cache-backed target directory.
+# Incremental debug/test artifacts grow much faster than the reusable binary
+# and dependency artifacts, so keep them disabled for bounded disk usage.
+[profile.dev]
+incremental = false
+
+[profile.test]
+incremental = false
+
 [workspace.lints.rust]
 unsafe_code = "forbid"

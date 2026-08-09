@@ -231,6 +231,9 @@ scripts/integration/tun-service.sh
 # Frontend management API process contract and reload/observer smoke:
 scripts/integration/api-contract.sh
 
+# Foreground binary startup/readiness logs and clean SIGTERM:
+make startup-logs-smoke
+
 # Release runtime throughput and Linux RSS/CPU process sampling:
 make benchmark-throughput
 

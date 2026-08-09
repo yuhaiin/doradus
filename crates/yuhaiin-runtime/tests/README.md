@@ -65,6 +65,11 @@ The current scenarios cover:
   and verifies persisted traffic/history remain readable. The reusable Podman
   entry point is `scripts/integration/stats-concurrency.sh`; logs are kept
   under `~/.cache/yuhaiin-rust/integration/stats-concurrency`.
+- `startup_logs.rs` starts the real runtime executable without
+  `YUHAIIN_QUIET`, verifies that database/API/supervisor startup progress is
+  visible on stderr, and then checks a clean SIGTERM shutdown. This protects
+  the foreground behavior that makes a manually launched binary distinguishable
+  from a hung process.
 - `scripts/integration/api-contract.sh` runs the frontend management API
   process contract in Podman, including CRUD, reload, selection, connections,
   statistics, SSE, and representative error responses. It uses host networking
