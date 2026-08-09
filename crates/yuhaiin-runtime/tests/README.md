@@ -75,6 +75,11 @@ The current scenarios cover:
   statistics, SSE, and representative error responses. It uses host networking
   so the subprocess and loopback fixtures share one namespace; build/runtime
   logs are kept under `~/.cache/yuhaiin-rust/integration/api-contract`.
+- `scripts/integration/go-rust-stats.sh` starts Go and Rust in separate Podman
+  network namespaces against one shared SQLite file. Both mixed inbounds write
+  traffic while both management APIs read connections/statistics concurrently;
+  build and process logs are kept under
+  `~/.cache/yuhaiin-rust/integration/go-rust-stats`.
 - standalone Go HTTP/2 transport wire compatibility is covered separately in
   `crates/yuhaiin-chain/tests/standalone_http2.rs`: fixed endpoint resolution,
   plaintext prior-knowledge H2, `CONNECT http://localhost`, raw bidirectional
