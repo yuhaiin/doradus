@@ -25,6 +25,8 @@
 
 > 2026-08-09 节点关闭生命周期：Go `node.close` 只从 `ProxyStore` 删除运行时实例、调用底层 `Proxy.Close`，不删除节点配置；Rust `RuntimeController::close_node` 现在对所有 live selector 的匹配 slot 原子替换为 fail-closed proxy，再在锁外关闭旧实例，因此已有引用会收到 closed 语义，新 flow 不会继续使用旧实例，配置仍可读，下一次成功 reload 会按持久化配置重新构造 slot。空 ID 和未知 ID 保持 Go 的幂等 no-op；新增关闭、active、配置保留及 reload 重建回归。
 
+> 2026-08-09 统计 force-abort 验收：新增真实子进程回归，子进程打开 `~/.cache` 下的 SQLite、写入连接/流量后由父进程调用 `Child::kill`，不执行 graceful shutdown；父进程重新打开同一数据库，确认 Rust `statistics.runtime` checkpoint、Go 兼容统计表、history 和 WAL/sidecar 恢复均可读。这样明确了 checkpoint 与 Go 表投影的实际进程级边界，后续仍需长时间投影失败和 Go 并发读写压力验收。
+
 > 2026-08-09 管理列表 query 契约收口：Rust API 不再对 nodes、inbounds、resolvers、route lists、route rules 统一搜索整个 JSON，而是按 Go handler 的字段集合过滤，并在过滤后计算分页 `total`。节点只搜索 `id/name/group/origin/chain.type`，入站只搜索 `id/name/network.type/protocol.type`，resolver 搜索 `id/type/host/subnet/tlsServerName`，路由列表/规则分别使用 Go 的四个字段。查询仍保持大小写不敏感、分页字段兼容 camelCase；列表 API 的完整 response/error/reload 语义逐项验收仍在 checklist。
 
 > 2026-08-09 runtime socket policy：`useDefaultInterface/netInterface` 已在 immutable snapshot 中解析为接口 IPv4/IPv6 source addresses；统一 `SocketPolicyProxy` 将策略传递到 direct/fixed、HTTP CONNECT、SOCKS5、协议 wrapper、HTTP/2 Yuubinsya、直连 UOT 和 native UDP socket。连接建立按目标地址族选择 source address，selector reload 会替换策略而不影响旧 flow。新增 FlowContext/connector/runtime reload 回归，`cargo test -p yuhaiin-core --all-features --offline --lib` 通过 121 项，`cargo test -p yuhaiin-runtime --all-features --offline --lib` 通过 137 项；inbound listen socket 的平台专用绑定仍保留为平台验收项。

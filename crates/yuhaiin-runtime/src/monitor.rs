@@ -1327,6 +1327,7 @@ fn history_time(item: &Value) -> i64 {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
     use std::time::SystemTime;
 
     use super::*;
@@ -1706,6 +1707,76 @@ mod tests {
 
         monitor.shutdown().await.unwrap();
         drop(reader_store);
+        remove_monitor_test_database(&path);
+    }
+
+    #[test]
+    fn monitor_force_abort_child() {
+        let Some(path) = std::env::var_os("YUHAIIN_RUNTIME_MONITOR_CRASH_CHILD_PATH") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = ConfigStore::open(&path).await.unwrap();
+            let monitor = ConnectionMonitor::load_with_store(store).await.unwrap();
+            let (flow, context) = flow();
+            monitor.opened(flow, context);
+            monitor.bytes(flow.key, TunFlowDirection::Upload, 29);
+            monitor.closed(flow.key);
+
+            // Keep the process alive so the parent can kill it before any
+            // graceful monitor shutdown or Drop-based cleanup can run.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+    }
+
+    #[test]
+    fn monitor_recovers_checkpoint_after_force_abort() {
+        let path = monitor_test_database_path();
+        remove_monitor_test_database(&path);
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .arg("--exact")
+            .arg("monitor::tests::monitor_force_abort_child")
+            .arg("--nocapture")
+            .env("YUHAIIN_RUNTIME_MONITOR_CRASH_CHILD_PATH", &path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        // The persistence worker's first interval tick is immediate; this
+        // leaves enough time for the checkpoint write while still ensuring
+        // the child is terminated far before its ten-second sleep ends.
+        std::thread::sleep(Duration::from_millis(700));
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "crash child must not exit gracefully");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = ConfigStore::open(&path).await.unwrap();
+            let monitor = ConnectionMonitor::load_with_store(store).await.unwrap();
+            assert_eq!(monitor.total_flow_value()["upload"], "29");
+            assert_eq!(monitor.all_history_value()["items"][0]["count"], "1");
+            let go_statistics = monitor
+                .persistence
+                .as_ref()
+                .unwrap()
+                .store
+                .load_go_statistics()
+                .unwrap();
+            assert_eq!(go_statistics.total_upload, 29);
+            assert_eq!(go_statistics.history[0].count, 1);
+            monitor.shutdown().await.unwrap();
+        });
         remove_monitor_test_database(&path);
     }
 
