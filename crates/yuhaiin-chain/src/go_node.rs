@@ -154,7 +154,7 @@ mod tests {
             }]
         );
         assert_eq!(parsed.http2.max_streams, 8);
-        assert!(parsed.yuubinsya.udp_over_stream);
+        assert!(parsed.yuubinsya.as_ref().unwrap().udp_over_stream);
     }
 
     #[test]
@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(parsed.fixed_addresses[0].host, "proxy.example");
         assert_eq!(parsed.fixed_addresses[0].port, 443);
         assert_eq!(parsed.http2.concurrency, 10);
-        assert!(parsed.yuubinsya.udp_coalesce);
+        assert!(parsed.yuubinsya.as_ref().unwrap().udp_coalesce);
     }
 
     #[test]
@@ -220,5 +220,25 @@ mod tests {
         })))
         .unwrap_err();
         assert_eq!(error.kind, ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn accepts_standalone_http2_transport_without_yuubinsya() {
+        let parsed = parse_go_node(
+            &json!({
+                "id": "http2-transport",
+                "chain": [
+                    { "type": "fixedv2", "fixedv2": {
+                        "addresses": [{ "host": "127.0.0.1", "port": 8080 }]
+                    }},
+                    { "type": "http2", "http2": { "concurrency": 1 } }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(parsed.yuubinsya.is_none());
+        assert_eq!(parsed.http2.concurrency, 1);
     }
 }

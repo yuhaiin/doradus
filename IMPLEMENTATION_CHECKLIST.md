@@ -18,10 +18,10 @@
 
 | 指标 | 数值 | 说明 |
 | --- | ---: | --- |
-| 当前范围条目 | 65 | `[x]` 已实现 + `[~]` 主路径已实现但仍有缺口；明确 `延期`/`不适用` 不计入当前替换范围 |
-| 完成条目 | 52 / 65 | `[x]`，80.0% |
-| 部分完成条目 | 13 / 65 | `[~]`，20.0%；每个部分完成条目按 50% 计入加权覆盖率 |
-| 加权迁移覆盖率 | **58.5 / 65 = 90.0%** | `(52 + 13 × 0.5) / 65` |
+| 当前范围条目 | 66 | `[x]` 已实现 + `[~]` 主路径已实现但仍有缺口；明确 `延期`/`不适用` 不计入当前替换范围 |
+| 完成条目 | 52 / 66 | `[x]`，78.8% |
+| 部分完成条目 | 14 / 66 | `[~]`，21.2%；每个部分完成条目按 50% 计入加权覆盖率 |
+| 加权迁移覆盖率 | **59 / 66 = 89.4%** | `(52 + 14 × 0.5) / 66` |
 | 明确延期 | 4 | 订阅、DoQ/DoH3、Shadowsocks/SSR、低频复杂协议等，不阻塞当前主路径 |
 | Go 没有对应能力 | 1 | 本地 DoH 管理端点 |
 
@@ -34,7 +34,7 @@
 | FakeIP | 3 | 1 | 87.5% | 更多生产数据样本 |
 | DNS resolver/server | 6 | 0 | 100.0% | DoQ/DoH3 明确延期；更多生产异常快照 |
 | Router/Trie/GeoIP | 5 | 0 | 100.0% | 发布策略中的数据库更新验收 |
-| Proxy/transport | 19 | 2 | 95.2% | Linux transparent UDP、平台 listen 绑定、复杂协议 |
+| Proxy/transport | 19 | 3 | 93.2% | standalone HTTP/2 后续目标协议层、Linux transparent UDP、平台 listen 绑定、复杂协议 |
 | NAT | 3 | 1 | 87.5% | Android/macOS route/NAT 生命周期 |
 | TUN inbound | 4 | 2 | 83.3% | namespace 长矩阵、Android/macOS 实机 |
 | 管理 API/connections/统计 | 3 | 3 | 75.0% | 逐操作生产 response/error/reload 快照、并发统计锁竞争 |
@@ -128,6 +128,7 @@ flowchart LR
 | `[x]` | SOCKS4A | 是 | — | `runtime/src/proxy/socks4a.rs` |
 | `[x]` | TLS transport | 是 | 是 | `runtime::doh_tls`, `protocol::tls`; chain 和 Trojan/VLESS/VMess 等协议层 outbound 默认使用纯 Rust Mozilla WebPKI roots，追加 Go `ca_cert`，并支持 `insecure_skip_verify` |
 | `[x]` | HTTP/2 transport | 是 | 是 | `chain`, runtime HTTP2 inbound |
+| `[~]` | Go standalone HTTP/2 raw transport | 是（transport） | 仅 raw transport，不作为最终 outbound | `yuhaiin-chain::ChainClient`, `h2_tunnel`；已支持 `[fixedv2,http2]`、plaintext prior-knowledge H2、CONNECT raw stream、pool/ping/close；`ChainProxy` 对缺少目标协议的节点 fail-closed。剩余：继续把 raw H2 作为可插拔底层接入 SOCKS/HTTP 等后续 protocol wrapper；不能把 standalone H2 单独当作带目标地址的最终出站 |
 | `[x]` | Yuubinsya TCP | 是 | 是 | `core::yuubinsya`, `chain` |
 | `[x]` | Yuubinsya native UDP | 是 | 是 | `core::proxy`, `chain` |
 | `[x]` | Yuubinsya UDP-over-TCP | 是 | 是 | `chain::{h2,UOT,direct_uot}` |

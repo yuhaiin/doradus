@@ -21,6 +21,10 @@ The current scenarios cover:
 - authenticated SOCKS5 TCP inbound and Yuubinsya TCP inbound → direct echo in
   the same real runtime process, including protocol handshakes and live
   inbound/outbound metadata.
+- standalone Go HTTP/2 transport wire compatibility is covered separately in
+  `crates/yuhaiin-chain/tests/standalone_http2.rs`: fixed endpoint resolution,
+  plaintext prior-knowledge H2, `CONNECT http://localhost`, raw bidirectional
+  bytes, pool ping/close, and the fail-closed final-proxy boundary.
 
 Run the tests from the repository root:
 

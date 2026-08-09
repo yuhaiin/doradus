@@ -88,7 +88,11 @@ pub struct ValidatedChain {
     pub tls: ValidatedTls,
     pub websocket: Option<ValidatedWebSocket>,
     pub http2: ValidatedHttp2,
-    pub yuubinsya: ValidatedYuubinsya,
+    /// The final protocol is optional for a standalone Go HTTP/2 transport.
+    /// When absent, the chain only provides a raw CONNECT stream and must be
+    /// wrapped by another protocol layer before it can be used as a final
+    /// destination proxy.
+    pub yuubinsya: Option<ValidatedYuubinsya>,
 }
 
 /// A fixed upstream endpoint retained in its original host/port form.
@@ -160,19 +164,37 @@ pub fn parse_config(json: &str) -> Result<ValidatedChain> {
 
 impl ChainConfig {
     pub fn validate(self) -> Result<ValidatedChain> {
-        if !(4..=5).contains(&self.chain.len()) {
+        if !(2..=5).contains(&self.chain.len()) {
             return Err(Error::invalid(
-                "the first runnable chain supports fixedv2, optional tls/websocket, http2, yuubinsya",
+                "the runnable chain supports fixedv2, optional tls/websocket, http2, and optional yuubinsya",
             ));
         }
         let fixed = require_node(&self.chain[0], "fixedv2", |node| node.fixedv2.clone())?;
-        let yuubinsya = require_node(
-            self.chain.last().expect("chain length validated"),
-            "yuubinsya",
-            |node| node.yuubinsya.clone(),
-        )?;
+        let has_yuubinsya = self
+            .chain
+            .last()
+            .is_some_and(|node| node.kind == "yuubinsya");
+        let yuubinsya = if has_yuubinsya {
+            Some(require_node(
+                self.chain.last().expect("chain length validated"),
+                "yuubinsya",
+                |node| node.yuubinsya.clone(),
+            )?)
+        } else {
+            if self.chain.last().is_none_or(|node| node.kind != "http2") {
+                return Err(Error::invalid(
+                    "standalone HTTP/2 chain must end with an http2 node",
+                ));
+            }
+            None
+        };
 
-        let middle = &self.chain[1..self.chain.len() - 1];
+        let middle_end = if has_yuubinsya {
+            self.chain.len() - 1
+        } else {
+            self.chain.len()
+        };
+        let middle = &self.chain[1..middle_end];
         let mut tls = None;
         let mut websocket = None;
         let mut http2 = None;
@@ -287,7 +309,10 @@ impl ChainConfig {
         let concurrency = http2.concurrency.max(1);
         let max_streams = http2.max_streams.max(1);
         let idle_timeout = std::time::Duration::from_secs(http2.idle_timeout_secs.max(1));
-        if yuubinsya.password.is_empty() {
+        if yuubinsya
+            .as_ref()
+            .is_some_and(|yuubinsya| yuubinsya.password.is_empty())
+        {
             return Err(Error::invalid("Yuubinsya password cannot be empty"));
         }
         Ok(ValidatedChain {
@@ -301,11 +326,11 @@ impl ChainConfig {
                 max_streams,
                 idle_timeout,
             },
-            yuubinsya: ValidatedYuubinsya {
+            yuubinsya: yuubinsya.map(|yuubinsya| ValidatedYuubinsya {
                 password: yuubinsya.password,
                 udp_over_stream: yuubinsya.udp_over_stream,
                 udp_coalesce: yuubinsya.udp_coalesce,
-            },
+            }),
         })
     }
 }
@@ -459,7 +484,7 @@ mod tests {
         );
         assert_eq!(chain.http2.concurrency, 8);
         assert_eq!(chain.http2.max_streams, 128);
-        assert!(chain.yuubinsya.udp_over_stream);
+        assert!(chain.yuubinsya.as_ref().unwrap().udp_over_stream);
         assert!(chain.tls.server_name().ends_with(".mcdn.bilivideo.cn"));
     }
 

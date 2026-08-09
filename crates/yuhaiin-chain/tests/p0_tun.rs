@@ -786,11 +786,11 @@ fn insecure_chain_client(address: SocketAddr) -> ChainClient {
             max_streams: 128,
             idle_timeout: std::time::Duration::from_secs(300),
         },
-        yuubinsya: ValidatedYuubinsya {
+        yuubinsya: Some(ValidatedYuubinsya {
             password: PASSWORD.to_owned(),
             udp_over_stream: true,
             udp_coalesce: false,
-        },
+        }),
     })
     .unwrap()
 }
@@ -819,11 +819,11 @@ fn chain_client_with_max_streams(
             max_streams,
             idle_timeout: std::time::Duration::from_secs(300),
         },
-        yuubinsya: ValidatedYuubinsya {
+        yuubinsya: Some(ValidatedYuubinsya {
             password: PASSWORD.to_owned(),
             udp_over_stream: true,
             udp_coalesce: false,
-        },
+        }),
     })
     .unwrap()
 }
@@ -954,11 +954,11 @@ async fn tls_websocket_http2_chain_uses_http11_upgrade_before_h2() {
             max_streams: 8,
             idle_timeout: Duration::from_secs(30),
         },
-        yuubinsya: ValidatedYuubinsya {
+        yuubinsya: Some(ValidatedYuubinsya {
             password: PASSWORD.to_owned(),
             udp_over_stream: false,
             udp_coalesce: false,
-        },
+        }),
     })
     .unwrap();
     let mut stream = client

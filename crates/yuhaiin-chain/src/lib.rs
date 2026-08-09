@@ -313,12 +313,21 @@ impl ChainClient {
             return Ok(elapsed);
         }
 
+        let Some(yuubinsya) = self.chain.yuubinsya.as_ref() else {
+            let started = Instant::now();
+            let mut stream = self.open_h2_stream(local_bind_addresses).await?;
+            stream
+                .shutdown()
+                .await
+                .map_err(|error| Error::new(ErrorKind::Closed, error.to_string()))?;
+            return Ok(started.elapsed());
+        };
         let stream = self.open_h2_stream(local_bind_addresses).await?;
         let (session, elapsed) = tokio::time::timeout(
             Duration::from_secs(10),
             AsyncYuubinsyaPingSession::connect(
                 stream,
-                derive_salt(self.chain.yuubinsya.password.as_bytes()),
+                derive_salt(yuubinsya.password.as_bytes()),
                 destination,
             ),
         )
@@ -353,13 +362,36 @@ impl ChainClient {
                 "Yuubinsya TCP destination must use tcp network",
             ));
         }
+        let yuubinsya = self.chain.yuubinsya.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unsupported,
+                "standalone HTTP/2 transport has no destination protocol",
+            )
+        })?;
         let stream = self.open_h2_stream(local_bind_addresses).await?;
         AsyncYuubinsyaTcpSession::connect(
             stream,
-            derive_salt(self.chain.yuubinsya.password.as_bytes()),
+            derive_salt(yuubinsya.password.as_bytes()),
             destination,
         )
         .await
+    }
+
+    /// Open a raw Go-compatible HTTP/2 CONNECT stream. This is the transport
+    /// half used by standalone HTTP/2 inbound/outbound compositions; it does
+    /// not encode a destination because Go's HTTP/2 transport deliberately
+    /// leaves that to the protocol layer above it.
+    pub async fn connect_raw_with_bind(
+        &self,
+        local_bind_addresses: &[std::net::IpAddr],
+    ) -> Result<tokio::io::DuplexStream> {
+        if self.chain.yuubinsya.is_some() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "raw HTTP/2 transport requested from a Yuubinsya chain",
+            ));
+        }
+        self.open_h2_stream(local_bind_addresses).await
     }
 
     /// Open a Yuubinsya UDP-over-TCP session. The first frame is the migrate
@@ -378,7 +410,13 @@ impl ChainClient {
         local_bind_addresses: &[std::net::IpAddr],
     ) -> Result<AsyncYuubinsyaUotSession<tokio::io::DuplexStream>> {
         self.ensure_open()?;
-        if !self.chain.yuubinsya.udp_over_stream {
+        let yuubinsya = self.chain.yuubinsya.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unsupported,
+                "standalone HTTP/2 transport has no UDP protocol",
+            )
+        })?;
+        if !yuubinsya.udp_over_stream {
             return Err(Error::new(
                 ErrorKind::Unsupported,
                 "chain does not enable yuubinsya udp_over_stream",
@@ -387,9 +425,9 @@ impl ChainClient {
         let stream = self.open_h2_stream(local_bind_addresses).await?;
         AsyncYuubinsyaUotSession::connect(
             stream,
-            derive_salt(self.chain.yuubinsya.password.as_bytes()),
+            derive_salt(yuubinsya.password.as_bytes()),
             migrate_id,
-            self.chain.yuubinsya.udp_coalesce,
+            yuubinsya.udp_coalesce,
         )
         .await
     }
@@ -526,9 +564,19 @@ impl ChainProxy {
         }
     }
 
+    fn final_proxy(client: ChainClient) -> Result<Self> {
+        if client.chain.yuubinsya.is_none() {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "standalone HTTP/2 transport requires a destination protocol layer",
+            ));
+        }
+        Ok(Self::new(client))
+    }
+
     /// Construct the common async proxy contract from a Go node payload.
     pub fn from_go_json(json: &str) -> Result<Self> {
-        Ok(Self::new(ChainClient::from_go_json(json)?))
+        Self::final_proxy(ChainClient::from_go_json(json)?)
     }
 
     pub fn from_go_json_with_resolver(
@@ -540,9 +588,7 @@ impl ChainProxy {
                 backend: ChainProxyBackend::DirectUot(proxy),
             });
         }
-        Ok(Self::new(ChainClient::from_go_json_with_resolver(
-            json, resolver,
-        )?))
+        Self::final_proxy(ChainClient::from_go_json_with_resolver(json, resolver)?)
     }
 
     pub fn client(&self) -> Option<&ChainClient> {
@@ -558,12 +604,21 @@ impl AsyncProxy for ChainProxy {
         match &self.backend {
             ChainProxyBackend::H2(client) => {
                 let client = client.clone();
-                let destination = context.effective_destination();
                 Box::pin(async move {
-                    let session = client
-                        .connect_tcp_with_bind(destination, &context.local_bind_addresses)
-                        .await?;
-                    Ok(Box::new(session) as BoxAsyncStream)
+                    if client.chain.yuubinsya.is_some() {
+                        let session = client
+                            .connect_tcp_with_bind(
+                                context.effective_destination(),
+                                &context.local_bind_addresses,
+                            )
+                            .await?;
+                        Ok(Box::new(session) as BoxAsyncStream)
+                    } else {
+                        let stream = client
+                            .connect_raw_with_bind(&context.local_bind_addresses)
+                            .await?;
+                        Ok(Box::new(stream) as BoxAsyncStream)
+                    }
                 })
             }
             ChainProxyBackend::DirectUot(proxy) => proxy.connect(context),

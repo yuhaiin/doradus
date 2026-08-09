@@ -1687,6 +1687,39 @@ cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- -
 `/api/v2/nodes/{id}/latency`，因此当前 service-chain 已覆盖 direct、HTTP CONNECT、
 SOCKS5、TLS/H2/Yuubinsya TCP，以及 Yuubinsya UOT UDP 的真实进程组合。
 
+## 44. 2026-08-09 standalone HTTP/2 transport compatibility
+
+Go `pkg/net/proxy/http2/v2` 的 client/server 是明文 prior-knowledge HTTP/2：client
+对每条 raw tunnel 发送 `CONNECT http://localhost`，收到 `200` 后把 request body 和
+response body 当作双向字节流；它不携带 Yuubinsya password，也不把最终目标地址编码进
+HTTP/2 request。Go inbound contract 则把 HTTP/2 作为 transport，外层仍由 HTTP、SOCKS5、
+Yuubinsya 等 protocol 处理目标地址。
+
+Rust `yuhaiin-chain` 现在允许 Go chain 的最后一层为 `http2`，并复用原有
+fixed/DNS/TLS/WebSocket/H2 pool；`ChainClient::connect_raw_with_bind` 提供 raw
+CONNECT stream，支持多 stream、多连接、idle/drain、ping 和 close。原有
+`fixed → tls → http2 → yuubinsya` 路径保持不变。为避免把“只有 transport、没有目标
+protocol”的节点误当成最终出站，`ChainProxy::from_go_json*` 对 `[fixedv2,http2]`
+节点 fail-closed；未来可在这个 raw boundary 上叠加 SOCKS/HTTP 等 protocol wrapper，
+不复制 H2 pool 或 TLS 实现。
+
+新增 `crates/yuhaiin-chain/tests/standalone_http2.rs`，使用真实 loopback TCP listener
+跑 H2 server，检查 Go-compatible CONNECT URI、双向 raw bytes、second-stream ping、
+pool close 和 final-proxy capability error；同时新增 Go JSON parser 单测。已有
+runtime H2 inbound 单测继续验证 HTTP/2 transport 到 HTTP protocol 的 CONNECT/header/body
+桥接。
+
+执行：
+
+```bash
+cargo test -p yuhaiin-chain --all-features --offline --test standalone_http2 -- --nocapture
+cargo test -p yuhaiin-runtime --all-features --offline --lib http2_transport_bridges_each_connect_stream_to_the_protocol_server -- --nocapture
+```
+
+这项目前记为 `[~]`：raw transport 和 inbound 已有 wire-level 覆盖，但后续 SOCKS/HTTP
+protocol wrapper 尚未接到 standalone raw H2，因此不能宣称 `[fixedv2,http2]` 本身是可用的
+最终代理。
+
 ## 41. 2026-08-09 运行验收与跨平台构建边界
 
 在 service-chain 统计回归之后又执行了当前仓库的最小容器和交叉构建验收：
