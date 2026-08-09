@@ -21,6 +21,8 @@
 
 > 2026-08-09 节点选择契约：Go 的 `node.use` 与 `nodes.selected` 使用独立的 `selected_tcp_node_v2` / `selected_udp_node_v2` 选择，并在一次 use 操作中同时更新 TCP、UDP。Rust API 现在在配置 overlay 中持久化两套选择，`nodes.selected` 分别返回两套节点；入站 outbound 选择优先读取 TCP 选择，并保留旧 `selected.node` 单选择作为读取回退。无选择时管理 API 不再擅自把第一个 enabled 节点伪装成已选节点；数据面仍按 Go 运行时语义回退到可用 enabled 节点或 direct。新增独立 TCP/UDP selection、use 返回空对象和双写回读单测。
 
+> 2026-08-09 节点 active 状态契约：Go `nodes.active` 暴露的是 `NodeRuntime` 已注册的 proxy entries，不是节点表中所有 `enabled` 行。Rust 现在从 `RuntimeController` 的 live selector registry 汇总实际 proxy slot 的节点 ID，过滤已释放 selector 后返回 active nodes；新增 selector 创建、释放和 idle enabled node 不出现在 active 列表的回归。
+
 > 2026-08-09 管理列表 query 契约收口：Rust API 不再对 nodes、inbounds、resolvers、route lists、route rules 统一搜索整个 JSON，而是按 Go handler 的字段集合过滤，并在过滤后计算分页 `total`。节点只搜索 `id/name/group/origin/chain.type`，入站只搜索 `id/name/network.type/protocol.type`，resolver 搜索 `id/type/host/subnet/tlsServerName`，路由列表/规则分别使用 Go 的四个字段。查询仍保持大小写不敏感、分页字段兼容 camelCase；列表 API 的完整 response/error/reload 语义逐项验收仍在 checklist。
 
 > 2026-08-09 runtime socket policy：`useDefaultInterface/netInterface` 已在 immutable snapshot 中解析为接口 IPv4/IPv6 source addresses；统一 `SocketPolicyProxy` 将策略传递到 direct/fixed、HTTP CONNECT、SOCKS5、协议 wrapper、HTTP/2 Yuubinsya、直连 UOT 和 native UDP socket。连接建立按目标地址族选择 source address，selector reload 会替换策略而不影响旧 flow。新增 FlowContext/connector/runtime reload 回归，`cargo test -p yuhaiin-core --all-features --offline --lib` 通过 121 项，`cargo test -p yuhaiin-runtime --all-features --offline --lib` 通过 137 项；inbound listen socket 的平台专用绑定仍保留为平台验收项。

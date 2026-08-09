@@ -1634,8 +1634,9 @@ async fn active_nodes_value(state: &ApiState) -> ApiResult {
         .repository()
         .list_go_nodes()
         .await?;
+    let active_ids = state.controller.active_proxy_ids();
     Ok(Json(
-        json!({"items": records.into_iter().filter(|record| record.enabled).map(node_json).collect::<Vec<_>>() }),
+        json!({"items": records.into_iter().filter(|record| active_ids.binary_search(&record.id).is_ok()).map(node_json).collect::<Vec<_>>() }),
     ))
 }
 
@@ -3297,6 +3298,51 @@ mod tests {
         let selected = selected_nodes_value(&state).await.unwrap();
         assert_eq!(selected.0["tcp"]["id"], "udp-node");
         assert_eq!(selected.0["udp"]["id"], "udp-node");
+    }
+
+    #[tokio::test]
+    async fn active_nodes_reports_live_proxy_slots_not_all_enabled_rows() {
+        let state = state().await;
+        let _ = save_node_value(
+            &state,
+            json!({
+                "id": "active-node",
+                "name": "active-node",
+                "enabled": true,
+                "chain": [{"type":"direct","direct":{}}]
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let _ = save_node_value(
+            &state,
+            json!({
+                "id": "idle-node",
+                "name": "idle-node",
+                "enabled": true,
+                "chain": [{"type":"direct","direct":{}}]
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let initially_active = active_nodes_value(&state).await.unwrap();
+        assert!(initially_active.0["items"].as_array().unwrap().is_empty());
+
+        let selector = state
+            .controller
+            .build_proxy_selector("", "active-node", "", "", Duration::from_secs(1))
+            .await
+            .unwrap();
+        let active = active_nodes_value(&state).await.unwrap();
+        assert_eq!(active.0["items"].as_array().unwrap().len(), 1);
+        assert_eq!(active.0["items"][0]["id"], "active-node");
+
+        drop(selector);
+        let after_drop = active_nodes_value(&state).await.unwrap();
+        assert!(after_drop.0["items"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

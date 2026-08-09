@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     future::Future,
     path::PathBuf,
     sync::{Arc, RwLock, Weak},
@@ -125,6 +126,18 @@ impl RuntimeController {
         );
         self.register_selector(&selector);
         Ok(selector)
+    }
+
+    /// Return the persisted node IDs represented by currently live runtime
+    /// proxy selectors. This mirrors Go's `NodeRuntime.Active`, which reports
+    /// proxy entries that have actually been opened rather than every enabled
+    /// row in the node store.
+    pub fn active_proxy_ids(&self) -> Vec<String> {
+        let mut ids = BTreeSet::new();
+        for selector in self.live_selectors() {
+            ids.extend(selector.active_node_ids());
+        }
+        ids.into_iter().collect()
     }
 
     /// Assemble the first TUN data-plane runtime from one consistent

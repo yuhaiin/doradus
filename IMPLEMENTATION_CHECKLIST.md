@@ -144,7 +144,7 @@ flowchart LR
 
 | 状态 | 功能 | 位置 | 当前结果 | 剩余工作 |
 | --- | --- | --- | --- | --- |
-| `[~]` | 前端 API/RPC | `runtime/src/api.rs` | 对齐现有 generated client；settings、nodes、inbounds、DNS、hosts/FakeDNS、route、TUN、connections 等共用 store/runtime struct；列表 API 已补 Go 的 query 字段边界并在过滤后计算 total；核心错误已按 Go RPC 分类为 400/404/503/500；node.use 与 nodes.selected 已对齐 Go 的独立 TCP/UDP 选择及旧 key 回退 | 继续用前端 generated-contracts 和真实 Go handler 做 response 字段/剩余错误语义逐项验收；补 production snapshot 的管理面回归 |
+| `[~]` | 前端 API/RPC | `runtime/src/api.rs` | 对齐现有 generated client；settings、nodes、inbounds、DNS、hosts/FakeDNS、route、TUN、connections 等共用 store/runtime struct；列表 API 已补 Go 的 query 字段边界并在过滤后计算 total；核心错误已按 Go RPC 分类为 400/404/503/500；node.use/nodes.selected 已对齐 Go 的独立 TCP/UDP 选择及旧 key 回退；nodes.active 已按 live proxy selector 而非 enabled 行返回 | 继续用前端 generated-contracts 和真实 Go handler 做 response 字段/剩余错误语义逐项验收；补 production snapshot 的管理面回归 |
 | `[x]` | live connections | `monitor`, `connections` API/SSE | 建立、更新、关闭、数字 ID close、EventSource added/removed |
 | `[~]` | history/traffic/statistics | `monitor`, SQLite persistence | Rust checkpoint 负责频繁 crash recovery；无 checkpoint 时可接管 Go 的 `statistics_kv`、`traffic_hourly`、`connection_history`、`failed_connection_history` 和 telemetry 表；运行期间首次写入及每 30 秒低频写回 Go 兼容统计投影，投影失败会保留待重试状态，正常 shutdown 再做最终原子投影；history 按 Go key 合并；已有独立文件库 reader 回归验证运行中的可见性 | 生产库更多版本/异常中断 fixture；force-abort 后 Go 表可见性和跨进程读取仍需 Podman/进程级验收 |
 | `[x]` | runtime reload | `RuntimeController` | 配置先构建新 snapshot，失败保留旧 snapshot；selector/inbound/DNS 按 owner 收敛 |

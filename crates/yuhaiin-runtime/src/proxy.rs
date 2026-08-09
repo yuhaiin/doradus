@@ -496,6 +496,19 @@ struct ProxyContextMetadata {
 }
 
 impl RuntimeProxySelector {
+    pub(crate) fn active_node_ids(&self) -> Vec<String> {
+        [
+            self.direct_id.as_str(),
+            self.proxy_id.as_str(),
+            self.bypass_id.as_str(),
+            self.drop_id.as_str(),
+        ]
+        .into_iter()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect()
+    }
+
     async fn from_snapshot(
         snapshot: &RuntimeSnapshot,
         direct_id: &str,
