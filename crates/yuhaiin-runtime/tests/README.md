@@ -80,6 +80,10 @@ The current scenarios cover:
   traffic while both management APIs read connections/statistics concurrently;
   build and process logs are kept under
   `~/.cache/yuhaiin-rust/integration/go-rust-stats`.
+- `scripts/integration/production-parity.sh` discovers stopped SQLite snapshots
+  in the sibling Go checkout (or uses `YUHAIIN_SOURCE_DB`), then runs the full
+  Go/Rust management parity smoke for each one. Copies and logs live under
+  `~/.cache/yuhaiin-rust/production-parity`.
 - standalone Go HTTP/2 transport wire compatibility is covered separately in
   `crates/yuhaiin-chain/tests/standalone_http2.rs`: fixed endpoint resolution,
   plaintext prior-knowledge H2, `CONNECT http://localhost`, raw bidirectional

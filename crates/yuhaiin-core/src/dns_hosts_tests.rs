@@ -177,6 +177,27 @@ fn hosts_alias_cycles_are_rejected_and_target_loading_accepts_ip_or_domain() {
     );
 }
 
+#[test]
+fn host_overrides_accept_go_address_forms_with_optional_ports() {
+    assert_eq!(host_without_port("example.com"), "example.com");
+    assert_eq!(host_without_port("example.com:443"), "example.com");
+    assert_eq!(host_without_port("[2001:db8::1]:443"), "2001:db8::1");
+    assert_eq!(host_without_port("2001:db8::1"), "2001:db8::1");
+
+    let hosts = HostsTable::new();
+    hosts
+        .insert_target(DomainName::new("example.com").unwrap(), "127.0.0.1:8022")
+        .unwrap();
+    assert_eq!(
+        hosts
+            .lookup(&DomainName::new("example.com").unwrap())
+            .unwrap()
+            .unwrap()
+            .v4,
+        vec!["127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()]
+    );
+}
+
 #[cfg(feature = "async-proxy")]
 struct AsyncStaticUpstream;
 

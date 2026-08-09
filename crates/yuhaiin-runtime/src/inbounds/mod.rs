@@ -599,7 +599,14 @@ async fn start_listeners(
                         }
                     }));
                 }
-                "socks5" | "mixed" if supports_socks5_udp(&spec.protocol, spec.protocol_udp) => {
+                "socks5" | "mixed" => {
+                    if !supports_socks5_udp(&spec.protocol, spec.protocol_udp) {
+                        monitor.warn(format!(
+                            "skip UDP inbound {}: protocol {:?} has no UDP mode",
+                            spec.id, spec.protocol
+                        ));
+                        continue;
+                    }
                     if tls_acceptor.is_some() {
                         monitor.warn(format!(
                             "skip UDP inbound {}: TLS transport only wraps TCP listeners",

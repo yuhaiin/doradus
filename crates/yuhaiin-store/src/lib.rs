@@ -25,7 +25,8 @@ mod sqlite;
 mod statistics;
 mod status;
 use migration::{
-    import_go_schema, require_go_table, table_exists, validate_go_texts, validate_go_timestamp,
+    import_go_schema, recover_legacy_node_chains, require_go_table, table_exists,
+    validate_go_texts, validate_go_timestamp,
 };
 #[cfg(test)]
 use migration::{meta_flag, table_row_count};
@@ -478,6 +479,7 @@ impl ConfigStore {
                 // caller repairs that row.  The Rust schema migration above
                 // is already committed and remains valid in that case.
                 import_go_schema(&connection)?;
+                recover_legacy_node_chains(&connection)?;
                 verify_integrity(&connection)
             }
             Err(error) => {

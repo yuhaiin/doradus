@@ -42,6 +42,36 @@
 
 覆盖率不会把 `[~]` 自动改成 `[x]`；只有对应的测试、进程级验证或平台证据完成后才更新条目状态。
 
+## 当前模块执行面板
+
+下面只列仍会产生实际工作量的项目；已经通过主路径验收的能力保留在后面的模块证据表中。每一项都对应一个可直接执行的下一步，避免把多个不相关缺口塞进一行。
+
+| 模块 | 当前状态 | 下一步可执行项 | 验收证据 |
+| --- | --- | --- | --- |
+| SQLite / 生产库 | `[~]` | 增加更多生产版本快照；逐表核对 route/resolver projection；补异常关闭后的未建模表检查 | 默认 3 份真实快照已通过 `make production-parity-smoke`；store fixture tests |
+| FakeIP | `[~]` | 增加真实生产 FakeIP 表快照，并验证双栈池容量/TTL/重启后的分配稳定性 | FakeIP store tests + Go state takeover |
+| Linux transparent inbound | `[~]` | 在具备 `CAP_NET_ADMIN` 的独立 namespace 中验证 TPROXY UDP、redir IPv4/IPv6 和多 flow teardown | `scripts/integration/*transparent*`、Podman privileged run |
+| TUN / NAT | `[~]` | 增加 MTU/fragment/namespace teardown 矩阵；补 Android VpnService fd 和 macOS utun 实机验收 | `tun-service.sh`、`p0_tun`、平台设备日志 |
+| API / reload | `[~]` | 用真实 Go handler 做剩余错误字段快照；覆盖 inbound/node/route mutation 后的长生命周期 reload | `api-contract.sh`、`go-api-parity.sh` |
+| connections / statistics | `[~]` | 增加更多 production telemetry 快照；逐字段核对长时间范围与升级期间锁竞争 | `stats-concurrency.sh`、`go-rust-stats.sh` |
+| 更新 / 发布 | `[~]` | 在至少一种 systemd 和一种 launchd 环境做替换、回滚、SIGTERM 和备份恢复演练 | `docs/RELEASE_REPLACEMENT.md` |
+| Android | `[~]` | 真机验证 VpnService fd、权限、route 生命周期和电量/RSS | Android instrumentation/runtime log |
+| macOS | `[~]` | 获得 SDK/clang 后编译 runtime，验证 utun、权限、route、LaunchDaemon 和 SIGTERM | macOS target check + runtime log |
+| 明确延期 | `延期` | subscriptions、DoQ/DoH3、Shadowsocks/SSR、Tailscale/WireGuard/Reality/Mux/QUIC 不阻塞当前替换 | 需求变更时单独建项 |
+
+### 本轮执行顺序
+
+```mermaid
+flowchart LR
+    A[生产快照与 API 长生命周期] --> B[统计 telemetry 字段与锁竞争]
+    B --> C[Linux TPROXY / redir namespace]
+    C --> D[TUN MTU / namespace teardown]
+    D --> E[Android / macOS 实机验收]
+    E --> F[发布替换与回滚演练]
+```
+
+每完成一项，先补对应自动化证据，再只修改该项状态；不因单元测试通过而把平台或生产验收提前标成 `[x]`。
+
 ## 替换目标
 
 Rust 服务必须能够复用现有 `yuhaiin-react`，从 inbound 到 outbound 经过同一个 snapshot/router/monitor 链路：
@@ -79,7 +109,7 @@ flowchart LR
 | `[x]` | schema/migration | `schema.rs`, `migration.rs` | Rust schema v3、Go v1/v5/v6 compatibility、未来版本 fail-closed、事务回滚/修复重试 |
 | `[x]` | typed repository | `repository.rs` | nodes、inbounds、resolvers、routes、lists、tags、settings、NAT、MaxMind、FakeIP 读写；未知 Go JSON 保留 |
 | `[x]` | 并发与异常终止 | `src/tests`, `tests/cross_process` | WAL 多进程 writer/reader、未提交事务 force-stop、sidecar lock、损坏库 fail-closed |
-| `[~]` | 真实生产库兼容覆盖 | store tests | 已有真实 Go v5/v6-shaped fixture 和 415MB 导出；Go fresh `state.db` 已由 Rust 接管并通过 API smoke，native Rust fresh state 也已由 Go 反向打开并完成 migration startup smoke；Rust/Go 非空 nodes、resolvers、inbounds、route rules/lists、settings_kv 和 `backup_settings` 已完成双向进程级读回；schema-4 状态（206 nodes、12 inbounds、6 resolvers、6 route rules、11 route lists）和真实 schema-7 状态（206 nodes、13 users、73 subscription-node links）均已启动 Rust 并实际读取管理面；schema-7 的 `nodes.selected` 已验证从 Go `metadata` 原始字符串读取，`node.use` 也会双写两个 Go selection key；附加订阅表保持原样，统计 history 重复 key 也会在接管和最终投影前按 Go 主键合并；仍需用更多生产版本验证 route/resolver projection 逐行语义、未建模表和异常快照 |
+| `[~]` | 真实生产库兼容覆盖 | store tests | 已有真实 Go v5/v6-shaped fixture 和 415MB 导出；默认 `production-parity-smoke` 已对 `tmp/v2/state.db`、`tmp/yuhaiin/state.db`、`tmp/aws/yuhaiin/state.db` 三份停止快照完成 Go/Rust 双进程、逐操作 API 对照；覆盖 nodes、resolvers、inbounds、route rules/lists、settings、统计、FakeDNS、hosts、server、interfaces、licenses；修复了旧 telemetry migration ledger、partial network_split、带端口 dns_hosts、禁用 FakeIP 空 CIDR 和 route list persisted metrics；`tmp/state.db` 仍可用 `YUHAIIN_SOURCE_DB` 显式诊断，但当前先在 Go 自己的重复 `fakeip_entries` migration 失败，未计入默认 smoke；仍需更多生产版本验证 route/resolver projection 逐行语义、未建模表和异常快照 |
 | `延期` | fsqlite | — | 已停止实验；性能、内存和生态不满足要求，不再作为候选后端 |
 
 ## 3. FakeIP
@@ -236,6 +266,9 @@ make startup-logs-smoke
 
 # Go/Rust shared SQLite statistics read/write interoperability:
 make go-rust-stats-smoke
+
+# Go/Rust management parity over all discovered stopped production snapshots:
+make production-parity-smoke
 
 # Release runtime throughput and Linux RSS/CPU process sampling:
 make benchmark-throughput

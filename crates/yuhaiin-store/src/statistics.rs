@@ -620,6 +620,36 @@ fn replace_in_transaction(connection: &Connection, snapshot: &GoStatisticsSnapsh
                  ON failure_dimension_daily(value_id, bucket_start_utc DESC);",
         )
         .map_err(storage_error)?;
+    mark_go_telemetry_migrations_applied(connection)?;
+    Ok(())
+}
+
+/// Rust writes the final Go v6 telemetry schema directly. When the source was
+/// an older Go database, keep Go's own migration ledger in sync so a rollback
+/// or a temporary dual-process check does not replay CREATE TABLE statements
+/// against the already projected tables.
+fn mark_go_telemetry_migrations_applied(connection: &Connection) -> Result<()> {
+    if !table_exists(connection, "metadata") || !table_exists(connection, "migrate") {
+        return Ok(());
+    }
+    for (version, name) in [
+        (5_i64, "telemetry_dimensions"),
+        (6_i64, "compact_telemetry_dimensions"),
+    ] {
+        connection
+            .execute_with_params(
+                "INSERT OR IGNORE INTO migrate(version, name, applied_at)
+                 VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER))",
+                &[SqliteValue::from(version), SqliteValue::from(name)],
+            )
+            .map_err(storage_error)?;
+    }
+    connection
+        .execute_with_params(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?1)",
+            &[SqliteValue::from("6")],
+        )
+        .map_err(storage_error)?;
     Ok(())
 }
 
@@ -909,6 +939,40 @@ mod tests {
         assert_eq!(
             store.load_go_statistics().unwrap(),
             GoStatisticsSnapshot::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_go_migration_ledger_advances_with_telemetry_projection() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        {
+            let connection = store.lock_connection().unwrap();
+            connection
+                .execute_batch(
+                    "UPDATE metadata SET value = '4' WHERE key = 'schema_version';
+                     DELETE FROM migrate WHERE version > 4;",
+                )
+                .unwrap();
+        }
+
+        store
+            .replace_go_statistics(&GoStatisticsSnapshot::default())
+            .unwrap();
+
+        let connection = store.lock_connection().unwrap();
+        assert_eq!(
+            connection
+                .query("SELECT value FROM metadata WHERE key = 'schema_version'")
+                .unwrap()[0]
+                .get(0),
+            Some(&SqliteValue::Text("6".into()))
+        );
+        assert_eq!(
+            connection
+                .query("SELECT COUNT(*) FROM migrate WHERE version IN (5, 6)")
+                .unwrap()[0]
+                .get(0),
+            Some(&SqliteValue::Integer(2))
         );
     }
 }

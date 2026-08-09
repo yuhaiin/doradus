@@ -40,7 +40,7 @@ use yuhaiin_store::{
 
 use crate::update::UpdateService;
 use crate::{
-    ProxyRouteListTransport, RouteListSnapshot, RouteListTransport, RuntimeController,
+    ProxyRouteListTransport, RouteListTransport, RuntimeController,
     download_route_url_with_transport, expand_go_route_rule, interfaces::discover_interfaces,
     latency::LatencyRequest, log::log_batch_value, refresh_route_list_caches_with_transport,
 };
@@ -1931,7 +1931,6 @@ async fn route_config_put_value(state: &ApiState, value: Value) -> ApiResult {
 }
 
 async fn route_lists_get_value(state: &ApiState, input: &Value) -> ApiResult {
-    let route_lists = state.controller.handle().load().route_lists.clone();
     let records = state
         .controller
         .store()
@@ -1940,7 +1939,7 @@ async fn route_lists_get_value(state: &ApiState, input: &Value) -> ApiResult {
         .await?;
     let values = records
         .into_iter()
-        .map(|record| route_list_item_json(record, &route_lists))
+        .map(route_list_item_json)
         .collect::<Vec<_>>();
     Ok(Json(page_with_filter(
         values,
@@ -3324,33 +3323,38 @@ fn route_rule_detail_json(record: GoRouteRuleRecord) -> Value {
     )
 }
 
-fn route_list_item_json(record: GoRouteListRecord, route_lists: &RouteListSnapshot) -> Value {
+fn route_list_item_json(record: GoRouteListRecord) -> Value {
     let value = raw_json(
         &record.data_json,
         json!({"name": record.name, "type": record.list_type}),
     );
     let name = string_or(&value, "name", &record.name);
-    let entries = route_lists.values(&name).unwrap_or_default();
     let source = value.get("source").cloned().unwrap_or_default();
     let source_type = string_or(&source, "type", &record.source_type);
-    let preview = if source_type == "local" {
-        source
-            .get("local")
-            .and_then(|local| local.get("lists"))
-            .and_then(Value::as_array)
-            .and_then(|values| values.first())
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned()
+    // The Go list-store contract reports the persisted source metadata here,
+    // not the number of entries currently loaded into the runtime trie.  In
+    // particular, an empty local list is valid and must not become an error
+    // merely because it has no runtime values.
+    let source_values = if source_type == "local" {
+        source.get("local").and_then(|local| local.get("lists"))
     } else {
-        entries.first().cloned().unwrap_or_default()
+        source.get("remote").and_then(|remote| remote.get("urls"))
     };
-    let error_count = u32::from(route_lists.error(&name).is_some());
+    let item_count = source_values.and_then(Value::as_array).map_or(0, Vec::len);
+    let preview = source_values
+        .and_then(Value::as_array)
+        .and_then(|values| values.first())
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let error_count = value
+        .get("errorMsgs")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
     json!({
         "name": name,
         "type": string_or(&value, "type", &record.list_type),
         "source": source_type,
-        "itemCount": entries.len(),
+        "itemCount": item_count,
         "errorCount": error_count,
         "preview": preview,
     })

@@ -6,17 +6,21 @@ set -euo pipefail
 # the host drives both traffic paths and reads both management APIs.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${repo_root}/scripts/lib/cache.sh"
 go_root="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
 cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/go-rust-stats}"
+keep_runs="${YUHAIIN_KEEP_RUNS:-3}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 
 command -v curl >/dev/null
 command -v go >/dev/null
 command -v podman >/dev/null
 test -d "${go_root}"
+[[ "${keep_runs}" =~ ^[1-9][0-9]*$ ]]
 mkdir -p "${scenario_dir}"
+cache_prune_timestamped_runs "${scenario_dir}" "$((keep_runs - 1))"
 
 run_id="$(date +%Y%m%d%H%M%S)-$$"
 run_dir="${scenario_dir}/${run_id}"

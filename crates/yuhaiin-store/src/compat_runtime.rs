@@ -81,10 +81,24 @@ struct GoResolverContract {
 
 impl GoDnsSettingsRecord {
     pub fn to_fakeip_runtime_config(&self) -> Result<GoFakeIpRuntimeConfig> {
+        // Older Go snapshots leave the disabled FakeIP ranges empty.  Go
+        // accepts that state because the ranges are not consumed while the
+        // feature is off; normalize it to the same safe defaults before the
+        // Rust runtime builds its typed configuration.
+        let ipv4_range = if self.fakedns_ipv4_range.trim().is_empty() {
+            "198.18.0.0/15"
+        } else {
+            &self.fakedns_ipv4_range
+        };
+        let ipv6_range = if self.fakedns_ipv6_range.trim().is_empty() {
+            "fc00::/18"
+        } else {
+            &self.fakedns_ipv6_range
+        };
         Ok(GoFakeIpRuntimeConfig {
             enabled: self.fakedns_enabled,
-            ipv4: parse_ipv4_cidr(&self.fakedns_ipv4_range, "dns_settings.fakedns_ipv4_range")?,
-            ipv6: parse_ipv6_cidr(&self.fakedns_ipv6_range, "dns_settings.fakedns_ipv6_range")?,
+            ipv4: parse_ipv4_cidr(ipv4_range, "dns_settings.fakedns_ipv4_range")?,
+            ipv6: parse_ipv6_cidr(ipv6_range, "dns_settings.fakedns_ipv6_range")?,
         })
     }
 }

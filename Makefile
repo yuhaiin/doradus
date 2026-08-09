@@ -2,7 +2,8 @@ SHELL := /bin/bash
 
 CARGO ?= cargo
 RUSTC ?= rustc
-CARGO_TARGET_DIR ?= $(HOME)/.cache/yuhaiin-rust/cargo-target
+CACHE_ROOT ?= $(HOME)/.cache/yuhaiin-rust
+CARGO_TARGET_DIR ?= $(CACHE_ROOT)/cargo-target
 ANDROID_NDK ?= /opt/android-ndk
 ANDROID_API ?= 35
 ANDROID_TARGET ?= aarch64-linux-android
@@ -41,12 +42,13 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke api-contract-smoke go-api-parity-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
+.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke api-contract-smoke go-api-parity-smoke production-parity-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
 help:
 	@printf '%s\n' \
+		'make cache-usage        show generated Rust cache usage' \
 		'make build              build the yuhaiin runtime binary (debug)' \
 		'make build-release      build the yuhaiin runtime binary (release)' \
 		'make build MUSL=1       build a static musl debug binary' \
@@ -57,6 +59,7 @@ help:
 		'make build-tun-service-smoke build the runtime-owned TUN smoke binary' \
 		'make api-contract-smoke run the frontend management API process contract in Podman' \
 		'make go-api-parity-smoke compare public API responses against a Go state snapshot' \
+		'make production-parity-smoke compare several stopped production SQLite snapshots' \
 		'make go-rust-stats-smoke run concurrent Go/Rust SQLite statistics smoke in Podman' \
 		'make service-chain-smoke run inbound/router/outbound protocol chains in Podman' \
 		'make benchmark-throughput run the release inbound/router/outbound throughput benchmark in Podman' \
@@ -79,6 +82,9 @@ help:
 		'FEATURES=$(FEATURES)' \
 		'NO_DEFAULT_FEATURES=$(NO_DEFAULT_FEATURES)' \
 		'MUSL=$(MUSL) MUSL_TARGET=$(MUSL_TARGET) MUSL_LINKER=$(MUSL_LINKER)'
+
+cache-usage:
+	@du -h -d 2 "$(CACHE_ROOT)" 2>/dev/null | sort -h | tail -25
 
 build: build-debug
 
@@ -112,6 +118,9 @@ api-contract-smoke:
 
 go-api-parity-smoke:
 	./scripts/integration/go-api-parity.sh
+
+production-parity-smoke:
+	./scripts/integration/production-parity.sh
 
 go-rust-stats-smoke:
 	./scripts/integration/go-rust-stats.sh

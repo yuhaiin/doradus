@@ -80,6 +80,7 @@ impl HostsTable {
     /// Insert either an IP target or a hostname alias from Go's textual
     /// `dns_hosts.target` column.
     pub fn insert_target(&self, domain: DomainName, target: &str) -> Result<()> {
+        let target = host_without_port(target);
         if let Ok(address) = target.parse::<IpAddr>() {
             return self.insert_ip(domain, address);
         }
@@ -180,6 +181,33 @@ impl HostsTable {
             .map_err(|_| Error::new(ErrorKind::Closed, "DNS hosts lock poisoned"))?
             .len())
     }
+}
+
+/// Return the hostname part of the address-like strings accepted by Go's
+/// hosts configuration.  The compatibility table may contain entries such
+/// as `name.example:443` or `[2001:db8::1]:443`; DNS itself only indexes the
+/// hostname, so the optional port is intentionally discarded here.
+pub fn host_without_port(value: &str) -> &str {
+    if value.starts_with('[') {
+        if let Some(end) = value.find(']') {
+            if value.as_bytes().get(end + 1) == Some(&b':')
+                && value[end + 2..].parse::<u16>().is_ok()
+            {
+                return &value[1..end];
+            }
+        }
+        return value;
+    }
+    if value.parse::<IpAddr>().is_ok() {
+        return value;
+    }
+    if let Some((host, port)) = value.rsplit_once(':')
+        && !host.is_empty()
+        && port.parse::<u16>().is_ok()
+    {
+        return host;
+    }
+    value
 }
 
 fn host_response(addresses: IpSet) -> DnsResponse {
