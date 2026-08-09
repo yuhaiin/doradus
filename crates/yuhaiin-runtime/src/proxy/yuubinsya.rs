@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use yuhaiin_chain::YuubinsyaServerProxy;
 use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection as TunFlowDirection, FlowObserver as TunFlowObserver,
+    FlowObserverGuard,
 };
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncProxySelector, YuubinsyaUdpServer};
 use yuhaiin_core::yuubinsya::derive_salt;
@@ -19,6 +20,17 @@ use super::common::{
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
+pub(crate) fn new_server(
+    spec: &InboundSpec,
+    selector: Arc<RuntimeProxySelector>,
+) -> Arc<YuubinsyaServerProxy> {
+    let upstream: Arc<dyn AsyncProxy> = Arc::new(RoutedProxy { selector });
+    Arc::new(YuubinsyaServerProxy::new(
+        derive_salt(spec.password.as_bytes()),
+        upstream,
+    ))
+}
+
 pub(crate) async fn serve<S>(
     stream: S,
     peer: SocketAddr,
@@ -29,8 +41,20 @@ pub(crate) async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let upstream: Arc<dyn AsyncProxy> = Arc::new(RoutedProxy { selector });
-    let server = YuubinsyaServerProxy::new(derive_salt(spec.password.as_bytes()), upstream);
+    let server = new_server(&spec, selector);
+    serve_with_server(stream, peer, spec, server, monitor).await
+}
+
+pub(crate) async fn serve_with_server<S>(
+    stream: S,
+    peer: SocketAddr,
+    spec: InboundSpec,
+    server: Arc<YuubinsyaServerProxy>,
+    monitor: Arc<ConnectionMonitor>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let annotate = spec.clone();
     server
         .serve_observed(stream, peer, monitor, move |context| {
@@ -65,7 +89,8 @@ pub(crate) async fn serve_udp(
                     let key = udp_flow_key(peer_addr, &target);
                     let datagram = selector.select(&context).open_datagram(&context).await?;
                     let datagram: Arc<dyn AsyncDatagram> = Arc::from(datagram);
-                    monitor.opened(TunFlow { key }, context);
+                    let observation =
+                        FlowObserverGuard::open(monitor.clone(), TunFlow { key }, context);
                     let receiver = Arc::clone(&datagram);
                     let reply_tx = reply_tx.clone();
                     let id_for_task = id.clone();
@@ -90,6 +115,7 @@ pub(crate) async fn serve_udp(
                         datagram,
                         key,
                         peer,
+                        _observation: observation,
                     })
                 };
                 state.datagram.send_to(&packet[..length], target).await?;
@@ -98,7 +124,7 @@ pub(crate) async fn serve_udp(
             close_event = close_events.recv() => {
                 match close_event {
                     Ok(flow) => {
-                        close_udp_flows(&mut flows, flow, &monitor).await;
+                        close_udp_flows(&mut flows, flow).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -114,7 +140,7 @@ pub(crate) async fn serve_udp(
     }
     for state in flows.into_values() {
         let _ = state.datagram.close().await;
-        monitor.closed(state.key);
+        drop(state);
     }
     let _ = spec;
     Ok(())

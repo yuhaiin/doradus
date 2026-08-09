@@ -7,13 +7,15 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
-> 当前实现快照：可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store`、`yuhaiin-geo`、`yuhaiin-protocol` 和 `yuhaiin-runtime` 七个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，MaxMindDB 位于独立的 `yuhaiin-geo`，协议 wire codec/可组合 transport 位于 `yuhaiin-protocol`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责应用层组装和原子 reload，`yuhaiin-runtime::api` 提供与现有 `yuhaiin-react` client 对齐的管理面，`yuhaiin-runtime::run_tun_device_until` 负责已创建设备的数据面生命周期，`src/bin/yuhaiin.rs` 只是桌面设备创建和进程 wiring 的一个 host。HTTP 层复用 Go compatibility records，不新增一套配置 DTO，也不把平台权限细节泄漏到上层。
+> 当前实现快照：可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store`、`yuhaiin-geo`、`yuhaiin-protocol` 和 `yuhaiin-runtime` 七个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，MaxMindDB 位于独立的 `yuhaiin-geo`，协议 wire codec/可组合 transport 位于 `yuhaiin-protocol`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责应用层组装和原子 reload，`yuhaiin-runtime::api` 提供与现有 `yuhaiin-react` client 对齐的管理面，`yuhaiin-runtime::run_tun_device_until` 负责已创建设备的数据面生命周期，`yuhaiin-runtime::inbound::run_until` 统一拥有 TUN、TCP/HTTP/WebSocket 和 UDP inbound 的启动、reload、shutdown 及 accepted-flow 生命周期，`src/bin/yuhaiin.rs` 只负责桌面 host/API/DNS wiring。HTTP 层复用 Go compatibility records，不新增一套配置 DTO，也不把平台权限细节泄漏到上层。
 
 > 已实现的代码包括：SQLite 配置事务与 schema v3 typed repository、Go v6 fixture/import/字段差异报告、FakeIP IPv4/IPv6 分配/持久化/旧 snapshot 幂等导入与 A/AAAA/PTR/HTTPS/SVCB hint answer transform、域名/CIDR/Geo country Router snapshot publish/rollback、独立 `yuhaiin-geo` 的 MaxMindDB reader/校验下载/atomic refresh、带 TTL/容量淘汰的 DNS cache、同步/异步 UDP DNS client/server/policy/cancellation boundary、DoH transport boundary、注入 connector 的 HTTP/2 DoH framing、可直接接入异步 DNS/TUN packet pipeline 的 `H2DohDnsHandler`、可复用的 RustCrypto TCP→TLS→ALPN h2 DoH connector 和 DoT TCP framing resolver、同时组装 System/UDP/TCP/DoH/DoT 的 `RustCryptoResolverFactory`、hosts→upstream→FakeIP 的可注入异步 resolver stack、`yuhaiin-runtime` 的 Go compatibility snapshot 组装与 direct/HTTP/SOCKS5/Shadowsocks/Trojan/VLESS/chain proxy 构造、direct/fixed/drop/HTTP CONNECT/SOCKS5、独立 `yuhaiin-protocol` 的 Shadowsocks/Trojan/VLESS TCP/UDP codec、inbound/outbound wrapper、TLS 和 WebSocket transport 组合、feature-gated `rustls-rustcrypto` TLS client、共享 WebSocket byte-stream transport（standalone、VLESS 和 WebSocket+HTTP/2 inbound/outbound）、Yuubinsya native UDP client/server socket、UOT/TCP/coalesce/Ping client/server session、full-cone NAT UDP relay、唯一的 `tun-rs AsyncDevice + smoltcp` TUN adapter，以及独立的 `yuhaiin-chain`（fixedv2 → 可选 TLS/WebSocket → HTTP/2 pool/CONNECT → Yuubinsya TCP/UOT/Ping）。TLS provider 仍是 alpha，DoQ/DoH3、WebSocket early-data/子协议和特权 Linux namespace/Android/macOS 验收仍是独立门槛，未用 C TLS 代替。
 >
 > 本轮新增 Go 自定义 AEAD transport：它与 Shadowsocks AEAD 不同，使用 P-256/Ed25519 handshake、ChaCha20/XChaCha20 方向 stream，以及 Go 兼容的 `nonce || ciphertext` UDP packet。协议 codec、TCP/UDP outbound wrapper、SOCKS5 AEAD inbound 和 AEAD 外层 Yuubinsya UDP 已接入；Rust 本地回归与 Go↔Rust TCP/UDP 双向实例互操作通过，更完整组合仍列为 P1 验收项。
 
-> 2026-08-09 管理面补齐 `tools.interfaces` 的替换契约：Go 返回所有非 loopback 接口及其 `net.Interface.Addrs()` CIDR 字符串；Rust 现在在 Linux 通过纯 Rust netlink packet API 读取 RTM_GETADDR，同时使用 sysfs 的接口索引映射名称，覆盖 IPv4/IPv6、无地址接口和 loopback 过滤。实现位于 `yuhaiin-runtime::interfaces`，API 继续直接序列化共享 `InterfaceInfo`，没有新增 HTTP DTO；netlink 不可用时回退到无 loopback 的 sysfs/IPv6 发现。`cargo test -p yuhaiin-runtime --all-features --offline` 已通过 115 个 runtime 单测及 DoH 集成测试，最小 `http-api` library 构建也已验证。
+> 2026-08-09 管理面补齐 `tools.interfaces` 的替换契约：Go 返回所有非 loopback 接口及其 `net.Interface.Addrs()` CIDR 字符串；Rust 现在在 Linux 通过纯 Rust netlink packet API 读取 RTM_GETADDR，同时使用 sysfs 的接口索引映射名称，覆盖 IPv4/IPv6、无地址接口和 loopback 过滤。实现位于 `yuhaiin-runtime::interfaces`，API 继续直接序列化共享 `InterfaceInfo`，没有新增 HTTP DTO；netlink 不可用时回退到无 loopback 的 sysfs/IPv6 发现。`cargo test -p yuhaiin-runtime --all-features --offline` 已通过 117 个 runtime 单测及 7 个 DoH 集成测试，最小 `http-api` library 构建也已验证。
+
+> 2026-08-09 inbound 生命周期收口：TUN 不再由 binary 单独启动；`yuhaiin-runtime::inbound::run_until` 与 SOCKS5、HTTP、Yuubinsya、WebSocket、HTTP/2 listener 共享同一个 inbound owner。普通 TCP/WebSocket accepted task 由 `JoinSet` 归属 listener，reload/shutdown/abort 会回收子任务；`yuhaiin-core::flow::FlowObserverGuard` 让正常结束、管理面 close 和强制取消都能完成 monitor close、history/SSE/traffic 收敛。Yuubinsya server 也提升到 listener 级，HTTP/2 多 stream 可共享 migrate ID 的 UDP session，listener 结束时显式 close 上游 session。runtime 新增 listener abort 后 live connection 清理回归；`yuhaiin-runtime` 117 个单测、`yuhaiin-chain` 42 个单测和 `yuhaiin-core` 116 个单测均通过。Podman 特权无网络容器中 `tun-smoke` 的真实 TUN 创建/关闭和 route smoke 也通过。
 
 ## 1. 目标、边界和完成定义
 
@@ -751,12 +753,12 @@ Content-Type: application/json
 Rust 版管理面位于 `yuhaiin-runtime::api`，不要求前端改写。第一版已覆盖：
 
 - `nodes.*` / `node.*`：作为 outbound/node 管理，保存 Go `nodes_v2` 兼容行；
-- `inbounds.*`：保存并回读 Go `inbounds_v2` 原始 JSON，当前数据面优先使用 TUN；
+- `inbounds.*`：保存并回读 Go `inbounds_v2` 原始 JSON，TUN、SOCKS5、HTTP proxy、Yuubinsya 及其 transport listener 都由同一 inbound supervisor 组装；
 - `resolvers.*`、`resolver.hosts.*`、`resolver.fakedns.*`、`resolver.server.*`：UDP/TCP/System 和可选 RustCrypto DoH/DoT registry；
 - `route.config.*`、`route.lists.*`、`route.rules.*`、`route.tags.*`：规则/列表原文持久化，常见 domain/CIDR/host-list 表达式编译到当前 Router；
 - `settings.*`、`tun.config.*`、`info`：管理进程和数据面启动配置。
 
-`connections` 由 `yuhaiin-runtime::ConnectionMonitor` 统一维护，TUN、HTTP/SOCKS5/Yuubinsya 入站都使用同一 live snapshot、流量计数、SSE 事件和历史统计。`connections.close` 先按 Go 合约严格校验十进制数字 ID，再通过 per-flow close event 唤醒 TCP relay 或 UDP flow；因此前端关闭普通入站连接时不会只改变列表而遗留底层 socket。TUN 仍保留原有的 packet dispatcher 消费队列，两个路径共享 `ConnectionMonitor` 的状态和持久化统计。traffic/telemetry 管理接口也按 Go 的 RFC3339 `from < to` 合约校验请求；telemetry 以 UTC 小时桶持久化流量和失败维度，查询时按时间范围聚合并执行每个 dimension 的 `limit` 排序截断，旧版没有小时桶的统计状态仍可用聚合兼容读取。
+`connections` 由 `yuhaiin-runtime::ConnectionMonitor` 统一维护，TUN、HTTP/SOCKS5/Yuubinsya 入站都使用同一 live snapshot、流量计数、SSE 事件和历史统计。`connections.close` 先按 Go 合约严格校验十进制数字 ID，再通过 per-flow close event 唤醒 TCP relay 或 UDP flow；因此前端关闭普通入站连接时不会只改变列表而遗留底层 socket。TUN 是 inbound supervisor 下的一条 packet dispatcher 路径，和 TCP/UDP listener 共享 `ConnectionMonitor` 的状态、持久化统计及 shutdown/reload owner。traffic/telemetry 管理接口也按 Go 的 RFC3339 `from < to` 合约校验请求；telemetry 以 UTC 小时桶持久化流量和失败维度，查询时按时间范围聚合并执行每个 dimension 的 `limit` 排序截断，旧版没有小时桶的统计状态仍可用聚合兼容读取。
 
 列表响应保持 `{items, page: {page, pageSize, total}}`，记录的未知字段保留在 store 的 `data_json`，secret 脱敏和完整 Go 高级协议属于后续兼容范围。每个写操作先提交 SQLite，再由 `RuntimeController::mutate_and_reload` 串行重建；重建失败时旧 snapshot 继续服务，并通过错误响应告知前端。
 
@@ -768,7 +770,7 @@ cargo run -p yuhaiin-runtime --bin yuhaiin --all-features
 
 默认监听 `127.0.0.1:18080`，数据库使用 `$XDG_DATA_HOME/yuhaiin-rust/state.sqlite`，没有 `XDG_DATA_HOME` 时使用 `~/.local/share/yuhaiin-rust/state.sqlite`。`YUHAIIN_HTTP` 和 `YUHAIIN_DB` 可覆盖这两个值；测试和迁移临时文件放在 `~/.cache`，不使用 `/tmp`。
 
-设置 `YUHAIIN_TUN=1` 或写入 `tun.runtime.enabled=true` 后，进程启动单一路径 `tun-rs AsyncDevice + smoltcp`，从同一个 runtime snapshot 组装 selector、Full Cone NAT 和 DNS handler。TUN 的 `ipv4` 可写成 `10.0.0.1/24` 或 `{address,prefix}`；第一版默认 MTU 1500、单队列、有界 channel。系统权限、route 和设备创建失败会 fail-closed，不能把失败降级成 direct。
+设置 `YUHAIIN_TUN=1` 或写入 `tun.runtime.enabled=true` 后，`inbound::run_until` 启动单一路径 `tun-rs AsyncDevice + smoltcp`，从同一个 runtime snapshot 组装 selector、Full Cone NAT 和 DNS handler；配置 reload 会由同一个 inbound owner 关闭旧设备/dispatcher 后重建。TUN 的 `ipv4` 可写成 `10.0.0.1/24` 或 `{address,prefix}`；第一版默认 MTU 1500、单队列、有界 channel。系统权限、route 和设备创建失败会 fail-closed，不能把失败降级成 direct。
 
 ## 8. Proxy 迁移顺序与契约
 

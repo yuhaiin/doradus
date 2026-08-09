@@ -17,12 +17,7 @@ use yuhaiin_core::{Error, ErrorKind, Result};
 use yuhaiin_runtime::BuiltinResolverFactory;
 use yuhaiin_runtime::api::ApiState;
 use yuhaiin_runtime::{RuntimeBuilder, RuntimeController, inbound, run_dns_supervisor};
-#[cfg(feature = "tun")]
-use yuhaiin_runtime::{load_tun_config, run_tun_device_until, wait_for_shutdown_or_reload};
 use yuhaiin_store::{ConfigStore, GoNodeRecord, restore_database};
-
-#[cfg(feature = "tun")]
-use yuhaiin_core::tun::TunRuntime;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -83,10 +78,6 @@ async fn run() -> Result<()> {
         let _ = signal_tx.send(true);
     });
 
-    #[cfg(feature = "tun")]
-    let tun_task =
-        tokio::task::spawn_local(run_tun_supervisor(controller.clone(), shutdown_rx.clone()));
-
     let dns_task =
         tokio::task::spawn_local(run_dns_supervisor(controller.clone(), shutdown_rx.clone()));
     let inbound_task =
@@ -103,10 +94,6 @@ async fn run() -> Result<()> {
     let _ = shutdown_tx.send(true);
     let logs = controller.monitor().logs();
 
-    #[cfg(feature = "tun")]
-    if let Err(error) = tun_task.await.map_err(join_error)? {
-        logs.error(format!("TUN task stopped: {error}"));
-    }
     if let Err(error) = dns_task.await.map_err(join_error)? {
         logs.error(format!("DNS task stopped: {error}"));
     }
@@ -136,27 +123,6 @@ async fn ensure_direct_node(store: &ConfigStore) -> Result<()> {
             data_json: br##"{"id":"direct","name":"Direct","group":"builtin","origin":"rust-builtin","enabled":true,"protocol":"direct","chain":[{"type":"direct","direct":{}}]}"##.to_vec(),
         })
         .await
-}
-
-#[cfg(feature = "tun")]
-async fn run_tun_supervisor(
-    controller: RuntimeController,
-    shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    loop {
-        let config = load_tun_config(controller.store()).await?;
-        if !config.enabled {
-            if wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
-                return Ok(());
-            }
-            continue;
-        }
-        let tun = TunRuntime::open(config.tun.clone()).map_err(io_error)?;
-        run_tun_device_until(controller.clone(), tun, config, shutdown.clone()).await?;
-        if *shutdown.borrow() {
-            return Ok(());
-        }
-    }
 }
 
 fn default_database_path() -> PathBuf {

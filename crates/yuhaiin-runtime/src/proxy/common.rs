@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, Wr
 
 use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
-    FlowObserver as TunFlowObserver,
+    FlowObserver as TunFlowObserver, FlowObserverGuard,
 };
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream};
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
@@ -24,6 +24,7 @@ pub(crate) struct UdpFlowState {
     pub(crate) datagram: Arc<dyn AsyncDatagram>,
     pub(crate) key: TunFlowKey,
     pub(crate) peer: Endpoint,
+    pub(crate) _observation: FlowObserverGuard,
 }
 
 pub(crate) struct UdpReply {
@@ -35,7 +36,6 @@ pub(crate) struct UdpReply {
 pub(crate) async fn close_udp_flows(
     flows: &mut HashMap<UdpFlowId, UdpFlowState>,
     flow: TunFlowKey,
-    monitor: &ConnectionMonitor,
 ) {
     let ids = flows
         .iter()
@@ -45,7 +45,7 @@ pub(crate) async fn close_udp_flows(
     for id in ids {
         if let Some(state) = flows.remove(&id) {
             let _ = state.datagram.close().await;
-            monitor.closed(state.key);
+            drop(state);
         }
     }
 }
@@ -102,7 +102,7 @@ where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    monitor.opened(TunFlow { key: flow }, context);
+    let _observation = FlowObserverGuard::open(monitor.clone(), TunFlow { key: flow }, context);
     let (mut left_read, mut left_write) = split(left);
     let (mut right_read, mut right_write) = split(right);
     if !prefix.is_empty() {
@@ -124,7 +124,6 @@ where
         TunFlowDirection::Download,
     );
     let result = tokio::try_join!(upload, download).map(|_| ());
-    monitor.closed(flow);
     result
 }
 

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
-use yuhaiin_core::flow::{Flow, FlowDirection, FlowKey, FlowObserver};
+use yuhaiin_core::flow::{Flow, FlowDirection, FlowKey, FlowObserver, FlowObserverGuard};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy};
 use yuhaiin_core::yuubinsya::{
     YuubinsyaHeader, YuubinsyaProtocol, decode_header, decode_uot_frame, encode_header,
@@ -416,6 +416,11 @@ struct ObservedInbound {
     annotate: Arc<dyn Fn(&mut FlowContext) + Send + Sync>,
 }
 
+struct ObservedFlow {
+    flow: FlowKey,
+    _observation: FlowObserverGuard,
+}
+
 impl YuubinsyaServerProxy {
     pub fn new(password_hash: [u8; 32], upstream: Arc<dyn AsyncProxy>) -> Self {
         Self {
@@ -494,7 +499,11 @@ impl YuubinsyaServerProxy {
                 });
                 let mut outbound = self.upstream.connect(&context).await?;
                 if let (Some(observed), Some(flow)) = (observed.as_ref(), flow) {
-                    observed.observer.opened(Flow { key: flow }, context);
+                    let _observation = FlowObserverGuard::open(
+                        Arc::clone(&observed.observer),
+                        Flow { key: flow },
+                        context,
+                    );
                     let result = copy_bidirectional_observed(
                         &mut inbound,
                         &mut outbound,
@@ -503,7 +512,6 @@ impl YuubinsyaServerProxy {
                     )
                     .await
                     .map_err(io_error);
-                    observed.observer.closed(flow);
                     result?;
                 } else {
                     tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
@@ -574,7 +582,7 @@ impl YuubinsyaServerProxy {
             .udp_session(session.migrate_id, destination.clone())
             .await?;
         let (sender, mut responses) = shared.register(destination.clone()).await;
-        let mut observed_flows = HashMap::<Endpoint, FlowKey>::new();
+        let mut observed_flows = HashMap::<Endpoint, ObservedFlow>::new();
         let result: Result<()> = async {
             if let Some(observed) = observed {
                 let mut context = FlowContext::new(destination.clone());
@@ -586,8 +594,18 @@ impl YuubinsyaServerProxy {
                     source: observed.source,
                     destination: endpoint_socket_addr(&destination, observed.source),
                 };
-                observed.observer.opened(Flow { key: flow }, context);
-                observed_flows.insert(destination.clone(), flow);
+                let observation = FlowObserverGuard::open(
+                    Arc::clone(&observed.observer),
+                    Flow { key: flow },
+                    context,
+                );
+                observed_flows.insert(
+                    destination.clone(),
+                    ObservedFlow {
+                        flow,
+                        _observation: observation,
+                    },
+                );
                 observed.observer.bytes(flow, FlowDirection::Upload, payload.len());
             }
             shared.send_to(&payload, destination).await?;
@@ -597,7 +615,7 @@ impl YuubinsyaServerProxy {
                         let (destination, payload) = incoming?;
                         if let Some(observed) = observed {
                             let flow = if let Some(flow) = observed_flows.get(&destination) {
-                                *flow
+                                flow.flow
                             } else {
                                 let mut context = FlowContext::new(destination.clone());
                                 context.source = Some(Endpoint::ip(yuhaiin_core::Network::Udp, observed.source));
@@ -608,8 +626,18 @@ impl YuubinsyaServerProxy {
                                     source: observed.source,
                                     destination: endpoint_socket_addr(&destination, observed.source),
                                 };
-                                observed.observer.opened(Flow { key: flow }, context);
-                                observed_flows.insert(destination.clone(), flow);
+                                let observation = FlowObserverGuard::open(
+                                    Arc::clone(&observed.observer),
+                                    Flow { key: flow },
+                                    context,
+                                );
+                                observed_flows.insert(
+                                    destination.clone(),
+                                    ObservedFlow {
+                                        flow,
+                                        _observation: observation,
+                                    },
+                                );
                                 flow
                             };
                             observed.observer.bytes(flow, FlowDirection::Upload, payload.len());
@@ -624,7 +652,11 @@ impl YuubinsyaServerProxy {
                                 session.send_to(&source, &payload).await?;
                                 if let Some(observed) = observed {
                                     if let Some(flow) = observed_flows.get(&source) {
-                                        observed.observer.bytes(*flow, FlowDirection::Download, payload.len());
+                                        observed.observer.bytes(
+                                            flow.flow,
+                                            FlowDirection::Download,
+                                            payload.len(),
+                                        );
                                     }
                                 }
                             }
@@ -640,11 +672,7 @@ impl YuubinsyaServerProxy {
             }
         }
         .await;
-        if let Some(observed) = observed {
-            for flow in observed_flows.into_values() {
-                observed.observer.closed(flow);
-            }
-        }
+        drop(observed_flows);
         shared.unregister_sender(&sender).await;
         result
     }

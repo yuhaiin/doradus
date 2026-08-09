@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite, split};
 use tokio::sync::{Mutex, mpsc};
-use yuhaiin_core::flow::{FlowKey as TunFlowKey, FlowObserver};
+use yuhaiin_core::flow::{Flow, FlowKey as TunFlowKey, FlowObserver, FlowObserverGuard};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 use yuhaiin_protocol::trojan::{self, Command};
@@ -70,6 +70,12 @@ struct UdpReply {
     payload: Vec<u8>,
 }
 
+struct UdpFlowState {
+    datagram: Arc<dyn AsyncDatagram>,
+    key: TunFlowKey,
+    _observation: FlowObserverGuard,
+}
+
 async fn serve_udp<S>(
     stream: S,
     peer: SocketAddr,
@@ -83,14 +89,14 @@ where
     let (mut reader, writer) = split(stream);
     let writer = Arc::new(Mutex::new(writer));
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(64);
-    let mut flows = HashMap::<Endpoint, (Arc<dyn AsyncDatagram>, TunFlowKey)>::new();
+    let mut flows = HashMap::<Endpoint, UdpFlowState>::new();
     let mut packet = vec![0u8; 64 * 1024];
     loop {
         tokio::select! {
             received = trojan::read_udp_frame(&mut reader, &mut packet) => {
                 let (length, target) = received?;
                 let (datagram, flow) = if let Some(state) = flows.get(&target) {
-                    (Arc::clone(&state.0), state.1)
+                    (Arc::clone(&state.datagram), state.key)
                 } else {
                     let mut context = FlowContext::new(target.clone());
                     context.source = Some(Endpoint::ip(Network::Udp, peer));
@@ -102,7 +108,8 @@ where
                         destination: target.addr().unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
                     };
                     let datagram: Arc<dyn AsyncDatagram> = Arc::from(selector.select(&context).open_datagram(&context).await?);
-                    monitor.opened(yuhaiin_core::flow::Flow { key: flow }, context);
+                    let observation =
+                        FlowObserverGuard::open(monitor.clone(), Flow { key: flow }, context);
                     let receiver = Arc::clone(&datagram);
                     let reply_tx = reply_tx.clone();
                     let id = target.clone();
@@ -117,7 +124,14 @@ where
                             }
                         }
                     });
-                    flows.insert(target.clone(), (Arc::clone(&datagram), flow));
+                    flows.insert(
+                        target.clone(),
+                        UdpFlowState {
+                            datagram: Arc::clone(&datagram),
+                            key: flow,
+                            _observation: observation,
+                        },
+                    );
                     (datagram, flow)
                 };
                 datagram.send_to(&packet[..length], target).await?;
@@ -126,16 +140,20 @@ where
             Some(reply) = reply_rx.recv() => {
                 if !flows.contains_key(&reply.id) { continue; }
                 trojan::write_udp_frame(&mut *writer.lock().await, &reply.target, &reply.payload).await?;
-                if let Some((_, flow)) = flows.get(&reply.id) {
-                    monitor.bytes(*flow, yuhaiin_core::flow::FlowDirection::Download, reply.payload.len());
+                if let Some(state) = flows.get(&reply.id) {
+                    monitor.bytes(
+                        state.key,
+                        yuhaiin_core::flow::FlowDirection::Download,
+                        reply.payload.len(),
+                    );
                 }
             }
             else => break,
         }
     }
-    for (_, (datagram, flow)) in flows {
-        let _ = datagram.close().await;
-        monitor.closed(flow);
+    for (_, state) in flows {
+        let _ = state.datagram.close().await;
+        drop(state);
     }
     Ok(())
 }

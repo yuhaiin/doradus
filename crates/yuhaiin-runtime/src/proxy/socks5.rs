@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
-    FlowObserver as TunFlowObserver,
+    FlowObserver as TunFlowObserver, FlowObserverGuard,
 };
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
@@ -192,7 +192,8 @@ pub(crate) async fn serve_socks5_udp_loop(
                     let key = udp_flow_key(peer, &target);
                     let datagram = selector.select(&context).open_datagram(&context).await?;
                     let datagram: Arc<dyn AsyncDatagram> = Arc::from(datagram);
-                    monitor.opened(TunFlow { key }, context);
+                    let observation =
+                        FlowObserverGuard::open(monitor.clone(), TunFlow { key }, context);
                     let receiver = Arc::clone(&datagram);
                     let reply_tx = reply_tx.clone();
                     let id_for_task = id.clone();
@@ -217,6 +218,7 @@ pub(crate) async fn serve_socks5_udp_loop(
                         datagram,
                         key,
                         peer: source,
+                        _observation: observation,
                     })
                 };
                 state.datagram.send_to(payload, target).await?;
@@ -225,7 +227,7 @@ pub(crate) async fn serve_socks5_udp_loop(
             close_event = close_events.recv() => {
                 match close_event {
                     Ok(flow) => {
-                        close_udp_flows(&mut flows, flow, &monitor).await;
+                        close_udp_flows(&mut flows, flow).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -243,7 +245,7 @@ pub(crate) async fn serve_socks5_udp_loop(
     }
     for state in flows.into_values() {
         let _ = state.datagram.close().await;
-        monitor.closed(state.key);
+        drop(state);
     }
     let _ = spec;
     Ok(())

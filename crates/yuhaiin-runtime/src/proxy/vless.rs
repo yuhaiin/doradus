@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split};
 use tokio::sync::{Mutex, mpsc};
 use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey, FlowObserver,
+    FlowObserverGuard,
 };
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
@@ -84,7 +85,7 @@ where
     let flow = udp_flow_key(peer, &destination);
     let datagram: Arc<dyn AsyncDatagram> =
         Arc::from(selector.select(&context).open_datagram(&context).await?);
-    monitor.opened(TunFlow { key: flow }, context);
+    let _observation = FlowObserverGuard::open(monitor.clone(), TunFlow { key: flow }, context);
     let (mut reader, writer) = split(stream);
     let writer = Arc::new(Mutex::new(writer));
     let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -138,7 +139,6 @@ where
     receive_task.abort();
     let _ = receive_task.await;
     let _ = datagram.close().await;
-    monitor.closed(flow);
     result
 }
 

@@ -22,6 +22,8 @@ use tokio::sync::watch;
 
 use yuhaiin_core::process::{ProcessResolver, default_process_resolver};
 use yuhaiin_core::proxy::BoxAsyncStream;
+#[cfg(feature = "tun")]
+use yuhaiin_core::tun::TunRuntime;
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Result};
 use yuhaiin_store::GoInboundRecord;
 
@@ -100,37 +102,87 @@ impl UdpMode {
     }
 }
 
-/// Run all enabled normal TCP inbounds and restart their listener set after a
-/// successful configuration reload. The supervisor is intentionally outside
-/// `RuntimeController`: the controller publishes immutable snapshots, while
-/// this owner controls sockets and listener task lifetimes.
+/// Run all enabled inbounds and restart their listener set after a successful
+/// configuration reload. TUN, TCP and UDP are owned from this boundary so
+/// `RuntimeController` only publishes immutable snapshots while this module
+/// controls device, socket and accepted-flow lifetimes.
 pub async fn run_until(
     controller: RuntimeController,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    // TUN is an inbound in Go's runtime model. Keep its device owner under
+    // this supervisor so API reload/shutdown has one inbound lifecycle for
+    // TUN, TCP listeners, UDP listeners and their accepted flows.
+    #[cfg(feature = "tun")]
+    let tun_task =
+        tokio::task::spawn_local(run_tun_supervisor(controller.clone(), shutdown.clone()));
+
     let mut reload = controller.subscribe_reload();
     let mut listeners = Vec::new();
-    loop {
-        abort_listeners(&mut listeners).await;
-        listeners = start_listeners(&controller).await?;
-        if *shutdown.borrow() {
-            break;
+    let result = async {
+        loop {
+            abort_listeners(&mut listeners).await;
+            listeners = start_listeners(&controller).await?;
+            if *shutdown.borrow() {
+                break;
+            }
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                changed = reload.recv() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
         }
-        tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
-                }
+        Ok::<(), Error>(())
+    }
+    .await;
+    abort_listeners(&mut listeners).await;
+
+    #[cfg(feature = "tun")]
+    if result.is_ok() {
+        if let Err(error) = tun_task.await.map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("TUN inbound supervisor task: {error}"),
+            )
+        })? {
+            controller
+                .monitor()
+                .error(format!("TUN inbound supervisor stopped: {error}"));
+        }
+    } else {
+        tun_task.abort();
+        let _ = tun_task.await;
+    }
+    result
+}
+
+#[cfg(feature = "tun")]
+async fn run_tun_supervisor(
+    controller: RuntimeController,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    loop {
+        let config = crate::load_tun_config(controller.store()).await?;
+        if !config.enabled {
+            if crate::wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+                return Ok(());
             }
-            changed = reload.recv() => {
-                if changed.is_err() {
-                    break;
-                }
-            }
+            continue;
+        }
+        let tun = TunRuntime::open(config.tun.clone())
+            .map_err(|error| Error::new(ErrorKind::Io, format!("open TUN inbound: {error}")))?;
+        crate::run_tun_device_until(controller.clone(), tun, config, shutdown.clone()).await?;
+        if *shutdown.borrow() {
+            return Ok(());
         }
     }
-    abort_listeners(&mut listeners).await;
-    Ok(())
 }
 
 async fn start_listeners(
@@ -782,55 +834,82 @@ async fn serve_h2_listener(
 ) -> Result<()> {
     use tokio::task::JoinSet;
 
+    let yuubinsya_server = (spec.protocol == "yuubinsya")
+        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()));
     let mut connections = JoinSet::new();
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, peer) = accepted.map_err(crate::proxy::common::io_error)?;
-                let spec = spec.clone();
-                let selector = selector.clone();
-                let monitor = monitor.clone();
-                let tls_acceptor = tls_acceptor.clone();
-                let logs = monitor.logs();
-                connections.spawn(async move {
-                    let result: Result<()> = if let Some(acceptor) = tls_acceptor {
-                        #[cfg(feature = "doh-tls")]
-                        {
-                            match acceptor.accept(stream).await {
-                                Ok(stream) if stream.get_ref().1.alpn_protocol() == Some(b"h2") => {
-                                    serve_h2_connection(stream, peer, spec, selector, monitor).await
+    let result = async {
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted.map_err(crate::proxy::common::io_error)?;
+                    let spec = spec.clone();
+                    let selector = selector.clone();
+                    let monitor = monitor.clone();
+                    let tls_acceptor = tls_acceptor.clone();
+                    let yuubinsya_server = yuubinsya_server.clone();
+                    let logs = monitor.logs();
+                    connections.spawn(async move {
+                        let result: Result<()> = if let Some(acceptor) = tls_acceptor {
+                            #[cfg(feature = "doh-tls")]
+                            {
+                                match acceptor.accept(stream).await {
+                                    Ok(stream) if stream.get_ref().1.alpn_protocol() == Some(b"h2") => {
+                                        serve_h2_connection(
+                                            stream,
+                                            peer,
+                                            spec,
+                                            selector,
+                                            monitor,
+                                            yuubinsya_server,
+                                        ).await
+                                    }
+                                    Ok(_) => Err(Error::new(
+                                        ErrorKind::Protocol,
+                                        "inbound HTTP/2 TLS did not negotiate ALPN h2",
+                                    )),
+                                    Err(error) => Err(Error::new(
+                                        ErrorKind::Protocol,
+                                        format!("inbound HTTP/2 TLS handshake: {error}"),
+                                    )),
                                 }
-                                Ok(_) => Err(Error::new(
-                                    ErrorKind::Protocol,
-                                    "inbound HTTP/2 TLS did not negotiate ALPN h2",
-                                )),
-                                Err(error) => Err(Error::new(
-                                    ErrorKind::Protocol,
-                                    format!("inbound HTTP/2 TLS handshake: {error}"),
-                                )),
                             }
+                            #[cfg(not(feature = "doh-tls"))]
+                            {
+                                let _ = (acceptor, stream, peer, spec, selector, monitor, yuubinsya_server);
+                                Err(Error::new(
+                                    ErrorKind::Unsupported,
+                                    "inbound HTTP/2 TLS requires the doh-tls feature",
+                                ))
+                            }
+                        } else {
+                            serve_h2_connection(
+                                stream,
+                                peer,
+                                spec,
+                                selector,
+                                monitor,
+                                yuubinsya_server,
+                            ).await
+                        };
+                        if let Err(error) = result {
+                            logs.error(format!("HTTP/2 inbound connection error: {error}"));
                         }
-                        #[cfg(not(feature = "doh-tls"))]
-                        {
-                            let _ = (acceptor, stream, peer, spec, selector, monitor);
-                            Err(Error::new(
-                                ErrorKind::Unsupported,
-                                "inbound HTTP/2 TLS requires the doh-tls feature",
-                            ))
-                        }
-                    } else {
-                        serve_h2_connection(stream, peer, spec, selector, monitor).await
-                    };
+                    });
+                }
+                Some(result) = connections.join_next(), if !connections.is_empty() => {
                     if let Err(error) = result {
-                        logs.error(format!("HTTP/2 inbound connection error: {error}"));
+                        monitor.warn(format!("HTTP/2 connection task stopped: {error}"));
                     }
-                });
-            }
-            Some(result) = connections.join_next(), if !connections.is_empty() => {
-                let _ = result;
+                }
             }
         }
+    }.await;
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    if let Some(server) = yuubinsya_server {
+        server.close().await;
     }
+    result
 }
 
 #[cfg(feature = "http2")]
@@ -840,6 +919,7 @@ async fn serve_h2_connection<S>(
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
+    yuubinsya_server: Option<Arc<yuhaiin_chain::YuubinsyaServerProxy>>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -866,8 +946,18 @@ where
                 let spec = spec.clone();
                 let selector = selector.clone();
                 let monitor = monitor.clone();
+                let yuubinsya_server = yuubinsya_server.clone();
                 streams.spawn(async move {
-                    serve_h2_stream(request, respond, peer, spec, selector, monitor).await
+                    serve_h2_stream(
+                        request,
+                        respond,
+                        peer,
+                        spec,
+                        selector,
+                        monitor,
+                        yuubinsya_server,
+                    )
+                    .await
                 });
             }
             Some(result) = streams.join_next(), if !streams.is_empty() => {
@@ -892,6 +982,7 @@ async fn serve_h2_stream(
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
+    yuubinsya_server: Option<Arc<yuhaiin_chain::YuubinsyaServerProxy>>,
 ) -> Result<()> {
     use http::{Response, StatusCode};
     use tokio::io::duplex;
@@ -933,6 +1024,7 @@ async fn serve_h2_stream(
         spec,
         selector,
         monitor,
+        yuubinsya_server,
     )
     .await;
     bridge.abort();
@@ -993,52 +1085,175 @@ async fn serve_listener(
     monitor: Arc<ConnectionMonitor>,
     tls_acceptor: Option<InboundTlsAcceptor>,
 ) -> Result<()> {
+    use tokio::task::JoinSet;
+
     let protocol = spec.protocol.clone();
-    loop {
-        let (stream, peer) = listener
-            .accept()
-            .await
-            .map_err(crate::proxy::common::io_error)?;
-        let selector = selector.clone();
-        let monitor = monitor.clone();
-        let spec = spec.clone();
-        let protocol = protocol.clone();
-        let tls_acceptor = tls_acceptor.clone();
-        let logs = monitor.logs();
-        tokio::spawn(async move {
-            let result = async {
-                #[cfg(feature = "doh-tls")]
-                let stream: BoxAsyncStream = if let Some(acceptor) = tls_acceptor {
-                    Box::new(acceptor.accept(stream).await.map_err(|error| {
-                        Error::new(
-                            ErrorKind::Protocol,
-                            format!("inbound TLS handshake: {error}"),
-                        )
-                    })?)
-                } else {
-                    Box::new(stream)
-                };
-                #[cfg(not(feature = "doh-tls"))]
-                let stream: BoxAsyncStream = {
-                    let _ = tls_acceptor;
-                    Box::new(stream)
-                };
-                let stream = if let Some(password) = spec.aead_password.as_deref() {
-                    yuhaiin_protocol::aead::server(stream, password.as_bytes(), spec.aead_method)
-                        .await?
-                } else {
-                    stream
-                };
-                serve_connection(stream, peer, protocol, spec, selector, monitor).await
+    let yuubinsya_server = (protocol == "yuubinsya")
+        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()));
+    let mut connections = JoinSet::new();
+    let result = async {
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted.map_err(crate::proxy::common::io_error)?;
+                    let selector = selector.clone();
+                    let monitor = monitor.clone();
+                    let spec = spec.clone();
+                    let protocol = protocol.clone();
+                    let tls_acceptor = tls_acceptor.clone();
+                    let yuubinsya_server = yuubinsya_server.clone();
+                    let logs = monitor.logs();
+                    connections.spawn(async move {
+                        let result = async {
+                            #[cfg(feature = "doh-tls")]
+                            let stream: BoxAsyncStream = if let Some(acceptor) = tls_acceptor {
+                                Box::new(acceptor.accept(stream).await.map_err(|error| {
+                                    Error::new(
+                                        ErrorKind::Protocol,
+                                        format!("inbound TLS handshake: {error}"),
+                                    )
+                                })?)
+                            } else {
+                                Box::new(stream)
+                            };
+                            #[cfg(not(feature = "doh-tls"))]
+                            let stream: BoxAsyncStream = {
+                                let _ = tls_acceptor;
+                                Box::new(stream)
+                            };
+                            let stream = if let Some(password) = spec.aead_password.as_deref() {
+                                yuhaiin_protocol::aead::server(
+                                    stream,
+                                    password.as_bytes(),
+                                    spec.aead_method,
+                                )
+                                .await?
+                            } else {
+                                stream
+                            };
+                            serve_connection(
+                                stream,
+                                peer,
+                                protocol,
+                                spec,
+                                selector,
+                                monitor,
+                                yuubinsya_server,
+                            )
+                            .await
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            logs.error(format!("inbound connection error: {error}"));
+                        }
+                    });
+                }
+                Some(result) = connections.join_next(), if !connections.is_empty() => {
+                    if let Err(error) = result {
+                        monitor.warn(format!("inbound connection task stopped: {error}"));
+                    }
+                }
             }
-            .await;
-            if let Err(error) = result {
-                logs.error(format!("inbound connection error: {error}"));
-            }
-        });
+        }
     }
+    .await;
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    if let Some(server) = yuubinsya_server {
+        server.close().await;
+    }
+    result
 }
 
+#[cfg(feature = "websocket")]
+async fn serve_websocket_listener(
+    listener: TcpListener,
+    spec: InboundSpec,
+    selector: Arc<RuntimeProxySelector>,
+    monitor: Arc<ConnectionMonitor>,
+    tls_acceptor: Option<InboundTlsAcceptor>,
+) -> Result<()> {
+    use tokio::task::JoinSet;
+
+    let protocol = spec.protocol.clone();
+    let yuubinsya_server = (protocol == "yuubinsya")
+        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()));
+    let mut connections = JoinSet::new();
+    let result = async {
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted.map_err(crate::proxy::common::io_error)?;
+                    let selector = selector.clone();
+                    let monitor = monitor.clone();
+                    let spec = spec.clone();
+                    let protocol = protocol.clone();
+                    let tls_acceptor = tls_acceptor.clone();
+                    let yuubinsya_server = yuubinsya_server.clone();
+                    let logs = monitor.logs();
+                    connections.spawn(async move {
+                        #[cfg(feature = "doh-tls")]
+                        let result = if let Some(acceptor) = tls_acceptor {
+                            match acceptor.accept(stream).await {
+                                Ok(stream) => {
+                                    serve_websocket_stream(
+                                        stream, peer, protocol, spec, selector, monitor,
+                                        yuubinsya_server,
+                                    )
+                                    .await
+                                }
+                                Err(error) => Err(Error::new(
+                                    ErrorKind::Protocol,
+                                    format!("inbound TLS handshake: {error}"),
+                                )),
+                            }
+                        } else {
+                            serve_websocket_stream(
+                                stream,
+                                peer,
+                                protocol,
+                                spec,
+                                selector,
+                                monitor,
+                                yuubinsya_server,
+                            )
+                            .await
+                        };
+                        #[cfg(not(feature = "doh-tls"))]
+                        let result = {
+                            let _ = tls_acceptor;
+                            serve_websocket_stream(
+                                stream,
+                                peer,
+                                protocol,
+                                spec,
+                                selector,
+                                monitor,
+                                yuubinsya_server,
+                            )
+                            .await
+                        };
+                        if let Err(error) = result {
+                            logs.error(format!("WebSocket inbound connection error: {error}"));
+                        }
+                    });
+                }
+                Some(result) = connections.join_next(), if !connections.is_empty() => {
+                    if let Err(error) = result {
+                        monitor.warn(format!("WebSocket connection task stopped: {error}"));
+                    }
+                }
+            }
+        }
+    }
+    .await;
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    if let Some(server) = yuubinsya_server {
+        server.close().await;
+    }
+    result
+}
 #[cfg(feature = "websocket")]
 async fn accept_websocket_stream<S>(
     stream: S,
@@ -1092,94 +1307,75 @@ async fn serve_websocket_h2_listener(
     monitor: Arc<ConnectionMonitor>,
     tls_acceptor: Option<InboundTlsAcceptor>,
 ) -> Result<()> {
-    loop {
-        let (stream, peer) = listener
-            .accept()
-            .await
-            .map_err(crate::proxy::common::io_error)?;
-        let selector = selector.clone();
-        let monitor = monitor.clone();
-        let spec = spec.clone();
-        let tls_acceptor = tls_acceptor.clone();
-        let logs = monitor.logs();
-        tokio::spawn(async move {
-            let result = async {
-                #[cfg(feature = "doh-tls")]
-                let stream: BoxAsyncStream = if let Some(acceptor) = tls_acceptor {
-                    Box::new(acceptor.accept(stream).await.map_err(|error| {
-                        Error::new(
-                            ErrorKind::Protocol,
-                            format!("inbound WebSocket TLS handshake: {error}"),
-                        )
-                    })?)
-                } else {
-                    Box::new(stream)
-                };
-                #[cfg(not(feature = "doh-tls"))]
-                let stream = {
-                    let _ = tls_acceptor;
-                    stream
-                };
-                let (stream, early_data) = accept_websocket_stream(stream).await?;
-                let stream = PrefixedIo::new(early_data, stream);
-                serve_h2_connection(stream, peer, spec, selector, monitor).await
-            }
-            .await;
-            if let Err(error) = result {
-                logs.error(format!(
-                    "WebSocket+HTTP/2 inbound connection error: {error}"
-                ));
-            }
-        });
-    }
-}
+    use tokio::task::JoinSet;
 
-#[cfg(feature = "websocket")]
-async fn serve_websocket_listener(
-    listener: TcpListener,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-    tls_acceptor: Option<InboundTlsAcceptor>,
-) -> Result<()> {
-    let protocol = spec.protocol.clone();
-    loop {
-        let (stream, peer) = listener
-            .accept()
-            .await
-            .map_err(crate::proxy::common::io_error)?;
-        let selector = selector.clone();
-        let monitor = monitor.clone();
-        let spec = spec.clone();
-        let protocol = protocol.clone();
-        let tls_acceptor = tls_acceptor.clone();
-        let logs = monitor.logs();
-        tokio::spawn(async move {
-            #[cfg(feature = "doh-tls")]
-            let result = if let Some(acceptor) = tls_acceptor {
-                match acceptor.accept(stream).await {
-                    Ok(stream) => {
-                        serve_websocket_stream(stream, peer, protocol, spec, selector, monitor)
+    let yuubinsya_server = (spec.protocol == "yuubinsya")
+        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()));
+    let mut connections = JoinSet::new();
+    let result = async {
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted.map_err(crate::proxy::common::io_error)?;
+                    let selector = selector.clone();
+                    let monitor = monitor.clone();
+                    let spec = spec.clone();
+                    let tls_acceptor = tls_acceptor.clone();
+                    let yuubinsya_server = yuubinsya_server.clone();
+                    let logs = monitor.logs();
+                    connections.spawn(async move {
+                        let result = async {
+                            #[cfg(feature = "doh-tls")]
+                            let stream: BoxAsyncStream = if let Some(acceptor) = tls_acceptor {
+                                Box::new(acceptor.accept(stream).await.map_err(|error| {
+                                    Error::new(
+                                        ErrorKind::Protocol,
+                                        format!("inbound WebSocket TLS handshake: {error}"),
+                                    )
+                                })?)
+                            } else {
+                                Box::new(stream)
+                            };
+                            #[cfg(not(feature = "doh-tls"))]
+                            let stream = {
+                                let _ = tls_acceptor;
+                                stream
+                            };
+                            let (stream, early_data) = accept_websocket_stream(stream).await?;
+                            let stream = PrefixedIo::new(early_data, stream);
+                            serve_h2_connection(
+                                stream,
+                                peer,
+                                spec,
+                                selector,
+                                monitor,
+                                yuubinsya_server,
+                            )
                             .await
-                    }
-                    Err(error) => Err(Error::new(
-                        ErrorKind::Protocol,
-                        format!("inbound TLS handshake: {error}"),
-                    )),
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            logs.error(format!(
+                                "WebSocket+HTTP/2 inbound connection error: {error}"
+                            ));
+                        }
+                    });
                 }
-            } else {
-                serve_websocket_stream(stream, peer, protocol, spec, selector, monitor).await
-            };
-            #[cfg(not(feature = "doh-tls"))]
-            let result = {
-                let _ = tls_acceptor;
-                serve_websocket_stream(stream, peer, protocol, spec, selector, monitor).await
-            };
-            if let Err(error) = result {
-                logs.error(format!("WebSocket inbound connection error: {error}"));
+                Some(result) = connections.join_next(), if !connections.is_empty() => {
+                    if let Err(error) = result {
+                        monitor.warn(format!("WebSocket+HTTP/2 connection task stopped: {error}"));
+                    }
+                }
             }
-        });
+        }
     }
+    .await;
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    if let Some(server) = yuubinsya_server {
+        server.close().await;
+    }
+    result
 }
 
 #[cfg(feature = "websocket")]
@@ -1190,13 +1386,23 @@ async fn serve_websocket_stream<S>(
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
+    yuubinsya_server: Option<Arc<yuhaiin_chain::YuubinsyaServerProxy>>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (stream, early_data) = accept_websocket_stream(stream).await?;
     let stream = PrefixedIo::new(early_data, stream);
-    serve_connection(stream, peer, protocol, spec, selector, monitor).await
+    serve_connection(
+        stream,
+        peer,
+        protocol,
+        spec,
+        selector,
+        monitor,
+        yuubinsya_server,
+    )
+    .await
 }
 
 async fn serve_connection<S>(
@@ -1206,6 +1412,7 @@ async fn serve_connection<S>(
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
+    yuubinsya_server: Option<Arc<yuhaiin_chain::YuubinsyaServerProxy>>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1217,7 +1424,14 @@ where
         "mixed" => serve_mixed(stream, peer, spec, selector, monitor).await,
         "trojan" => crate::proxy::trojan::serve(stream, peer, spec, selector, monitor).await,
         "vless" => crate::proxy::vless::serve(stream, peer, spec, selector, monitor).await,
-        "yuubinsya" => crate::proxy::yuubinsya::serve(stream, peer, spec, selector, monitor).await,
+        "yuubinsya" => {
+            if let Some(server) = yuubinsya_server {
+                crate::proxy::yuubinsya::serve_with_server(stream, peer, spec, server, monitor)
+                    .await
+            } else {
+                crate::proxy::yuubinsya::serve(stream, peer, spec, selector, monitor).await
+            }
+        }
         other => Err(Error::new(
             ErrorKind::Unsupported,
             format!("inbound protocol {other:?} is not implemented"),
@@ -2106,6 +2320,91 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             echo_task.abort();
             let _ = echo_task.await;
             result.unwrap();
+        });
+    }
+
+    #[test]
+    fn aborting_an_inbound_listener_closes_its_owned_live_flow() {
+        block_on(async {
+            let (echo_address, echo_task) = echo_server().await;
+            let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let inbound_address = inbound_listener.local_addr().unwrap();
+            let (selector, monitor) = direct_runtime().await;
+            let listener_task = tokio::spawn(serve_listener(
+                inbound_listener,
+                InboundSpec {
+                    id: "socks-abort-inbound".to_owned(),
+                    protocol: "socks5".to_owned(),
+                    listen: inbound_address,
+                    username: String::new(),
+                    password: String::new(),
+                    udp_mode: UdpMode::Disabled,
+                    protocol_udp: false,
+                    transports: vec!["normal".to_owned()],
+                    aead_password: None,
+                    aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
+                    outbound_id: "direct".to_owned(),
+                },
+                selector,
+                monitor.clone(),
+                None,
+            ));
+
+            let mut client = TcpStream::connect(inbound_address).await.unwrap();
+            client.write_all(&[5, 1, 0]).await.unwrap();
+            let mut method = [0u8; 2];
+            client.read_exact(&mut method).await.unwrap();
+            let ip = match echo_address.ip() {
+                std::net::IpAddr::V4(ip) => ip.octets(),
+                std::net::IpAddr::V6(_) => panic!("test echo server must be IPv4"),
+            };
+            let mut request = vec![5, 1, 0, 1];
+            request.extend_from_slice(&ip);
+            request.extend_from_slice(&echo_address.port().to_be_bytes());
+            client.write_all(&request).await.unwrap();
+            let mut reply = [0u8; 10];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply[1], 0);
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if !monitor.connections_value()["connections"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("relay should be observed before listener abort");
+
+            listener_task.abort();
+            let _ = listener_task.await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if monitor.connections_value()["connections"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("aborting listener must close its child relay and monitor entry");
+            assert_eq!(
+                monitor.all_history_value()["items"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(1)
+            );
+
+            drop(client);
+            echo_task.abort();
+            let _ = echo_task.await;
         });
     }
 
