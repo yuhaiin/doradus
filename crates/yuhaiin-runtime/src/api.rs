@@ -38,8 +38,8 @@ use yuhaiin_store::{
 
 use crate::{
     ProxyRouteListTransport, RouteListSnapshot, RouteListTransport, RuntimeController,
-    download_route_url_with_transport, expand_go_route_rule, latency::LatencyRequest,
-    log::log_batch_value, refresh_route_list_caches_with_transport,
+    download_route_url_with_transport, expand_go_route_rule, interfaces::discover_interfaces,
+    latency::LatencyRequest, log::log_batch_value, refresh_route_list_caches_with_transport,
 };
 
 #[derive(Clone)]
@@ -2374,54 +2374,6 @@ fn subscription_json(record: GoSubscriptionLinkRecord) -> Value {
     set_string(&mut value, "url", record.url);
     set_string(&mut value, "type", record.link_type);
     value
-}
-
-fn discover_interfaces() -> Vec<Value> {
-    let mut names = std::fs::read_dir("/sys/class/net")
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .collect::<Vec<_>>();
-    names.sort();
-    let mut addresses = std::collections::BTreeMap::<String, Vec<String>>::new();
-    if let Ok(content) = std::fs::read_to_string("/proc/net/if_inet6") {
-        for line in content.lines() {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields.len() < 6 || fields[0].len() != 32 {
-                continue;
-            }
-            let mut bytes = [0u8; 16];
-            let mut valid = true;
-            for (index, chunk) in fields[0].as_bytes().chunks_exact(2).enumerate() {
-                let Ok(text) = std::str::from_utf8(chunk) else {
-                    valid = false;
-                    break;
-                };
-                let Ok(byte) = u8::from_str_radix(text, 16) else {
-                    valid = false;
-                    break;
-                };
-                bytes[index] = byte;
-            }
-            if valid {
-                addresses
-                    .entry(fields[5].to_owned())
-                    .or_default()
-                    .push(std::net::Ipv6Addr::from(bytes).to_string());
-            }
-        }
-    }
-    names
-        .into_iter()
-        .map(|name| {
-            json!({
-                "name": name,
-                "addresses": addresses.remove(&name).unwrap_or_default()
-            })
-        })
-        .collect()
 }
 
 async fn publishes_get_value(state: &ApiState) -> ApiResult {

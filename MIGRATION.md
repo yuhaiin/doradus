@@ -13,6 +13,8 @@
 >
 > 本轮新增 Go 自定义 AEAD transport：它与 Shadowsocks AEAD 不同，使用 P-256/Ed25519 handshake、ChaCha20/XChaCha20 方向 stream，以及 Go 兼容的 `nonce || ciphertext` UDP packet。协议 codec、TCP/UDP outbound wrapper、SOCKS5 AEAD inbound 和 AEAD 外层 Yuubinsya UDP 已接入；Rust 本地回归与 Go↔Rust TCP/UDP 双向实例互操作通过，更完整组合仍列为 P1 验收项。
 
+> 2026-08-09 管理面补齐 `tools.interfaces` 的替换契约：Go 返回所有非 loopback 接口及其 `net.Interface.Addrs()` CIDR 字符串；Rust 现在在 Linux 通过纯 Rust netlink packet API 读取 RTM_GETADDR，同时使用 sysfs 的接口索引映射名称，覆盖 IPv4/IPv6、无地址接口和 loopback 过滤。实现位于 `yuhaiin-runtime::interfaces`，API 继续直接序列化共享 `InterfaceInfo`，没有新增 HTTP DTO；netlink 不可用时回退到无 loopback 的 sysfs/IPv6 发现。`cargo test -p yuhaiin-runtime --all-features --offline` 已通过 115 个 runtime 单测及 DoH 集成测试，最小 `http-api` library 构建也已验证。
+
 ## 1. 目标、边界和完成定义
 
 ### 1.1 目标

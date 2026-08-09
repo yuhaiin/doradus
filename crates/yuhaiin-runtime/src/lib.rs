@@ -15,6 +15,8 @@ mod dot_tls;
 mod handle;
 #[path = "inbounds/mod.rs"]
 pub mod inbound;
+#[cfg(feature = "http-api")]
+mod interfaces;
 pub mod latency;
 pub mod log;
 pub mod monitor;

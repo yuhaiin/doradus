@@ -66,3 +66,8 @@ required-features = ["http-api"]
 h2 = "0.4.15"
 http-body-util = "0.1.4"
 tower = { version = "0.5.2", features = ["util"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-core = "0.8.2"
+netlink-packet-route = "0.31.0"
+netlink-sys = "0.8.8"

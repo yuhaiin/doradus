@@ -16,10 +16,9 @@ use yuhaiin_core::{Error, ErrorKind, Result};
 #[cfg(not(feature = "doh-tls"))]
 use yuhaiin_runtime::BuiltinResolverFactory;
 use yuhaiin_runtime::api::ApiState;
-use yuhaiin_runtime::{
-    RuntimeBuilder, RuntimeController, inbound, load_tun_config, run_dns_supervisor,
-    run_tun_device_until, wait_for_shutdown_or_reload,
-};
+use yuhaiin_runtime::{RuntimeBuilder, RuntimeController, inbound, run_dns_supervisor};
+#[cfg(feature = "tun")]
+use yuhaiin_runtime::{load_tun_config, run_tun_device_until, wait_for_shutdown_or_reload};
 use yuhaiin_store::{ConfigStore, GoNodeRecord, restore_database};
 
 #[cfg(feature = "tun")]
