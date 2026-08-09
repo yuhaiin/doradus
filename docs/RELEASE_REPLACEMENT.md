@@ -12,6 +12,24 @@ test -x "$HOME/.cache/yuhaiin-rust/release/yuhaiin.new"
 test -f "$HOME/.cache/yuhaiin-rust/release/yuhaiin.new"
 ```
 
+Linux 默认构建仍使用 host toolchain；需要静态 musl 产物时使用 Makefile。`MUSL=1`
+默认使用 Rust toolchain 自带的 `rust-lld`，避免本机 `musl-gcc` 生成的 PIE 在部分
+musl loader 版本上无法启动：
+
+```bash
+make build MUSL=1          # x86_64-unknown-linux-musl debug
+make build-release-musl    # x86_64-unknown-linux-musl release
+
+# 其他 musl target 由调用方提供对应 linker
+make build-release-musl \
+  MUSL_TARGET=aarch64-unknown-linux-musl \
+  MUSL_LINKER=/opt/musl/bin/aarch64-linux-musl-gcc
+```
+
+输出位于 `$(CARGO_TARGET_DIR)/$(MUSL_TARGET)/{debug,release}/yuhaiin`，默认
+`CARGO_TARGET_DIR` 是 `~/.cache/yuhaiin-rust/cargo-target`；可用 `file` 和直接执行
+`yuhaiin version` 检查产物。
+
 如果从源码构建 Android `aarch64` 产物，使用本机 NDK 的 API 35 clang；不要把中间文件放进 `/tmp`：
 
 ```bash

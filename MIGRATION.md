@@ -1569,3 +1569,13 @@ Go `pkg/net/proxy/tls.ParseTLSConfig` 先加载系统证书池，再追加节点
 同一 Go TLS 配置还会作为 Trojan/VLESS/VMess 等协议的独立 transport layer 使用。Rust 原先只在 chain builder 处理公共根和自定义 CA，`protocol::tls::RustCryptoTlsProxy` 仍忽略 `insecure_skip_verify`，并且配置自定义 CA 时不会追加公共根。现在两条构建路径统一：公共 WebPKI 根始终存在，自定义 CA 追加到同一 root store，`insecure_skip_verify` 使用 Rustls custom verifier，同时保留握手签名验证；连接池/协议包装不再因配置形态不同而改变证书语义。
 
 runtime 的 Trojan TLS builder 回归已覆盖 `insecure_skip_verify=true` 和空自定义 CA；workspace 全量测试通过。该回归验证的是构建和选项传递，协议层真实远端证书仍需按具体 Trojan/VLESS/VMess fixture 继续做 wire-level 长连接验收。
+
+## 36. 2026-08-09 Makefile musl 构建
+
+Makefile 新增 `MUSL=1`、`build-musl` 和 `build-release-musl`。默认目标为
+`x86_64-unknown-linux-musl`，使用 Rust toolchain 自带的 `rust-lld` 生成 static-pie；
+本机实测 `make build MUSL=1` 和 `make build-release-musl` 均成功，debug binary 可执行
+`yuhaiin version`，`file`/`ldd` 均显示静态 musl 产物。直接使用本机 `musl-gcc` 生成的
+Rust binary 在当前环境的 musl loader 初始化阶段会段错误，因此 Makefile 不默认选择它；
+交叉 musl target 可通过 `MUSL_TARGET` 和 `MUSL_LINKER` 显式覆盖。所有临时状态仍放在
+`~/.cache/yuhaiin-rust`，未使用 `/tmp`。

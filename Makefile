@@ -1,12 +1,18 @@
 SHELL := /bin/bash
 
 CARGO ?= cargo
+RUSTC ?= rustc
 CARGO_TARGET_DIR ?= $(HOME)/.cache/yuhaiin-rust/cargo-target
 ANDROID_NDK ?= /opt/android-ndk
 ANDROID_API ?= 35
 ANDROID_TARGET ?= aarch64-linux-android
 ANDROID_CLANG ?= $(ANDROID_NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin/$(ANDROID_TARGET)$(ANDROID_API)-clang
 ANDROID_LLVM_AR ?= $(ANDROID_NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+MUSL ?= 0
+MUSL_TARGET ?= x86_64-unknown-linux-musl
+RUST_SYSROOT ?= $(shell $(RUSTC) --print sysroot)
+RUST_HOST ?= $(shell $(RUSTC) -vV | sed -n 's/^host: //p')
+MUSL_LINKER ?= $(RUST_SYSROOT)/lib/rustlib/$(RUST_HOST)/bin/rust-lld
 
 # FEATURES is additive to the package's default features. Set
 # NO_DEFAULT_FEATURES=1 when a smaller feature set is required.
@@ -14,6 +20,17 @@ FEATURES ?=
 NO_DEFAULT_FEATURES ?= 0
 
 CARGO_COMMON_ARGS := --target-dir "$(CARGO_TARGET_DIR)"
+ifeq ($(MUSL),1)
+CARGO_TARGET_ARGS := --target "$(MUSL_TARGET)"
+CARGO_BUILD_ENV := RUSTFLAGS="$(RUSTFLAGS) -C linker=$(MUSL_LINKER)"
+DEBUG_BINARY_DIR := $(CARGO_TARGET_DIR)/$(MUSL_TARGET)/debug
+RELEASE_BINARY_DIR := $(CARGO_TARGET_DIR)/$(MUSL_TARGET)/release
+else
+CARGO_TARGET_ARGS :=
+CARGO_BUILD_ENV :=
+DEBUG_BINARY_DIR := $(CARGO_TARGET_DIR)/debug
+RELEASE_BINARY_DIR := $(CARGO_TARGET_DIR)/release
+endif
 ifeq ($(NO_DEFAULT_FEATURES),1)
 FEATURE_ARGS := --no-default-features
 endif
@@ -24,7 +41,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help build build-debug build-release build-all-bins build-tun-smoke \
+.PHONY: help build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -32,6 +49,9 @@ help:
 	@printf '%s\n' \
 		'make build              build the yuhaiin runtime binary (debug)' \
 		'make build-release      build the yuhaiin runtime binary (release)' \
+		'make build MUSL=1       build a static musl debug binary' \
+		'make build-musl         alias for make build MUSL=1' \
+		'make build-release-musl build a static musl release binary' \
 		'make build-all-bins     build every workspace binary' \
 		'make build-tun-smoke    build the privileged TUN smoke binary' \
 		'make run ARGS="..."    run the runtime binary with arguments' \
@@ -44,17 +64,24 @@ help:
 		'' \
 		'CARGO_TARGET_DIR=$(CARGO_TARGET_DIR)' \
 		'FEATURES=$(FEATURES)' \
-		'NO_DEFAULT_FEATURES=$(NO_DEFAULT_FEATURES)'
+		'NO_DEFAULT_FEATURES=$(NO_DEFAULT_FEATURES)' \
+		'MUSL=$(MUSL) MUSL_TARGET=$(MUSL_TARGET) MUSL_LINKER=$(MUSL_LINKER)'
 
 build: build-debug
 
 build-debug:
-	$(CARGO) build $(CARGO_COMMON_ARGS) -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
-	@printf 'binary: %s/debug/%s\n' "$(CARGO_TARGET_DIR)" "$(RUNTIME_BIN)"
+	$(CARGO_BUILD_ENV) $(CARGO) build $(CARGO_COMMON_ARGS) $(CARGO_TARGET_ARGS) -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
+	@printf 'binary: %s/%s\n' "$(DEBUG_BINARY_DIR)" "$(RUNTIME_BIN)"
 
 build-release:
-	$(CARGO) build $(CARGO_COMMON_ARGS) --release -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
-	@printf 'binary: %s/release/%s\n' "$(CARGO_TARGET_DIR)" "$(RUNTIME_BIN)"
+	$(CARGO_BUILD_ENV) $(CARGO) build $(CARGO_COMMON_ARGS) $(CARGO_TARGET_ARGS) --release -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
+	@printf 'binary: %s/%s\n' "$(RELEASE_BINARY_DIR)" "$(RUNTIME_BIN)"
+
+build-musl:
+	$(MAKE) MUSL=1 build-debug
+
+build-release-musl:
+	$(MAKE) MUSL=1 build-release
 
 build-all-bins:
 	$(CARGO) build $(CARGO_COMMON_ARGS) --workspace --bins --all-features
@@ -71,7 +98,7 @@ run:
 	$(CARGO) run $(CARGO_COMMON_ARGS) -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS) -- $(ARGS)
 
 version: build-debug
-	"$(CARGO_TARGET_DIR)/debug/$(RUNTIME_BIN)" version
+	"$(DEBUG_BINARY_DIR)/$(RUNTIME_BIN)" version
 
 check:
 	$(CARGO) check $(CARGO_COMMON_ARGS) --workspace --all-features
