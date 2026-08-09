@@ -1399,3 +1399,5 @@ cargo test -p yuhaiin-protocol --tests --offline -- --ignored --nocapture
 实际测试文件仍保留 `#[ignore]`，因为没有 sibling Go checkout 的 CI 不应因此失败；在本机显式提供 `YUHAIIN_GO_ROOT` 时，上述协议路径已实际跨语言运行，而不是只依赖 Rust 对 Rust 的 codec 单测。
 
 同时对照 Go `pkg/net/dns/server/server.go` 确认：Go 的本地 DNS server 只监听配置地址上的 UDP 和 TCP；DoH/DoH3 是 resolver 的上游 transport，并不是本地管理 server endpoint。Rust 因此保持同一边界：`resolver.server` 管理本地 UDP/TCP listener，DoH/HTTP2 位于 resolver client factory；checklist 不再把不存在于 Go 的本地 DoH listener 当作未完成项。
+
+另外以 `yuhaiin-react/src/api/generated.ts` 的 88 个 RPC operation 和 legacy route 为基准做了静态逐项核对：Rust RPC switch 覆盖全部前端可通过 `requestJSON` 调用的 operation；`connections.events`、`tools.logs` 两个流式 operation 按 Go contract 走直接 SSE route，不应被误判为普通 JSON RPC 缺失。Rust 额外保留的 `tun.config.*` 是旧管理面兼容入口，不改变前端已有 operation。当前还剩 response schema/字段语义的逐项快照核对，不把“路径存在”当作 schema 已完全等价。
