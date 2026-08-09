@@ -3167,12 +3167,36 @@ async fn write_config_json(state: &ApiState, key: &str, value: Value) -> ApiResu
 
 fn node_json(record: GoNodeRecord) -> Value {
     let mut value = object_or_fallback(&record.data_json, json!({}));
+    strip_go_internal_node_fields(&mut value);
     set_string(&mut value, "id", record.id);
     set_string(&mut value, "name", record.name);
     set_string(&mut value, "group", record.group_name);
     set_string(&mut value, "origin", record.origin);
     set_bool(&mut value, "enabled", record.enabled);
     value
+}
+
+/// The persisted Go node JSON contains runtime-only `userId` fields for some
+/// protocol layers. Go's public `contract.node.Node` does not expose those
+/// fields, but the raw JSON must remain intact in SQLite so the runtime can
+/// still use it and a later Go process can read it back. Keep this filtering
+/// at the HTTP projection boundary rather than mutating the compatibility
+/// record or rewriting the stored node.
+fn strip_go_internal_node_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("userId");
+            for child in object.values_mut() {
+                strip_go_internal_node_fields(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_go_internal_node_fields(item);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 fn inbound_json(record: GoInboundRecord) -> Value {
@@ -3782,6 +3806,29 @@ mod tests {
     use yuhaiin_core::dns::{DnsResponse, encode_response};
     use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
     use yuhaiin_store::ConfigStore;
+
+    #[test]
+    fn node_public_json_hides_go_internal_user_ids_without_mutating_unknown_json() {
+        let value = node_json(yuhaiin_store::GoNodeRecord {
+            id: "node-1".to_owned(),
+            name: "Node 1".to_owned(),
+            group_name: "group".to_owned(),
+            origin: "manual".to_owned(),
+            enabled: true,
+            chain_types_json: b"[\"yuubinsya\"]".to_vec(),
+            updated_at: 0,
+            data_json: br#"{
+                "id":"raw-id",
+                "futureField":"preserve-for-compatibility",
+                "chain":[{"type":"yuubinsya","yuubinsya":{"userId":"runtime-only"}}]
+            }"#
+            .to_vec(),
+        });
+        assert_eq!(value["id"], "node-1");
+        assert_eq!(value["name"], "Node 1");
+        assert_eq!(value["futureField"], "preserve-for-compatibility");
+        assert!(value["chain"][0]["yuubinsya"].get("userId").is_none());
+    }
 
     #[test]
     fn settings_contract_uses_go_defaults_and_ignores_backup_payload() {

@@ -2122,3 +2122,18 @@ runtime-tun-opened name=yrtun0
 runtime-tun-traffic-ok
 runtime-tun-closed name=yrtun0
 ```
+
+## 60. 2026-08-10 Go/Rust production API projection parity
+
+使用已停止且一致的 schema-7 Go `state.db` 副本，在
+`~/.cache/yuhaiin-rust/integration/go-api-parity-20260810` 分别启动 Go 与 Rust；源库没有
+被写入，也没有使用 `/tmp`。新增 `scripts/integration/go-api-parity.sh` 和
+`make go-api-parity-smoke`，Go/Rust 各自使用独立副本，比较前端真实请求体（列表使用
+`page_size`）的 `settings.get`、`nodes.get`、`resolvers.get`、`inbounds.get` 和
+`connections.total`，列表只按 `id` 规范化顺序。
+
+首次对照发现 Rust 的兼容 JSON 公开投影把协议层内部的 `userId` 返回给了前端；Go 的
+公开 `contract.node.Node` 不返回该字段。Rust 现在只在 `node_json` HTTP 投影边界递归
+移除 `userId`，SQLite 中的原始 JSON 不变，因此 runtime 仍能使用并由未来 Go 读回。
+修复后 206 个生产节点、6 个 resolver、10 个 inbound、settings 和 totals 对照全部
+`identical`。该测试同时覆盖了 Rust 前台启动日志和 Go/Rust 独立状态目录约束。
