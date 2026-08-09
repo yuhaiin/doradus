@@ -17,6 +17,13 @@ The current scenarios cover:
   server. It keeps an enabled HTTP inbound alive while testing node selection
   so `nodes.active` observes a real selector after reload rather than a
   synthetic enabled row.
+- `api_reload_flow.rs` keeps one SQLite state and two real HTTP CONNECT
+  fixtures, changes the selected node through `PUT /api/v2/nodes/{id}`, then
+  proves that the next inbound connection uses the new outbound after reload.
+  It also checks node latency, live traffic/history, and the same node,
+  inbound, totals, and history after a process restart. Run the reusable
+  Podman entry point with `make api-reload-flow-smoke`; logs are kept under
+  `~/.cache/yuhaiin-rust/integration/api-reload-flow`.
 - HTTP inbound → domain route rule → fixed + HTTP CONNECT outbound, including
   live connection metadata, traffic counters, route testing, and node latency.
 - HTTP inbound + mixed UDP inbound → TLS + HTTP/2 + Yuubinsya UDP-over-TCP

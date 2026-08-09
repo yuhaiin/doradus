@@ -37,7 +37,7 @@
 | Proxy/transport | 20 | 2 | 95.5% | raw standalone HTTP/2 不携带目标地址、Linux transparent UDP、平台 listen 绑定、复杂协议 |
 | NAT | 3 | 1 | 87.5% | Android/macOS route/NAT 生命周期 |
 | TUN inbound | 4 | 2 | 83.3% | namespace 长矩阵、Android/macOS 实机 |
-| 管理 API/connections/统计 | 3 | 3 | 75.0% | 逐操作生产 response/error/reload 快照、并发统计锁竞争 |
+| 管理 API/connections/统计 | 3 | 3 | 75.0% | 已补真实 node mutation→reload→新连接→latency/traffic/history→重启读回；仍需逐操作生产 response/error 快照、更多生产版本与并发统计锁竞争 |
 | 平台与发布 | 2 | 3 | 70.0% | Android/macOS 实机、service-manager 现场回滚 |
 
 覆盖率不会把 `[~]` 自动改成 `[x]`；只有对应的测试、进程级验证或平台证据完成后才更新条目状态。
@@ -52,7 +52,7 @@
 | FakeIP | `[~]` | 增加真实生产 FakeIP 表快照，并验证双栈池容量/TTL/重启后的分配稳定性 | FakeIP store tests + Go state takeover |
 | Linux transparent inbound | `[~]` | 在具备 `CAP_NET_ADMIN` 的独立 namespace 中验证 TPROXY UDP、redir IPv4/IPv6 和多 flow teardown | `make transparent-service-smoke` 已真实验证隔离 namespace REDIRECT TCP：非 root client → Rust redir → `SO_ORIGINAL_DST` → direct outbound → echo，并检查 upload/download counters、shutdown；同时验证 `IP_TRANSPARENT`/原目标 ancillary socket capability。剩余是 TPROXY UDP 策略路由、IPv4/IPv6 redir 和多 flow teardown |
 | TUN / NAT | `[~]` | 增加 MTU/fragment/namespace teardown 矩阵；补 Android VpnService fd 和 macOS utun 实机验收 | `tun-service.sh`、`p0_tun`、平台设备日志 |
-| API / reload | `[~]` | 用真实 Go handler 做剩余错误字段快照；覆盖 inbound/node/route mutation 后的长生命周期 reload | `api-contract.sh`、`go-api-parity.sh` |
+| API / reload | `[~]` | 已覆盖 node mutation 后新连接切换出口、latency、traffic/history 和同库重启读回；继续用真实 Go handler 做剩余错误字段/response 快照，并补 inbound/route mutation 长生命周期 | `api-reload-flow.sh`、`api-contract.sh`、`go-api-parity.sh` |
 | connections / statistics | `[~]` | 增加更多 production telemetry 快照；逐字段核对长时间范围与升级期间锁竞争 | `stats-concurrency.sh`、`go-rust-stats.sh` |
 | 更新 / 发布 | `[~]` | 在至少一种 systemd 和一种 launchd 环境做替换、回滚、SIGTERM 和备份恢复演练 | `docs/RELEASE_REPLACEMENT.md` |
 | Android | `[~]` | 真机验证 VpnService fd、权限、route 生命周期和电量/RSS | Android instrumentation/runtime log |
@@ -205,7 +205,7 @@ flowchart LR
 
 | 状态 | 功能 | 位置 | 当前结果 | 剩余工作 |
 | --- | --- | --- | --- | --- |
-| `[~]` | 前端 API/RPC | `runtime/src/api.rs` | 对齐现有 generated client；settings、nodes、inbounds、DNS、hosts/FakeDNS、route、TUN、connections 等共用 store/runtime struct；列表 API 已补 Go 的 query 字段边界并在过滤后计算 total；核心错误已按 Go RPC 分类为 400/404/503/500；node.use/nodes.selected 已对齐 Go 的独立 TCP/UDP 选择、Go `metadata` 原始字符串及旧 key 回退；nodes.active 已按 live proxy selector 而非 enabled 行返回；node.close 现在按 Go `ProxyStore.Delete` 关闭 live slot、保留配置，成功 reload 后可重建；node save 返回的 origin 对齐 Go 的 `manual`，inbound save 返回持久化后的 contract，resolver system/default 字段在存储后规范化；settings 现在按 Go contract 返回默认值、写回 `settings_kv`，backup config 同时读写 Go `backup_settings`；route list/rule detail GET 与持久化层已补 Go 的默认值规范化，route tags 已改为读写 Go `node_tags_v2` 并按 `name/type/hash` 过滤；route mutation 会维护 rule/list pending activation，`route.activation` 合并两类状态，显式 apply 同时清理，过期 activation 按 Go timer 生命周期惰性归零，route list refresh 使用未来一分钟的 host-index deadline；route list config 现在优先读写 Go `settings_kv.route_extra`，Rust overlay 作为新库 fallback，并按 Go contract 规范化数字字符串；fresh Rust service 的 31 个核心只读 RPC 及节点/resolver/inbound/route mutation smoke 已实际验证 200；新增 `tests/api_contract.rs`，在单个真实进程中覆盖主要 React CRUD、分页/query、reload 后 `nodes.active`、connections/traffic/telemetry/history、SSE、tools 和代表性 404；已静态核对 React generated.ts 的 88 个 operation，并新增 88 项按实际传输方式（87 个 JSON-RPC + `connections.events` GET/SSE）的自动路由覆盖测试，流式 `connections.events`/`tools.logs` 按 Go 的直接 SSE 路由处理；Go 协议互操作与真实 namespace TUN 回归均通过；新增 `scripts/integration/go-api-parity.sh`，使用真实 schema-7 Go 状态快照启动隔离的 Go/Rust 服务，实际比较 `settings.get`、`nodes.get`、`resolvers.get`、`inbounds.get`、`connections.total`，并在 HTTP projection 边界隐藏 Go raw node JSON 中的内部 `userId` 字段 | 继续用真实 Go handler 做剩余错误语义、完整 response 字段和 route reload/apply 长生命周期快照；补更多 production snapshot 的管理面回归 |
+| `[~]` | 前端 API/RPC | `runtime/src/api.rs` | 对齐现有 generated client；settings、nodes、inbounds、DNS、hosts/FakeDNS、route、TUN、connections 等共用 store/runtime struct；列表 API 已补 Go 的 query 字段边界并在过滤后计算 total；核心错误已按 Go RPC 分类为 400/404/503/500；node.use/nodes.selected 已对齐 Go 的独立 TCP/UDP 选择、Go `metadata` 原始字符串及旧 key 回退；nodes.active 已按 live proxy selector 而非 enabled 行返回；node.close 现在按 Go `ProxyStore.Delete` 关闭 live slot、保留配置，成功 reload 后可重建；node save 返回的 origin 对齐 Go 的 `manual`，inbound save 返回持久化后的 contract，resolver system/default 字段在存储后规范化；settings 现在按 Go contract 返回默认值、写回 `settings_kv`，backup config 同时读写 Go `backup_settings`；route list/rule detail GET 与持久化层已补 Go 的默认值规范化，route tags 已改为读写 Go `node_tags_v2` 并按 `name/type/hash` 过滤；route mutation 会维护 rule/list pending activation，`route.activation` 合并两类状态，显式 apply 同时清理，过期 activation 按 Go timer 生命周期惰性归零，route list refresh 使用未来一分钟的 host-index deadline；route list config 现在优先读写 Go `settings_kv.route_extra`，Rust overlay 作为新库 fallback，并按 Go contract 规范化数字字符串；fresh Rust service 的 31 个核心只读 RPC 及节点/resolver/inbound/route mutation smoke 已实际验证 200；`tests/api_contract.rs` 在单个真实进程中覆盖主要 React CRUD、分页/query、reload 后 `nodes.active`、connections/traffic/telemetry/history、SSE、tools 和代表性 404；新增 `tests/api_reload_flow.rs`，以两个真实 HTTP CONNECT 出口证明 `PUT /api/v2/nodes/{id}` 后新连接切换到新出口，并验证 latency、traffic/history 与同库重启读回；已静态核对 React generated.ts 的 88 个 operation，并新增 88 项按实际传输方式（87 个 JSON-RPC + `connections.events` GET/SSE）的自动路由覆盖测试，流式 `connections.events`/`tools.logs` 按 Go 的直接 SSE 路由处理；Go 协议互操作与真实 namespace TUN 回归均通过；新增 `scripts/integration/go-api-parity.sh` 与 `scripts/integration/api-reload-flow.sh`，分别覆盖 Go 状态快照对照和真实 mutation 长生命周期 | 继续用真实 Go handler 做剩余错误语义、完整 response 字段和 route reload/apply 长生命周期快照；补 inbound mutation、更多 production snapshot 的管理面回归 |
 > **Fresh-state note:** Rust 的 Go 默认投影已补齐：首次初始化同步 `settings_kv`、
 > `route_extra`、`bootstrap.system=true`、LAN rule priority=1 和 Go 的 route preview，并移除
 > 不属于 Go `nodes_v2` 的 `rust-builtin/direct` 持久化节点；实际 Rust/Go fresh RPC 对照记录见
@@ -266,6 +266,7 @@ make transparent-service-smoke
 
 # Frontend management API process contract and reload/observer smoke:
 scripts/integration/api-contract.sh
+make api-reload-flow-smoke
 
 # Foreground binary startup/readiness logs and clean SIGTERM:
 make startup-logs-smoke

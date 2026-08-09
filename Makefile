@@ -42,7 +42,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke build-transparent-service-smoke transparent-service-smoke api-contract-smoke go-api-parity-smoke production-parity-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
+.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke build-transparent-service-smoke transparent-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke production-parity-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -60,6 +60,7 @@ help:
 		'make tun-service-smoke run the runtime-owned TUN lifecycle and echo smoke' \
 		'make transparent-service-smoke run isolated REDIRECT TCP inbound smoke' \
 		'make api-contract-smoke run the frontend management API process contract in Podman' \
+		'make api-reload-flow-smoke verify mutation reloads the real data plane and survives restart' \
 		'make go-api-parity-smoke compare public API responses against a Go state snapshot' \
 		'make production-parity-smoke compare several stopped production SQLite snapshots' \
 		'make go-rust-stats-smoke run concurrent Go/Rust SQLite statistics smoke in Podman' \
@@ -127,6 +128,9 @@ transparent-service-smoke:
 
 api-contract-smoke:
 	./scripts/integration/api-contract.sh
+
+api-reload-flow-smoke:
+	./scripts/integration/api-reload-flow.sh
 
 go-api-parity-smoke:
 	./scripts/integration/go-api-parity.sh
