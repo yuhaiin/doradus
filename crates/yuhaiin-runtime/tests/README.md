@@ -45,6 +45,10 @@ The current scenarios cover:
   DoT/TLS resolver pair in a host-network Podman container. It asserts that
   both TLS transports reach their server from the configured local IPv4
   address; logs are kept under `~/.cache/yuhaiin-rust/integration/doh-source-bind`.
+- `scripts/integration/socks5-udp-associate.sh` runs the real SOCKS5 control
+  handshake, UDP ASSOCIATE, UDP echo, shared direct outbound and monitor
+  assertion in a host-network Podman container. It keeps logs under
+  `~/.cache/yuhaiin-rust/integration/socks5-udp-associate`.
 - standalone Go HTTP/2 transport wire compatibility is covered separately in
   `crates/yuhaiin-chain/tests/standalone_http2.rs`: fixed endpoint resolution,
   plaintext prior-knowledge H2, `CONNECT http://localhost`, raw bidirectional

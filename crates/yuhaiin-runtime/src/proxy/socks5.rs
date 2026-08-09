@@ -108,8 +108,9 @@ where
             .await
             .map_err(io_error)?;
         let address = socket.local_addr().map_err(io_error)?;
-        write_socks_reply_endpoint(&mut stream, 0, address).await?;
-        return serve_socks5_udp_loop(socket, spec, selector, monitor, Some(peer)).await;
+        let advertised_address = SocketAddr::new(peer.ip(), address.port());
+        write_socks_reply_endpoint(&mut stream, 0, advertised_address).await?;
+        return serve_socks5_udp_loop(socket, spec, selector, monitor, Some(peer.ip())).await;
     }
     let source = Endpoint::ip(Network::Tcp, peer);
     let mut context = FlowContext::new(destination.clone());
@@ -159,20 +160,20 @@ pub(crate) async fn serve_socks5_udp_loop(
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
-    allowed_peer: Option<SocketAddr>,
+    allowed_peer: Option<IpAddr>,
 ) -> Result<()> {
     let udp_buffer_size = selector.udp_buffer_size().max(512);
     let udp_ringbuffer_size = selector.udp_ringbuffer_size().max(1);
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
     let mut flows = HashMap::<UdpFlowId, UdpFlowState>::new();
     let mut close_events = monitor.subscribe_close_requests();
-    let mut client = allowed_peer;
+    let mut client = None;
     let mut packet = vec![0u8; udp_buffer_size];
     loop {
         tokio::select! {
             received = socket.recv_from(&mut packet) => {
                 let (length, peer) = received.map_err(io_error)?;
-                if allowed_peer.is_some_and(|allowed| allowed != peer) {
+                if allowed_peer.is_some_and(|allowed| allowed != peer.ip()) {
                     continue;
                 }
                 let Some((target, payload)) = parse_socks_udp_packet(&packet[..length])? else {

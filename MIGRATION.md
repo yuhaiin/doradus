@@ -1898,4 +1898,32 @@ test rustcrypto_encrypted_resolvers_honor_local_bind_address ... ok
 ```
 
 因此 DNS 的 UDP/TCP/DoH/DoT source-address 已分别有单测和 Podman 入口；SOCKS5 UDP
-ASSOCIATE、node latency 的 DNS/UDP 网络 fixture 仍是下一项。
+ASSOCIATE 的真实 inbound 链路见下节，node latency 的 DNS/UDP 网络 fixture 仍待补。
+
+## 50. 2026-08-10 real SOCKS5 UDP ASSOCIATE chain smoke
+
+原有 `connections_close_removes_a_live_socks5_udp_flow` 直接调用 UDP loop，不能发现真实
+SOCKS5 控制连接与 UDP socket 端口不同的问题。本轮新增
+`socks5_udp_associate_routes_through_the_shared_outbound`，完整走：
+
+```text
+SOCKS5 greeting/request(UDP ASSOCIATE)
+  -> advertised UDP relay
+  -> SOCKS5 UDP packet
+  -> router/RuntimeProxySelector
+  -> direct AsyncDatagram
+  -> UDP echo target
+  -> monitor connections
+```
+
+同时修复了两个真实协议问题：
+
+- UDP ASSOCIATE 按 client IP 验证来源，而不是错误地要求 UDP 源端口等于 TCP 控制端口；
+  首个合法 UDP peer 会成为回包目标；
+- BND.ADDR 不再把 wildcard `0.0.0.0` 直接暴露给客户端，而是用控制连接的 peer IP 和
+  relay port 生成可达地址。
+
+`scripts/integration/socks5-udp-associate.sh` 与 `make socks5-udp-associate-smoke` 已在
+host-network Debian testing Podman 中通过，并且断言 inbound metadata 与 `outbound=direct`。
+构建和运行日志位于 `~/.cache/yuhaiin-rust/integration/socks5-udp-associate`，没有使用
+`/tmp`。当前只剩 node latency 的 DNS/UDP 网络 fixture 在该组 checklist 中。

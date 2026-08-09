@@ -1838,7 +1838,7 @@ mod tests {
     #[cfg(feature = "websocket")]
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpStream, UdpSocket};
+    use tokio::net::{TcpSocket, TcpStream, UdpSocket};
     #[cfg(feature = "websocket")]
     use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
 
@@ -3070,6 +3070,113 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             target_task.abort();
             let _ = target_task.await;
             result.unwrap();
+        });
+    }
+
+    #[test]
+    fn socks5_udp_associate_routes_through_the_shared_outbound() {
+        block_on(async {
+            let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let target_address = target.local_addr().unwrap();
+            let target_task = tokio::spawn(async move {
+                let mut buffer = [0u8; 2048];
+                if let Ok((length, peer)) = target.recv_from(&mut buffer).await {
+                    let _ = target.send_to(&buffer[..length], peer).await;
+                }
+            });
+
+            let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let inbound_address = inbound_listener.local_addr().unwrap();
+            let (selector, monitor) = direct_runtime().await;
+            let listener_monitor = monitor.clone();
+            let listener_task = tokio::spawn(async move {
+                let (stream, peer) = inbound_listener.accept().await.unwrap();
+                let _ = crate::proxy::socks5::serve(
+                    stream,
+                    peer,
+                    InboundSpec {
+                        id: "socks-associate-inbound".to_owned(),
+                        protocol: "socks5".to_owned(),
+                        listen: inbound_address,
+                        username: String::new(),
+                        password: String::new(),
+                        udp_mode: UdpMode::Enabled,
+                        protocol_udp: true,
+                        transports: vec!["normal".to_owned()],
+                        aead_password: None,
+                        aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
+                        outbound_id: "direct".to_owned(),
+                        reverse_target: None,
+                        reverse_http: None,
+                    },
+                    selector,
+                    listener_monitor,
+                )
+                .await;
+            });
+
+            let control_socket = TcpSocket::new_v4().unwrap();
+            control_socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+            let mut control = control_socket.connect(inbound_address).await.unwrap();
+            control.write_all(&[5, 1, 0]).await.unwrap();
+            let mut method = [0u8; 2];
+            control.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [5, 0]);
+
+            control
+                .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            let mut bind_reply = [0u8; 10];
+            control.read_exact(&mut bind_reply).await.unwrap();
+            assert_eq!(&bind_reply[..4], &[5, 0, 0, 1]);
+            let relay_address = SocketAddr::new(
+                std::net::Ipv4Addr::new(bind_reply[4], bind_reply[5], bind_reply[6], bind_reply[7])
+                    .into(),
+                u16::from_be_bytes([bind_reply[8], bind_reply[9]]),
+            );
+            assert_eq!(
+                relay_address.ip(),
+                "127.0.0.2".parse::<std::net::IpAddr>().unwrap()
+            );
+
+            let client = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+            let target = Endpoint::ip(Network::Udp, target_address);
+            let packet =
+                crate::proxy::socks5::encode_socks_udp_packet(&target, b"udp-associate").unwrap();
+            client.send_to(&packet, relay_address).await.unwrap();
+            let mut reply = [0u8; 2048];
+            let (length, _) =
+                tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut reply))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let (_, payload) = crate::proxy::socks5::parse_socks_udp_packet(&reply[..length])
+                .unwrap()
+                .unwrap();
+            assert_eq!(payload, b"udp-associate");
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if monitor.connections_value()["connections"]
+                        .as_array()
+                        .is_some_and(|connections| !connections.is_empty())
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("SOCKS5 UDP ASSOCIATE flow should reach the monitor");
+            let connection = monitor.connections_value()["connections"][0].clone();
+            assert_eq!(connection["inboundName"], "socks-associate-inbound");
+            assert_eq!(connection["outbound"], "direct");
+
+            listener_task.abort();
+            let _ = listener_task.await;
+            target_task.abort();
+            let _ = target_task.await;
         });
     }
 
