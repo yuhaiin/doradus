@@ -106,6 +106,36 @@ impl RuntimeSnapshot {
                     })
                 })
                 .ok_or_else(|| Error::invalid("proxy protocol layer is missing"))?;
+            if config
+                .layers
+                .iter()
+                .any(|layer| layer.kind.eq_ignore_ascii_case("obfs_http"))
+            {
+                if config.transport != yuhaiin_store::GoProxyTransport::Shadowsocks {
+                    return Err(Error::new(
+                        ErrorKind::Unsupported,
+                        "obfs_http is only supported around the Go Shadowsocks protocol",
+                    ));
+                }
+                let obfs = config
+                    .layers
+                    .iter()
+                    .find(|layer| layer.kind.eq_ignore_ascii_case("obfs_http"))
+                    .expect("obfs_http layer was checked above");
+                let host = obfs
+                    .config
+                    .get("host")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| Error::invalid("obfs_http host is missing"))?;
+                let port = obfs
+                    .config
+                    .get("port")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| Error::invalid("obfs_http port is missing"))?;
+                upstream = Arc::new(yuhaiin_protocol::http_obfs::HttpObfsProxy::new(
+                    upstream, host, port,
+                )?);
+            }
             match config.transport {
                 yuhaiin_store::GoProxyTransport::Shadowsocks => {
                     let password = layer
@@ -849,6 +879,47 @@ mod tests {
         };
         let built = snapshot(config)
             .build_proxy("shadowsocks", Duration::from_secs(2))
+            .await
+            .unwrap();
+        let context = yuhaiin_core::FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        assert!(built.proxy.connect(&context).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn go_shadowsocks_obfs_http_layer_builds_before_protocol_framing() {
+        let config = GoProxyRuntimeConfig {
+            id: "shadowsocks-obfs-http".to_owned(),
+            name: "shadowsocks-obfs-http".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec![
+                "fixedv2".to_owned(),
+                "obfs_http".to_owned(),
+                "shadowsocks".to_owned(),
+            ],
+            layers: vec![
+                yuhaiin_store::GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({"addresses":[{"host":"127.0.0.1","port":24445}]}),
+                },
+                yuhaiin_store::GoProxyLayer {
+                    kind: "obfs_http".to_owned(),
+                    config: serde_json::json!({"host":"obfs.example","port":"80"}),
+                },
+                yuhaiin_store::GoProxyLayer {
+                    kind: "shadowsocks".to_owned(),
+                    config: serde_json::json!({"method":"AEAD_AES_256_GCM","password":"secret"}),
+                },
+            ],
+            transport: GoProxyTransport::Shadowsocks,
+            data_json: serde_json::to_vec(&serde_json::json!({"chain":[]})).unwrap(),
+        };
+        let built = snapshot(config)
+            .build_proxy("shadowsocks-obfs-http", Duration::from_secs(2))
             .await
             .unwrap();
         let context = yuhaiin_core::FlowContext::new(yuhaiin_core::Endpoint::ip(
