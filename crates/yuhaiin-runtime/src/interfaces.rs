@@ -22,6 +22,59 @@ pub(crate) fn discover_interfaces() -> Vec<InterfaceInfo> {
     fallback()
 }
 
+/// Find the interface owning an address using the same address snapshot that
+/// backs `tools.interfaces`.  This is intentionally best-effort: a socket can
+/// be created by a platform-specific binder that is not represented in the
+/// portable interface listing, in which case the connection field stays empty
+/// instead of reporting a guessed interface.
+pub(crate) fn interface_for_ip(ip: std::net::IpAddr) -> Option<String> {
+    let by_address = discover_interfaces().into_iter().find_map(|interface| {
+        interface
+            .addresses
+            .iter()
+            .any(|cidr| cidr_contains(cidr, ip))
+            .then_some(interface.name)
+    });
+    by_address.or_else(|| {
+        #[cfg(target_os = "linux")]
+        {
+            linux::route_interface_for_ip(ip)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    })
+}
+
+fn cidr_contains(cidr: &str, ip: std::net::IpAddr) -> bool {
+    let Some((network, prefix)) = cidr.rsplit_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match (network.parse::<std::net::IpAddr>(), ip) {
+        (Ok(std::net::IpAddr::V4(network)), std::net::IpAddr::V4(ip)) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            u32::from(network) & mask == u32::from(ip) & mask
+        }
+        (Ok(std::net::IpAddr::V6(network)), std::net::IpAddr::V6(ip)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(network) & mask == u128::from(ip) & mask
+        }
+        _ => false,
+    }
+}
+
 fn assemble(
     devices: &BTreeMap<u32, (String, bool)>,
     addresses: impl IntoIterator<Item = (u32, String)>,
@@ -125,11 +178,77 @@ mod linux {
     use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_ROUTE};
     use std::collections::BTreeMap;
     use std::io;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     pub(super) fn discover() -> io::Result<Vec<InterfaceInfo>> {
         let devices = devices()?;
         let addresses = dump_addresses()?;
         Ok(assemble(&devices, addresses))
+    }
+
+    pub(super) fn route_interface_for_ip(ip: IpAddr) -> Option<String> {
+        match ip {
+            IpAddr::V4(ip) => route_interface_v4(ip),
+            IpAddr::V6(ip) => route_interface_v6(ip),
+        }
+    }
+
+    fn route_interface_v4(ip: Ipv4Addr) -> Option<String> {
+        let content = std::fs::read_to_string("/proc/net/route").ok()?;
+        let target = u32::from(ip);
+        content
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                if fields.len() < 8 {
+                    return None;
+                }
+                let destination = u32::from_str_radix(fields[1], 16).ok()?;
+                let mask = u32::from_str_radix(fields[7], 16).ok()?;
+                let prefix = mask.count_ones();
+                let destination = u32::from_le(destination);
+                let mask = u32::from_le(mask);
+                (target & mask == destination & mask).then_some((prefix, fields[0].to_owned()))
+            })
+            .max_by_key(|(prefix, _)| *prefix)
+            .map(|(_, interface)| interface)
+    }
+
+    fn route_interface_v6(ip: Ipv6Addr) -> Option<String> {
+        let content = std::fs::read_to_string("/proc/net/ipv6_route").ok()?;
+        let target = ip.octets();
+        content
+            .lines()
+            .filter_map(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                if fields.len() < 10 || fields[0].len() != 32 {
+                    return None;
+                }
+                let prefix = u8::from_str_radix(fields[1], 16).ok()?;
+                if prefix > 128 {
+                    return None;
+                }
+                let mut network = [0u8; 16];
+                for (offset, chunk) in fields[0].as_bytes().chunks_exact(2).enumerate() {
+                    network[offset] =
+                        u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+                }
+                (prefix_matches(network, target, prefix)).then_some((prefix, fields[9].to_owned()))
+            })
+            .max_by_key(|(prefix, _)| *prefix)
+            .map(|(_, interface)| interface)
+    }
+
+    fn prefix_matches(network: [u8; 16], target: [u8; 16], prefix: u8) -> bool {
+        let full_bytes = usize::from(prefix / 8);
+        if network[..full_bytes] != target[..full_bytes] {
+            return false;
+        }
+        let remaining = prefix % 8;
+        remaining == 0
+            || (network[full_bytes] & (u8::MAX << (8 - remaining)))
+                == (target[full_bytes] & (u8::MAX << (8 - remaining)))
     }
 
     fn devices() -> io::Result<BTreeMap<u32, (String, bool)>> {
@@ -274,6 +393,23 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn interface_lookup_matches_ipv4_and_ipv6_cidrs() {
+        assert!(cidr_contains("192.0.2.0/24", "192.0.2.44".parse().unwrap()));
+        assert!(!cidr_contains(
+            "192.0.2.0/24",
+            "192.0.3.44".parse().unwrap()
+        ));
+        assert!(cidr_contains(
+            "2001:db8::/32",
+            "2001:db8:1::44".parse().unwrap()
+        ));
+        assert!(!cidr_contains(
+            "2001:db8::/32",
+            "2001:db9::44".parse().unwrap()
+        ));
     }
 
     #[cfg(target_os = "linux")]

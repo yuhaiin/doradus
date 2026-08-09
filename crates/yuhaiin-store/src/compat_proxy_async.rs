@@ -11,6 +11,22 @@ use yuhaiin_core::{DomainName, Error, ErrorKind, Result};
 use crate::{GoProxyLayer, GoProxyRuntimeConfig, GoProxyTransport};
 
 impl GoProxyRuntimeConfig {
+    /// Resolve the first fixed endpoint used by this node, if it has one.
+    ///
+    /// Runtime observability uses this before opening a flow to determine the
+    /// actual socket destination for fixed/proxy/chain nodes.  It deliberately
+    /// shares the same endpoint parser and injected resolver as proxy build,
+    /// instead of introducing a second JSON interpretation in the runtime.
+    pub async fn resolved_fixed_endpoint(
+        &self,
+        resolver: &dyn AsyncIpResolver,
+    ) -> Result<Option<SocketAddr>> {
+        let Some(endpoint) = self.fixed_endpoint().transpose()? else {
+            return Ok(None);
+        };
+        Ok(Some(resolve_endpoint(&endpoint, resolver).await?))
+    }
+
     /// Convert a Go node whose base transport is implemented by core into the
     /// core factory input. Chain transports remain explicit unsupported values
     /// here and must go through `yuhaiin-chain::parse_go_node` instead.

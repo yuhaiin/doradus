@@ -464,6 +464,46 @@ mod tests {
         assert!(!Arc::ptr_eq(&before, &after_successful_reload));
     }
 
+    #[test]
+    fn registered_selector_refreshes_connection_metadata_with_snapshot() {
+        let controller = controller();
+        block_on(controller.store().repository().put_go_node(&GoNodeRecord {
+            id: "proxy".to_owned(),
+            name: "proxy".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types_json: br#"["direct"]"#.to_vec(),
+            updated_at: 1,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        }))
+        .unwrap();
+        block_on(controller.reload()).unwrap();
+        let selector = block_on(controller.build_proxy_selector(
+            "",
+            "proxy",
+            "",
+            "",
+            std::time::Duration::from_secs(1),
+        ))
+        .unwrap();
+
+        block_on(controller.store().put_config(
+            "resolver.hosts",
+            br#"{"hosts":{"reload.example":"192.0.2.44"}}"#,
+        ))
+        .unwrap();
+        block_on(controller.reload()).unwrap();
+
+        let mut context = FlowContext::new(Endpoint::ip(
+            Network::Tcp,
+            "192.0.2.44:443".parse().unwrap(),
+        ));
+        context.original_domain = Some(yuhaiin_core::DomainName::new("reload.example").unwrap());
+        selector.route_context(&mut context);
+        assert_eq!(context.hosts.as_deref(), Some("reload.example:443"));
+    }
+
     #[cfg(feature = "tun")]
     #[test]
     fn controller_assembles_tun_runtime_from_one_full_cone_snapshot() {

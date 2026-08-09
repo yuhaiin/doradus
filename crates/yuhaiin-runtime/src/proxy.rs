@@ -1,12 +1,14 @@
 //! Proxy construction from the shared runtime snapshot.
 
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use yuhaiin_chain::ChainProxy;
 use yuhaiin_core::proxy::{AsyncProxy, AsyncProxySelector};
 use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyKind};
-use yuhaiin_core::{Error, ErrorKind, FlowContext, Result};
+use yuhaiin_core::{Error, ErrorKind, FlowContext, GeoLookup, Result};
 use yuhaiin_store::GoProxyRuntimeConfig;
 use yuhaiin_trie::router::RuntimeRoutedProxySelector;
 
@@ -322,7 +324,10 @@ async fn build_aead_proxy(
         BaseProxyKind::Fixed { address } => Some(*address),
         _ => None,
     };
+    #[cfg(feature = "doh-tls")]
     let mut upstream: Arc<dyn AsyncProxy> = base.build()?;
+    #[cfg(not(feature = "doh-tls"))]
+    let upstream: Arc<dyn AsyncProxy> = base.build()?;
     if config
         .chain_types
         .iter()
@@ -373,6 +378,14 @@ pub struct RuntimeProxySelector {
     bypass_id: String,
     drop_id: String,
     timeout: Duration,
+    metadata: RwLock<ProxyContextMetadata>,
+}
+
+#[derive(Clone, Default)]
+struct ProxyContextMetadata {
+    hosts: yuhaiin_core::dns_hosts::HostsTable,
+    geo: Option<Arc<dyn GeoLookup>>,
+    endpoints: BTreeMap<String, SocketAddr>,
 }
 
 impl RuntimeProxySelector {
@@ -394,31 +407,55 @@ impl RuntimeProxySelector {
             bypass_id: bypass_id.to_owned(),
             drop_id: drop_id.to_owned(),
             timeout,
+            metadata: RwLock::new(
+                snapshot
+                    .proxy_context_metadata(direct_id, proxy_id, bypass_id, drop_id)
+                    .await?,
+            ),
         })
     }
 
     pub(crate) async fn prepare(
         &self,
         snapshot: &RuntimeSnapshot,
-    ) -> Result<RuntimeRoutedProxySelector> {
-        snapshot
-            .build_routed_proxy_selector(
-                &self.direct_id,
-                &self.proxy_id,
-                &self.bypass_id,
-                &self.drop_id,
-                self.timeout,
-            )
-            .await
+    ) -> Result<PreparedProxySelector> {
+        Ok(PreparedProxySelector {
+            selector: snapshot
+                .build_routed_proxy_selector(
+                    &self.direct_id,
+                    &self.proxy_id,
+                    &self.bypass_id,
+                    &self.drop_id,
+                    self.timeout,
+                )
+                .await?,
+            metadata: snapshot
+                .proxy_context_metadata(
+                    &self.direct_id,
+                    &self.proxy_id,
+                    &self.bypass_id,
+                    &self.drop_id,
+                )
+                .await?,
+        })
     }
 
-    pub(crate) fn replace(&self, next: RuntimeRoutedProxySelector) {
+    pub(crate) fn replace(&self, next: PreparedProxySelector) {
         let mut current = self
             .current
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *current = next;
+        *current = next.selector;
+        *self
+            .metadata
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.metadata;
     }
+}
+
+pub(crate) struct PreparedProxySelector {
+    pub(crate) selector: RuntimeRoutedProxySelector,
+    metadata: ProxyContextMetadata,
 }
 
 impl AsyncProxySelector for RuntimeProxySelector {
@@ -428,6 +465,18 @@ impl AsyncProxySelector for RuntimeProxySelector {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         current.route_context(context);
+        let metadata = self
+            .metadata
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        annotate_connection_metadata(
+            context,
+            &metadata,
+            &self.direct_id,
+            &self.proxy_id,
+            &self.bypass_id,
+        );
     }
 
     fn select(&self, context: &FlowContext) -> Arc<dyn AsyncProxy> {
@@ -436,6 +485,87 @@ impl AsyncProxySelector for RuntimeProxySelector {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         current.select(context)
+    }
+}
+
+impl RuntimeSnapshot {
+    async fn proxy_context_metadata(
+        &self,
+        direct_id: &str,
+        proxy_id: &str,
+        bypass_id: &str,
+        drop_id: &str,
+    ) -> Result<ProxyContextMetadata> {
+        let mut endpoints = BTreeMap::new();
+        for id in [direct_id, proxy_id, bypass_id, drop_id]
+            .into_iter()
+            .filter(|id| !id.trim().is_empty())
+        {
+            let Some(config) = self.proxy_config(id) else {
+                continue;
+            };
+            if let Ok(Some(endpoint)) = config.resolved_fixed_endpoint(self.resolver.as_ref()).await
+            {
+                endpoints.insert(id.to_owned(), endpoint);
+            }
+        }
+        Ok(ProxyContextMetadata {
+            hosts: self.hosts.clone(),
+            geo: self.geo.clone(),
+            endpoints,
+        })
+    }
+}
+
+fn annotate_connection_metadata(
+    context: &mut FlowContext,
+    metadata: &ProxyContextMetadata,
+    direct_id: &str,
+    proxy_id: &str,
+    bypass_id: &str,
+) {
+    if context.hosts.is_none() {
+        let domain = context
+            .original_domain
+            .as_ref()
+            .or_else(|| context.destination.host());
+        if let Some(domain) = domain {
+            if metadata.hosts.resolve(domain).ok().flatten().is_some() {
+                context.hosts = Some(
+                    context
+                        .destination
+                        .port()
+                        .map(|port| format!("{domain}:{port}"))
+                        .unwrap_or_else(|| domain.to_string()),
+                );
+            }
+        }
+    }
+
+    let selected_id = match context.route_mode {
+        yuhaiin_core::RouteMode::Direct => direct_id,
+        yuhaiin_core::RouteMode::Proxy => proxy_id,
+        yuhaiin_core::RouteMode::Bypass => bypass_id,
+        yuhaiin_core::RouteMode::Block => return,
+    };
+    let endpoint = metadata
+        .endpoints
+        .get(selected_id)
+        .copied()
+        .or_else(|| context.destination.addr())
+        .or_else(|| context.effective_destination().addr());
+    let Some(endpoint) = endpoint else {
+        return;
+    };
+    #[cfg(feature = "http-api")]
+    if context.interface.is_none() {
+        context.interface = crate::interfaces::interface_for_ip(endpoint.ip());
+    }
+    if context.outbound_geo.is_none() {
+        context.outbound_geo = metadata
+            .geo
+            .as_ref()
+            .and_then(|geo| geo.country_code(endpoint.ip()).ok().flatten());
     }
 }
 
@@ -748,7 +878,7 @@ mod tests {
     use yuhaiin_core::proxy::FixedAsyncProxy;
     use yuhaiin_core::proxy::{AsyncProxySelector, YuubinsyaUdpServer};
     use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyKind};
-    use yuhaiin_core::{FlowContext, RouteMode};
+    use yuhaiin_core::{FlowContext, GeoLookup, RouteMode};
     use yuhaiin_protocol::trojan::{self, Command};
     use yuhaiin_store::GoProxyLayer;
     use yuhaiin_store::GoProxyTransport;
@@ -838,6 +968,50 @@ mod tests {
         context.route_mode = RouteMode::Direct;
         let direct = selector.select(&context);
         assert!(!Arc::ptr_eq(&selected, &direct));
+    }
+
+    struct TestGeo;
+
+    impl GeoLookup for TestGeo {
+        fn country_code(&self, _address: std::net::IpAddr) -> yuhaiin_core::Result<Option<String>> {
+            Ok(Some("ZZ".to_owned()))
+        }
+    }
+
+    #[test]
+    fn selector_populates_hosts_and_outbound_geo_before_proxy_connect() {
+        let config = GoProxyRuntimeConfig {
+            id: "proxy".to_owned(),
+            name: "Proxy".to_owned(),
+            group_name: String::new(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["direct".to_owned()],
+            layers: Vec::new(),
+            transport: GoProxyTransport::Direct,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        };
+        let mut snapshot = snapshot(config);
+        let domain = yuhaiin_core::DomainName::new("hosts.example").unwrap();
+        snapshot
+            .hosts
+            .insert_ip(domain.clone(), "192.0.2.44".parse().unwrap())
+            .unwrap();
+        snapshot.geo = Some(Arc::new(TestGeo));
+        let selector =
+            block_on(snapshot.build_proxy_selector("", "proxy", "", "", Duration::from_secs(1)))
+                .unwrap();
+
+        let mut context = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.44:443".parse().unwrap(),
+        ));
+        context.original_domain = Some(domain);
+        context.route_mode = RouteMode::Direct;
+        selector.route_context(&mut context);
+
+        assert_eq!(context.hosts.as_deref(), Some("hosts.example:443"));
+        assert_eq!(context.outbound_geo.as_deref(), Some("ZZ"));
     }
 
     #[tokio::test]
