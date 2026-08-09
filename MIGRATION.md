@@ -21,6 +21,8 @@
 
 > 2026-08-09 inbound owner：修正 TUN 虽位于 `inbounds` 模块、却由 `run_until` 外部独立 `tun_task` 管理的生命周期偏差。现在 `start_listeners` 从 Go TUN inbound record 加载配置，并把 device/packet loop 的 task 放入与 SOCKS5、HTTP、Yuubinsya、UDP listener 相同的 owner 集合；reload 先统一 abort/cleanup，再重建全部 enabled inbounds，shutdown/force-abort 也使用同一边界。TUN 仍保留 `tun.runtime` 兼容回退和移动端注入 `AsyncDevice` 入口。重建 runtime binary 后，在 privileged、`--network=none` 的 Debian testing Podman 中检测到真实 `yhrtun30822` 设备，SIGTERM 后进程以 0 退出。
 
+> 2026-08-09 mobile TUN inbound：补齐 `inbound::run_until_with_tun_runtime`，移动端可先用 `TunRuntime::from_async_device` 接管 `VpnService`/平台 fd，再让同一个 inbound supervisor 同时拥有 TUN、SOCKS5、HTTP、Yuubinsya 和 UDP listeners。注入设备不会在 reload 时被重新打开或丢弃；`run_tun_device_until_ref` 只重建 snapshot 对应的 proxy runtime/dispatcher，并在最终 shutdown/abort 时统一释放。Android target check 通过；真实 VpnService 权限、route 和功耗仍需设备验收。
+
 > 2026-08-09 cross-target boundary：`yuhaiin-core` 的 `async-proxy,tun` 已通过 `aarch64-linux-android` 和 `aarch64-apple-darwin` 的 `cargo check`。在 Android 上使用 `/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang`、对应 `clang++`、`llvm-ar` 和 Cargo linker 后，`yuhaiin-runtime --all-features` 的 `aarch64-linux-android` target check 也通过；bundled SQLite 的 C 编译边界已验证。macOS runtime check 仍需要 macOS SDK/clang，Android VpnService fd、权限和实机生命周期仍未由此命令行检查替代。
 
 > 2026-08-09 update service：补齐 `/api/v2/update/check`、`update.apply`、`update.status` 的真实 Rust 实现。服务按 Go 的 stable/beta/main channel 过滤和排序 GitHub releases，要求目标平台 asset 与 `checksums.txt`，下载时持续更新状态并在 SHA-256 不匹配时删除 staged 文件；临时文件放在 `~/.cache/yuhaiin-rust/updates`，helper 会复制到安装目录后再做替换和 service restart，失败恢复 `.update-backup`。reqwest 使用 rustls no-provider + RustCrypto，`cargo tree` 未发现 ring/OpenSSL/native-tls；网络端点和不同发行版 service manager 仍需现场验收。

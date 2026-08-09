@@ -249,10 +249,17 @@ fn normalize_tun_name(name: &str) -> Result<String> {
         return Err(Error::invalid("TUN inbound name is empty"));
     }
     if name.starts_with("fd://") {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            "TUN inbound uses an injected fd; desktop supervisor cannot open fd:// names",
-        ));
+        #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
+        {
+            return Ok(name.to_owned());
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
+        {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "TUN inbound uses an injected fd; desktop supervisor cannot open fd:// names",
+            ));
+        }
     }
     Ok(name.to_owned())
 }
@@ -321,7 +328,25 @@ pub(crate) fn open_tun(config: &TunRuntimeConfig) -> Result<yuhaiin_core::tun::T
 #[cfg(feature = "tun")]
 pub async fn run_tun_device_until(
     controller: RuntimeController,
-    mut tun: yuhaiin_core::tun::TunRuntime,
+    tun: yuhaiin_core::tun::TunRuntime,
+    config: TunRuntimeConfig,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut tun = tun;
+    run_tun_device_until_ref(controller, &mut tun, config, shutdown).await
+}
+
+/// Run a previously-created TUN device without taking ownership of it.
+///
+/// The reference form is used by mobile inbound supervisors: a VPN host owns
+/// the fd-backed device for the lifetime of the service, while this function
+/// can return at a configuration reload so the proxy runtime and dispatcher
+/// are rebuilt from the new immutable snapshot. The device itself remains
+/// open and is reused on the next iteration.
+#[cfg(feature = "tun")]
+pub async fn run_tun_device_until_ref(
+    controller: RuntimeController,
+    tun: &mut yuhaiin_core::tun::TunRuntime,
     config: TunRuntimeConfig,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {

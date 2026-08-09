@@ -106,14 +106,75 @@ impl UdpMode {
 /// controls device, socket and accepted-flow lifetimes.
 pub async fn run_until(
     controller: RuntimeController,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    run_until_inner(controller, shutdown, true).await
+}
+
+/// Run normal inbounds together with a TUN device created by the platform
+/// host.
+///
+/// Android's `VpnService` owns the file descriptor, so the runtime must not
+/// try to open or close a second desktop device. The injected device remains
+/// owned by this inbound supervisor, is included in the same final shutdown
+/// boundary as TCP/UDP listeners, and is reused across reloads while its
+/// proxy runtime is rebuilt from the new snapshot.
+#[cfg(feature = "tun")]
+pub async fn run_until_with_tun_runtime(
+    controller: RuntimeController,
+    shutdown: watch::Receiver<bool>,
+    mut tun: yuhaiin_core::tun::TunRuntime,
+    config: crate::TunRuntimeConfig,
+) -> Result<()> {
+    if !config.enabled {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "injected TUN runtime is disabled",
+        ));
+    }
+
+    let tun_controller = controller.clone();
+    let tun_shutdown = shutdown.clone();
+    let tun_monitor = controller.monitor();
+    let tun_task = tokio::task::spawn_local(async move {
+        loop {
+            match crate::run_tun_device_until_ref(
+                tun_controller.clone(),
+                &mut tun,
+                config.clone(),
+                tun_shutdown.clone(),
+            )
+            .await
+            {
+                Ok(()) if *tun_shutdown.borrow() => break,
+                Ok(()) => continue,
+                Err(error) => {
+                    tun_monitor.error(format!("injected TUN inbound stopped: {error}"));
+                    break;
+                }
+            }
+        }
+    });
+
+    let result = run_until_inner(controller, shutdown, false).await;
+    if !tun_task.is_finished() {
+        tun_task.abort();
+    }
+    let _ = tun_task.await;
+    result
+}
+
+async fn run_until_inner(
+    controller: RuntimeController,
     mut shutdown: watch::Receiver<bool>,
+    open_tun: bool,
 ) -> Result<()> {
     let mut reload = controller.subscribe_reload();
     let mut listeners = Vec::new();
     let result = async {
         loop {
             abort_listeners(&mut listeners).await;
-            listeners = start_listeners(&controller, shutdown.clone()).await?;
+            listeners = start_listeners(&controller, shutdown.clone(), open_tun).await?;
             if *shutdown.borrow() {
                 break;
             }
@@ -141,6 +202,7 @@ pub async fn run_until(
 async fn start_listeners(
     controller: &RuntimeController,
     shutdown: watch::Receiver<bool>,
+    open_tun: bool,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
     let records = controller.store().repository().list_go_inbounds().await?;
     let proxy_id = selected_proxy_id(controller).await?;
@@ -150,7 +212,7 @@ async fn start_listeners(
     let monitor = controller.monitor();
     let mut listeners = Vec::new();
     #[cfg(not(feature = "tun"))]
-    let _ = &shutdown;
+    let _ = (&shutdown, open_tun);
 
     // A Go TUN record is an inbound, even though it owns a device instead of
     // a TCP/UDP socket. Keep its task in this same owner collection so reload,
@@ -159,7 +221,7 @@ async fn start_listeners(
     #[cfg(feature = "tun")]
     {
         let tun_config = crate::load_tun_config(controller.store()).await?;
-        if tun_config.enabled {
+        if open_tun && tun_config.enabled {
             let task_controller = controller.clone();
             let task_monitor = monitor.clone();
             let task_shutdown = shutdown.clone();
