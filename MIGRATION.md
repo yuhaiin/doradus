@@ -1437,3 +1437,9 @@ cargo test -p yuhaiin-protocol --tests --offline -- --ignored --nocapture
 统计 checkpoint 与 Go 兼容表投影现在分离处理：checkpoint 仍由 persistence worker 高频写入，用于异常退出恢复；Go `statistics_*`、traffic、history 和 telemetry 表继续按首次成功及 30 秒间隔低频投影。若 SQLite 被 Go 进程或其他 writer 锁住，投影重试由 2 秒起按指数退避，最大 60 秒，成功后恢复 30 秒周期，避免锁竞争期间每个 dirty 事件都发起写事务。
 
 正常 shutdown 先通知并等待 persistence worker 结束，再执行最终 checkpoint/Go projection；因此最终 flush 不会与尚未完成的后台写事务并发，也能在 worker 异常时继续尝试最终持久化。`monitor` 的 180 个 runtime 单测已通过，新增退避倍增与封顶边界回归。
+
+## 19. 2026-08-09 release replacement handbook
+
+新增 `docs/RELEASE_REPLACEMENT.md`，把 Rust binary 直接替换现有 Go service 时的边界写成可执行流程：Android `aarch64` 使用 `/opt/android-ndk/.../aarch64-linux-android35-clang`，状态库先停服务再做 SQLite backup/quick-check，systemd 与 launchd 分别执行 stop/bootout、binary 替换、启动和 `/api/v2/info` 健康检查；回滚同时覆盖 binary 与数据库 backup。
+
+文档明确 Go/Rust 只能使用独立数据库副本并行做对照，不能同时写同一个 `state.db`；WAL、`state.db-wal`、`state.db-shm` 和 sidecar lock 不得在未确认进程退出前手工删除。Windows service 与真实发行版 service manager 仍保留为现场验收项。
