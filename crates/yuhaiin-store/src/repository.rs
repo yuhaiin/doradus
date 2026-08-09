@@ -14,6 +14,88 @@ fn validate_route_resolver_name(value: &str, field: &str) -> Result<()> {
 }
 
 impl ConfigRepository {
+    /// Read Go's global settings KV table without converting it into a second
+    /// lossy settings schema. Unknown sections remain available to future
+    /// callers and malformed JSON is rejected for the same fail-closed
+    /// startup behavior as the other Go compatibility tables.
+    pub async fn list_go_settings_kv(&self) -> Result<Vec<GoSettingsKvRecord>> {
+        let connection = self.store.lock_connection()?;
+        if !table_exists(&connection, "settings_kv") {
+            return Ok(Vec::new());
+        }
+        let rows = connection
+            .query(
+                "SELECT section, key, value_json
+                 FROM settings_kv ORDER BY section, key",
+            )
+            .map_err(storage_error)?;
+        rows.iter()
+            .map(|row| {
+                let section = row_text(row, 0, "settings_kv.section")?;
+                let key = row_text(row, 1, "settings_kv.key")?;
+                let value_json = row_text(row, 2, "settings_kv.value_json")?;
+                serde_json::from_str::<serde_json::Value>(&value_json).map_err(|error| {
+                    Error::invalid(format!(
+                        "settings_kv {section}.{key} contains invalid JSON: {error}"
+                    ))
+                })?;
+                Ok(GoSettingsKvRecord {
+                    section,
+                    key,
+                    value_json,
+                })
+            })
+            .collect()
+    }
+
+    /// Upsert only the scalar settings understood by the shared Go contract.
+    /// Unknown/platform rows are intentionally untouched. Fresh Rust stores
+    /// do not have this legacy table, so the operation is a no-op there.
+    pub async fn put_go_settings_kv(&self, values: &[GoSettingsKvRecord]) -> Result<()> {
+        let connection = self.store.lock_connection()?;
+        if !table_exists(&connection, "settings_kv") {
+            return Ok(());
+        }
+        drop(connection);
+        let values = values.to_vec();
+        self.store.with_write_transaction(|connection| {
+            require_go_table(
+                connection,
+                "settings_kv",
+                &["section", "key", "value_json", "updated_at"],
+            )?;
+            for value in &values {
+                validate_go_texts(&[
+                    ("settings_kv.section", &value.section),
+                    ("settings_kv.key", &value.key),
+                    ("settings_kv.value_json", &value.value_json),
+                ])?;
+                serde_json::from_str::<serde_json::Value>(&value.value_json).map_err(|error| {
+                    Error::invalid(format!(
+                        "settings_kv {}.{} contains invalid JSON: {error}",
+                        value.section, value.key
+                    ))
+                })?;
+                connection
+                    .execute_with_params(
+                        "INSERT INTO settings_kv(section, key, value_json, updated_at)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(section, key) DO UPDATE SET
+                           value_json = excluded.value_json,
+                           updated_at = excluded.updated_at",
+                        &[
+                            SqliteValue::from(value.section.as_str()),
+                            SqliteValue::from(value.key.as_str()),
+                            SqliteValue::from(value.value_json.as_str()),
+                            SqliteValue::from(0_i64),
+                        ],
+                    )
+                    .map_err(storage_error)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Read the Go v6 inbound metadata without taking ownership of the source
     /// table. The paired `put_go_inbound` method writes only the known columns
     /// and preserves `data_json` supplied by the caller.

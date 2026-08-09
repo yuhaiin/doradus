@@ -1389,12 +1389,45 @@ fn imports_production_shaped_go_snapshot_without_losing_legacy_tables() {
                 "../../tests/fixtures/go_sqlite_v6_production_snapshot.sql"
             ))
             .unwrap();
+        connection
+            .execute(
+                "INSERT INTO settings_kv(section, key, value_json, updated_at)
+                 VALUES ('general', 'ipv6', 'true', 210),
+                        ('general', 'use_default_interface', 'false', 210),
+                        ('general', 'net_interface', '\"eth0\"', 210),
+                        ('advanced', 'relay_buffer_size', '8192', 210),
+                        ('logcat', 'level', '3', 210)",
+            )
+            .unwrap();
         connection.close().unwrap();
     }
 
     {
         let store = block_on(ConfigStore::open(&path)).unwrap();
         let repository = store.repository();
+        let settings = block_on(repository.list_go_settings_kv()).unwrap();
+        assert!(settings.iter().any(|value| {
+            value.section == "general" && value.key == "ipv6" && value.value_json == "true"
+        }));
+        assert!(settings.iter().any(|value| {
+            value.section == "advanced"
+                && value.key == "relay_buffer_size"
+                && value.value_json == "8192"
+        }));
+        block_on(repository.put_go_settings_kv(&[GoSettingsKvRecord {
+            section: "general".to_owned(),
+            key: "ipv6".to_owned(),
+            value_json: "false".to_owned(),
+        }]))
+        .unwrap();
+        assert!(
+            block_on(repository.list_go_settings_kv())
+                .unwrap()
+                .iter()
+                .any(|value| {
+                    value.section == "general" && value.key == "ipv6" && value.value_json == "false"
+                })
+        );
         let nodes = block_on(repository.list_proxy_nodes()).unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].id, "node-prod");
@@ -1541,7 +1574,7 @@ fn imports_production_shaped_go_snapshot_without_losing_legacy_tables() {
             .query("SELECT COUNT(*) FROM settings_kv")
             .unwrap()[0]
             .get(0),
-        Some(&SqliteValue::Integer(1))
+        Some(&SqliteValue::Integer(6))
     );
     assert_eq!(
         connection

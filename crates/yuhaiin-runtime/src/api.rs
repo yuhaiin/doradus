@@ -438,7 +438,7 @@ async fn rpc(
         "update.check" => update_check_value(&body),
         "update.apply" => update_apply_value(&state, &body).await,
         "update.status" => update_status_value(&state).await,
-        "settings.get" => read_config_json(&state, "settings", default_settings()).await,
+        "settings.get" => settings_get_value(&state).await,
         "settings.put" => write_config_json(&state, "settings", body).await,
         "backup.config.get" => {
             read_config_json(&state, "backup.config", default_backup_config()).await
@@ -615,7 +615,20 @@ fn info_value(state: &ApiState) -> ApiResult {
 }
 
 async fn settings_get(State(state): State<ApiState>) -> ApiResult {
-    read_config_json(&state, "settings", default_settings()).await
+    settings_get_value(&state).await
+}
+
+async fn settings_get_value(state: &ApiState) -> ApiResult {
+    if state
+        .controller
+        .store()
+        .get_config("settings")
+        .await?
+        .is_some()
+    {
+        return read_config_json(state, "settings", default_settings()).await;
+    }
+    json_value(state.controller.handle().load().settings.to_json())
 }
 
 async fn settings_put(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
@@ -2591,9 +2604,17 @@ async fn read_config_json(state: &ApiState, key: &str, default: Value) -> ApiRes
 async fn write_config_json(state: &ApiState, key: &str, value: Value) -> ApiResult {
     let bytes = serde_json::to_vec(&value)?;
     let key = key.to_owned();
+    let settings_kv =
+        (key == "settings").then(|| crate::RuntimeSettings::from_value(&value).to_go_settings_kv());
     state
         .controller
-        .mutate_and_reload(move |store| async move { store.put_config(&key, &bytes).await })
+        .mutate_and_reload(move |store| async move {
+            store.put_config(&key, &bytes).await?;
+            if let Some(settings_kv) = settings_kv {
+                store.repository().put_go_settings_kv(&settings_kv).await?;
+            }
+            Ok(())
+        })
         .await?;
     Ok(Json(value))
 }

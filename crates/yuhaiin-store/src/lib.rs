@@ -168,6 +168,16 @@ pub struct GoInboundRecord {
     pub data_json: Vec<u8>,
 }
 
+/// Scalar settings preserved by Go's `settings_kv` table.  The Rust runtime
+/// reads the known keys while leaving unknown platform/application keys in the
+/// source table for forward compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoSettingsKvRecord {
+    pub section: String,
+    pub key: String,
+    pub value_json: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoNodeRecord {
     pub id: String,
