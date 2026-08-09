@@ -277,6 +277,10 @@ impl IpSet {
 pub struct FlowContext {
     pub source: Option<Endpoint>,
     pub destination: Endpoint,
+    /// The address selected by the runtime resolver for the final direct
+    /// socket. Keep this separate from `destination`: protocol layers must
+    /// still see the original domain for routing, SNI and proxy framing.
+    pub resolved_destination: Option<Endpoint>,
     pub network: Network,
     pub route_mode: RouteMode,
     pub resolver_policy: ResolverPolicy,
@@ -335,6 +339,7 @@ impl FlowContext {
         Self {
             source: None,
             destination,
+            resolved_destination: None,
             network,
             route_mode: RouteMode::Proxy,
             resolver_policy: ResolverPolicy::default(),
@@ -375,6 +380,15 @@ impl FlowContext {
             return self.destination.clone();
         };
         Endpoint::domain(self.network, domain.clone(), port)
+    }
+
+    /// Return the endpoint that a final direct transport should dial.
+    /// `effective_destination` deliberately restores a domain for protocol
+    /// layers; a resolver may additionally provide an IP for direct sockets.
+    pub fn proxy_destination(&self) -> Endpoint {
+        self.resolved_destination
+            .clone()
+            .unwrap_or_else(|| self.effective_destination())
     }
 
     pub fn local_bind_for(&self, remote: SocketAddr) -> Option<SocketAddr> {

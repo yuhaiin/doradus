@@ -460,7 +460,7 @@ pub struct DirectAsyncProxy {
 #[cfg(feature = "async-proxy")]
 impl AsyncProxy for DirectAsyncProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
-        let destination = context.effective_destination();
+        let destination = context.proxy_destination();
         Box::pin(async move {
             let address = destination.addr().ok_or_else(|| {
                 Error::new(
@@ -478,7 +478,7 @@ impl AsyncProxy for DirectAsyncProxy {
         &'a self,
         context: &'a FlowContext,
     ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
-        let destination = context.effective_destination();
+        let destination = context.proxy_destination();
         Box::pin(async move {
             let address = destination.addr().ok_or_else(|| {
                 Error::new(

@@ -6,9 +6,15 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use yuhaiin_chain::ChainProxy;
-use yuhaiin_core::proxy::{AsyncProxy, AsyncProxySelector, DropAsyncProxy};
+use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+use yuhaiin_core::proxy::{
+    AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream, DropAsyncProxy,
+};
 use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyKind};
-use yuhaiin_core::{Error, ErrorKind, FlowContext, GeoLookup, Result};
+use yuhaiin_core::{
+    BoxFuture, Endpoint, Error, ErrorKind, FlowContext, GeoLookup, IpSet, Network, ResolveStrategy,
+    Result,
+};
 use yuhaiin_store::GoProxyRuntimeConfig;
 use yuhaiin_trie::router::RuntimeRoutedProxySelector;
 
@@ -43,6 +49,109 @@ pub(crate) mod yuubinsya;
 pub struct ProxyBuild {
     pub config: GoProxyRuntimeConfig,
     pub proxy: Arc<dyn AsyncProxy>,
+}
+
+/// Resolve final domain destinations once per accepted flow before a direct
+/// socket is opened. The context still carries the domain, so protocol layers
+/// such as TLS, HTTP/2 and Yuubinsya preserve their domain/SNI semantics; only
+/// the direct transport reads `FlowContext::proxy_destination`.
+struct ResolvingProxy {
+    inner: Arc<dyn AsyncProxy>,
+    resolver: Arc<dyn AsyncIpResolver>,
+}
+
+impl ResolvingProxy {
+    fn new(inner: Arc<dyn AsyncProxy>, resolver: Arc<dyn AsyncIpResolver>) -> Self {
+        Self { inner, resolver }
+    }
+
+    fn resolve_context<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<FlowContext>> {
+        let mut resolved = context.clone();
+        let destination = resolved.effective_destination();
+        let Endpoint::Domain {
+            network,
+            host,
+            port,
+        } = destination
+        else {
+            return Box::pin(async move { Ok(resolved) });
+        };
+        if network == Network::Udp && resolved.resolver_policy.udp_skip_resolve_target {
+            return Box::pin(async move { Ok(resolved) });
+        }
+        let resolver = Arc::clone(&self.resolver);
+        let strategy = resolved.resolver_policy.strategy;
+        Box::pin(async move {
+            let addresses = resolver.resolve(&host, strategy).await?;
+            let address = select_resolved_address(&addresses, strategy).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("resolver returned no usable address for {host}"),
+                )
+            })?;
+            resolved.resolved_destination =
+                Some(Endpoint::ip(network, SocketAddr::new(address, port)));
+            Ok(resolved)
+        })
+    }
+}
+
+impl AsyncProxy for ResolvingProxy {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let context = self.resolve_context(context).await?;
+            inner.connect(&context).await
+        })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let context = self.resolve_context(context).await?;
+            inner.open_datagram(&context).await
+        })
+    }
+
+    fn ping<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<Duration>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let context = self.resolve_context(context).await?;
+            inner.ping(&context).await
+        })
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        self.inner.close()
+    }
+}
+
+fn select_resolved_address(
+    addresses: &IpSet,
+    strategy: ResolveStrategy,
+) -> Option<std::net::IpAddr> {
+    match strategy {
+        ResolveStrategy::OnlyIpv6 | ResolveStrategy::PreferIpv6 => addresses
+            .v6
+            .first()
+            .copied()
+            .map(std::net::IpAddr::V6)
+            .or_else(|| addresses.v4.first().copied().map(std::net::IpAddr::V4)),
+        ResolveStrategy::OnlyIpv4 | ResolveStrategy::PreferIpv4 | ResolveStrategy::Default => {
+            addresses
+                .v4
+                .first()
+                .copied()
+                .map(std::net::IpAddr::V4)
+                .or_else(|| addresses.v6.first().copied().map(std::net::IpAddr::V6))
+        }
+    }
 }
 
 impl RuntimeSnapshot {
@@ -300,12 +409,15 @@ impl RuntimeSnapshot {
             .build_proxy_slot(drop_id, timeout, BaseProxyKind::Drop)
             .await?;
 
+        let wrap = |proxy| {
+            Arc::new(ResolvingProxy::new(proxy, self.resolver.clone())) as Arc<dyn AsyncProxy>
+        };
         Ok(RuntimeRoutedProxySelector {
             router: self.router.clone(),
-            direct,
-            proxy,
-            bypass,
-            drop,
+            direct: wrap(direct),
+            proxy: wrap(proxy),
+            bypass: wrap(bypass),
+            drop: wrap(drop),
         })
     }
 
@@ -1176,6 +1288,53 @@ mod tests {
         context.route_mode = RouteMode::Direct;
         let direct = selector.select(&context);
         assert!(!Arc::ptr_eq(&selected, &direct));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selector_resolves_domain_for_direct_socket_without_losing_protocol_domain() {
+        let config = GoProxyRuntimeConfig {
+            id: "proxy".to_owned(),
+            name: "Proxy".to_owned(),
+            group_name: String::new(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["direct".to_owned()],
+            layers: Vec::new(),
+            transport: GoProxyTransport::Direct,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        };
+        let selector = snapshot(config)
+            .build_proxy_selector("", "proxy", "", "", Duration::from_secs(1))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut payload = [0u8; 15];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut payload)
+                .await
+                .unwrap();
+            payload
+        });
+
+        let mut context = FlowContext::new(yuhaiin_core::Endpoint::domain(
+            yuhaiin_core::Network::Tcp,
+            yuhaiin_core::DomainName::new("localhost").unwrap(),
+            address.port(),
+        ));
+        context.route_mode = RouteMode::Proxy;
+        let selected = selector.select(&context);
+        let mut stream = selected.connect(&context).await.unwrap();
+        assert_eq!(
+            context.effective_destination().host().unwrap().as_str(),
+            "localhost"
+        );
+        assert!(context.resolved_destination.is_none());
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"resolved-domain")
+            .await
+            .unwrap();
+        assert_eq!(server.await.unwrap(), *b"resolved-domain");
     }
 
     #[tokio::test(flavor = "current_thread")]
