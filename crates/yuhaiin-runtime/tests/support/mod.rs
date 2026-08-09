@@ -121,6 +121,50 @@ impl ConnectFixture {
     }
 }
 
+/// A minimal no-auth SOCKS5 proxy fixture. It records the address form sent by
+/// the runtime and maps domain destinations to the loopback echo target so
+/// the integration test proves proxy-side DNS framing without host DNS.
+pub struct Socks5Fixture {
+    pub target: SocketAddr,
+    pub outbound: SocketAddr,
+    pub destinations: Arc<Mutex<Vec<String>>>,
+    shutdown: watch::Sender<bool>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Socks5Fixture {
+    pub async fn start() -> Self {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = target_listener.local_addr().unwrap();
+        let outbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let outbound = outbound_listener.local_addr().unwrap();
+        let destinations = Arc::new(Mutex::new(Vec::new()));
+        let (shutdown, _) = watch::channel(false);
+
+        let target_task = tokio::spawn(serve_target(target_listener, shutdown.subscribe()));
+        let proxy_task = tokio::spawn(serve_socks5_proxy(
+            outbound_listener,
+            shutdown.subscribe(),
+            target,
+            destinations.clone(),
+        ));
+        Self {
+            target,
+            outbound,
+            destinations,
+            shutdown,
+            tasks: vec![target_task, proxy_task],
+        }
+    }
+
+    pub async fn shutdown(self) {
+        let _ = self.shutdown.send(true);
+        for task in self.tasks {
+            let _ = task.await;
+        }
+    }
+}
+
 struct DomainMappingProxy {
     direct: DirectAsyncProxy,
     tcp_target: SocketAddr,
@@ -445,6 +489,124 @@ async fn handle_connect(mut client: TcpStream, authorities: Arc<Mutex<Vec<String
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
 }
 
+async fn serve_socks5_proxy(
+    listener: TcpListener,
+    mut shutdown: watch::Receiver<bool>,
+    fallback_target: SocketAddr,
+    destinations: Arc<Mutex<Vec<String>>>,
+) {
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((stream, _)) = accepted else { break };
+                let destinations = destinations.clone();
+                tokio::spawn(async move {
+                    handle_socks5_proxy(stream, fallback_target, destinations).await;
+                });
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
+            }
+        }
+    }
+}
+
+async fn handle_socks5_proxy(
+    mut client: TcpStream,
+    fallback_target: SocketAddr,
+    destinations: Arc<Mutex<Vec<String>>>,
+) {
+    let mut greeting = [0u8; 2];
+    if client.read_exact(&mut greeting).await.is_err() || greeting[0] != 5 {
+        return;
+    }
+    let mut methods = vec![0u8; usize::from(greeting[1])];
+    if client.read_exact(&mut methods).await.is_err() {
+        return;
+    }
+    if !methods.contains(&0) {
+        let _ = client.write_all(&[5, 255]).await;
+        return;
+    }
+    if client.write_all(&[5, 0]).await.is_err() {
+        return;
+    }
+
+    let mut request = [0u8; 4];
+    if client.read_exact(&mut request).await.is_err()
+        || request[0] != 5
+        || request[1] != 1
+        || request[2] != 0
+    {
+        return;
+    }
+    let (authority, target) = match request[3] {
+        1 => {
+            let mut ip = [0u8; 4];
+            if client.read_exact(&mut ip).await.is_err() {
+                return;
+            }
+            let mut port = [0u8; 2];
+            if client.read_exact(&mut port).await.is_err() {
+                return;
+            }
+            let address =
+                SocketAddr::new(std::net::IpAddr::V4(ip.into()), u16::from_be_bytes(port));
+            (address.to_string(), address)
+        }
+        3 => {
+            let mut length = [0u8; 1];
+            if client.read_exact(&mut length).await.is_err() {
+                return;
+            }
+            let mut host = vec![0u8; usize::from(length[0])];
+            if client.read_exact(&mut host).await.is_err() {
+                return;
+            }
+            let host = String::from_utf8_lossy(&host);
+            let mut port = [0u8; 2];
+            if client.read_exact(&mut port).await.is_err() {
+                return;
+            }
+            let port = u16::from_be_bytes(port);
+            (
+                format!("{host}:{port}"),
+                SocketAddr::new(fallback_target.ip(), port),
+            )
+        }
+        4 => {
+            let mut ip = [0u8; 16];
+            if client.read_exact(&mut ip).await.is_err() {
+                return;
+            }
+            let mut port = [0u8; 2];
+            if client.read_exact(&mut port).await.is_err() {
+                return;
+            }
+            let address =
+                SocketAddr::new(std::net::IpAddr::V6(ip.into()), u16::from_be_bytes(port));
+            (address.to_string(), address)
+        }
+        _ => return,
+    };
+    destinations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(authority);
+    let Ok(mut upstream) = TcpStream::connect(target).await else {
+        let _ = client.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+        return;
+    };
+    if client
+        .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+}
+
 pub async fn seed_empty_database(path: &Path) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
@@ -643,6 +805,71 @@ pub async fn configure_http_chain(
 
     let rule = json!({
         "name":"proxy-example-test",
+        "mode":"proxy",
+        "match":{"domain":"example.test"},
+        "tag":"integration"
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/route/rules",
+        Some(&rule),
+    )
+    .await;
+}
+
+pub async fn configure_socks5_chain(
+    service: &ServiceProcess,
+    inbound: SocketAddr,
+    outbound: SocketAddr,
+) {
+    let node = json!({
+        "id":"socks5-out",
+        "name":"SOCKS5 test outbound",
+        "group":"integration",
+        "enabled":true,
+        "chain":[
+            {"type":"fixed","fixed":{"host":"127.0.0.1","port":outbound.port()}},
+            {"type":"socks5","socks5":{"username":"","password":""}}
+        ]
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes",
+        Some(&node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes/socks5-out/use",
+        None,
+    )
+    .await;
+
+    let inbound = json!({
+        "id":"socks5-chain-in",
+        "name":"SOCKS5 outbound chain inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":{"type":"http","http":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+
+    let rule = json!({
+        "name":"proxy-example-test-over-socks5",
         "mode":"proxy",
         "match":{"domain":"example.test"},
         "tag":"integration"

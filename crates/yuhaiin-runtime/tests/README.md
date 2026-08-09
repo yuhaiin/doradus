@@ -14,6 +14,8 @@ The current scenarios cover:
   outbound, including TCP echo, UDP echo, live connection metadata, traffic,
   telemetry, failed-history, closed-flow history, and node latency through the
   same configured node.
+- HTTP inbound → domain route rule → fixed + SOCKS5 outbound, including
+  proxy-side domain framing, live metadata, and node latency.
 - mixed inbound → SOCKS5 UDP framing → direct UDP, including the Go-compatible
   mixed UDP mode and a conflicting default `127.0.0.1:1080` listener.
 - authenticated SOCKS5 TCP inbound and Yuubinsya TCP inbound → direct echo in

@@ -1676,6 +1676,17 @@ traffic、telemetry、failed-history，并在 TCP flow 关闭后确认 history �
 cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
 ```
 
+## 43. 2026-08-09 SOCKS5 outbound process-chain regression
+
+新增可复用的纯 Rust SOCKS5 loopback fixture，并通过真实 runtime API 配置
+`fixed → socks5` outbound。HTTP inbound 发送 `example.test:<port>` 的 CONNECT 请求，
+请求经过 route rule 和 SOCKS5 outbound 后由 fixture 映射到 loopback echo target；fixture
+会记录 SOCKS5 domain request，确认 runtime 没有提前把代理侧域名错误地解析成 IP。
+
+该场景同时验证 outbound connection metadata、route match history、双向 payload 和
+`/api/v2/nodes/{id}/latency`，因此当前 service-chain 已覆盖 direct、HTTP CONNECT、
+SOCKS5、TLS/H2/Yuubinsya TCP，以及 Yuubinsya UOT UDP 的真实进程组合。
+
 ## 41. 2026-08-09 运行验收与跨平台构建边界
 
 在 service-chain 统计回归之后又执行了当前仓库的最小容器和交叉构建验收：

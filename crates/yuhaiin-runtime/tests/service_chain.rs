@@ -11,10 +11,10 @@ use yuhaiin_chain::AsyncYuubinsyaTcpSession;
 use yuhaiin_core::{Endpoint, Network};
 
 use support::{
-    ConnectFixture, H2YuubinsyaFixture, ServiceProcess, YUUBINSYA_PASSWORD, add_mixed_udp_inbound,
-    add_socks5_inbound, add_yuubinsya_inbound, api_json, configure_http_chain,
-    configure_tls_h2_yuubinsya_chain, connect_loopback, integration_dir, seed_empty_database,
-    wait_for_connection,
+    ConnectFixture, H2YuubinsyaFixture, ServiceProcess, Socks5Fixture, YUUBINSYA_PASSWORD,
+    add_mixed_udp_inbound, add_socks5_inbound, add_yuubinsya_inbound, api_json,
+    configure_http_chain, configure_socks5_chain, configure_tls_h2_yuubinsya_chain,
+    connect_loopback, integration_dir, seed_empty_database, wait_for_connection,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -165,6 +165,99 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_inbound_routes_through_socks5_outbound() {
+    let fixture = Socks5Fixture::start().await;
+    let _default_mixed_blocker = tokio::net::TcpListener::bind("127.0.0.1:1080").await.ok();
+    let inbound_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let inbound = inbound_listener.local_addr().unwrap();
+    drop(inbound_listener);
+
+    let root = integration_dir("service-socks5-chain");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_socks5_chain(&service, inbound, fixture.outbound).await;
+
+    let mut client = connect_loopback(inbound).await;
+    let authority = format!("example.test:{}", fixture.target.port());
+    client
+        .write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut headers = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while !headers.windows(4).any(|window| window == b"\r\n\r\n") {
+        let length = client.read(&mut buffer).await.unwrap();
+        assert!(length > 0, "HTTP inbound closed before SOCKS5 response");
+        headers.extend_from_slice(&buffer[..length]);
+    }
+    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 200"));
+
+    let payload = b"socks5-outbound-payload";
+    client.write_all(payload).await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, payload);
+
+    let connection = wait_for_connection(&service.client, &service.base_url).await;
+    let item = connection["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inboundName"] == "socks5-chain-in")
+        .expect("SOCKS5 outbound chain connection must be visible");
+    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["outbound"], "socks5-out");
+    assert!(item["matchHistory"].as_array().is_some_and(|history| {
+        history
+            .iter()
+            .any(|entry| entry["ruleName"] == "proxy-example-test-over-socks5")
+    }));
+
+    let mut destinations = Vec::new();
+    for _ in 0..100 {
+        destinations = fixture
+            .destinations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if destinations
+            .iter()
+            .any(|destination| destination == &authority)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        destinations
+            .iter()
+            .any(|destination| destination == &authority)
+    );
+
+    let latency = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes/socks5-out/latency",
+        Some(&json!({
+            "type":"tcp",
+            "url":format!("http://{authority}/health")
+        })),
+    )
+    .await;
+    assert_eq!(
+        latency["ok"], true,
+        "SOCKS5 chain latency response: {latency}"
+    );
+
+    client.shutdown().await.unwrap();
     service.shutdown().await;
     fixture.shutdown().await;
 }
