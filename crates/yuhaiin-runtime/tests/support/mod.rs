@@ -22,7 +22,7 @@ use yuhaiin_core::yuubinsya::derive_salt;
 use yuhaiin_core::{BoxFuture, Endpoint, FlowContext, Result};
 use yuhaiin_store::ConfigStore;
 
-const YUUBINSYA_PASSWORD: &str = "runtime-integration-yuubinsya";
+pub const YUUBINSYA_PASSWORD: &str = "runtime-integration-yuubinsya";
 const LEAF_CERTIFICATE_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
 MIIBmzCCAUGgAwIBAgIUA6T+/U88N9aMPipK+MdNsAFRUAUwCgYIKoZIzj0EAwIw
 GDEWMBQGA1UEAwwNeXVoYWlpbi1wMC1jYTAeFw0yNjA4MDYxODIwNDlaFw0zNjA4
@@ -62,6 +62,16 @@ pub async fn reserve_loopback() -> SocketAddr {
     let address = listener.local_addr().unwrap();
     drop(listener);
     address
+}
+
+pub async fn connect_loopback(address: SocketAddr) -> TcpStream {
+    for _ in 0..120 {
+        match TcpStream::connect(address).await {
+            Ok(stream) => return stream,
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    panic!("loopback listener {address} did not become ready");
 }
 
 /// A small HTTP CONNECT proxy and target server used to prove that the Rust
@@ -736,6 +746,50 @@ pub async fn add_mixed_udp_inbound(service: &ServiceProcess, id: &str, listen: S
         "network":{"type":"tcp_udp","tcp_udp":{"host":listen.to_string(),"udp":"enabled"}},
         "transports":[{"type":"normal","normal":{}}],
         "protocol":{"type":"mixed","mixed":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+}
+
+pub async fn add_socks5_inbound(
+    service: &ServiceProcess,
+    id: &str,
+    listen: SocketAddr,
+    username: &str,
+    password: &str,
+) {
+    let inbound = json!({
+        "id":id,
+        "name":"SOCKS5 integration inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":listen.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":{"type":"socks5","socks5":{"username":username,"password":password}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+}
+
+pub async fn add_yuubinsya_inbound(service: &ServiceProcess, id: &str, listen: SocketAddr) {
+    let inbound = json!({
+        "id":id,
+        "name":"Yuubinsya integration inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":listen.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":{"type":"yuubinsya","yuubinsya":{"password":YUUBINSYA_PASSWORD,"udp":false}}
     });
     api_json(
         &service.client,

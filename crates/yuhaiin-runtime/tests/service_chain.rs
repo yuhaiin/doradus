@@ -7,10 +7,13 @@ use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use yuhaiin_chain::AsyncYuubinsyaTcpSession;
+use yuhaiin_core::{Endpoint, Network};
 
 use support::{
-    ConnectFixture, H2YuubinsyaFixture, ServiceProcess, add_mixed_udp_inbound, api_json,
-    configure_http_chain, configure_tls_h2_yuubinsya_chain, integration_dir, seed_empty_database,
+    ConnectFixture, H2YuubinsyaFixture, ServiceProcess, YUUBINSYA_PASSWORD, add_mixed_udp_inbound,
+    add_socks5_inbound, add_yuubinsya_inbound, api_json, configure_http_chain,
+    configure_tls_h2_yuubinsya_chain, connect_loopback, integration_dir, seed_empty_database,
     wait_for_connection,
 };
 
@@ -508,4 +511,98 @@ async fn mixed_inbound_exposes_socks5_udp_and_keeps_supervisor_alive() {
 
     let _ = target_task.await;
     service.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socks5_and_yuubinsya_inbounds_route_through_the_runtime_process() {
+    let fixture = ConnectFixture::start().await;
+    let _default_mixed_blocker = tokio::net::TcpListener::bind("127.0.0.1:1080").await.ok();
+    let socks5_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks5_inbound = socks5_listener.local_addr().unwrap();
+    drop(socks5_listener);
+    let yuubinsya_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yuubinsya_inbound = yuubinsya_listener.local_addr().unwrap();
+    drop(yuubinsya_listener);
+
+    let root = integration_dir("service-required-inbounds");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    add_socks5_inbound(
+        &service,
+        "socks5-required-in",
+        socks5_inbound,
+        "integration-user",
+        "integration-password",
+    )
+    .await;
+    add_yuubinsya_inbound(&service, "yuubinsya-required-in", yuubinsya_inbound).await;
+
+    let mut socks5 = connect_loopback(socks5_inbound).await;
+    socks5.write_all(&[5, 1, 2]).await.unwrap();
+    let mut method = [0u8; 2];
+    socks5.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [5, 2]);
+    let username = b"integration-user";
+    let password = b"integration-password";
+    let mut auth_request = vec![1, username.len() as u8];
+    auth_request.extend_from_slice(username);
+    auth_request.push(password.len() as u8);
+    auth_request.extend_from_slice(password);
+    socks5.write_all(&auth_request).await.unwrap();
+    let mut auth = [0u8; 2];
+    socks5.read_exact(&mut auth).await.unwrap();
+    assert_eq!(auth, [1, 0]);
+    let target_ip = match fixture.target {
+        SocketAddr::V4(address) => address.ip().octets().to_vec(),
+        SocketAddr::V6(_) => panic!("integration target must be IPv4"),
+    };
+    let mut connect_request = vec![5, 1, 0, 1];
+    connect_request.extend_from_slice(&target_ip);
+    connect_request.extend_from_slice(&fixture.target.port().to_be_bytes());
+    socks5.write_all(&connect_request).await.unwrap();
+    let mut socks5_reply = [0u8; 10];
+    socks5.read_exact(&mut socks5_reply).await.unwrap();
+    assert_eq!(socks5_reply[..2], [5, 0]);
+    socks5.write_all(b"socks5-inbound-payload").await.unwrap();
+    let mut socks5_echo = [0u8; 22];
+    socks5.read_exact(&mut socks5_echo).await.unwrap();
+    assert_eq!(&socks5_echo, b"socks5-inbound-payload");
+
+    let yuubinsya_stream = connect_loopback(yuubinsya_inbound).await;
+    let mut yuubinsya = AsyncYuubinsyaTcpSession::connect(
+        yuubinsya_stream,
+        yuhaiin_core::yuubinsya::derive_salt(YUUBINSYA_PASSWORD.as_bytes()),
+        Endpoint::ip(Network::Tcp, fixture.target),
+    )
+    .await
+    .unwrap();
+    yuubinsya
+        .write_all(b"yuubinsya-inbound-payload")
+        .await
+        .unwrap();
+    let mut yuubinsya_echo = [0u8; 25];
+    yuubinsya.read_exact(&mut yuubinsya_echo).await.unwrap();
+    assert_eq!(&yuubinsya_echo, b"yuubinsya-inbound-payload");
+
+    let connections = wait_for_connection(&service.client, &service.base_url).await;
+    let connections = connections["connections"].as_array().unwrap();
+    let socks5_connection = connections
+        .iter()
+        .find(|item| item["inboundName"] == "socks5-required-in")
+        .expect("SOCKS5 inbound connection must be visible");
+    assert_eq!(socks5_connection["inbound"], "socks5");
+    assert_eq!(socks5_connection["outbound"], "direct");
+    let yuubinsya_connection = connections
+        .iter()
+        .find(|item| item["inboundName"] == "yuubinsya-required-in")
+        .expect("Yuubinsya inbound connection must be visible");
+    assert_eq!(yuubinsya_connection["inbound"], "yuubinsya");
+    assert_eq!(yuubinsya_connection["outbound"], "direct");
+
+    yuubinsya.shutdown().await.unwrap();
+    socks5.shutdown().await.unwrap();
+    service.shutdown().await;
+    fixture.shutdown().await;
 }

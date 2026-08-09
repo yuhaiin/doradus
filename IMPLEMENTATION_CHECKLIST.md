@@ -141,7 +141,7 @@ flowchart LR
 
 | 状态 | 功能 | 当前结果 | 剩余工作 |
 | --- | --- | --- | --- |
-| `[x]` | inbound → router → outbound | HTTP/SOCKS5/SOCKS4A/Trojan/VLESS/Yuubinsya/TUN 都走共享 FlowContext 和 selector；有真实 loopback relay 回归；域名目标会按同一 resolver snapshot 先解析为 socket endpoint，同时保留原始域名供 TLS/HTTP2/Yuubinsya 使用；Podman 已验证 HTTP inbound → direct 的 IP/域名目标；`tests/service_chain.rs` 进一步用真实子进程/API 验证 HTTP inbound → route rule → HTTP CONNECT outbound、mixed inbound → SOCKS5 UDP → direct，以及 HTTP + mixed UDP → TLS + HTTP/2 + Yuubinsya UOT outbound，并检查 TCP/UDP connections 与 latency | 继续增加 Go fixture，不改变主链路 |
+| `[x]` | inbound → router → outbound | HTTP/SOCKS5/SOCKS4A/Trojan/VLESS/Yuubinsya/TUN 都走共享 FlowContext 和 selector；有真实 loopback relay 回归；域名目标会按同一 resolver snapshot 先解析为 socket endpoint，同时保留原始域名供 TLS/HTTP2/Yuubinsya 使用；Podman 已验证 HTTP inbound → direct 的 IP/域名目标；`tests/service_chain.rs` 进一步用真实子进程/API 验证 HTTP inbound → route rule → HTTP CONNECT outbound、认证 SOCKS5 TCP inbound → direct、Yuubinsya TCP inbound → direct、mixed inbound → SOCKS5 UDP → direct，以及 HTTP + mixed UDP → TLS + HTTP/2 + Yuubinsya UOT outbound，并检查 TCP/UDP connections 与 latency | 继续增加 Go fixture，不改变主链路 |
 | `[x]` | inbound settings | `store::InboundSettings`, `RuntimeSnapshot`, `ConnectionMonitor` | Go legacy `inbound_settings` 与 Rust overlay、前端 API、reload 已统一；`sniff` 影响公共 relay，DNS 三项同时作用于 TUN、socket inbound 和 Yuubinsya chain；reload 原子替换 resolver handler |
 | `[x]` | HTTP/2 pool | fixed endpoint、TLS identity、ALPN、multi-stream/multi-connection、idle/drain、GOAWAY replacement、metrics | h2 公共 API 无法主动发送 client GOAWAY，保持 application-level drain |
 | `[x]` | Yuubinsya reliability | migrate ID、coalesce、bounded retry/replay、UOT/native UDP、ping、服务端 demux、TLS/H2 listener | 主动 GOAWAY 同上；继续 Go 低版本 fixture |

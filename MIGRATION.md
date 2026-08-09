@@ -1696,3 +1696,25 @@ cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- -
 
 这些结果把 Linux/TUN、Android 交叉构建和 macOS 源码 target check 分开记录；平台行仍保持
 `[~]`，直到有对应系统的 native SDK、权限和设备运行证据。
+
+## 42. 2026-08-09 required inbound process-chain regression
+
+为避免只验证 HTTP inbound 而误判 inbound 矩阵已完成，`service_chain.rs` 新增一个真实
+子进程场景：通过 `/api/v2/inbounds` 同时写入带用户名密码的 SOCKS5 TCP inbound 和
+Yuubinsya TCP inbound，等待同一个 inbound owner reload 后分别完成协议握手，再经共享
+router/selector 的 direct 出口连接 loopback echo target。
+
+该场景确认：
+
+- SOCKS5 username/password negotiation、CONNECT response 和双向 relay 正常；
+- Yuubinsya header authentication、destination framing 和双向 relay 正常；
+- 两种 inbound 都进入同一个 `FlowContext`/`ConnectionMonitor`，connections 中的
+  `inbound`, `inboundName`, `outbound=direct` 字段正确；
+- listener 就绪通过可复用的 retry fixture 等待，不依赖固定 sleep，失败仍会保留
+  SQLite/cache 状态供 Podman 或本地复现。
+
+执行：
+
+```bash
+cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
+```

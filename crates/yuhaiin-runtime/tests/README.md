@@ -16,6 +16,9 @@ The current scenarios cover:
   same configured node.
 - mixed inbound → SOCKS5 UDP framing → direct UDP, including the Go-compatible
   mixed UDP mode and a conflicting default `127.0.0.1:1080` listener.
+- authenticated SOCKS5 TCP inbound and Yuubinsya TCP inbound → direct echo in
+  the same real runtime process, including protocol handshakes and live
+  inbound/outbound metadata.
 
 Run the tests from the repository root:
 
