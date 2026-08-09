@@ -261,7 +261,7 @@ fn recv_udp_now(
         .map_err(errno_to_io)?
         .find_map(|message| match message {
             ControlMessageOwned::Ipv4OrigDstAddr(address) => Some(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::from(address.sin_addr.s_addr.to_be_bytes())),
+                IpAddr::V4(decode_original_ipv4(address.sin_addr.s_addr)),
                 u16::from_be(address.sin_port),
             )),
             ControlMessageOwned::Ipv6OrigDstAddr(address) => Some(SocketAddr::new(
@@ -286,6 +286,13 @@ fn sockaddr_to_socket_addr(address: &SockaddrStorage) -> Option<SocketAddr> {
     address
         .as_sockaddr_in6()
         .map(|address| SocketAddr::new(IpAddr::V6(address.ip()), address.port()))
+}
+
+fn decode_original_ipv4(raw: u32) -> Ipv4Addr {
+    // Linux exposes the network-order address through a native-endian
+    // integer. `from_be` restores the integer representation expected by
+    // `Ipv4Addr::from` on every target endian.
+    Ipv4Addr::from(u32::from_be(raw))
 }
 
 async fn send_udp_reply(payload: &[u8], source: SocketAddr, destination: SocketAddr) -> Result<()> {
@@ -381,7 +388,10 @@ fn original_destination(stream: &TcpStream) -> Result<SocketAddr> {
             )
         })?;
         return Ok(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::from(raw.sin_addr.s_addr.to_be_bytes())),
+            // `sin_addr` is stored in network byte order but exposed as a
+            // native-endian integer by libc on Linux. Converting from network
+            // order avoids reversing 10.254.0.3 into 3.0.254.10.
+            IpAddr::V4(decode_original_ipv4(raw.sin_addr.s_addr)),
             u16::from_be(raw.sin_port),
         ));
     }
@@ -412,5 +422,11 @@ mod tests {
     async fn redir_listener_binds_an_ephemeral_tcp_port_without_transparent_capability() {
         let listener = bind_listener("127.0.0.1:0".parse().unwrap(), false).unwrap();
         assert_ne!(listener.local_addr().unwrap().port(), 0);
+    }
+
+    #[test]
+    fn original_destination_ipv4_decodes_network_order() {
+        let raw = u32::from_ne_bytes([10, 254, 0, 3]);
+        assert_eq!(decode_original_ipv4(raw), Ipv4Addr::new(10, 254, 0, 3));
     }
 }
