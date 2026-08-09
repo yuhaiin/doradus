@@ -36,18 +36,6 @@ const GO_STATISTICS_PROJECTION_RETRY_MAX: Duration = Duration::from_secs(60);
 const PERSISTENCE_KEY: &str = "statistics.runtime";
 const PERSISTENCE_VERSION: u32 = 1;
 
-const TELEMETRY_DIMENSIONS: [&str; 9] = [
-    "protocol",
-    "inbound",
-    "source",
-    "addr",
-    "outbound",
-    "process",
-    "rule",
-    "tag",
-    "destination",
-];
-
 /// Socket inbound tasks are spawned on Tokio's multithread executor. This
 /// runtime-local boundary deliberately requires a Send future while the core
 /// TUN API keeps its more permissive LocalBoxFuture contract.
@@ -688,19 +676,20 @@ impl ConnectionMonitor {
         entry.error = error.to_owned();
         entry.time = unix_seconds();
         let bucket = entry.time.div_euclid(3600) * 3600;
-        for (dimension, value) in [
-            ("protocol", protocol.to_owned()),
-            ("addr", host.to_owned()),
-            ("destination", host.to_owned()),
-        ] {
+        let connection = json!({
+            "network": {"connType": protocol},
+            "addr": host,
+            "destination": host,
+        });
+        for (dimension, value) in telemetry_dimensions(&connection) {
             let item = state
                 .telemetry
-                .entry((dimension.to_owned(), value.clone()))
+                .entry((dimension.clone(), value.clone()))
                 .or_default();
             item.2 = item.2.saturating_add(1);
             let item = state
                 .telemetry_buckets
-                .entry((bucket, dimension.to_owned(), value))
+                .entry((bucket, dimension, value))
                 .or_default();
             item.2 = item.2.saturating_add(1);
         }
@@ -808,16 +797,10 @@ impl ConnectionMonitor {
             self.mark_dirty();
             return;
         };
-        for dimension in TELEMETRY_DIMENSIONS {
-            let value = object
-                .get(dimension)
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("unknown")
-                .to_owned();
+        for (dimension, value) in telemetry_dimensions(&Value::Object(object)) {
             let item = state
                 .telemetry
-                .entry((dimension.to_owned(), value.clone()))
+                .entry((dimension.clone(), value.clone()))
                 .or_default();
             match direction {
                 TunFlowDirection::Upload => item.1 = item.1.saturating_add(bytes),
@@ -825,7 +808,7 @@ impl ConnectionMonitor {
             }
             let item = state
                 .telemetry_buckets
-                .entry((now.div_euclid(3600) * 3600, dimension.to_owned(), value))
+                .entry((now.div_euclid(3600) * 3600, dimension, value))
                 .or_default();
             match direction {
                 TunFlowDirection::Upload => item.1 = item.1.saturating_add(bytes),
@@ -978,8 +961,9 @@ impl ConnectionMonitor {
             .telemetry
             .into_iter()
             .map(|entry| {
+                let value = normalize_persisted_telemetry_value(&entry.dimension, entry.value);
                 (
-                    (entry.dimension, entry.value),
+                    (entry.dimension, value),
                     (entry.download, entry.upload, entry.failures),
                 )
             })
@@ -988,8 +972,9 @@ impl ConnectionMonitor {
             .telemetry_buckets
             .into_iter()
             .map(|entry| {
+                let value = normalize_persisted_telemetry_value(&entry.dimension, entry.value);
                 (
-                    (entry.bucket, entry.dimension, entry.value),
+                    (entry.bucket, entry.dimension, value),
                     (entry.download, entry.upload, entry.failures),
                 )
             })
@@ -1041,16 +1026,17 @@ impl ConnectionMonitor {
             );
         }
         for item in persisted.telemetry {
+            let value = normalize_persisted_telemetry_value(&item.dimension, item.value);
             let aggregate = state
                 .telemetry
-                .entry((item.dimension.clone(), item.value.clone()))
+                .entry((item.dimension.clone(), value.clone()))
                 .or_default();
             aggregate.0 = aggregate.0.saturating_add(item.download);
             aggregate.1 = aggregate.1.saturating_add(item.upload);
             aggregate.2 = aggregate.2.saturating_add(item.failures);
             let bucket = state
                 .telemetry_buckets
-                .entry((item.bucket, item.dimension, item.value))
+                .entry((item.bucket, item.dimension, value))
                 .or_default();
             bucket.0 = bucket.0.saturating_add(item.download);
             bucket.1 = bucket.1.saturating_add(item.upload);
@@ -1268,6 +1254,150 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
     })
 }
 
+/// Build the same telemetry dimensions as Go's `statistics.dimensionsForConnection`.
+///
+/// This is intentionally derived from the public connection contract instead of
+/// the internal flow/router structs. It keeps the persisted telemetry stable
+/// when a protocol adds metadata and makes FakeIP/domain handling identical for
+/// TUN and socket inbound flows.
+fn telemetry_dimensions(connection: &Value) -> Vec<(String, String)> {
+    let protocol = connection
+        .pointer("/network/connType")
+        .and_then(Value::as_str)
+        .or_else(|| connection.get("protocol").and_then(Value::as_str))
+        .unwrap_or_default();
+    let inbound = first_non_empty(&[
+        string_field(connection, "inboundName"),
+        string_field(connection, "inbound"),
+    ]);
+    let source = normalize_telemetry_source(&string_field(connection, "source"));
+    let addr = telemetry_addr(connection);
+    let outbound = first_non_empty(&[
+        string_field(connection, "nodeName"),
+        string_field(connection, "nodeId"),
+        string_field(connection, "outbound"),
+    ]);
+    let process = string_field(connection, "process");
+    let tag = string_field(connection, "tag");
+    let destination = telemetry_destination(connection);
+
+    let mut values = BTreeMap::new();
+    for (dimension, value) in [
+        ("protocol", protocol.to_owned()),
+        ("inbound", inbound),
+        ("source", source),
+        ("addr", addr),
+        ("outbound", outbound),
+        ("process", process),
+        ("tag", tag),
+        ("destination", destination),
+    ] {
+        if !value.is_empty() {
+            values.insert(dimension.to_owned(), value);
+        }
+    }
+    if let Some(rule) = connection
+        .get("matchHistory")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|match_value| match_value.get("ruleName").and_then(Value::as_str))
+        .filter(|rule| !rule.is_empty())
+        .last()
+    {
+        values.insert("rule".to_owned(), rule.to_owned());
+    }
+    values.into_iter().collect()
+}
+
+fn string_field(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn first_non_empty(values: &[String]) -> String {
+    values
+        .iter()
+        .find(|value| !value.is_empty())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn telemetry_addr(connection: &Value) -> String {
+    let addr = string_field(connection, "addr");
+    let fake_ip = string_field(connection, "fakeIp");
+    if !fake_ip.is_empty() && telemetry_host(&addr) == telemetry_host(&fake_ip) {
+        return first_non_empty(&[
+            string_field(connection, "domain"),
+            string_field(connection, "hosts"),
+        ]);
+    }
+    addr
+}
+
+fn telemetry_destination(connection: &Value) -> String {
+    if !string_field(connection, "fakeIp").is_empty() {
+        return String::new();
+    }
+    first_non_empty(&[
+        string_field(connection, "domain"),
+        string_field(connection, "hosts"),
+        string_field(connection, "destination"),
+        string_field(connection, "addr"),
+    ])
+}
+
+fn telemetry_host(value: &str) -> String {
+    if let Ok(address) = value.parse::<std::net::SocketAddr>() {
+        return address.ip().to_string();
+    }
+    if let Some((host, port)) = value.rsplit_once(':')
+        && !host.contains(':')
+        && is_decimal(port)
+    {
+        return host.trim_matches(['[', ']']).to_owned();
+    }
+    value.trim_matches(&['[', ']'][..]).to_owned()
+}
+
+fn normalize_telemetry_source(value: &str) -> String {
+    let mut value = value.trim().to_owned();
+    if let Some(rest) = value.strip_prefix("http2.h-")
+        && let Some(marker) = rest.find("-2")
+    {
+        value = rest[marker + 2..].to_owned();
+    }
+    if let Some(left) = value.rfind('[')
+        && let Some(right) = value[left + 1..].find(']')
+    {
+        return value[left + 1..left + 1 + right].to_owned();
+    }
+    if value.matches(':').count() == 1
+        && let Some(colon) = value.rfind(':')
+        && colon > 0
+        && colon + 1 < value.len()
+        && is_decimal(&value[colon + 1..])
+    {
+        return value[..colon].to_owned();
+    }
+    value
+}
+
+fn normalize_persisted_telemetry_value(dimension: &str, value: String) -> String {
+    if dimension == "source" {
+        normalize_telemetry_source(&value)
+    } else {
+        value
+    }
+}
+
+fn is_decimal(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn endpoint_string(endpoint: &Endpoint) -> String {
     endpoint.to_string()
 }
@@ -1471,7 +1601,68 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            9
+            5
+        );
+    }
+
+    #[test]
+    fn telemetry_dimensions_match_go_fakeip_and_route_projection() {
+        let connection = json!({
+            "network": {"connType": "tcp"},
+            "inbound": "socks5",
+            "inboundName": "Desktop SOCKS",
+            "source": "[2001:db8::2]:1234",
+            "addr": "198.18.0.1:443",
+            "fakeIp": "198.18.0.1",
+            "domain": "example.com",
+            "hosts": "hosts.example",
+            "destination": "203.0.113.10:443",
+            "outbound": "proxy",
+            "nodeId": "node-1",
+            "nodeName": "Tokyo",
+            "process": "/usr/bin/browser",
+            "tag": "streaming",
+            "matchHistory": [
+                {"ruleName": "first-rule"},
+                {"ruleName": "last-rule"}
+            ]
+        });
+
+        assert_eq!(
+            telemetry_dimensions(&connection),
+            vec![
+                ("addr".to_owned(), "example.com".to_owned()),
+                ("inbound".to_owned(), "Desktop SOCKS".to_owned()),
+                ("outbound".to_owned(), "Tokyo".to_owned()),
+                ("process".to_owned(), "/usr/bin/browser".to_owned()),
+                ("protocol".to_owned(), "tcp".to_owned()),
+                ("rule".to_owned(), "last-rule".to_owned()),
+                ("source".to_owned(), "2001:db8::2".to_owned()),
+                ("tag".to_owned(), "streaming".to_owned()),
+            ]
+        );
+        assert_eq!(telemetry_destination(&connection), "");
+    }
+
+    #[test]
+    fn telemetry_source_normalization_matches_go_http2_and_socket_forms() {
+        assert_eq!(
+            normalize_telemetry_source(" http2.h-ignored-2[2001:db8::4]:443 "),
+            "2001:db8::4"
+        );
+        assert_eq!(normalize_telemetry_source("192.0.2.4:1234"), "192.0.2.4");
+        assert_eq!(
+            normalize_telemetry_source("[2001:db8::4]:1234"),
+            "2001:db8::4"
+        );
+        assert_eq!(normalize_telemetry_source("unix-client"), "unix-client");
+        assert_eq!(
+            normalize_persisted_telemetry_value("source", "192.0.2.4:1234".to_owned()),
+            "192.0.2.4"
+        );
+        assert_eq!(
+            normalize_persisted_telemetry_value("addr", "example.com:443".to_owned()),
+            "example.com:443"
         );
     }
 
@@ -1818,7 +2009,7 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .len(),
-                9
+                5
             );
             assert_eq!(
                 reloaded.all_history_value()["items"]

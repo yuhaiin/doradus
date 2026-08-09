@@ -2137,3 +2137,19 @@ runtime-tun-closed name=yrtun0
 移除 `userId`，SQLite 中的原始 JSON 不变，因此 runtime 仍能使用并由未来 Go 读回。
 修复后 206 个生产节点、6 个 resolver、10 个 inbound、settings 和 totals 对照全部
 `identical`。该测试同时覆盖了 Rust 前台启动日志和 Go/Rust 独立状态目录约束。
+
+## 61. 2026-08-10 Go telemetry dimension projection
+
+Rust 的连接和流量数据面此前会为缺失字段写入 `unknown` telemetry 维度，并直接使用
+`source`、FakeIP 地址和原始 route metadata；这与 Go
+`statistics.dimensionsForConnection` 的非空过滤、`inboundName`/`nodeName` 优先级、
+FakeIP 地址回退、destination 忽略和最后一个非空 rule 语义不同。
+
+`ConnectionMonitor` 现在从公开 connection contract 统一生成 telemetry dimensions：
+source 支持 IPv4/IPv6、端口和 Go HTTP/2 `http2.h-*` 形式的归一化；FakeIP 目标优先使用
+domain/hosts 作为 `addr`，并不写入 `destination`；旧 Rust checkpoint 恢复时也会归一化
+source。failure telemetry 复用同一维度构造，避免正常流量和失败流量产生两套 key。
+
+验证结果：monitor 相关 23 个单测通过，真实 `service_chain` 7 个测试通过，统计并发读者、
+流量更新、停止和 SQLite 重启读回测试通过。此次只使用项目 cache-owned target 和测试目录，
+没有使用 `/tmp`。
