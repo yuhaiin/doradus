@@ -1,9 +1,13 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split};
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf, split,
+};
 
 use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
@@ -91,10 +95,10 @@ where
 }
 
 pub(crate) async fn relay_counted_with_prefix<A, B>(
-    left: A,
+    mut left: A,
     right: B,
     flow: TunFlowKey,
-    context: FlowContext,
+    mut context: FlowContext,
     monitor: Arc<ConnectionMonitor>,
     prefix: &[u8],
 ) -> std::io::Result<()>
@@ -102,6 +106,15 @@ where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let sniffed = sniff_stream(&mut left).await;
+    let metadata = yuhaiin_core::sniff::inspect(&sniffed);
+    if context.tls_server_name.is_none() {
+        context.tls_server_name = metadata.tls_server_name;
+    }
+    if context.http_host.is_none() {
+        context.http_host = metadata.http_host;
+    }
+    let left = PrefixedStream::new(sniffed, left);
     let _observation = FlowObserverGuard::open(monitor.clone(), TunFlow { key: flow }, context);
     let (mut left_read, mut left_write) = split(left);
     let (mut right_read, mut right_write) = split(right);
@@ -125,6 +138,173 @@ where
     );
     let result = tokio::try_join!(upload, download).map(|_| ());
     result
+}
+
+const SNIFF_TIMEOUT: Duration = Duration::from_millis(55);
+const SNIFF_BUFFER_SIZE: usize = 16 * 1024;
+
+async fn sniff_stream<S>(stream: &mut S) -> Vec<u8>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut bytes = vec![0; SNIFF_BUFFER_SIZE];
+    match tokio::time::timeout(SNIFF_TIMEOUT, stream.read(&mut bytes)).await {
+        Ok(Ok(length)) => {
+            bytes.truncate(length);
+            bytes
+        }
+        Ok(Err(_)) | Err(_) => Vec::new(),
+    }
+}
+
+struct PrefixedStream<S> {
+    prefix: Vec<u8>,
+    offset: usize,
+    inner: S,
+}
+
+impl<S> PrefixedStream<S> {
+    fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix,
+            offset: 0,
+            inner,
+        }
+    }
+}
+
+impl<S> AsyncRead for PrefixedStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.offset < self.prefix.len() {
+            let length = (self.prefix.len() - self.offset).min(buf.remaining());
+            buf.put_slice(&self.prefix[self.offset..self.offset + length]);
+            self.offset += length;
+            return Poll::Ready(Ok(()));
+        }
+        let inner = Pin::new(&mut self.inner);
+        inner.poll_read(_cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for PrefixedStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn relay_sniffs_http_host_before_open_without_dropping_prefix() {
+        let (mut client, relay_left) = duplex(4096);
+        let (relay_right, mut remote) = duplex(4096);
+        let monitor = Arc::new(ConnectionMonitor::new());
+        let flow = TunFlowKey {
+            network: Network::Tcp,
+            source: "127.0.0.1:41000".parse().unwrap(),
+            destination: "127.0.0.1:41001".parse().unwrap(),
+        };
+        let context = FlowContext::new(Endpoint::ip(Network::Tcp, flow.destination));
+        let relay = tokio::spawn(relay_counted(
+            relay_left,
+            relay_right,
+            flow,
+            context,
+            monitor.clone(),
+        ));
+        let request = b"GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut received = vec![0; request.len()];
+        remote.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, request);
+        assert_eq!(
+            monitor.connections_value()["connections"][0]["httpHost"],
+            "example.com"
+        );
+
+        remote.write_all(b"ok").await.unwrap();
+        remote.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"ok");
+        relay.await.unwrap().unwrap();
+        assert!(
+            monitor.connections_value()["connections"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_does_not_wait_for_silent_peer_past_sniff_deadline() {
+        let (mut client, relay_left) = duplex(4096);
+        let (relay_right, mut remote) = duplex(4096);
+        let monitor = Arc::new(ConnectionMonitor::new());
+        let flow = TunFlowKey {
+            network: Network::Tcp,
+            source: "127.0.0.1:41002".parse().unwrap(),
+            destination: "127.0.0.1:41003".parse().unwrap(),
+        };
+        let context = FlowContext::new(Endpoint::ip(Network::Tcp, flow.destination));
+        let relay = tokio::spawn(relay_counted(
+            relay_left,
+            relay_right,
+            flow,
+            context,
+            monitor.clone(),
+        ));
+
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if monitor.connections_value()["connections"]
+                    .as_array()
+                    .is_some_and(|connections| !connections.is_empty())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("relay should open after the bounded sniff deadline");
+
+        client.write_all(b"ping").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        remote.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"ping");
+        remote.shutdown().await.unwrap();
+        client.read_to_end(&mut Vec::new()).await.unwrap();
+        relay.await.unwrap().unwrap();
+    }
 }
 
 async fn copy_counted<R, W>(

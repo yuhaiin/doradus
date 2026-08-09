@@ -32,6 +32,7 @@ pub mod process;
 pub mod proxy;
 #[cfg(feature = "async-proxy")]
 pub mod proxy_factory;
+pub mod sniff;
 #[cfg(feature = "tls-rustcrypto")]
 pub mod tls;
 #[cfg(feature = "tun")]

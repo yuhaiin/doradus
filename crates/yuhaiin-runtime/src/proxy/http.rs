@@ -98,7 +98,7 @@ where
     let mut context = FlowContext::new(destination.clone());
     context.source = Some(source);
     context.original_domain = destination.host().cloned();
-    context.http_host = header_value(&headers, "host").map(ToOwned::to_owned);
+    context.http_host = yuhaiin_core::sniff::http_host(headers.as_bytes());
     spec.annotate_context(&mut context);
     selector.route_context(&mut context);
     let outbound = match selector.select(&context).connect(&context).await {
