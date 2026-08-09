@@ -100,6 +100,7 @@ async fn run() -> Result<()> {
     if let Err(error) = inbound_task.await.map_err(join_error)? {
         logs.error(format!("inbound task stopped: {error}"));
     }
+    controller.persist_monitor().await?;
     if let Some(source) = controller.take_restore_request() {
         restore_database(source, &database).await?;
     }

@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, watch};
 
 use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
@@ -53,6 +53,13 @@ struct ConnectionEntry {
     value: Value,
     upload: u64,
     download: u64,
+}
+
+struct PersistenceState {
+    store: ConfigStore,
+    dirty: Arc<Notify>,
+    shutdown: watch::Sender<bool>,
+    worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Default)]
@@ -133,7 +140,7 @@ pub struct ConnectionMonitor {
     events: broadcast::Sender<MonitorEvent>,
     close_events: broadcast::Sender<TunFlowKey>,
     logs: RuntimeLog,
-    persistence: Option<Arc<Notify>>,
+    persistence: Option<Arc<PersistenceState>>,
 }
 
 impl Default for ConnectionMonitor {
@@ -177,24 +184,77 @@ impl ConnectionMonitor {
             monitor.restore_persisted(persisted);
         }
 
-        let notify = Arc::new(Notify::new());
+        let dirty = Arc::new(Notify::new());
+        let (shutdown, mut shutdown_rx) = watch::channel(false);
+        let persistence = Arc::new(PersistenceState {
+            store,
+            dirty,
+            shutdown,
+            worker: AsyncMutex::new(None),
+        });
         let mut persistent = monitor.clone();
-        persistent.persistence = Some(notify.clone());
+        persistent.persistence = Some(persistence.clone());
         let writer_monitor = persistent.clone();
-        tokio::spawn(async move {
+        let worker_persistence = persistence.clone();
+        let worker = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(2));
             loop {
                 tokio::select! {
-                    _ = notify.notified() => {},
+                    _ = worker_persistence.dirty.notified() => {},
                     _ = interval.tick() => {},
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
                 }
                 let value = writer_monitor.persisted_json();
                 if let Ok(bytes) = serde_json::to_vec(&value) {
-                    let _ = store.put_config(PERSISTENCE_KEY, &bytes).await;
+                    let _ = worker_persistence
+                        .store
+                        .put_config(PERSISTENCE_KEY, &bytes)
+                        .await;
                 }
             }
         });
+        *persistence.worker.lock().await = Some(worker);
         Ok(persistent)
+    }
+
+    /// Flush the current counters/history and stop the owned persistence task.
+    ///
+    /// The runtime calls this after inbound/DNS owners have stopped and before
+    /// a backup restore can replace the database. This closes the low-traffic
+    /// window where the old periodic-only writer could lose the final flow.
+    pub async fn shutdown(&self) -> yuhaiin_core::Result<()> {
+        let Some(persistence) = self.persistence.clone() else {
+            return Ok(());
+        };
+        let worker = persistence.worker.lock().await.take();
+        let _ = persistence.shutdown.send(true);
+        self.persist_now().await?;
+        if let Some(worker) = worker {
+            worker.await.map_err(|error| {
+                yuhaiin_core::Error::new(
+                    yuhaiin_core::ErrorKind::Storage,
+                    format!("statistics persistence task: {error}"),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn persist_now(&self) -> yuhaiin_core::Result<()> {
+        let Some(persistence) = self.persistence.clone() else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(&self.persisted_json()).map_err(|error| {
+            yuhaiin_core::Error::new(
+                yuhaiin_core::ErrorKind::Storage,
+                format!("statistics state serialization: {error}"),
+            )
+        })?;
+        persistence.store.put_config(PERSISTENCE_KEY, &bytes).await
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<MonitorEvent> {
@@ -730,8 +790,8 @@ impl ConnectionMonitor {
     }
 
     fn mark_dirty(&self) {
-        if let Some(notify) = self.persistence.as_ref() {
-            notify.notify_one();
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.dirty.notify_one();
         }
     }
 
@@ -1133,7 +1193,7 @@ mod tests {
             monitor.opened(flow, context);
             monitor.bytes(flow.key, TunFlowDirection::Upload, 13);
             monitor.closed(flow.key);
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            monitor.shutdown().await.unwrap();
 
             let reloaded = ConnectionMonitor::load_with_store(store).await.unwrap();
             assert_eq!(reloaded.total_flow_value()["upload"], "13");
@@ -1152,6 +1212,7 @@ mod tests {
                     .len(),
                 1
             );
+            reloaded.shutdown().await.unwrap();
         });
     }
 }

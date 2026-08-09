@@ -25,6 +25,7 @@
 - [x] 第一版管理面与可执行服务：`yuhaiin-runtime` 提供与 `yuhaiin-react` 现有 client 对齐的 `/api/v2/rpc/<operation>`，可管理 nodes/outbounds、inbounds、resolvers、hosts/FakeDNS、route config/lists/rules/tags、settings 和 TUN 配置；`yuhaiin` binary 负责 SQLite、runtime reload、HTTP listener、可选 DNS UDP server 和 `tun-rs + smoltcp` 数据面启动
 - [x] Inbound 运行时统一 owner：`yuhaiin-runtime::inbound::run_until` 同时拥有 TUN、TCP/HTTP/WebSocket/HTTP2 和 UDP listener；accepted TCP/WebSocket flow 由 listener `JoinSet` 管理，reload/shutdown/abort 不遗留 live connection；`FlowObserverGuard` 覆盖强制取消后的 monitor close/history/SSE/traffic，Yuubinsya HTTP/2 多 stream 共享 listener 级 server/migrate session
 - [x] 管理面真实运行验收：Podman Debian testing host-network smoke 已验证 HTTP inbound→direct outbound、SQLite restart readback、live connections 查询、数字 ID close、connections SSE 初始/新增/移除事件，以及 inbound PUT reload 后旧端口关闭、新端口可用；临时目录统一使用 `~/.cache`，不使用 `/tmp`
+- [x] 统计持久化生命周期：`ConnectionMonitor` 拥有可等待的 SQLite writer，服务在 inbound/DNS owner 收敛后执行 final flush 并等待 writer，再进行 backup restore；单测和 Podman 立即退出/重启 smoke 均验证最后一条 history、traffic 不依赖 2 秒周期即可读回
 
 ## 未完成项与下一阶段计划
 

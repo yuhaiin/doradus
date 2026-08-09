@@ -60,6 +60,12 @@ impl RuntimeController {
         self.monitor.clone()
     }
 
+    /// Flush and stop the monitor's owned SQLite persistence task after all
+    /// data-plane owners have been joined.
+    pub async fn persist_monitor(&self) -> Result<()> {
+        self.monitor.shutdown().await
+    }
+
     /// Close the runtime instance associated with a node without deleting its
     /// persisted configuration.  Rust proxy instances are held by immutable
     /// selector snapshots rather than a Go-style node map; publishing a fresh
