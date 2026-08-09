@@ -2839,7 +2839,7 @@ fn default_route_config() -> Value {
     json!({"directResolver":"", "proxyResolver":"", "resolveLocally":false, "udpProxyFqdnStrategy":"default"})
 }
 fn default_settings() -> Value {
-    json!({"ipv6":false,"useDefaultInterface":true,"netInterface":"","pprof":false,"systemProxy":{"http":false,"socks5":false},"logcat":{"level":"info","save":false,"ignoreTimeoutError":false,"ignoreDnsError":false},"advanced":{"udpBufferSize":2048,"relayBufferSize":4096,"udpRingbufferSize":250,"happyEyeballsSemaphore":250},"backup":{"instanceName":"","interval":0,"lastBackupHash":""}})
+    json!({"ipv6":false,"useDefaultInterface":true,"netInterface":"","pprof":true,"systemProxy":{"http":false,"socks5":false},"logcat":{"level":"info","save":false,"ignoreTimeoutError":false,"ignoreDnsError":false},"advanced":{"udpBufferSize":2048,"relayBufferSize":4096,"udpRingbufferSize":250,"happyEyeballsSemaphore":250},"backup":{"instanceName":"","interval":0,"lastBackupHash":""}})
 }
 fn default_inbound_config() -> Value {
     json!({"port":0,"bind":"127.0.0.1"})

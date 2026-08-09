@@ -886,6 +886,7 @@ mod tests {
 
     fn snapshot(config: GoProxyRuntimeConfig) -> RuntimeSnapshot {
         RuntimeSnapshot {
+            settings: crate::RuntimeSettings::default(),
             resolver: Arc::new(SystemAsyncIpResolver),
             hosts: yuhaiin_core::dns_hosts::HostsTable::new(),
             fakeip: None,

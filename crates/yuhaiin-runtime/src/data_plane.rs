@@ -89,7 +89,10 @@ pub struct TunRuntimeConfig {
 /// `AsyncDevice::from_fd`, then call [`run_tun_device_until`].
 #[cfg(feature = "tun")]
 pub async fn load_tun_config(store: &yuhaiin_store::ConfigStore) -> Result<TunRuntimeConfig> {
-    if let Some(config) = load_go_tun_config(store).await? {
+    if let Some(mut config) = load_go_tun_config(store).await? {
+        if !crate::RuntimeSettings::load(store).await?.ipv6 {
+            config.tun.ipv6.clear();
+        }
         return Ok(config);
     }
     let value = store
@@ -121,7 +124,7 @@ pub async fn load_tun_config(store: &yuhaiin_store::ConfigStore) -> Result<TunRu
             .and_then(Value::as_u64)
             .unwrap_or(256) as usize,
     };
-    Ok(TunRuntimeConfig {
+    let mut config = TunRuntimeConfig {
         enabled,
         tun,
         routes: Vec::new(),
@@ -148,7 +151,11 @@ pub async fn load_tun_config(store: &yuhaiin_store::ConfigStore) -> Result<TunRu
             .get("channelCapacity")
             .and_then(Value::as_u64)
             .unwrap_or(256) as usize,
-    })
+    };
+    if !crate::RuntimeSettings::load(store).await?.ipv6 {
+        config.tun.ipv6.clear();
+    }
+    Ok(config)
 }
 
 /// Read the Go v6 plain-contract TUN inbound first. `tun.runtime` remains a
@@ -476,6 +483,10 @@ mod tests {
             .put_config("tun.runtime", &serde_json::to_vec(&value).unwrap())
             .await
             .unwrap();
+        store
+            .put_config("settings", br#"{"ipv6":true}"#)
+            .await
+            .unwrap();
 
         let config = load_tun_config(&store).await.unwrap();
         assert!(config.enabled);
@@ -521,6 +532,10 @@ mod tests {
                 updated_at: 1,
                 data_json: serde_json::to_vec(&value).unwrap(),
             })
+            .await
+            .unwrap();
+        store
+            .put_config("settings", br#"{"ipv6":true}"#)
             .await
             .unwrap();
 

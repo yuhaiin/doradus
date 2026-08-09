@@ -25,6 +25,7 @@ mod resolver;
 mod route;
 #[cfg(feature = "doh-tls")]
 mod rustcrypto_resolver;
+mod settings;
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -75,6 +76,7 @@ pub use route::{
 };
 #[cfg(feature = "doh-tls")]
 pub use rustcrypto_resolver::RustCryptoResolverFactory;
+pub use settings::{Ipv6PolicyResolver, RuntimeSettings};
 
 /// Runtime-only knobs that are not part of the persisted Go schema.
 #[derive(Debug, Clone)]
@@ -114,6 +116,7 @@ impl Default for RuntimeBuildOptions {
 /// load. Existing flows can keep using an older snapshot during reload.
 #[derive(Clone)]
 pub struct RuntimeSnapshot {
+    pub settings: RuntimeSettings,
     pub resolver: Arc<dyn AsyncIpResolver>,
     pub hosts: HostsTable,
     pub fakeip: Option<FakeIpPools>,
@@ -266,6 +269,7 @@ impl RuntimeBuilder {
 
     pub async fn build(&self) -> Result<RuntimeSnapshot> {
         let repository = self.store.repository();
+        let settings = RuntimeSettings::load(&self.store).await?;
         let nat = repository.get_nat_config_or_default("default").await?;
         let hosts = load_hosts(&repository, &self.store).await?;
         let resolvers = repository.list_go_resolver_runtime_configs().await?;
@@ -326,6 +330,7 @@ impl RuntimeBuilder {
             &hosts,
             fakeip.as_ref(),
             self.options.fakeip_skip_check_upstream,
+            settings.ipv6,
         );
         let mut resolver_by_id = BTreeMap::new();
         let mut resolver_errors = BTreeMap::new();
@@ -339,6 +344,7 @@ impl RuntimeBuilder {
                             &hosts,
                             fakeip.as_ref(),
                             self.options.fakeip_skip_check_upstream,
+                            settings.ipv6,
                         );
                         let wrapped = if self.options.resolver_query_fallback {
                             Arc::new(FallbackResolver::new(wrapped, resolver.clone()))
@@ -365,6 +371,7 @@ impl RuntimeBuilder {
         )?;
         Ok(RuntimeSnapshot {
             resolver,
+            settings,
             hosts,
             fakeip,
             resolvers,
@@ -392,6 +399,7 @@ fn wrap_resolver(
     hosts: &HostsTable,
     fakeip: Option<&FakeIpPools>,
     skip_check_upstream: bool,
+    ipv6_enabled: bool,
 ) -> Arc<dyn AsyncIpResolver> {
     let upstream = match fakeip {
         Some(pools) => Arc::new(FakeIpResolver::new(
@@ -401,7 +409,9 @@ fn wrap_resolver(
         )) as Arc<dyn AsyncIpResolver>,
         None => upstream,
     };
-    Arc::new(AsyncHostsResolver::new(hosts.clone(), upstream))
+    let upstream =
+        Arc::new(AsyncHostsResolver::new(hosts.clone(), upstream)) as Arc<dyn AsyncIpResolver>;
+    Arc::new(Ipv6PolicyResolver::new(upstream, ipv6_enabled))
 }
 
 async fn load_hosts(
@@ -526,7 +536,7 @@ async fn load_fakeip_config(
 mod tests {
     use super::*;
     use std::future::Future;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
     use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
@@ -619,6 +629,50 @@ mod tests {
         assert!(snapshot.fakeip.is_none());
         assert!(snapshot.proxies.is_empty());
         assert!(snapshot.resolver_by_id.is_empty());
+    }
+
+    struct DualStackResolver;
+
+    impl AsyncIpResolver for DualStackResolver {
+        fn resolve<'a>(
+            &'a self,
+            _domain: &'a DomainName,
+            _strategy: ResolveStrategy,
+        ) -> BoxFuture<'a, Result<IpSet>> {
+            Box::pin(async {
+                Ok(IpSet {
+                    v4: vec![Ipv4Addr::new(192, 0, 2, 55)],
+                    v6: vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 55)],
+                })
+            })
+        }
+    }
+
+    #[test]
+    fn settings_ipv6_is_published_and_applied_to_the_shared_resolver() {
+        let store = block_on(ConfigStore::open_memory()).unwrap();
+        block_on(store.put_config("settings", br#"{"ipv6":false}"#)).unwrap();
+        let snapshot =
+            block_on(RuntimeBuilder::new(store.clone(), Arc::new(DualStackResolver)).build())
+                .unwrap();
+        assert!(!snapshot.settings.ipv6);
+        let domain = DomainName::new("example.com").unwrap();
+        let resolved =
+            block_on(snapshot.resolver.resolve(&domain, ResolveStrategy::Default)).unwrap();
+        assert_eq!(resolved.v4.len(), 1);
+        assert!(resolved.v6.is_empty());
+
+        block_on(store.put_config("settings", br#"{"ipv6":true}"#)).unwrap();
+        let snapshot =
+            block_on(RuntimeBuilder::new(store, Arc::new(DualStackResolver)).build()).unwrap();
+        assert!(snapshot.settings.ipv6);
+        assert_eq!(
+            block_on(snapshot.resolver.resolve(&domain, ResolveStrategy::Default))
+                .unwrap()
+                .v6
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -746,6 +800,7 @@ mod tests {
             .unwrap(),
         );
         let snapshot = RuntimeSnapshot {
+            settings: RuntimeSettings::default(),
             resolver: main,
             hosts: HostsTable::new(),
             fakeip: None,
