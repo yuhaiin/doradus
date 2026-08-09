@@ -16,6 +16,7 @@
 > 2026-08-09 管理面补齐 `tools.interfaces` 的替换契约：Go 返回所有非 loopback 接口及其 `net.Interface.Addrs()` CIDR 字符串；Rust 现在在 Linux 通过纯 Rust netlink packet API 读取 RTM_GETADDR，同时使用 sysfs 的接口索引映射名称，覆盖 IPv4/IPv6、无地址接口和 loopback 过滤。实现位于 `yuhaiin-runtime::interfaces`，API 继续直接序列化共享 `InterfaceInfo`，没有新增 HTTP DTO；netlink 不可用时回退到无 loopback 的 sysfs/IPv6 发现。`cargo test -p yuhaiin-runtime --all-features --offline` 已通过 117 个 runtime 单测及 7 个 DoH 集成测试，最小 `http-api` library 构建也已验证。
 
 > 2026-08-09 inbound 生命周期收口：TUN 不再由 binary 单独启动；`yuhaiin-runtime::inbound::run_until` 与 SOCKS5、HTTP、Yuubinsya、WebSocket、HTTP/2 listener 共享同一个 inbound owner。普通 TCP/WebSocket accepted task 由 `JoinSet` 归属 listener，reload/shutdown/abort 会回收子任务；`yuhaiin-core::flow::FlowObserverGuard` 让正常结束、管理面 close 和强制取消都能完成 monitor close、history/SSE/traffic 收敛。Yuubinsya server 也提升到 listener 级，HTTP/2 多 stream 可共享 migrate ID 的 UDP session，listener 结束时显式 close 上游 session。runtime 新增 listener abort 后 live connection 清理回归；`yuhaiin-runtime` 117 个单测、`yuhaiin-chain` 42 个单测和 `yuhaiin-core` 116 个单测均通过。Podman 特权无网络容器中 `tun-smoke` 的真实 TUN 创建/关闭和 route smoke 也通过。
+> 2026-08-09 TUN 配置边界收口：Go 的 `inbounds_v2` 中 `network.type=empty`、`protocol.type=tun` 现在是 Rust TUN supervisor 的主配置源，按 Go `TunProtocol` 读取 `tun://` 名称、`portal`/`portalV6`、`routes`/`excludes`；旧 `tun.runtime` 仅作为没有 Go TUN inbound 时的兼容回退。普通 TCP/UDP listener 会跳过 TUN record，单设备 runtime 遇到多个 TUN record fail-closed。新增 Go inbound 配置解析回归，runtime 全部 118 个单测和 7 个 DoH 集成测试通过；此前 Podman 特权无网络容器中的真实 TUN 创建/关闭及 route smoke 仍通过。
 
 ## 1. 目标、边界和完成定义
 
@@ -753,7 +754,7 @@ Content-Type: application/json
 Rust 版管理面位于 `yuhaiin-runtime::api`，不要求前端改写。第一版已覆盖：
 
 - `nodes.*` / `node.*`：作为 outbound/node 管理，保存 Go `nodes_v2` 兼容行；
-- `inbounds.*`：保存并回读 Go `inbounds_v2` 原始 JSON，TUN、SOCKS5、HTTP proxy、Yuubinsya 及其 transport listener 都由同一 inbound supervisor 组装；
+- `inbounds.*`：保存并回读 Go `inbounds_v2` 原始 JSON，TUN、SOCKS5、HTTP proxy、Yuubinsya 及其 transport listener 都由同一 inbound supervisor 组装；TUN 使用 `network.type=empty` + `protocol.type=tun`，而不是新的 Rust 专属配置表；
 - `resolvers.*`、`resolver.hosts.*`、`resolver.fakedns.*`、`resolver.server.*`：UDP/TCP/System 和可选 RustCrypto DoH/DoT registry；
 - `route.config.*`、`route.lists.*`、`route.rules.*`、`route.tags.*`：规则/列表原文持久化，常见 domain/CIDR/host-list 表达式编译到当前 Router；
 - `settings.*`、`tun.config.*`、`info`：管理进程和数据面启动配置。
@@ -770,7 +771,7 @@ cargo run -p yuhaiin-runtime --bin yuhaiin --all-features
 
 默认监听 `127.0.0.1:18080`，数据库使用 `$XDG_DATA_HOME/yuhaiin-rust/state.sqlite`，没有 `XDG_DATA_HOME` 时使用 `~/.local/share/yuhaiin-rust/state.sqlite`。`YUHAIIN_HTTP` 和 `YUHAIIN_DB` 可覆盖这两个值；测试和迁移临时文件放在 `~/.cache`，不使用 `/tmp`。
 
-设置 `YUHAIIN_TUN=1` 或写入 `tun.runtime.enabled=true` 后，`inbound::run_until` 启动单一路径 `tun-rs AsyncDevice + smoltcp`，从同一个 runtime snapshot 组装 selector、Full Cone NAT 和 DNS handler；配置 reload 会由同一个 inbound owner 关闭旧设备/dispatcher 后重建。TUN 的 `ipv4` 可写成 `10.0.0.1/24` 或 `{address,prefix}`；第一版默认 MTU 1500、单队列、有界 channel。系统权限、route 和设备创建失败会 fail-closed，不能把失败降级成 direct。
+写入 Go `inbounds_v2` 的 TUN record（`network.type=empty`、`protocol.type=tun`）后，或在兼容场景设置 `YUHAIIN_TUN=1`/`tun.runtime.enabled=true`，`inbound::run_until` 启动单路径 `tun-rs AsyncDevice + smoltcp`，从同一个 runtime snapshot 组装 selector、Full Cone NAT 和 DNS handler；配置 reload 会由同一个 inbound owner 关闭旧设备/dispatcher 后重建。Go TUN 的 `name` 支持 `tun://tun0`（会剥离 scheme），`portal`/`portalV6` 写入 IPv4/IPv6 地址，`routes` 与 `excludes` 走同一可回滚 route lease；旧 `tun.runtime` 仍支持 `ipv4`/`ipv6` 对象形式。第一版默认 MTU 1500、单队列、有界 channel；当前单设备 runtime 对多个 TUN record fail-closed。系统权限、route 和设备创建失败会 fail-closed，不能把失败降级成 direct。
 
 ## 8. Proxy 迁移顺序与契约
 

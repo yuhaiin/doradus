@@ -22,8 +22,6 @@ use tokio::sync::watch;
 
 use yuhaiin_core::process::{ProcessResolver, default_process_resolver};
 use yuhaiin_core::proxy::BoxAsyncStream;
-#[cfg(feature = "tun")]
-use yuhaiin_core::tun::TunRuntime;
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Result};
 use yuhaiin_store::GoInboundRecord;
 
@@ -176,8 +174,7 @@ async fn run_tun_supervisor(
             }
             continue;
         }
-        let tun = TunRuntime::open(config.tun.clone())
-            .map_err(|error| Error::new(ErrorKind::Io, format!("open TUN inbound: {error}")))?;
+        let tun = crate::data_plane::open_tun(&config)?;
         crate::run_tun_device_until(controller.clone(), tun, config, shutdown.clone()).await?;
         if *shutdown.borrow() {
             return Ok(());
@@ -195,7 +192,10 @@ async fn start_listeners(
         .await?;
     let monitor = controller.monitor();
     let mut listeners = Vec::new();
-    for record in records.into_iter().filter(|record| record.enabled) {
+    for record in records
+        .into_iter()
+        .filter(|record| record.enabled && !record.protocol_type.eq_ignore_ascii_case("tun"))
+    {
         let mut spec = match InboundSpec::from_record(record.clone()) {
             Ok(spec) => spec,
             Err(error) => {
