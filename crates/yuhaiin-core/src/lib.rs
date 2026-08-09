@@ -283,6 +283,7 @@ pub struct FlowContext {
     /// Management-plane identity of the component that accepted the flow.
     /// These fields are optional so packet-only callers do not need a second
     /// DTO or synthetic values.
+    pub component: Option<String>,
     pub inbound: Option<String>,
     pub inbound_name: Option<String>,
     pub outbound: Option<String>,
@@ -307,6 +308,7 @@ impl FlowContext {
             route_mode: RouteMode::Proxy,
             resolver_policy: ResolverPolicy::default(),
             original_domain: None,
+            component: None,
             inbound: None,
             inbound_name: None,
             outbound: None,

@@ -1035,6 +1035,9 @@ impl TunProxyRuntime {
 
     fn context_for_flow(&self, flow: TunFlow) -> crate::FlowContext {
         let mut context = (self.context_provider)(flow);
+        if context.component.is_none() {
+            context.component = Some("tun".to_owned());
+        }
         let needs_process =
             context.process.is_none() || context.process_id.is_none() || context.user_id.is_none();
         if needs_process {

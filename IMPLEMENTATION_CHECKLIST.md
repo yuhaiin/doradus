@@ -27,6 +27,7 @@
 - [x] 管理面真实运行验收：Podman Debian testing host-network smoke 已验证 HTTP inbound→direct outbound、SQLite restart readback、live connections 查询、数字 ID close、connections SSE 初始/新增/移除事件，以及 inbound PUT reload 后旧端口关闭、新端口可用；临时目录统一使用 `~/.cache`，不使用 `/tmp`
 - [x] 统计持久化生命周期：`ConnectionMonitor` 拥有可等待的 SQLite writer，服务在 inbound/DNS owner 收敛后执行 final flush 并等待 writer，再进行 backup restore；单测和 Podman 立即退出/重启 smoke 均验证最后一条 history、traffic 不依赖 2 秒周期即可读回
 - [x] TUN inbound 服务级验收：管理 API 写入 Go `inbounds_v2` 的 `empty/tun` 后，privileged `--network=none` runtime 通过 `inbound::run_until` 真实创建命名 TUN；`/sys/class/net`、SIGTERM graceful shutdown、设备消失和同名设备重新打开均通过，supervisor 失败也会进入 monitor 日志
+- [x] 连接元数据契约：普通 HTTP/SOCKS5/Yuubinsya inbound 的 `component` 保持空值，TUN flow 才输出 `component=tun` 并默认 `inbound=tun/inboundName=TUN`；monitor 序列化与 TUN 上下文注入均有回归测试
 
 ## 未完成项与下一阶段计划
 

@@ -44,6 +44,7 @@ fn proxy_runtime_enriches_context_with_injected_process_metadata() {
         },
     };
     let context = runtime.context_for_flow(flow);
+    assert_eq!(context.component.as_deref(), Some("tun"));
     assert_eq!(context.process.as_deref(), Some("/usr/bin/test-client"));
     assert_eq!(context.process_id, Some(42));
     assert_eq!(context.user_id, Some(1000));

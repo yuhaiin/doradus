@@ -925,8 +925,17 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         .as_ref()
         .map(ToString::to_string)
         .unwrap_or_default();
-    let inbound = context.inbound.as_deref().unwrap_or("tun");
-    let inbound_name = context.inbound_name.as_deref().unwrap_or("TUN");
+    let is_tun = context.component.as_deref() == Some("tun");
+    let inbound = context
+        .inbound
+        .as_deref()
+        .or_else(|| is_tun.then_some("tun"))
+        .unwrap_or_default();
+    let inbound_name = context
+        .inbound_name
+        .as_deref()
+        .or_else(|| is_tun.then_some("TUN"))
+        .unwrap_or_default();
     let outbound = context
         .outbound
         .as_deref()
@@ -955,7 +964,7 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         "uid": context.user_id.map(|value| value.to_string()).unwrap_or_default(),
         "tlsServerName": "",
         "httpHost": "",
-        "component": "tun",
+        "component": context.component.as_deref().unwrap_or_default(),
         "udpMigrateId": context.udp_migrate_id.load(std::sync::atomic::Ordering::Relaxed).to_string(),
         "mode": route_mode(context.route_mode),
         "matchHistory": [],
@@ -1065,6 +1074,19 @@ mod tests {
         assert_eq!(connection["process"], "/usr/bin/example-app");
         assert_eq!(connection["pid"], "42");
         assert_eq!(connection["uid"], "1000");
+        assert_eq!(connection["component"], "");
+    }
+
+    #[test]
+    fn monitor_preserves_tun_component_and_defaults() {
+        let monitor = ConnectionMonitor::new();
+        let (flow, mut context) = flow();
+        context.component = Some("tun".to_owned());
+        monitor.opened(flow, context);
+        let connection = &monitor.connections_value()["connections"][0];
+        assert_eq!(connection["component"], "tun");
+        assert_eq!(connection["inbound"], "tun");
+        assert_eq!(connection["inboundName"], "TUN");
     }
 
     #[test]

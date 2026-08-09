@@ -22,6 +22,8 @@
 > 2026-08-09 统计持久化生命周期收口：`ConnectionMonitor` 现在拥有 SQLite persistence worker，并提供显式 `shutdown()`；inbound/DNS owner 收敛后，binary 会先执行 final flush、等待 writer 退出，再处理 backup restore，避免短连接/低流量统计丢失或与恢复竞态。新增回归不等待 2 秒周期即可重启读回最后一条 history/traffic；Podman Debian testing host-network smoke 已验证服务立即 SIGINT 退出后同一 SQLite 直接读回 history 和 total。
 > 2026-08-09 服务信号生命周期收口：Unix binary 同时监听 SIGINT 和 SIGTERM，并复用同一个 shutdown watch；Podman `stop --time 10` 已验证 inbound owner、DNS owner、统计 final flush 完成后以 exit code 0 退出，不再因只监听 Ctrl-C 而退化到 SIGKILL。
 > 2026-08-09 TUN inbound 服务级验收：先通过管理 API 写入 Go `inbounds_v2` 的 `empty/tun` 记录，再在 privileged、`--network=none` 的 Debian testing 容器中复用同一 SQLite 启动 runtime；容器内 `/sys/class/net/<tun-name>` 证实 TUN 由 `inbound::run_until` 持有，Podman SIGTERM 后设备消失且 exit code 为 0，随后独立 TUN probe 可重新打开同名设备。测试状态目录使用 `~/.cache/yuhaiin-rust-*`。
+>
+> 2026-08-09 连接元数据契约修复：monitor 不再把所有 `TunFlow` 统一序列化为 `component=tun`；普通 inbound 的 component 为空，只有 TUN runtime 注入 `component=tun`，并保留 TUN 的默认 inbound 标识。新增普通 inbound/TUN 双路径回归。
 
 ## 1. 目标、边界和完成定义
 
