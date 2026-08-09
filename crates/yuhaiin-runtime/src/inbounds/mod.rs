@@ -166,20 +166,33 @@ async fn run_tun_supervisor(
     controller: RuntimeController,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    loop {
-        let config = crate::load_tun_config(controller.store()).await?;
-        if !config.enabled {
-            if crate::wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+    let log_controller = controller.clone();
+    log_controller
+        .monitor()
+        .info("TUN inbound supervisor started");
+    let result = async {
+        loop {
+            let config = crate::load_tun_config(controller.store()).await?;
+            if !config.enabled {
+                if crate::wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+                    return Ok(());
+                }
+                continue;
+            }
+            let tun = crate::data_plane::open_tun(&config)?;
+            crate::run_tun_device_until(controller.clone(), tun, config, shutdown.clone()).await?;
+            if *shutdown.borrow() {
                 return Ok(());
             }
-            continue;
-        }
-        let tun = crate::data_plane::open_tun(&config)?;
-        crate::run_tun_device_until(controller.clone(), tun, config, shutdown.clone()).await?;
-        if *shutdown.borrow() {
-            return Ok(());
         }
     }
+    .await;
+    if let Err(error) = &result {
+        log_controller
+            .monitor()
+            .error(format!("TUN inbound supervisor stopped: {error}"));
+    }
+    result
 }
 
 async fn start_listeners(
