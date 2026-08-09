@@ -70,6 +70,11 @@ name = "tun-service-smoke"
 path = "src/bin/tun_service_smoke.rs"
 required-features = ["tun"]
 
+[[bin]]
+name = "transparent-service-smoke"
+path = "src/bin/transparent_service_smoke.rs"
+required-features = ["http-api"]
+
 [dev-dependencies]
 bytes = "1.12.1"
 h2 = "0.4.15"

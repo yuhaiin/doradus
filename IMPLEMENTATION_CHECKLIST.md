@@ -50,7 +50,7 @@
 | --- | --- | --- | --- |
 | SQLite / 生产库 | `[~]` | 增加更多生产版本快照；逐表核对 route/resolver projection；补异常关闭后的未建模表检查 | 默认 3 份真实快照已通过 `make production-parity-smoke`；store fixture tests |
 | FakeIP | `[~]` | 增加真实生产 FakeIP 表快照，并验证双栈池容量/TTL/重启后的分配稳定性 | FakeIP store tests + Go state takeover |
-| Linux transparent inbound | `[~]` | 在具备 `CAP_NET_ADMIN` 的独立 namespace 中验证 TPROXY UDP、redir IPv4/IPv6 和多 flow teardown | `scripts/integration/*transparent*`、Podman privileged run |
+| Linux transparent inbound | `[~]` | 在具备 `CAP_NET_ADMIN` 的独立 namespace 中验证 TPROXY UDP、redir IPv4/IPv6 和多 flow teardown | `make transparent-service-smoke` 已真实验证隔离 namespace REDIRECT TCP：非 root client → Rust redir → `SO_ORIGINAL_DST` → direct outbound → echo，并检查 upload/download counters、shutdown；同时验证 `IP_TRANSPARENT`/原目标 ancillary socket capability。剩余是 TPROXY UDP 策略路由、IPv4/IPv6 redir 和多 flow teardown |
 | TUN / NAT | `[~]` | 增加 MTU/fragment/namespace teardown 矩阵；补 Android VpnService fd 和 macOS utun 实机验收 | `tun-service.sh`、`p0_tun`、平台设备日志 |
 | API / reload | `[~]` | 用真实 Go handler 做剩余错误字段快照；覆盖 inbound/node/route mutation 后的长生命周期 reload | `api-contract.sh`、`go-api-parity.sh` |
 | connections / statistics | `[~]` | 增加更多 production telemetry 快照；逐字段核对长时间范围与升级期间锁竞争 | `stats-concurrency.sh`、`go-rust-stats.sh` |
@@ -166,7 +166,7 @@ flowchart LR
 | `[x]` | protocol wrappers | inbound/outbound 共用 | inbound/outbound 共用 | `yuhaiin-protocol` |
 | `[x]` | Go inbound protocol aliases / noop | `none` accept-and-close；`mix`、`reverseHttp`、`reverseTcp` 旧 JSON 拼写归一化并保留 section 配置 | 与 Go contract oneof 的兼容字段回归 | `runtime::inbounds::normalize_inbound_protocol` |
 | `[x]` | Go 低频 inbound：`reverse_http` / `reverse_tcp` | 是；目标地址/URL 解析后复用共享 router、outbound、relay 和 monitor | reverse TCP 原始流、reverse HTTP 请求改写/原始流回退均有 loopback 单测；HTTPS target 受 `doh-tls` feature 控制 | 继续补 Go fixture 互操作 |
-| `[~]` | Linux 透明 inbound：`tproxy` / `redir` | TCP 已接入；TPROXY UDP 已接入；redir 按 Go contract 禁用 UDP | Linux TCP 使用 `IP_TRANSPARENT`、`SO_ORIGINAL_DST`/`IP6T_SO_ORIGINAL_DST`；TPROXY UDP 使用原目标 ancillary；IPv4/IPv6 原目标 ancillary 已用本机 Linux socket 回归。Podman 中 REDIRECT TCP 已真实回环成功；rootless Podman veth 即使 privileged 也未将非本地 TPROXY 包交给透明 socket，故 UDP 仍保留环境受限状态；TLS/WS 等透明 transport fail-closed | 用真实 Linux network namespace/宿主机 CAP_NET_ADMIN 重跑 TPROXY UDP ancillary、redir IPv4/IPv6、权限失败及多 flow 生命周期；Podman REDIRECT TCP 验收已完成 |
+| `[~]` | Linux 透明 inbound：`tproxy` / `redir` | TCP 已接入；TPROXY UDP 已接入；redir 按 Go contract 禁用 UDP | Linux TCP 使用 `IP_TRANSPARENT`、`SO_ORIGINAL_DST`/`IP6T_SO_ORIGINAL_DST`；TPROXY UDP 使用原目标 ancillary；IPv4/IPv6 原目标 ancillary 已用本机 Linux socket 回归。`make transparent-service-smoke` 又在隔离 Podman namespace 真实验证了非 root REDIRECT TCP → Rust redir → direct outbound → echo、upload/download counters 和 shutdown，并验证 TPROXY socket capability；TLS/WS 等透明 transport fail-closed | 用真实 Linux network namespace/宿主机 CAP_NET_ADMIN 重跑 TPROXY UDP 策略路由、IPv4/IPv6 redir 和多 flow 生命周期 |
 
 ### 6.2 连接链路与策略
 
@@ -260,6 +260,9 @@ scripts/integration/tun-service.sh
 
 # Same smoke through the Makefile entry point:
 make tun-service-smoke
+
+# Isolated Linux transparent inbound: REDIRECT TCP + TPROXY socket capability:
+make transparent-service-smoke
 
 # Frontend management API process contract and reload/observer smoke:
 scripts/integration/api-contract.sh

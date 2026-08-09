@@ -42,7 +42,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke api-contract-smoke go-api-parity-smoke production-parity-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
+.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke build-transparent-service-smoke transparent-service-smoke api-contract-smoke go-api-parity-smoke production-parity-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -58,6 +58,7 @@ help:
 		'make build-tun-smoke    build the privileged TUN smoke binary' \
 		'make build-tun-service-smoke build the runtime-owned TUN smoke binary' \
 		'make tun-service-smoke run the runtime-owned TUN lifecycle and echo smoke' \
+		'make transparent-service-smoke run isolated REDIRECT TCP inbound smoke' \
 		'make api-contract-smoke run the frontend management API process contract in Podman' \
 		'make go-api-parity-smoke compare public API responses against a Go state snapshot' \
 		'make production-parity-smoke compare several stopped production SQLite snapshots' \
@@ -116,6 +117,13 @@ build-tun-service-smoke:
 
 tun-service-smoke:
 	./scripts/integration/tun-service.sh
+
+build-transparent-service-smoke:
+	$(CARGO) build $(CARGO_COMMON_ARGS) -p $(RUNTIME_PACKAGE) --bin transparent-service-smoke --all-features
+	@printf 'binary: %s/debug/transparent-service-smoke\n' "$(CARGO_TARGET_DIR)"
+
+transparent-service-smoke:
+	./scripts/integration/transparent-service.sh
 
 api-contract-smoke:
 	./scripts/integration/api-contract.sh

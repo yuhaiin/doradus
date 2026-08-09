@@ -42,6 +42,12 @@ The current scenarios cover:
   reusable SQLite state directory, and runs the same `inbound::run_until`
   owner in a privileged Podman `--network=none` container. It checks that the
   kernel TUN device appears and is removed by the common shutdown path.
+- `scripts/integration/transparent-service.sh` runs an isolated privileged
+  Linux namespace with a host `iptables` helper, redirects a non-root TCP
+  client into the Rust `redir` inbound, verifies `SO_ORIGINAL_DST`, direct
+  outbound echo, flow counters, and shutdown, and probes the TPROXY socket
+  capability. Host firewall state is not modified; rule changes are confined
+  to the Podman network namespace and removed by a trap.
 - `scripts/integration/dns-source-bind.sh` runs the existing UDP/TCP resolver
   source-address tests inside a host-network Podman container. It confirms
   that the configured local IPv4 address reaches the DNS server for both
@@ -146,6 +152,8 @@ The runtime-owned TUN process smoke uses the same cache convention:
 scripts/integration/tun-service.sh
 
 make tun-service-smoke
+
+make transparent-service-smoke
 
 make benchmark-tun-throughput
 YUHAIIN_TUN_BENCH_BYTES=$((16 * 1024 * 1024)) make benchmark-tun-throughput
