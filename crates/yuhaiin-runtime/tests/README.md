@@ -116,6 +116,12 @@ when investigating long-stream behavior. WireGuard is intentionally not
 implemented in the current scope, so no WireGuard performance number is
 reported.
 
+The 2026-08-10 Linux verification completed the lifecycle smoke and the
+default 4 MiB benchmark. The Podman run created and removed `yrtun0`, relayed
+the fixed-proxy loopback echo, and reported `55.769740794235275 MiB/s`,
+`12440 KiB` peak RSS, and `12` CPU ticks. These numbers are a baseline for
+this host, not a cross-machine performance promise.
+
 Run the tests from the repository root:
 
 ```bash
@@ -138,6 +144,8 @@ The runtime-owned TUN process smoke uses the same cache convention:
 
 ```bash
 scripts/integration/tun-service.sh
+
+make tun-service-smoke
 
 make benchmark-tun-throughput
 YUHAIIN_TUN_BENCH_BYTES=$((16 * 1024 * 1024)) make benchmark-tun-throughput
