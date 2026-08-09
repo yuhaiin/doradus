@@ -147,11 +147,11 @@ where
     Err(Error::new(ErrorKind::Protocol, "HTTP headers exceed limit"))
 }
 
-fn parse_authority(value: &str, network: Network) -> Result<Endpoint> {
+pub(crate) fn parse_authority(value: &str, network: Network) -> Result<Endpoint> {
     parse_authority_with_default(value, network, None)
 }
 
-fn parse_authority_with_default(
+pub(crate) fn parse_authority_with_default(
     value: &str,
     network: Network,
     default_port: Option<u16>,

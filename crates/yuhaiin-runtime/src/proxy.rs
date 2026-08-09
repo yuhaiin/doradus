@@ -18,6 +18,8 @@ use crate::RuntimeSnapshot;
 pub(crate) mod common;
 #[path = "proxy/http.rs"]
 pub(crate) mod http;
+#[path = "proxy/reverse.rs"]
+pub(crate) mod reverse;
 #[path = "proxy/socks4a.rs"]
 pub(crate) mod socks4a;
 #[path = "proxy/socks5.rs"]

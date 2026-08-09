@@ -28,9 +28,9 @@ use yuhaiin_store::GoInboundRecord;
 use crate::{ConnectionMonitor, RuntimeController, RuntimeProxySelector};
 
 #[cfg(feature = "doh-tls")]
-type InboundTlsAcceptor = tokio_rustls::TlsAcceptor;
+pub(crate) type InboundTlsAcceptor = tokio_rustls::TlsAcceptor;
 #[cfg(not(feature = "doh-tls"))]
-type InboundTlsAcceptor = ();
+pub(crate) type InboundTlsAcceptor = ();
 
 fn has_transport(transports: &[String], kind: &str) -> bool {
     transports
@@ -56,6 +56,16 @@ pub(crate) struct InboundSpec {
     pub(crate) aead_password: Option<String>,
     pub(crate) aead_method: yuhaiin_protocol::aead::CryptoMethod,
     pub(crate) outbound_id: String,
+    pub(crate) reverse_target: Option<Endpoint>,
+    pub(crate) reverse_http: Option<ReverseHttpConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReverseHttpConfig {
+    pub(crate) target: Endpoint,
+    pub(crate) path: String,
+    pub(crate) authority: String,
+    pub(crate) https: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -613,6 +623,41 @@ impl InboundSpec {
                 })
                 .collect();
         let (aead_password, aead_method) = parse_aead_transport(&value, &transports)?;
+        let reverse_target = if protocol.eq_ignore_ascii_case("reverse_tcp") {
+            let target = section
+                .get("host")
+                .or_else(|| section.get("target"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|target| !target.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "reverse_tcp inbound target is missing",
+                    )
+                })?;
+            Some(crate::proxy::http::parse_authority(
+                target,
+                yuhaiin_core::Network::Tcp,
+            )?)
+        } else {
+            None
+        };
+        let reverse_http = if protocol.eq_ignore_ascii_case("reverse_http") {
+            let url = section
+                .get("url")
+                .or_else(|| section.get("URL"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|url| !url.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "reverse_http inbound URL is missing",
+                    )
+                })?;
+            Some(parse_reverse_http_config(url)?)
+        } else {
+            None
+        };
         Ok(Self {
             id: record.id,
             protocol,
@@ -625,6 +670,8 @@ impl InboundSpec {
             aead_password,
             aead_method,
             outbound_id: String::new(),
+            reverse_target,
+            reverse_http,
         })
     }
 
@@ -715,6 +762,40 @@ fn parse_listen_addr(value: &str) -> Result<SocketAddr> {
             ErrorKind::InvalidInput,
             format!("inbound listen address: {error}"),
         )
+    })
+}
+
+fn parse_reverse_http_config(value: &str) -> Result<ReverseHttpConfig> {
+    let value = value.trim();
+    let (https, rest) = if let Some(rest) = value.strip_prefix("http://") {
+        (false, rest)
+    } else if let Some(rest) = value.strip_prefix("https://") {
+        (true, rest)
+    } else {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "reverse_http URL must use http:// or https://",
+        ));
+    };
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, "/"));
+    if authority.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "reverse_http URL has no target authority",
+        ));
+    }
+    let default_port = if https { 443 } else { 80 };
+    let target = crate::proxy::http::parse_authority_with_default(
+        authority,
+        yuhaiin_core::Network::Tcp,
+        Some(default_port),
+    )?;
+    let path = format!("/{}", path.trim_start_matches('/'));
+    Ok(ReverseHttpConfig {
+        target,
+        path,
+        authority: authority.to_owned(),
+        https,
     })
 }
 
@@ -1475,6 +1556,12 @@ where
         "socks4a" => crate::proxy::socks4a::serve(stream, peer, spec, selector, monitor).await,
         "socks5" => crate::proxy::socks5::serve(stream, peer, spec, selector, monitor).await,
         "http" => crate::proxy::http::serve(stream, peer, spec, selector, monitor).await,
+        "reverse_tcp" => {
+            crate::proxy::reverse::serve_tcp(stream, peer, spec, selector, monitor).await
+        }
+        "reverse_http" => {
+            crate::proxy::reverse::serve_http(stream, peer, spec, selector, monitor).await
+        }
         "mixed" => serve_mixed(stream, peer, spec, selector, monitor).await,
         "trojan" => crate::proxy::trojan::serve(stream, peer, spec, selector, monitor).await,
         "vless" => crate::proxy::vless::serve(stream, peer, spec, selector, monitor).await,
@@ -1595,7 +1682,7 @@ mod tests {
     use yuhaiin_core::{Endpoint, Network};
     use yuhaiin_protocol::trojan::{self, Command};
     use yuhaiin_protocol::vless::{self, Command as VlessCommand};
-    use yuhaiin_store::{ConfigStore, GoNodeRecord};
+    use yuhaiin_store::{ConfigStore, GoInboundRecord, GoNodeRecord};
 
     #[cfg(feature = "doh-tls")]
     const CA_CERTIFICATE_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
@@ -1741,6 +1828,152 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
     }
 
     #[tokio::test]
+    async fn reverse_tcp_inbound_routes_a_raw_flow_through_shared_outbound() {
+        let (selector, monitor) = direct_runtime().await;
+        let (echo_address, echo_task) = echo_server().await;
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let spec = InboundSpec {
+            id: "reverse-tcp-inbound".to_owned(),
+            protocol: "reverse_tcp".to_owned(),
+            listen: "127.0.0.1:19084".parse().unwrap(),
+            username: String::new(),
+            password: String::new(),
+            udp_mode: UdpMode::Disabled,
+            protocol_udp: false,
+            transports: vec!["normal".to_owned()],
+            aead_password: None,
+            aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
+            outbound_id: "direct".to_owned(),
+            reverse_target: Some(Endpoint::ip(Network::Tcp, echo_address)),
+            reverse_http: None,
+        };
+        let task = tokio::spawn(crate::proxy::reverse::serve_tcp(
+            server,
+            "127.0.0.1:41005".parse().unwrap(),
+            spec,
+            selector,
+            monitor,
+        ));
+        client.write_all(b"reverse-tcp-flow").await.unwrap();
+        let mut echoed = [0u8; 16];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"reverse-tcp-flow");
+        client.shutdown().await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        echo_task.abort();
+    }
+
+    #[tokio::test]
+    async fn reverse_http_inbound_rewrites_requests_and_routes_response() {
+        let (selector, monitor) = direct_runtime().await;
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target_listener.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let headers = read_headers(&mut stream).await;
+            let headers = String::from_utf8(headers).unwrap();
+            assert!(headers.starts_with("GET /base/health HTTP/1.1\r\n"));
+            assert!(headers.contains("Host: 127.0.0.1:"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nreverse-ok!")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let spec = InboundSpec {
+            id: "reverse-http-inbound".to_owned(),
+            protocol: "reverse_http".to_owned(),
+            listen: "127.0.0.1:19085".parse().unwrap(),
+            username: String::new(),
+            password: String::new(),
+            udp_mode: UdpMode::Disabled,
+            protocol_udp: false,
+            transports: vec!["normal".to_owned()],
+            aead_password: None,
+            aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
+            outbound_id: "direct".to_owned(),
+            reverse_target: None,
+            reverse_http: Some(ReverseHttpConfig {
+                target: Endpoint::ip(Network::Tcp, target_address),
+                path: "/base".to_owned(),
+                authority: target_address.to_string(),
+                https: false,
+            }),
+        };
+        let task = tokio::spawn(crate::proxy::reverse::serve_http(
+            server,
+            "127.0.0.1:41006".parse().unwrap(),
+            spec,
+            selector,
+            monitor,
+        ));
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: public.example\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+        assert!(response.ends_with(b"reverse-ok!"));
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        target_task.await.unwrap();
+    }
+
+    #[test]
+    fn reverse_inbound_fields_follow_go_contract_json() {
+        let reverse_tcp = InboundSpec::from_record(GoInboundRecord {
+            id: "reverse-tcp".to_owned(),
+            name: "Reverse TCP".to_owned(),
+            enabled: true,
+            network_type: "tcp_udp".to_owned(),
+            protocol_type: "reverse_tcp".to_owned(),
+            transport_types_json: br#"[]"#.to_vec(),
+            updated_at: 1,
+            data_json: br#"{
+                "network":{"type":"tcp_udp","tcp_udp":{"host":":3000","udp":false}},
+                "protocol":{"type":"reverse_tcp","reverse_tcp":{"host":"backend.example:3389"}}
+            }"#
+            .to_vec(),
+        })
+        .unwrap();
+        assert_eq!(
+            reverse_tcp.reverse_target,
+            Some(Endpoint::domain(
+                Network::Tcp,
+                yuhaiin_core::DomainName::new("backend.example").unwrap(),
+                3389,
+            ))
+        );
+
+        let reverse_http = InboundSpec::from_record(GoInboundRecord {
+            id: "reverse-http".to_owned(),
+            name: "Reverse HTTP".to_owned(),
+            enabled: true,
+            network_type: "tcp_udp".to_owned(),
+            protocol_type: "reverse_http".to_owned(),
+            transport_types_json: br#"[]"#.to_vec(),
+            updated_at: 1,
+            data_json: br#"{
+                "network":{"type":"tcp_udp","tcp_udp":{"host":":3001","udp":false}},
+                "protocol":{"type":"reverse_http","reverse_http":{"url":"https://api.example/base"}}
+            }"#
+            .to_vec(),
+        })
+        .unwrap();
+        let reverse_http = reverse_http.reverse_http.unwrap();
+        assert!(reverse_http.https);
+        assert_eq!(reverse_http.path, "/base");
+        assert_eq!(reverse_http.authority, "api.example");
+        assert_eq!(reverse_http.target.port(), Some(443));
+    }
+
+    #[tokio::test]
     async fn aead_socks5_inbound_routes_through_shared_outbound() {
         let (selector, monitor) = direct_runtime().await;
         let (echo_address, echo_task) = echo_server().await;
@@ -1758,6 +1991,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             aead_password: Some("secret".to_owned()),
             aead_method: yuhaiin_protocol::aead::CryptoMethod::XChacha20Poly1305,
             outbound_id: "direct".to_owned(),
+            reverse_target: None,
+            reverse_http: None,
         };
         let listener_task = tokio::spawn(serve_listener(listener, spec, selector, monitor, None));
 
@@ -1825,6 +2060,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             aead_password: None,
             aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
             outbound_id: "direct".to_owned(),
+            reverse_target: None,
+            reverse_http: None,
         };
         let task = tokio::spawn(crate::proxy::trojan::serve(
             server,
@@ -1864,6 +2101,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             aead_password: None,
             aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
             outbound_id: "direct".to_owned(),
+            reverse_target: None,
+            reverse_http: None,
         };
         let task = tokio::spawn(crate::proxy::vless::serve(
             server,
@@ -1912,6 +2151,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             aead_password: None,
             aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
             outbound_id: "direct".to_owned(),
+            reverse_target: None,
+            reverse_http: None,
         };
         let task = tokio::spawn(crate::proxy::vless::serve(
             server,
@@ -1962,6 +2203,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             aead_password: None,
             aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
             outbound_id: "direct".to_owned(),
+            reverse_target: None,
+            reverse_http: None,
         };
         let task = tokio::spawn(crate::proxy::trojan::serve(
             server,
@@ -2034,6 +2277,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             aead_password: None,
             aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
             outbound_id: "direct".to_owned(),
+            reverse_target: None,
+            reverse_http: None,
         };
         let mut context = FlowContext::new(Endpoint::ip(
             Network::Tcp,
@@ -2072,6 +2317,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 aead_password: None,
                 aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                 outbound_id: "direct".to_owned(),
+                reverse_target: None,
+                reverse_http: None,
             };
             let mut context = FlowContext::new(Endpoint::ip(
                 Network::Tcp,
@@ -2111,6 +2358,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     aead_password: None,
                     aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
+                    reverse_target: None,
+                    reverse_http: None,
                 },
                 selector,
                 monitor,
@@ -2172,6 +2421,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     aead_password: None,
                     aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
+                    reverse_target: None,
+                    reverse_http: None,
                 },
                 selector,
                 monitor,
@@ -2230,6 +2481,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     aead_password: None,
                     aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
+                    reverse_target: None,
+                    reverse_http: None,
                 },
                 selector,
                 monitor,
@@ -2325,6 +2578,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     aead_password: None,
                     aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
+                    reverse_target: None,
+                    reverse_http: None,
                 },
                 selector,
                 monitor.clone(),
@@ -2400,6 +2655,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     aead_password: None,
                     aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
+                    reverse_target: None,
+                    reverse_http: None,
                 },
                 selector,
                 monitor.clone(),
@@ -2493,6 +2750,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     aead_password: None,
                     aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
+                    reverse_target: None,
+                    reverse_http: None,
                 },
                 selector,
                 monitor.clone(),
@@ -2571,6 +2830,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     aead_password: None,
                     aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
+                    reverse_target: None,
+                    reverse_http: None,
                 },
                 selector,
                 monitor,
@@ -2629,6 +2890,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     aead_password: None,
                     aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
+                    reverse_target: None,
+                    reverse_http: None,
                 },
                 selector,
                 monitor,
@@ -2705,6 +2968,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     aead_password: None,
                     aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
+                    reverse_target: None,
+                    reverse_http: None,
                 },
                 selector,
                 monitor,
@@ -2784,6 +3049,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     aead_password: None,
                     aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
+                    reverse_target: None,
+                    reverse_http: None,
                 },
                 selector,
                 monitor,
@@ -2873,6 +3140,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     aead_password: None,
                     aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
+                    reverse_target: None,
+                    reverse_http: None,
                 },
                 selector,
                 monitor,
@@ -2960,6 +3229,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     aead_password: None,
                     aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
+                    reverse_target: None,
+                    reverse_http: None,
                 },
                 selector,
                 monitor,

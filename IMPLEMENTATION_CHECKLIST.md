@@ -20,7 +20,7 @@ flowchart LR
     UI[yuhaiin-react] --> API[管理 API / RPC]
     API --> STORE[(rusqlite bundled SQLite)]
     STORE --> SNAP[RuntimeSnapshot 原子 reload]
-    IN[TUN / SOCKS5 / HTTP / Yuubinsya inbound] --> FLOW[FlowContext]
+    IN[TUN / SOCKS5 / HTTP / Yuubinsya / reverse inbound] --> FLOW[FlowContext]
     FLOW --> ROUTER[域名/CIDR/Geo Router]
     ROUTER --> OUT[direct / fixed / HTTP / SOCKS5 / TLS / HTTP2 / Yuubinsya]
     OUT --> MON[connections / history / traffic / SSE]
@@ -101,7 +101,8 @@ flowchart LR
 | `[x]` | Yuubinsya UDP-over-TCP | 是 | 是 | `chain::{h2,UOT,direct_uot}` |
 | `[x]` | WebSocket transport | 是 | 是 | `core::websocket`, runtime/protocol |
 | `[x]` | protocol wrappers | inbound/outbound 共用 | inbound/outbound 共用 | `yuhaiin-protocol` |
-| `[~]` | Go 低频 inbound contract：`tproxy` / `redir` / `reverse_http` / `reverse_tcp` | 否；当前 `start_listeners` 会记录并跳过这些非主路径协议 | 不影响当前 HTTP/SOCKS5/Yuubinsya/TUN 替换主路径，但它们不是 Tailscale 等复杂协议，不能永久遗漏 | 先实现 reverse TCP/HTTP 的共享 router bridge；再按 Linux 原始目标地址能力实现 tproxy/redir，补权限和 Podman 验收 |
+| `[x]` | Go 低频 inbound：`reverse_http` / `reverse_tcp` | 是；目标地址/URL 解析后复用共享 router、outbound、relay 和 monitor | reverse TCP 原始流、reverse HTTP 请求改写/原始流回退均有 loopback 单测；HTTPS target 受 `doh-tls` feature 控制 | 继续补 Go fixture 互操作 |
+| `[~]` | Linux 透明 inbound：`tproxy` / `redir` | 否；当前会记录并跳过 | 需要 Linux 原始目标地址 ancillary/socket redirect 能力、权限边界和 Podman 验收；不属于 Tailscale 等复杂协议，不能永久遗漏 | 先做 Linux capability probe，再实现 TCP/UDP 原始目标地址适配与 fail-closed 测试 |
 
 ### 6.2 连接链路与策略
 
@@ -196,4 +197,4 @@ podman run --rm --network=host \
 3. 补发布切换/rollback 手册：binary 替换、SQLite backup、失败回滚、旧 Go 并行运行和状态目录锁。
 4. 对现有 frontend generated operations 做一次逐项 route/schema 快照比对；subscription 维持明确的 deferred 状态。
 5. 每完成一项，只修改本模块表格、验收命令和 `MIGRATION.md` 的一条 dated entry，不再把所有历史细节堆回本文件。
-6. 补齐 Go 低频 inbound contract：reverse TCP/HTTP 优先，Linux tproxy/redir 随透明代理 socket/权限测试推进。
+6. 补齐 Linux `tproxy`/`redir`：先做 capability/权限探测，再接入原始目标地址和 UDP 透明转发测试。
