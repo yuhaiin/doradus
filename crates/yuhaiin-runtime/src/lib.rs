@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 use yuhaiin_core::dns_hosts::HostsTable;
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
@@ -117,6 +118,10 @@ impl Default for RuntimeBuildOptions {
 #[derive(Clone)]
 pub struct RuntimeSnapshot {
     pub settings: RuntimeSettings,
+    /// Shared connect budget for the immutable snapshot. New flows acquire
+    /// one permit while establishing a TCP proxy connection; reload builds a
+    /// new budget without changing existing flows.
+    pub(crate) connect_semaphore: Arc<Semaphore>,
     pub resolver: Arc<dyn AsyncIpResolver>,
     pub hosts: HostsTable,
     pub fakeip: Option<FakeIpPools>,
@@ -369,9 +374,11 @@ impl RuntimeBuilder {
             self.options.route_fallback.clone(),
             geo.clone(),
         )?;
+        let connect_semaphore = Arc::new(Semaphore::new(settings.happy_eyeballs_semaphore));
         Ok(RuntimeSnapshot {
             resolver,
             settings,
+            connect_semaphore,
             hosts,
             fakeip,
             resolvers,
@@ -801,6 +808,7 @@ mod tests {
         );
         let snapshot = RuntimeSnapshot {
             settings: RuntimeSettings::default(),
+            connect_semaphore: Arc::new(Semaphore::new(250)),
             resolver: main,
             hosts: HostsTable::new(),
             fakeip: None,

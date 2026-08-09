@@ -34,6 +34,7 @@
 > 2026-08-09 Go settings KV compatibility：进一步补齐真实 Go SQLite 的 `settings_kv(section,key,value_json)`。Rust 在没有 `settings` overlay 时从该表读取全局 settings，`settings.get` 返回同一前端字段形状；Rust `settings.put` 在旧表存在时回写已知 scalar keys，未知 platform/application rows 保持不变。生产形状 Go v6 fixture 已覆盖读取与回写，避免把配置保存到 Rust 私有 key 后 Go 兼容层看不到。真实 socket bind、buffer/semaphore 调优和 pprof endpoint 仍未完成。
 > 2026-08-09 DNS server compatibility：`run_dns_supervisor` 与 resolver server API 现在遵循 Go 的来源优先级：Rust `resolver.server` overlay 优先，否则读取/回写 `dns_settings.server`；因此真实 Go SQLite 导入后配置的监听地址不再被遗漏。新增 Go v6 fixture server 读写和 overlay precedence 回归；DNS server 的完整 TCP/UDP/DoH/DoT transport 组合及 DoQ/DoH3 仍按清单推进。
 > 2026-08-09 DNS server UDP/TCP owner：Rust runtime DNS supervisor 现在在同一配置地址同时启动 UDP 与 RFC 1035 TCP listener，共用 immutable snapshot 的 `RuntimeDnsHandler`，reload/shutdown 同时收敛两条 listener；runtime 新增同地址双协议回归，Podman Debian host-network smoke 实际查询 UDP/TCP 均返回答案。DoQ/DoH3 仍按低优先级延期。
+> 2026-08-09 runtime settings data-plane policy：`relayBufferSize` 已进入 HTTP/SOCKS4A/SOCKS5/Trojan/VLESS inbound 的 counted relay；`udpBufferSize` 与 `udpRingbufferSize` 已进入 SOCKS5/Trojan/VLESS/Yuubinsya UDP loop 和 runtime DNS UDP listener；`happyEyeballsSemaphore` 通过 snapshot-owned connect budget 限制 TCP 建连并在 live selector reload 时替换。新增 buffer、UDP loop、selector reload 的编译/运行时覆盖；这不是完整 IPv4/IPv6 happy-eyeballs racing，`useDefaultInterface/netInterface` 的真实 socket bind 与 pprof endpoint 仍待完成。
 
 ## 1. 目标、边界和完成定义
 

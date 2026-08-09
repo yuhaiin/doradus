@@ -74,10 +74,12 @@ pub(crate) async fn serve_udp(
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
 ) -> Result<()> {
-    let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(64);
+    let udp_buffer_size = selector.udp_buffer_size().max(512);
+    let udp_ringbuffer_size = selector.udp_ringbuffer_size().max(1);
+    let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
     let mut flows = HashMap::<UdpFlowId, UdpFlowState>::new();
     let mut close_events = monitor.subscribe_close_requests();
-    let mut packet = vec![0u8; 64 * 1024];
+    let mut packet = vec![0u8; udp_buffer_size];
     loop {
         tokio::select! {
             received = server.recv_from(&mut packet) => {
@@ -101,7 +103,7 @@ pub(crate) async fn serve_udp(
                     let reply_tx = reply_tx.clone();
                     let id_for_task = id.clone();
                     tokio::spawn(async move {
-                        let mut buffer = vec![0u8; 64 * 1024];
+                        let mut buffer = vec![0u8; udp_buffer_size];
                         loop {
                             match receiver.recv_from(&mut buffer).await {
                                 Ok((length, target)) => {

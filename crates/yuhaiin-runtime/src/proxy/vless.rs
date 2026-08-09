@@ -17,7 +17,7 @@ use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 use yuhaiin_protocol::vless::{self, Command};
 
-use super::common::{relay_counted, udp_flow_key};
+use super::common::{relay_counted_with_buffer, udp_flow_key};
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -56,9 +56,16 @@ where
                 }
             };
             vless::write_response(&mut stream, &[]).await?;
-            relay_counted(stream, outbound, flow, context, monitor)
-                .await
-                .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))
+            relay_counted_with_buffer(
+                stream,
+                outbound,
+                flow,
+                context,
+                monitor,
+                selector.relay_buffer_size(),
+            )
+            .await
+            .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))
         }
         Command::Udp => serve_udp(stream, peer, spec, selector, monitor, destination).await,
     }
@@ -90,10 +97,12 @@ where
     let _observation = FlowObserverGuard::open(monitor.clone(), TunFlow { key: flow }, context);
     let (mut reader, writer) = split(stream);
     let writer = Arc::new(Mutex::new(writer));
-    let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(64);
+    let udp_buffer_size = selector.udp_buffer_size().max(512);
+    let udp_ringbuffer_size = selector.udp_ringbuffer_size().max(1);
+    let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(udp_ringbuffer_size);
     let receiver = Arc::clone(&datagram);
     let receive_task = tokio::spawn(async move {
-        let mut buffer = vec![0u8; 64 * 1024];
+        let mut buffer = vec![0u8; udp_buffer_size];
         loop {
             match receiver.recv_from(&mut buffer).await {
                 Ok((length, _target)) => {
@@ -107,7 +116,7 @@ where
     });
     let mut close_events = monitor.subscribe_close_requests();
     let result = async {
-        let mut packet = vec![0u8; 64 * 1024];
+        let mut packet = vec![0u8; udp_buffer_size];
         loop {
             tokio::select! {
                 length = reader.read_u16() => {

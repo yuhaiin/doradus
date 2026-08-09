@@ -8,7 +8,7 @@ use yuhaiin_core::flow::FlowKey as TunFlowKey;
 use yuhaiin_core::proxy::AsyncProxySelector;
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
-use super::common::{io_error, relay_counted, relay_counted_with_prefix};
+use super::common::{io_error, relay_counted_with_buffer, relay_counted_with_prefix_and_buffer};
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -77,7 +77,7 @@ where
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
             .map_err(io_error)?;
-        return relay_counted(
+        return relay_counted_with_buffer(
             stream,
             outbound,
             TunFlowKey {
@@ -89,6 +89,7 @@ where
             },
             context,
             monitor,
+            selector.relay_buffer_size(),
         )
         .await
         .map_err(io_error);
@@ -109,7 +110,7 @@ where
         }
     };
     let request = rewrite_forward_request(method, &origin_target, &headers)?;
-    relay_counted_with_prefix(
+    relay_counted_with_prefix_and_buffer(
         stream,
         outbound,
         TunFlowKey {
@@ -122,6 +123,7 @@ where
         context,
         monitor,
         request.as_bytes(),
+        selector.relay_buffer_size(),
     )
     .await
     .map_err(io_error)

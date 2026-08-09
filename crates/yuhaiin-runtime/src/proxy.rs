@@ -246,7 +246,13 @@ impl RuntimeSnapshot {
             base.build()?
         };
 
-        Ok(ProxyBuild { config, proxy })
+        Ok(ProxyBuild {
+            config,
+            proxy: Arc::new(ConnectBudgetProxy {
+                inner: proxy,
+                semaphore: self.connect_semaphore.clone(),
+            }),
+        })
     }
 
     /// Build the four proxy slots consumed by the TUN dispatcher.
@@ -302,13 +308,58 @@ impl RuntimeSnapshot {
         fallback: BaseProxyKind,
     ) -> Result<Arc<dyn AsyncProxy>> {
         if id.trim().is_empty() {
-            return BaseProxyConfig {
+            let proxy = BaseProxyConfig {
                 kind: fallback,
                 timeout,
             }
-            .build();
+            .build()?;
+            return Ok(Arc::new(ConnectBudgetProxy {
+                inner: proxy,
+                semaphore: self.connect_semaphore.clone(),
+            }));
         }
         Ok(self.build_proxy(id, timeout).await?.proxy)
+    }
+}
+
+/// Apply the Go happy-eyeballs dial budget at the runtime boundary. The
+/// permit covers only connection establishment; once a flow is connected it
+/// must not consume a slot for the lifetime of the relay.
+struct ConnectBudgetProxy {
+    inner: Arc<dyn AsyncProxy>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+impl AsyncProxy for ConnectBudgetProxy {
+    fn connect<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> yuhaiin_core::BoxFuture<'a, Result<yuhaiin_core::proxy::BoxAsyncStream>> {
+        Box::pin(async move {
+            let _permit =
+                self.semaphore.clone().acquire_owned().await.map_err(|_| {
+                    Error::new(ErrorKind::Closed, "runtime connect budget is closed")
+                })?;
+            self.inner.connect(context).await
+        })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> yuhaiin_core::BoxFuture<'a, Result<Box<dyn yuhaiin_core::proxy::AsyncDatagram>>> {
+        self.inner.open_datagram(context)
+    }
+
+    fn ping<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> yuhaiin_core::BoxFuture<'a, Result<Duration>> {
+        self.inner.ping(context)
+    }
+
+    fn close(&self) -> yuhaiin_core::BoxFuture<'_, Result<()>> {
+        self.inner.close()
     }
 }
 
@@ -379,6 +430,7 @@ pub struct RuntimeProxySelector {
     drop_id: String,
     timeout: Duration,
     metadata: RwLock<ProxyContextMetadata>,
+    settings: RwLock<crate::RuntimeSettings>,
 }
 
 #[derive(Clone, Default)]
@@ -412,6 +464,7 @@ impl RuntimeProxySelector {
                     .proxy_context_metadata(direct_id, proxy_id, bypass_id, drop_id)
                     .await?,
             ),
+            settings: RwLock::new(snapshot.settings.clone()),
         })
     }
 
@@ -437,6 +490,7 @@ impl RuntimeProxySelector {
                     &self.drop_id,
                 )
                 .await?,
+            settings: snapshot.settings.clone(),
         })
     }
 
@@ -450,12 +504,38 @@ impl RuntimeProxySelector {
             .metadata
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.metadata;
+        *self
+            .settings
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.settings;
+    }
+
+    pub(crate) fn relay_buffer_size(&self) -> usize {
+        self.settings
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .relay_buffer_size
+    }
+
+    pub(crate) fn udp_buffer_size(&self) -> usize {
+        self.settings
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .udp_buffer_size
+    }
+
+    pub(crate) fn udp_ringbuffer_size(&self) -> usize {
+        self.settings
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .udp_ringbuffer_size
     }
 }
 
 pub(crate) struct PreparedProxySelector {
     pub(crate) selector: RuntimeRoutedProxySelector,
     metadata: ProxyContextMetadata,
+    settings: crate::RuntimeSettings,
 }
 
 impl AsyncProxySelector for RuntimeProxySelector {
@@ -887,6 +967,7 @@ mod tests {
     fn snapshot(config: GoProxyRuntimeConfig) -> RuntimeSnapshot {
         RuntimeSnapshot {
             settings: crate::RuntimeSettings::default(),
+            connect_semaphore: Arc::new(tokio::sync::Semaphore::new(250)),
             resolver: Arc::new(SystemAsyncIpResolver),
             hosts: yuhaiin_core::dns_hosts::HostsTable::new(),
             fakeip: None,
@@ -969,6 +1050,41 @@ mod tests {
         context.route_mode = RouteMode::Direct;
         let direct = selector.select(&context);
         assert!(!Arc::ptr_eq(&selected, &direct));
+    }
+
+    #[test]
+    fn live_selector_reload_replaces_data_plane_settings() {
+        let config = GoProxyRuntimeConfig {
+            id: "proxy".to_owned(),
+            name: "Proxy".to_owned(),
+            group_name: String::new(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["direct".to_owned()],
+            layers: Vec::new(),
+            transport: GoProxyTransport::Direct,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        };
+        let mut first = snapshot(config.clone());
+        first.settings.udp_buffer_size = 4096;
+        first.settings.relay_buffer_size = 8192;
+        first.settings.udp_ringbuffer_size = 512;
+        let selector =
+            block_on(first.build_proxy_selector("", "proxy", "", "", Duration::from_secs(1)))
+                .unwrap();
+        assert_eq!(selector.udp_buffer_size(), 4096);
+        assert_eq!(selector.relay_buffer_size(), 8192);
+        assert_eq!(selector.udp_ringbuffer_size(), 512);
+
+        let mut next = snapshot(config);
+        next.settings.udp_buffer_size = 2048;
+        next.settings.relay_buffer_size = 2049;
+        next.settings.udp_ringbuffer_size = 100;
+        let prepared = block_on(selector.prepare(&next)).unwrap();
+        selector.replace(prepared);
+        assert_eq!(selector.udp_buffer_size(), 2048);
+        assert_eq!(selector.relay_buffer_size(), 2049);
+        assert_eq!(selector.udp_ringbuffer_size(), 100);
     }
 
     struct TestGeo;

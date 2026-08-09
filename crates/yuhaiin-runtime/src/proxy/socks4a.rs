@@ -14,7 +14,7 @@ use yuhaiin_core::flow::FlowKey as TunFlowKey;
 use yuhaiin_core::proxy::AsyncProxySelector;
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
-use super::common::{io_error, relay_counted};
+use super::common::{io_error, relay_counted_with_buffer};
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -68,7 +68,7 @@ where
     // Preserve the original port/address bytes, including the 0.0.0.x marker
     // used by SOCKS4A domain requests, just like the Go server.
     write_reply(&mut stream, 90, request.address, request.port).await?;
-    relay_counted(
+    relay_counted_with_buffer(
         stream,
         outbound,
         TunFlowKey {
@@ -80,6 +80,7 @@ where
         },
         context,
         monitor,
+        selector.relay_buffer_size(),
     )
     .await
     .map_err(io_error)

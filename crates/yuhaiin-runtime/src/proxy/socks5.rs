@@ -17,7 +17,8 @@ use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 use super::common::{
-    UdpFlowId, UdpFlowState, UdpReply, close_udp_flows, io_error, relay_counted, udp_flow_key,
+    UdpFlowId, UdpFlowState, UdpReply, close_udp_flows, io_error, relay_counted_with_buffer,
+    udp_flow_key,
 };
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -126,7 +127,7 @@ where
         }
     };
     write_socks_reply(&mut stream, 0).await?;
-    relay_counted(
+    relay_counted_with_buffer(
         stream,
         outbound,
         TunFlowKey {
@@ -138,6 +139,7 @@ where
         },
         context,
         monitor,
+        selector.relay_buffer_size(),
     )
     .await
     .map_err(io_error)
@@ -159,11 +161,13 @@ pub(crate) async fn serve_socks5_udp_loop(
     monitor: Arc<ConnectionMonitor>,
     allowed_peer: Option<SocketAddr>,
 ) -> Result<()> {
-    let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(64);
+    let udp_buffer_size = selector.udp_buffer_size().max(512);
+    let udp_ringbuffer_size = selector.udp_ringbuffer_size().max(1);
+    let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
     let mut flows = HashMap::<UdpFlowId, UdpFlowState>::new();
     let mut close_events = monitor.subscribe_close_requests();
     let mut client = allowed_peer;
-    let mut packet = vec![0u8; 64 * 1024];
+    let mut packet = vec![0u8; udp_buffer_size];
     loop {
         tokio::select! {
             received = socket.recv_from(&mut packet) => {
@@ -200,7 +204,7 @@ pub(crate) async fn serve_socks5_udp_loop(
                     let reply_tx = reply_tx.clone();
                     let id_for_task = id.clone();
                     tokio::spawn(async move {
-                        let mut buffer = vec![0u8; 64 * 1024];
+                        let mut buffer = vec![0u8; udp_buffer_size];
                         loop {
                             match receiver.recv_from(&mut buffer).await {
                                 Ok((length, target)) => {

@@ -383,13 +383,17 @@ pub async fn run_dns_supervisor(
             continue;
         };
         let address = parse_dns_server(&server, 53, "api-dns")?;
+        let snapshot = controller.handle().load();
         let handler = RuntimeDnsHandler {
-            resolver: controller.handle().load().resolver.clone(),
-            fakeip: controller.handle().load().fakeip.clone(),
+            resolver: snapshot.resolver.clone(),
+            fakeip: snapshot.fakeip.clone(),
         };
-        let udp =
-            yuhaiin_core::dns_udp_async::AsyncUdpDnsServer::bind(address, handler.clone(), 4096)
-                .await?;
+        let udp = yuhaiin_core::dns_udp_async::AsyncUdpDnsServer::bind(
+            address,
+            handler.clone(),
+            snapshot.settings.udp_buffer_size.max(512),
+        )
+        .await?;
         let tcp = AsyncTcpDnsServer::bind(address, handler, 65535, Duration::from_secs(5)).await?;
         let udp_controller = controller.clone();
         let udp_shutdown_receiver = shutdown.clone();

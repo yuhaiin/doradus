@@ -80,6 +80,7 @@ impl AsyncProxy for RoutedProxy {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) async fn relay_counted<A, B>(
     left: A,
     right: B,
@@ -91,16 +92,49 @@ where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    relay_counted_with_prefix(left, right, flow, context, monitor, &[]).await
+    relay_counted_with_buffer(left, right, flow, context, monitor, 16 * 1024).await
+}
+
+pub(crate) async fn relay_counted_with_buffer<A, B>(
+    left: A,
+    right: B,
+    flow: TunFlowKey,
+    context: FlowContext,
+    monitor: Arc<ConnectionMonitor>,
+    buffer_size: usize,
+) -> std::io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    relay_counted_with_prefix_and_buffer(left, right, flow, context, monitor, &[], buffer_size)
+        .await
 }
 
 pub(crate) async fn relay_counted_with_prefix<A, B>(
+    left: A,
+    right: B,
+    flow: TunFlowKey,
+    context: FlowContext,
+    monitor: Arc<ConnectionMonitor>,
+    prefix: &[u8],
+) -> std::io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    relay_counted_with_prefix_and_buffer(left, right, flow, context, monitor, prefix, 16 * 1024)
+        .await
+}
+
+pub(crate) async fn relay_counted_with_prefix_and_buffer<A, B>(
     mut left: A,
     right: B,
     flow: TunFlowKey,
     mut context: FlowContext,
     monitor: Arc<ConnectionMonitor>,
     prefix: &[u8],
+    buffer_size: usize,
 ) -> std::io::Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -128,6 +162,7 @@ where
         monitor.clone(),
         flow,
         TunFlowDirection::Upload,
+        buffer_size,
     );
     let download = copy_counted(
         &mut right_read,
@@ -135,6 +170,7 @@ where
         monitor.clone(),
         flow,
         TunFlowDirection::Download,
+        buffer_size,
     );
     let result = tokio::try_join!(upload, download).map(|_| ());
     result
@@ -313,12 +349,13 @@ async fn copy_counted<R, W>(
     monitor: Arc<ConnectionMonitor>,
     flow: TunFlowKey,
     direction: TunFlowDirection,
+    buffer_size: usize,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buffer = vec![0u8; 16 * 1024];
+    let mut buffer = vec![0u8; buffer_size.max(1)];
     loop {
         let read = tokio::select! {
             result = reader.read(&mut buffer) => result?,

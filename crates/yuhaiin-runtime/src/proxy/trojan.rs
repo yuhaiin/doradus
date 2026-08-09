@@ -15,7 +15,7 @@ use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 use yuhaiin_protocol::trojan::{self, Command};
 
-use super::common::{relay_counted, relay_counted_with_prefix};
+use super::common::{relay_counted_with_buffer, relay_counted_with_prefix};
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -60,9 +60,16 @@ where
             return Err(error);
         }
     };
-    relay_counted(stream, outbound, flow, context, monitor)
-        .await
-        .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))
+    relay_counted_with_buffer(
+        stream,
+        outbound,
+        flow,
+        context,
+        monitor,
+        selector.relay_buffer_size(),
+    )
+    .await
+    .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))
 }
 
 struct UdpReply {
@@ -89,9 +96,11 @@ where
 {
     let (mut reader, writer) = split(stream);
     let writer = Arc::new(Mutex::new(writer));
-    let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(64);
+    let udp_buffer_size = selector.udp_buffer_size().max(512);
+    let udp_ringbuffer_size = selector.udp_ringbuffer_size().max(1);
+    let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
     let mut flows = HashMap::<Endpoint, UdpFlowState>::new();
-    let mut packet = vec![0u8; 64 * 1024];
+    let mut packet = vec![0u8; udp_buffer_size];
     loop {
         tokio::select! {
             received = trojan::read_udp_frame(&mut reader, &mut packet) => {
@@ -116,7 +125,7 @@ where
                     let reply_tx = reply_tx.clone();
                     let id = target.clone();
                     tokio::spawn(async move {
-                        let mut buffer = vec![0u8; 64 * 1024];
+                        let mut buffer = vec![0u8; udp_buffer_size];
                         loop {
                             match receiver.recv_from(&mut buffer).await {
                                 Ok((length, target)) => {
