@@ -1900,7 +1900,7 @@ async fn get_route_list_value(state: &ApiState, id: String) -> ApiResult {
     records
         .into_iter()
         .find(|record| record.name == id)
-        .map(|record| Json(raw_json(&record.data_json, json!({"name": record.name}))))
+        .map(|record| Json(route_list_detail_json(record)))
         .ok_or_else(|| ApiError::not_found("route list not found"))
 }
 
@@ -1909,15 +1909,23 @@ async fn save_route_list_value(
     mut value: Value,
     name: Option<String>,
 ) -> ApiResult {
-    let name = name.unwrap_or(required_string(&value, "name")?);
-    set_string(&mut value, "name", name.clone());
-    let source = value.get("source").cloned().unwrap_or_else(|| json!({}));
+    let request_name = name.unwrap_or(required_string(&value, "name")?);
+    set_string(&mut value, "name", request_name.clone());
+    let name = request_name.trim().to_owned();
+    if name.is_empty() {
+        return Err(ApiError::bad("route list name is empty"));
+    }
+    let persisted_value = normalize_route_list_value(&value, &name);
+    let source = persisted_value
+        .get("source")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let record = GoRouteListRecord {
         name: name.clone(),
-        list_type: string_or(&value, "type", "host"),
+        list_type: string_or(&persisted_value, "type", "host"),
         source_type: string_or(&source, "type", "local"),
         updated_at: unix_seconds(),
-        data_json: serde_json::to_vec(&value)?,
+        data_json: serde_json::to_vec(&persisted_value)?,
     };
     let returned = value.clone();
     state
@@ -1980,7 +1988,7 @@ async fn get_route_rule_value(state: &ApiState, name: String, _index: usize) -> 
     records
         .into_iter()
         .find(|record| record.name == name)
-        .map(|record| Json(raw_json(&record.data_json, json!({"name": record.name}))))
+        .map(|record| Json(route_rule_detail_json(record)))
         .ok_or_else(|| ApiError::not_found("route rule not found"))
 }
 
@@ -1989,7 +1997,11 @@ async fn save_route_rule_value(
     mut value: Value,
     index: Option<usize>,
 ) -> ApiResult {
-    let name = required_string(&value, "name")?;
+    let request_name = required_string(&value, "name")?;
+    let name = request_name.trim().to_owned();
+    if name.is_empty() {
+        return Err(ApiError::bad("route rule name is empty"));
+    }
     let current = state
         .controller
         .store()
@@ -2011,11 +2023,12 @@ async fn save_route_rule_value(
                 .saturating_add(1)
         }
     });
-    set_string(&mut value, "name", name.clone());
+    set_string(&mut value, "name", request_name);
     let returned = value.clone();
-    let (match_type, pattern) = route_match(&value);
+    let mut persisted_value = normalize_route_rule_value(&value, &name);
+    let (match_type, pattern) = route_match(&persisted_value);
     if !pattern.is_empty() {
-        if let Some(object) = value.as_object_mut() {
+        if let Some(object) = persisted_value.as_object_mut() {
             let mut matcher = Map::new();
             matcher.insert(
                 if match_type == "cidr" {
@@ -2038,15 +2051,15 @@ async fn save_route_rule_value(
         id: name.clone(),
         name: name.clone(),
         priority,
-        disabled: bool_or(&value, "disabled", false),
-        action_mode: string_or(&value, "mode", "direct"),
+        disabled: bool_or(&persisted_value, "disabled", false),
+        action_mode: string_or(&persisted_value, "mode", "direct"),
         match_type,
-        tag: match string_or(&value, "tag", "default").as_str() {
+        tag: match string_or(&persisted_value, "tag", "default").as_str() {
             "" => "default".to_owned(),
             tag => tag.to_owned(),
         },
         updated_at: unix_seconds(),
-        data_json: serde_json::to_vec(&value)?,
+        data_json: serde_json::to_vec(&persisted_value)?,
     };
     state
         .controller
@@ -2869,6 +2882,83 @@ fn resolver_json(record: GoResolverRecord) -> Value {
     set_string(&mut value, "type", record.resolver_type);
     set_string(&mut value, "host", record.host);
     value
+}
+
+fn normalize_route_list_value(value: &Value, name: &str) -> Value {
+    let mut normalized = value.clone();
+    set_string(&mut normalized, "name", name.trim().to_owned());
+    let list_type = string_or(&normalized, "type", "host");
+    set_string(
+        &mut normalized,
+        "type",
+        if list_type.trim().is_empty() {
+            "host".to_owned()
+        } else {
+            list_type
+        },
+    );
+
+    let source_value = normalized
+        .get("source")
+        .filter(|source| source.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let mut source = source_value;
+    let source_type = string_or(&source, "type", "local");
+    let source_type = if source_type.trim().is_empty() {
+        "local"
+    } else {
+        source_type.as_str()
+    };
+    set_string(&mut source, "type", source_type);
+    if let Some(object) = source.as_object_mut() {
+        if source_type == "remote" {
+            object.remove("local");
+            object
+                .entry("remote".to_owned())
+                .or_insert_with(|| json!({}));
+        } else {
+            object.insert("type".to_owned(), Value::String("local".to_owned()));
+            object.remove("remote");
+            object
+                .entry("local".to_owned())
+                .or_insert_with(|| json!({}));
+        }
+    }
+    if let Some(object) = normalized.as_object_mut() {
+        object.insert("source".to_owned(), source);
+    }
+    normalized
+}
+
+fn normalize_route_rule_value(value: &Value, name: &str) -> Value {
+    let mut normalized = value.clone();
+    set_string(&mut normalized, "name", name.trim().to_owned());
+    let mode = string_or(&normalized, "mode", "bypass");
+    set_string(
+        &mut normalized,
+        "mode",
+        if mode.trim().is_empty() {
+            "bypass".to_owned()
+        } else {
+            mode
+        },
+    );
+    normalized
+}
+
+fn route_list_detail_json(record: GoRouteListRecord) -> Value {
+    normalize_route_list_value(
+        &raw_json(&record.data_json, json!({"name": record.name})),
+        &record.name,
+    )
+}
+
+fn route_rule_detail_json(record: GoRouteRuleRecord) -> Value {
+    normalize_route_rule_value(
+        &raw_json(&record.data_json, json!({"name": record.name})),
+        &record.name,
+    )
 }
 
 fn route_list_item_json(record: GoRouteListRecord, route_lists: &RouteListSnapshot) -> Value {
@@ -3695,6 +3785,39 @@ mod tests {
         assert_eq!(local["itemCount"], 2);
         assert_eq!(local["errorCount"], 0);
         assert!(local["preview"].as_str().unwrap().contains("example.test"));
+    }
+
+    #[tokio::test]
+    async fn route_detail_gets_return_go_store_normalized_contracts() {
+        let state = state().await;
+        let _ = save_route_list_value(&state, json!({"name":"normalized-list", "source":{}}), None)
+            .await
+            .unwrap();
+        let list = get_route_list_value(&state, "normalized-list".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(list.0["name"], "normalized-list");
+        assert_eq!(list.0["type"], "host");
+        assert_eq!(list.0["source"]["type"], "local");
+        assert!(list.0["source"]["local"].is_object());
+        assert!(list.0["source"].get("remote").is_none());
+
+        let _ = save_route_rule_value(
+            &state,
+            json!({
+                "name":"normalized-rule",
+                "mode":"",
+                "match":{"domain":"normalized.example"}
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let rule = get_route_rule_value(&state, "normalized-rule".to_owned(), 999)
+            .await
+            .unwrap();
+        assert_eq!(rule.0["name"], "normalized-rule");
+        assert_eq!(rule.0["mode"], "bypass");
     }
 
     #[tokio::test]
