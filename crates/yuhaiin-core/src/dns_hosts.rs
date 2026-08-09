@@ -103,6 +103,22 @@ impl HostsTable {
         Ok(())
     }
 
+    /// Replace entries with a higher-priority table while keeping the lower
+    /// layer intact.  Runtime assembly uses this to put persisted Go hosts
+    /// overrides above the operating-system hosts file.
+    pub fn overlay(&self, overrides: &HostsTable) -> Result<()> {
+        let overrides = overrides
+            .entries
+            .read()
+            .map_err(|_| Error::new(ErrorKind::Closed, "DNS hosts lock poisoned"))?
+            .clone();
+        self.entries
+            .write()
+            .map_err(|_| Error::new(ErrorKind::Closed, "DNS hosts lock poisoned"))?
+            .extend(overrides);
+        Ok(())
+    }
+
     pub fn remove(&self, domain: &DomainName) -> Result<bool> {
         Ok(self
             .entries

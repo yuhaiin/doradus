@@ -27,6 +27,7 @@ mod route;
 mod rustcrypto_resolver;
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +35,9 @@ use yuhaiin_core::dns_hosts::HostsTable;
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::dns_resolver_stack::AsyncHostsResolver;
 use yuhaiin_core::nat::NatTable;
-use yuhaiin_core::{Error, ErrorKind, FlowContext, GeoLookup, ResolverPolicy, Result, RouteMode};
+use yuhaiin_core::{
+    DomainName, Error, ErrorKind, FlowContext, GeoLookup, ResolverPolicy, Result, RouteMode,
+};
 use yuhaiin_geo::{GeoDatabaseManager, GeoMetadata};
 use yuhaiin_store::fakeip::{FakeIpPool, FakeIpPoolOptions, FakeIpV6Pool};
 use yuhaiin_store::{
@@ -405,11 +408,15 @@ async fn load_hosts(
     repository: &yuhaiin_store::ConfigRepository,
     store: &ConfigStore,
 ) -> Result<HostsTable> {
+    let hosts = HostsTable::new();
+    load_system_hosts(&hosts);
+
     let persisted = repository.list_go_dns_hosts().await?;
     if !persisted.is_empty() {
-        return repository.load_go_dns_hosts_table().await;
+        let configured = repository.load_go_dns_hosts_table().await?;
+        hosts.overlay(&configured)?;
+        return Ok(hosts);
     }
-    let hosts = HostsTable::new();
     let Some(bytes) = store.get_config("resolver.hosts").await? else {
         return Ok(hosts);
     };
@@ -424,13 +431,59 @@ async fn load_hosts(
         .and_then(serde_json::Value::as_object)
         .or_else(|| value.as_object())
         .ok_or_else(|| Error::invalid("resolver.hosts must be a JSON object"))?;
+    let configured = HostsTable::new();
     for (host, target) in object {
         let Some(target) = target.as_str() else {
             return Err(Error::invalid("resolver.hosts targets must be strings"));
         };
-        hosts.insert_target(yuhaiin_core::DomainName::new(host)?, target)?;
+        configured.insert_target(DomainName::new(host)?, target)?;
     }
+    hosts.overlay(&configured)?;
     Ok(hosts)
+}
+
+/// Load the host file used by the platform resolver as the lowest-priority
+/// hosts layer.  A missing/unreadable file is normal on some targets and must
+/// not prevent the service from starting; malformed individual rows are
+/// ignored with the same fail-soft behavior as libc-style hosts parsing.
+fn load_system_hosts(hosts: &HostsTable) {
+    let Ok(contents) = std::fs::read_to_string(system_hosts_path()) else {
+        return;
+    };
+    for (address, domain) in parse_system_hosts(&contents) {
+        let _ = hosts.insert_ip(domain, address);
+    }
+}
+
+#[cfg(not(windows))]
+fn system_hosts_path() -> &'static str {
+    "/etc/hosts"
+}
+
+#[cfg(windows)]
+fn system_hosts_path() -> &'static str {
+    r"C:\Windows\System32\drivers\etc\hosts"
+}
+
+fn parse_system_hosts(contents: &str) -> Vec<(IpAddr, DomainName)> {
+    let mut entries = Vec::new();
+    for line in contents.lines() {
+        let line = line.split('#').next().unwrap_or_default();
+        let mut fields = line.split_whitespace();
+        let Some(address) = fields.next().and_then(|value| value.parse::<IpAddr>().ok()) else {
+            continue;
+        };
+        for host in fields {
+            let host = host.trim_end_matches('.');
+            if host.is_empty() {
+                continue;
+            }
+            if let Ok(domain) = DomainName::new(host) {
+                entries.push((address, domain));
+            }
+        }
+    }
+    entries
 }
 
 async fn load_fakeip_config(
@@ -490,6 +543,37 @@ mod tests {
                 Poll::Pending => std::thread::yield_now(),
             }
         }
+    }
+
+    #[test]
+    fn system_hosts_parser_handles_comments_aliases_and_invalid_rows() {
+        let entries = parse_system_hosts(
+            "# comment\n192.0.2.10 example.test alias.example.test # trailing\n\
+             2001:db8::10 v6.example.test\nnot-an-ip ignored.example.test\n",
+        );
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].0, "192.0.2.10".parse::<IpAddr>().unwrap());
+        assert_eq!(entries[0].1, DomainName::new("example.test").unwrap());
+        assert_eq!(entries[1].1, DomainName::new("alias.example.test").unwrap());
+        assert_eq!(entries[2].0, "2001:db8::10".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn configured_hosts_overlay_system_hosts_in_one_snapshot() {
+        let system = HostsTable::new();
+        let configured = HostsTable::new();
+        let domain = DomainName::new("example.test").unwrap();
+        system
+            .insert_ip(domain.clone(), "192.0.2.10".parse().unwrap())
+            .unwrap();
+        configured
+            .insert_ip(domain.clone(), "192.0.2.20".parse().unwrap())
+            .unwrap();
+        system.overlay(&configured).unwrap();
+        assert_eq!(
+            system.resolve(&domain).unwrap().unwrap().v4,
+            vec!["192.0.2.20".parse::<std::net::Ipv4Addr>().unwrap()]
+        );
     }
 
     struct StaticResolver {
