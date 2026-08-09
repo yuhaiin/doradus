@@ -17,6 +17,8 @@
 
 > 2026-08-09 路由规则 API 兼容性：GET/DELETE 忽略旧 URL 中的 `index`，PUT 更新已有名称时保留原 `priority`，并以公开 `name` 作为 Go 兼容表的 canonical `id`；删除按 `name` 完成并重新编号。这样前端重复编辑同一规则不会生成 `name:index` 重复行，旧数据中的非 canonical id 也会在更新时收敛。
 
+> 2026-08-09 管理 API 错误分类：Rust API 的核心 `ErrorKind` 现在在统一边界按 Go v2 RPC 语义映射：`InvalidInput/Unsupported` 为 400 `bad_request`，`NotFound` 为 404，`Closed/Timeout` 为 503 `unavailable`，I/O、协议和存储错误保留 500 `internal_error`。新增状态分类回归，避免有效的前端参数错误被误报为服务器故障。
+
 > 2026-08-09 管理列表 query 契约收口：Rust API 不再对 nodes、inbounds、resolvers、route lists、route rules 统一搜索整个 JSON，而是按 Go handler 的字段集合过滤，并在过滤后计算分页 `total`。节点只搜索 `id/name/group/origin/chain.type`，入站只搜索 `id/name/network.type/protocol.type`，resolver 搜索 `id/type/host/subnet/tlsServerName`，路由列表/规则分别使用 Go 的四个字段。查询仍保持大小写不敏感、分页字段兼容 camelCase；列表 API 的完整 response/error/reload 语义逐项验收仍在 checklist。
 
 > 2026-08-09 runtime socket policy：`useDefaultInterface/netInterface` 已在 immutable snapshot 中解析为接口 IPv4/IPv6 source addresses；统一 `SocketPolicyProxy` 将策略传递到 direct/fixed、HTTP CONNECT、SOCKS5、协议 wrapper、HTTP/2 Yuubinsya、直连 UOT 和 native UDP socket。连接建立按目标地址族选择 source address，selector reload 会替换策略而不影响旧 flow。新增 FlowContext/connector/runtime reload 回归，`cargo test -p yuhaiin-core --all-features --offline --lib` 通过 121 项，`cargo test -p yuhaiin-runtime --all-features --offline --lib` 通过 137 项；inbound listen socket 的平台专用绑定仍保留为平台验收项。

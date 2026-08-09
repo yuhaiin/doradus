@@ -196,7 +196,25 @@ impl IntoResponse for ApiError {
 
 impl From<yuhaiin_core::Error> for ApiError {
     fn from(error: yuhaiin_core::Error) -> Self {
-        Self::internal(error.to_string())
+        // Go's rpcError exposes the underlying validation message without
+        // prepending an internal Rust error-kind label.
+        let message = error.message;
+        match error.kind {
+            // Match the Go v2 RPC boundary: validation and unsupported
+            // configurations are client errors, not server failures.
+            yuhaiin_core::ErrorKind::InvalidInput | yuhaiin_core::ErrorKind::Unsupported => {
+                Self::bad(message)
+            }
+            yuhaiin_core::ErrorKind::NotFound => Self::not_found(message),
+            // A closed/timeout runtime owner is equivalent to Go's
+            // unavailable service dependency.
+            yuhaiin_core::ErrorKind::Closed | yuhaiin_core::ErrorKind::Timeout => {
+                Self::unavailable(message)
+            }
+            yuhaiin_core::ErrorKind::Io
+            | yuhaiin_core::ErrorKind::Protocol
+            | yuhaiin_core::ErrorKind::Storage => Self::internal(message),
+        }
     }
 }
 
@@ -4012,6 +4030,48 @@ mod tests {
         );
         assert_eq!(value["page"]["total"], 2);
         assert_eq!(value["items"][0]["name"], "proxy backup");
+    }
+
+    #[test]
+    fn core_errors_use_go_rpc_status_categories() {
+        let cases = [
+            (
+                yuhaiin_core::ErrorKind::InvalidInput,
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+            (
+                yuhaiin_core::ErrorKind::Unsupported,
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+            (
+                yuhaiin_core::ErrorKind::NotFound,
+                StatusCode::NOT_FOUND,
+                "not_found",
+            ),
+            (
+                yuhaiin_core::ErrorKind::Timeout,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+            ),
+            (
+                yuhaiin_core::ErrorKind::Closed,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+            ),
+            (
+                yuhaiin_core::ErrorKind::Storage,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+            ),
+        ];
+        for (kind, status, code) in cases {
+            let error = ApiError::from(yuhaiin_core::Error::new(kind, "contract error"));
+            assert_eq!(error.status, status);
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, "contract error");
+        }
     }
 
     #[tokio::test]
