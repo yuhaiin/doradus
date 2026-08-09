@@ -133,7 +133,10 @@ async fn run(options: RunOptions) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|error| Error::new(ErrorKind::Io, format!("bind HTTP API: {error}")))?;
-    console_notice(format!("HTTP API listening on http://{listen}"));
+    let actual_listen = listener
+        .local_addr()
+        .map_err(|error| Error::new(ErrorKind::Io, format!("read HTTP API address: {error}")))?;
+    console_notice(format!("HTTP API listening on http://{actual_listen}"));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let username = options
         .username
@@ -165,6 +168,7 @@ async fn run(options: RunOptions) -> Result<()> {
         state,
         wait_for_shutdown(shutdown_rx),
     ));
+    console_notice("runtime ready; DNS, inbound and HTTP API supervisors started");
     let api_result = api_task
         .await
         .map_err(|error| Error::new(ErrorKind::Io, format!("HTTP API task: {error}")))?;

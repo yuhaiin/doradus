@@ -59,6 +59,11 @@ The current scenarios cover:
   and verifies persisted traffic/history remain readable. The reusable Podman
   entry point is `scripts/integration/stats-concurrency.sh`; logs are kept
   under `~/.cache/yuhaiin-rust/integration/stats-concurrency`.
+- `scripts/integration/api-contract.sh` runs the frontend management API
+  process contract in Podman, including CRUD, reload, selection, connections,
+  statistics, SSE, and representative error responses. It uses host networking
+  so the subprocess and loopback fixtures share one namespace; build/runtime
+  logs are kept under `~/.cache/yuhaiin-rust/integration/api-contract`.
 - standalone Go HTTP/2 transport wire compatibility is covered separately in
   `crates/yuhaiin-chain/tests/standalone_http2.rs`: fixed endpoint resolution,
   plaintext prior-knowledge H2, `CONNECT http://localhost`, raw bidirectional
@@ -71,6 +76,7 @@ Run the tests from the repository root:
 ```bash
 cargo test -p yuhaiin-runtime --all-features --offline --test api_contract -- --nocapture
 cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
+scripts/integration/api-contract.sh
 ```
 
 By default each test stores its SQLite state below

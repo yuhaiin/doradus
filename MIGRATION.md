@@ -2008,3 +2008,16 @@ node latency、direct DNS/UDP latency 以及 TLS+HTTP/2+Yuubinsya 进程级链�
 如果运行中的二进制仍出现这两个旧错误，先用 `make build` 后执行 Makefile 打印的
 `~/.cache/yuhaiin-rust/cargo-target/debug/yuhaiin`，不要混用旧的 `target/debug/yuhaiin`；
 两条报错分别对应旧 listener normalization 和旧 direct build 路径，不是当前源码的预期行为。
+
+## 55. 2026-08-10 runtime readiness and API contract runner
+
+前台启动日志现在会报告实际 HTTP API 绑定地址，并在 DNS、inbound 和 HTTP API
+supervisor 都启动后输出 `runtime ready`；使用 `--host 127.0.0.1:0` 时也不会再只显示
+不可连接的 `:0` 占位地址。设置 `YUHAIIN_QUIET=1` 仍会关闭 console mirror，管理 API
+中的 `tools.logs`/SSE 不受影响。
+
+新增 `scripts/integration/api-contract.sh` 和 `make api-contract-smoke`，统一在
+`~/.cache/yuhaiin-rust/integration/api-contract` 保存构建及 Podman 日志，构建出的 runtime
+和 API contract test binary 从同一个 cache target 挂载，使用 host network 复用 loopback
+fixture。当前真实进程 contract 已通过；`--network=none` 会让该测试受到容器 loopback
+命名空间差异影响，不作为 API contract 的默认验收模式。
