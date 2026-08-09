@@ -1927,22 +1927,29 @@ async fn save_route_list_value(
         updated_at: unix_seconds(),
         data_json: serde_json::to_vec(&persisted_value)?,
     };
+    let activation = serde_json::to_vec(&pending_route_list_activation())?;
     let returned = value.clone();
     state
         .controller
         .mutate_and_reload(move |store| async move {
-            store.repository().put_go_route_list(&record).await
+            store.repository().put_go_route_list(&record).await?;
+            store
+                .put_config(ROUTE_LIST_ACTIVATION_KEY, &activation)
+                .await
         })
         .await?;
     Ok(Json(returned))
 }
 
 async fn delete_route_list_value(state: &ApiState, id: String) -> ApiResult {
+    let activation = serde_json::to_vec(&pending_route_list_activation())?;
     let result = state
         .controller
         .mutate_and_reload(move |store| async move {
             if store.repository().delete_go_route_list(&id).await? {
-                Ok(())
+                store
+                    .put_config(ROUTE_LIST_ACTIVATION_KEY, &activation)
+                    .await
             } else {
                 Err(yuhaiin_core::Error::new(
                     yuhaiin_core::ErrorKind::NotFound,
@@ -2061,6 +2068,7 @@ async fn save_route_rule_value(
         updated_at: unix_seconds(),
         data_json: serde_json::to_vec(&persisted_value)?,
     };
+    let activation = serde_json::to_vec(&pending_route_rule_activation())?;
     state
         .controller
         .mutate_and_reload(move |store| async move {
@@ -2070,7 +2078,8 @@ async fn save_route_rule_value(
                     .delete_go_route_rule_by_name(&record.name)
                     .await?;
             }
-            store.repository().put_go_route_rule(&record).await
+            store.repository().put_go_route_rule(&record).await?;
+            store.put_config(ROUTE_ACTIVATION_KEY, &activation).await
         })
         .await?;
     Ok(Json(returned))
@@ -2086,14 +2095,15 @@ async fn delete_route_rule_value(state: &ApiState, name: String, _index: usize) 
     if !records.iter().any(|record| record.name == name) {
         return Err(ApiError::not_found("route rule not found"));
     }
+    let activation = serde_json::to_vec(&pending_route_rule_activation())?;
     let result = state
         .controller
         .mutate_and_reload(move |store| async move {
             store
                 .repository()
                 .delete_go_route_rule_by_name(&name)
-                .await
-                .map(|_| ())
+                .await?;
+            store.put_config(ROUTE_ACTIVATION_KEY, &activation).await
         })
         .await;
     result.map(|_| empty_json()).map_err(Into::into)
@@ -2117,6 +2127,7 @@ async fn route_rules_priority_value(state: &ApiState, value: &Value) -> ApiResul
             "unknown priority operate {operate:?}"
         )));
     }
+    let activation = serde_json::to_vec(&pending_route_rule_activation())?;
 
     let result = state
         .controller
@@ -2124,7 +2135,8 @@ async fn route_rules_priority_value(state: &ApiState, value: &Value) -> ApiResul
             store
                 .repository()
                 .change_go_route_rule_priority(&source_name, &target_name, &operate)
-                .await
+                .await?;
+            store.put_config(ROUTE_ACTIVATION_KEY, &activation).await
         })
         .await;
     result
@@ -2237,10 +2249,14 @@ async fn route_apply_value(state: &ApiState) -> ApiResult {
         "lastApplyAt": applied_at,
     });
     let bytes = serde_json::to_vec(&activation)?;
+    let list_bytes = serde_json::to_vec(&json!({"hostIndexRefreshAt": 0}))?;
     state
         .controller
         .mutate_and_reload(move |store| async move {
-            store.put_config(ROUTE_ACTIVATION_KEY, &bytes).await
+            store.put_config(ROUTE_ACTIVATION_KEY, &bytes).await?;
+            store
+                .put_config(ROUTE_LIST_ACTIVATION_KEY, &list_bytes)
+                .await
         })
         .await?;
     state
@@ -2252,14 +2268,39 @@ async fn route_apply_value(state: &ApiState) -> ApiResult {
 }
 
 async fn route_activation_value(state: &ApiState) -> ApiResult {
-    let value = state
+    let rule_value = state
         .controller
         .store()
         .get_config(ROUTE_ACTIVATION_KEY)
         .await?
         .map(|bytes| raw_json(&bytes, json!({"hostIndexRefreshAt": 0, "ruleApplyAt": 0})))
         .unwrap_or_else(|| json!({"hostIndexRefreshAt": 0, "ruleApplyAt": 0}));
+    let list_value = state
+        .controller
+        .store()
+        .get_config(ROUTE_LIST_ACTIVATION_KEY)
+        .await?
+        .map(|bytes| raw_json(&bytes, json!({"hostIndexRefreshAt": 0})))
+        .unwrap_or_else(|| json!({"hostIndexRefreshAt": 0}));
+    let value = json!({
+        "hostIndexRefreshAt": list_value
+            .get("hostIndexRefreshAt")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        "ruleApplyAt": rule_value
+            .get("ruleApplyAt")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+    });
     json_value(value)
+}
+
+fn pending_route_list_activation() -> Value {
+    json!({"hostIndexRefreshAt": unix_millis() + 60_000})
+}
+
+fn pending_route_rule_activation() -> Value {
+    json!({"hostIndexRefreshAt": 0, "ruleApplyAt": unix_millis() + 60_000})
 }
 
 async fn hosts_get_value(state: &ApiState) -> ApiResult {
@@ -3636,6 +3677,8 @@ mod tests {
         )
         .await
         .unwrap();
+        let pending = route_activation_value(&state).await.unwrap();
+        assert!(pending.0["ruleApplyAt"].as_i64().unwrap_or_default() > unix_millis());
 
         let priority = router(state.clone())
             .oneshot(
@@ -3663,7 +3706,7 @@ mod tests {
             "drop-example"
         );
 
-        let tested = router(state)
+        let tested = router(state.clone())
             .oneshot(
                 Request::post("/api/v2/route/rules/test")
                     .header("content-type", "application/json")
@@ -3677,6 +3720,11 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["mode"], "drop");
         assert!(value.get("matchResult").is_some());
+
+        let _ = route_apply_value(&state).await.unwrap();
+        let applied = route_activation_value(&state).await.unwrap();
+        assert_eq!(applied.0["hostIndexRefreshAt"], 0);
+        assert_eq!(applied.0["ruleApplyAt"], 0);
     }
 
     #[tokio::test]
@@ -3772,6 +3820,20 @@ mod tests {
         )
         .await
         .unwrap();
+        let list_pending = route_lists_activation_value(&state).await.unwrap();
+        assert!(
+            list_pending.0["hostIndexRefreshAt"]
+                .as_i64()
+                .unwrap_or_default()
+                > unix_millis()
+        );
+        let combined_pending = route_activation_value(&state).await.unwrap();
+        assert!(
+            combined_pending.0["hostIndexRefreshAt"]
+                .as_i64()
+                .unwrap_or_default()
+                > unix_millis()
+        );
         let listed = route_lists_get_value(&state, &json!({"page":1,"pageSize":20}))
             .await
             .unwrap();
