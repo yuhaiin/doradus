@@ -1372,3 +1372,30 @@ Go 的 `pkg/store/inbound_settings.go` 和 `pkg/httpapi/v2.go` 定义了前端�
 - 所有这些入口先执行 DNS query 判定；合法 query 走本地 resolver/FakeIP，非法或非 query 保留原始 framing 转发；成功 reload 会同时替换 TUN 与 socket/chain handler。
 
 本次新增 store legacy/overlay、runtime snapshot、API reload、disabled-sniff relay、公共 TCP DNS framing、Yuubinsya chain TCP/UOT DNS 以及多线程 `Send` 边界单测；各协议 UDP adapter 复用同一 request predicate，并通过 Podman/交叉编译门槛继续验收。
+
+## 17. 2026-08-09 Go 互操作与 DoH server 范围核对
+
+本轮重新在存在 Go 工具链和 sibling checkout 的环境中显式运行了此前默认 ignored 的互操作测试，结果如下：
+
+| 测试组 | 结果 |
+| --- | --- |
+| Yuubinsya TCP/UOT/native UDP/Ping | `yuhaiin-chain` Go interop 1 项通过 |
+| WebSocket/HTTP2 | `yuhaiin-chain` Go interop 1 项通过 |
+| AEAD transport | `yuhaiin-protocol` 4 项通过 |
+| Shadowsocks/legacy wire fixture | 1 项通过 |
+| Trojan/VLESS/VMess | 各 1 项通过 |
+| HTTP obfs 与 ShadowsocksR codec fixture | 各 1 项通过 |
+
+执行时使用：
+
+```text
+YUHAIIN_GO_ROOT=/home/asutorufa/Documents/Programming/yuhaiin
+GOEXPERIMENT=jsonv2,greenteagc
+cargo test -p yuhaiin-chain --test go_yuubinsya_interop --offline -- --ignored --nocapture
+cargo test -p yuhaiin-chain --test go_websocket_interop --offline -- --ignored --nocapture
+cargo test -p yuhaiin-protocol --tests --offline -- --ignored --nocapture
+```
+
+实际测试文件仍保留 `#[ignore]`，因为没有 sibling Go checkout 的 CI 不应因此失败；在本机显式提供 `YUHAIIN_GO_ROOT` 时，上述协议路径已实际跨语言运行，而不是只依赖 Rust 对 Rust 的 codec 单测。
+
+同时对照 Go `pkg/net/dns/server/server.go` 确认：Go 的本地 DNS server 只监听配置地址上的 UDP 和 TCP；DoH/DoH3 是 resolver 的上游 transport，并不是本地管理 server endpoint。Rust 因此保持同一边界：`resolver.server` 管理本地 UDP/TCP listener，DoH/HTTP2 位于 resolver client factory；checklist 不再把不存在于 Go 的本地 DoH listener 当作未完成项。

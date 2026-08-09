@@ -9,6 +9,7 @@
 - `[x]` 已实现，并有自动化测试或运行验收。
 - `[~]` 主路径已实现，但仍有明确的兼容、平台或生产验收缺口。
 - `[ ]` 尚未实现。
+- `不适用` 表示 Go 当前版本没有对应能力，不能把它当作 Rust 缺口。
 - `延期` 表示当前范围明确不阻塞 Rust 替换 Go；不是“忘记了”。
 
 ## 替换目标
@@ -71,7 +72,7 @@ flowchart LR
 | `[x]` | DNS 上游 interface policy | resolver factories | UDP/TCP、RustCrypto DoH/DoT direct dialer 接受和 outbound 相同的 source-address policy；自定义 factory 保持默认兼容，selector reload 会重建 resolver |
 | `[x]` | Go 空配置启动基线 | `RuntimeSettings`, `runtime::defaults`, `data_plane::configured_dns_server`, `api::default_settings` | 无持久 settings 时对齐 Go 的 IPv6、HTTP system proxy、debug/save 日志默认值；无 DNS row/overlay 时默认监听 `127.0.0.1:5353`；真正空库首次构建时幂等写入 mixed/TUN/yuubinsya、bootstrap resolver、LAN route/list；API 与运行时共用同一默认对象 | 真实生产库的更多部分/异常快照继续补 fixture；删除默认项后不自动恢复 |
 | `延期` | DoQ / DoH3 | — | 使用量低，等纯 Rust QUIC/HTTP3 方案稳定后再加入；不阻塞当前替换 |
-| `[ ]` | DoH server 管理端点 | API/runtime | 当前管理 DNS server 是 UDP/TCP；若前端要求 DoH listener，再增加独立 server transport |
+| `不适用` | 本地 DoH server 管理端点 | — | Go `pkg/net/dns/server/server.go` 的本地 DNS server 只启动 UDP/TCP；DoH 是 resolver 的上游 client transport，现有 Rust 已实现 DoH/HTTP2 client 和 `resolver.server` UDP/TCP 管理 API | 若未来前端明确新增本地 DoH listener，再作为独立能力设计；当前不为填补表格增加 Go 没有的功能 |
 
 ## 5. Router、Trie、GeoIP
 
@@ -195,7 +196,7 @@ podman run --rm --network=host \
 
 ## 12. 下一步执行顺序
 
-1. 为 DNS UDP/TCP/DoH/DoT、SOCKS5 UDP ASSOCIATE 和 node latency DNS/UDP 增加 Podman source-address/网络回归；内置 resolver 已完成 policy 接入，自定义 factory 仍可按需覆写扩展入口。
+1. 为 DNS UDP/TCP/DoH/DoT、SOCKS5 UDP ASSOCIATE 和 node latency DNS/UDP 增加 Podman source-address/网络回归；内置 resolver 已完成 policy 接入，自定义 factory 仍可按需覆写扩展入口。Go 互操作测试已在本机显式运行并通过，详见 `MIGRATION.md` 2026-08-09 记录。
 2. 补 Android/macOS target、权限、TUN fd/route 生命周期和实际资源消耗验收。
 3. 补发布切换/rollback 手册：binary 替换、SQLite backup、失败回滚、旧 Go 并行运行和状态目录锁。
 4. 对现有 frontend generated operations 做一次逐项 route/schema 快照比对；subscription 维持明确的 deferred 状态。
