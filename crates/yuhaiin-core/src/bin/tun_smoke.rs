@@ -426,10 +426,9 @@ fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
             bypass: Arc::clone(&drop),
             drop,
         });
-        // The benchmark intentionally allows enough packet commands for the
-        // kernel/TUN queue to get ahead of the async proxy task. Production
-        // callers still choose their own bounded channel from config.
-        let mut proxy_runtime = TunProxyRuntime::new(selector, 64 * 1024)
+        // Keep the benchmark command/output queues bounded like production;
+        // the dispatcher loop itself is responsible for making progress.
+        let mut proxy_runtime = TunProxyRuntime::new(selector, 256)
             .map_err(|error| std::io::Error::other(error.to_string()))?
             .with_io_timeout(Duration::from_secs(10))
             .map_err(|error| std::io::Error::other(error.to_string()))?;

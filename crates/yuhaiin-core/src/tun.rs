@@ -64,6 +64,7 @@ fn tun_debug(message: impl std::fmt::Display) {
 
 pub const DEFAULT_MTU: usize = 1500;
 pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
+const MAX_TCP_EVENT_BYTES_PER_POLL: usize = 64 * 1024;
 
 #[cfg(feature = "async-proxy")]
 const DEFAULT_GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -702,7 +703,8 @@ impl TunDispatcher {
                 state.opened = true;
                 self.events.push_back(TunEvent::TcpOpened { flow });
             }
-            while socket.can_recv() {
+            let mut event_bytes = 0usize;
+            while socket.can_recv() && event_bytes < MAX_TCP_EVENT_BYTES_PER_POLL {
                 // `recv_capacity` is the remaining socket buffer, not the
                 // size of the next packet. Keep each event bounded so a fast
                 // TUN stream cannot allocate one large Vec per segment.
@@ -710,6 +712,7 @@ impl TunDispatcher {
                 match socket.recv_slice(&mut payload) {
                     Ok(length) if length != 0 => {
                         payload.truncate(length);
+                        event_bytes = event_bytes.saturating_add(length);
                         self.events.push_back(TunEvent::TcpData { flow, payload });
                     }
                     Ok(_) => break,
@@ -2624,6 +2627,12 @@ impl TunRuntime {
                     }
                 }
             }
+            // A current-thread runtime can keep the TUN reader ready while a
+            // newly opened proxy is still connecting. Yield once per loop so
+            // flow tasks get a chance to consume their bounded command queue;
+            // otherwise a large upload can fill that queue before the proxy
+            // task is ever polled.
+            tokio::task::yield_now().await;
         }
     }
 }

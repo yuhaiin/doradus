@@ -2046,7 +2046,7 @@ loopback echo，并在 runtime 子进程上采样 Linux `VmRSS` 与 `/proc/<pid>
 | 场景 | 状态 | 说明 |
 | --- | --- | --- |
 | HTTP inbound → router → HTTP CONNECT outbound | 已有可执行基准 | `make benchmark-throughput`；默认 64 MiB、单流、loopback |
-| TUN inbound | 已有可执行 packet 基准 | `make benchmark-tun-throughput`；默认 4 MiB、单流、privileged Podman、TUN → smoltcp → fixed proxy → loopback echo；更长流仍需继续修复/验证 |
+| TUN inbound | 已有可执行 packet 基准 | `make benchmark-tun-throughput`；默认 4 MiB、单流、privileged Podman、TUN → smoltcp → fixed proxy → loopback echo；16/64/256 MiB 长流已通过 |
 | WireGuard | 未实现/不报告性能 | 当前范围没有 WireGuard backend，不用虚构结果 |
 
 benchmark 数值只能用于同机、同 profile、同 payload 和同 namespace 的回归比较，不能
@@ -2065,10 +2065,35 @@ BENCHMARK {"bytes":67108864,"cpu_ticks":26,"elapsed_ms":309.641875,"mib_per_sec"
 `tun-rs + smoltcp + fixed proxy + loopback echo`）：
 
 ```text
-BENCHMARK {"scenario":"tun-inbound-fixed-proxy-loopback","bytes":4194304,"elapsed_ms":67.218512,"mib_per_sec":59.50741664736643,"peak_rss_kib":29180,"cpu_ticks":7,"proc_samples":378}
+BENCHMARK {"scenario":"tun-inbound-fixed-proxy-loopback","bytes":4194304,"elapsed_ms":71.190321,"mib_per_sec":56.18741345470264,"peak_rss_kib":12440,"cpu_ticks":12,"proc_samples":2041}
 ```
 
-该 TUN runner 采用 4 MiB smoltcp TCP RX/TX buffer 和有界 proxy channel，以避免把
-单包 smoke 的结果误当成持续流性能；当前 4/8/16 MiB 在本机通过，64 MiB 长流仍会在
-尾段关闭，故不作为稳定基线。数值只能用于同机、同 profile、同 payload 和同 namespace
-的回归比较，不能直接解释为 Go 与 Rust 的跨机器性能结论。
+该 TUN runner 采用 4 MiB smoltcp TCP RX/TX buffer、有界 proxy channel，以及每次
+smoltcp poll 最多派发 64 KiB TCP 数据；同时在线程内 runtime loop 主动让出一次执行权，
+避免 current-thread Tokio 在 TUN RX 持续 ready 时饿死新建 proxy task。修复后 16/64/256
+MiB 长流均在本机通过，结果只能用于同机、同 profile、同 payload 和同 namespace 的回归
+比较，不能直接解释为 Go 与 Rust 的跨机器性能结论。
+
+## 58. 2026-08-10 TUN bounded backpressure and long-stream regression
+
+之前的 TUN throughput fixture 使用很大的 proxy channel 来掩盖调度问题：current-thread
+Tokio 在 TUN RX 持续 ready 时可能一直处理上传事件，新建的 direct/fixed proxy task 得不到
+执行机会；channel 降到正常有界值后会暴露 `no available capacity`，说明不是单纯增大内存
+可以解决的问题。
+
+本轮修复了两个数据面边界：`TunDispatcher::collect_events` 每个 flow 每次 poll 最多
+派发 64 KiB TCP 数据，剩余数据留在 smoltcp socket 的接收缓冲区；完整 TUN dispatcher
+loop 每轮主动 `yield_now()`，保证 proxy task 能消费 command queue 和产生回包。基准 channel
+从 `64*1024` 降为 256，仍保持有界内存。
+
+Podman privileged/network=none、release、同一 loopback echo fixture 的实测结果：
+
+```text
+4 MiB:   71.190321 ms, 56.1874 MiB/s, peak RSS 12440 KiB
+16 MiB:  312.345178 ms, 51.2254 MiB/s, peak RSS 12400 KiB
+64 MiB:  1045.700406 ms, 61.2030 MiB/s, peak RSS 12428 KiB
+256 MiB: 4040.536757 ms, 63.3579 MiB/s, peak RSS 12328 KiB
+```
+
+这证明当前 Linux TUN inbound 的长流背压不再依赖无界积压；Android/macOS 设备和真实
+透明网络路径仍按 checklist 的平台状态单独验收。
