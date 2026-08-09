@@ -26,12 +26,31 @@ impl RustCryptoTlsProxy {
         server_name: impl Into<String>,
         next_protocols: &[String],
     ) -> Result<Self> {
+        Self::new_with_options(upstream, root_store, server_name, next_protocols, false)
+    }
+
+    pub fn new_with_options(
+        upstream: Arc<dyn AsyncProxy>,
+        root_store: RootCertStore,
+        server_name: impl Into<String>,
+        next_protocols: &[String],
+        insecure_skip_verify: bool,
+    ) -> Result<Self> {
         let provider = Arc::new(rustls_rustcrypto::provider());
-        let mut config = ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-            .map_err(tls_error)?
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let mut config = if insecure_skip_verify {
+            ClientConfig::builder_with_provider(Arc::clone(&provider))
+                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+                .map_err(tls_error)?
+                .dangerous()
+                .with_custom_certificate_verifier(SkipServerVerification::new(provider))
+                .with_no_client_auth()
+        } else {
+            ClientConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+                .map_err(tls_error)?
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
         config.alpn_protocols = next_protocols
             .iter()
             .map(|protocol| protocol.as_bytes().to_vec())
@@ -41,6 +60,63 @@ impl RustCryptoTlsProxy {
             connector: TlsConnector::from(Arc::new(config)),
             server_name: server_name.into(),
         })
+    }
+}
+
+/// Skip certificate-chain and hostname checks for Go's explicit
+/// `insecure_skip_verify` option while retaining TLS handshake signature
+/// verification.
+#[derive(Debug)]
+struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
+
+impl SkipServerVerification {
+    fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Arc<Self> {
+        Arc::new(Self(provider))
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
     }
 }
 

@@ -1018,6 +1018,7 @@ fn build_protocol_tls_proxy(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| Error::invalid("protocol TLS layer requires servernames"))?;
     let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     if let Some(certificates) = layer
         .config
         .get("ca_cert")
@@ -1041,9 +1042,12 @@ fn build_protocol_tls_proxy(
             })?;
         }
     }
-    if roots.is_empty() {
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    }
+    let insecure_skip_verify = layer
+        .config
+        .get("insecure_skip_verify")
+        .or_else(|| layer.config.get("insecureSkipVerify"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let next_protocols = layer
         .config
         .get("next_protos")
@@ -1057,12 +1061,15 @@ fn build_protocol_tls_proxy(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    Ok(Arc::new(yuhaiin_protocol::tls::RustCryptoTlsProxy::new(
-        upstream,
-        roots,
-        server_name,
-        &next_protocols,
-    )?))
+    Ok(Arc::new(
+        yuhaiin_protocol::tls::RustCryptoTlsProxy::new_with_options(
+            upstream,
+            roots,
+            server_name,
+            &next_protocols,
+            insecure_skip_verify,
+        )?,
+    ))
 }
 
 #[cfg(test)]
@@ -1677,7 +1684,7 @@ mod tests {
                 },
                 yuhaiin_store::GoProxyLayer {
                     kind: "tls".to_owned(),
-                    config: serde_json::json!({"servernames":["example.com"]}),
+                    config: serde_json::json!({"servernames":["example.com"], "insecure_skip_verify": true}),
                 },
                 yuhaiin_store::GoProxyLayer {
                     kind: "trojan".to_owned(),

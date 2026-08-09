@@ -1563,3 +1563,9 @@ Rust route tags 之前读写私有 `yuhaiin_config` 的 `route.tag.*` key，与 
 Go `pkg/net/proxy/tls.ParseTLSConfig` 先加载系统证书池，再追加节点 `ca_cert`，并支持 `insecure_skip_verify`。Rust chain 之前要求每个 TLS 节点至少提供一份 `ca_cert`，且忽略了 `insecure_skip_verify`，使使用公共 CA 或自签名测试证书的 Go 节点无法直接接管。现在 chain 使用纯 Rust `webpki-roots` 作为默认公共根，并继续追加 PEM/DER 格式的 `ca_cert`；空 `ca_cert` 合法，私有 CA 仍必须随节点配置提供；`insecure_skip_verify` 只跳过证书链/主机名校验，仍验证 TLS 握手签名。
 
 新增配置、根证书池和 TLS+HTTP/2+Yuubinsya TCP/UOT through TUN 回归；其中专项回归实际使用空 CA + `insecure_skip_verify=true` 完成 TLS、TCP 和 UOT 握手。`yuhaiin-chain` 全部 47 个单元/集成测试通过。该实现与 Go 的系统证书池在企业私有根集合上仍可能不同，生产私有 CA 应显式配置，不能把 WebPKI 根集合当作平台证书池的逐字节等价物。
+
+## 35. 2026-08-09 协议层 TLS transport 兼容
+
+同一 Go TLS 配置还会作为 Trojan/VLESS/VMess 等协议的独立 transport layer 使用。Rust 原先只在 chain builder 处理公共根和自定义 CA，`protocol::tls::RustCryptoTlsProxy` 仍忽略 `insecure_skip_verify`，并且配置自定义 CA 时不会追加公共根。现在两条构建路径统一：公共 WebPKI 根始终存在，自定义 CA 追加到同一 root store，`insecure_skip_verify` 使用 Rustls custom verifier，同时保留握手签名验证；连接池/协议包装不再因配置形态不同而改变证书语义。
+
+runtime 的 Trojan TLS builder 回归已覆盖 `insecure_skip_verify=true` 和空自定义 CA；workspace 全量测试通过。该回归验证的是构建和选项传递，协议层真实远端证书仍需按具体 Trojan/VLESS/VMess fixture 继续做 wire-level 长连接验收。
