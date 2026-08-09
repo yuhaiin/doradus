@@ -154,7 +154,7 @@ flowchart LR
 | `[x]` | Linux container | Podman host-network / privileged network=none smoke | 已有；每次新增数据面模块继续复用 `~/.cache` 状态目录 |
 | `[~]` | Android | `yuhaiin-core` 与 `yuhaiin-runtime --all-features` 均已通过 `aarch64-linux-android` target check；bundled SQLite 使用 `/opt/android-ndk/.../aarch64-linux-android35-clang`；已有外部 fd 注入的 inbound owner API | VpnService fd、权限、电量/内存实测；继续补 Android 原生 route/生命周期验收 |
 | `[~]` | macOS | `yuhaiin-core` 的 `async-proxy,tun` 已通过 `aarch64-apple-darwin` target check；runtime 仍需 macOS SDK/clang 编译 bundled SQLite | macOS SDK/clang runtime target check；utun、LaunchDaemon、权限、SIGTERM/route 实机验收 |
-| `[ ]` | 发布替换手册 | 架构和 API 已稳定 | 补 binary 迁移、state backup/rollback、旧 Go 并行/切换步骤 |
+| `[~]` | 发布替换手册 | Rust binary 已兼容 Go service command 的 `-host/-path/-u/-p/-eweb/-nfs-mode`；`-path DIR` 使用 `DIR/state.db`，默认监听 `0.0.0.0:50051`，显式 `YUHAIIN_DB/YUHAIIN_HTTP` 仍可覆盖 | 补 systemd/launchd/Windows service 安装替换、SQLite backup/rollback、旧 Go 并行与锁冲突演练 |
 
 ## 11. 必跑验证
 

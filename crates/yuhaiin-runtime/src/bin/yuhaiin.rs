@@ -19,29 +19,61 @@ use yuhaiin_runtime::api::ApiState;
 use yuhaiin_runtime::{RuntimeBuilder, RuntimeController, inbound, run_dns_supervisor};
 use yuhaiin_store::{ConfigStore, GoNodeRecord, restore_database};
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RunOptions {
+    database: Option<PathBuf>,
+    listen: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    external_web: Option<String>,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let mut args = std::env::args_os();
-    let _program = args.next();
-    if args.next().as_deref() == Some(std::ffi::OsStr::new("update-helper")) {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args
+        .first()
+        .map(|arg| arg == "update-helper")
+        .unwrap_or(false)
+    {
         let target = args
-            .next()
+            .get(1)
             .ok_or_else(|| Error::invalid("update-helper target is missing"))?;
         let staged = args
-            .next()
+            .get(2)
             .ok_or_else(|| Error::invalid("update-helper staged path is missing"))?;
         yuhaiin_runtime::update::run_update_helper(
-            std::path::Path::new(&target),
-            std::path::Path::new(&staged),
+            std::path::Path::new(target),
+            std::path::Path::new(staged),
         )
         .map_err(|error| Error::new(ErrorKind::Io, error))?;
         return Ok(());
     }
-    tokio::task::LocalSet::new().run_until(run()).await
+    if args
+        .first()
+        .map(|arg| arg == "version" || arg == "-v" || arg == "--version")
+        .unwrap_or(false)
+    {
+        println!("yuhaiin-rust {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args
+        .first()
+        .map(|arg| arg == "help" || arg == "-h" || arg == "--help")
+        .unwrap_or(false)
+    {
+        print_help();
+        return Ok(());
+    }
+    let options = parse_run_options(&args)?;
+    tokio::task::LocalSet::new().run_until(run(options)).await
 }
 
-async fn run() -> Result<()> {
-    let database = env_path("YUHAIIN_DB", default_database_path());
+async fn run(options: RunOptions) -> Result<()> {
+    let database = options
+        .database
+        .or_else(|| std::env::var_os("YUHAIIN_DB").map(PathBuf::from))
+        .unwrap_or_else(default_database_path);
     if let Some(parent) = database.parent() {
         std::fs::create_dir_all(parent).map_err(io_error)?;
     }
@@ -76,15 +108,28 @@ async fn run() -> Result<()> {
         )));
     }
     let controller = RuntimeController::from_builder(builder).await?;
-    let listen = env_string("YUHAIIN_HTTP", "127.0.0.1:18080")
+    let listen = options
+        .listen
+        .or_else(|| std::env::var("YUHAIIN_HTTP").ok())
+        .unwrap_or_else(|| "0.0.0.0:50051".to_owned())
         .parse::<SocketAddr>()
         .map_err(|error| Error::invalid(format!("YUHAIIN_HTTP is invalid: {error}")))?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|error| Error::new(ErrorKind::Io, format!("bind HTTP API: {error}")))?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let username = env_string("YUHAIIN_API_USERNAME", "");
-    let password = env_string("YUHAIIN_API_PASSWORD", "");
+    let username = options
+        .username
+        .or_else(|| std::env::var("YUHAIIN_API_USERNAME").ok())
+        .unwrap_or_default();
+    let password = options
+        .password
+        .or_else(|| std::env::var("YUHAIIN_API_PASSWORD").ok())
+        .unwrap_or_default();
+    // The Go flag controls a separately served frontend. Keep accepting it so
+    // an existing service command can swap in this binary; serving static
+    // assets remains the host application's responsibility.
+    let _ = options.external_web;
     let state = ApiState::new(controller.clone())
         .with_shutdown(shutdown_tx.clone())
         .with_optional_auth(username, password);
@@ -143,20 +188,118 @@ async fn ensure_direct_node(store: &ConfigStore) -> Result<()> {
 }
 
 fn default_database_path() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
+    let config_root = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
-                .join(".local/share")
-        })
-        .join("yuhaiin-rust/state.sqlite")
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let go_path = config_root.join("yuhaiin/state.db");
+    let rust_path = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("yuhaiin-rust/state.sqlite");
+    if go_path.exists() || !rust_path.exists() {
+        go_path
+    } else {
+        rust_path
+    }
 }
 
-fn env_path(key: &str, default: PathBuf) -> PathBuf {
-    std::env::var_os(key).map(PathBuf::from).unwrap_or(default)
+fn parse_run_options(args: &[std::ffi::OsString]) -> Result<RunOptions> {
+    let mut options = RunOptions::default();
+    let mut index = usize::from(args.first().map(|arg| arg == "run").unwrap_or(false));
+    while index < args.len() {
+        let flag = args[index].to_string_lossy();
+        match flag.as_ref() {
+            "-host" | "--host" | "-h" => {
+                options.listen = Some(required_option_value(args, &mut index, &flag)?);
+            }
+            "-path" | "--path" => {
+                options.database = Some(
+                    PathBuf::from(required_option_value(args, &mut index, &flag)?).join("state.db"),
+                );
+            }
+            "-u" | "--username" => {
+                options.username = Some(required_option_value(args, &mut index, &flag)?);
+            }
+            "-p" | "--password" => {
+                options.password = Some(required_option_value(args, &mut index, &flag)?);
+            }
+            "-eweb" | "--external-web" => {
+                options.external_web = Some(required_option_value(args, &mut index, &flag)?);
+            }
+            "-nfs-mode" | "--nfs-mode" => {}
+            other if other.starts_with('-') => {
+                return Err(Error::invalid(format!("unknown option {other:?}")));
+            }
+            other => return Err(Error::invalid(format!("unexpected argument {other:?}"))),
+        }
+        index += 1;
+    }
+    Ok(options)
 }
-fn env_string(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_owned())
+
+fn required_option_value(
+    args: &[std::ffi::OsString],
+    index: &mut usize,
+    flag: &str,
+) -> Result<String> {
+    *index += 1;
+    let value = args
+        .get(*index)
+        .ok_or_else(|| Error::invalid(format!("option {flag} requires a value")))?;
+    Ok(value.to_string_lossy().into_owned())
+}
+
+fn print_help() {
+    println!(
+        "Usage: yuhaiin-rust [run] [options]\n\nOptions:\n  -host, --host ADDR       HTTP listen address (default 0.0.0.0:50051)\n  -path, --path DIR        Go-compatible data directory (DIR/state.db)\n  -u, --username NAME      HTTP Basic Auth username\n  -p, --password PASSWORD  HTTP Basic Auth password\n  -eweb, --external-web DIR  Accepted for Go service-command compatibility\n  -nfs-mode                Accepted for Go service-command compatibility\n  version                  Print version\n  update-helper TARGET STAGED  Apply a staged update"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RunOptions, parse_run_options};
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn parses_go_service_flags_and_maps_path_to_state_db() {
+        let parsed = parse_run_options(&args(&[
+            "run",
+            "-host",
+            "127.0.0.1:50051",
+            "-path",
+            "/var/lib/yuhaiin",
+            "-u",
+            "alice",
+            "-p",
+            "secret",
+            "-nfs-mode",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            RunOptions {
+                database: Some(PathBuf::from("/var/lib/yuhaiin/state.db")),
+                listen: Some("127.0.0.1:50051".to_owned()),
+                username: Some("alice".to_owned()),
+                password: Some("secret".to_owned()),
+                external_web: None,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_missing_and_unknown_options() {
+        assert!(parse_run_options(&args(&["-host"])).is_err());
+        assert!(parse_run_options(&args(&["--unknown"])).is_err());
+        assert!(parse_run_options(&args(&["run", "positional"])).is_err());
+    }
 }
 
 async fn wait_for_shutdown(mut receiver: watch::Receiver<bool>) {
