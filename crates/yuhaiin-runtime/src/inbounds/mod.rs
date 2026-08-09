@@ -19,7 +19,6 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 
 use yuhaiin_core::process::{ProcessResolver, default_process_resolver};
-#[cfg(all(feature = "websocket", feature = "http2"))]
 use yuhaiin_core::proxy::BoxAsyncStream;
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Result};
 use yuhaiin_store::GoInboundRecord;
@@ -52,6 +51,8 @@ pub(crate) struct InboundSpec {
     pub(crate) udp_mode: UdpMode,
     pub(crate) protocol_udp: bool,
     pub(crate) transports: Vec<String>,
+    pub(crate) aead_password: Option<String>,
+    pub(crate) aead_method: yuhaiin_protocol::aead::CryptoMethod,
     pub(crate) outbound_id: String,
 }
 
@@ -155,10 +156,21 @@ async fn start_listeners(
                     && !transport.eq_ignore_ascii_case("tls")
                     && !transport.eq_ignore_ascii_case("http2")
                     && !transport.eq_ignore_ascii_case("websocket")
+                    && !transport.eq_ignore_ascii_case("aead")
             })
         {
             monitor.warn(format!(
                 "skip inbound {}: configured transport is not implemented",
+                spec.id
+            ));
+            continue;
+        }
+        if spec.aead_password.is_some()
+            && (has_transport(&spec.transports, "websocket")
+                || has_transport(&spec.transports, "http2"))
+        {
+            monitor.warn(format!(
+                "skip inbound {}: AEAD transport composition with WebSocket/HTTP2 is not implemented",
                 spec.id
             ));
             continue;
@@ -442,7 +454,7 @@ impl InboundSpec {
             .get("udp")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let transports =
+        let transports: Vec<String> =
             serde_json::from_slice::<Vec<serde_json::Value>>(&record.transport_types_json)
                 .unwrap_or_default()
                 .into_iter()
@@ -454,6 +466,7 @@ impl InboundSpec {
                         .map(ToOwned::to_owned)
                 })
                 .collect();
+        let (aead_password, aead_method) = parse_aead_transport(&value, &transports)?;
         Ok(Self {
             id: record.id,
             protocol,
@@ -463,6 +476,8 @@ impl InboundSpec {
             udp_mode,
             protocol_udp,
             transports,
+            aead_password,
+            aead_method,
             outbound_id: String::new(),
         })
     }
@@ -502,6 +517,44 @@ impl InboundSpec {
             }
         }
     }
+}
+
+fn parse_aead_transport(
+    value: &serde_json::Value,
+    transports: &[String],
+) -> Result<(Option<String>, yuhaiin_protocol::aead::CryptoMethod)> {
+    if !has_transport(transports, "aead") {
+        return Ok((None, yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305));
+    }
+    let transport = value
+        .get("transports")
+        .or_else(|| value.get("transport"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("aead"))
+            })
+        })
+        .ok_or_else(|| Error::invalid("AEAD transport configuration is missing"))?;
+    let config = transport
+        .get("aead")
+        .or_else(|| transport.get("config"))
+        .unwrap_or(transport);
+    let password = config
+        .get("password")
+        .and_then(serde_json::Value::as_str)
+        .filter(|password| !password.is_empty())
+        .ok_or_else(|| Error::invalid("AEAD transport password is empty"))?
+        .to_owned();
+    let method = config
+        .get("cryptoMethod")
+        .or_else(|| config.get("crypto_method"))
+        .and_then(serde_json::Value::as_str)
+        .map(yuhaiin_protocol::aead::CryptoMethod::parse)
+        .unwrap_or(yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305);
+    Ok((Some(password), method))
 }
 
 fn parse_listen_addr(value: &str) -> Result<SocketAddr> {
@@ -913,25 +966,32 @@ async fn serve_listener(
         let tls_acceptor = tls_acceptor.clone();
         let logs = monitor.logs();
         tokio::spawn(async move {
-            #[cfg(feature = "doh-tls")]
-            let result = if let Some(acceptor) = tls_acceptor {
-                match acceptor.accept(stream).await {
-                    Ok(stream) => {
-                        serve_connection(stream, peer, protocol, spec, selector, monitor).await
-                    }
-                    Err(error) => Err(Error::new(
-                        ErrorKind::Protocol,
-                        format!("inbound TLS handshake: {error}"),
-                    )),
-                }
-            } else {
+            let result = async {
+                #[cfg(feature = "doh-tls")]
+                let stream: BoxAsyncStream = if let Some(acceptor) = tls_acceptor {
+                    Box::new(acceptor.accept(stream).await.map_err(|error| {
+                        Error::new(
+                            ErrorKind::Protocol,
+                            format!("inbound TLS handshake: {error}"),
+                        )
+                    })?)
+                } else {
+                    Box::new(stream)
+                };
+                #[cfg(not(feature = "doh-tls"))]
+                let stream: BoxAsyncStream = {
+                    let _ = tls_acceptor;
+                    Box::new(stream)
+                };
+                let stream = if let Some(password) = spec.aead_password.as_deref() {
+                    yuhaiin_protocol::aead::server(stream, password.as_bytes(), spec.aead_method)
+                        .await?
+                } else {
+                    stream
+                };
                 serve_connection(stream, peer, protocol, spec, selector, monitor).await
-            };
-            #[cfg(not(feature = "doh-tls"))]
-            let result = {
-                let _ = tls_acceptor;
-                serve_connection(stream, peer, protocol, spec, selector, monitor).await
-            };
+            }
+            .await;
             if let Err(error) = result {
                 logs.error(format!("inbound connection error: {error}"));
             }
@@ -1306,6 +1366,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             udp_mode: UdpMode::Disabled,
             protocol_udp: false,
             transports: vec!["normal".to_owned()],
+            aead_password: None,
+            aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
             outbound_id: "direct".to_owned(),
         };
         let task = tokio::spawn(crate::proxy::trojan::serve(
@@ -1343,6 +1405,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             udp_mode: UdpMode::Disabled,
             protocol_udp: false,
             transports: vec!["normal".to_owned()],
+            aead_password: None,
+            aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
             outbound_id: "direct".to_owned(),
         };
         let task = tokio::spawn(crate::proxy::vless::serve(
@@ -1389,6 +1453,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             udp_mode: UdpMode::Enabled,
             protocol_udp: true,
             transports: vec!["normal".to_owned()],
+            aead_password: None,
+            aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
             outbound_id: "direct".to_owned(),
         };
         let task = tokio::spawn(crate::proxy::vless::serve(
@@ -1437,6 +1503,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             udp_mode: UdpMode::Enabled,
             protocol_udp: true,
             transports: vec!["normal".to_owned()],
+            aead_password: None,
+            aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
             outbound_id: "direct".to_owned(),
         };
         let task = tokio::spawn(crate::proxy::trojan::serve(
@@ -1507,6 +1575,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             udp_mode: UdpMode::Disabled,
             protocol_udp: false,
             transports: vec!["normal".to_owned()],
+            aead_password: None,
+            aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
             outbound_id: "direct".to_owned(),
         };
         let mut context = FlowContext::new(Endpoint::ip(
@@ -1543,6 +1613,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 udp_mode: UdpMode::Disabled,
                 protocol_udp: false,
                 transports: vec!["normal".to_owned()],
+                aead_password: None,
+                aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                 outbound_id: "direct".to_owned(),
             };
             let mut context = FlowContext::new(Endpoint::ip(
@@ -1580,6 +1652,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["normal".to_owned()],
+                    aead_password: None,
+                    aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
                 },
                 selector,
@@ -1639,6 +1713,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["normal".to_owned()],
+                    aead_password: None,
+                    aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
                 },
                 selector,
@@ -1695,6 +1771,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["normal".to_owned()],
+                    aead_password: None,
+                    aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
                 },
                 selector,
@@ -1788,6 +1866,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["normal".to_owned()],
+                    aead_password: None,
+                    aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
                 },
                 selector,
@@ -1869,6 +1949,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     udp_mode: UdpMode::Enabled,
                     protocol_udp: true,
                     transports: vec!["normal".to_owned()],
+                    aead_password: None,
+                    aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
                 },
                 selector,
@@ -1945,6 +2027,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["normal".to_owned()],
+                    aead_password: None,
+                    aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
                 },
                 selector,
@@ -2001,6 +2085,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["websocket".to_owned()],
+                    aead_password: None,
+                    aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
                 },
                 selector,
@@ -2075,6 +2161,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["normal".to_owned()],
+                    aead_password: None,
+                    aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
                 },
                 selector,
@@ -2152,6 +2240,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["tls".to_owned()],
+                    aead_password: None,
+                    aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
                 },
                 selector,
@@ -2239,6 +2329,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["websocket".to_owned(), "http2".to_owned()],
+                    aead_password: None,
+                    aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
                 },
                 selector,
@@ -2324,6 +2416,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["http2".to_owned()],
+                    aead_password: None,
+                    aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
                     outbound_id: "direct".to_owned(),
                 },
                 selector,
