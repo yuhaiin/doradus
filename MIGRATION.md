@@ -1675,3 +1675,24 @@ traffic、telemetry、failed-history，并在 TCP flow 关闭后确认 history �
 ```bash
 cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
 ```
+
+## 41. 2026-08-09 运行验收与跨平台构建边界
+
+在 service-chain 统计回归之后又执行了当前仓库的最小容器和交叉构建验收：
+
+- `tun-smoke` 在 Debian testing 的 Podman `--privileged --network=none` 容器中成功创建
+  TUN，输出 `tun-opened`；启用 `YUHAIIN_TUN_ROUTE_SMOKE=1` 时成功安装
+  `198.18.0.0/15` route 并正常退出。状态和构建产物仍只使用仓库外的
+  `~/.cache/yuhaiin-rust`，没有写入 `/tmp`。
+- `make android-aarch64` 实际使用
+  `/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang`
+  和 `llvm-ar` 构建出 Android 35 的 `aarch64` runtime ELF；这只证明交叉编译和链接边界，
+  不替代 Android `VpnService` fd、权限、route、功耗和生命周期实机验收。
+- `cargo check -p yuhaiin-core --no-default-features --features async-proxy,tun
+  --target aarch64-apple-darwin --offline` 通过；完整 runtime 仍需要 macOS SDK/clang
+  编译 bundled SQLite，本 Linux 主机的系统 clang 不能伪装成该验收条件。
+- `make build MUSL=1` 继续产出 static-pie `x86_64-unknown-linux-musl` runtime，
+  说明 Makefile 的 `rust-lld` 路径没有被新增测试或文档改动破坏。
+
+这些结果把 Linux/TUN、Android 交叉构建和 macOS 源码 target check 分开记录；平台行仍保持
+`[~]`，直到有对应系统的 native SDK、权限和设备运行证据。
