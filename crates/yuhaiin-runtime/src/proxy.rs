@@ -360,15 +360,26 @@ impl RuntimeSnapshot {
             base.build()?
         };
 
+        let proxy = Arc::new(ConnectBudgetProxy {
+            inner: Arc::new(SocketPolicyProxy {
+                inner: proxy,
+                bind_addresses: self.socket_bind_addresses.clone(),
+            }),
+            semaphore: self.connect_semaphore.clone(),
+        }) as Arc<dyn AsyncProxy>;
+        let proxy = if config.transport == yuhaiin_store::GoProxyTransport::Direct {
+            self.resolve_proxy(proxy)
+        } else {
+            proxy
+        };
         Ok(ProxyBuild {
             config,
-            proxy: Arc::new(ConnectBudgetProxy {
-                inner: Arc::new(SocketPolicyProxy {
-                    inner: proxy,
-                    bind_addresses: self.socket_bind_addresses.clone(),
-                }),
-                semaphore: self.connect_semaphore.clone(),
-            }),
+            // `build_proxy` is also used by management operations such as
+            // node latency and route-list refresh, which do not pass through
+            // the routed selector. Direct is the one final transport that
+            // requires an IP; HTTP/SOCKS5/protocol chains must retain the
+            // original domain for their wire framing and proxy-side DNS.
+            proxy,
         })
     }
 
@@ -409,16 +420,17 @@ impl RuntimeSnapshot {
             .build_proxy_slot(drop_id, timeout, BaseProxyKind::Drop)
             .await?;
 
-        let wrap = |proxy| {
-            Arc::new(ResolvingProxy::new(proxy, self.resolver.clone())) as Arc<dyn AsyncProxy>
-        };
         Ok(RuntimeRoutedProxySelector {
             router: self.router.clone(),
-            direct: wrap(direct),
-            proxy: wrap(proxy),
-            bypass: wrap(bypass),
-            drop: wrap(drop),
+            direct,
+            proxy,
+            bypass,
+            drop,
         })
+    }
+
+    pub(crate) fn resolve_proxy(&self, proxy: Arc<dyn AsyncProxy>) -> Arc<dyn AsyncProxy> {
+        Arc::new(ResolvingProxy::new(proxy, self.resolver.clone()))
     }
 
     async fn build_proxy_slot(
@@ -428,18 +440,24 @@ impl RuntimeSnapshot {
         fallback: BaseProxyKind,
     ) -> Result<Arc<dyn AsyncProxy>> {
         if id.trim().is_empty() {
+            let is_direct = matches!(fallback, BaseProxyKind::Direct);
             let proxy = BaseProxyConfig {
                 kind: fallback,
                 timeout,
             }
             .build()?;
-            return Ok(Arc::new(ConnectBudgetProxy {
+            let proxy = Arc::new(ConnectBudgetProxy {
                 inner: Arc::new(SocketPolicyProxy {
                     inner: proxy,
                     bind_addresses: self.socket_bind_addresses.clone(),
                 }),
                 semaphore: self.connect_semaphore.clone(),
-            }));
+            }) as Arc<dyn AsyncProxy>;
+            return Ok(if is_direct {
+                self.resolve_proxy(proxy)
+            } else {
+                proxy
+            });
         }
         Ok(self.build_proxy(id, timeout).await?.proxy)
     }
@@ -1254,6 +1272,45 @@ mod tests {
             kind: BaseProxyKind::Direct,
             timeout: Duration::from_secs(1),
         };
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn standalone_build_proxy_resolves_domain_destinations() {
+        let config = GoProxyRuntimeConfig {
+            id: "direct".to_owned(),
+            name: "Direct".to_owned(),
+            group_name: String::new(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["direct".to_owned()],
+            layers: Vec::new(),
+            transport: GoProxyTransport::Direct,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        };
+        let built = snapshot(config)
+            .build_proxy("direct", Duration::from_secs(1))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut payload = [0u8; 18];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut payload)
+                .await
+                .unwrap();
+            payload
+        });
+        let context = FlowContext::new(yuhaiin_core::Endpoint::domain(
+            yuhaiin_core::Network::Tcp,
+            yuhaiin_core::DomainName::new("localhost").unwrap(),
+            address.port(),
+        ));
+        let mut stream = built.proxy.connect(&context).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"standalone-resolve")
+            .await
+            .unwrap();
+        assert_eq!(server.await.unwrap(), *b"standalone-resolve");
     }
 
     #[test]

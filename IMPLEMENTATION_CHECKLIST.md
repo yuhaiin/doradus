@@ -141,7 +141,7 @@ flowchart LR
 
 | 状态 | 功能 | 当前结果 | 剩余工作 |
 | --- | --- | --- | --- |
-| `[x]` | inbound → router → outbound | HTTP/SOCKS5/SOCKS4A/Trojan/VLESS/Yuubinsya/TUN 都走共享 FlowContext 和 selector；有真实 loopback relay 回归；域名目标会按同一 resolver snapshot 先解析为 socket endpoint，同时保留原始域名供 TLS/HTTP2/Yuubinsya 使用；Podman 已验证 HTTP inbound → direct 的 IP/域名目标 | 继续增加 Go fixture，不改变主链路 |
+| `[x]` | inbound → router → outbound | HTTP/SOCKS5/SOCKS4A/Trojan/VLESS/Yuubinsya/TUN 都走共享 FlowContext 和 selector；有真实 loopback relay 回归；域名目标会按同一 resolver snapshot 先解析为 socket endpoint，同时保留原始域名供 TLS/HTTP2/Yuubinsya 使用；Podman 已验证 HTTP inbound → direct 的 IP/域名目标；`tests/service_chain.rs` 进一步用真实子进程/API 验证 HTTP inbound → route rule → HTTP CONNECT outbound，以及 mixed inbound → SOCKS5 UDP → direct | 继续增加 Go fixture，不改变主链路 |
 | `[x]` | inbound settings | `store::InboundSettings`, `RuntimeSnapshot`, `ConnectionMonitor` | Go legacy `inbound_settings` 与 Rust overlay、前端 API、reload 已统一；`sniff` 影响公共 relay，DNS 三项同时作用于 TUN、socket inbound 和 Yuubinsya chain；reload 原子替换 resolver handler |
 | `[x]` | HTTP/2 pool | fixed endpoint、TLS identity、ALPN、multi-stream/multi-connection、idle/drain、GOAWAY replacement、metrics | h2 公共 API 无法主动发送 client GOAWAY，保持 application-level drain |
 | `[x]` | Yuubinsya reliability | migrate ID、coalesce、bounded retry/replay、UOT/native UDP、ping、服务端 demux、TLS/H2 listener | 主动 GOAWAY 同上；继续 Go 低版本 fixture |
@@ -229,7 +229,7 @@ podman run --rm --network=host \
 1. 为 DNS UDP/TCP/DoH/DoT、SOCKS5 UDP ASSOCIATE 和 node latency DNS/UDP 增加 Podman source-address/网络回归；内置 resolver 已完成 policy 接入，自定义 factory 仍可按需覆写扩展入口。Go 互操作测试已在本机显式运行并通过，详见 `MIGRATION.md` 2026-08-09 记录。
 2. 补 Android/macOS target、权限、TUN fd/route 生命周期和实际资源消耗验收。
 3. 补发布切换/rollback 手册：binary 替换、SQLite backup、失败回滚、旧 Go 并行运行和状态目录锁。
-4. 对现有 frontend generated operations 做一次逐项 route/schema 快照比对；四个核心只读 RPC 已与 Go fresh state 实际收到 200 并核对顶层字段，subscription 维持明确的 deferred 状态；剩余是完整 operation、生产数据和 mutation/reload side effect 快照。
+4. 对现有 frontend generated operations 做一次逐项 route/schema 快照比对；四个核心只读 RPC 已与 Go fresh state 实际收到 200 并核对顶层字段，`tests/service_chain.rs` 已覆盖真实配置 mutation/reload 后的数据面与观测面；subscription 维持明确的 deferred 状态；剩余是完整 operation、生产数据和 mutation/reload side effect 快照。
 5. 每完成一项，只修改本模块表格、验收命令和 `MIGRATION.md` 的一条 dated entry，不再把所有历史细节堆回本文件。
 6. 完成 Linux `tproxy`/`redir` 验收：在真正的 network namespace/宿主机 CAP_NET_ADMIN 环境覆盖 TPROXY UDP ancillary、redir IPv4/IPv6、权限失败及多 flow 生命周期；Podman REDIRECT TCP 已有可重复验收记录。
 7. 补统计兼容验收：Go fresh state 的 Rust takeover、native Rust state 的 Go reverse-open startup smoke、真实 schema-7 原始 telemetry 表经 Rust 转换后由 Go 成功读取已通过；仍需用更多真实 Go v6/生产形状数据库验证 source normalization、Rust 最终 flush 后 Go 的逐字段长范围结果，以及 force-abort/进程崩溃时 checkpoint 与 Go 表之间的恢复边界。

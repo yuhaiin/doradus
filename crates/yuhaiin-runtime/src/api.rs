@@ -1324,7 +1324,9 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
     let snapshot = state.controller.handle().load();
     let proxy: Arc<dyn AsyncProxy> = match snapshot.build_proxy(&proxy_id, timeout).await {
         Ok(build) => build.proxy,
-        Err(_error) if proxy_id == "direct" => Arc::new(DirectAsyncProxy { timeout }),
+        Err(_error) if proxy_id == "direct" => {
+            snapshot.resolve_proxy(Arc::new(DirectAsyncProxy { timeout }))
+        }
         Err(error) => return Err(error.into()),
     };
     let transport = Arc::new(ProxyRouteListTransport::new(

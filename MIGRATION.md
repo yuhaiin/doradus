@@ -1616,3 +1616,39 @@ Rust `crates/yuhaiin-store/src/statistics.rs` 现在在同一个写事务中：
 确认 SQLite 中存在 compact telemetry 相关表；再用 Go 服务打开同一副本，调用
 `POST /api/v2/rpc/connections.telemetry`（2020–2030，limit 50）返回 HTTP 200，且不再
 出现缺表/`value_id` 错误。该验证没有修改原始数据库，也没有使用 `/tmp`。
+
+## 39. 2026-08-09 service-chain integration regression
+
+新增 `crates/yuhaiin-runtime/tests/service_chain.rs` 与共享 fixture
+`crates/yuhaiin-runtime/tests/support/mod.rs`。测试启动 Cargo 构建出的真实
+`yuhaiin` 子进程，使用 SQLite 和 `/api/v2` 写入 node、inbound、route rule，等待
+runtime reload 后再通过 loopback socket 发送实际流量，而不是只调用 Rust router
+函数。HTTP 场景验证了 HTTP inbound → `example.test` route rule → fixed + HTTP
+CONNECT outbound，并检查 outbound 收到的 CONNECT authority、live connection 的
+inbound/outbound/mode/match history、traffic total、`route.rules.test` 和 node
+latency。
+
+同一组测试还验证了 Go `mixed` inbound 的 UDP 语义：mixed 即使没有显式
+`protocol_udp` 字段，也必须启动 SOCKS5 UDP listener；UDP packet 经过 mixed →
+SOCKS5 UDP framing → direct relay 后由 loopback target 回显，并在 connections 中
+显示为 `mixed`/`direct`。此外，单个默认 mixed listener 占用 1080 时只记录 bind
+错误并跳过该 inbound，不再让整个 inbound supervisor 提前退出，因此随后通过 API
+添加的自定义 inbound 仍能启动。
+
+本次也修复了管理 API 直接构造 proxy 时的域名目标问题：只有 direct transport 在
+进入 socket connect 前通过 runtime resolver 解析 endpoint；HTTP/SOCKS5/TLS/
+HTTP2/Yuubinsya 等需要把域名交给远端或握手层的 proxy 保留原始 domain。这样
+`direct async proxy requires an already-resolved IP endpoint` 不再出现在 direct
+latency/管理面调用中，同时不会破坏 proxy-side DNS 和 TLS SNI。
+
+运行命令：
+
+```bash
+cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
+# 或使用可重复检查的 cache-owned 目录：
+bash scripts/integration/service-chain.sh
+```
+
+测试默认将状态放在 `~/.cache/yuhaiin-rust/integration/<scenario>/<pid>`；设置
+`YUHAIIN_INTEGRATION_DIR` 可保留 SQLite 供本地或 Podman `--network=host` 任务检查，
+不使用 `/tmp`。

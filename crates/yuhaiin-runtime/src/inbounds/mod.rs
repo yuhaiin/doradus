@@ -38,6 +38,11 @@ fn has_transport(transports: &[String], kind: &str) -> bool {
         .any(|transport| transport.eq_ignore_ascii_case(kind))
 }
 
+fn supports_socks5_udp(protocol: &str, protocol_udp: bool) -> bool {
+    (protocol.eq_ignore_ascii_case("mixed") || protocol.eq_ignore_ascii_case("mix"))
+        || (protocol.eq_ignore_ascii_case("socks5") && protocol_udp)
+}
+
 fn inbound_process_resolver() -> Option<&'static dyn ProcessResolver> {
     static RESOLVER: OnceLock<Option<Arc<dyn ProcessResolver>>> = OnceLock::new();
     RESOLVER.get_or_init(default_process_resolver).as_deref()
@@ -256,6 +261,20 @@ async fn start_listeners(
         }
     }
 
+    async fn bind_tcp_listener(
+        listen: SocketAddr,
+        id: &str,
+        monitor: &ConnectionMonitor,
+    ) -> Option<TcpListener> {
+        match TcpListener::bind(listen).await {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                monitor.error(format!("skip inbound {id}: bind TCP {listen}: {error}"));
+                None
+            }
+        }
+    }
+
     for record in records
         .into_iter()
         .filter(|record| record.enabled && !record.protocol_type.eq_ignore_ascii_case("tun"))
@@ -387,9 +406,10 @@ async fn start_listeners(
                 ));
             }
             if spec.udp_mode.tcp_enabled() {
-                let listener = TcpListener::bind(spec.listen).await.map_err(|error| {
-                    Error::new(ErrorKind::Io, format!("bind inbound {}: {error}", spec.id))
-                })?;
+                let Some(listener) = bind_tcp_listener(spec.listen, &spec.id, &monitor).await
+                else {
+                    continue;
+                };
                 let selector = selector.clone();
                 let monitor = monitor.clone();
                 let spec = spec.clone();
@@ -468,9 +488,10 @@ async fn start_listeners(
                 ));
             }
             if spec.udp_mode.tcp_enabled() {
-                let listener = TcpListener::bind(spec.listen).await.map_err(|error| {
-                    Error::new(ErrorKind::Io, format!("bind inbound {}: {error}", spec.id))
-                })?;
+                let Some(listener) = bind_tcp_listener(spec.listen, &spec.id, &monitor).await
+                else {
+                    continue;
+                };
                 let selector = selector.clone();
                 let monitor = monitor.clone();
                 let spec = spec.clone();
@@ -495,9 +516,9 @@ async fn start_listeners(
         if spec.udp_mode.tcp_enabled()
             || (spec.protocol.eq_ignore_ascii_case("vless") && spec.udp_mode.udp_enabled())
         {
-            let listener = TcpListener::bind(spec.listen).await.map_err(|error| {
-                Error::new(ErrorKind::Io, format!("bind inbound {}: {error}", spec.id))
-            })?;
+            let Some(listener) = bind_tcp_listener(spec.listen, &spec.id, &monitor).await else {
+                continue;
+            };
             let selector = selector.clone();
             let monitor = monitor.clone();
             let spec = spec.clone();
@@ -527,12 +548,16 @@ async fn start_listeners(
                     let password_hash =
                         yuhaiin_core::yuubinsya::derive_salt(spec.password.as_bytes());
                     let socket = if let Some(password) = spec.aead_password.clone() {
-                        let raw = UdpSocket::bind(spec.listen).await.map_err(|error| {
-                            Error::new(
-                                ErrorKind::Io,
-                                format!("bind AEAD Yuubinsya UDP inbound {}: {error}", spec.id),
-                            )
-                        })?;
+                        let raw = match UdpSocket::bind(spec.listen).await {
+                            Ok(socket) => socket,
+                            Err(error) => {
+                                monitor.error(format!(
+                                    "skip UDP inbound {}: bind AEAD Yuubinsya UDP {}: {error}",
+                                    spec.id, spec.listen
+                                ));
+                                continue;
+                            }
+                        };
                         yuhaiin_core::proxy::YuubinsyaUdpServer::new(
                             Box::new(yuhaiin_protocol::aead::AeadUdpServer::new(
                                 raw,
@@ -547,12 +572,22 @@ async fn start_listeners(
                         // format without the SOCKS5 three-byte prefix.  The
                         // prefix is only used when Yuubinsya wraps a SOCKS5
                         // UDP association.
-                        yuhaiin_core::proxy::YuubinsyaUdpServer::bind(
+                        match yuhaiin_core::proxy::YuubinsyaUdpServer::bind(
                             spec.listen,
                             password_hash,
                             false,
                         )
-                        .await?
+                        .await
+                        {
+                            Ok(socket) => socket,
+                            Err(error) => {
+                                monitor.error(format!(
+                                    "skip UDP inbound {}: bind Yuubinsya UDP {}: {error}",
+                                    spec.id, spec.listen
+                                ));
+                                continue;
+                            }
+                        }
                     };
                     let logs = monitor.logs();
                     listeners.push(tokio::spawn(async move {
@@ -564,7 +599,7 @@ async fn start_listeners(
                         }
                     }));
                 }
-                "socks5" if spec.protocol_udp => {
+                "socks5" | "mixed" if supports_socks5_udp(&spec.protocol, spec.protocol_udp) => {
                     if tls_acceptor.is_some() {
                         monitor.warn(format!(
                             "skip UDP inbound {}: TLS transport only wraps TCP listeners",
@@ -572,12 +607,16 @@ async fn start_listeners(
                         ));
                         continue;
                     }
-                    let socket = UdpSocket::bind(spec.listen).await.map_err(|error| {
-                        Error::new(
-                            ErrorKind::Io,
-                            format!("bind SOCKS5 UDP inbound {}: {error}", spec.id),
-                        )
-                    })?;
+                    let socket = match UdpSocket::bind(spec.listen).await {
+                        Ok(socket) => socket,
+                        Err(error) => {
+                            monitor.error(format!(
+                                "skip UDP inbound {}: bind SOCKS5 UDP {}: {error}",
+                                spec.id, spec.listen
+                            ));
+                            continue;
+                        }
+                    };
                     let logs = monitor.logs();
                     if let Some(password) = spec.aead_password.clone() {
                         let socket = crate::proxy::socks5::AeadUdpSocket::new(
@@ -2460,6 +2499,15 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         assert_eq!(UdpMode::from_value(Some(&json!(true))), UdpMode::Enabled);
         assert!(UdpMode::UdpOnly.udp_enabled());
         assert!(!UdpMode::UdpOnly.tcp_enabled());
+    }
+
+    #[test]
+    fn mixed_inbound_inherits_go_socks5_udp_mode() {
+        assert!(supports_socks5_udp("mixed", false));
+        assert!(supports_socks5_udp("mix", true));
+        assert!(supports_socks5_udp("socks5", true));
+        assert!(!supports_socks5_udp("socks5", false));
+        assert!(!supports_socks5_udp("http", true));
     }
 
     struct FixedProcessResolver;
