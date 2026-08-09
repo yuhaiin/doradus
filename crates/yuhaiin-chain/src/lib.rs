@@ -133,14 +133,30 @@ impl ChainClient {
         chain: ValidatedChain,
         resolver: Arc<dyn AsyncIpResolver>,
     ) -> Result<Self> {
-        let roots = root_store(&chain.tls.ca_certificates)?;
+        let roots = if chain.tls.insecure_skip_verify {
+            // The verifier below does not consult roots; matching Go also
+            // means malformed optional CA material must not block an
+            // explicitly insecure test node.
+            RootCertStore::empty()
+        } else {
+            root_store(&chain.tls.ca_certificates)?
+        };
         let h2_idle_timeout = chain.http2.idle_timeout;
         let provider = Arc::new(rustls_rustcrypto::provider());
-        let mut config = ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-            .map_err(tls_error)?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let mut config = if chain.tls.insecure_skip_verify {
+            ClientConfig::builder_with_provider(Arc::clone(&provider))
+                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+                .map_err(tls_error)?
+                .dangerous()
+                .with_custom_certificate_verifier(SkipServerVerification::new(provider))
+                .with_no_client_auth()
+        } else {
+            ClientConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+                .map_err(tls_error)?
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        };
         config.alpn_protocols = chain
             .tls
             .next_protos
@@ -1113,6 +1129,64 @@ fn root_store(certificates: &[Vec<u8>]) -> Result<RootCertStore> {
         }
     }
     Ok(roots)
+}
+
+/// Go's `InsecureSkipVerify` skips certificate-chain and hostname validation,
+/// but the TLS handshake still needs to verify the server's ephemeral
+/// signature.  Keep that signature check enabled so this option does not
+/// disable the cryptographic part of TLS itself.
+#[derive(Debug)]
+struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
+
+impl SkipServerVerification {
+    fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Arc<Self> {
+        Arc::new(Self(provider))
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 fn tls_error(error: impl std::fmt::Display) -> Error {

@@ -1560,6 +1560,6 @@ Rust route tags 之前读写私有 `yuhaiin_config` 的 `route.tag.*` key，与 
 
 ## 34. 2026-08-09 TLS 公共根证书兼容
 
-Go `pkg/net/proxy/tls.ParseTLSConfig` 先加载系统证书池，再追加节点 `ca_cert`。Rust chain 之前要求每个 TLS 节点至少提供一份 `ca_cert`，使使用公共 CA 的 Go 节点在配置校验阶段就无法启动。现在 chain 使用纯 Rust `webpki-roots` 作为默认公共根，并继续追加 PEM/DER 格式的 `ca_cert`；空 `ca_cert` 合法，私有 CA 仍必须随节点配置提供。
+Go `pkg/net/proxy/tls.ParseTLSConfig` 先加载系统证书池，再追加节点 `ca_cert`，并支持 `insecure_skip_verify`。Rust chain 之前要求每个 TLS 节点至少提供一份 `ca_cert`，且忽略了 `insecure_skip_verify`，使使用公共 CA 或自签名测试证书的 Go 节点无法直接接管。现在 chain 使用纯 Rust `webpki-roots` 作为默认公共根，并继续追加 PEM/DER 格式的 `ca_cert`；空 `ca_cert` 合法，私有 CA 仍必须随节点配置提供；`insecure_skip_verify` 只跳过证书链/主机名校验，仍验证 TLS 握手签名。
 
-新增配置、根证书池和 TLS+HTTP/2+Yuubinsya TCP/UOT through TUN 回归；`yuhaiin-chain` 全部 45 个单元/集成测试通过。该实现与 Go 的系统证书池在企业私有根集合上仍可能不同，生产私有 CA 应显式配置，不能把 WebPKI 根集合当作平台证书池的逐字节等价物。
+新增配置、根证书池和 TLS+HTTP/2+Yuubinsya TCP/UOT through TUN 回归；其中专项回归实际使用空 CA + `insecure_skip_verify=true` 完成 TLS、TCP 和 UOT 握手。`yuhaiin-chain` 全部 47 个单元/集成测试通过。该实现与 Go 的系统证书池在企业私有根集合上仍可能不同，生产私有 CA 应显式配置，不能把 WebPKI 根集合当作平台证书池的逐字节等价物。

@@ -52,6 +52,8 @@ pub struct TlsConfig {
     #[serde(default)]
     pub enable: bool,
     #[serde(default)]
+    pub insecure_skip_verify: bool,
+    #[serde(default)]
     pub servernames: Vec<String>,
     #[serde(default)]
     pub ca_cert: Vec<String>,
@@ -118,6 +120,7 @@ impl ValidatedFixedAddress {
 
 #[derive(Debug, Clone)]
 pub struct ValidatedTls {
+    pub insecure_skip_verify: bool,
     pub servernames: Vec<String>,
     pub ca_certificates: Vec<Vec<u8>>,
     pub next_protos: Vec<String>,
@@ -254,6 +257,7 @@ impl ChainConfig {
                     return Err(Error::invalid("HTTP/2 chain requires TLS ALPN h2"));
                 }
                 ValidatedTls {
+                    insecure_skip_verify: tls.insecure_skip_verify,
                     servernames: tls
                         .servernames
                         .into_iter()
@@ -264,6 +268,7 @@ impl ChainConfig {
                 }
             }
             None => ValidatedTls {
+                insecure_skip_verify: false,
                 servernames: Vec::new(),
                 ca_certificates: Vec::new(),
                 next_protos: Vec::new(),
@@ -323,7 +328,8 @@ impl ValidatedTls {
     /// protocol profile.
     pub fn pool_identity(&self) -> String {
         format!(
-            "servernames:{}\0alpn:{}",
+            "insecure_skip_verify:{}\0servernames:{}\0alpn:{}",
+            self.insecure_skip_verify,
             self.servernames.join("\0"),
             self.next_protos.join("\0")
         )
@@ -473,6 +479,15 @@ mod tests {
         value["chain"][1]["tls"]["ca_cert"] = serde_json::json!([]);
         let chain = parse_config(&value.to_string()).unwrap();
         assert!(chain.tls.ca_certificates.is_empty());
+    }
+
+    #[test]
+    fn preserves_go_insecure_skip_verify_tls_option() {
+        let mut value: serde_json::Value = serde_json::from_str(CONFIG).unwrap();
+        value["chain"][1]["tls"]["ca_cert"] = serde_json::json!([]);
+        value["chain"][1]["tls"]["insecure_skip_verify"] = serde_json::json!(true);
+        let chain = parse_config(&value.to_string()).unwrap();
+        assert!(chain.tls.insecure_skip_verify);
     }
 
     #[test]

@@ -766,6 +766,35 @@ fn chain_client(address: SocketAddr, certificate: Vec<u8>) -> ChainClient {
     chain_client_with_max_streams(address, certificate, 128)
 }
 
+fn insecure_chain_client(address: SocketAddr) -> ChainClient {
+    ChainClient::new(ValidatedChain {
+        id: None,
+        name: Some("P0 insecure TLS fixture".to_owned()),
+        fixed_addresses: vec![yuhaiin_chain::ValidatedFixedAddress {
+            host: address.ip().to_string(),
+            port: address.port(),
+        }],
+        tls: ValidatedTls {
+            insecure_skip_verify: true,
+            servernames: vec!["localhost".to_owned()],
+            ca_certificates: Vec::new(),
+            next_protos: vec!["h2".to_owned()],
+        },
+        websocket: None,
+        http2: ValidatedHttp2 {
+            concurrency: 4,
+            max_streams: 128,
+            idle_timeout: std::time::Duration::from_secs(300),
+        },
+        yuubinsya: ValidatedYuubinsya {
+            password: PASSWORD.to_owned(),
+            udp_over_stream: true,
+            udp_coalesce: false,
+        },
+    })
+    .unwrap()
+}
+
 fn chain_client_with_max_streams(
     address: SocketAddr,
     certificate: Vec<u8>,
@@ -779,6 +808,7 @@ fn chain_client_with_max_streams(
             port: address.port(),
         }],
         tls: ValidatedTls {
+            insecure_skip_verify: false,
             servernames: vec!["localhost".to_owned()],
             ca_certificates: vec![certificate],
             next_protos: vec!["h2".to_owned()],
@@ -910,6 +940,7 @@ async fn tls_websocket_http2_chain_uses_http11_upgrade_before_h2() {
             port: address.port(),
         }],
         tls: ValidatedTls {
+            insecure_skip_verify: false,
             servernames: vec!["localhost".to_owned()],
             ca_certificates: vec![certificate.as_ref().to_vec()],
             next_protos: Vec::new(),
@@ -1292,13 +1323,7 @@ async fn tls_h2_yuubinsya_server_dispatches_tcp_and_migrated_uot() {
         })
     };
 
-    let chain = chain_client(address, {
-        let ca = rustls_pemfile::certs(&mut Cursor::new(CA_CERTIFICATE_PEM))
-            .next()
-            .unwrap()
-            .unwrap();
-        ca.as_ref().to_vec()
-    });
+    let chain = insecure_chain_client(address);
 
     let tcp_destination = Endpoint::ip(Network::Tcp, tcp_target_address);
     let mut tcp = chain.connect_tcp(tcp_destination).await.unwrap();
