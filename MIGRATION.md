@@ -17,6 +17,7 @@
 
 > 2026-08-09 inbound 生命周期收口：TUN 不再由 binary 单独启动；`yuhaiin-runtime::inbound::run_until` 与 SOCKS5、HTTP、Yuubinsya、WebSocket、HTTP/2 listener 共享同一个 inbound owner。普通 TCP/WebSocket accepted task 由 `JoinSet` 归属 listener，reload/shutdown/abort 会回收子任务；`yuhaiin-core::flow::FlowObserverGuard` 让正常结束、管理面 close 和强制取消都能完成 monitor close、history/SSE/traffic 收敛。Yuubinsya server 也提升到 listener 级，HTTP/2 多 stream 可共享 migrate ID 的 UDP session，listener 结束时显式 close 上游 session。runtime 新增 listener abort 后 live connection 清理回归；`yuhaiin-runtime` 117 个单测、`yuhaiin-chain` 42 个单测和 `yuhaiin-core` 116 个单测均通过。Podman 特权无网络容器中 `tun-smoke` 的真实 TUN 创建/关闭和 route smoke 也通过。
 > 2026-08-09 TUN 配置边界收口：Go 的 `inbounds_v2` 中 `network.type=empty`、`protocol.type=tun` 现在是 Rust TUN supervisor 的主配置源，按 Go `TunProtocol` 读取 `tun://` 名称、`portal`/`portalV6`、`routes`/`excludes`；旧 `tun.runtime` 仅作为没有 Go TUN inbound 时的兼容回退。普通 TCP/UDP listener 会跳过 TUN record，单设备 runtime 遇到多个 TUN record fail-closed。新增 Go inbound 配置解析回归，runtime 全部 118 个单测和 7 个 DoH 集成测试通过；此前 Podman 特权无网络容器中的真实 TUN 创建/关闭及 route smoke 仍通过。
+> 2026-08-09 Podman runtime smoke：用 `cargo build -p yuhaiin-runtime --bin yuhaiin --all-features --offline` 构建 binary，在 Debian testing `--network=host` 容器中通过 API 创建 HTTP inbound；宿主机经 `127.0.0.1:18083` 访问本地 HTTP server，验证 API reload、HTTP inbound→direct outbound、history/traffic 统计。停止并重启同一容器后，`inbounds.get` 和 `connections.history` 均从 SQLite 读回。容器状态目录使用 `~/.cache/yuhaiin-rust-podman.*`，不使用 `/tmp`。
 
 ## 1. 目标、边界和完成定义
 
