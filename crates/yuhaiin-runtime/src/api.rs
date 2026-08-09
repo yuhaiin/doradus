@@ -3158,7 +3158,15 @@ mod tests {
         let listed = route_rules_get_value(&state, &json!({"page":1,"pageSize":20}))
             .await
             .unwrap();
-        assert_eq!(listed.0["items"][0]["name"], "drop-example");
+        assert_eq!(
+            listed.0["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == "drop-example")
+                .unwrap()["name"],
+            "drop-example"
+        );
 
         let tested = router(state)
             .oneshot(
@@ -3193,15 +3201,16 @@ mod tests {
         let listed = route_lists_get_value(&state, &json!({"page":1,"pageSize":20}))
             .await
             .unwrap();
-        assert_eq!(listed.0["items"][0]["name"], "local-domains");
-        assert_eq!(listed.0["items"][0]["itemCount"], 2);
-        assert_eq!(listed.0["items"][0]["errorCount"], 0);
-        assert!(
-            listed.0["items"][0]["preview"]
-                .as_str()
-                .unwrap()
-                .contains("example.test")
-        );
+        let local = listed.0["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "local-domains")
+            .unwrap();
+        assert_eq!(local["name"], "local-domains");
+        assert_eq!(local["itemCount"], 2);
+        assert_eq!(local["errorCount"], 0);
+        assert!(local["preview"].as_str().unwrap().contains("example.test"));
     }
 
     #[tokio::test]

@@ -412,8 +412,13 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(snapshot.route_rules.len(), 1);
-        assert_eq!(snapshot.route_rules[0].id, "controller-rule");
+        assert_eq!(snapshot.route_rules.len(), 2);
+        assert!(
+            snapshot
+                .route_rules
+                .iter()
+                .any(|rule| rule.id == "controller-rule")
+        );
     }
 
     #[test]

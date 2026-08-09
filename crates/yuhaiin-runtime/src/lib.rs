@@ -8,6 +8,7 @@
 pub mod api;
 mod controller;
 mod data_plane;
+mod defaults;
 #[cfg(feature = "doh-tls")]
 mod doh_tls;
 #[cfg(feature = "doh-tls")]
@@ -279,6 +280,7 @@ impl RuntimeBuilder {
     }
 
     pub async fn build(&self) -> Result<RuntimeSnapshot> {
+        defaults::ensure_go_defaults(&self.store).await?;
         let repository = self.store.repository();
         let settings = RuntimeSettings::load(&self.store).await?;
         let socket_bind_addresses =
@@ -696,8 +698,14 @@ mod tests {
         let store = block_on(ConfigStore::open_memory()).unwrap();
         let builder = RuntimeBuilder::new(store, Arc::new(SystemAsyncIpResolver));
         let snapshot = block_on(builder.build()).unwrap();
-        assert!(snapshot.route.is_none());
-        assert!(snapshot.resolvers.is_empty());
+        assert_eq!(snapshot.resolvers.len(), 1);
+        assert_eq!(snapshot.resolvers[0].id, "bootstrap");
+        assert_eq!(
+            snapshot.route.as_ref().unwrap().direct_resolver,
+            "bootstrap"
+        );
+        assert_eq!(snapshot.route_lists.values("LAN").unwrap().len(), 18);
+        assert_eq!(snapshot.route_rules.len(), 1);
     }
 
     #[test]
@@ -787,7 +795,8 @@ mod tests {
                 .build(),
         )
         .unwrap();
-        assert!(snapshot.resolver_by_id.is_empty());
+        assert_eq!(snapshot.resolver_by_id.len(), 1);
+        assert!(snapshot.resolver_by_id.contains_key("bootstrap"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # yuhaiin Go -> Rust 迁移设计与实施文档
 
-> 文档状态：架构基线，2026-08-08
+> 文档状态：架构基线，2026-08-09
 >
 > 目标目录：`/home/asutorufa/Documents/Programming/yuhaiin-rust`
 >
@@ -10,6 +10,8 @@
 > 当前实现快照：可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store`、`yuhaiin-geo`、`yuhaiin-protocol` 和 `yuhaiin-runtime` 七个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，MaxMindDB 位于独立的 `yuhaiin-geo`，协议 wire codec/可组合 transport 位于 `yuhaiin-protocol`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责应用层组装和原子 reload，`yuhaiin-runtime::api` 提供与现有 `yuhaiin-react` client 对齐的管理面和 Rust-native pprof endpoint，`yuhaiin-runtime::run_tun_device_until` 负责已创建设备的数据面生命周期，`yuhaiin-runtime::inbound::run_until` 统一拥有 TUN、TCP/HTTP/WebSocket 和 UDP inbound 的启动、reload、shutdown 及 accepted-flow 生命周期，`src/bin/yuhaiin.rs` 只负责桌面 host/API/DNS wiring。HTTP 层复用 Go compatibility records，不新增一套配置 DTO，也不把平台权限细节泄漏到上层。
 
 > 2026-08-09 runtime socket policy：`useDefaultInterface/netInterface` 已在 immutable snapshot 中解析为接口 IPv4/IPv6 source addresses；统一 `SocketPolicyProxy` 将策略传递到 direct/fixed、HTTP CONNECT、SOCKS5、协议 wrapper、HTTP/2 Yuubinsya、直连 UOT 和 native UDP socket。连接建立按目标地址族选择 source address，selector reload 会替换策略而不影响旧 flow。新增 FlowContext/connector/runtime reload 回归，`cargo test -p yuhaiin-core --all-features --offline --lib` 通过 121 项，`cargo test -p yuhaiin-runtime --all-features --offline --lib` 通过 137 项；inbound listen socket 的平台专用绑定仍保留为平台验收项。
+
+> 2026-08-09 Go empty-store object graph：新增 `runtime::defaults::ensure_go_defaults`。真正没有 inbound/resolver/route settings/route rule/route list 的新 SQLite store 首次构建时，会一次性写入 Go 兼容的 mixed（`127.0.0.1:1080`）、禁用的 TUN、禁用的 Yuubinsya、`bootstrap` UDP resolver、LAN host list、direct LAN rule 和 route settings；通过 `yuhaiin_config` marker 保证重复启动幂等，也保证用户删除默认行后不会被下次启动强行恢复。默认对象仍复用现有 typed repository 和 API/runtime reload boundary；新增默认 JSON、非空 store 不修改、重复 build 和中断恢复回归，`cargo test -p yuhaiin-runtime --all-features --offline` 通过 157 个 runtime 单测、2 个 binary tests、7 个 DoH/DoT 集成测试。
 
 > 2026-08-09 DNS resolver socket policy：`ResolverTransportFactory` 增加带 source-address policy 的默认扩展入口；内置 UDP/TCP DNS client 和 RustCrypto DoH/DoT direct dialer 已按目标地址族绑定接口地址，旧的自定义 factory 不实现扩展时仍走原有 `build`。新增 UDP/TCP/runtime resolver 回归；完整 workspace 测试继续通过。
 
@@ -29,7 +31,7 @@
 
 > 2026-08-09 Linux transparent inbound acceptance：修正 `SO_ORIGINAL_DST` 与 `IP_ORIGDSTADDR` IPv4 地址的 native/network endian 转换，并加入回归测试。Podman 中通过真实 `REDIRECT` 规则验证 TCP inbound→direct→upstream，返回 `transparent-ok` 且 history 记录正确目标；同样的 rootless Podman veth 环境即使使用 privileged，也无法将非本地目标的 `TPROXY` UDP 包交给透明 socket，独立 Python `IP_TRANSPARENT`/`IP_RECVORIGDSTADDR` 探针结果一致。因此 TPROXY UDP 实现保留，真实验收明确依赖宿主机/真正 network namespace 的 CAP_NET_ADMIN；Go contract 中 redir 的 UDP 仍保持禁用，TLS/WS 等透明 transport 继续 fail-closed。
 
-> 2026-08-09 Go zero-configuration baseline：`RuntimeSettings::default()` 对齐 Go `DefaultSetting` 的 IPv6、HTTP system proxy、debug/save 日志默认值；`api::default_settings` 直接复用同一默认对象，避免管理面与数据面漂移。DNS supervisor 在没有 `resolver.server` overlay 和 `dns_settings` row 时使用 Go 默认监听地址 `127.0.0.1:5353`。新增空 settings、API 默认值复用和 empty-store DNS fallback 回归；完整默认 inbound/route object 的 store 初始化仍按 checklist 继续实现。
+> 2026-08-09 Go zero-configuration baseline：`RuntimeSettings::default()` 对齐 Go `DefaultSetting` 的 IPv6、HTTP system proxy、debug/save 日志默认值；`api::default_settings` 直接复用同一默认对象，避免管理面与数据面漂移。DNS supervisor 在没有 `resolver.server` overlay 和 `dns_settings` row 时使用 Go 默认监听地址 `127.0.0.1:5353`；默认 inbound/route object 的 store 初始化已由上一条完成。
 
 > 2026-08-09 inbound protocol compatibility：补齐 Go contract 的 `none` noop inbound（接受后关闭，不进入 router），并归一化旧 JSON 中的 `mix`、`reverseHttp`、`reverseTcp` 拼写；section 查找同时兼容旧字段名，避免协议名归一化后丢失认证/目标配置。新增 alias 解析和 noop close 回归。
 
