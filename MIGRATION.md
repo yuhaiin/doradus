@@ -1875,5 +1875,27 @@ test dns_tcp_async::tests::async_tcp_client_and_server_round_trip_preserves_tran
 [dns-source-bind] passed
 ```
 
-DoH/DoT 的 source-address 和 SOCKS5 UDP/node latency 的网络验收仍保留在 checklist 下一步，
-因为它们需要额外的 TLS/代理服务端 fixture；本次没有把 UDP/TCP 的已有覆盖重复实现一套。
+当时 DoH/DoT 以及 SOCKS5 UDP/node latency 的网络验收仍保留在 checklist 下一步；后续的
+DoH/DoT fixture 见下节，本次没有把 UDP/TCP 的已有覆盖重复实现一套。
+
+## 49. 2026-08-10 RustCrypto DoH/DoT source-address Podman smoke
+
+在 UDP/TCP resolver smoke 之后，继续把加密 DNS transport 的 source-address policy 做成
+真实网络验收。`crates/yuhaiin-runtime/tests/doh_tls.rs` 的 server fixture 现在把接入方
+peer 传回测试，并新增 `rustcrypto_encrypted_resolvers_honor_local_bind_address`：同一个
+`RustCryptoResolverFactory` 分别构造 DoH/HTTP2 和 DoT/TLS resolver，调用统一的
+`build_with_policy`，要求两端都从 `127.0.0.2` 连接并检查返回地址。
+
+`scripts/integration/doh-source-bind.sh` 与 `make doh-source-smoke` 在 host-network Debian
+testing Podman 中执行该测试；构建和运行日志位于
+`~/.cache/yuhaiin-rust/integration/doh-source-bind`，没有使用 `/tmp`。
+
+实际执行结果：
+
+```text
+test rustcrypto_encrypted_resolvers_honor_local_bind_address ... ok
+[doh-source-bind] passed
+```
+
+因此 DNS 的 UDP/TCP/DoH/DoT source-address 已分别有单测和 Podman 入口；SOCKS5 UDP
+ASSOCIATE、node latency 的 DNS/UDP 网络 fixture 仍是下一项。

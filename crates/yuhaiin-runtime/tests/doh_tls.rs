@@ -84,14 +84,17 @@ async fn spawn_doh_server(
     response_status: http::StatusCode,
     response_content_type: &'static str,
     response_delay: Duration,
-) -> (std::net::SocketAddr, oneshot::Receiver<()>) {
+) -> (
+    std::net::SocketAddr,
+    oneshot::Receiver<std::net::SocketAddr>,
+) {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
     let address = listener.local_addr().unwrap();
     let (finished, done) = oneshot::channel();
     tokio::spawn(async move {
-        let Ok((stream, _)) = listener.accept().await else {
+        let Ok((stream, peer)) = listener.accept().await else {
             return;
         };
         let tls = match TlsAcceptor::from(server_config(with_h2))
@@ -135,7 +138,7 @@ async fn spawn_doh_server(
             .unwrap();
         let mut send = respond.send_response(head, false).unwrap();
         send.send_data(Bytes::from(response), true).unwrap();
-        let _ = finished.send(());
+        let _ = finished.send(peer);
         // A real DoH endpoint normally keeps TLS/HTTP2 alive after one
         // response. Let the client drop the connection instead of producing
         // an artificial unexpected TLS EOF in the response path.
@@ -144,14 +147,17 @@ async fn spawn_doh_server(
     (address, done)
 }
 
-async fn spawn_dot_server() -> (std::net::SocketAddr, oneshot::Receiver<()>) {
+async fn spawn_dot_server() -> (
+    std::net::SocketAddr,
+    oneshot::Receiver<std::net::SocketAddr>,
+) {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
     let address = listener.local_addr().unwrap();
     let (finished, done) = oneshot::channel();
     tokio::spawn(async move {
-        let Ok((stream, _)) = listener.accept().await else {
+        let Ok((stream, peer)) = listener.accept().await else {
             return;
         };
         let Ok(mut stream) = TlsAcceptor::from(server_config(false)).accept(stream).await else {
@@ -183,7 +189,7 @@ async fn spawn_dot_server() -> (std::net::SocketAddr, oneshot::Receiver<()>) {
             .await
             .unwrap();
         stream.write_all(&response).await.unwrap();
-        let _ = finished.send(());
+        let _ = finished.send(peer);
     });
     (address, done)
 }
@@ -260,6 +266,64 @@ async fn rustcrypto_dot_factory_resolves_over_real_tls_and_tcp_framing() {
         vec!["192.0.2.124".parse::<std::net::Ipv4Addr>().unwrap()]
     );
     done.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rustcrypto_encrypted_resolvers_honor_local_bind_address() {
+    let (doh_address, doh_done) = spawn_doh_server(
+        true,
+        http::StatusCode::OK,
+        "application/dns-message",
+        Duration::ZERO,
+    )
+    .await;
+    let (dot_address, dot_done) = spawn_dot_server().await;
+    let factory = RustCryptoResolverFactory::new(
+        &[certificate_der(CA_CERTIFICATE_PEM)],
+        Duration::from_secs(2),
+        8,
+    )
+    .unwrap();
+    let local_bind_addresses = ["127.0.0.2".parse().unwrap()];
+
+    let doh = factory
+        .build_with_policy(&resolver_config(doh_address), &local_bind_addresses)
+        .unwrap();
+    let doh_answer = doh
+        .resolve(
+            &DomainName::new("example.com").unwrap(),
+            ResolveStrategy::OnlyIpv4,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        doh_answer.v4,
+        vec!["192.0.2.123".parse::<std::net::Ipv4Addr>().unwrap()]
+    );
+
+    let dot = factory
+        .build_with_policy(&dot_resolver_config(dot_address), &local_bind_addresses)
+        .unwrap();
+    let dot_answer = dot
+        .resolve(
+            &DomainName::new("example.com").unwrap(),
+            ResolveStrategy::OnlyIpv4,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dot_answer.v4,
+        vec!["192.0.2.124".parse::<std::net::Ipv4Addr>().unwrap()]
+    );
+
+    assert_eq!(
+        doh_done.await.unwrap().ip(),
+        "127.0.0.2".parse::<std::net::IpAddr>().unwrap()
+    );
+    assert_eq!(
+        dot_done.await.unwrap().ip(),
+        "127.0.0.2".parse::<std::net::IpAddr>().unwrap()
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

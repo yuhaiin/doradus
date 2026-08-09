@@ -230,7 +230,7 @@ podman run --rm --network=host \
 
 ## 12. 下一步执行顺序
 
-1. 为 DNS DoH/DoT、SOCKS5 UDP ASSOCIATE 和 node latency DNS/UDP 增加更完整的 Podman source-address/网络回归；UDP/TCP resolver source-address 已由 `scripts/integration/dns-source-bind.sh` 覆盖，内置 resolver 已完成 policy 接入，自定义 factory 仍可按需覆写扩展入口。Go 互操作测试已在本机显式运行并通过，详见 `MIGRATION.md` 2026-08-09 记录。
+1. 为 SOCKS5 UDP ASSOCIATE 和 node latency DNS/UDP 增加更完整的 Podman source-address/网络回归；UDP/TCP resolver source-address 已由 `scripts/integration/dns-source-bind.sh` 覆盖，RustCrypto DoH/DoT 已由 `scripts/integration/doh-source-bind.sh` 覆盖，内置 resolver 已完成 policy 接入，自定义 factory 仍可按需覆写扩展入口。Go 互操作测试已在本机显式运行并通过，详见 `MIGRATION.md` 2026-08-09 记录。
 2. 补 Android/macOS target、权限、TUN fd/route 生命周期和实际资源消耗验收。
 3. 补发布切换/rollback 手册：binary 替换、SQLite backup、失败回滚、旧 Go 并行运行和状态目录锁。
 4. 对现有 frontend generated operations 做一次逐项 route/schema 快照比对；四个核心只读 RPC 已与 Go fresh state 实际收到 200 并核对顶层字段，`tests/service_chain.rs` 已覆盖真实配置 mutation/reload 后的数据面与观测面；subscription 维持明确的 deferred 状态；剩余是完整 operation、生产数据和 mutation/reload side effect 快照。
