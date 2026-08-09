@@ -151,8 +151,8 @@ flowchart LR
 | --- | --- | --- | --- |
 | `[x]` | Linux desktop | binary、SQLite、HTTP API、DNS、inbound owner、TUN、Podman smoke | 持续增加真实生产配置回归 |
 | `[x]` | Linux container | Podman host-network / privileged network=none smoke | 已有；每次新增数据面模块继续复用 `~/.cache` 状态目录 |
-| `[~]` | Android | core 可注入 device，纯 Rust crate 设计不依赖 C TLS | target、VpnService fd、权限、电量/内存实测 |
-| `[~]` | macOS | 部分 crate 可做 target compile boundary | utun、LaunchDaemon、权限、SIGTERM/route 实机验收 |
+| `[~]` | Android | `yuhaiin-core` 的 `async-proxy,tun` 已通过 `aarch64-linux-android` target check；runtime 仍依赖 bundled SQLite 的 NDK C compiler | 安装 Android NDK/`aarch64-linux-android-clang` 后完成 runtime target check；VpnService fd、权限、电量/内存实测 |
+| `[~]` | macOS | `yuhaiin-core` 的 `async-proxy,tun` 已通过 `aarch64-apple-darwin` target check；runtime 仍需 macOS SDK/clang 编译 bundled SQLite | macOS SDK/clang runtime target check；utun、LaunchDaemon、权限、SIGTERM/route 实机验收 |
 | `[ ]` | 发布替换手册 | 架构和 API 已稳定 | 补 binary 迁移、state backup/rollback、旧 Go 并行/切换步骤 |
 
 ## 11. 必跑验证
