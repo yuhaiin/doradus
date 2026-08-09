@@ -345,7 +345,7 @@ impl ConfigRepository {
             return Ok(Vec::new());
         }
         let rows = connection
-            .query("SELECT id, name, members_json, updated_at FROM node_tags_v2 ORDER BY id")
+            .query("SELECT id, name, members_json, updated_at FROM node_tags_v2 ORDER BY name")
             .map_err(storage_error)?;
         rows.iter()
             .map(|row| {
@@ -1103,6 +1103,27 @@ impl ConfigRepository {
 
     pub async fn delete_go_node_tag(&self, id: &str) -> Result<bool> {
         self.delete_go_compatibility_row("node_tags_v2", "id", id)
+    }
+
+    /// Delete a Go route-tag contract by its public name.  The current Go
+    /// store addresses tags by `name`; older imported rows may have a
+    /// compatibility `id` that is not identical to that name.
+    pub async fn delete_go_node_tag_by_name(&self, name: &str) -> Result<bool> {
+        validate_id(name)?;
+        self.store.with_write_transaction(|connection| {
+            require_go_table(
+                connection,
+                "node_tags_v2",
+                &["id", "name", "members_json", "updated_at"],
+            )?;
+            connection
+                .execute_with_params(
+                    "DELETE FROM node_tags_v2 WHERE name = ?1",
+                    &[SqliteValue::from(name)],
+                )
+                .map(|changed| changed != 0)
+                .map_err(storage_error)
+        })
     }
 
     pub async fn delete_go_resolver(&self, id: &str) -> Result<bool> {

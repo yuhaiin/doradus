@@ -2450,31 +2450,87 @@ async fn tags_get_value(state: &ApiState, input: &Value) -> ApiResult {
     let values = state
         .controller
         .store()
-        .list_config("route.tag.")
+        .repository()
+        .list_go_node_tags()
         .await?
         .into_iter()
-        .filter_map(|(key, value)| {
-            serde_json::from_slice::<Value>(&value)
-                .ok()
-                .or_else(|| Some(json!({"name": key.trim_start_matches("route.tag.")})))
+        .map(|record| {
+            let mut value = serde_json::from_slice::<Value>(&record.members_json)?;
+            let object = value.as_object_mut().ok_or_else(|| {
+                ApiError::internal(format!(
+                    "stored route tag {:?} is not a JSON object",
+                    record.name
+                ))
+            })?;
+            if object
+                .get("name")
+                .and_then(Value::as_str)
+                .is_none_or(|name| name.trim().is_empty())
+            {
+                object.insert("name".to_owned(), Value::String(record.name));
+            }
+            if object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_none_or(|tag_type| tag_type.trim().is_empty())
+            {
+                object.insert("type".to_owned(), Value::String("node".to_owned()));
+            }
+            let tag_type = object
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if tag_type != "node" && tag_type != "mirror" {
+                return Err(ApiError::internal(format!(
+                    "stored route tag type {tag_type:?} is invalid"
+                )));
+            }
+            Ok(value)
         })
-        .collect::<Vec<_>>();
-    Ok(Json(page(values, input)))
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(Json(page_with_filter(values, input, tag_matches_query)))
 }
 
 async fn tag_put_value(state: &ApiState, value: Value) -> ApiResult {
-    let tag = required_string(&value, "tag")?;
-    write_config_json(state, &format!("route.tag.{tag}"), value).await
+    let name = required_string(&value, "tag")?.trim().to_owned();
+    let mut tag_type = string_or(&value, "type", "node");
+    if tag_type.trim().is_empty() {
+        tag_type = "node".to_owned();
+    }
+    if tag_type != "node" && tag_type != "mirror" {
+        return Err(ApiError::bad(format!("unknown tag type {tag_type:?}")));
+    }
+    let hash = string_or(&value, "hash", "");
+    let tag = json!({"name": name, "type": tag_type, "hash": [hash]});
+    let record = yuhaiin_store::GoNodeTagRecord {
+        id: name.clone(),
+        name,
+        members_json: serde_json::to_vec(&tag)?,
+        updated_at: unix_seconds(),
+    };
+    state
+        .controller
+        .mutate_and_reload(
+            move |store| async move { store.repository().put_go_node_tag(&record).await },
+        )
+        .await?;
+    Ok(empty_json())
 }
 
 async fn tag_delete_value(state: &ApiState, tag: String) -> ApiResult {
+    let tag = tag.trim().to_owned();
     state
         .controller
         .mutate_and_reload(move |store| async move {
-            store
-                .delete_config(&format!("route.tag.{tag}"))
-                .await
-                .map(|_| ())
+            let deleted = store.repository().delete_go_node_tag_by_name(&tag).await?;
+            if deleted {
+                Ok(())
+            } else {
+                Err(yuhaiin_core::Error::new(
+                    yuhaiin_core::ErrorKind::NotFound,
+                    format!("tag {tag:?} was not found"),
+                ))
+            }
         })
         .await?;
     empty()
@@ -3433,6 +3489,20 @@ fn route_rule_matches_query(value: &Value, query: &str) -> bool {
     ["name", "mode", "tag", "resolver"]
         .iter()
         .any(|key| field_contains(value, key, query))
+}
+
+fn tag_matches_query(value: &Value, query: &str) -> bool {
+    field_contains(value, "name", query)
+        || field_contains(value, "type", query)
+        || value
+            .get("hash")
+            .and_then(Value::as_array)
+            .is_some_and(|hashes| {
+                hashes
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|hash| hash.to_ascii_lowercase().contains(query))
+            })
 }
 
 fn required_string(value: &Value, key: &str) -> std::result::Result<String, ApiError> {
@@ -4883,6 +4953,38 @@ mod tests {
             response.status(),
             StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE
         ));
+    }
+
+    #[tokio::test]
+    async fn route_tags_use_go_node_tags_contract_and_filter_fields() {
+        let state = state().await;
+
+        let response = tag_put_value(&state, json!({"tag":" mobile ","type":"","hash":"abc"}))
+            .await
+            .unwrap();
+        assert_eq!(response.0, json!({}));
+
+        let listed = tags_get_value(&state, &json!({"page":1,"page_size":20}))
+            .await
+            .unwrap();
+        assert_eq!(listed.0["items"][0]["name"], "mobile");
+        assert_eq!(listed.0["items"][0]["type"], "node");
+        assert_eq!(listed.0["items"][0]["hash"], json!(["abc"]));
+        assert_eq!(listed.0["page"]["total"], 1);
+
+        let filtered = tags_get_value(&state, &json!({"query":"abc"}))
+            .await
+            .unwrap();
+        assert_eq!(filtered.0["page"]["total"], 1);
+        let unmatched = tags_get_value(&state, &json!({"query":"mirror"}))
+            .await
+            .unwrap();
+        assert_eq!(unmatched.0["page"]["total"], 0);
+
+        let _ = tag_delete_value(&state, "mobile".to_owned()).await.unwrap();
+        let empty = tags_get_value(&state, &json!({})).await.unwrap();
+        assert_eq!(empty.0["page"]["total"], 0);
+        assert!(tag_delete_value(&state, "mobile".to_owned()).await.is_err());
     }
 
     #[tokio::test]

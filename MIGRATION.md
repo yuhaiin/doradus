@@ -1551,3 +1551,9 @@ selected_udp_node_v2 = a549f6c7-3ba1-42bc-9708-3a069f5e61b2
 修复前 Rust `nodes.selected` 返回 `{}`，原因是只读取 `yuhaiin_config` 中形如 `{"id": ...}` 的 JSON。修复后 Rust 在缺少 overlay 时从 `metadata` 回读两个 ID，真实副本的 `nodes.selected` 已返回与 Go 相同的 TCP/UDP 节点；通过 Rust `node.use` 后，两个 Go metadata key 也都写回相同的原始 ID，重读仍返回选中节点。新增 API 单测覆盖 metadata-only 读取和 use 双写。
 
 同一快照中 `resolvers.get` 的 6 条记录及有效 `page/page_size` 分页总数一致；route list 的 remote cache 统计仍会因副本缓存文件和网络环境不同而不同，不能据此宣称逐字段完全一致。生产管理面剩余工作仍是逐操作 response/error/reload side-effect 差异快照。
+
+## 33. 2026-08-09 route tags Go contract 双副本回归
+
+Rust route tags 之前读写私有 `yuhaiin_config` 的 `route.tag.*` key，与 Go 当前使用的 `node_tags_v2(name, members_json, updated_at)` 不一致，导致 Rust 接管真实 Go 状态时看不到已有 tags。现在 list/put/delete 均使用 `node_tags_v2`；响应对象按 Go `TagItem` 返回 `name/type/hash`，空 type 规范化为 `node`，list query 在 name/type/hash 上过滤，delete 按公开 name 删除并对不存在记录返回 404。
+
+使用真实 schema-7 Go 数据库的两个独立副本分别启动 Go 与 Rust，生成的 RPC `route.tags.get` 输出完全一致：9 条生产 tags、`page/pageSize/total` 分页字段和每条的 name/type/hash 均一致。随后对两个进程分别执行 put、按 query 读取、delete 和重复 delete；HTTP 状态序列均为 `200/200/200/404`，Rust 删除后 `node_tags_v2` 行数为 0。副本、请求和日志均保存在 `~/.cache/yuhaiin-rust/api-compare-tags-20260809` 与 `api-compare-tags-mutation-20260809`，没有使用 `/tmp`；本次证据以 React generated client 使用的 RPC 路径为准。
