@@ -12,8 +12,7 @@ use yuhaiin_core::proxy::{
 };
 use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyKind};
 use yuhaiin_core::{
-    BoxFuture, Endpoint, Error, ErrorKind, FlowContext, GeoLookup, IpSet, Network, ResolveStrategy,
-    Result,
+    BoxFuture, Endpoint, Error, ErrorKind, FlowContext, GeoLookup, IpSet, ResolveStrategy, Result,
 };
 use yuhaiin_store::GoProxyRuntimeConfig;
 use yuhaiin_trie::router::RuntimeRoutedProxySelector;
@@ -79,9 +78,6 @@ impl ResolvingProxy {
         else {
             return Box::pin(async move { Ok(resolved) });
         };
-        if network == Network::Udp && resolved.resolver_policy.udp_skip_resolve_target {
-            return Box::pin(async move { Ok(resolved) });
-        }
         let resolver = Arc::clone(&self.resolver);
         let strategy = resolved.resolver_policy.strategy;
         Box::pin(async move {
@@ -1399,6 +1395,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(server.await.unwrap(), *b"resolved-domain");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selector_resolves_domain_for_direct_udp_even_when_proxy_dns_is_skipped() {
+        let config = GoProxyRuntimeConfig {
+            id: "proxy".to_owned(),
+            name: "Proxy".to_owned(),
+            group_name: String::new(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["direct".to_owned()],
+            layers: Vec::new(),
+            transport: GoProxyTransport::Direct,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        };
+        let selector = snapshot(config)
+            .build_proxy_selector("", "proxy", "", "", Duration::from_secs(1))
+            .await
+            .unwrap();
+        let destination = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = destination.local_addr().unwrap().port();
+        let mut context = FlowContext::new(yuhaiin_core::Endpoint::domain(
+            yuhaiin_core::Network::Udp,
+            yuhaiin_core::DomainName::new("localhost").unwrap(),
+            port,
+        ));
+        context.route_mode = RouteMode::Proxy;
+        context.resolver_policy.udp_skip_resolve_target = true;
+
+        selector
+            .select(&context)
+            .open_datagram(&context)
+            .await
+            .expect("direct transport must resolve its own UDP target");
     }
 
     #[tokio::test(flavor = "current_thread")]
