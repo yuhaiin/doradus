@@ -620,7 +620,7 @@ pub async fn selected_proxy_id(controller: &RuntimeController) -> Result<String>
     let nodes = controller.store().repository().list_go_nodes().await?;
     let selected = controller
         .store()
-        .get_config("selected.node")
+        .get_config("selected_tcp_node_v2")
         .await?
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|value| {
@@ -629,6 +629,20 @@ pub async fn selected_proxy_id(controller: &RuntimeController) -> Result<String>
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         });
+    let selected = match selected {
+        Some(selected) => Some(selected),
+        None => controller
+            .store()
+            .get_config("selected.node")
+            .await?
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| {
+                value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            }),
+    };
     Ok(selected
         .filter(|id| nodes.iter().any(|node| node.enabled && node.id == *id))
         .or_else(|| {

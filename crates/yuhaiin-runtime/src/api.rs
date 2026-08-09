@@ -45,6 +45,13 @@ use crate::{
     refresh_route_list_caches_with_transport,
 };
 
+// Go keeps TCP and UDP node selection independently in metadata.  Keep the
+// same names in the Rust config overlay, while retaining the old single-key
+// selection as a read fallback for databases written by earlier Rust builds.
+const SELECTED_TCP_NODE_KEY: &str = "selected_tcp_node_v2";
+const SELECTED_UDP_NODE_KEY: &str = "selected_udp_node_v2";
+const LEGACY_SELECTED_NODE_KEY: &str = "selected.node";
+
 #[derive(Clone)]
 pub struct ApiState {
     pub controller: RuntimeController,
@@ -1576,23 +1583,48 @@ async fn selected_nodes_value(state: &ApiState) -> ApiResult {
         .repository()
         .list_go_nodes()
         .await?;
-    let selected_id = state
+    let tcp = selected_node_record(state, &records, SELECTED_TCP_NODE_KEY).await?;
+    let udp = selected_node_record(state, &records, SELECTED_UDP_NODE_KEY).await?;
+    let mut selection = Map::new();
+    if let Some(record) = tcp {
+        selection.insert("tcp".to_owned(), node_json(record));
+    }
+    if let Some(record) = udp {
+        selection.insert("udp".to_owned(), node_json(record));
+    }
+    Ok(Json(Value::Object(selection)))
+}
+
+async fn selected_node_id(state: &ApiState, key: &str) -> Result<Option<String>, ApiError> {
+    let selected = state
         .controller
         .store()
-        .get_config("selected.node")
+        .get_config(key)
         .await?
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned));
-    let selected = selected_id
+    if selected.is_some() || key == LEGACY_SELECTED_NODE_KEY {
+        return Ok(selected);
+    }
+    Ok(state
+        .controller
+        .store()
+        .get_config(LEGACY_SELECTED_NODE_KEY)
+        .await?
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned)))
+}
+
+async fn selected_node_record(
+    state: &ApiState,
+    records: &[GoNodeRecord],
+    key: &str,
+) -> Result<Option<GoNodeRecord>, ApiError> {
+    let selected_id = selected_node_id(state, key).await?;
+    Ok(selected_id
         .as_deref()
         .and_then(|id| records.iter().find(|record| record.id == id))
-        .cloned()
-        .or_else(|| records.into_iter().find(|record| record.enabled));
-    Ok(Json(
-        selected
-            .map(|record| json!({"tcp": node_json(record), "udp": null}))
-            .unwrap_or_else(|| json!({})),
-    ))
+        .cloned())
 }
 
 async fn active_nodes_value(state: &ApiState) -> ApiResult {
@@ -1617,7 +1649,16 @@ async fn select_node_value(state: &ApiState, id: String) -> ApiResult {
     if !records.iter().any(|record| record.id == id) {
         return Err(ApiError::not_found(format!("node {id:?} was not found")));
     }
-    write_config_json(state, "selected.node", json!({"id": id})).await
+    let bytes = serde_json::to_vec(&json!({"id": id}))?;
+    state
+        .controller
+        .mutate_and_reload(move |store| async move {
+            store.put_config(SELECTED_TCP_NODE_KEY, &bytes).await?;
+            store.put_config(SELECTED_UDP_NODE_KEY, &bytes).await?;
+            store.put_config(LEGACY_SELECTED_NODE_KEY, &bytes).await
+        })
+        .await?;
+    Ok(empty_json())
 }
 
 async fn inbounds_get_value(state: &ApiState, input: &Value) -> ApiResult {
@@ -3212,6 +3253,50 @@ mod tests {
             .unwrap();
         assert_eq!(listed.0["items"][0]["chain"][0]["type"], "direct");
         assert_eq!(state.controller.handle().revision(), 1);
+    }
+
+    #[tokio::test]
+    async fn node_selection_keeps_go_tcp_udp_contract_and_use_updates_both() {
+        let state = state().await;
+        for id in ["tcp-node", "udp-node"] {
+            let _ = save_node_value(
+                &state,
+                json!({
+                    "id": id,
+                    "name": id,
+                    "enabled": true,
+                    "chain": [{"type":"direct","direct":{}}]
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        state
+            .controller
+            .store()
+            .put_config(SELECTED_TCP_NODE_KEY, br#"{"id":"tcp-node"}"#)
+            .await
+            .unwrap();
+        state
+            .controller
+            .store()
+            .put_config(SELECTED_UDP_NODE_KEY, br#"{"id":"udp-node"}"#)
+            .await
+            .unwrap();
+
+        let selected = selected_nodes_value(&state).await.unwrap();
+        assert_eq!(selected.0["tcp"]["id"], "tcp-node");
+        assert_eq!(selected.0["udp"]["id"], "udp-node");
+
+        let used = select_node_value(&state, "udp-node".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(used.0, json!({}));
+        let selected = selected_nodes_value(&state).await.unwrap();
+        assert_eq!(selected.0["tcp"]["id"], "udp-node");
+        assert_eq!(selected.0["udp"]["id"], "udp-node");
     }
 
     #[tokio::test]
