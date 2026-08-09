@@ -3,9 +3,9 @@
 //! The Go implementation used by yuhaiin exposes VMess as an outbound-only
 //! protocol.  This module deliberately implements the modern `alter_id=0`
 //! path: the authenticated AEAD request header, AES-128-GCM/ChaCha20-Poly1305
-//! (or plaintext) chunk stream, and the encrypted response header.  Legacy
-//! alter-id/CFB users and VMess UDP packet mode remain explicit unsupported
-//! features instead of being silently treated as TCP.
+//! (or plaintext) chunk stream, the encrypted response header, and the
+//! symmetric-target UDP packet mode. Legacy alter-id/CFB users remain
+//! explicitly unsupported instead of being silently treated as modern VMess.
 
 use std::io;
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use crc32fast::Hasher as Crc32;
 use md5::{Digest as Md5Digest, Md5};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split};
+use tokio::sync::Mutex;
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
@@ -367,18 +368,138 @@ impl AsyncProxy for VmessProxy {
 
     fn open_datagram<'a>(
         &'a self,
-        _context: &'a FlowContext,
+        context: &'a FlowContext,
     ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
-        Box::pin(async {
-            Err(Error::new(
-                ErrorKind::Unsupported,
-                "VMess UDP packet mode is not implemented yet",
-            ))
+        Box::pin(async move {
+            let mut upstream = self.upstream.connect(context).await?;
+            let destination = context.effective_destination();
+            let (request, state) =
+                encode_request(&self.uuid, self.security, CMD_UDP, &destination)?;
+            upstream.write_all(&request).await.map_err(io_error)?;
+            let (reader, writer) = split(upstream);
+            Ok(Box::new(VmessDatagram {
+                reader: Mutex::new(VmessDatagramReader {
+                    reader,
+                    response_key: response_key(&state.body_key),
+                    response_iv: response_key(&state.body_iv),
+                    response_v: state.response_v,
+                    security: state.security,
+                    count: 0,
+                    response_read: false,
+                    destination: destination.clone(),
+                }),
+                writer: Mutex::new(VmessDatagramWriter {
+                    writer,
+                    key: state.body_key,
+                    iv: state.body_iv,
+                    security: state.security,
+                    count: 0,
+                    destination,
+                }),
+            }) as Box<dyn AsyncDatagram>)
         })
     }
 
     fn close(&self) -> BoxFuture<'_, Result<()>> {
         self.upstream.close()
+    }
+}
+
+struct VmessDatagramReader {
+    reader: tokio::io::ReadHalf<BoxAsyncStream>,
+    response_key: [u8; 16],
+    response_iv: [u8; 16],
+    response_v: u8,
+    security: Security,
+    count: u16,
+    response_read: bool,
+    destination: Endpoint,
+}
+
+struct VmessDatagramWriter {
+    writer: tokio::io::WriteHalf<BoxAsyncStream>,
+    key: [u8; 16],
+    iv: [u8; 16],
+    security: Security,
+    count: u16,
+    destination: Endpoint,
+}
+
+struct VmessDatagram {
+    reader: Mutex<VmessDatagramReader>,
+    writer: Mutex<VmessDatagramWriter>,
+}
+
+impl AsyncDatagram for VmessDatagram {
+    fn send_to<'a>(&'a self, payload: &'a [u8], target: Endpoint) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            let mut writer = self.writer.lock().await;
+            if target != writer.destination {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "VMess UDP only supports the symmetric target used at open",
+                ));
+            }
+            let key = writer.key;
+            let iv = writer.iv;
+            let security = writer.security;
+            let count = writer.count;
+            write_body_frame(&mut writer.writer, &key, &iv, security, count, payload)
+                .await
+                .map_err(io_error)?;
+            writer.count = writer.count.wrapping_add(1);
+            Ok(payload.len())
+        })
+    }
+
+    fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
+        Box::pin(async move {
+            let mut reader = self.reader.lock().await;
+            let response_key = reader.response_key;
+            let response_iv = reader.response_iv;
+            let response_v = reader.response_v;
+            if !reader.response_read {
+                read_response_header(&mut reader.reader, &response_key, &response_iv, response_v)
+                    .await
+                    .map_err(io_error)?;
+                reader.response_read = true;
+            }
+            let security = reader.security;
+            let count = reader.count;
+            let payload = read_body_frame(
+                &mut reader.reader,
+                &response_key,
+                &response_iv,
+                security,
+                count,
+            )
+            .await
+            .map_err(io_error)?
+            .ok_or_else(|| Error::new(ErrorKind::Closed, "VMess UDP stream ended"))?;
+            if payload.len() > buffer.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "VMess UDP payload buffer is too small",
+                ));
+            }
+            buffer[..payload.len()].copy_from_slice(&payload);
+            reader.count = reader.count.wrapping_add(1);
+            Ok((payload.len(), reader.destination.clone()))
+        })
+    }
+
+    fn local_addr(&self) -> Result<Endpoint> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "VMess UDP has no local endpoint",
+        ))
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async {
+            let mut writer = self.writer.lock().await;
+            writer.writer.shutdown().await.map_err(io_error)
+        })
     }
 }
 
@@ -913,5 +1034,87 @@ mod tests {
         encoded[last] ^= 1;
         assert!(decode_request(&encoded, &uuid).is_err());
         assert!(decode_request(&encoded[..10], &uuid).is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_command_round_trips_with_independent_direction_counters() {
+        let uuid = crate::vless::parse_uuid(UUID).unwrap();
+        let destination =
+            Endpoint::domain(Network::Udp, DomainName::new("example.com").unwrap(), 443);
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let (client_reader, mut client_writer) = split(Box::new(client) as BoxAsyncStream);
+        let expected_destination = destination.clone();
+
+        let server_task = tokio::spawn(async move {
+            let request = read_request(&mut server, &uuid).await.unwrap();
+            assert_eq!(request.command, CMD_UDP);
+            assert_eq!(request.destination, expected_destination);
+
+            let response_header = encode_response_header(
+                request.response_v,
+                &response_key(&request.body_key),
+                &response_key(&request.body_iv),
+            )
+            .unwrap();
+            server.write_all(&response_header).await.unwrap();
+            let payload = read_body_frame(
+                &mut server,
+                &request.body_key,
+                &request.body_iv,
+                request.security,
+                0,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(payload, b"ping");
+            write_body_frame(
+                &mut server,
+                &response_key(&request.body_key),
+                &response_key(&request.body_iv),
+                request.security,
+                0,
+                b"pong",
+            )
+            .await
+            .unwrap();
+        });
+
+        let (request, state) =
+            encode_request(&uuid, Security::Aes128Gcm, CMD_UDP, &destination).unwrap();
+        client_writer.write_all(&request).await.unwrap();
+        let datagram = VmessDatagram {
+            reader: Mutex::new(VmessDatagramReader {
+                reader: client_reader,
+                response_key: response_key(&state.body_key),
+                response_iv: response_key(&state.body_iv),
+                response_v: state.response_v,
+                security: state.security,
+                count: 0,
+                response_read: false,
+                destination: destination.clone(),
+            }),
+            writer: Mutex::new(VmessDatagramWriter {
+                writer: client_writer,
+                key: state.body_key,
+                iv: state.body_iv,
+                security: state.security,
+                count: 0,
+                destination: destination.clone(),
+            }),
+        };
+
+        assert_eq!(
+            datagram
+                .send_to(b"ping", destination.clone())
+                .await
+                .unwrap(),
+            4
+        );
+        let mut buffer = [0u8; 32];
+        let (length, received_from) = datagram.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..length], b"pong");
+        assert_eq!(received_from, destination);
+        server_task.await.unwrap();
     }
 }
