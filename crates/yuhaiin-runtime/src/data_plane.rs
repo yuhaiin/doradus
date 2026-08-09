@@ -9,7 +9,6 @@ use std::net::IpAddr;
 #[cfg(feature = "tun")]
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-#[cfg(feature = "tun")]
 use std::time::Duration;
 
 use serde_json::Value;
@@ -18,6 +17,7 @@ use yuhaiin_core::dns::{
     AsyncDnsHandler, DnsRecordType, DnsResponse, decode_query, encode_response,
 };
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+use yuhaiin_core::dns_tcp_async::AsyncTcpDnsServer;
 #[cfg(feature = "tun")]
 use yuhaiin_core::{Error, ErrorKind};
 use yuhaiin_core::{LocalBoxFuture, ResolveStrategy, Result};
@@ -27,9 +27,10 @@ use yuhaiin_store::GoInboundRecord;
 use crate::{RuntimeController, parse_dns_server};
 
 /// DNS packet handler backed by the resolver in the current immutable
-/// runtime snapshot.  TUN DNS hijacking and the optional UDP DNS listener use
+/// runtime snapshot. TUN DNS hijacking and both DNS listener transports use
 /// the same handler, so a reload cannot make them disagree about resolver
 /// policy.
+#[derive(Clone)]
 pub struct RuntimeDnsHandler {
     pub resolver: Arc<dyn AsyncIpResolver>,
     pub fakeip: Option<yuhaiin_store::FakeIpPools>,
@@ -365,8 +366,10 @@ pub async fn run_tun_device_until(
     Ok(())
 }
 
-/// Run the optional UDP DNS listener with the same reload and shutdown owner
-/// used by the executable service.
+/// Run the optional UDP and TCP DNS listeners with the same reload and
+/// shutdown owner used by the executable service. Go exposes both transports
+/// on the configured address, and clients commonly fall back to TCP when a
+/// UDP response is truncated.
 pub async fn run_dns_supervisor(
     controller: RuntimeController,
     shutdown: watch::Receiver<bool>,
@@ -384,12 +387,21 @@ pub async fn run_dns_supervisor(
             resolver: controller.handle().load().resolver.clone(),
             fakeip: controller.handle().load().fakeip.clone(),
         };
-        let dns =
-            yuhaiin_core::dns_udp_async::AsyncUdpDnsServer::bind(address, handler, 4096).await?;
-        dns.serve_until(async {
-            let _ = wait_for_shutdown_or_reload(&controller, shutdown.clone()).await;
-        })
-        .await?;
+        let udp =
+            yuhaiin_core::dns_udp_async::AsyncUdpDnsServer::bind(address, handler.clone(), 4096)
+                .await?;
+        let tcp = AsyncTcpDnsServer::bind(address, handler, 65535, Duration::from_secs(5)).await?;
+        let udp_controller = controller.clone();
+        let udp_shutdown_receiver = shutdown.clone();
+        let udp_shutdown = async move {
+            let _ = wait_for_shutdown_or_reload(&udp_controller, udp_shutdown_receiver).await;
+        };
+        let tcp_controller = controller.clone();
+        let tcp_shutdown_receiver = shutdown.clone();
+        let tcp_shutdown = async move {
+            let _ = wait_for_shutdown_or_reload(&tcp_controller, tcp_shutdown_receiver).await;
+        };
+        tokio::try_join!(udp.serve_until(udp_shutdown), tcp.serve_until(tcp_shutdown))?;
         if *shutdown.borrow() {
             return Ok(());
         }
@@ -582,6 +594,26 @@ mod tests {
             configured_dns_server(&store).await.unwrap().as_deref(),
             Some("127.0.0.1:5353")
         );
+    }
+
+    #[tokio::test]
+    async fn dns_server_binds_udp_and_tcp_on_the_same_configured_address() {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let handler = RuntimeDnsHandler {
+            resolver: Arc::new(SystemAsyncIpResolver),
+            fakeip: None,
+        };
+        let udp =
+            yuhaiin_core::dns_udp_async::AsyncUdpDnsServer::bind(address, handler.clone(), 4096)
+                .await
+                .unwrap();
+        let tcp = AsyncTcpDnsServer::bind(address, handler, 65535, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(udp.local_addr().unwrap(), address);
+        assert_eq!(tcp.local_addr().unwrap(), address);
     }
 
     #[tokio::test]
