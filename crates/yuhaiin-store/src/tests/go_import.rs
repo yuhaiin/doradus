@@ -160,6 +160,7 @@ fn go_node_runtime_preserves_proxy_layers_and_selects_supported_base() {
         ("vless", GoProxyTransport::Vless),
         ("vmess", GoProxyTransport::Vmess),
         ("yuubinsya", GoProxyTransport::Yuubinsya),
+        ("aead", GoProxyTransport::Aead),
         ("tls", GoProxyTransport::Tls),
         ("http2", GoProxyTransport::Http2),
     ];
@@ -203,6 +204,21 @@ fn go_node_runtime_preserves_proxy_layers_and_selects_supported_base() {
     assert_eq!(runtime.layers[1].kind, "tls");
     let wire = serde_json::to_value(&runtime).unwrap();
     assert_eq!(wire["layers"][0]["config"]["password"], "***");
+
+    let aead = GoNodeRecord {
+        id: "node-aead".to_owned(),
+        name: "aead".to_owned(),
+        group_name: "test".to_owned(),
+        origin: "manual".to_owned(),
+        enabled: true,
+        chain_types_json: br#"["fixedv2","aead"]"#.to_vec(),
+        updated_at: 1,
+        data_json: br#"{"chain":[{"type":"fixedv2","fixedv2":{"addresses":[{"host":"127.0.0.1","port":443}]}},{"type":"aead","aead":{"password":"secret","cryptoMethod":"AeadCryptoMethod_XChacha20Poly1305"}}]}"#.to_vec(),
+    };
+    let aead_runtime = aead.to_proxy_runtime_config().unwrap();
+    assert_eq!(aead_runtime.transport, GoProxyTransport::Aead);
+    assert_eq!(aead_runtime.layers[1].kind, "aead");
+    assert_eq!(aead_runtime.layers[1].config["password"], "secret");
 
     let wrapped_base = GoNodeRecord {
         chain_types_json: br#"["tls","fixed"]"#.to_vec(),

@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -140,7 +143,7 @@ where
 }
 
 pub(crate) async fn serve_udp_socket(
-    socket: UdpSocket,
+    socket: impl InboundUdpSocket,
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
@@ -149,7 +152,7 @@ pub(crate) async fn serve_udp_socket(
 }
 
 pub(crate) async fn serve_socks5_udp_loop(
-    socket: UdpSocket,
+    mut socket: impl InboundUdpSocket,
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
@@ -244,6 +247,100 @@ pub(crate) async fn serve_socks5_udp_loop(
     }
     let _ = spec;
     Ok(())
+}
+
+pub(crate) trait InboundUdpSocket: Send + Unpin + 'static {
+    fn recv_from<'a>(
+        &'a mut self,
+        buffer: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>>;
+
+    fn send_to<'a>(
+        &'a mut self,
+        buffer: &'a [u8],
+        peer: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>>;
+}
+
+impl InboundUdpSocket for UdpSocket {
+    fn recv_from<'a>(
+        &'a mut self,
+        buffer: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>> {
+        Box::pin(UdpSocket::recv_from(self, buffer))
+    }
+
+    fn send_to<'a>(
+        &'a mut self,
+        buffer: &'a [u8],
+        peer: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+        Box::pin(UdpSocket::send_to(self, buffer, peer))
+    }
+}
+
+pub(crate) struct AeadUdpSocket {
+    socket: UdpSocket,
+    password: Vec<u8>,
+    method: yuhaiin_protocol::aead::CryptoMethod,
+}
+
+impl AeadUdpSocket {
+    pub(crate) fn new(
+        socket: UdpSocket,
+        password: impl Into<Vec<u8>>,
+        method: yuhaiin_protocol::aead::CryptoMethod,
+    ) -> Self {
+        Self {
+            socket,
+            password: password.into(),
+            method,
+        }
+    }
+}
+
+impl InboundUdpSocket for AeadUdpSocket {
+    fn recv_from<'a>(
+        &'a mut self,
+        buffer: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut packet = vec![0u8; 65_535];
+            let (length, peer) = self.socket.recv_from(&mut packet).await?;
+            let plaintext = yuhaiin_protocol::aead::decrypt_packet(
+                &packet[..length],
+                &self.password,
+                self.method,
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+            if buffer.len() < plaintext.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "AEAD UDP payload exceeds receive buffer",
+                ));
+            }
+            buffer[..plaintext.len()].copy_from_slice(&plaintext);
+            Ok((plaintext.len(), peer))
+        })
+    }
+
+    fn send_to<'a>(
+        &'a mut self,
+        buffer: &'a [u8],
+        peer: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            let packet =
+                yuhaiin_protocol::aead::encrypt_packet(buffer, &self.password, self.method)
+                    .map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+            self.socket
+                .send_to(&packet, peer)
+                .await
+                .map(|_| buffer.len())
+        })
+    }
 }
 
 async fn read_socks_endpoint<S>(stream: &mut S, network: Network, atyp: u8) -> Result<Endpoint>

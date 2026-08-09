@@ -99,7 +99,8 @@ impl GoProxyRuntimeConfig {
             | GoProxyTransport::Trojan
             | GoProxyTransport::Vless
             | GoProxyTransport::Vmess
-            | GoProxyTransport::Yuubinsya => Some(fixed_endpoint(&self.layers)),
+            | GoProxyTransport::Yuubinsya
+            | GoProxyTransport::Aead => Some(fixed_endpoint(&self.layers)),
             _ => None,
         }
     }
@@ -134,6 +135,9 @@ impl GoProxyRuntimeConfig {
             | GoProxyTransport::Vless
             | GoProxyTransport::Vmess => BaseProxyKind::Fixed {
                 address: address.ok_or_else(|| Error::invalid("proxy protocol has no endpoint"))?,
+            },
+            GoProxyTransport::Aead => BaseProxyKind::Fixed {
+                address: address.ok_or_else(|| Error::invalid("AEAD proxy has no endpoint"))?,
             },
             GoProxyTransport::Yuubinsya => {
                 let config = layer_config(&self.layers, "yuubinsya")?;
@@ -174,6 +178,7 @@ fn transport_name(transport: &GoProxyTransport) -> &str {
         GoProxyTransport::Vless => "vless",
         GoProxyTransport::Vmess => "vmess",
         GoProxyTransport::Yuubinsya => "yuubinsya",
+        GoProxyTransport::Aead => "aead",
         GoProxyTransport::Tls => "tls",
         GoProxyTransport::Http2 => "http2",
         GoProxyTransport::Unknown { name } => name,

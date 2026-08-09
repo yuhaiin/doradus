@@ -10,6 +10,8 @@
 > 当前实现快照：可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store`、`yuhaiin-geo`、`yuhaiin-protocol` 和 `yuhaiin-runtime` 七个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，MaxMindDB 位于独立的 `yuhaiin-geo`，协议 wire codec/可组合 transport 位于 `yuhaiin-protocol`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责应用层组装和原子 reload，`yuhaiin-runtime::api` 提供与现有 `yuhaiin-react` client 对齐的管理面，`yuhaiin-runtime::run_tun_device_until` 负责已创建设备的数据面生命周期，`src/bin/yuhaiin.rs` 只是桌面设备创建和进程 wiring 的一个 host。HTTP 层复用 Go compatibility records，不新增一套配置 DTO，也不把平台权限细节泄漏到上层。
 
 > 已实现的代码包括：SQLite 配置事务与 schema v3 typed repository、Go v6 fixture/import/字段差异报告、FakeIP IPv4/IPv6 分配/持久化/旧 snapshot 幂等导入与 A/AAAA/PTR/HTTPS/SVCB hint answer transform、域名/CIDR/Geo country Router snapshot publish/rollback、独立 `yuhaiin-geo` 的 MaxMindDB reader/校验下载/atomic refresh、带 TTL/容量淘汰的 DNS cache、同步/异步 UDP DNS client/server/policy/cancellation boundary、DoH transport boundary、注入 connector 的 HTTP/2 DoH framing、可直接接入异步 DNS/TUN packet pipeline 的 `H2DohDnsHandler`、可复用的 RustCrypto TCP→TLS→ALPN h2 DoH connector 和 DoT TCP framing resolver、同时组装 System/UDP/TCP/DoH/DoT 的 `RustCryptoResolverFactory`、hosts→upstream→FakeIP 的可注入异步 resolver stack、`yuhaiin-runtime` 的 Go compatibility snapshot 组装与 direct/HTTP/SOCKS5/Shadowsocks/Trojan/VLESS/chain proxy 构造、direct/fixed/drop/HTTP CONNECT/SOCKS5、独立 `yuhaiin-protocol` 的 Shadowsocks/Trojan/VLESS TCP/UDP codec、inbound/outbound wrapper、TLS 和 WebSocket transport 组合、feature-gated `rustls-rustcrypto` TLS client、共享 WebSocket byte-stream transport（standalone、VLESS 和 WebSocket+HTTP/2 inbound/outbound）、Yuubinsya native UDP client/server socket、UOT/TCP/coalesce/Ping client/server session、full-cone NAT UDP relay、唯一的 `tun-rs AsyncDevice + smoltcp` TUN adapter，以及独立的 `yuhaiin-chain`（fixedv2 → 可选 TLS/WebSocket → HTTP/2 pool/CONNECT → Yuubinsya TCP/UOT/Ping）。TLS provider 仍是 alpha，DoQ/DoH3、WebSocket early-data/子协议和特权 Linux namespace/Android/macOS 验收仍是独立门槛，未用 C TLS 代替。
+>
+> 本轮新增 Go 自定义 AEAD transport：它与 Shadowsocks AEAD 不同，使用 P-256/Ed25519 handshake、ChaCha20/XChaCha20 方向 stream，以及 Go 兼容的 `nonce || ciphertext` UDP packet。协议 codec、TCP/UDP outbound wrapper、SOCKS5 AEAD inbound 和 AEAD 外层 Yuubinsya UDP 已接入；Rust 本地回归与 Go↔Rust TCP wire 互操作通过，Go UDP 实例互操作和更完整组合仍列为 P1 验收项。
 
 ## 1. 目标、边界和完成定义
 
@@ -922,6 +924,7 @@ server 同时处理 TCP listener 和 UDP listener：
 | Trojan | 是 | UDP-over-TCP ASSOCIATE | 委托 | 已实现 |
 | VLESS | 是 | UDP-over-TCP length framing | 委托 | 已实现（TCP/UDP codec、inbound/outbound、WebSocket transport composition、Go wire 互操作） |
 | VMess modern AEAD | 是 | 固定目标 UDP packet | 委托 | 已实现（alter-id=0 TCP/UDP codec、TLS/WebSocket composition、Go client→Rust wire 互操作） |
+| Go AEAD transport | 是 | nonce+ciphertext packet | 委托 | 已实现（TCP/UDP codec、inbound/outbound wrapper、Go↔Rust TCP 互操作；Go UDP 实例互操作仍待补） |
 | HTTP/2 prior knowledge | CONNECT stream | CONNECT stream | 委托 | 必须 |
 | Yuubinsya | 是 | native + UOT | 是 | 最高优先级 |
 
@@ -961,6 +964,24 @@ request body key/IV 的 SHA-256 前 16 字节派生 key/IV；跨语言 fixture �
 `CMD_UDP` request，并通过固定目标和独立方向计数器维持 Go 的 symmetric-NAT 语义，已有
 双向 framing 单元回归。legacy alter-id、HTTP/2/early-data 等变体必须返回显式 unsupported，
 不得静默按 modern TCP 处理。
+
+### 8.10 Go AEAD transport
+
+Go 代码中的 `pkg/net/proxy/aead` 是独立的自定义 transport，不是 Shadowsocks 的 AEAD
+framing，不能复用 Shadowsocks 的 salt、record 或 UDP 地址编码。Rust 实现放在
+`yuhaiin-protocol::aead`，边界如下：
+
+- handshake 使用 P-256 ephemeral key、Ed25519 header signature 和带时间校验的加密时间戳；
+- TCP 使用独立方向的 ChaCha20 或 XChaCha20 stream cipher，并保留有界 record framing；
+- UDP 使用 Go 兼容的 `nonce || ciphertext` packet，packet key 由 password 派生；
+- `AeadProxy` 只负责 transport wrapping，parent、resolver、TLS 和上层协议由 runtime/chain
+  组装；store 保留 Go tagged layer，避免把它误解析为 Shadowsocks；
+- inbound 在进入 SOCKS5/Yuubinsya protocol dispatcher 前解包，TCP/UDP 都复用既有 listener
+  生命周期和 outbound selector。
+
+当前已通过 Rust stream/packet 单测、`fixedv2 -> aead` TCP/UDP loopback、AEAD SOCKS5
+inbound→direct outbound，以及 Go↔Rust TCP wire 互操作。Go UDP 实例级互操作、更多 TLS/HTTP2
+组合、API/reload 及 Android/macOS 验收仍是后续门槛。
 
 ## 9. NAT 迁移设计
 

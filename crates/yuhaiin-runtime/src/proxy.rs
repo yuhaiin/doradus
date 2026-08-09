@@ -63,6 +63,8 @@ impl RuntimeSnapshot {
                 json,
                 self.resolver.clone(),
             )?) as Arc<dyn AsyncProxy>
+        } else if config.transport == yuhaiin_store::GoProxyTransport::Aead {
+            build_aead_proxy(&config, timeout, self.resolver.clone()).await?
         } else if matches!(
             config.transport,
             yuhaiin_store::GoProxyTransport::Shadowsocks
@@ -306,6 +308,59 @@ impl RuntimeSnapshot {
         }
         Ok(self.build_proxy(id, timeout).await?.proxy)
     }
+}
+
+async fn build_aead_proxy(
+    config: &GoProxyRuntimeConfig,
+    timeout: Duration,
+    resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let base = config
+        .to_base_proxy_config_with_resolver(timeout, resolver)
+        .await?;
+    let udp_server = match &base.kind {
+        BaseProxyKind::Fixed { address } => Some(*address),
+        _ => None,
+    };
+    let mut upstream: Arc<dyn AsyncProxy> = base.build()?;
+    if config
+        .chain_types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("tls"))
+    {
+        #[cfg(feature = "doh-tls")]
+        {
+            upstream = build_protocol_tls_proxy(config, upstream)?;
+        }
+        #[cfg(not(feature = "doh-tls"))]
+        {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "AEAD TLS transport requires the doh-tls feature",
+            ));
+        }
+    }
+    let layer = config
+        .layers
+        .iter()
+        .find(|layer| layer.kind.eq_ignore_ascii_case("aead"))
+        .ok_or_else(|| Error::invalid("AEAD transport layer is missing"))?;
+    let password = layer
+        .config
+        .get("password")
+        .and_then(serde_json::Value::as_str)
+        .filter(|password| !password.is_empty())
+        .ok_or_else(|| Error::invalid("AEAD password is empty"))?;
+    let method = layer
+        .config
+        .get("cryptoMethod")
+        .or_else(|| layer.config.get("crypto_method"))
+        .and_then(serde_json::Value::as_str)
+        .map(yuhaiin_protocol::aead::CryptoMethod::parse)
+        .unwrap_or(yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305);
+    Ok(Arc::new(yuhaiin_protocol::aead::AeadProxy::new(
+        upstream, password, method, udp_server,
+    )))
 }
 
 /// A TUN-facing selector whose proxy slots can be replaced as one unit after
@@ -815,6 +870,133 @@ mod tests {
             .unwrap();
         assert_eq!(&echoed, b"hello");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn go_aead_layer_builds_stream_transport_over_fixed_parent() {
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_address = tcp_listener.local_addr().unwrap();
+        let tcp_server = tokio::spawn(async move {
+            let (stream, _) = tcp_listener.accept().await.unwrap();
+            let mut stream = yuhaiin_protocol::aead::server(
+                Box::new(stream),
+                b"secret",
+                yuhaiin_protocol::aead::CryptoMethod::XChacha20Poly1305,
+            )
+            .await
+            .unwrap();
+            let mut payload = [0u8; 5];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut payload)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, &payload)
+                .await
+                .unwrap();
+        });
+        let config = GoProxyRuntimeConfig {
+            id: "aead".to_owned(),
+            name: "aead".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned(), "aead".to_owned()],
+            layers: vec![
+                GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({
+                        "addresses": [{"host": "127.0.0.1", "port": tcp_address.port()}]
+                    }),
+                },
+                GoProxyLayer {
+                    kind: "aead".to_owned(),
+                    config: serde_json::json!({
+                        "password": "secret",
+                        "cryptoMethod": "AeadCryptoMethod_XChacha20Poly1305"
+                    }),
+                },
+            ],
+            transport: GoProxyTransport::Aead,
+            data_json: serde_json::json!({"chain": []}).to_string().into_bytes(),
+        };
+        let built = snapshot(config)
+            .build_proxy("aead", Duration::from_secs(2))
+            .await
+            .unwrap();
+        let context = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        let mut stream = built.proxy.connect(&context).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"hello")
+            .await
+            .unwrap();
+        let mut echoed = [0u8; 5];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut echoed)
+            .await
+            .unwrap();
+        assert_eq!(&echoed, b"hello");
+        tcp_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn go_aead_layer_builds_authenticated_udp_over_fixed_parent() {
+        let udp_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_address = udp_socket.local_addr().unwrap();
+        let udp_server = tokio::spawn(async move {
+            let mut packet = [0u8; 2048];
+            let (length, peer) = udp_socket.recv_from(&mut packet).await.unwrap();
+            let payload = yuhaiin_protocol::aead::decrypt_packet(
+                &packet[..length],
+                b"secret",
+                yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
+            )
+            .unwrap();
+            assert_eq!(payload, b"udp-hello");
+            let reply = yuhaiin_protocol::aead::encrypt_packet(
+                b"udp-world",
+                b"secret",
+                yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
+            )
+            .unwrap();
+            udp_socket.send_to(&reply, peer).await.unwrap();
+        });
+        let config = GoProxyRuntimeConfig {
+            id: "aead-udp".to_owned(),
+            name: "aead-udp".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned(), "aead".to_owned()],
+            layers: vec![
+                GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({
+                        "addresses": [{"host": "127.0.0.1", "port": udp_address.port()}]
+                    }),
+                },
+                GoProxyLayer {
+                    kind: "aead".to_owned(),
+                    config: serde_json::json!({"password": "secret"}),
+                },
+            ],
+            transport: GoProxyTransport::Aead,
+            data_json: serde_json::json!({"chain": []}).to_string().into_bytes(),
+        };
+        let built = snapshot(config)
+            .build_proxy("aead-udp", Duration::from_secs(2))
+            .await
+            .unwrap();
+        let context = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Udp,
+            "192.0.2.1:5353".parse().unwrap(),
+        ));
+        let datagram = built.proxy.open_datagram(&context).await.unwrap();
+        let target = context.effective_destination();
+        datagram.send_to(b"udp-hello", target).await.unwrap();
+        let mut response = [0u8; 64];
+        let (length, _) = datagram.recv_from(&mut response).await.unwrap();
+        assert_eq!(&response[..length], b"udp-world");
+        udp_server.await.unwrap();
     }
 
     #[tokio::test]

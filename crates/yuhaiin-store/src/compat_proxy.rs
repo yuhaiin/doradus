@@ -46,6 +46,7 @@ pub enum GoProxyTransport {
     Vless,
     Vmess,
     Yuubinsya,
+    Aead,
     Tls,
     Http2,
     Unknown { name: String },
@@ -178,6 +179,7 @@ fn parse_proxy_transport(value: &str) -> GoProxyTransport {
         "vless" => GoProxyTransport::Vless,
         "vmess" => GoProxyTransport::Vmess,
         "yuubinsya" => GoProxyTransport::Yuubinsya,
+        "aead" => GoProxyTransport::Aead,
         "tls" => GoProxyTransport::Tls,
         "http2" => GoProxyTransport::Http2,
         other => GoProxyTransport::Unknown {
@@ -196,6 +198,7 @@ fn select_proxy_transport(chain_types: &[String], layers: &[GoProxyLayer]) -> Go
     // fixed dialer, and Yuubinsya wraps the full fixed/TLS/HTTP2 chain.
     for preferred in [
         "yuubinsya",
+        "aead",
         "socks5",
         "vmess",
         "vless",

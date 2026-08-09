@@ -327,16 +327,36 @@ async fn start_listeners(
                         ));
                         continue;
                     }
-                    let socket = yuhaiin_core::proxy::YuubinsyaUdpServer::bind(
-                        spec.listen,
-                        yuhaiin_core::yuubinsya::derive_salt(spec.password.as_bytes()),
+                    let password_hash =
+                        yuhaiin_core::yuubinsya::derive_salt(spec.password.as_bytes());
+                    let socket = if let Some(password) = spec.aead_password.clone() {
+                        let raw = UdpSocket::bind(spec.listen).await.map_err(|error| {
+                            Error::new(
+                                ErrorKind::Io,
+                                format!("bind AEAD Yuubinsya UDP inbound {}: {error}", spec.id),
+                            )
+                        })?;
+                        yuhaiin_core::proxy::YuubinsyaUdpServer::new(
+                            Box::new(yuhaiin_protocol::aead::AeadUdpServer::new(
+                                raw,
+                                password,
+                                spec.aead_method,
+                            )),
+                            password_hash,
+                            false,
+                        )
+                    } else {
                         // Go's Yuubinsya inbound uses the native packet
                         // format without the SOCKS5 three-byte prefix.  The
                         // prefix is only used when Yuubinsya wraps a SOCKS5
                         // UDP association.
-                        false,
-                    )
-                    .await?;
+                        yuhaiin_core::proxy::YuubinsyaUdpServer::bind(
+                            spec.listen,
+                            password_hash,
+                            false,
+                        )
+                        .await?
+                    };
                     let logs = monitor.logs();
                     listeners.push(tokio::spawn(async move {
                         if let Err(error) =
@@ -362,14 +382,32 @@ async fn start_listeners(
                         )
                     })?;
                     let logs = monitor.logs();
-                    listeners.push(tokio::spawn(async move {
-                        if let Err(error) =
-                            crate::proxy::socks5::serve_udp_socket(socket, spec, selector, monitor)
-                                .await
-                        {
-                            logs.error(format!("SOCKS5 UDP listener stopped: {error}"));
-                        }
-                    }));
+                    if let Some(password) = spec.aead_password.clone() {
+                        let socket = crate::proxy::socks5::AeadUdpSocket::new(
+                            socket,
+                            password,
+                            spec.aead_method,
+                        );
+                        listeners.push(tokio::spawn(async move {
+                            if let Err(error) = crate::proxy::socks5::serve_udp_socket(
+                                socket, spec, selector, monitor,
+                            )
+                            .await
+                            {
+                                logs.error(format!("AEAD SOCKS5 UDP listener stopped: {error}"));
+                            }
+                        }));
+                    } else {
+                        listeners.push(tokio::spawn(async move {
+                            if let Err(error) = crate::proxy::socks5::serve_udp_socket(
+                                socket, spec, selector, monitor,
+                            )
+                            .await
+                            {
+                                logs.error(format!("SOCKS5 UDP listener stopped: {error}"));
+                            }
+                        }));
+                    }
                 }
                 _ => monitor.warn(format!(
                     "skip UDP inbound {}: protocol {:?} has no UDP mode",
@@ -1340,6 +1378,64 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             }
         });
         (address, task)
+    }
+
+    #[tokio::test]
+    async fn aead_socks5_inbound_routes_through_shared_outbound() {
+        let (selector, monitor) = direct_runtime().await;
+        let (echo_address, echo_task) = echo_server().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let spec = InboundSpec {
+            id: "aead-socks5-inbound".to_owned(),
+            protocol: "socks5".to_owned(),
+            listen: address,
+            username: String::new(),
+            password: String::new(),
+            udp_mode: UdpMode::Disabled,
+            protocol_udp: false,
+            transports: vec!["aead".to_owned()],
+            aead_password: Some("secret".to_owned()),
+            aead_method: yuhaiin_protocol::aead::CryptoMethod::XChacha20Poly1305,
+            outbound_id: "direct".to_owned(),
+        };
+        let listener_task = tokio::spawn(serve_listener(listener, spec, selector, monitor, None));
+
+        let raw = TcpStream::connect(address).await.unwrap();
+        let mut client = yuhaiin_protocol::aead::client(
+            Box::new(raw),
+            b"secret",
+            yuhaiin_protocol::aead::CryptoMethod::XChacha20Poly1305,
+        )
+        .await
+        .unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        assert_eq!(read_exact_array::<2>(&mut client).await, [5, 0]);
+        let mut request = vec![5, 1, 0, 1];
+        let std::net::IpAddr::V4(echo_ip) = echo_address.ip() else {
+            panic!("echo server must bind an IPv4 address");
+        };
+        request.extend_from_slice(&echo_ip.octets());
+        request.extend_from_slice(&echo_address.port().to_be_bytes());
+        client.write_all(&request).await.unwrap();
+        let reply = read_exact_array::<10>(&mut client).await;
+        assert_eq!(reply[0..2], [5, 0]);
+        client.write_all(b"aead-flow").await.unwrap();
+        let mut echoed = [0u8; 9];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"aead-flow");
+
+        listener_task.abort();
+        let _ = listener_task.await;
+        echo_task.abort();
+    }
+
+    async fn read_exact_array<const N: usize>(
+        stream: &mut yuhaiin_core::proxy::BoxAsyncStream,
+    ) -> [u8; N] {
+        let mut value = [0u8; N];
+        stream.read_exact(&mut value).await.unwrap();
+        value
     }
 
     async fn read_headers(stream: &mut TcpStream) -> Vec<u8> {

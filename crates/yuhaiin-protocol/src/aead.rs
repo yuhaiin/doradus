@@ -7,10 +7,11 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chacha20::ChaCha20Legacy;
+use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce, XChaCha20Poly1305, XNonce};
@@ -22,8 +23,8 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{PublicKey, SecretKey};
 use sha2_10::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use yuhaiin_core::proxy::BoxAsyncStream;
-use yuhaiin_core::{Error, ErrorKind, Result};
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
+use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 const HASH_SIZE: usize = 32;
 const SIGNATURE_SIZE: usize = 64;
@@ -100,6 +101,292 @@ pub async fn server(
     )
     .await
     .map_err(|_| Error::new(ErrorKind::Timeout, "AEAD handshake timed out"))?
+}
+
+/// AEAD transport around an already constructed outbound proxy.
+///
+/// The stream path performs the Go handshake lazily on `connect`. The UDP
+/// path uses the Go packet format (`nonce || ciphertext`) and, when a fixed
+/// server address is supplied, bypasses the stream-only parent proxy just as
+/// Go's fixed `PacketConn` does.
+pub struct AeadProxy {
+    upstream: Arc<dyn AsyncProxy>,
+    password: Vec<u8>,
+    method: CryptoMethod,
+    udp_server: Option<std::net::SocketAddr>,
+}
+
+impl AeadProxy {
+    pub fn new(
+        upstream: Arc<dyn AsyncProxy>,
+        password: impl AsRef<[u8]>,
+        method: CryptoMethod,
+        udp_server: Option<std::net::SocketAddr>,
+    ) -> Self {
+        Self {
+            upstream,
+            password: password.as_ref().to_vec(),
+            method,
+            udp_server,
+        }
+    }
+}
+
+impl AsyncProxy for AeadProxy {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        Box::pin(async move {
+            let stream = self.upstream.connect(context).await?;
+            client(stream, &self.password, self.method).await
+        })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+        Box::pin(async move {
+            if let Some(server) = self.udp_server {
+                let bind_address: std::net::SocketAddr = match server {
+                    std::net::SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+                    std::net::SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+                };
+                let socket = tokio::net::UdpSocket::bind(bind_address)
+                    .await
+                    .map_err(|error| {
+                        Error::new(ErrorKind::Io, format!("bind AEAD UDP client: {error}"))
+                    })?;
+                return Ok(Box::new(AeadUdpDatagram {
+                    socket,
+                    server,
+                    password: self.password.clone(),
+                    method: self.method,
+                }) as Box<dyn AsyncDatagram>);
+            }
+            let upstream = self.upstream.open_datagram(context).await?;
+            Ok(Box::new(AeadDatagram {
+                upstream,
+                password: self.password.clone(),
+                method: self.method,
+            }) as Box<dyn AsyncDatagram>)
+        })
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        self.upstream.close()
+    }
+}
+
+/// Encrypt one Go AEAD UDP packet. `password` is the configured plaintext
+/// password; the compatibility password salt is derived internally.
+pub fn encrypt_packet(payload: &[u8], password: &[u8], method: CryptoMethod) -> Result<Vec<u8>> {
+    let key = packet_key(password);
+    let mut nonce = vec![0u8; method.nonce_size()];
+    fill_random(&mut nonce);
+    let ciphertext = match method {
+        CryptoMethod::Chacha20Poly1305 => ChaCha20Poly1305::new_from_slice(&key)
+            .map_err(|_| Error::new(ErrorKind::Protocol, "invalid AEAD packet key"))?
+            .encrypt(Nonce::from_slice(&nonce), payload),
+        CryptoMethod::XChacha20Poly1305 => XChaCha20Poly1305::new_from_slice(&key)
+            .map_err(|_| Error::new(ErrorKind::Protocol, "invalid AEAD packet key"))?
+            .encrypt(XNonce::from_slice(&nonce), payload),
+    }
+    .map_err(|_| Error::new(ErrorKind::Protocol, "AEAD UDP encryption failed"))?;
+    nonce.extend_from_slice(&ciphertext);
+    Ok(nonce)
+}
+
+/// Decrypt one Go AEAD UDP packet (`nonce || ciphertext`).
+pub fn decrypt_packet(packet: &[u8], password: &[u8], method: CryptoMethod) -> Result<Vec<u8>> {
+    let nonce_size = method.nonce_size();
+    if packet.len() < nonce_size + FRAME_TAG_SIZE {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "AEAD UDP packet is truncated",
+        ));
+    }
+    let key = packet_key(password);
+    let nonce = &packet[..nonce_size];
+    let ciphertext = &packet[nonce_size..];
+    match method {
+        CryptoMethod::Chacha20Poly1305 => ChaCha20Poly1305::new_from_slice(&key)
+            .map_err(|_| Error::new(ErrorKind::Protocol, "invalid AEAD packet key"))?
+            .decrypt(Nonce::from_slice(nonce), ciphertext),
+        CryptoMethod::XChacha20Poly1305 => XChaCha20Poly1305::new_from_slice(&key)
+            .map_err(|_| Error::new(ErrorKind::Protocol, "invalid AEAD packet key"))?
+            .decrypt(XNonce::from_slice(nonce), ciphertext),
+    }
+    .map_err(|_| Error::new(ErrorKind::Protocol, "AEAD UDP authentication failed"))
+}
+
+fn packet_key(password: &[u8]) -> [u8; HASH_SIZE] {
+    let password_hash = password_salt(password);
+    let mut hasher = Sha256::new();
+    hasher.update(password_hash);
+    hasher.update(b"yuubinsya-salt-");
+    hasher.finalize().into()
+}
+
+struct AeadUdpDatagram {
+    socket: tokio::net::UdpSocket,
+    server: std::net::SocketAddr,
+    password: Vec<u8>,
+    method: CryptoMethod,
+}
+
+/// Server-side authenticated UDP socket for an outer Go AEAD transport.
+/// Unlike [`AeadUdpDatagram`], replies are sent to the peer returned by the
+/// receive operation; this is the boundary needed by inbound protocols such as
+/// Yuubinsya that carry their own target address inside the decrypted payload.
+pub struct AeadUdpServer {
+    socket: tokio::net::UdpSocket,
+    password: Vec<u8>,
+    method: CryptoMethod,
+}
+
+impl AeadUdpServer {
+    pub fn new(
+        socket: tokio::net::UdpSocket,
+        password: impl AsRef<[u8]>,
+        method: CryptoMethod,
+    ) -> Self {
+        Self {
+            socket,
+            password: password.as_ref().to_vec(),
+            method,
+        }
+    }
+}
+
+impl AsyncDatagram for AeadUdpServer {
+    fn send_to<'a>(&'a self, payload: &'a [u8], target: Endpoint) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            let address = target.addr().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unsupported,
+                    "AEAD UDP peer must be an IP endpoint",
+                )
+            })?;
+            let packet = encrypt_packet(payload, &self.password, self.method)?;
+            self.socket
+                .send_to(&packet, address)
+                .await
+                .map_err(|error| Error::new(ErrorKind::Io, format!("AEAD UDP send: {error}")))?;
+            Ok(payload.len())
+        })
+    }
+
+    fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
+        Box::pin(async move {
+            let mut packet = vec![0u8; 65_535];
+            let (length, peer) =
+                self.socket.recv_from(&mut packet).await.map_err(|error| {
+                    Error::new(ErrorKind::Io, format!("AEAD UDP receive: {error}"))
+                })?;
+            let plaintext = decrypt_packet(&packet[..length], &self.password, self.method)?;
+            if buffer.len() < plaintext.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "AEAD UDP payload exceeds receive buffer",
+                ));
+            }
+            buffer[..plaintext.len()].copy_from_slice(&plaintext);
+            Ok((plaintext.len(), Endpoint::ip(Network::Udp, peer)))
+        })
+    }
+
+    fn local_addr(&self) -> Result<Endpoint> {
+        self.socket
+            .local_addr()
+            .map(|address| Endpoint::ip(Network::Udp, address))
+            .map_err(|error| Error::new(ErrorKind::Io, format!("AEAD UDP local address: {error}")))
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl AsyncDatagram for AeadUdpDatagram {
+    fn send_to<'a>(&'a self, payload: &'a [u8], _target: Endpoint) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            let packet = encrypt_packet(payload, &self.password, self.method)?;
+            self.socket
+                .send_to(&packet, self.server)
+                .await
+                .map_err(|error| Error::new(ErrorKind::Io, format!("AEAD UDP send: {error}")))?;
+            Ok(payload.len())
+        })
+    }
+
+    fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
+        Box::pin(async move {
+            let mut packet = vec![0u8; 65_535];
+            let (length, peer) =
+                self.socket.recv_from(&mut packet).await.map_err(|error| {
+                    Error::new(ErrorKind::Io, format!("AEAD UDP receive: {error}"))
+                })?;
+            let plaintext = decrypt_packet(&packet[..length], &self.password, self.method)?;
+            if buffer.len() < plaintext.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "AEAD UDP payload exceeds receive buffer",
+                ));
+            }
+            buffer[..plaintext.len()].copy_from_slice(&plaintext);
+            Ok((plaintext.len(), Endpoint::ip(Network::Udp, peer)))
+        })
+    }
+
+    fn local_addr(&self) -> Result<Endpoint> {
+        self.socket
+            .local_addr()
+            .map(|address| Endpoint::ip(Network::Udp, address))
+            .map_err(|error| Error::new(ErrorKind::Io, format!("AEAD UDP local address: {error}")))
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct AeadDatagram {
+    upstream: Box<dyn AsyncDatagram>,
+    password: Vec<u8>,
+    method: CryptoMethod,
+}
+
+impl AsyncDatagram for AeadDatagram {
+    fn send_to<'a>(&'a self, payload: &'a [u8], target: Endpoint) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            let packet = encrypt_packet(payload, &self.password, self.method)?;
+            self.upstream.send_to(&packet, target).await?;
+            Ok(payload.len())
+        })
+    }
+
+    fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
+        Box::pin(async move {
+            let mut packet = vec![0u8; 65_535];
+            let (length, target) = self.upstream.recv_from(&mut packet).await?;
+            let plaintext = decrypt_packet(&packet[..length], &self.password, self.method)?;
+            if buffer.len() < plaintext.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "AEAD UDP payload exceeds receive buffer",
+                ));
+            }
+            buffer[..plaintext.len()].copy_from_slice(&plaintext);
+            Ok((plaintext.len(), target))
+        })
+    }
+
+    fn local_addr(&self) -> Result<Endpoint> {
+        self.upstream.local_addr()
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        self.upstream.close()
+    }
 }
 
 async fn handshake_client(
@@ -205,11 +492,6 @@ async fn handshake_server(
         &client_salt,
         &server_time,
     )?;
-    let client_time = decrypt_timestamp(
-        password,
-        &client_salt,
-        &client_header[SIGNATURE_SIZE + HASH_SIZE..SIGNATURE_SIZE + HASH_SIZE + TIME_SIZE],
-    )?;
     let write = derive_cipher(
         method,
         shared.raw_secret_bytes().as_slice(),
@@ -276,10 +558,10 @@ fn decrypt_timestamp(password: &[u8], salt: &[u8], encrypted: &[u8]) -> Result<[
 
 fn crypt_timestamp(password: &[u8], salt: &[u8], data: &mut [u8; TIME_SIZE]) -> Result<()> {
     let hkdf = Hkdf::<Sha256>::new(Some(salt), password);
-    let mut key_nonce = [0u8; 40];
+    let mut key_nonce = [0u8; 44];
     hkdf.expand(b"time", &mut key_nonce)
         .map_err(|_| Error::new(ErrorKind::Protocol, "AEAD timestamp key derivation failed"))?;
-    let mut cipher = ChaCha20Legacy::new_from_slices(&key_nonce[..32], &key_nonce[32..])
+    let mut cipher = ChaCha20::new_from_slices(&key_nonce[..32], &key_nonce[32..])
         .map_err(|_| Error::new(ErrorKind::Protocol, "invalid AEAD timestamp cipher"))?;
     cipher.apply_keystream(data);
     Ok(())
@@ -651,6 +933,21 @@ mod tests {
             let mut response = vec![0u8; 16];
             client.read_exact(&mut response).await.unwrap();
             assert_eq!(&response, b"server-to-client");
+        }
+    }
+
+    #[test]
+    fn udp_packet_round_trip_both_cipher_methods_and_rejects_wrong_password() {
+        for method in [
+            CryptoMethod::Chacha20Poly1305,
+            CryptoMethod::XChacha20Poly1305,
+        ] {
+            let packet = encrypt_packet(b"udp-payload", b"secret", method).unwrap();
+            assert_eq!(
+                decrypt_packet(&packet, b"secret", method).unwrap(),
+                b"udp-payload"
+            );
+            assert!(decrypt_packet(&packet, b"wrong", method).is_err());
         }
     }
 }
