@@ -1665,7 +1665,8 @@ mixed UDP inbound 发送 SOCKS5 UDP domain frame，确认 UDP-over-TCP session�
 side UDP relay 和回包均工作。
 
 测试还检查两条 flow 的 `connections` 均显示正确 inbound/outbound/mode，且同一个
-chain node 的 TCP latency API 返回成功。fixture 中 direct target 的域名映射只存在
+chain node 的 TCP latency API 返回成功；同时使用前端实际的 RFC3339 `from/to` 查询
+traffic、telemetry、failed-history，并在 TCP flow 关闭后确认 history 已生成。fixture 中 direct target 的域名映射只存在
 测试 server 侧，用来保留客户端发出的 `example.test`，不依赖宿主机 DNS，也没有把
 测试专用解析逻辑带入生产 runtime。
 

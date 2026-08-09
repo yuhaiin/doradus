@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use serde_json::json;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -295,6 +296,62 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
             .any(|window| window == udp_payload)
     );
 
+    let range_end = OffsetDateTime::now_utc();
+    let range_start = range_end - time::Duration::hours(1);
+    let range_start = range_start.format(&Rfc3339).unwrap();
+    let range_end = (range_end + time::Duration::hours(1))
+        .format(&Rfc3339)
+        .unwrap();
+    let traffic = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::GET,
+        &format!("/api/v2/connections/traffic?interval=hour&from={range_start}&to={range_end}"),
+        None,
+    )
+    .await;
+    assert_eq!(traffic["interval"], "hour");
+    assert!(traffic["items"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["upload"]
+                .as_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|value| value > 0)
+        })
+    }));
+
+    let telemetry = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::GET,
+        &format!("/api/v2/connections/telemetry?from={range_start}&to={range_end}&limit=6"),
+        None,
+    )
+    .await;
+    assert!(telemetry["groups"].as_array().is_some_and(|groups| {
+        groups.iter().any(|group| {
+            group["items"].as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["upload"]
+                        .as_str()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .is_some_and(|value| value > 0)
+                })
+            })
+        })
+    }));
+
+    let failed_history = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::GET,
+        "/api/v2/connections/failed-history",
+        None,
+    )
+    .await;
+    assert!(failed_history["items"].is_array());
+    assert!(failed_history["dumpProcessEnabled"].is_boolean());
+
     let mut udp_connection = None;
     for _ in 0..100 {
         let current = api_json(
@@ -338,6 +395,36 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
     assert_eq!(latency["ok"], true, "chain latency response: {latency}");
 
     client.shutdown().await.unwrap();
+
+    let mut history = None;
+    for _ in 0..100 {
+        let current = api_json(
+            &service.client,
+            &service.base_url,
+            reqwest::Method::GET,
+            "/api/v2/connections/history",
+            None,
+        )
+        .await;
+        history = current["items"].as_array().and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["connection"]["inboundName"] == "tls-h2-yuubinsya-in")
+                .cloned()
+        });
+        if history.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let history = history.expect("closed HTTP chain must be visible in history");
+    assert!(history["count"].as_str().is_some_and(|value| value != "0"));
+    assert!(
+        history["time"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+
     service.shutdown().await;
     fixture.shutdown().await;
 }

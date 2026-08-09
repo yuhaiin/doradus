@@ -11,8 +11,9 @@ The current scenarios cover:
 - HTTP inbound → domain route rule → fixed + HTTP CONNECT outbound, including
   live connection metadata, traffic counters, route testing, and node latency.
 - HTTP inbound + mixed UDP inbound → TLS + HTTP/2 + Yuubinsya UDP-over-TCP
-  outbound, including TCP echo, UDP echo, live connection metadata, and node
-  latency through the same configured node.
+  outbound, including TCP echo, UDP echo, live connection metadata, traffic,
+  telemetry, failed-history, closed-flow history, and node latency through the
+  same configured node.
 - mixed inbound → SOCKS5 UDP framing → direct UDP, including the Go-compatible
   mixed UDP mode and a conflicting default `127.0.0.1:1080` listener.
 
