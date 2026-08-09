@@ -26,6 +26,8 @@ use yuhaiin_store::GoInboundRecord;
 
 use crate::{RuntimeController, parse_dns_server};
 
+const DEFAULT_DNS_SERVER: &str = "127.0.0.1:5353";
+
 /// DNS packet handler backed by the resolver in the current immutable
 /// runtime snapshot. TUN DNS hijacking and both DNS listener transports use
 /// the same handler, so a reload cannot make them disagree about resolver
@@ -459,7 +461,8 @@ async fn configured_dns_server(store: &yuhaiin_store::ConfigStore) -> Result<Opt
         .into_iter()
         .next()
         .map(|record| record.server)
-        .filter(|server| !server.trim().is_empty()))
+        .filter(|server| !server.trim().is_empty())
+        .or_else(|| Some(DEFAULT_DNS_SERVER.to_owned())))
 }
 
 #[cfg(feature = "tun")]
@@ -622,6 +625,15 @@ mod tests {
         assert_eq!(
             configured_dns_server(&store).await.unwrap().as_deref(),
             Some("127.0.0.1:5353")
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_store_uses_go_default_dns_server() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        assert_eq!(
+            configured_dns_server(&store).await.unwrap().as_deref(),
+            Some(DEFAULT_DNS_SERVER)
         );
     }
 

@@ -32,16 +32,18 @@ pub struct RuntimeSettings {
 impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
-            ipv6: false,
+            // Keep the zero-configuration baseline aligned with Go's
+            // DefaultSetting. Persisted values still override each field.
+            ipv6: true,
             use_default_interface: true,
             net_interface: String::new(),
             // Go historically enables pprof unless a persisted setting turns
             // it off; keep that startup default for imported installations.
             pprof: true,
-            system_proxy_http: false,
+            system_proxy_http: true,
             system_proxy_socks5: false,
-            logcat_level: "info".to_owned(),
-            logcat_save: false,
+            logcat_level: "debug".to_owned(),
+            logcat_save: true,
             ignore_timeout_error: false,
             ignore_dns_error: false,
             udp_buffer_size: 2048,
@@ -430,6 +432,17 @@ mod tests {
     }
 
     #[test]
+    fn empty_settings_match_go_default_setting_baseline() {
+        let settings = RuntimeSettings::default();
+        assert!(settings.ipv6);
+        assert!(settings.use_default_interface);
+        assert!(settings.system_proxy_http);
+        assert!(!settings.system_proxy_socks5);
+        assert_eq!(settings.logcat_level, "debug");
+        assert!(settings.logcat_save);
+    }
+
+    #[test]
     fn settings_accept_legacy_snake_case_and_keep_go_bounds() {
         let settings = RuntimeSettings::from_value(&serde_json::json!({
             "ipv6": true,
@@ -445,7 +458,7 @@ mod tests {
         assert!(settings.ipv6);
         assert!(!settings.use_default_interface);
         assert_eq!(settings.net_interface, "eth0");
-        assert_eq!(settings.logcat_level, "info");
+        assert_eq!(settings.logcat_level, "debug");
         assert_eq!(settings.udp_buffer_size, 4096);
         assert_eq!(settings.relay_buffer_size, 4096);
         assert_eq!(settings.udp_ringbuffer_size, 250);

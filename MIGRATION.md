@@ -29,6 +29,8 @@
 
 > 2026-08-09 Linux transparent inbound：新增 `yuhaiin-runtime::proxy::transparent`。`tproxy` TCP listener 设置 `IP_TRANSPARENT`，从 accepted socket 的 local address 获取原目标；`redir` TCP 使用 `SO_ORIGINAL_DST`/`IP6T_SO_ORIGINAL_DST`。TPROXY UDP 使用 `IP_ORIGDSTADDR`/`IPV6_ORIGDSTADDR` ancillary 读取原目标，并将每个 peer→destination flow 接入共享 router、proxy selector、monitor 和 close lifecycle；回包用透明 UDP socket 绑定原目标后连接回客户端。Go contract 中 redir 的 UDP 仍保持禁用；TLS/WS 等透明 transport 和真实 iptables/nftables/Podman 流量验收仍未完成。
 
+> 2026-08-09 Go zero-configuration baseline：`RuntimeSettings::default()` 对齐 Go `DefaultSetting` 的 IPv6、HTTP system proxy、debug/save 日志默认值；`api::default_settings` 直接复用同一默认对象，避免管理面与数据面漂移。DNS supervisor 在没有 `resolver.server` overlay 和 `dns_settings` row 时使用 Go 默认监听地址 `127.0.0.1:5353`。新增空 settings、API 默认值复用和 empty-store DNS fallback 回归；完整默认 inbound/route object 的 store 初始化仍按 checklist 继续实现。
+
 > 2026-08-09 inbound protocol compatibility：补齐 Go contract 的 `none` noop inbound（接受后关闭，不进入 router），并归一化旧 JSON 中的 `mix`、`reverseHttp`、`reverseTcp` 拼写；section 查找同时兼容旧字段名，避免协议名归一化后丢失认证/目标配置。新增 alias 解析和 noop close 回归。
 
 > 2026-08-09 cross-target boundary：`yuhaiin-core` 的 `async-proxy,tun` 已通过 `aarch64-linux-android` 和 `aarch64-apple-darwin` 的 `cargo check`。在 Android 上使用 `/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang`、对应 `clang++`、`llvm-ar` 和 Cargo linker 后，`yuhaiin-runtime --all-features` 的 `aarch64-linux-android` target check 也通过；bundled SQLite 的 C 编译边界已验证。macOS runtime check 仍需要 macOS SDK/clang，Android VpnService fd、权限和实机生命周期仍未由此命令行检查替代。

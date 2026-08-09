@@ -69,6 +69,7 @@ flowchart LR
 | `[x]` | DoH/DoT client | `runtime::{doh_tls,dot_tls,resolver}.rs` | RustCrypto TLS、HTTP/2 DoH、DoT length-prefix、可注入 proxy/bootstrap connector |
 | `[x]` | DNS/TUN 闭环 | `RuntimeDnsHandler`, TUN dispatcher | DNS hijack、FakeIP response、原始 transaction 回写、超时和取消回收 |
 | `[x]` | DNS 上游 interface policy | resolver factories | UDP/TCP、RustCrypto DoH/DoT direct dialer 接受和 outbound 相同的 source-address policy；自定义 factory 保持默认兼容，selector reload 会重建 resolver |
+| `[x]` | Go 空配置启动基线 | `RuntimeSettings`, `data_plane::configured_dns_server`, `api::default_settings` | 无持久 settings 时对齐 Go 的 IPv6、HTTP system proxy、debug/save 日志默认值；无 DNS row/overlay 时默认监听 `127.0.0.1:5353`，API 与运行时共用 settings 默认值 | Go 默认的完整 inbound/route object 仍需在 runtime/store 初始化层继续补齐 |
 | `延期` | DoQ / DoH3 | — | 使用量低，等纯 Rust QUIC/HTTP3 方案稳定后再加入；不阻塞当前替换 |
 | `[ ]` | DoH server 管理端点 | API/runtime | 当前管理 DNS server 是 UDP/TCP；若前端要求 DoH listener，再增加独立 server transport |
 

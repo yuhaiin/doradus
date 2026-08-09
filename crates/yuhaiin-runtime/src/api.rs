@@ -40,8 +40,9 @@ use yuhaiin_store::{
 use crate::update::UpdateService;
 use crate::{
     ProxyRouteListTransport, RouteListSnapshot, RouteListTransport, RuntimeController,
-    download_route_url_with_transport, expand_go_route_rule, interfaces::discover_interfaces,
-    latency::LatencyRequest, log::log_batch_value, refresh_route_list_caches_with_transport,
+    RuntimeSettings, download_route_url_with_transport, expand_go_route_rule,
+    interfaces::discover_interfaces, latency::LatencyRequest, log::log_batch_value,
+    refresh_route_list_caches_with_transport,
 };
 
 #[derive(Clone)]
@@ -2962,7 +2963,11 @@ fn default_route_config() -> Value {
     json!({"directResolver":"", "proxyResolver":"", "resolveLocally":false, "udpProxyFqdnStrategy":"default"})
 }
 fn default_settings() -> Value {
-    json!({"ipv6":false,"useDefaultInterface":true,"netInterface":"","pprof":true,"systemProxy":{"http":false,"socks5":false},"logcat":{"level":"info","save":false,"ignoreTimeoutError":false,"ignoreDnsError":false},"advanced":{"udpBufferSize":2048,"relayBufferSize":4096,"udpRingbufferSize":250,"happyEyeballsSemaphore":250},"backup":{"instanceName":"","interval":0,"lastBackupHash":""}})
+    let mut value = RuntimeSettings::default().to_json();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("backup".to_owned(), default_backup_config());
+    }
+    value
 }
 fn default_inbound_config() -> Value {
     json!({"port":0,"bind":"127.0.0.1"})
