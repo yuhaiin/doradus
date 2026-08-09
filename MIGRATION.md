@@ -1589,3 +1589,30 @@ React operation inventory：87 个 JSON-RPC operation 逐个发空 JSON 请求�
 200 及 `text/event-stream`。该测试不要求 mutation 的空参数成功，因此不会掩盖参数校验；
 它专门保证前端可见 operation 仍然进入 Rust handler。`cargo test -p yuhaiin-runtime
 every_generated_frontend_rpc_operation_has_a_route --all-features` 已通过。
+
+## 38. 2026-08-09 telemetry daily projection 与 Go v5→v6 接管
+
+真实生产副本回归发现了两层统计兼容边界：一份 compact telemetry 库缺少
+`traffic_dimension_daily` / `failure_dimension_daily`，会让 Go 的
+`connections.telemetry` 在长时间范围直接返回 `no such table`；另一份 schema-7
+生产库虽然仍只有 Go v5 的文本维度 hourly 表，但 `metadata.schema_version` 已经被
+历史迁移版本复用，Go 当前迁移不会再执行 compact telemetry 转换，启动时会同时出现
+`telemetry_dimension_values` 缺失和 daily maintenance 不能读取 `value_id`。
+
+Rust `crates/yuhaiin-store/src/statistics.rs` 现在在同一个写事务中：
+
+- 创建 Go v6 兼容的 `telemetry_dimension_values`、traffic/failure hourly 和 daily
+  表及 lookup index；
+- 以 UTC 小时为边界保留最近 30 天 hourly，将更早数据按
+  `(bucket_start_utc / 86400) * 86400, value_id` 聚合到 daily；
+- 对旧的文本维度 hourly 表使用临时 compact 表写入 snapshot，成功后删除旧表并
+  原子 rename 为 Go v6 表；失败会回滚，不会留下半套 schema；
+- loader 同时合并 hourly/daily，避免 Rust 重启后丢失历史流量或失败计数。
+
+新增 store 单测覆盖缺 daily 表、同日多个小时的 traffic/failure 合并、Go v6 fixture
+回写以及 Go v5 文本维度到 compact 表的转换。随后从
+`/home/asutorufa/Documents/Programming/yuhaiin/tmp/v2/state.db` 制作独立副本到
+`~/.cache/yuhaiin-rust/api-production-20260809/legacy-compat-*`，Rust 服务优雅停止后
+确认 SQLite 中存在 compact telemetry 相关表；再用 Go 服务打开同一副本，调用
+`POST /api/v2/rpc/connections.telemetry`（2020–2030，limit 50）返回 HTTP 200，且不再
+出现缺表/`value_id` 错误。该验证没有修改原始数据库，也没有使用 `/tmp`。

@@ -13,6 +13,9 @@ use super::{ConfigStore, Error, ErrorKind, Result, SqliteValue, storage_error, t
 use crate::schema::table_has_column;
 use crate::sqlite::{Connection, Row};
 
+const TELEMETRY_HOURLY_RETENTION_SECONDS: i64 = 30 * 86_400;
+const TELEMETRY_SECONDS_PER_DAY: i64 = 86_400;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GoTrafficBucketRecord {
     pub bucket: i64,
@@ -351,30 +354,60 @@ fn replace_in_transaction(connection: &Connection, snapshot: &GoStatisticsSnapsh
             );",
         )
         .map_err(storage_error)?;
-    if !compact_telemetry && !legacy_telemetry {
-        connection
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS telemetry_dimension_values (
+    let traffic_hourly_table = if legacy_telemetry {
+        "traffic_dimension_hourly_rust_v6"
+    } else {
+        "traffic_dimension_hourly"
+    };
+    let traffic_daily_table = if legacy_telemetry {
+        "traffic_dimension_daily_rust_v6"
+    } else {
+        "traffic_dimension_daily"
+    };
+    let failure_hourly_table = if legacy_telemetry {
+        "failure_dimension_hourly_rust_v6"
+    } else {
+        "failure_dimension_hourly"
+    };
+    let failure_daily_table = if legacy_telemetry {
+        "failure_dimension_daily_rust_v6"
+    } else {
+        "failure_dimension_daily"
+    };
+    connection
+        .execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS telemetry_dimension_values (
                     id INTEGER PRIMARY KEY, dimension TEXT NOT NULL, value TEXT NOT NULL,
                     UNIQUE (dimension, value)
                 );
-                CREATE TABLE IF NOT EXISTS traffic_dimension_hourly (
+                CREATE TABLE IF NOT EXISTS {traffic_hourly_table} (
                     bucket_start_utc INTEGER NOT NULL, value_id INTEGER NOT NULL,
                     upload_bytes INTEGER NOT NULL, download_bytes INTEGER NOT NULL,
                     PRIMARY KEY (bucket_start_utc, value_id)
                 );
-                CREATE TABLE IF NOT EXISTS failure_dimension_hourly (
+                CREATE TABLE IF NOT EXISTS {failure_hourly_table} (
                     bucket_start_utc INTEGER NOT NULL, value_id INTEGER NOT NULL,
                     failed_count INTEGER NOT NULL,
                     PRIMARY KEY (bucket_start_utc, value_id)
-                );",
-            )
-            .map_err(storage_error)?;
-    }
+                );
+                CREATE TABLE IF NOT EXISTS {traffic_daily_table} (
+                    bucket_start_utc INTEGER NOT NULL, value_id INTEGER NOT NULL,
+                    upload_bytes INTEGER NOT NULL DEFAULT 0,
+                    download_bytes INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (bucket_start_utc, value_id)
+                ) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS {failure_daily_table} (
+                    bucket_start_utc INTEGER NOT NULL, value_id INTEGER NOT NULL,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (bucket_start_utc, value_id)
+                ) WITHOUT ROWID;"
+        ))
+        .map_err(storage_error)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| Error::new(ErrorKind::Storage, error.to_string()))?
         .as_secs() as i64;
+    let hourly_cutoff = now.div_euclid(3_600) * 3_600 - TELEMETRY_HOURLY_RETENTION_SECONDS;
 
     for (key, value) in [
         ("total_download", snapshot.total_download),
@@ -465,10 +498,10 @@ fn replace_in_transaction(connection: &Connection, snapshot: &GoStatisticsSnapsh
     }
 
     for table in [
-        "traffic_dimension_hourly",
-        "failure_dimension_hourly",
-        "traffic_dimension_daily",
-        "failure_dimension_daily",
+        traffic_hourly_table,
+        failure_hourly_table,
+        traffic_daily_table,
+        failure_daily_table,
         "telemetry_dimension_values",
     ] {
         if table_exists(connection, table) {
@@ -477,44 +510,7 @@ fn replace_in_transaction(connection: &Connection, snapshot: &GoStatisticsSnapsh
                 .map_err(storage_error)?;
         }
     }
-    if legacy_telemetry {
-        for item in &snapshot.telemetry {
-            if item.download != 0 || item.upload != 0 {
-                connection
-                    .execute_with_params(
-                        "INSERT INTO traffic_dimension_hourly(
-                            bucket_start_utc, dimension, value, upload_bytes,
-                            download_bytes, updated_at
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        &[
-                            SqliteValue::from(item.bucket),
-                            SqliteValue::from(item.dimension.as_str()),
-                            SqliteValue::from(item.value.as_str()),
-                            SqliteValue::from(u64_to_i64(item.upload, "telemetry upload")?),
-                            SqliteValue::from(u64_to_i64(item.download, "telemetry download")?),
-                            SqliteValue::from(now),
-                        ],
-                    )
-                    .map_err(storage_error)?;
-            }
-            if item.failures != 0 {
-                connection
-                    .execute_with_params(
-                        "INSERT INTO failure_dimension_hourly(
-                            bucket_start_utc, dimension, value, failed_count, updated_at
-                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        &[
-                            SqliteValue::from(item.bucket),
-                            SqliteValue::from(item.dimension.as_str()),
-                            SqliteValue::from(item.value.as_str()),
-                            SqliteValue::from(u64_to_i64(item.failures, "telemetry failures")?),
-                            SqliteValue::from(now),
-                        ],
-                    )
-                    .map_err(storage_error)?;
-            }
-        }
-    } else {
+    {
         for item in &snapshot.telemetry {
             connection
                 .execute_with_params(
@@ -541,13 +537,27 @@ fn replace_in_transaction(connection: &Connection, snapshot: &GoStatisticsSnapsh
                 .ok_or_else(|| Error::new(ErrorKind::Storage, "telemetry value was not created"))?;
             let id = row_i64(id, 0, "telemetry_dimension_values.id")?;
             if item.download != 0 || item.upload != 0 {
+                let (table, bucket) = if item.bucket < hourly_cutoff {
+                    (
+                        traffic_daily_table,
+                        item.bucket.div_euclid(TELEMETRY_SECONDS_PER_DAY)
+                            * TELEMETRY_SECONDS_PER_DAY,
+                    )
+                } else {
+                    (traffic_hourly_table, item.bucket)
+                };
                 connection
                     .execute_with_params(
-                        "INSERT INTO traffic_dimension_hourly(
-                        bucket_start_utc, value_id, upload_bytes, download_bytes
-                     ) VALUES (?1, ?2, ?3, ?4)",
+                        &format!(
+                            "INSERT INTO {table}(
+                                bucket_start_utc, value_id, upload_bytes, download_bytes
+                             ) VALUES (?1, ?2, ?3, ?4)
+                             ON CONFLICT(bucket_start_utc, value_id) DO UPDATE SET
+                               upload_bytes = {table}.upload_bytes + excluded.upload_bytes,
+                               download_bytes = {table}.download_bytes + excluded.download_bytes"
+                        ),
                         &[
-                            SqliteValue::from(item.bucket),
+                            SqliteValue::from(bucket),
                             SqliteValue::from(id),
                             SqliteValue::from(u64_to_i64(item.upload, "telemetry upload")?),
                             SqliteValue::from(u64_to_i64(item.download, "telemetry download")?),
@@ -556,13 +566,26 @@ fn replace_in_transaction(connection: &Connection, snapshot: &GoStatisticsSnapsh
                     .map_err(storage_error)?;
             }
             if item.failures != 0 {
+                let (table, bucket) = if item.bucket < hourly_cutoff {
+                    (
+                        failure_daily_table,
+                        item.bucket.div_euclid(TELEMETRY_SECONDS_PER_DAY)
+                            * TELEMETRY_SECONDS_PER_DAY,
+                    )
+                } else {
+                    (failure_hourly_table, item.bucket)
+                };
                 connection
                     .execute_with_params(
-                        "INSERT INTO failure_dimension_hourly(
-                        bucket_start_utc, value_id, failed_count
-                     ) VALUES (?1, ?2, ?3)",
+                        &format!(
+                            "INSERT INTO {table}(
+                                bucket_start_utc, value_id, failed_count
+                             ) VALUES (?1, ?2, ?3)
+                             ON CONFLICT(bucket_start_utc, value_id) DO UPDATE SET
+                               failed_count = {table}.failed_count + excluded.failed_count"
+                        ),
                         &[
-                            SqliteValue::from(item.bucket),
+                            SqliteValue::from(bucket),
                             SqliteValue::from(id),
                             SqliteValue::from(u64_to_i64(item.failures, "telemetry failures")?),
                         ],
@@ -571,6 +594,32 @@ fn replace_in_transaction(connection: &Connection, snapshot: &GoStatisticsSnapsh
             }
         }
     }
+    if legacy_telemetry {
+        connection
+            .execute_batch(&format!(
+                "DROP TABLE traffic_dimension_hourly;
+                 DROP TABLE failure_dimension_hourly;
+                 DROP TABLE IF EXISTS traffic_dimension_daily;
+                 DROP TABLE IF EXISTS failure_dimension_daily;
+                 ALTER TABLE {traffic_hourly_table} RENAME TO traffic_dimension_hourly;
+                 ALTER TABLE {traffic_daily_table} RENAME TO traffic_dimension_daily;
+                 ALTER TABLE {failure_hourly_table} RENAME TO failure_dimension_hourly;
+                 ALTER TABLE {failure_daily_table} RENAME TO failure_dimension_daily;"
+            ))
+            .map_err(storage_error)?;
+    }
+    connection
+        .execute_batch(
+            "CREATE INDEX IF NOT EXISTS traffic_dimension_hourly_lookup_idx
+                 ON traffic_dimension_hourly(value_id, bucket_start_utc DESC);
+             CREATE INDEX IF NOT EXISTS traffic_dimension_daily_lookup_idx
+                 ON traffic_dimension_daily(value_id, bucket_start_utc DESC);
+             CREATE INDEX IF NOT EXISTS failure_dimension_hourly_lookup_idx
+                 ON failure_dimension_hourly(value_id, bucket_start_utc DESC);
+             CREATE INDEX IF NOT EXISTS failure_dimension_daily_lookup_idx
+                 ON failure_dimension_daily(value_id, bucket_start_utc DESC);",
+        )
+        .map_err(storage_error)?;
     Ok(())
 }
 
@@ -640,11 +689,17 @@ mod tests {
     #[tokio::test]
     async fn go_statistics_round_trip_creates_compatible_projection() {
         let store = ConfigStore::open_memory().await.unwrap();
+        let recent_bucket = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            / 3_600
+            * 3_600;
         let snapshot = GoStatisticsSnapshot {
             total_download: 11,
             total_upload: 7,
             traffic: vec![GoTrafficBucketRecord {
-                bucket: 1_700_000_000,
+                bucket: recent_bucket,
                 upload: 7,
                 download: 11,
             }],
@@ -665,7 +720,7 @@ mod tests {
                 error: "timeout".to_owned(),
             }],
             telemetry: vec![GoTelemetryBucketRecord {
-                bucket: 1_700_000_000,
+                bucket: recent_bucket,
                 dimension: "protocol".to_owned(),
                 value: "tcp".to_owned(),
                 download: 11,
@@ -676,6 +731,176 @@ mod tests {
 
         store.replace_go_statistics(&snapshot).unwrap();
         assert_eq!(store.load_go_statistics().unwrap(), snapshot);
+    }
+
+    #[tokio::test]
+    async fn go_statistics_projection_rolls_old_telemetry_into_daily_tables() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let current_hour = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            / 3_600
+            * 3_600;
+        let old_day = (current_hour - TELEMETRY_HOURLY_RETENTION_SECONDS - 86_400)
+            .div_euclid(TELEMETRY_SECONDS_PER_DAY)
+            * TELEMETRY_SECONDS_PER_DAY;
+        let old_bucket_a = old_day + 3_600;
+        let old_bucket_b = old_day + 7_200;
+        let recent_bucket = current_hour - 3_600;
+        let snapshot = GoStatisticsSnapshot {
+            telemetry: vec![
+                GoTelemetryBucketRecord {
+                    bucket: old_bucket_a,
+                    dimension: "protocol".to_owned(),
+                    value: "tcp".to_owned(),
+                    download: 11,
+                    upload: 7,
+                    failures: 2,
+                },
+                GoTelemetryBucketRecord {
+                    bucket: old_bucket_b,
+                    dimension: "protocol".to_owned(),
+                    value: "tcp".to_owned(),
+                    download: 13,
+                    upload: 5,
+                    failures: 3,
+                },
+                GoTelemetryBucketRecord {
+                    bucket: recent_bucket,
+                    dimension: "protocol".to_owned(),
+                    value: "tcp".to_owned(),
+                    download: 17,
+                    upload: 19,
+                    failures: 4,
+                },
+            ],
+            ..GoStatisticsSnapshot::default()
+        };
+
+        store.replace_go_statistics(&snapshot).unwrap();
+
+        {
+            let connection = store.lock_connection().unwrap();
+            for table in ["traffic_dimension_daily", "failure_dimension_daily"] {
+                assert!(table_exists(&connection, table), "missing {table}");
+            }
+            let value_id = connection
+                .query(
+                    "SELECT id FROM telemetry_dimension_values
+                     WHERE dimension = 'protocol' AND value = 'tcp'",
+                )
+                .unwrap();
+            let value_id = row_i64(&value_id[0], 0, "telemetry value id").unwrap();
+
+            let traffic = connection
+                .query_with_params(
+                    "SELECT upload_bytes, download_bytes
+                     FROM traffic_dimension_daily
+                     WHERE bucket_start_utc = ?1 AND value_id = ?2",
+                    &[SqliteValue::from(old_day), SqliteValue::from(value_id)],
+                )
+                .unwrap();
+            assert_eq!(traffic.len(), 1);
+            assert_eq!(row_i64(&traffic[0], 0, "daily upload").unwrap(), 12);
+            assert_eq!(row_i64(&traffic[0], 1, "daily download").unwrap(), 24);
+
+            let failures = connection
+                .query_with_params(
+                    "SELECT failed_count
+                     FROM failure_dimension_daily
+                     WHERE bucket_start_utc = ?1 AND value_id = ?2",
+                    &[SqliteValue::from(old_day), SqliteValue::from(value_id)],
+                )
+                .unwrap();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(row_i64(&failures[0], 0, "daily failures").unwrap(), 5);
+
+            let old_hourly = connection
+                .query_with_params(
+                    "SELECT COUNT(*) FROM traffic_dimension_hourly
+                     WHERE bucket_start_utc < ?1",
+                    &[SqliteValue::from(
+                        current_hour - TELEMETRY_HOURLY_RETENTION_SECONDS,
+                    )],
+                )
+                .unwrap();
+            assert_eq!(row_i64(&old_hourly[0], 0, "old hourly count").unwrap(), 0);
+        }
+
+        let loaded = store.load_go_statistics().unwrap();
+        assert_eq!(loaded.telemetry.len(), 2);
+        let daily = loaded
+            .telemetry
+            .iter()
+            .find(|item| item.bucket == old_day)
+            .unwrap();
+        assert_eq!(daily.download, 24);
+        assert_eq!(daily.upload, 12);
+        assert_eq!(daily.failures, 5);
+        let hourly = loaded
+            .telemetry
+            .iter()
+            .find(|item| item.bucket == recent_bucket)
+            .unwrap();
+        assert_eq!(hourly.download, 17);
+        assert_eq!(hourly.upload, 19);
+        assert_eq!(hourly.failures, 4);
+    }
+
+    #[tokio::test]
+    async fn legacy_telemetry_projection_rolls_back_schema_conversion_on_error() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        {
+            let connection = store.lock_connection().unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE traffic_dimension_hourly (
+                         bucket_start_utc INTEGER NOT NULL,
+                         dimension TEXT NOT NULL,
+                         value TEXT NOT NULL,
+                         upload_bytes INTEGER NOT NULL DEFAULT 0,
+                         download_bytes INTEGER NOT NULL DEFAULT 0,
+                         updated_at INTEGER NOT NULL,
+                         PRIMARY KEY (bucket_start_utc, dimension, value)
+                     );
+                     CREATE TABLE failure_dimension_hourly (
+                         bucket_start_utc INTEGER NOT NULL,
+                         dimension TEXT NOT NULL,
+                         value TEXT NOT NULL,
+                         failed_count INTEGER NOT NULL DEFAULT 0,
+                         updated_at INTEGER NOT NULL,
+                         PRIMARY KEY (bucket_start_utc, dimension, value)
+                     );
+                     INSERT INTO traffic_dimension_hourly
+                         VALUES (1, 'protocol', 'tcp', 7, 11, 1);",
+                )
+                .unwrap();
+        }
+
+        let result = store.replace_go_statistics(&GoStatisticsSnapshot {
+            telemetry: vec![GoTelemetryBucketRecord {
+                bucket: 1,
+                dimension: "protocol".to_owned(),
+                value: "tcp".to_owned(),
+                download: u64::MAX,
+                ..GoTelemetryBucketRecord::default()
+            }],
+            ..GoStatisticsSnapshot::default()
+        });
+        assert!(result.is_err());
+
+        let connection = store.lock_connection().unwrap();
+        assert!(!table_exists(&connection, "telemetry_dimension_values"));
+        assert!(table_has_column(&connection, "traffic_dimension_hourly", "dimension").unwrap());
+        assert_eq!(
+            connection
+                .query("SELECT download_bytes FROM traffic_dimension_hourly")
+                .unwrap()
+                .first()
+                .and_then(|row| row.get(0)),
+            Some(&SqliteValue::Integer(11))
+        );
     }
 
     #[tokio::test]

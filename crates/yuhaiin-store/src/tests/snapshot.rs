@@ -454,7 +454,15 @@ fn loads_statistics_from_go_v6_production_shape() {
     assert_eq!(statistics.telemetry[1].upload, 10);
     assert_eq!(statistics.telemetry[1].failures, 2);
     store.replace_go_statistics(&statistics).unwrap();
-    assert_eq!(store.load_go_statistics().unwrap(), statistics);
+    // The Go projection keeps only recent hourly rows. Both fixture rows are
+    // older than the 30-day retention window, so Rust must preserve their
+    // values by folding them into the same UTC daily bucket on writeback.
+    let projected = store.load_go_statistics().unwrap();
+    assert_eq!(projected.telemetry.len(), 1);
+    assert_eq!(projected.telemetry[0].bucket, 0);
+    assert_eq!(projected.telemetry[0].download, 220);
+    assert_eq!(projected.telemetry[0].upload, 110);
+    assert_eq!(projected.telemetry[0].failures, 5);
     drop(store);
     remove_database_artifacts(&path);
 }
@@ -477,7 +485,20 @@ fn loads_and_replaces_legacy_go_v5_telemetry_tables() {
     assert_eq!(statistics.telemetry[0].dimension, "source");
     assert_eq!(statistics.telemetry[0].failures, 3);
     store.replace_go_statistics(&statistics).unwrap();
-    assert_eq!(store.load_go_statistics().unwrap(), statistics);
+    let projected = store.load_go_statistics().unwrap();
+    assert_eq!(projected.telemetry.len(), 3);
+    assert!(
+        projected
+            .telemetry
+            .iter()
+            .all(|item| item.bucket == 1_699_920_000)
+    );
+    {
+        let connection = store.lock_connection().unwrap();
+        assert!(table_exists(&connection, "telemetry_dimension_values"));
+        assert!(table_has_column(&connection, "traffic_dimension_hourly", "value_id").unwrap());
+        assert!(!table_has_column(&connection, "traffic_dimension_hourly", "dimension").unwrap());
+    }
     drop(store);
     remove_database_artifacts(&path);
 }
