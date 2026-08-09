@@ -1451,3 +1451,7 @@ cargo test -p yuhaiin-protocol --tests --offline -- --ignored --nocapture
 ## 21. 2026-08-09 macOS cross-target evidence
 
 当前 Linux 主机上 `cargo check -p yuhaiin-core --features async-proxy,tun --target aarch64-apple-darwin --offline` 通过；`yuhaiin-runtime --all-features` 则在 `libsqlite3-sys` bundled SQLite 编译阶段失败，因为主机 `/usr/bin/clang` 不识别 macOS 专用的 `-arch arm64` 与 `-mmacosx-version-min=11.0`，且环境没有 `xcrun`/macOS SDK。该结果确认 Rust core 代码可过 target check，但不能替代 macOS SDK/clang 下的 runtime 编译和 utun/LaunchDaemon 实机验收。
+
+## 22. 2026-08-09 service smoke
+
+使用 `target/debug/yuhaiin -host 127.0.0.1:55123 -path ~/.cache/yuhaiin-rust/service-smoke-<pid>` 启动独立 Rust service，未使用 `/tmp`，并通过 `/api/v2/info`、`/api/v2/settings`、`/api/v2/nodes`、`/api/v2/connections/total` 实际请求后收到 200 响应。空库幂等初始化出 built-in `direct` node，生成 `state.db`、WAL、SHM 和 sidecar lock；随后向该自有 smoke 进程发送 SIGTERM，进程正常退出。该结果覆盖 CLI path/host、SQLite 初始化和最小前端管理面链路，不替代代理流量和 TUN namespace 验收。
