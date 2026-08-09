@@ -18,11 +18,13 @@ The current scenarios cover:
   so `nodes.active` observes a real selector after reload rather than a
   synthetic enabled row.
 - `api_reload_flow.rs` keeps one SQLite state and two real HTTP CONNECT
-  fixtures, changes the selected node through `PUT /api/v2/nodes/{id}`, then
-  proves that the next inbound connection uses the new outbound after reload.
-  It also checks node latency, live traffic/history, and the same node,
-  inbound, totals, and history after a process restart. Run the reusable
-  Podman entry point with `make api-reload-flow-smoke`; logs are kept under
+  fixtures, changes the selected node through `PUT /api/v2/nodes/{id}`, moves
+  the HTTP inbound listener through `PUT /api/v2/inbounds/{id}`, and changes a
+  route from proxy to direct through `PUT /api/v2/route/rules/{name}/{index}`.
+  It proves each mutation on the real data path, checks node latency and live
+  traffic/history, and reads the same node, moved inbound, totals, and history
+  after a process restart. Run the reusable Podman entry point with
+  `make api-reload-flow-smoke`; logs are kept under
   `~/.cache/yuhaiin-rust/integration/api-reload-flow`.
 - HTTP inbound → domain route rule → fixed + HTTP CONNECT outbound, including
   live connection metadata, traffic counters, route testing, and node latency.

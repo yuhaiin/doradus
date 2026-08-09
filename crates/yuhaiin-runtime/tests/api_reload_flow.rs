@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 use support::{
     ConnectFixture, ServiceProcess, api_json, configure_http_chain, connect_loopback,
@@ -53,6 +54,16 @@ async fn wait_for_authority(fixture: &ConnectFixture, expected: &str) {
     panic!("HTTP fixture did not receive CONNECT authority {expected}");
 }
 
+async fn wait_for_listener_closed(address: SocketAddr) {
+    for _ in 0..100 {
+        if TcpStream::connect(address).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("old inbound listener {address} remained active after PUT reload");
+}
+
 async fn wait_for_history(service: &ServiceProcess) -> serde_json::Value {
     for _ in 0..100 {
         let history = api_json(
@@ -80,7 +91,7 @@ async fn wait_for_history(service: &ServiceProcess) -> serde_json::Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn api_node_mutation_reloads_real_flow_and_survives_restart() {
+async fn api_mutations_reload_real_flow_and_survive_restart() {
     let first = ConnectFixture::start().await;
     let second = ConnectFixture::start().await;
     let inbound = reserve_loopback().await;
@@ -145,6 +156,68 @@ async fn api_node_mutation_reloads_real_flow_and_survives_restart() {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .any(|authority| authority == &second_authority)
+    );
+
+    let moved_inbound = reserve_loopback().await;
+    let updated_inbound = json!({
+        "name":"HTTP chain inbound moved",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":moved_inbound.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":{"type":"http","http":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::PUT,
+        "/api/v2/inbounds/http-chain-in",
+        Some(&updated_inbound),
+    )
+    .await;
+    wait_for_listener_closed(inbound).await;
+    connect_and_echo(moved_inbound, &second_authority, b"after-inbound-reload").await;
+
+    let proxy_authority_count_before_direct_route = second
+        .connect_authorities
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len();
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::PUT,
+        "/api/v2/route/rules/proxy-example-test/0",
+        Some(&json!({
+            "mode":"direct",
+            "match":{"domain":"localhost"},
+            "tag":"integration"
+        })),
+    )
+    .await;
+    let route_test = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/route/rules/test",
+        Some(&json!({"host":format!("localhost:{}", second.target.port())})),
+    )
+    .await;
+    assert_eq!(route_test["mode"], "direct", "reloaded route: {route_test}");
+    connect_and_echo(
+        moved_inbound,
+        &format!("localhost:{}", second.target.port()),
+        b"after-route-reload",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let proxy_authority_count_after_direct_route = second
+        .connect_authorities
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len();
+    assert_eq!(
+        proxy_authority_count_after_direct_route, proxy_authority_count_before_direct_route,
+        "direct route must bypass the HTTP outbound fixture"
     );
 
     let total = api_json(
@@ -215,11 +288,12 @@ async fn api_node_mutation_reloads_real_flow_and_survives_restart() {
         None,
     )
     .await;
-    assert!(
-        inbounds["items"]
-            .as_array()
-            .is_some_and(|items| { items.iter().any(|item| item["id"] == "http-chain-in") })
-    );
+    assert!(inbounds["items"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["id"] == "http-chain-in"
+                && item["network"]["tcp_udp"]["host"] == moved_inbound.to_string()
+        })
+    }));
     let persisted_total = api_json(
         &restarted.client,
         &restarted.base_url,
