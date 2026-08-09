@@ -126,13 +126,12 @@ async fn run(options: RunOptions) -> Result<()> {
         .password
         .or_else(|| std::env::var("YUHAIIN_API_PASSWORD").ok())
         .unwrap_or_default();
-    // The Go flag controls a separately served frontend. Keep accepting it so
-    // an existing service command can swap in this binary; serving static
-    // assets remains the host application's responsibility.
-    let _ = options.external_web;
-    let state = ApiState::new(controller.clone())
+    let mut state = ApiState::new(controller.clone())
         .with_shutdown(shutdown_tx.clone())
         .with_optional_auth(username, password);
+    if let Some(external_web) = options.external_web {
+        state = state.with_external_web(external_web);
+    }
     let signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         wait_for_process_shutdown().await;

@@ -27,6 +27,7 @@ use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
+use tower_http::services::{ServeDir, ServeFile};
 use yuhaiin_core::proxy::{AsyncProxy, DirectAsyncProxy};
 use yuhaiin_core::{BoxFuture, DomainName, Endpoint, FlowContext, Network};
 use yuhaiin_geo::{GeoDatabaseManager, GeoDownloadTransport, GeoRefreshRequest};
@@ -50,6 +51,7 @@ pub struct ApiState {
     pub update: Arc<UpdateService>,
     shutdown: Option<watch::Sender<bool>>,
     auth: Option<ApiAuth>,
+    web_root: Option<PathBuf>,
 }
 
 /// Optional management API credentials. The stored values are SHA-256
@@ -96,11 +98,20 @@ impl ApiState {
             update,
             shutdown: None,
             auth: None,
+            web_root: None,
         }
     }
 
     pub fn with_shutdown(mut self, shutdown: watch::Sender<bool>) -> Self {
         self.shutdown = Some(shutdown);
+        self
+    }
+
+    /// Serve a Go-compatible external frontend directory from the same HTTP
+    /// listener. API routes remain registered before the fallback; unknown
+    /// paths use `index.html` so React client-side routes keep working.
+    pub fn with_external_web(mut self, root: impl Into<PathBuf>) -> Self {
+        self.web_root = Some(root.into());
         self
     }
 
@@ -207,7 +218,8 @@ struct ListQuery {
 /// may be served from a different local development port.
 pub fn router(state: ApiState) -> Router {
     let auth = state.auth.clone();
-    Router::new()
+    let web_root = state.web_root.clone();
+    let router = Router::new()
         .route("/api/v2/info", get(info))
         .route("/api/v2/update/check", post(update_check))
         .route("/api/v2/update/apply", post(update_apply))
@@ -340,7 +352,13 @@ pub fn router(state: ApiState) -> Router {
             let auth = auth.clone();
             async move { authenticate(auth, request, next).await }
         }))
-        .with_state(state)
+        .with_state(state);
+    if let Some(root) = web_root {
+        let index = root.join("index.html");
+        router.fallback_service(ServeDir::new(root).fallback(ServeFile::new(index)))
+    } else {
+        router
+    }
 }
 
 async fn authenticate(auth: Option<ApiAuth>, request: Request<Body>, next: Next) -> Response {
@@ -2981,6 +2999,55 @@ mod tests {
         .await
         .unwrap();
         ApiState::new(controller)
+    }
+
+    #[tokio::test]
+    async fn external_web_root_serves_assets_and_react_fallback_without_hiding_api() {
+        let root = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+            .unwrap_or_else(|| PathBuf::from(".cache"))
+            .join("yuhaiin-rust")
+            .join(format!("api-web-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("index.html"), "<html>rust-ui</html>").unwrap();
+        std::fs::write(root.join("app.js"), "console.log('rust-ui');").unwrap();
+
+        let app = router(state().await.with_external_web(&root));
+        let asset = app
+            .clone()
+            .oneshot(Request::get("/app.js").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(asset.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(asset.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"console.log('rust-ui');"
+        );
+
+        let fallback = app
+            .clone()
+            .oneshot(Request::get("/dashboard").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(fallback.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(fallback.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"<html>rust-ui</html>"
+        );
+
+        let api = app
+            .oneshot(Request::get("/api/v2/info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
