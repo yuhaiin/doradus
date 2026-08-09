@@ -182,6 +182,11 @@ flowchart LR
 > `MIGRATION.md` §53。宿主机已有 `127.0.0.1:1080` 时，API contract 的 active-node 进程 smoke
 > 需放到 Podman 独立 network namespace，避免默认 mixed listener 端口冲突。
 
+> **Process regression note:** `tests/api_contract.rs` 现在还会在真实 runtime 子进程中
+> 校验 fresh mixed inbound 的 `tcp_udp.udp=enabled`，并通过 loopback HTTP server 验证
+> direct node 的域名 latency；`scripts/integration/api-contract.sh` 会运行该文件的全部
+> process tests，而不是只运行管理面大测试。
+
 | `[x]` | live connections | `monitor`, `connections` API/SSE | 建立、更新、关闭、数字 ID close、EventSource added/removed |
 | `[~]` | history/traffic/statistics | `monitor`, SQLite persistence | Rust checkpoint 负责频繁 crash recovery；无 checkpoint 时可接管 Go 的 `statistics_kv`、`traffic_hourly`、`connection_history`、`failed_connection_history` 和 telemetry 表；运行期间首次写入及每 30 秒低频写回 Go 兼容统计投影，SQLite 锁导致的投影失败按 2 秒起、60 秒封顶指数退避，正常 shutdown 先收敛 persistence worker 再做最终原子投影；history 按 Go key 合并，旧 checkpoint 中重复 `(protocol, addr, process)` 也会先合并，避免真实生产库最终 flush 的 UNIQUE 冲突；`connections.total.counters` 现在只保留活动 flow，关闭和重启都会清除 live counter，与 Go `Connections.Remove` 一致；统计 projection 现在创建 Go v6 所需的 hourly/daily 四张 telemetry 表，按 Go 的 30 天 hourly retention 将旧数据按 UTC 日聚合；若生产库因历史 schema version 复用仍只有 Go v5 文本维度表，Rust 接管写回会在同一事务内转换为 compact `telemetry_dimension_values` + hourly/daily 表；真实 schema-7 原始生产副本经 Rust 优雅停止后，Go `connections.telemetry` 已返回 200；独立文件库 reader、真实 schema-7 takeover 和真实子进程 `Child::kill` 已验证 checkpoint、Go 表及 WAL/sidecar 重开恢复；`tests/service_chain.rs` 现在还用真实 TLS/H2/Yuubinsya TCP/UOT UDP flow 读取 traffic、telemetry、failed-history，并在 TCP 关闭后读取 history；新增真实 runtime 进程测试，在流量更新期间并发读取六类统计 API，停止后重启同一 SQLite 并读回 traffic/history，且有 Podman 入口 | 生产库更多版本/异常中断 fixture；还需在 Podman/真实部署中验证 Go 进程并发读写和升级期间统计表锁竞争；继续补 telemetry source normalization 与逐字段长范围快照 |
 | `[x]` | runtime reload | `RuntimeController` | 配置先构建新 snapshot，失败保留旧 snapshot；selector/inbound/DNS 按 owner 收敛 |

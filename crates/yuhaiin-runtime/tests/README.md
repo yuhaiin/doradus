@@ -12,9 +12,11 @@ The current scenarios cover:
   React management contracts: settings/backup, hosts/FakeDNS, resolver and
   inbound CRUD, node selection/active state, users, publishes/subscriptions,
   route config/lists/rules/tags/apply, connections/statistics, SSE, tools and
-  representative 404 errors. It keeps an enabled HTTP inbound alive while
-  testing node selection so `nodes.active` observes a real selector after
-  reload rather than a synthetic enabled row.
+  representative 404 errors. It also checks the fresh default mixed inbound's
+  UDP contract and runs direct-node domain latency against a real loopback HTTP
+  server. It keeps an enabled HTTP inbound alive while testing node selection
+  so `nodes.active` observes a real selector after reload rather than a
+  synthetic enabled row.
 - HTTP inbound → domain route rule → fixed + HTTP CONNECT outbound, including
   live connection metadata, traffic counters, route testing, and node latency.
 - HTTP inbound + mixed UDP inbound → TLS + HTTP/2 + Yuubinsya UDP-over-TCP

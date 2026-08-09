@@ -2021,3 +2021,12 @@ supervisor 都启动后输出 `runtime ready`；使用 `--host 127.0.0.1:0` 时�
 和 API contract test binary 从同一个 cache target 挂载，使用 host network 复用 loopback
 fixture。当前真实进程 contract 已通过；`--network=none` 会让该测试受到容器 loopback
 命名空间差异影响，不作为 API contract 的默认验收模式。
+
+## 56. 2026-08-10 direct/mixed process regression
+
+为避免旧二进制或旧配置掩盖运行时回归，`tests/api_contract.rs` 现在包含两个真实
+runtime 子进程断言：fresh state 的 `/api/v2/inbounds/mixed` 必须保留
+`network.tcp_udp.udp=enabled`，并启动一个 loopback HTTP server，通过
+`/api/v2/nodes/{id}/latency` 验证 direct node 的域名目标会先经 resolver 解析后再建立
+socket。`scripts/integration/api-contract.sh` 不再只运行管理面大测试，而是运行该文件的
+全部 process tests；当前 Podman host-network 结果为 2/2 通过。

@@ -5,6 +5,8 @@ mod support;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 use support::{ServiceProcess, integration_dir, seed_empty_database};
 
@@ -99,6 +101,63 @@ async fn wait_for_active_node(service: &ServiceProcess, id: &str) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_process_direct_node_latency_resolves_domain_before_connect() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let length = stream.read(&mut buffer).await.unwrap();
+            assert!(
+                length > 0,
+                "direct latency probe closed before HTTP headers"
+            );
+            request.extend_from_slice(&buffer[..length]);
+        }
+        assert!(request.starts_with(b"GET /health HTTP/1.1\r\n"));
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let root = integration_dir("api-direct-latency");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    expect_ok(
+        &service,
+        Method::POST,
+        "/api/v2/nodes",
+        Some(json!({
+            "id":"api-direct-latency",
+            "name":"API direct latency",
+            "enabled":true,
+            "chain":[{"type":"direct","direct":{}}]
+        })),
+    )
+    .await;
+
+    let response = expect_ok(
+        &service,
+        Method::POST,
+        "/api/v2/nodes/api-direct-latency/latency",
+        Some(json!({
+            "type":"tcp",
+            "url":format!("http://localhost:{}/health", address.port())
+        })),
+    )
+    .await;
+    assert_eq!(response["ok"], true, "direct latency response: {response}");
+
+    server.await.unwrap();
+    service.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn management_api_round_trips_frontend_contracts_in_one_process() {
     let root = integration_dir("management-api-contract");
     std::fs::create_dir_all(&root).unwrap();
@@ -118,6 +177,11 @@ async fn management_api_round_trips_frontend_contracts_in_one_process() {
     assert_eq!(settings["systemProxy"]["http"], true);
     assert_eq!(settings["logcat"]["level"], "debug");
     assert_eq!(settings["logcat"]["save"], true);
+
+    let mixed = expect_ok(&service, Method::GET, "/api/v2/inbounds/mixed", None).await;
+    assert_eq!(mixed["protocol"]["type"], "mixed");
+    assert_eq!(mixed["network"]["type"], "tcp_udp");
+    assert_eq!(mixed["network"]["tcp_udp"]["udp"], "enabled");
 
     let nodes = expect_ok(
         &service,

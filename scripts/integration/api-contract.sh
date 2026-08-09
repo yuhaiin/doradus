@@ -46,9 +46,7 @@ podman run --rm \
   "${image}" \
   -ec '
     set -eu
-    /usr/local/bin/yuhaiin-api-contract \
-      management_api_round_trips_frontend_contracts_in_one_process \
-      --exact --nocapture
+    /usr/local/bin/yuhaiin-api-contract --nocapture
   ' \
   | tee "${scenario_dir}/podman.log"
 
