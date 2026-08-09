@@ -1447,3 +1447,7 @@ cargo test -p yuhaiin-protocol --tests --offline -- --ignored --nocapture
 ## 20. 2026-08-09 transparent UDP ancillary coverage
 
 `yuhaiin-runtime::proxy::transparent` 新增 Linux 本机 socket 回归：启用 `IP_ORIGDSTADDR` 与 `IPV6_ORIGDSTADDR`，分别发送 IPv4/IPv6 UDP packet，并通过真实 `recvmsg` ancillary 解析 peer、payload 和 original destination。该测试不修改宿主路由，也不伪装成完整 TPROXY 网络 namespace 验收；需要 `CAP_NET_ADMIN` 的非本地转发、iptables/nftables 和多 flow 生命周期仍按 checklist 单独执行。
+
+## 21. 2026-08-09 macOS cross-target evidence
+
+当前 Linux 主机上 `cargo check -p yuhaiin-core --features async-proxy,tun --target aarch64-apple-darwin --offline` 通过；`yuhaiin-runtime --all-features` 则在 `libsqlite3-sys` bundled SQLite 编译阶段失败，因为主机 `/usr/bin/clang` 不识别 macOS 专用的 `-arch arm64` 与 `-mmacosx-version-min=11.0`，且环境没有 `xcrun`/macOS SDK。该结果确认 Rust core 代码可过 target check，但不能替代 macOS SDK/clang 下的 runtime 编译和 utun/LaunchDaemon 实机验收。
