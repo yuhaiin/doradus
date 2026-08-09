@@ -133,11 +133,7 @@ impl ChainClient {
         chain: ValidatedChain,
         resolver: Arc<dyn AsyncIpResolver>,
     ) -> Result<Self> {
-        let roots = if chain.tls.ca_certificates.is_empty() {
-            RootCertStore::empty()
-        } else {
-            root_store(&chain.tls.ca_certificates)?
-        };
+        let roots = root_store(&chain.tls.ca_certificates)?;
         let h2_idle_timeout = chain.http2.idle_timeout;
         let provider = Arc::new(rustls_rustcrypto::provider());
         let mut config = ClientConfig::builder_with_provider(provider)
@@ -1097,7 +1093,11 @@ fn io_error(error: std::io::Error) -> Error {
 }
 
 fn root_store(certificates: &[Vec<u8>]) -> Result<RootCertStore> {
+    // Go starts from the platform system pool and appends node-specific
+    // certificates.  The pure-Rust equivalent uses the Mozilla WebPKI set;
+    // private or enterprise roots can still be appended through ca_cert.
     let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     for certificate in certificates {
         let mut cursor = std::io::Cursor::new(certificate);
         let mut parsed = false;
@@ -1112,9 +1112,6 @@ fn root_store(certificates: &[Vec<u8>]) -> Result<RootCertStore> {
                 .map_err(tls_error)?;
         }
     }
-    if roots.is_empty() {
-        return Err(Error::invalid("TLS chain has no CA certificate"));
-    }
     Ok(roots)
 }
 
@@ -1128,6 +1125,12 @@ mod tests {
 
     fn endpoint(port: u16) -> Endpoint {
         Endpoint::ip(Network::Udp, SocketAddr::from(([192, 0, 2, 1], port)))
+    }
+
+    #[test]
+    fn root_store_has_public_roots_without_custom_certificates() {
+        let roots = root_store(&[]).unwrap();
+        assert!(!roots.is_empty());
     }
 
     #[test]

@@ -1557,3 +1557,9 @@ selected_udp_node_v2 = a549f6c7-3ba1-42bc-9708-3a069f5e61b2
 Rust route tags 之前读写私有 `yuhaiin_config` 的 `route.tag.*` key，与 Go 当前使用的 `node_tags_v2(name, members_json, updated_at)` 不一致，导致 Rust 接管真实 Go 状态时看不到已有 tags。现在 list/put/delete 均使用 `node_tags_v2`；响应对象按 Go `TagItem` 返回 `name/type/hash`，空 type 规范化为 `node`，list query 在 name/type/hash 上过滤，delete 按公开 name 删除并对不存在记录返回 404。
 
 使用真实 schema-7 Go 数据库的两个独立副本分别启动 Go 与 Rust，生成的 RPC `route.tags.get` 输出完全一致：9 条生产 tags、`page/pageSize/total` 分页字段和每条的 name/type/hash 均一致。随后对两个进程分别执行 put、按 query 读取、delete 和重复 delete；HTTP 状态序列均为 `200/200/200/404`，Rust 删除后 `node_tags_v2` 行数为 0。副本、请求和日志均保存在 `~/.cache/yuhaiin-rust/api-compare-tags-20260809` 与 `api-compare-tags-mutation-20260809`，没有使用 `/tmp`；本次证据以 React generated client 使用的 RPC 路径为准。
+
+## 34. 2026-08-09 TLS 公共根证书兼容
+
+Go `pkg/net/proxy/tls.ParseTLSConfig` 先加载系统证书池，再追加节点 `ca_cert`。Rust chain 之前要求每个 TLS 节点至少提供一份 `ca_cert`，使使用公共 CA 的 Go 节点在配置校验阶段就无法启动。现在 chain 使用纯 Rust `webpki-roots` 作为默认公共根，并继续追加 PEM/DER 格式的 `ca_cert`；空 `ca_cert` 合法，私有 CA 仍必须随节点配置提供。
+
+新增配置、根证书池和 TLS+HTTP/2+Yuubinsya TCP/UOT through TUN 回归；`yuhaiin-chain` 全部 45 个单元/集成测试通过。该实现与 Go 的系统证书池在企业私有根集合上仍可能不同，生产私有 CA 应显式配置，不能把 WebPKI 根集合当作平台证书池的逐字节等价物。

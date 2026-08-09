@@ -126,7 +126,7 @@ flowchart LR
 | `[x]` | HTTP proxy / CONNECT | 是 | 是 | `runtime::inbound`, `core::proxy` |
 | `[x]` | SOCKS5 | 是 | 是 | `runtime::inbound`, `core::proxy`；outbound 已覆盖 TCP CONNECT + UDP ASSOCIATE、认证和 domain framing |
 | `[x]` | SOCKS4A | 是 | — | `runtime/src/proxy/socks4a.rs` |
-| `[x]` | TLS transport | 是 | 是 | `runtime::doh_tls`, `protocol::tls` |
+| `[x]` | TLS transport | 是 | 是 | `runtime::doh_tls`, `protocol::tls`; chain outbound 默认使用纯 Rust Mozilla WebPKI roots，并追加 Go `ca_cert` |
 | `[x]` | HTTP/2 transport | 是 | 是 | `chain`, runtime HTTP2 inbound |
 | `[x]` | Yuubinsya TCP | 是 | 是 | `core::yuubinsya`, `chain` |
 | `[x]` | Yuubinsya native UDP | 是 | 是 | `core::proxy`, `chain` |

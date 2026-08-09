@@ -241,10 +241,6 @@ impl ChainConfig {
                     }
                     ca_certificates.push(certificate);
                 }
-                if ca_certificates.is_empty() {
-                    return Err(Error::invalid("TLS node requires at least one ca_cert"));
-                }
-
                 let next_protos = if tls.next_protos.is_empty() {
                     if has_websocket {
                         Vec::new()
@@ -469,6 +465,14 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_str(CONFIG).unwrap();
         value["chain"][3]["yuubinsya"]["password"] = serde_json::Value::String(String::new());
         assert!(parse_config(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn accepts_public_ca_tls_without_custom_ca_certificates() {
+        let mut value: serde_json::Value = serde_json::from_str(CONFIG).unwrap();
+        value["chain"][1]["tls"]["ca_cert"] = serde_json::json!([]);
+        let chain = parse_config(&value.to_string()).unwrap();
+        assert!(chain.tls.ca_certificates.is_empty());
     }
 
     #[test]
