@@ -32,6 +32,7 @@
 > 2026-08-09 system hosts overlay：runtime snapshot 在持久化 Go `dns_hosts`/兼容配置之前加载平台 hosts 文件（Unix `/etc/hosts`，Windows 使用系统 hosts 路径），并用 `HostsTable::overlay` 保证显式配置覆盖系统值；同一层同时供 `AsyncHostsResolver` 和 connection metadata selector 使用。新增注释、IPv4/IPv6、别名/非法行与覆盖优先级回归；握手后才可见的底层 socket interface、Android/macOS 原生 interface backend 仍未伪造兼容。
 > 2026-08-09 runtime settings 应用：新增 `RuntimeSettings`，由 persisted `settings` JSON 解析并随 `RuntimeSnapshot` 原子 reload；`ipv6` 现在统一约束共享 resolver、按 ID resolver、DNS answer 和 TUN `portalV6`，默认 pprof 兼容 Go 的历史默认值。新增 settings parser、IPv6 resolver、snapshot reload 和 TUN 配置回归；`useDefaultInterface/netInterface` 真实 socket bind、buffer/semaphore 调优和 pprof endpoint 仍未宣称完成。`cargo test -p yuhaiin-runtime --all-features --offline` 当前 133 个单测、7 个集成测试通过；Podman Debian testing privileged TUN smoke 输出 `tun-opened`，route smoke 输出 `tun-route-installed`。
 > 2026-08-09 Go settings KV compatibility：进一步补齐真实 Go SQLite 的 `settings_kv(section,key,value_json)`。Rust 在没有 `settings` overlay 时从该表读取全局 settings，`settings.get` 返回同一前端字段形状；Rust `settings.put` 在旧表存在时回写已知 scalar keys，未知 platform/application rows 保持不变。生产形状 Go v6 fixture 已覆盖读取与回写，避免把配置保存到 Rust 私有 key 后 Go 兼容层看不到。真实 socket bind、buffer/semaphore 调优和 pprof endpoint 仍未完成。
+> 2026-08-09 DNS server compatibility：`run_dns_supervisor` 与 resolver server API 现在遵循 Go 的来源优先级：Rust `resolver.server` overlay 优先，否则读取/回写 `dns_settings.server`；因此真实 Go SQLite 导入后配置的监听地址不再被遗漏。新增 Go v6 fixture server 读写和 overlay precedence 回归；DNS server 的完整 TCP/UDP/DoH/DoT transport 组合及 DoQ/DoH3 仍按清单推进。
 
 ## 1. 目标、边界和完成定义
 

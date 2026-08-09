@@ -339,6 +339,41 @@ impl ConfigRepository {
             .collect()
     }
 
+    /// Update only the Go resolver server field, preserving FakeDNS columns
+    /// in `dns_settings`. Fresh Rust stores do not have this compatibility
+    /// table and continue using the Rust config overlay.
+    pub async fn put_go_dns_server(&self, server: &str) -> Result<()> {
+        let connection = self.store.lock_connection()?;
+        if !table_exists(&connection, "dns_settings") {
+            return Ok(());
+        }
+        drop(connection);
+        validate_go_texts(&[("dns_settings.server", &server.to_owned())])?;
+        self.store.with_write_transaction(|connection| {
+            require_go_table(
+                connection,
+                "dns_settings",
+                &[
+                    "id",
+                    "server",
+                    "fakedns_enabled",
+                    "fakedns_ipv4_range",
+                    "fakedns_ipv6_range",
+                ],
+            )?;
+            connection
+                .execute_with_params(
+                    "INSERT INTO dns_settings(
+                         id, server, fakedns_enabled, fakedns_ipv4_range, fakedns_ipv6_range
+                     ) VALUES (?1, ?2, 0, '', '')
+                     ON CONFLICT(id) DO UPDATE SET server = excluded.server",
+                    &[SqliteValue::from(1_i64), SqliteValue::from(server)],
+                )
+                .map_err(storage_error)?;
+            Ok(())
+        })
+    }
+
     pub async fn load_go_fakeip_runtime_config(&self) -> Result<Option<GoFakeIpRuntimeConfig>> {
         let records = self.list_go_dns_settings().await?;
         records

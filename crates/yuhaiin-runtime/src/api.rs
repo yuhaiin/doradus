@@ -2088,7 +2088,16 @@ async fn resolver_server_get_value(state: &ApiState) -> ApiResult {
 
 async fn resolver_server_put_value(state: &ApiState, value: Value) -> ApiResult {
     let server = string_or(&value, "server", "");
-    write_config_json(state, "resolver.server", json!({"server": server})).await
+    let config = json!({"server": server});
+    let bytes = serde_json::to_vec(&config)?;
+    state
+        .controller
+        .mutate_and_reload(move |store| async move {
+            store.put_config("resolver.server", &bytes).await?;
+            store.repository().put_go_dns_server(&server).await
+        })
+        .await?;
+    Ok(Json(config))
 }
 
 async fn tags_get_value(state: &ApiState, input: &Value) -> ApiResult {

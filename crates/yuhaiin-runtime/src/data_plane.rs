@@ -372,18 +372,7 @@ pub async fn run_dns_supervisor(
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     loop {
-        let server = controller
-            .store()
-            .get_config("resolver.server")
-            .await?
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|value| {
-                value
-                    .get("server")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .filter(|server| !server.trim().is_empty());
+        let server = configured_dns_server(controller.store()).await?;
         let Some(server) = server else {
             if wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
                 return Ok(());
@@ -405,6 +394,31 @@ pub async fn run_dns_supervisor(
             return Ok(());
         }
     }
+}
+
+/// Resolve the DNS listener address with the same precedence as the Go
+/// resolver config controller: Rust's live overlay wins, while an imported
+/// Go `dns_settings.server` row is used when no overlay exists.
+async fn configured_dns_server(store: &yuhaiin_store::ConfigStore) -> Result<Option<String>> {
+    if let Some(bytes) = store.get_config("resolver.server").await? {
+        return Ok(serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|server| !server.trim().is_empty()));
+    }
+    Ok(store
+        .repository()
+        .list_go_dns_settings()
+        .await?
+        .into_iter()
+        .next()
+        .map(|record| record.server)
+        .filter(|server| !server.trim().is_empty()))
 }
 
 #[cfg(feature = "tun")]
@@ -555,6 +569,19 @@ mod tests {
         assert!(!config.enabled);
         assert!(config.tun.ipv4.is_none());
         assert!(config.tun.ipv6.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dns_server_overlay_is_used_before_legacy_database_fallback() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        store
+            .put_config("resolver.server", br#"{"server":"127.0.0.1:5353"}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            configured_dns_server(&store).await.unwrap().as_deref(),
+            Some("127.0.0.1:5353")
+        );
     }
 
     #[tokio::test]

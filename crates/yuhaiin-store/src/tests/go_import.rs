@@ -1428,6 +1428,8 @@ fn imports_production_shaped_go_snapshot_without_losing_legacy_tables() {
                     value.section == "general" && value.key == "ipv6" && value.value_json == "false"
                 })
         );
+        let imported_dns_settings = block_on(repository.list_go_dns_settings()).unwrap();
+        assert_eq!(imported_dns_settings[0].server, "dns-udp");
         let nodes = block_on(repository.list_proxy_nodes()).unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].id, "node-prod");
@@ -1485,6 +1487,10 @@ fn imports_production_shaped_go_snapshot_without_losing_legacy_tables() {
         assert!(dns_settings[0].fakedns_enabled);
         assert_eq!(dns_settings[0].fakedns_ipv4_range, "198.18.0.0/15");
         assert_eq!(dns_settings[0].fakedns_ipv6_range, "fc00::/18");
+        block_on(repository.put_go_dns_server("127.0.0.1:5353")).unwrap();
+        let updated_dns_settings = block_on(repository.list_go_dns_settings()).unwrap();
+        assert_eq!(updated_dns_settings[0].server, "127.0.0.1:5353");
+        assert!(updated_dns_settings[0].fakedns_enabled);
         let fakeip = block_on(repository.load_go_fakeip_runtime_config())
             .unwrap()
             .unwrap();
