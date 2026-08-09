@@ -98,6 +98,7 @@ where
     let mut context = FlowContext::new(destination.clone());
     context.source = Some(source);
     context.original_domain = destination.host().cloned();
+    context.http_host = header_value(&headers, "host").map(ToOwned::to_owned);
     spec.annotate_context(&mut context);
     selector.route_context(&mut context);
     let outbound = match selector.select(&context).connect(&context).await {
@@ -252,7 +253,9 @@ fn rewrite_forward_request(method: &str, target: &str, headers: &str) -> Result<
 fn header_value<'a>(headers: &'a str, wanted: &str) -> Option<&'a str> {
     headers.lines().skip(1).find_map(|line| {
         let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case(wanted).then_some(value.trim())
+        name.trim()
+            .eq_ignore_ascii_case(wanted)
+            .then_some(value.trim())
     })
 }
 
@@ -332,6 +335,12 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("proxy-authorization")
         );
+    }
+
+    #[test]
+    fn header_value_preserves_host_for_connection_observability() {
+        let headers = "GET / HTTP/1.1\r\n hOsT: example.com:8080 \r\n\r\n";
+        assert_eq!(header_value(headers, "Host"), Some("example.com:8080"));
     }
 
     #[test]

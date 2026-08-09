@@ -26,6 +26,7 @@
 > 2026-08-09 连接元数据契约修复：monitor 不再把所有 `TunFlow` 统一序列化为 `component=tun`；普通 inbound 的 component 为空，只有 TUN runtime 注入 `component=tun`，并保留 TUN 的默认 inbound 标识。新增普通 inbound/TUN 双路径回归。
 > 2026-08-09 路由解释元数据链补齐：`RouterRuntime` 现在把命中的 Go rule name、tag、host/process list、match history 和 Geo country 写回共享 `FlowContext`；runtime selector 增加统一的可变 `route_context` 钩子，HTTP/SOCKS4A/SOCKS5/Trojan/VLESS/Yuubinsya/TUN 都在选择 outbound 前调用，因此普通连接与 TUN 连接的实际 proxy 选择、`connections` 实时字段和 `route.rules.test` 使用同一条路由快照。`resolver` 同步记录 route settings 选择的 resolver ID。新增 trie、route compiler、monitor 回归；Podman Debian testing host-network smoke 进一步创建真实 HTTP inbound 和 CIDR route rule，延迟 upstream 期间读取 `/api/v2/connections`，确认 live connection 返回 `tag=local-test`、`matchHistory[0].ruleName=local-rule`、`mode=direct`，再完成真实 HTTP 请求。
 > 2026-08-09 FakeIP/TUN 上下文链补齐：`RuntimeController::build_tun_proxy_runtime_with_dns` 在构造同一份 snapshot 的 TUN runtime 时，把 FakeIP 池转换成 SQLite-free 的双栈 `FakeIpView`；每个新 TUN flow 在 router 选择前按目的 IP恢复 `original_domain`，并在 monitor 的 Go 兼容 connection 对象中保留 `fakeIp`。共享 view 会在 resolver 分配新地址后替换，不把 SQLite 放进 packet callback；新增 controller、store snapshot 和 monitor 回归，避免 FakeIP TUN 流量只能按合成 IP 路由或显示。
+> 2026-08-09 连接观测扩展：共享 `FlowContext` 增加 Go `connections` 所需的 `hosts`、`tlsServerName`、`httpHost`、`interface` 和 `outboundGeo` 可选字段，monitor 序列化这些值时不再硬编码为空；HTTP forward inbound 已把真实 `Host` 写入上下文，并有头部/monitor 单测。TLS SNI、hosts resolver source、实际 socket interface 和 selected outbound Geo 仍由后续 sniff/resolver/socket adapter 填充，当前保持空值而不是伪造兼容数据。
 
 ## 1. 目标、边界和完成定义
 

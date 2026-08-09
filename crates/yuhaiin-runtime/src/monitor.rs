@@ -947,12 +947,12 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         "source": source,
         "inbound": inbound,
         "inboundName": inbound_name,
-        "interface": "",
+        "interface": context.interface.as_deref().unwrap_or_default(),
         "outbound": outbound,
         "localAddr": source,
         "destination": original,
         "fakeIp": context.fake_ip.as_deref().unwrap_or_default(),
-        "hosts": "",
+        "hosts": context.hosts.as_deref().unwrap_or_default(),
         "domain": domain,
         "ip": context.destination.addr().map(|addr| addr.ip().to_string()).unwrap_or_default(),
         "tag": context.tag.as_deref().unwrap_or_default(),
@@ -962,8 +962,8 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         "process": context.process.as_deref().unwrap_or_default(),
         "pid": context.process_id.map(|value| value.to_string()).unwrap_or_default(),
         "uid": context.user_id.map(|value| value.to_string()).unwrap_or_default(),
-        "tlsServerName": "",
-        "httpHost": "",
+        "tlsServerName": context.tls_server_name.as_deref().unwrap_or_default(),
+        "httpHost": context.http_host.as_deref().unwrap_or_default(),
         "component": context.component.as_deref().unwrap_or_default(),
         "udpMigrateId": context.udp_migrate_id.load(std::sync::atomic::Ordering::Relaxed).to_string(),
         "mode": route_mode(context.route_mode),
@@ -980,7 +980,7 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
             .collect::<Vec<_>>(),
         "resolver": context.resolver.as_deref().unwrap_or_default(),
         "geo": context.geo.as_deref().unwrap_or_default(),
-        "outboundGeo": "",
+        "outboundGeo": context.outbound_geo.as_deref().unwrap_or_default(),
         "lists": context.lists,
     })
 }
@@ -1117,6 +1117,24 @@ mod tests {
             "media-hosts"
         );
         assert_eq!(connection["matchHistory"][0]["history"][0]["matched"], true);
+    }
+
+    #[test]
+    fn monitor_preserves_protocol_and_socket_metadata_in_connections() {
+        let monitor = ConnectionMonitor::new();
+        let (flow, mut context) = flow();
+        context.hosts = Some("hosts".to_owned());
+        context.tls_server_name = Some("example.com".to_owned());
+        context.http_host = Some("example.com:443".to_owned());
+        context.interface = Some("eth0".to_owned());
+        context.outbound_geo = Some("US".to_owned());
+        monitor.opened(flow, context);
+        let connection = &monitor.connections_value()["connections"][0];
+        assert_eq!(connection["hosts"], "hosts");
+        assert_eq!(connection["tlsServerName"], "example.com");
+        assert_eq!(connection["httpHost"], "example.com:443");
+        assert_eq!(connection["interface"], "eth0");
+        assert_eq!(connection["outboundGeo"], "US");
     }
 
     #[test]

@@ -288,6 +288,11 @@ pub struct FlowContext {
     pub lists: Vec<String>,
     pub resolver: Option<String>,
     pub geo: Option<String>,
+    /// Address/source metadata recorded by the resolver layer.  Go exposes
+    /// this as `hosts` on connection records; keeping it on the shared flow
+    /// context lets DNS, TUN and inbound adapters populate it without making
+    /// the monitor depend on a particular resolver implementation.
+    pub hosts: Option<String>,
     /// The packet destination before FakeIP reverse lookup.  Keeping this
     /// separate from `destination` lets routing use the restored domain while
     /// observability still reports that the application connected to a
@@ -301,6 +306,14 @@ pub struct FlowContext {
     pub inbound_name: Option<String>,
     pub outbound: Option<String>,
     pub outbound_name: Option<String>,
+    /// Protocol metadata discovered while accepting or sniffing a flow.
+    pub tls_server_name: Option<String>,
+    pub http_host: Option<String>,
+    /// Local interface and the selected outbound endpoint's GeoIP label.  A
+    /// flow may legitimately leave either value unset on platforms where the
+    /// socket does not expose it.
+    pub interface: Option<String>,
+    pub outbound_geo: Option<String>,
     /// Process metadata supplied by a platform process resolver. TUN callers
     /// can leave this empty when the operating system does not expose socket
     /// ownership; inbound and test callers can still provide it explicitly.
@@ -326,12 +339,17 @@ impl FlowContext {
             lists: Vec::new(),
             resolver: None,
             geo: None,
+            hosts: None,
             fake_ip: None,
             component: None,
             inbound: None,
             inbound_name: None,
             outbound: None,
             outbound_name: None,
+            tls_server_name: None,
+            http_host: None,
+            interface: None,
+            outbound_geo: None,
             process: None,
             process_id: None,
             user_id: None,
