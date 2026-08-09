@@ -733,7 +733,7 @@ YUHAIIN_CHAIN_PROBE=1 \
 
 另外，`crates/yuhaiin-chain/tests/interop/yuubinsya_go_client.go` 使用 Go 仓库里的真实 `fixed` 和 `yuubinsya` client，由 ignored Rust 集成测试启动 Rust Yuubinsya server，实际验收 TCP、UDP-over-TCP、native authenticated UDP 和 Ping 四条路径。Go 的 Yuubinsya server/client 默认 native UDP packet 不带 SOCKS5 三字节 prefix，因此 Rust runtime 的 Yuubinsya inbound 也使用无 prefix 模式；SOCKS5 UDP association 的 prefix 仍由对应 SOCKS5 boundary 单独启用。
 
-`crates/yuhaiin-chain/tests/interop/websocket_go_client.go` 使用 Go 仓库里的真实 `fixed -> websocket -> http2/v2 -> yuubinsya` client，由 ignored Rust 集成测试启动 Rust WebSocket+HTTP/2 server；测试已在 `GOEXPERIMENT=jsonv2,greenteagc` 下通过。Go 的 WebSocket early-data（`early_data` header）和 subprotocol 不是当前默认链路必需项，已明确留作后续兼容增强。
+`crates/yuhaiin-chain/tests/interop/websocket_go_client.go` 使用 Go 仓库里的真实 `fixed -> websocket -> http2/v2 -> yuubinsya` client，由 ignored Rust 集成测试启动 Rust WebSocket+HTTP/2 server；测试已在 `GOEXPERIMENT=jsonv2,greenteagc` 下通过。2026-08-09 起，Rust WebSocket inbound 兼容 Go 的 `early_data: base64`：握手阶段按 RawStd base64 解码 `Sec-WebSocket-Key`，最多接收 2048 字节并注入后续协议读取流，同时返回 `early_data: true`；该行为已有 tungstenite 握手和分片读取单测。outbound lazy early-data 需要把握手延迟到首个 protocol write，暂留后续；subprotocol 也仍未纳入默认配置路径。
 
 这里的 `CONFIG.json` 只作为用户外部配置读取，密码和 CA 不复制进仓库。当前 `concurrency` 同时限制 bounded CONNECT pipe 容量；Rust 版已经有按 fixed endpoint 的 HTTP/2 pool、多 stream 复用、有 owner flush task 的有界 UOT coalesced writer、application-level drain、peer GOAWAY 观察和连接重建，且已有优雅 drain/session rollover 验收。由于 `h2 0.4` 的公开 client API 不提供主动发送 GOAWAY frame，Rust 版接受将 client-side GOAWAY 作为非阻塞延期，不调用私有 API 或引入 raw frame hack；当前关闭策略已满足使用需求，未来只有升级到公开支持该能力的 h2 API 才重新评估主动 GOAWAY。
 

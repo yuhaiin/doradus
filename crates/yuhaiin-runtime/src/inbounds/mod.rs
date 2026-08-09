@@ -14,6 +14,8 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+#[cfg(feature = "websocket")]
+use base64::Engine as _;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
@@ -1038,16 +1040,48 @@ async fn serve_listener(
 }
 
 #[cfg(feature = "websocket")]
-async fn accept_websocket_stream<S>(stream: S) -> Result<crate::proxy::websocket::WebSocketIo<S>>
+async fn accept_websocket_stream<S>(
+    stream: S,
+) -> Result<(crate::proxy::websocket::WebSocketIo<S>, Vec<u8>)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let websocket = tokio_tungstenite::accept_async(stream)
-        .await
-        .map_err(|error| {
-            Error::new(ErrorKind::Protocol, format!("WebSocket handshake: {error}"))
-        })?;
-    Ok(crate::proxy::websocket::WebSocketIo::new(websocket))
+    let mut early_data = Vec::new();
+    let websocket = tokio_tungstenite::accept_hdr_async(
+        stream,
+        |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+         mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            let wants_early_data = request
+                .headers()
+                .get("early_data")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.eq_ignore_ascii_case("base64"));
+            if wants_early_data {
+                if let Some(key) = request.headers().get("Sec-WebSocket-Key") {
+                    if let Ok(decoded) =
+                        base64::engine::general_purpose::STANDARD_NO_PAD.decode(key.as_bytes())
+                    {
+                        if decoded.len() <= 2048 {
+                            early_data = decoded;
+                            response.headers_mut().insert(
+                                "early_data",
+                                tokio_tungstenite::tungstenite::http::HeaderValue::from_static(
+                                    "true",
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(response)
+        },
+    )
+    .await
+    .map_err(|error| Error::new(ErrorKind::Protocol, format!("WebSocket handshake: {error}")))?;
+    Ok((
+        crate::proxy::websocket::WebSocketIo::new(websocket),
+        early_data,
+    ))
 }
 
 #[cfg(all(feature = "websocket", feature = "http2"))]
@@ -1086,7 +1120,8 @@ async fn serve_websocket_h2_listener(
                     let _ = tls_acceptor;
                     stream
                 };
-                let stream = accept_websocket_stream(stream).await?;
+                let (stream, early_data) = accept_websocket_stream(stream).await?;
+                let stream = PrefixedIo::new(early_data, stream);
                 serve_h2_connection(stream, peer, spec, selector, monitor).await
             }
             .await;
@@ -1159,7 +1194,8 @@ async fn serve_websocket_stream<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let stream = accept_websocket_stream(stream).await?;
+    let (stream, early_data) = accept_websocket_stream(stream).await?;
+    let stream = PrefixedIo::new(early_data, stream);
     serve_connection(stream, peer, protocol, spec, selector, monitor).await
 }
 
@@ -1204,10 +1240,7 @@ where
         .read_exact(&mut first)
         .await
         .map_err(crate::proxy::common::io_error)?;
-    let stream = PrefixedIo {
-        prefix: Some(first[0]),
-        inner: stream,
-    };
+    let stream = PrefixedIo::new(vec![first[0]], stream);
     if first[0] == 4 {
         crate::proxy::socks4a::serve(stream, peer, spec, selector, monitor).await
     } else if first[0] == 5 {
@@ -1222,8 +1255,19 @@ where
 /// protocol detection separate from SOCKS5/HTTP framing and preserves writes
 /// on the original stream.
 struct PrefixedIo<S> {
-    prefix: Option<u8>,
+    prefix: Vec<u8>,
+    prefix_offset: usize,
     inner: S,
+}
+
+impl<S> PrefixedIo<S> {
+    fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix,
+            prefix_offset: 0,
+            inner,
+        }
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for PrefixedIo<S> {
@@ -1232,14 +1276,14 @@ impl<S: AsyncRead + Unpin> AsyncRead for PrefixedIo<S> {
         cx: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        if let Some(prefix) = self.prefix.take() {
-            if buffer.remaining() > 0 {
-                buffer.put_slice(&[prefix]);
-                return Poll::Ready(Ok(()));
-            }
-            self.prefix = Some(prefix);
+        let this = self.as_mut().get_mut();
+        if this.prefix_offset < this.prefix.len() && buffer.remaining() > 0 {
+            let count = (this.prefix.len() - this.prefix_offset).min(buffer.remaining());
+            buffer.put_slice(&this.prefix[this.prefix_offset..this.prefix_offset + count]);
+            this.prefix_offset += count;
+            return Poll::Ready(Ok(()));
         }
-        Pin::new(&mut self.inner).poll_read(cx, buffer)
+        Pin::new(&mut this.inner).poll_read(cx, buffer)
     }
 }
 
@@ -1269,6 +1313,8 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpStream, UdpSocket};
+    #[cfg(feature = "websocket")]
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
 
     use super::*;
     use crate::{RuntimeBuilder, RuntimeController};
@@ -1354,6 +1400,50 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             .await
             .unwrap();
         (selector, controller.monitor())
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_inbound_preserves_go_early_data_prefix() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (stream, early_data) = accept_websocket_stream(stream).await.unwrap();
+            assert_eq!(early_data, b"early-data");
+            let mut stream = PrefixedIo::new(early_data, stream);
+            let mut received = vec![0u8; b"early-dataafter".len()];
+            stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, b"early-dataafter");
+        });
+
+        let raw = TcpStream::connect(address).await.unwrap();
+        let mut request = format!("ws://{address}/proxy")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Key",
+            HeaderValue::from_static("ZWFybHktZGF0YQ"),
+        );
+        request
+            .headers_mut()
+            .insert("early_data", HeaderValue::from_static("base64"));
+        let (mut websocket, response) =
+            tokio_tungstenite::client_async(request, raw).await.unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get("early_data")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        websocket
+            .send(tokio_tungstenite::tungstenite::Message::binary(
+                b"after".to_vec(),
+            ))
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 
     async fn echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
