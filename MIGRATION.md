@@ -1926,4 +1926,26 @@ SOCKS5 greeting/request(UDP ASSOCIATE)
 `scripts/integration/socks5-udp-associate.sh` 与 `make socks5-udp-associate-smoke` 已在
 host-network Debian testing Podman 中通过，并且断言 inbound metadata 与 `outbound=direct`。
 构建和运行日志位于 `~/.cache/yuhaiin-rust/integration/socks5-udp-associate`，没有使用
-`/tmp`。当前只剩 node latency 的 DNS/UDP 网络 fixture 在该组 checklist 中。
+`/tmp`。node latency 的 DNS/UDP API fixture 见下节；其余更复杂 outbound/重试场景仍在
+checklist 的增强项中。
+
+## 51. 2026-08-10 node latency DNS/UDP API chain smoke
+
+为验证 latency API 不只是调用底层 probe 的 mock，新增
+`direct_node_latency_dns_uses_the_selected_proxy_datagram`：测试保存一个 direct node，
+通过 snapshot 的 `build_proxy` 取得选中的 outbound，再调用 `node_latency_value` 的 DNS
+分支；本地 UDP server 解码并回写真实 DNS transaction，响应必须为成功。
+
+`scripts/integration/node-latency-dns.sh` 和 `make node-latency-dns-smoke` 在 host-network
+Debian testing Podman 中执行同一测试，日志位于
+`~/.cache/yuhaiin-rust/integration/node-latency-dns`，没有使用 `/tmp`。
+
+实际执行结果：
+
+```text
+test api::tests::direct_node_latency_dns_uses_the_selected_proxy_datagram ... ok
+[node-latency-dns] passed
+```
+
+这补齐了当前 checklist 中 node latency 的基础 DNS/UDP 网络闭环；更复杂 outbound、失败
+重试和长生命周期统计仍属于后续增强项。

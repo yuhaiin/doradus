@@ -49,6 +49,10 @@ The current scenarios cover:
   handshake, UDP ASSOCIATE, UDP echo, shared direct outbound and monitor
   assertion in a host-network Podman container. It keeps logs under
   `~/.cache/yuhaiin-rust/integration/socks5-udp-associate`.
+- `scripts/integration/node-latency-dns.sh` saves a direct node through the
+  API-layer fixture, invokes `node_latency` with a real UDP DNS server, and
+  checks the selected proxy datagram path and DNS transaction in Podman. Logs
+  are kept under `~/.cache/yuhaiin-rust/integration/node-latency-dns`.
 - standalone Go HTTP/2 transport wire compatibility is covered separately in
   `crates/yuhaiin-chain/tests/standalone_http2.rs`: fixed endpoint resolution,
   plaintext prior-knowledge H2, `CONNECT http://localhost`, raw bidirectional

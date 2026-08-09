@@ -3779,7 +3779,9 @@ mod tests {
     use base64::Engine;
     use http_body_util::BodyExt;
     use std::sync::Arc;
+    use tokio::net::UdpSocket;
     use tower::ServiceExt;
+    use yuhaiin_core::dns::{DnsResponse, encode_response};
     use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
     use yuhaiin_store::ConfigStore;
 
@@ -4152,6 +4154,62 @@ mod tests {
             response.0
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_node_latency_dns_uses_the_selected_proxy_datagram() {
+        let state = state().await;
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut query = [0u8; 4096];
+            let (length, peer) = server.recv_from(&mut query).await.unwrap();
+            let response = encode_response(
+                &query[..length],
+                &DnsResponse {
+                    addresses: yuhaiin_core::IpSet {
+                        v4: vec!["192.0.2.77".parse().unwrap()],
+                        v6: Vec::new(),
+                    },
+                    ptr_names: Vec::new(),
+                    service_bindings: Vec::new(),
+                    minimum_ttl: Some(30),
+                },
+            )
+            .unwrap();
+            server.send_to(&response, peer).await.unwrap();
+        });
+
+        let _ = save_node_value(
+            &state,
+            json!({
+                "id": "direct-dns-latency",
+                "name": "Direct DNS latency",
+                "enabled": true,
+                "chain": [{"type":"direct","direct":{}}]
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = node_latency_value(
+            &state,
+            &json!({
+                "id": "direct-dns-latency",
+                "type": "dns",
+                "host": address.to_string(),
+                "targetDomain": "example.com"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.0["ok"], true,
+            "DNS latency response: {}",
+            response.0
+        );
+        server_task.await.unwrap();
     }
 
     #[tokio::test]
