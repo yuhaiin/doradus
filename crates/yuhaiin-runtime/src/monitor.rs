@@ -31,6 +31,8 @@ use crate::RuntimeLog;
 const HISTORY_LIMIT: usize = 2048;
 const BUCKET_LIMIT: usize = 90 * 24 * 60;
 const GO_STATISTICS_PROJECTION_INTERVAL: Duration = Duration::from_secs(30);
+const GO_STATISTICS_PROJECTION_RETRY_INITIAL: Duration = Duration::from_secs(2);
+const GO_STATISTICS_PROJECTION_RETRY_MAX: Duration = Duration::from_secs(60);
 const PERSISTENCE_KEY: &str = "statistics.runtime";
 const PERSISTENCE_VERSION: u32 = 1;
 
@@ -263,6 +265,8 @@ impl ConnectionMonitor {
             let mut interval = tokio::time::interval(Duration::from_secs(2));
             let mut last_go_projection = Instant::now();
             let mut project_go_statistics = true;
+            let mut next_go_projection = Instant::now();
+            let mut projection_backoff = GO_STATISTICS_PROJECTION_RETRY_INITIAL;
             loop {
                 tokio::select! {
                     _ = worker_persistence.dirty.notified() => {},
@@ -280,8 +284,10 @@ impl ConnectionMonitor {
                         .put_config(PERSISTENCE_KEY, &bytes)
                         .await
                         .is_ok();
+                    let projection_due =
+                        project_go_statistics && Instant::now() >= next_go_projection;
                     if checkpoint_written
-                        && (project_go_statistics
+                        && (projection_due
                             || last_go_projection.elapsed() >= GO_STATISTICS_PROJECTION_INTERVAL)
                     {
                         // Keep the compact checkpoint as the crash-recovery
@@ -295,6 +301,13 @@ impl ConnectionMonitor {
                         {
                             last_go_projection = Instant::now();
                             project_go_statistics = false;
+                            next_go_projection =
+                                last_go_projection + GO_STATISTICS_PROJECTION_INTERVAL;
+                            projection_backoff = GO_STATISTICS_PROJECTION_RETRY_INITIAL;
+                        } else {
+                            project_go_statistics = true;
+                            next_go_projection = Instant::now() + projection_backoff;
+                            projection_backoff = next_projection_backoff(projection_backoff);
                         }
                     }
                 }
@@ -315,14 +328,19 @@ impl ConnectionMonitor {
         };
         let worker = persistence.worker.lock().await.take();
         let _ = persistence.shutdown.send(true);
-        self.persist_now().await?;
-        if let Some(worker) = worker {
-            worker.await.map_err(|error| {
+        let worker_error = if let Some(worker) = worker {
+            worker.await.err().map(|error| {
                 yuhaiin_core::Error::new(
                     yuhaiin_core::ErrorKind::Storage,
                     format!("statistics persistence task: {error}"),
                 )
-            })?;
+            })
+        } else {
+            None
+        };
+        self.persist_now().await?;
+        if let Some(error) = worker_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -1275,6 +1293,12 @@ fn route_mode(mode: RouteMode) -> &'static str {
     }
 }
 
+fn next_projection_backoff(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .min(GO_STATISTICS_PROJECTION_RETRY_MAX)
+}
+
 fn unix_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1512,6 +1536,22 @@ mod tests {
         assert_eq!(value["items"][1]["start"], "2024-02-01T00:00:00Z");
         assert_eq!(value["items"][1]["upload"], "17");
         assert_eq!(value["items"][2]["start"], "2024-03-01T00:00:00Z");
+    }
+
+    #[test]
+    fn go_statistics_projection_backoff_is_bounded_and_doubles() {
+        assert_eq!(
+            next_projection_backoff(GO_STATISTICS_PROJECTION_RETRY_INITIAL),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            next_projection_backoff(Duration::from_secs(32)),
+            GO_STATISTICS_PROJECTION_RETRY_MAX
+        );
+        assert_eq!(
+            next_projection_backoff(GO_STATISTICS_PROJECTION_RETRY_MAX),
+            GO_STATISTICS_PROJECTION_RETRY_MAX
+        );
     }
 
     #[test]

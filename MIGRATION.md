@@ -1431,3 +1431,9 @@ cargo test -p yuhaiin-protocol --tests --offline -- --ignored --nocapture
 同时对照 Go `pkg/net/dns/server/server.go` 确认：Go 的本地 DNS server 只监听配置地址上的 UDP 和 TCP；DoH/DoH3 是 resolver 的上游 transport，并不是本地管理 server endpoint。Rust 因此保持同一边界：`resolver.server` 管理本地 UDP/TCP listener，DoH/HTTP2 位于 resolver client factory；checklist 不再把不存在于 Go 的本地 DoH listener 当作未完成项。
 
 另外以 `yuhaiin-react/src/api/generated.ts` 的 88 个 RPC operation 和 legacy route 为基准做了静态逐项核对：Rust RPC switch 覆盖全部前端可通过 `requestJSON` 调用的 operation；`connections.events`、`tools.logs` 两个流式 operation 按 Go contract 走直接 SSE route，不应被误判为普通 JSON RPC 缺失。Rust 额外保留的 `tun.config.*` 是旧管理面兼容入口，不改变前端已有 operation。connections 的 `network` 对象、历史/失败历史字段以及 traffic 的 UTC 日历聚合已加入 Rust 单测；剩余工作仍是完整响应字段和真实生产数据的逐项快照核对，不把“路径存在”当作 schema 已完全等价。
+
+## 18. 2026-08-09 statistics projection backoff
+
+统计 checkpoint 与 Go 兼容表投影现在分离处理：checkpoint 仍由 persistence worker 高频写入，用于异常退出恢复；Go `statistics_*`、traffic、history 和 telemetry 表继续按首次成功及 30 秒间隔低频投影。若 SQLite 被 Go 进程或其他 writer 锁住，投影重试由 2 秒起按指数退避，最大 60 秒，成功后恢复 30 秒周期，避免锁竞争期间每个 dirty 事件都发起写事务。
+
+正常 shutdown 先通知并等待 persistence worker 结束，再执行最终 checkpoint/Go projection；因此最终 flush 不会与尚未完成的后台写事务并发，也能在 worker 异常时继续尝试最终持久化。`monitor` 的 180 个 runtime 单测已通过，新增退避倍增与封顶边界回归。
