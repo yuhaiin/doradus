@@ -5214,6 +5214,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_generated_frontend_rpc_operation_has_a_route() {
+        // Keep this inventory synchronized with yuhaiin-react/src/api/generated.ts.
+        // connections.events is intentionally excluded: it is a GET/SSE
+        // endpoint. tools.logs and tools.logs.v2 also have GET/SSE aliases,
+        // but their JSON-RPC routes remain part of this inventory.
+        const OPERATIONS: &[&str] = &[
+            "backup.config.get",
+            "backup.config.put",
+            "backup.restore",
+            "backup.run",
+            "connections",
+            "connections.close",
+            "connections.failed_history",
+            "connections.history",
+            "connections.telemetry",
+            "connections.total",
+            "connections.traffic",
+            "inbound.delete",
+            "inbound.get",
+            "inbound.put",
+            "inbounds.config.get",
+            "inbounds.config.put",
+            "inbounds.get",
+            "inbounds.post",
+            "info",
+            "node.close",
+            "node.delete",
+            "node.get",
+            "node.latency",
+            "node.put",
+            "node.use",
+            "nodes.active",
+            "nodes.get",
+            "nodes.post",
+            "nodes.selected",
+            "publish.delete",
+            "publish.put",
+            "publish.resolve",
+            "publishes",
+            "resolver.delete",
+            "resolver.fakedns.get",
+            "resolver.fakedns.put",
+            "resolver.get",
+            "resolver.hosts.get",
+            "resolver.hosts.put",
+            "resolver.put",
+            "resolver.server.get",
+            "resolver.server.put",
+            "resolvers.get",
+            "resolvers.post",
+            "route.activation",
+            "route.apply",
+            "route.config.get",
+            "route.config.put",
+            "route.list.delete",
+            "route.list.get",
+            "route.list.put",
+            "route.lists.activation",
+            "route.lists.config.get",
+            "route.lists.config.put",
+            "route.lists.get",
+            "route.lists.post",
+            "route.lists.refresh",
+            "route.rule.delete",
+            "route.rule.get",
+            "route.rule.put",
+            "route.rules.block_history",
+            "route.rules.get",
+            "route.rules.post",
+            "route.rules.priority",
+            "route.rules.test",
+            "route.tag.delete",
+            "route.tag.put",
+            "route.tags.get",
+            "settings.get",
+            "settings.put",
+            "subscriptions.delete",
+            "subscriptions.delete_preview",
+            "subscriptions.get",
+            "subscriptions.put",
+            "subscriptions.update",
+            "tools.interfaces",
+            "tools.licenses",
+            "tools.logs",
+            "tools.logs.v2",
+            "update.apply",
+            "update.check",
+            "update.status",
+            "user.delete",
+            "user.get",
+            "user.put",
+            "users.get",
+            "users.post",
+        ];
+        assert_eq!(OPERATIONS.len(), 87);
+
+        let app = router(state().await);
+        for operation in OPERATIONS {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(format!("/api/v2/rpc/{operation}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "generated frontend operation {operation} is not routed",
+            );
+        }
+
+        for (path, expected_content_type) in [
+            ("/api/v2/connections/events", "text/event-stream"),
+            ("/api/v2/tools/logs", "text/event-stream"),
+            ("/api/v2/tools/logs/v2", "text/event-stream"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "SSE route {path}");
+            assert_eq!(response.headers()["content-type"], expected_content_type);
+        }
+    }
+
+    #[tokio::test]
     async fn management_auth_matches_go_basic_and_eventsource_query_token() {
         let state = state().await.with_auth("alice", "secret");
         let app = router(state);
