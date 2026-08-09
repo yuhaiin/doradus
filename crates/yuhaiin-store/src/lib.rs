@@ -225,6 +225,37 @@ pub struct GoDnsSettingsRecord {
     pub fakedns_ipv6_range: String,
 }
 
+/// Settings shared by every inbound owner (TUN, SOCKS5, HTTP proxy and
+/// Yuubinsya).  The JSON names are the frontend contract; the serde aliases
+/// also let older Rust overlays use the Go/SQLite snake_case spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboundSettings {
+    #[serde(rename = "hijackDns", alias = "hijack_dns", default = "default_true")]
+    pub hijack_dns: bool,
+    #[serde(
+        rename = "hijackDnsFakeIp",
+        alias = "hijack_dns_fakeip",
+        default = "default_true"
+    )]
+    pub hijack_dns_fakeip: bool,
+    #[serde(rename = "sniff", alias = "sniff_enabled", default = "default_true")]
+    pub sniff: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for InboundSettings {
+    fn default() -> Self {
+        Self {
+            hijack_dns: true,
+            hijack_dns_fakeip: true,
+            sniff: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoDnsFakednsListRecord {
     pub kind: String,

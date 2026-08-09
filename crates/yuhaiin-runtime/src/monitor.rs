@@ -7,6 +7,7 @@
 //! waits for an HTTP/SSE consumer.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -137,6 +138,7 @@ struct PersistedMonitor {
 #[derive(Clone)]
 pub struct ConnectionMonitor {
     state: Arc<Mutex<MonitorState>>,
+    sniff_enabled: Arc<AtomicBool>,
     events: broadcast::Sender<MonitorEvent>,
     close_events: broadcast::Sender<TunFlowKey>,
     logs: RuntimeLog,
@@ -155,11 +157,23 @@ impl ConnectionMonitor {
         let (close_events, _) = broadcast::channel(256);
         Self {
             state: Arc::new(Mutex::new(MonitorState::default())),
+            sniff_enabled: Arc::new(AtomicBool::new(true)),
             events,
             close_events,
             logs: RuntimeLog::new(),
             persistence: None,
         }
+    }
+
+    /// Whether generic stream relays should spend a bounded read waiting for
+    /// TLS/HTTP metadata. Explicit protocol handlers may still attach their
+    /// own metadata; this switch controls only the common inbound path.
+    pub fn sniff_enabled(&self) -> bool {
+        self.sniff_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_sniff_enabled(&self, enabled: bool) {
+        self.sniff_enabled.store(enabled, Ordering::Release);
     }
 
     /// Load durable totals/history from the same SQLite store as the

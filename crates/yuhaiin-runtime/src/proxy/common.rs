@@ -140,7 +140,11 @@ where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let sniffed = sniff_stream(&mut left).await;
+    let sniffed = if monitor.sniff_enabled() {
+        sniff_stream(&mut left).await
+    } else {
+        Vec::new()
+    };
     let metadata = yuhaiin_core::sniff::inspect(&sniffed);
     if context.tls_server_name.is_none() {
         context.tls_server_name = metadata.tls_server_name;
@@ -339,6 +343,43 @@ mod tests {
         assert_eq!(received, b"ping");
         remote.shutdown().await.unwrap();
         client.read_to_end(&mut Vec::new()).await.unwrap();
+        relay.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_skips_sniff_wait_and_metadata_when_disabled() {
+        let (mut client, relay_left) = duplex(4096);
+        let (relay_right, mut remote) = duplex(4096);
+        let monitor = Arc::new(ConnectionMonitor::new());
+        monitor.set_sniff_enabled(false);
+        let flow = TunFlowKey {
+            network: Network::Tcp,
+            source: "127.0.0.1:41004".parse().unwrap(),
+            destination: "127.0.0.1:41005".parse().unwrap(),
+        };
+        let context = FlowContext::new(Endpoint::ip(Network::Tcp, flow.destination));
+        let relay = tokio::spawn(relay_counted(
+            relay_left,
+            relay_right,
+            flow,
+            context,
+            monitor.clone(),
+        ));
+        let request = b"GET / HTTP/1.1\r\nHost: no-sniff.example\r\n\r\n";
+        client.write_all(request).await.unwrap();
+        let mut received = vec![0; request.len()];
+        tokio::time::timeout(Duration::from_millis(20), remote.read_exact(&mut received))
+            .await
+            .expect("disabled sniff must not wait for its deadline")
+            .unwrap();
+        assert_eq!(received, request);
+        assert_ne!(
+            monitor.connections_value()["connections"][0]["httpHost"],
+            "no-sniff.example"
+        );
+
+        client.shutdown().await.unwrap();
+        remote.shutdown().await.unwrap();
         relay.await.unwrap().unwrap();
     }
 }

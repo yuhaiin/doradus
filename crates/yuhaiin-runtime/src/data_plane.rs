@@ -362,6 +362,17 @@ pub async fn run_tun_device_until_ref(
         Some(proxy_id) if !proxy_id.trim().is_empty() => proxy_id,
         _ => crate::inbound::selected_proxy_id(&controller).await?,
     };
+    let snapshot = controller.handle().load();
+    let async_dns_handler = snapshot.inbound_settings.hijack_dns.then(|| {
+        Arc::new(RuntimeDnsHandler {
+            resolver: if snapshot.inbound_settings.hijack_dns_fakeip {
+                snapshot.resolver.clone()
+            } else {
+                snapshot.dns_resolver.clone()
+            },
+            fakeip: snapshot.fakeip.clone(),
+        }) as Arc<dyn yuhaiin_core::dns::AsyncDnsHandler>
+    });
     let mut proxy_runtime = controller
         .build_tun_proxy_runtime_with_dns(
             &config.direct_id,
@@ -370,10 +381,7 @@ pub async fn run_tun_device_until_ref(
             &config.drop_id,
             Duration::from_secs(30),
             config.channel_capacity,
-            Some(Arc::new(RuntimeDnsHandler {
-                resolver: controller.handle().load().resolver.clone(),
-                fakeip: controller.handle().load().fakeip.clone(),
-            })),
+            async_dns_handler,
         )
         .await?;
     let mut dispatcher = yuhaiin_core::tun::TunDispatcher::new(64 * 1024, 64 * 1024, 2048)?;

@@ -1360,3 +1360,14 @@ reverse mapping、allocation/reuse、reverse lookup、translated rebind 和回�
 10. 配置：修改 route/DNS/proxy/TUN/MaxMindDB 设置后，SQLite transaction 原子提交，重启后配置与 runtime snapshot 一致。
 
 这十个场景全部通过后，才把 Rust backend 作为默认数据面；在此之前不要用“能够连通一个网站”作为迁移完成标准。
+
+## 16. 2026-08-09 inbound settings compatibility
+
+Go 的 `pkg/store/inbound_settings.go` 和 `pkg/httpapi/v2.go` 定义了前端不变的三项设置：`hijackDns`、`hijackDnsFakeIp`、`sniff`，空配置默认均为 `true`。Rust 现在使用共享的 `yuhaiin_store::InboundSettings`，避免 API、存储和 runtime 各自维护 DTO：
+
+- 有 Go `inbound_settings(id=1)` 表时，读取/写入原表，保留真实 Go 数据库的可见性；没有该表时，使用 `yuhaiin_config` 的 `inbounds.config` JSON overlay。
+- `RuntimeBuilder` 将设置放进不可变 `RuntimeSnapshot`；`inbounds.config` PUT 通过 `RuntimeController::mutate_and_reload` 提交，失败时保留旧 snapshot。
+- TUN inbound 在 `hijackDns=false` 时不安装异步 DNS handler，53 端口回到普通代理链；`hijackDnsFakeIp=false` 时使用未包 FakeIP 的 DNS resolver；`sniff=false` 时公共 TCP relay 不等待首包嗅探。
+- `ConnectionMonitor` 的 sniff 开关随成功 reload 原子更新，因此 SOCKS5、HTTP proxy、Yuubinsya 等共用 relay 的行为一致。
+
+本次新增 store legacy/overlay、runtime snapshot、API reload 和 disabled-sniff relay 单测；当前明确剩余项是 socket inbound 的 TCP/UDP DNS 原始包拦截，它已记录在 `IMPLEMENTATION_CHECKLIST.md`，不伪装为完成。

@@ -34,7 +34,7 @@ use yuhaiin_geo::{GeoDatabaseManager, GeoDownloadTransport, GeoRefreshRequest};
 
 use yuhaiin_store::{
     GoInboundRecord, GoNodeRecord, GoResolverRecord, GoRouteListRecord, GoRouteRuleRecord,
-    GoRouteSettingsRecord, GoSubscriptionLinkRecord, MaxMindMetadataRecord,
+    GoRouteSettingsRecord, GoSubscriptionLinkRecord, InboundSettings, MaxMindMetadataRecord,
 };
 
 use crate::update::UpdateService;
@@ -571,10 +571,8 @@ async fn rpc(
         "node.use" => select_node_value(&state, required_string(&body, "id")?).await,
         "node.close" => node_close_value(&state, required_string(&body, "id")?).await,
         "node.latency" => node_latency_value(&state, &body).await,
-        "inbounds.config.get" => {
-            read_config_json(&state, "inbounds.config", default_inbound_config()).await
-        }
-        "inbounds.config.put" => write_config_json(&state, "inbounds.config", body).await,
+        "inbounds.config.get" => inbounds_config_get_value(&state).await,
+        "inbounds.config.put" => inbounds_config_put_value(&state, body).await,
         "inbounds.get" => inbounds_get_value(&state, &body).await,
         "inbounds.post" => save_inbound_value(&state, body, None).await,
         "inbound.get" => get_inbound_value(&state, required_string(&body, "id")?).await,
@@ -1019,11 +1017,33 @@ async fn publish_resolve(
 }
 
 async fn inbounds_config_get(State(state): State<ApiState>) -> ApiResult {
-    read_config_json(&state, "inbounds.config", default_inbound_config()).await
+    inbounds_config_get_value(&state).await
 }
 
 async fn inbounds_config_put(State(state): State<ApiState>, Json(value): Json<Value>) -> ApiResult {
-    write_config_json(&state, "inbounds.config", value).await
+    inbounds_config_put_value(&state, value).await
+}
+
+async fn inbounds_config_get_value(state: &ApiState) -> ApiResult {
+    let settings = state
+        .controller
+        .store()
+        .repository()
+        .get_inbound_settings()
+        .await?;
+    json_value(serde_json::to_value(settings)?)
+}
+
+async fn inbounds_config_put_value(state: &ApiState, value: Value) -> ApiResult {
+    let settings: InboundSettings = serde_json::from_value(value)
+        .map_err(|error| ApiError::bad(format!("invalid inbound settings: {error}")))?;
+    state
+        .controller
+        .mutate_and_reload(move |store| async move {
+            store.repository().put_inbound_settings(settings).await
+        })
+        .await?;
+    json_value(serde_json::to_value(settings)?)
 }
 
 async fn users_get(State(state): State<ApiState>, Query(query): Query<ListQuery>) -> ApiResult {
@@ -2969,9 +2989,6 @@ fn default_settings() -> Value {
     }
     value
 }
-fn default_inbound_config() -> Value {
-    json!({"port":0,"bind":"127.0.0.1"})
-}
 fn default_route_list_config() -> Value {
     json!({"refreshInterval":"0","lastRefreshTime":"0","error":"","hostIndexDisk":false,"maxMindDbGeoIp":{"downloadUrl":"","error":""}})
 }
@@ -3066,6 +3083,66 @@ mod tests {
             .unwrap();
         assert_eq!(listed.0["items"][0]["chain"][0]["type"], "direct");
         assert_eq!(state.controller.handle().revision(), 1);
+    }
+
+    #[tokio::test]
+    async fn inbound_config_uses_go_shape_and_reload_updates_sniff_policy() {
+        let state = state().await;
+        let app = router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v2/inbounds/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let initial: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(initial["hijackDns"], true);
+        assert_eq!(initial["hijackDnsFakeIp"], true);
+        assert_eq!(initial["sniff"], true);
+
+        let response = app
+            .oneshot(
+                Request::put("/api/v2/inbounds/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"hijackDns":false,"hijackDnsFakeIp":false,"sniff":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!state.controller.handle().load().inbound_settings.hijack_dns);
+        assert!(
+            !state
+                .controller
+                .handle()
+                .load()
+                .inbound_settings
+                .hijack_dns_fakeip
+        );
+        assert!(!state.controller.monitor().sniff_enabled());
+        let saved = state
+            .controller
+            .store()
+            .repository()
+            .get_inbound_settings()
+            .await
+            .unwrap();
+        assert_eq!(
+            saved,
+            InboundSettings {
+                hijack_dns: false,
+                hijack_dns_fakeip: false,
+                sniff: false,
+            }
+        );
     }
 
     #[tokio::test]
@@ -3492,7 +3569,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         for (uri, body) in [
-            ("/api/v2/inbounds/config", r#"{"port":8188}"#),
+            (
+                "/api/v2/inbounds/config",
+                r#"{"hijackDns":true,"hijackDnsFakeIp":true,"sniff":true}"#,
+            ),
             ("/api/v2/route/lists/config", r#"{"refreshInterval":"1h"}"#),
             (
                 "/api/v2/route/tags/mobile",

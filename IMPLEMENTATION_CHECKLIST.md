@@ -67,7 +67,7 @@ flowchart LR
 | `[x]` | resolver facade | `yuhaiin-core/src/dns*`, `runtime/src/resolver.rs` | system/UDP/TCP、hosts、FakeIP、IPv4/IPv6 policy、按 route 选择 resolver、query fallback |
 | `[x]` | UDP/TCP | `dns_udp_async.rs`, `dns_tcp_async.rs`, runtime DNS supervisor | 纯 Tokio client/server、RFC1035 TCP fallback、多连接、同地址 UDP+TCP listener、owner cancellation |
 | `[x]` | DoH/DoT client | `runtime::{doh_tls,dot_tls,resolver}.rs` | RustCrypto TLS、HTTP/2 DoH、DoT length-prefix、可注入 proxy/bootstrap connector |
-| `[x]` | DNS/TUN 闭环 | `RuntimeDnsHandler`, TUN dispatcher | DNS hijack、FakeIP response、原始 transaction 回写、超时和取消回收 |
+| `[~]` | DNS/TUN/Inbound 闭环 | `RuntimeDnsHandler`, TUN dispatcher, `inbound_settings` | TUN 已按 `hijackDns`/`hijackDnsFakeIp` 选择接管和 FakeIP；公共 TCP relay 已按 `sniff` 开关工作；socket inbound 的 TCP/UDP DNS 原始包拦截仍待接入 |
 | `[x]` | DNS 上游 interface policy | resolver factories | UDP/TCP、RustCrypto DoH/DoT direct dialer 接受和 outbound 相同的 source-address policy；自定义 factory 保持默认兼容，selector reload 会重建 resolver |
 | `[x]` | Go 空配置启动基线 | `RuntimeSettings`, `runtime::defaults`, `data_plane::configured_dns_server`, `api::default_settings` | 无持久 settings 时对齐 Go 的 IPv6、HTTP system proxy、debug/save 日志默认值；无 DNS row/overlay 时默认监听 `127.0.0.1:5353`；真正空库首次构建时幂等写入 mixed/TUN/yuubinsya、bootstrap resolver、LAN route/list；API 与运行时共用同一默认对象 | 真实生产库的更多部分/异常快照继续补 fixture；删除默认项后不自动恢复 |
 | `延期` | DoQ / DoH3 | — | 使用量低，等纯 Rust QUIC/HTTP3 方案稳定后再加入；不阻塞当前替换 |
@@ -111,6 +111,7 @@ flowchart LR
 | 状态 | 功能 | 当前结果 | 剩余工作 |
 | --- | --- | --- | --- |
 | `[x]` | inbound → router → outbound | HTTP/SOCKS5/SOCKS4A/Trojan/VLESS/Yuubinsya/TUN 都走共享 FlowContext 和 selector；有真实 loopback relay 回归 | 继续增加 Go fixture，不改变主链路 |
+| `[~]` | inbound settings | `store::InboundSettings`, `RuntimeSnapshot`, `ConnectionMonitor` | Go legacy `inbound_settings` 与 Rust overlay、前端 API、reload 已统一；`sniff` 已影响公共 relay，DNS 三项在 TUN 已生效；socket inbound DNS hijack 仍待接入 |
 | `[x]` | HTTP/2 pool | fixed endpoint、TLS identity、ALPN、multi-stream/multi-connection、idle/drain、GOAWAY replacement、metrics | h2 公共 API 无法主动发送 client GOAWAY，保持 application-level drain |
 | `[x]` | Yuubinsya reliability | migrate ID、coalesce、bounded retry/replay、UOT/native UDP、ping、服务端 demux、TLS/H2 listener | 主动 GOAWAY 同上；继续 Go 低版本 fixture |
 | `[x]` | outbound source interface | `SocketPolicyProxy` 统一覆盖 direct/fixed/HTTP CONNECT/SOCKS5、protocol wrappers、HTTP/2 Yuubinsya、direct UOT 和 native UDP；reload 替换 policy；UDP/TCP/DoH/DoT resolver dialer 也复用同一 source-address policy | inbound listen socket 的平台专用绑定仍需按平台验收 |
@@ -142,7 +143,7 @@ flowchart LR
 
 | 状态 | 功能 | 位置 | 当前结果 | 剩余工作 |
 | --- | --- | --- | --- | --- |
-| `[x]` | 前端 API/RPC | `runtime/src/api.rs` | 对齐现有 generated client；settings、nodes、inbounds、DNS、hosts/FakeDNS、route、TUN、connections 等共用 store/runtime struct |
+| `[x]` | 前端 API/RPC | `runtime/src/api.rs` | 对齐现有 generated client；settings、nodes、inbounds、DNS、hosts/FakeDNS、route、TUN、connections 等共用 store/runtime struct；`inbounds.config` 返回/保存 Go 三项布尔设置并触发原子 reload |
 | `[x]` | live connections | `monitor`, `connections` API/SSE | 建立、更新、关闭、数字 ID close、EventSource added/removed |
 | `[x]` | history/traffic/statistics | `monitor`, SQLite persistence | history、total、traffic flush；正常关闭、SIGTERM、force abort 后读回 |
 | `[x]` | runtime reload | `RuntimeController` | 配置先构建新 snapshot，失败保留旧 snapshot；selector/inbound/DNS 按 owner 收敛 |

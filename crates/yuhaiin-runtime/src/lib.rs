@@ -46,7 +46,8 @@ use yuhaiin_geo::{GeoDatabaseManager, GeoMetadata};
 use yuhaiin_store::fakeip::{FakeIpPool, FakeIpPoolOptions, FakeIpV6Pool};
 use yuhaiin_store::{
     ConfigStore, FakeIpPools, FakeIpResolver, GoProxyRuntimeConfig, GoResolverRuntimeConfig,
-    GoRouteRuleRecord, GoRouteRuntimeConfig, MaxMindMetadataRecord, NatConfigRecord,
+    GoRouteRuleRecord, GoRouteRuntimeConfig, InboundSettings, MaxMindMetadataRecord,
+    NatConfigRecord,
 };
 use yuhaiin_trie::router::{RouteDecision, RouterRuntime};
 
@@ -122,6 +123,8 @@ impl Default for RuntimeBuildOptions {
 #[derive(Clone)]
 pub struct RuntimeSnapshot {
     pub settings: RuntimeSettings,
+    /// Inbound-wide policy shared by TUN and socket-based inbound servers.
+    pub inbound_settings: InboundSettings,
     /// Shared connect budget for the immutable snapshot. New flows acquire
     /// one permit while establishing a TCP proxy connection; reload builds a
     /// new budget without changing existing flows.
@@ -130,6 +133,9 @@ pub struct RuntimeSnapshot {
     /// interface. An empty list preserves the OS default route.
     pub(crate) socket_bind_addresses: Arc<[IpAddr]>,
     pub resolver: Arc<dyn AsyncIpResolver>,
+    /// Resolver without FakeIP transformation, used when DNS hijacking is
+    /// enabled but the `hijackDnsFakeIp` switch is disabled.
+    pub(crate) dns_resolver: Arc<dyn AsyncIpResolver>,
     pub hosts: HostsTable,
     pub fakeip: Option<FakeIpPools>,
     pub resolvers: Vec<GoResolverRuntimeConfig>,
@@ -283,6 +289,7 @@ impl RuntimeBuilder {
         defaults::ensure_go_defaults(&self.store).await?;
         let repository = self.store.repository();
         let settings = RuntimeSettings::load(&self.store).await?;
+        let inbound_settings = repository.get_inbound_settings().await?;
         let socket_bind_addresses =
             Arc::from(interfaces::bind_addresses_for_settings(&settings).into_boxed_slice());
         let nat = repository.get_nat_config_or_default("default").await?;
@@ -347,6 +354,13 @@ impl RuntimeBuilder {
             self.options.fakeip_skip_check_upstream,
             settings.ipv6,
         );
+        let dns_resolver = wrap_resolver(
+            self.upstream.clone(),
+            &hosts,
+            None,
+            self.options.fakeip_skip_check_upstream,
+            settings.ipv6,
+        );
         let mut resolver_by_id = BTreeMap::new();
         let mut resolver_errors = BTreeMap::new();
         let resolver_registry_enabled = self.resolver_factory.is_some();
@@ -387,7 +401,9 @@ impl RuntimeBuilder {
         let connect_semaphore = Arc::new(Semaphore::new(settings.happy_eyeballs_semaphore));
         Ok(RuntimeSnapshot {
             resolver,
+            dns_resolver,
             settings,
+            inbound_settings,
             connect_semaphore,
             socket_bind_addresses,
             hosts,
@@ -649,6 +665,26 @@ mod tests {
         assert!(snapshot.resolver_by_id.is_empty());
     }
 
+    #[test]
+    fn builder_loads_inbound_settings_from_the_frontend_overlay() {
+        let store = block_on(ConfigStore::open_memory()).unwrap();
+        block_on(store.put_config(
+            "inbounds.config",
+            br#"{"hijackDns":true,"hijackDnsFakeIp":false,"sniff":false}"#,
+        ))
+        .unwrap();
+        let snapshot =
+            block_on(RuntimeBuilder::new(store, Arc::new(SystemAsyncIpResolver)).build()).unwrap();
+        assert_eq!(
+            snapshot.inbound_settings,
+            yuhaiin_store::InboundSettings {
+                hijack_dns: true,
+                hijack_dns_fakeip: false,
+                sniff: false,
+            }
+        );
+    }
+
     struct DualStackResolver;
 
     impl AsyncIpResolver for DualStackResolver {
@@ -829,8 +865,10 @@ mod tests {
             connect_semaphore: Arc::new(Semaphore::new(250)),
             socket_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
             resolver: main,
+            dns_resolver: Arc::new(SystemAsyncIpResolver),
             hosts: HostsTable::new(),
             fakeip: None,
+            inbound_settings: yuhaiin_store::InboundSettings::default(),
             resolvers: Vec::new(),
             route: Some(GoRouteRuntimeConfig {
                 direct_resolver: "direct".to_owned(),

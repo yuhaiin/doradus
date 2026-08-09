@@ -339,6 +339,87 @@ impl ConfigRepository {
             .collect()
     }
 
+    fn read_legacy_inbound_settings(&self) -> Result<Option<InboundSettings>> {
+        let connection = self.store.lock_connection()?;
+        if !table_exists(&connection, "inbound_settings") {
+            return Ok(None);
+        }
+        let rows = connection
+            .query(
+                "SELECT hijack_dns, hijack_dns_fakeip, sniff_enabled
+                 FROM inbound_settings WHERE id = 1",
+            )
+            .map_err(storage_error)?;
+        rows.first()
+            .map(|row| {
+                Ok(InboundSettings {
+                    hijack_dns: row_integer(row, 0, "inbound_settings.hijack_dns")? != 0,
+                    hijack_dns_fakeip: row_integer(row, 1, "inbound_settings.hijack_dns_fakeip")?
+                        != 0,
+                    sniff: row_integer(row, 2, "inbound_settings.sniff_enabled")? != 0,
+                })
+            })
+            .transpose()
+    }
+
+    fn has_legacy_inbound_settings(&self) -> Result<bool> {
+        let connection = self.store.lock_connection()?;
+        Ok(table_exists(&connection, "inbound_settings"))
+    }
+
+    /// Load the inbound-wide policy from Go's `inbound_settings` row. Fresh
+    /// Rust stores use the same JSON contract under `inbounds.config`, so the
+    /// frontend and runtime have one source of truth on both database shapes.
+    pub async fn get_inbound_settings(&self) -> Result<InboundSettings> {
+        if let Some(settings) = self.read_legacy_inbound_settings()? {
+            return Ok(settings);
+        }
+
+        let Some(bytes) = self.store.get_config("inbounds.config").await? else {
+            return Ok(InboundSettings::default());
+        };
+        serde_json::from_slice(&bytes)
+            .map_err(|error| Error::invalid(format!("inbounds.config is invalid JSON: {error}")))
+    }
+
+    /// Persist the policy in the native Go row when present, otherwise in
+    /// the Rust config overlay. Existing Go databases are not altered with a
+    /// second competing settings table.
+    pub async fn put_inbound_settings(&self, settings: InboundSettings) -> Result<()> {
+        let has_legacy_table = self.has_legacy_inbound_settings()?;
+        if !has_legacy_table {
+            let bytes = serde_json::to_vec(&settings)
+                .map_err(|error| Error::invalid(format!("encode inbound settings: {error}")))?;
+            return self.store.put_config("inbounds.config", &bytes).await;
+        }
+
+        self.store.with_write_transaction(|connection| {
+            require_go_table(
+                connection,
+                "inbound_settings",
+                &["id", "hijack_dns", "hijack_dns_fakeip", "sniff_enabled"],
+            )?;
+            connection
+                .execute_with_params(
+                    "INSERT INTO inbound_settings(
+                         id, hijack_dns, hijack_dns_fakeip, sniff_enabled
+                     ) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(id) DO UPDATE SET
+                         hijack_dns = excluded.hijack_dns,
+                         hijack_dns_fakeip = excluded.hijack_dns_fakeip,
+                         sniff_enabled = excluded.sniff_enabled",
+                    &[
+                        SqliteValue::from(1_i64),
+                        SqliteValue::from(i64::from(settings.hijack_dns)),
+                        SqliteValue::from(i64::from(settings.hijack_dns_fakeip)),
+                        SqliteValue::from(i64::from(settings.sniff)),
+                    ],
+                )
+                .map_err(storage_error)?;
+            Ok(())
+        })
+    }
+
     /// Update only the Go resolver server field, preserving FakeDNS columns
     /// in `dns_settings`. Fresh Rust stores do not have this compatibility
     /// table and continue using the Rust config overlay.

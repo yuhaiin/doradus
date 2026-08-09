@@ -33,9 +33,11 @@ impl RuntimeController {
     /// Build and publish the initial snapshot before exposing the controller.
     pub async fn from_builder(builder: RuntimeBuilder) -> Result<Self> {
         let builder = Arc::new(builder);
-        let handle = RuntimeHandle::new(builder.build().await?);
+        let initial_snapshot = builder.build().await?;
         let (reload_events, _) = tokio::sync::broadcast::channel(32);
         let monitor = Arc::new(ConnectionMonitor::load_with_store(builder.store().clone()).await?);
+        monitor.set_sniff_enabled(initial_snapshot.inbound_settings.sniff);
+        let handle = RuntimeHandle::new(initial_snapshot);
         Ok(Self {
             builder,
             handle,
@@ -274,6 +276,7 @@ impl RuntimeController {
         for (selector, proxy) in selectors.into_iter().zip(prepared) {
             selector.replace(proxy);
         }
+        self.monitor.set_sniff_enabled(next.inbound_settings.sniff);
         let _ = self.reload_events.send(());
         self.set_reload_error("");
         Ok(next)

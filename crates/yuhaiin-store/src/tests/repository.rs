@@ -92,6 +92,74 @@ fn typed_repository_round_trips_all_runtime_domains() {
 }
 
 #[test]
+fn inbound_settings_use_go_defaults_and_rust_overlay() {
+    let store = block_on(ConfigStore::open_memory()).unwrap();
+    let repository = store.repository();
+    assert_eq!(
+        block_on(repository.get_inbound_settings()).unwrap(),
+        InboundSettings::default()
+    );
+
+    let settings = InboundSettings {
+        hijack_dns: true,
+        hijack_dns_fakeip: false,
+        sniff: false,
+    };
+    block_on(repository.put_inbound_settings(settings)).unwrap();
+    assert_eq!(
+        block_on(repository.get_inbound_settings()).unwrap(),
+        settings
+    );
+    assert_eq!(
+        block_on(store.get_config("inbounds.config")).unwrap(),
+        Some(serde_json::to_vec(&settings).unwrap())
+    );
+}
+
+#[test]
+fn inbound_settings_prefer_and_update_the_legacy_go_row() {
+    let store = block_on(ConfigStore::open_memory()).unwrap();
+    store
+        .with_write_transaction(|connection| {
+            connection
+                .execute_batch(
+                    "CREATE TABLE inbound_settings (
+                         id INTEGER PRIMARY KEY NOT NULL,
+                         hijack_dns INTEGER NOT NULL,
+                         hijack_dns_fakeip INTEGER NOT NULL,
+                         sniff_enabled INTEGER NOT NULL
+                     );
+                     INSERT INTO inbound_settings
+                         (id, hijack_dns, hijack_dns_fakeip, sniff_enabled)
+                     VALUES (1, 0, 1, 0);",
+                )
+                .map_err(storage_error)
+        })
+        .unwrap();
+    let repository = store.repository();
+    assert_eq!(
+        block_on(repository.get_inbound_settings()).unwrap(),
+        InboundSettings {
+            hijack_dns: false,
+            hijack_dns_fakeip: true,
+            sniff: false,
+        }
+    );
+
+    let settings = InboundSettings::default();
+    block_on(repository.put_inbound_settings(settings)).unwrap();
+    assert_eq!(
+        block_on(repository.get_inbound_settings()).unwrap(),
+        settings
+    );
+    assert!(
+        block_on(store.get_config("inbounds.config"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn fresh_store_supports_go_v6_compatibility_writes() {
     let store = block_on(ConfigStore::open_memory()).unwrap();
     let repository = store.repository();
