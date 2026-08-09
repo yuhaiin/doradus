@@ -101,6 +101,7 @@ flowchart LR
 | `[x]` | Yuubinsya UDP-over-TCP | 是 | 是 | `chain::{h2,UOT,direct_uot}` |
 | `[x]` | WebSocket transport | 是 | 是 | `core::websocket`, runtime/protocol |
 | `[x]` | protocol wrappers | inbound/outbound 共用 | inbound/outbound 共用 | `yuhaiin-protocol` |
+| `[x]` | Go inbound protocol aliases / noop | `none` accept-and-close；`mix`、`reverseHttp`、`reverseTcp` 旧 JSON 拼写归一化并保留 section 配置 | 与 Go contract oneof 的兼容字段回归 | `runtime::inbounds::normalize_inbound_protocol` |
 | `[x]` | Go 低频 inbound：`reverse_http` / `reverse_tcp` | 是；目标地址/URL 解析后复用共享 router、outbound、relay 和 monitor | reverse TCP 原始流、reverse HTTP 请求改写/原始流回退均有 loopback 单测；HTTPS target 受 `doh-tls` feature 控制 | 继续补 Go fixture 互操作 |
 | `[~]` | Linux 透明 inbound：`tproxy` / `redir` | TCP 已接入；TPROXY UDP 已接入；redir 按 Go contract 禁用 UDP | Linux TCP 使用 `IP_TRANSPARENT`、`SO_ORIGINAL_DST`/`IP6T_SO_ORIGINAL_DST`，TPROXY UDP 使用原目标 ancillary；仍需 CAP_NET_ADMIN、iptables/nftables 和 Podman 网络命名空间验收；TLS/WS 等透明 transport fail-closed | 用 Podman + TPROXY/REDIRECT 规则做真实 TCP/UDP acceptance，再补权限失败和多 flow 回归 |
 

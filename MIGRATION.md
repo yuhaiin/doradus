@@ -29,6 +29,8 @@
 
 > 2026-08-09 Linux transparent inbound：新增 `yuhaiin-runtime::proxy::transparent`。`tproxy` TCP listener 设置 `IP_TRANSPARENT`，从 accepted socket 的 local address 获取原目标；`redir` TCP 使用 `SO_ORIGINAL_DST`/`IP6T_SO_ORIGINAL_DST`。TPROXY UDP 使用 `IP_ORIGDSTADDR`/`IPV6_ORIGDSTADDR` ancillary 读取原目标，并将每个 peer→destination flow 接入共享 router、proxy selector、monitor 和 close lifecycle；回包用透明 UDP socket 绑定原目标后连接回客户端。Go contract 中 redir 的 UDP 仍保持禁用；TLS/WS 等透明 transport 和真实 iptables/nftables/Podman 流量验收仍未完成。
 
+> 2026-08-09 inbound protocol compatibility：补齐 Go contract 的 `none` noop inbound（接受后关闭，不进入 router），并归一化旧 JSON 中的 `mix`、`reverseHttp`、`reverseTcp` 拼写；section 查找同时兼容旧字段名，避免协议名归一化后丢失认证/目标配置。新增 alias 解析和 noop close 回归。
+
 > 2026-08-09 cross-target boundary：`yuhaiin-core` 的 `async-proxy,tun` 已通过 `aarch64-linux-android` 和 `aarch64-apple-darwin` 的 `cargo check`。在 Android 上使用 `/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang`、对应 `clang++`、`llvm-ar` 和 Cargo linker 后，`yuhaiin-runtime --all-features` 的 `aarch64-linux-android` target check 也通过；bundled SQLite 的 C 编译边界已验证。macOS runtime check 仍需要 macOS SDK/clang，Android VpnService fd、权限和实机生命周期仍未由此命令行检查替代。
 
 > 2026-08-09 update service：补齐 `/api/v2/update/check`、`update.apply`、`update.status` 的真实 Rust 实现。服务按 Go 的 stable/beta/main channel 过滤和排序 GitHub releases，要求目标平台 asset 与 `checksums.txt`，下载时持续更新状态并在 SHA-256 不匹配时删除 staged 文件；临时文件放在 `~/.cache/yuhaiin-rust/updates`，helper 会复制到安装目录后再做替换和 service restart，失败恢复 `.update-backup`。reqwest 使用 rustls no-provider + RustCrypto，`cargo tree` 未发现 ring/OpenSSL/native-tls；网络端点和不同发行版 service manager 仍需现场验收。

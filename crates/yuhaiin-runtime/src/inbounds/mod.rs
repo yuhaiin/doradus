@@ -655,13 +655,23 @@ impl InboundSpec {
             .pointer("/protocol/type")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(record.protocol_type.as_str())
-            .to_ascii_lowercase();
+            .to_owned();
+        let protocol = normalize_inbound_protocol(&protocol);
         let network_type = value
             .pointer("/network/type")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(record.network_type.as_str());
         let protocol_value = value.pointer("/protocol").cloned().unwrap_or_default();
-        let section = protocol_value.get(&protocol).cloned().unwrap_or_default();
+        let section = protocol_value
+            .get(&protocol)
+            .or_else(|| match protocol.as_str() {
+                "mixed" => protocol_value.get("mix"),
+                "reverse_http" => protocol_value.get("reverseHttp"),
+                "reverse_tcp" => protocol_value.get("reverseTcp"),
+                _ => None,
+            })
+            .cloned()
+            .unwrap_or_default();
         if !network_type.eq_ignore_ascii_case("tcp_udp")
             && !network_type.eq_ignore_ascii_case("empty")
         {
@@ -1671,10 +1681,20 @@ where
                 crate::proxy::yuubinsya::serve(stream, peer, spec, selector, monitor).await
             }
         }
+        "none" => Ok(()),
         other => Err(Error::new(
             ErrorKind::Unsupported,
             format!("inbound protocol {other:?} is not implemented"),
         )),
+    }
+}
+
+fn normalize_inbound_protocol(protocol: &str) -> String {
+    match protocol.to_ascii_lowercase().as_str() {
+        "mix" => "mixed".to_owned(),
+        "reversehttp" => "reverse_http".to_owned(),
+        "reversetcp" => "reverse_tcp".to_owned(),
+        normalized => normalized.to_owned(),
     }
 }
 
@@ -2085,6 +2105,74 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         .unwrap();
         assert_eq!(tproxy.listen, "127.0.0.1:12345".parse().unwrap());
         assert_eq!(tproxy.udp_mode, UdpMode::Enabled);
+
+        let mixed = InboundSpec::from_record(GoInboundRecord {
+            id: "mixed-alias".to_owned(),
+            name: "Mixed alias".to_owned(),
+            enabled: true,
+            network_type: "tcp_udp".to_owned(),
+            protocol_type: "mix".to_owned(),
+            transport_types_json: br#"[]"#.to_vec(),
+            updated_at: 1,
+            data_json: br#"{
+                "network":{"type":"tcp_udp","tcp_udp":{"host":"127.0.0.1:12346"}},
+                "protocol":{"type":"mix","mix":{"username":"u","password":"p"}}
+            }"#
+            .to_vec(),
+        })
+        .unwrap();
+        assert_eq!(mixed.protocol, "mixed");
+        assert_eq!(mixed.username, "u");
+        assert_eq!(mixed.password, "p");
+
+        let none = InboundSpec::from_record(GoInboundRecord {
+            id: "none".to_owned(),
+            name: "None".to_owned(),
+            enabled: true,
+            network_type: "tcp_udp".to_owned(),
+            protocol_type: "none".to_owned(),
+            transport_types_json: br#"[]"#.to_vec(),
+            updated_at: 1,
+            data_json: br#"{
+                "network":{"type":"tcp_udp","tcp_udp":{"host":"127.0.0.1:12347"}},
+                "protocol":{"type":"none","none":{}}
+            }"#
+            .to_vec(),
+        })
+        .unwrap();
+        assert_eq!(none.protocol, "none");
+    }
+
+    #[tokio::test]
+    async fn none_inbound_accepts_and_closes_without_routing() {
+        let (selector, monitor) = direct_runtime().await;
+        let (mut client, server) = tokio::io::duplex(64);
+        let task = tokio::spawn(serve_connection(
+            server,
+            "127.0.0.1:12347".parse().unwrap(),
+            "none".to_owned(),
+            InboundSpec {
+                id: "none".to_owned(),
+                protocol: "none".to_owned(),
+                listen: "127.0.0.1:12347".parse().unwrap(),
+                username: String::new(),
+                password: String::new(),
+                udp_mode: UdpMode::Disabled,
+                protocol_udp: false,
+                transports: Vec::new(),
+                aead_password: None,
+                aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
+                outbound_id: "direct".to_owned(),
+                reverse_target: None,
+                reverse_http: None,
+            },
+            selector,
+            monitor,
+            None,
+        ));
+        let mut byte = [0u8; 1];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
