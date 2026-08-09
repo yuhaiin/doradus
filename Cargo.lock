@@ -3595,6 +3595,7 @@ dependencies = [
  "tokio-tungstenite",
  "webpki-roots",
  "yuhaiin-core",
+ "yuhaiin-protocol",
 ]
 
 [[package]]

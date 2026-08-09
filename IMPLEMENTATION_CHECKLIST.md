@@ -1,6 +1,6 @@
 # yuhaiin Go → Rust 实现清单
 
-更新时间：2026-08-09
+更新时间：2026-08-10
 
 这份文件是“当前实现状态”的唯一入口；详细迁移设计、Go 源码映射和历史验收记录放在 [MIGRATION.md](MIGRATION.md)。这里不再使用 P0/P1/P2，所有事项按模块组织。
 
@@ -14,14 +14,14 @@
 
 ## 当前迁移覆盖率
 
-> 更新时间：2026-08-09。这个百分比按本文件的“功能条目”计算，不是代码行数、性能比例或最终质量分数。
+> 更新时间：2026-08-10。这个百分比按本文件的“功能条目”计算，不是代码行数、性能比例或最终质量分数。
 
 | 指标 | 数值 | 说明 |
 | --- | ---: | --- |
 | 当前范围条目 | 66 | `[x]` 已实现 + `[~]` 主路径已实现但仍有缺口；明确 `延期`/`不适用` 不计入当前替换范围 |
-| 完成条目 | 52 / 66 | `[x]`，78.8% |
-| 部分完成条目 | 14 / 66 | `[~]`，21.2%；每个部分完成条目按 50% 计入加权覆盖率 |
-| 加权迁移覆盖率 | **59 / 66 = 89.4%** | `(52 + 14 × 0.5) / 66` |
+| 完成条目 | 53 / 66 | `[x]`，80.3% |
+| 部分完成条目 | 13 / 66 | `[~]`，19.7%；每个部分完成条目按 50% 计入加权覆盖率 |
+| 加权迁移覆盖率 | **59.5 / 66 = 90.2%** | `(53 + 13 × 0.5) / 66` |
 | 明确延期 | 4 | 订阅、DoQ/DoH3、Shadowsocks/SSR、低频复杂协议等，不阻塞当前主路径 |
 | Go 没有对应能力 | 1 | 本地 DoH 管理端点 |
 
@@ -34,7 +34,7 @@
 | FakeIP | 3 | 1 | 87.5% | 更多生产数据样本 |
 | DNS resolver/server | 6 | 0 | 100.0% | DoQ/DoH3 明确延期；更多生产异常快照 |
 | Router/Trie/GeoIP | 5 | 0 | 100.0% | 发布策略中的数据库更新验收 |
-| Proxy/transport | 19 | 3 | 93.2% | standalone HTTP/2 后续目标协议层、Linux transparent UDP、平台 listen 绑定、复杂协议 |
+| Proxy/transport | 20 | 2 | 95.5% | raw standalone HTTP/2 不携带目标地址、Linux transparent UDP、平台 listen 绑定、复杂协议 |
 | NAT | 3 | 1 | 87.5% | Android/macOS route/NAT 生命周期 |
 | TUN inbound | 4 | 2 | 83.3% | namespace 长矩阵、Android/macOS 实机 |
 | 管理 API/connections/统计 | 3 | 3 | 75.0% | 逐操作生产 response/error/reload 快照、并发统计锁竞争 |
@@ -128,7 +128,7 @@ flowchart LR
 | `[x]` | SOCKS4A | 是 | — | `runtime/src/proxy/socks4a.rs` |
 | `[x]` | TLS transport | 是 | 是 | `runtime::doh_tls`, `protocol::tls`; chain 和 Trojan/VLESS/VMess 等协议层 outbound 默认使用纯 Rust Mozilla WebPKI roots，追加 Go `ca_cert`，并支持 `insecure_skip_verify` |
 | `[x]` | HTTP/2 transport | 是 | 是 | `chain`, runtime HTTP2 inbound |
-| `[~]` | Go standalone HTTP/2 raw transport | 是（transport） | 仅 raw transport，不作为最终 outbound | `yuhaiin-chain::ChainClient`, `h2_tunnel`；已支持 `[fixedv2,http2]`、plaintext prior-knowledge H2、CONNECT raw stream、pool/ping/close；`ChainProxy` 对缺少目标协议的节点 fail-closed。剩余：继续把 raw H2 作为可插拔底层接入 SOCKS/HTTP 等后续 protocol wrapper；不能把 standalone H2 单独当作带目标地址的最终出站 |
+| `[x]` | Go standalone HTTP/2 raw transport | 是（transport） | raw transport；可叠加 HTTP CONNECT/SOCKS5 作为 TCP outbound | `yuhaiin-chain::ChainClient`, `h2_tunnel`, `yuhaiin-protocol::{http,socks5}`；`[fixedv2,http2]` 保持 raw stream 且最终出站 fail-closed，`[fixedv2,http2,http]` 与 `[fixedv2,http2,socks5]` 已完成协议握手、认证、domain framing、双向 relay、latency 和 runtime 子进程回归。raw H2 没有 UDP datagram parent，因此 HTTP/SOCKS5 UDP 明确返回 unsupported；不能把 standalone H2 单独当成带目标地址的最终出站 |
 | `[x]` | Yuubinsya TCP | 是 | 是 | `core::yuubinsya`, `chain` |
 | `[x]` | Yuubinsya native UDP | 是 | 是 | `core::proxy`, `chain` |
 | `[x]` | Yuubinsya UDP-over-TCP | 是 | 是 | `chain::{h2,UOT,direct_uot}` |
@@ -142,7 +142,7 @@ flowchart LR
 
 | 状态 | 功能 | 当前结果 | 剩余工作 |
 | --- | --- | --- | --- |
-| `[x]` | inbound → router → outbound | HTTP/SOCKS5/SOCKS4A/Trojan/VLESS/Yuubinsya/TUN 都走共享 FlowContext 和 selector；有真实 loopback relay 回归；域名目标会按同一 resolver snapshot 先解析为 socket endpoint，同时保留原始域名供 TLS/HTTP2/Yuubinsya 使用；Podman 已验证 HTTP inbound → direct 的 IP/域名目标；`tests/service_chain.rs` 进一步用真实子进程/API 验证 HTTP inbound → route rule → HTTP CONNECT outbound、固定 + SOCKS5 outbound（保留 domain framing）、认证 SOCKS5 TCP inbound → direct、Yuubinsya TCP inbound → direct、mixed inbound → SOCKS5 UDP → direct，以及 HTTP + mixed UDP → TLS + HTTP/2 + Yuubinsya UOT outbound，并检查 TCP/UDP connections 与 latency | 继续增加 Go fixture，不改变主链路 |
+| `[x]` | inbound → router → outbound | HTTP/SOCKS5/SOCKS4A/Trojan/VLESS/Yuubinsya/TUN 都走共享 FlowContext 和 selector；有真实 loopback relay 回归；域名目标会按同一 resolver snapshot 先解析为 socket endpoint，同时保留原始域名供 TLS/HTTP2/Yuubinsya 使用；Podman 已验证 HTTP inbound → direct 的 IP/域名目标；`tests/service_chain.rs` 进一步用真实子进程/API 验证 HTTP inbound → route rule → HTTP CONNECT outbound、固定 + SOCKS5 outbound（保留 domain framing）、固定 + HTTP/2 + HTTP/SOCKS5 outbound、认证 SOCKS5 TCP inbound → direct、Yuubinsya TCP inbound → direct、mixed inbound → SOCKS5 UDP → direct，以及 HTTP + mixed UDP → TLS + HTTP/2 + Yuubinsya UOT outbound，并检查 TCP/UDP connections 与 latency | 继续增加 Go fixture，不改变主链路 |
 | `[x]` | inbound settings | `store::InboundSettings`, `RuntimeSnapshot`, `ConnectionMonitor` | Go legacy `inbound_settings` 与 Rust overlay、前端 API、reload 已统一；`sniff` 影响公共 relay，DNS 三项同时作用于 TUN、socket inbound 和 Yuubinsya chain；reload 原子替换 resolver handler |
 | `[x]` | HTTP/2 pool | fixed endpoint、TLS identity、ALPN、multi-stream/multi-connection、idle/drain、GOAWAY replacement、metrics | h2 公共 API 无法主动发送 client GOAWAY，保持 application-level drain |
 | `[x]` | Yuubinsya reliability | migrate ID、coalesce、bounded retry/replay、UOT/native UDP、ping、服务端 demux、TLS/H2 listener | 主动 GOAWAY 同上；继续 Go 低版本 fixture |

@@ -16,6 +16,9 @@ The current scenarios cover:
   same configured node.
 - HTTP inbound → domain route rule → fixed + SOCKS5 outbound, including
   proxy-side domain framing, live metadata, and node latency.
+- HTTP inbound → fixed + HTTP/2 + authenticated HTTP CONNECT outbound, and
+  HTTP inbound → fixed + HTTP/2 + authenticated SOCKS5 outbound, including
+  prior-knowledge H2 stream relay, route metadata, payload echo, and latency.
 - mixed inbound → SOCKS5 UDP framing → direct UDP, including the Go-compatible
   mixed UDP mode and a conflicting default `127.0.0.1:1080` listener.
 - authenticated SOCKS5 TCP inbound and Yuubinsya TCP inbound → direct echo in
@@ -24,7 +27,9 @@ The current scenarios cover:
 - standalone Go HTTP/2 transport wire compatibility is covered separately in
   `crates/yuhaiin-chain/tests/standalone_http2.rs`: fixed endpoint resolution,
   plaintext prior-knowledge H2, `CONNECT http://localhost`, raw bidirectional
-  bytes, pool ping/close, and the fail-closed final-proxy boundary.
+  bytes, pool ping/close, and the fail-closed raw final-proxy boundary. The
+  final HTTP/SOCKS5 compositions are covered by the process tests above and
+  intentionally remain TCP-only over a raw H2 parent.
 
 Run the tests from the repository root:
 

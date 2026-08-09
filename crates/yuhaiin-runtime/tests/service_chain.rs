@@ -11,11 +11,108 @@ use yuhaiin_chain::AsyncYuubinsyaTcpSession;
 use yuhaiin_core::{Endpoint, Network};
 
 use support::{
-    ConnectFixture, H2YuubinsyaFixture, ServiceProcess, Socks5Fixture, YUUBINSYA_PASSWORD,
-    add_mixed_udp_inbound, add_socks5_inbound, add_yuubinsya_inbound, api_json,
+    ConnectFixture, H2FinalProtocol, H2ProtocolFixture, H2YuubinsyaFixture, ServiceProcess,
+    Socks5Fixture, YUUBINSYA_PASSWORD, add_mixed_udp_inbound, add_socks5_inbound,
+    add_yuubinsya_inbound, api_json, configure_h2_http_chain, configure_h2_socks5_chain,
     configure_http_chain, configure_socks5_chain, configure_tls_h2_yuubinsya_chain,
     connect_loopback, integration_dir, seed_empty_database, wait_for_connection,
 };
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_inbound_routes_through_http2_http_outbound() {
+    run_h2_protocol_chain(H2FinalProtocol::Http).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_inbound_routes_through_http2_socks5_outbound() {
+    run_h2_protocol_chain(H2FinalProtocol::Socks5).await;
+}
+
+async fn run_h2_protocol_chain(protocol: H2FinalProtocol) {
+    let fixture = H2ProtocolFixture::start(protocol).await;
+    let _default_mixed_blocker = tokio::net::TcpListener::bind("127.0.0.1:1080").await.ok();
+    let inbound_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let inbound = inbound_listener.local_addr().unwrap();
+    drop(inbound_listener);
+
+    let (node_id, inbound_id, rule_name) = match protocol {
+        H2FinalProtocol::Http => (
+            "h2-http-out",
+            "h2-http-chain-in",
+            "proxy-example-test-over-h2-http",
+        ),
+        H2FinalProtocol::Socks5 => (
+            "h2-socks5-out",
+            "h2-socks5-chain-in",
+            "proxy-example-test-over-h2-socks5",
+        ),
+    };
+    let root = integration_dir(node_id);
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    match protocol {
+        H2FinalProtocol::Http => configure_h2_http_chain(&service, inbound, fixture.outbound).await,
+        H2FinalProtocol::Socks5 => {
+            configure_h2_socks5_chain(&service, inbound, fixture.outbound).await
+        }
+    }
+
+    let mut client = connect_loopback(inbound).await;
+    let authority = "example.test:443";
+    client
+        .write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut headers = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while !headers.windows(4).any(|window| window == b"\r\n\r\n") {
+        let length = client.read(&mut buffer).await.unwrap();
+        assert!(length > 0, "HTTP inbound closed before H2 chain response");
+        headers.extend_from_slice(&buffer[..length]);
+    }
+    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 200"));
+
+    let payload = match protocol {
+        H2FinalProtocol::Http => b"h2-http-payload".as_slice(),
+        H2FinalProtocol::Socks5 => b"h2-socks5-payload".as_slice(),
+    };
+    client.write_all(payload).await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, payload);
+
+    let connection = wait_for_connection(&service.client, &service.base_url).await;
+    let item = connection["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inboundName"] == inbound_id)
+        .expect("HTTP/2 protocol chain connection must be visible");
+    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["outbound"], node_id);
+    assert_eq!(item["mode"], "proxy");
+    assert!(
+        item["matchHistory"]
+            .as_array()
+            .is_some_and(|history| { history.iter().any(|entry| entry["ruleName"] == rule_name) })
+    );
+
+    let latency = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        &format!("/api/v2/nodes/{node_id}/latency"),
+        Some(&json!({"type":"tcp","url":"http://example.test:443/health"})),
+    )
+    .await;
+    assert_eq!(latency["ok"], true, "H2 protocol chain latency: {latency}");
+
+    client.shutdown().await.unwrap();
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {

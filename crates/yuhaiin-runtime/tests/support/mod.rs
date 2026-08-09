@@ -11,6 +11,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
+use http::Response;
 use rustls::ServerConfig;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -130,6 +132,40 @@ pub struct Socks5Fixture {
     pub destinations: Arc<Mutex<Vec<String>>>,
     shutdown: watch::Sender<bool>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy)]
+pub enum H2FinalProtocol {
+    Http,
+    Socks5,
+}
+
+/// A prior-knowledge HTTP/2 server with an HTTP CONNECT or SOCKS5 protocol
+/// endpoint behind each CONNECT stream. It exercises the same composition
+/// that a configured Rust chain uses: fixed -> HTTP/2 -> final protocol.
+pub struct H2ProtocolFixture {
+    pub outbound: SocketAddr,
+    shutdown: watch::Sender<bool>,
+    server_task: tokio::task::JoinHandle<()>,
+}
+
+impl H2ProtocolFixture {
+    pub async fn start(protocol: H2FinalProtocol) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let outbound = listener.local_addr().unwrap();
+        let (shutdown, receiver) = watch::channel(false);
+        let server_task = tokio::spawn(serve_h2_protocol_listener(listener, receiver, protocol));
+        Self {
+            outbound,
+            shutdown,
+            server_task,
+        }
+    }
+
+    pub async fn shutdown(self) {
+        let _ = self.shutdown.send(true);
+        let _ = self.server_task.await;
+    }
 }
 
 impl Socks5Fixture {
@@ -607,6 +643,228 @@ async fn handle_socks5_proxy(
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
 }
 
+async fn serve_h2_protocol_listener(
+    listener: TcpListener,
+    mut shutdown: watch::Receiver<bool>,
+    protocol: H2FinalProtocol,
+) {
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((stream, _)) = accepted else { break };
+                tasks.spawn(serve_h2_protocol_connection(stream, shutdown.clone(), protocol));
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
+            }
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                let _ = joined;
+            }
+        }
+    }
+    while let Some(result) = tasks.join_next().await {
+        let _ = result;
+    }
+}
+
+async fn serve_h2_protocol_connection(
+    socket: TcpStream,
+    mut shutdown: watch::Receiver<bool>,
+    protocol: H2FinalProtocol,
+) {
+    let Ok(mut connection) = h2::server::handshake(socket).await else {
+        return;
+    };
+    let request = tokio::select! {
+        request = connection.accept() => request,
+        changed = shutdown.changed() => {
+            if changed.is_ok() { connection.abrupt_shutdown(h2::Reason::NO_ERROR); }
+            return;
+        }
+    };
+    let Some(Ok((request, mut respond))) = request else {
+        return;
+    };
+    if request.method() != http::Method::CONNECT || request.uri().host() != Some("localhost") {
+        let _ = respond.send_response(
+            Response::builder()
+                .status(http::StatusCode::BAD_REQUEST)
+                .body(())
+                .unwrap(),
+            true,
+        );
+        return;
+    }
+
+    let mut body = request.into_body();
+    let Ok(mut send) = respond.send_response(Response::new(()), false) else {
+        return;
+    };
+    let (application, relay) = tokio::io::duplex(64 * 1024);
+    let (mut relay_read, mut relay_write) = tokio::io::split(relay);
+    let body_to_application = tokio::spawn(async move {
+        while let Some(data) = body.data().await {
+            let Ok(data) = data else { break };
+            if body.flow_control().release_capacity(data.len()).is_err() {
+                break;
+            }
+            if relay_write.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+        let _ = relay_write.shutdown().await;
+    });
+    let application_to_body = tokio::spawn(async move {
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let length = match relay_read.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(length) => length,
+            };
+            if send
+                .send_data(Bytes::copy_from_slice(&buffer[..length]), false)
+                .is_err()
+            {
+                break;
+            }
+        }
+        let _ = send.send_data(Bytes::new(), true);
+    });
+    let protocol_task = tokio::spawn(serve_h2_destination(application, protocol));
+
+    while let Some(result) = tokio::select! {
+        result = connection.accept() => result,
+        changed = shutdown.changed() => {
+            if changed.is_ok() { connection.abrupt_shutdown(h2::Reason::NO_ERROR); }
+            None
+        }
+    } {
+        if result.is_err() {
+            break;
+        }
+    }
+
+    protocol_task.abort();
+    body_to_application.abort();
+    application_to_body.abort();
+    let _ = protocol_task.await;
+    let _ = body_to_application.await;
+    let _ = application_to_body.await;
+}
+
+async fn serve_h2_destination(mut stream: tokio::io::DuplexStream, protocol: H2FinalProtocol) {
+    match protocol {
+        H2FinalProtocol::Http => {
+            let request = read_fixture_headers(&mut stream).await;
+            if !request.starts_with("CONNECT example.test:")
+                || !request.contains(" HTTP/1.1\r\n")
+                || !request.contains("Host: ")
+                || !request.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n")
+            {
+                return;
+            }
+            if stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        H2FinalProtocol::Socks5 => {
+            let mut greeting = [0u8; 4];
+            if stream.read_exact(&mut greeting).await.is_err() || greeting != [5, 2, 0, 2] {
+                return;
+            }
+            if stream.write_all(&[5, 2]).await.is_err() {
+                return;
+            }
+            let mut auth_head = [0u8; 2];
+            if stream.read_exact(&mut auth_head).await.is_err() || auth_head[0] != 1 {
+                return;
+            }
+            let mut username = vec![0u8; usize::from(auth_head[1])];
+            if stream.read_exact(&mut username).await.is_err() {
+                return;
+            }
+            let mut password_length = [0u8; 1];
+            if stream.read_exact(&mut password_length).await.is_err() {
+                return;
+            }
+            let mut password = vec![0u8; usize::from(password_length[0])];
+            if stream.read_exact(&mut password).await.is_err()
+                || username != b"user"
+                || password != b"pass"
+            {
+                return;
+            }
+            if stream.write_all(&[1, 0]).await.is_err() {
+                return;
+            }
+            let mut request = [0u8; 4];
+            if stream.read_exact(&mut request).await.is_err() || request != [5, 1, 0, 3] {
+                return;
+            }
+            let mut host_length = [0u8; 1];
+            if stream.read_exact(&mut host_length).await.is_err() {
+                return;
+            }
+            let mut host = vec![0u8; usize::from(host_length[0])];
+            if stream.read_exact(&mut host).await.is_err() {
+                return;
+            }
+            let mut port = [0u8; 2];
+            if stream.read_exact(&mut port).await.is_err() || host != b"example.test" {
+                return;
+            }
+            if stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    let mut buffer = [0u8; 16 * 1024];
+    let length = match stream.read(&mut buffer).await {
+        Ok(0) | Err(_) => return,
+        Ok(length) => length,
+    };
+    if buffer[..length].starts_with(b"GET ") {
+        let _ = stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+        return;
+    }
+    if stream.write_all(&buffer[..length]).await.is_err() {
+        return;
+    }
+    loop {
+        let length = match stream.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(length) => length,
+        };
+        if stream.write_all(&buffer[..length]).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn read_fixture_headers(stream: &mut tokio::io::DuplexStream) -> String {
+    let mut headers = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    while !headers.ends_with(b"\r\n\r\n") && headers.len() <= 64 * 1024 {
+        if stream.read_exact(&mut byte).await.is_err() {
+            return String::new();
+        }
+        headers.push(byte[0]);
+    }
+    String::from_utf8(headers).unwrap_or_default()
+}
+
 pub async fn seed_empty_database(path: &Path) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
@@ -870,6 +1128,113 @@ pub async fn configure_socks5_chain(
 
     let rule = json!({
         "name":"proxy-example-test-over-socks5",
+        "mode":"proxy",
+        "match":{"domain":"example.test"},
+        "tag":"integration"
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/route/rules",
+        Some(&rule),
+    )
+    .await;
+}
+
+pub async fn configure_h2_http_chain(
+    service: &ServiceProcess,
+    inbound: SocketAddr,
+    outbound: SocketAddr,
+) {
+    configure_h2_protocol_chain(
+        service,
+        inbound,
+        outbound,
+        "h2-http-out",
+        "h2-http-chain-in",
+        "proxy-example-test-over-h2-http",
+        json!({"type":"http","http":{"user":"user","password":"pass"}}),
+    )
+    .await;
+}
+
+pub async fn configure_h2_socks5_chain(
+    service: &ServiceProcess,
+    inbound: SocketAddr,
+    outbound: SocketAddr,
+) {
+    configure_h2_protocol_chain(
+        service,
+        inbound,
+        outbound,
+        "h2-socks5-out",
+        "h2-socks5-chain-in",
+        "proxy-example-test-over-h2-socks5",
+        json!({
+            "type":"socks5",
+            "socks5":{"user":"user","password":"pass","hostname":"","override_port":0}
+        }),
+    )
+    .await;
+}
+
+async fn configure_h2_protocol_chain(
+    service: &ServiceProcess,
+    inbound: SocketAddr,
+    outbound: SocketAddr,
+    node_id: &str,
+    inbound_id: &str,
+    rule_name: &str,
+    final_node: Value,
+) {
+    let node = json!({
+        "id":node_id,
+        "name":"HTTP/2 protocol test outbound",
+        "group":"integration",
+        "enabled":true,
+        "chain":[
+            {"type":"fixed","fixed":{"host":"127.0.0.1","port":outbound.port()}},
+            {"type":"http2","http2":{"concurrency":1,"max_streams":8,"idle_timeout_secs":30}},
+            final_node
+        ]
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes",
+        Some(&node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        &format!("/api/v2/nodes/{node_id}/use"),
+        None,
+    )
+    .await;
+
+    let inbound = json!({
+        "id":inbound_id,
+        "name":"HTTP/2 protocol chain inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":{"type":"http","http":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+
+    let rule = json!({
+        "name":rule_name,
         "mode":"proxy",
         "match":{"domain":"example.test"},
         "tag":"integration"

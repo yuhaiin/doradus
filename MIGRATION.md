@@ -1700,8 +1700,15 @@ fixed/DNS/TLS/WebSocket/H2 pool；`ChainClient::connect_raw_with_bind` 提供 ra
 CONNECT stream，支持多 stream、多连接、idle/drain、ping 和 close。原有
 `fixed → tls → http2 → yuubinsya` 路径保持不变。为避免把“只有 transport、没有目标
 protocol”的节点误当成最终出站，`ChainProxy::from_go_json*` 对 `[fixedv2,http2]`
-节点 fail-closed；未来可在这个 raw boundary 上叠加 SOCKS/HTTP 等 protocol wrapper，
-不复制 H2 pool 或 TLS 实现。
+节点仍 fail-closed；现在由 `yuhaiin-protocol::{http,socks5}` 在同一个 raw stream
+boundary 上提供 `[fixedv2,http2,http]` 和 `[fixedv2,http2,socks5]` 的 TCP protocol
+wrapper，不复制 H2 pool 或 TLS 实现。
+
+HTTP wrapper 使用 Go 兼容的 `CONNECT host:port HTTP/1.1`、Host、User-Agent 和可选
+Basic auth；SOCKS5 wrapper 保持 Go 的双 method greeting、username/password、domain/IP
+CONNECT framing，并保留 `hostname/override_port` 字段供后续 UDP 语义。raw H2 没有
+datagram parent，因此这两种 wrapper 的 UDP 入口都会返回明确的 unsupported，而不会把
+UDP 静默伪装成 TCP。
 
 新增 `crates/yuhaiin-chain/tests/standalone_http2.rs`，使用真实 loopback TCP listener
 跑 H2 server，检查 Go-compatible CONNECT URI、双向 raw bytes、second-stream ping、
@@ -1716,9 +1723,39 @@ cargo test -p yuhaiin-chain --all-features --offline --test standalone_http2 -- 
 cargo test -p yuhaiin-runtime --all-features --offline --lib http2_transport_bridges_each_connect_stream_to_the_protocol_server -- --nocapture
 ```
 
-这项目前记为 `[~]`：raw transport 和 inbound 已有 wire-level 覆盖，但后续 SOCKS/HTTP
-protocol wrapper 尚未接到 standalone raw H2，因此不能宣称 `[fixedv2,http2]` 本身是可用的
-最终代理。
+这项现记为 `[x]`：raw transport、HTTP/SOCKS5 final wrapper 和 inbound 都有 wire-level
+覆盖；`[fixedv2,http2]` 单独仍按设计只能作为 transport，必须由上层 protocol wrapper
+提供目标地址和 TCP/UDP 语义。
+
+新增执行：
+
+```bash
+cargo test -p yuhaiin-chain --all-features --offline --test http2_protocol -- --nocapture
+cargo test -p yuhaiin-runtime --all-features --offline --test service_chain http_inbound_routes_through_http2 -- --nocapture
+```
+
+前一组验证 raw H2 与 HTTP CONNECT/SOCKS5 wire 组合及双向 payload，后一组启动真实
+`yuhaiin` 子进程，经 SQLite/API 配置 inbound、route 和 outbound，再验证 connection
+metadata、route history、payload 和 node latency。
+
+## 45. 2026-08-10 HTTP/2 final protocol composition
+
+本轮把 standalone H2 从“只能打开 raw stream”推进到可复用的协议组合边界：
+
+- `ChainProxy::final_proxy` 以 raw `ChainProxy` 作为 parent，按配置选择
+  `yuhaiin_protocol::http::HttpProxy` 或 `Socks5Proxy`，因此 H2 pool、TLS、WebSocket 和
+  fixed endpoint 逻辑不复制到协议 wrapper；
+- `ChainConfig`/Go node parser 接受最后一层 `http`、`http_proxy` 或 `socks5`，仍保留
+  `yuubinsya` 兼容字段，并拒绝没有目标协议的 raw H2 final proxy；
+- HTTP CONNECT 支持 domain/IP authority、Go `Proxy-Authorization` Basic 头和有界响应
+  header parser；SOCKS5 支持 Go 兼容 greeting、两种认证方法、domain/IPv4/IPv6 TCP
+  CONNECT response framing；UDP over raw H2 明确失败，后续需要真正的 datagram-capable
+  parent 才能实现；
+- 新增 protocol 单测、H2 loopback composition test，以及 runtime process-level test：
+  `HTTP inbound → route → fixed → HTTP/2 → HTTP/SOCKS5 → payload/latency`。
+
+这项不改变 `[fixedv2,http2]` 的语义：它仍是没有目标地址的 transport，不能直接作为
+最终 outbound；可运行的 TCP 组合是 `[fixedv2,http2,http]` 或 `[fixedv2,http2,socks5]`。
 
 ## 41. 2026-08-09 运行验收与跨平台构建边界
 

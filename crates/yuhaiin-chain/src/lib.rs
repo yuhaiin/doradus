@@ -19,8 +19,8 @@ mod h2_tunnel;
 mod session;
 
 pub use config::{
-    ChainConfig, ChainNode, ValidatedChain, ValidatedFixedAddress, ValidatedHttp2, ValidatedTls,
-    ValidatedWebSocket, ValidatedYuubinsya, parse_config,
+    ChainConfig, ChainNode, ValidatedChain, ValidatedFixedAddress, ValidatedHttp, ValidatedHttp2,
+    ValidatedSocks5, ValidatedTls, ValidatedWebSocket, ValidatedYuubinsya, parse_config,
 };
 pub use go_node::parse_go_node;
 pub use h2_server::YuubinsyaH2Server;
@@ -544,8 +544,8 @@ impl ChainClient {
     }
 }
 
-/// Adapter from the runnable fixed -> TLS -> HTTP/2 -> Yuubinsya chain to the
-/// common async proxy contract used by the TUN flow runtime.
+/// Adapter from the runnable fixed -> TLS -> HTTP/2 -> destination protocol
+/// chain to the common async proxy contract used by the TUN flow runtime.
 #[derive(Clone)]
 pub struct ChainProxy {
     backend: ChainProxyBackend,
@@ -554,6 +554,7 @@ pub struct ChainProxy {
 #[derive(Clone)]
 enum ChainProxyBackend {
     H2(ChainClient),
+    Protocol(Arc<dyn AsyncProxy>),
     DirectUot(DirectUotProxy),
 }
 
@@ -565,13 +566,38 @@ impl ChainProxy {
     }
 
     fn final_proxy(client: ChainClient) -> Result<Self> {
-        if client.chain.yuubinsya.is_none() {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                "standalone HTTP/2 transport requires a destination protocol layer",
-            ));
+        if client.chain.yuubinsya.is_some() {
+            return Ok(Self::new(client));
         }
-        Ok(Self::new(client))
+        let parent: Arc<dyn AsyncProxy> = Arc::new(Self::new(client.clone()));
+        if let Some(http) = client.chain.http.as_ref() {
+            return Ok(Self {
+                backend: ChainProxyBackend::Protocol(Arc::new(
+                    yuhaiin_protocol::http::HttpProxy::new(
+                        parent,
+                        http.user.clone(),
+                        http.password.clone(),
+                    ),
+                )),
+            });
+        }
+        if let Some(socks5) = client.chain.socks5.as_ref() {
+            return Ok(Self {
+                backend: ChainProxyBackend::Protocol(Arc::new(
+                    yuhaiin_protocol::socks5::Socks5Proxy::new(
+                        parent,
+                        socks5.user.clone(),
+                        socks5.password.clone(),
+                        socks5.hostname.clone(),
+                        socks5.override_port,
+                    )?,
+                )),
+            });
+        }
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "standalone HTTP/2 transport requires a destination protocol layer",
+        ))
     }
 
     /// Construct the common async proxy contract from a Go node payload.
@@ -594,6 +620,7 @@ impl ChainProxy {
     pub fn client(&self) -> Option<&ChainClient> {
         match &self.backend {
             ChainProxyBackend::H2(client) => Some(client),
+            ChainProxyBackend::Protocol(_) => None,
             ChainProxyBackend::DirectUot(_) => None,
         }
     }
@@ -621,6 +648,7 @@ impl AsyncProxy for ChainProxy {
                     }
                 })
             }
+            ChainProxyBackend::Protocol(proxy) => proxy.connect(context),
             ChainProxyBackend::DirectUot(proxy) => proxy.connect(context),
         }
     }
@@ -663,6 +691,7 @@ impl AsyncProxy for ChainProxy {
                     }) as Box<dyn AsyncDatagram>)
                 })
             }
+            ChainProxyBackend::Protocol(proxy) => proxy.open_datagram(context),
             ChainProxyBackend::DirectUot(proxy) => proxy.open_datagram(context),
         }
     }
@@ -676,6 +705,7 @@ impl AsyncProxy for ChainProxy {
                     Ok(())
                 })
             }
+            ChainProxyBackend::Protocol(proxy) => proxy.close(),
             ChainProxyBackend::DirectUot(proxy) => proxy.close(),
         }
     }
@@ -692,6 +722,7 @@ impl AsyncProxy for ChainProxy {
                         .await
                 })
             }
+            ChainProxyBackend::Protocol(proxy) => proxy.ping(context),
             ChainProxyBackend::DirectUot(proxy) => proxy.ping(context),
         }
     }

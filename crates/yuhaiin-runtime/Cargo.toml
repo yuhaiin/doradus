@@ -66,8 +66,10 @@ path = "src/bin/yuhaiin.rs"
 required-features = ["http-api"]
 
 [dev-dependencies]
+bytes = "1.12.1"
 h2 = "0.4.15"
 http-body-util = "0.1.4"
+http = "1.5.0"
 tower = { version = "0.5.2", features = ["util"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

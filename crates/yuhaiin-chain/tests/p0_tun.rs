@@ -791,6 +791,8 @@ fn insecure_chain_client(address: SocketAddr) -> ChainClient {
             udp_over_stream: true,
             udp_coalesce: false,
         }),
+        http: None,
+        socks5: None,
     })
     .unwrap()
 }
@@ -824,6 +826,8 @@ fn chain_client_with_max_streams(
             udp_over_stream: true,
             udp_coalesce: false,
         }),
+        http: None,
+        socks5: None,
     })
     .unwrap()
 }
@@ -959,6 +963,8 @@ async fn tls_websocket_http2_chain_uses_http11_upgrade_before_h2() {
             udp_over_stream: false,
             udp_coalesce: false,
         }),
+        http: None,
+        socks5: None,
     })
     .unwrap();
     let mut stream = client

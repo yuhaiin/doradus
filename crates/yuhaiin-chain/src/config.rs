@@ -27,6 +27,12 @@ pub struct ChainNode {
     pub http2: Option<Http2Config>,
     #[serde(default)]
     pub yuubinsya: Option<YuubinsyaConfig>,
+    #[serde(default)]
+    pub http: Option<HttpConfig>,
+    #[serde(default)]
+    pub http_proxy: Option<HttpConfig>,
+    #[serde(default)]
+    pub socks5: Option<Socks5Config>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +86,26 @@ pub struct YuubinsyaConfig {
     pub udp_coalesce: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpConfig {
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Socks5Config {
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub override_port: i32,
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidatedChain {
     pub id: Option<String>,
@@ -93,6 +119,10 @@ pub struct ValidatedChain {
     /// wrapped by another protocol layer before it can be used as a final
     /// destination proxy.
     pub yuubinsya: Option<ValidatedYuubinsya>,
+    /// Final stream protocol layered on top of HTTP/2.  `None` means this is
+    /// a raw standalone HTTP/2 transport and still needs an outer protocol.
+    pub http: Option<ValidatedHttp>,
+    pub socks5: Option<ValidatedSocks5>,
 }
 
 /// A fixed upstream endpoint retained in its original host/port form.
@@ -156,6 +186,20 @@ pub struct ValidatedYuubinsya {
     pub udp_coalesce: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ValidatedHttp {
+    pub user: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedSocks5 {
+    pub user: String,
+    pub password: String,
+    pub hostname: String,
+    pub override_port: i32,
+}
+
 pub fn parse_config(json: &str) -> Result<ValidatedChain> {
     let config: ChainConfig = serde_json::from_str(json)
         .map_err(|error| Error::new(ErrorKind::InvalidInput, format!("chain JSON: {error}")))?;
@@ -166,30 +210,58 @@ impl ChainConfig {
     pub fn validate(self) -> Result<ValidatedChain> {
         if !(2..=5).contains(&self.chain.len()) {
             return Err(Error::invalid(
-                "the runnable chain supports fixedv2, optional tls/websocket, http2, and optional yuubinsya",
+                "the runnable chain supports fixedv2, optional tls/websocket, http2, and final yuubinsya/http/socks5",
             ));
         }
         let fixed = require_node(&self.chain[0], "fixedv2", |node| node.fixedv2.clone())?;
-        let has_yuubinsya = self
+        let final_kind = self
             .chain
             .last()
-            .is_some_and(|node| node.kind == "yuubinsya");
-        let yuubinsya = if has_yuubinsya {
+            .map(|node| node.kind.to_ascii_lowercase())
+            .ok_or_else(|| Error::invalid("chain has no final node"))?;
+        let has_destination_protocol = matches!(
+            final_kind.as_str(),
+            "yuubinsya" | "http" | "http_proxy" | "socks5"
+        );
+        let yuubinsya = if final_kind == "yuubinsya" {
             Some(require_node(
                 self.chain.last().expect("chain length validated"),
                 "yuubinsya",
                 |node| node.yuubinsya.clone(),
             )?)
         } else {
-            if self.chain.last().is_none_or(|node| node.kind != "http2") {
-                return Err(Error::invalid(
-                    "standalone HTTP/2 chain must end with an http2 node",
-                ));
-            }
             None
         };
+        let http = if matches!(final_kind.as_str(), "http" | "http_proxy") {
+            let expected = if final_kind == "http_proxy" {
+                "http_proxy"
+            } else {
+                "http"
+            };
+            Some(require_node(
+                self.chain.last().expect("chain length validated"),
+                expected,
+                |node| node.http.clone().or_else(|| node.http_proxy.clone()),
+            )?)
+        } else {
+            None
+        };
+        let socks5 = if final_kind == "socks5" {
+            Some(require_node(
+                self.chain.last().expect("chain length validated"),
+                "socks5",
+                |node| node.socks5.clone(),
+            )?)
+        } else {
+            None
+        };
+        if !has_destination_protocol && final_kind != "http2" {
+            return Err(Error::invalid(
+                "standalone HTTP/2 chain must end with http2 or a supported destination protocol",
+            ));
+        }
 
-        let middle_end = if has_yuubinsya {
+        let middle_end = if has_destination_protocol {
             self.chain.len() - 1
         } else {
             self.chain.len()
@@ -200,16 +272,16 @@ impl ChainConfig {
         let mut http2 = None;
         let mut saw_http2 = false;
         for node in middle {
-            match node.kind.as_str() {
-                "tls" if tls.is_none() && !saw_http2 => {
+            match node.kind.to_ascii_lowercase().as_str() {
+                kind if kind == "tls" && tls.is_none() && !saw_http2 => {
                     tls = Some(require_node(node, "tls", |node| node.tls.clone())?);
                 }
-                "websocket" if websocket.is_none() && !saw_http2 => {
+                kind if kind == "websocket" && websocket.is_none() && !saw_http2 => {
                     websocket = Some(require_node(node, "websocket", |node| {
                         node.websocket.clone()
                     })?);
                 }
-                "http2" if !saw_http2 => {
+                kind if kind == "http2" && !saw_http2 => {
                     http2 = Some(require_node(node, "http2", |node| node.http2.clone())?);
                     saw_http2 = true;
                 }
@@ -315,6 +387,17 @@ impl ChainConfig {
         {
             return Err(Error::invalid("Yuubinsya password cannot be empty"));
         }
+        if http.is_some() && socks5.is_some() {
+            return Err(Error::invalid(
+                "chain cannot contain both HTTP and SOCKS5 destination protocols",
+            ));
+        }
+        if socks5
+            .as_ref()
+            .is_some_and(|socks5| !(0..=i32::from(u16::MAX)).contains(&socks5.override_port))
+        {
+            return Err(Error::invalid("SOCKS5 override_port is out of range"));
+        }
         Ok(ValidatedChain {
             id: self.id,
             name: self.name,
@@ -330,6 +413,16 @@ impl ChainConfig {
                 password: yuubinsya.password,
                 udp_over_stream: yuubinsya.udp_over_stream,
                 udp_coalesce: yuubinsya.udp_coalesce,
+            }),
+            http: http.map(|http| ValidatedHttp {
+                user: http.user,
+                password: http.password,
+            }),
+            socks5: socks5.map(|socks5| ValidatedSocks5 {
+                user: socks5.user,
+                password: socks5.password,
+                hostname: socks5.hostname,
+                override_port: socks5.override_port,
             }),
         })
     }
@@ -537,5 +630,57 @@ mod tests {
                 path: "/proxy/ws".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn accepts_http_and_socks5_as_final_protocols_after_http2() {
+        let http = r#"
+        {
+          "chain": [
+            {"type":"fixedv2","fixedv2":{"addresses":[{"host":"127.0.0.1:443"}]}},
+            {"type":"http2","http2":{}},
+            {"type":"http","http":{"user":"user","password":"pass"}}
+          ]
+        }
+        "#;
+        let parsed = parse_config(http).unwrap();
+        assert_eq!(parsed.http.as_ref().unwrap().user, "user");
+        assert!(parsed.socks5.is_none());
+
+        let http_proxy = http.replace(
+            "\"type\":\"http\",\"http\"",
+            "\"type\":\"http_proxy\",\"http_proxy\"",
+        );
+        let parsed = parse_config(&http_proxy).unwrap();
+        assert_eq!(parsed.http.as_ref().unwrap().password, "pass");
+
+        let socks5 = r#"
+        {
+          "chain": [
+            {"type":"fixedv2","fixedv2":{"addresses":[{"host":"127.0.0.1:443"}]}},
+            {"type":"http2","http2":{}},
+            {"type":"socks5","socks5":{"user":"user","password":"pass","hostname":"relay.example","override_port":8443}}
+          ]
+        }
+        "#;
+        let parsed = parse_config(socks5).unwrap();
+        let socks5 = parsed.socks5.unwrap();
+        assert_eq!(socks5.hostname, "relay.example");
+        assert_eq!(socks5.override_port, 8443);
+        assert!(parsed.http.is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_socks5_override_port() {
+        let config = r#"
+        {
+          "chain": [
+            {"type":"fixedv2","fixedv2":{"addresses":[{"host":"127.0.0.1:443"}]}},
+            {"type":"http2","http2":{}},
+            {"type":"socks5","socks5":{"override_port":65536}}
+          ]
+        }
+        "#;
+        assert!(parse_config(config).is_err());
     }
 }
