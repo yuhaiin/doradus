@@ -15,7 +15,8 @@ use support::{
     Socks5Fixture, YUUBINSYA_PASSWORD, add_mixed_udp_inbound, add_socks5_inbound,
     add_yuubinsya_inbound, api_json, configure_h2_http_chain, configure_h2_socks5_chain,
     configure_http_chain, configure_socks5_chain, configure_tls_h2_yuubinsya_chain,
-    connect_loopback, integration_dir, seed_empty_database, wait_for_connection,
+    configure_tls_http_inbound, connect_loopback, connect_tls_loopback, integration_dir,
+    seed_empty_database, wait_for_connection,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -26,6 +27,59 @@ async fn http_inbound_routes_through_http2_http_outbound() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_inbound_routes_through_http2_socks5_outbound() {
     run_h2_protocol_chain(H2FinalProtocol::Socks5).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_http_inbound_terminates_tls_and_routes_through_direct_outbound() {
+    let fixture = ConnectFixture::start().await;
+    let inbound_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let inbound = inbound_listener.local_addr().unwrap();
+    drop(inbound_listener);
+
+    let root = integration_dir("service-tls-http-inbound");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_tls_http_inbound(&service, inbound).await;
+
+    let mut client = connect_tls_loopback(inbound).await;
+    let authority = fixture.target.to_string();
+    client
+        .write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut headers = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while !headers.windows(4).any(|window| window == b"\r\n\r\n") {
+        let length = client.read(&mut buffer).await.unwrap();
+        assert!(
+            length > 0,
+            "TLS HTTP inbound closed before CONNECT response"
+        );
+        headers.extend_from_slice(&buffer[..length]);
+    }
+    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 200"));
+
+    let payload = b"tls-inbound-payload";
+    client.write_all(payload).await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, payload);
+
+    let connection = wait_for_connection(&service.client, &service.base_url).await;
+    let item = connection["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inboundName"] == "tls-http-in")
+        .expect("TLS HTTP inbound connection must be visible");
+    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["outbound"], "tls-inbound-direct");
+
+    client.shutdown().await.unwrap();
+    service.shutdown().await;
+    fixture.shutdown().await;
 }
 
 async fn run_h2_protocol_chain(protocol: H2FinalProtocol) {

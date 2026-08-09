@@ -41,7 +41,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke api-contract-smoke go-api-parity-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke \
+.PHONY: help build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke api-contract-smoke go-api-parity-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -57,6 +57,7 @@ help:
 		'make build-tun-service-smoke build the runtime-owned TUN smoke binary' \
 		'make api-contract-smoke run the frontend management API process contract in Podman' \
 		'make go-api-parity-smoke compare public API responses against a Go state snapshot' \
+		'make service-chain-smoke run inbound/router/outbound protocol chains in Podman' \
 		'make benchmark-throughput run the release inbound/router/outbound throughput benchmark in Podman' \
 		'make benchmark-tun-throughput run the privileged TUN packet throughput benchmark in Podman' \
 		'make dns-source-smoke   run UDP/TCP resolver source-bind smoke in Podman' \
@@ -109,6 +110,9 @@ api-contract-smoke:
 
 go-api-parity-smoke:
 	./scripts/integration/go-api-parity.sh
+
+service-chain-smoke:
+	./scripts/integration/service-chain.sh
 
 benchmark-throughput:
 	./scripts/benchmark/throughput.sh

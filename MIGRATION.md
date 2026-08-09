@@ -2173,3 +2173,20 @@ lists/rules/tags，以及 interfaces/licenses。对照中修复了几项真实�
   interfaces 只规范化宿主机枚举顺序，SSE `tools.logs` 由已有流式测试覆盖。
 
 本轮 workspace 未使用 `/tmp`；对照日志和副本均位于 `~/.cache/yuhaiin-rust`。
+
+## 63. 2026-08-10 TLS inbound process chain
+
+此前 runtime 已有 TLS termination 实现，但服务级测试主要验证 TLS 作为 outbound
+transport；fixture 中的证书/私钥也没有覆盖 inbound listener。现在新增可复用的
+`configure_tls_http_inbound` fixture：通过前端保持不变的 Go-shaped JSON 配置
+`TLS transport → HTTP protocol`，由真实 runtime inbound owner 接收连接，使用
+RustCrypto TLS server 解密，再按共享 `FlowContext → selector → direct outbound`
+连接 loopback echo。
+
+`tests/service_chain.rs` 新增
+`tls_http_inbound_terminates_tls_and_routes_through_direct_outbound`，使用真实 TLS
+client、CONNECT 握手、payload echo 和 connections metadata 断言；
+`make service-chain-smoke` / `scripts/integration/service-chain.sh` 可重复运行整组
+service-chain 测试，状态、日志和构建产物继续放在 `~/.cache/yuhaiin-rust`，不使用
+`/tmp`。本次定向测试通过，TLS inbound 的功能条目不再只是静态代码存在，而有真实
+子进程数据面证据。

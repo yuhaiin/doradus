@@ -13,11 +13,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::Response;
-use rustls::ServerConfig;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, ServerConfig};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, watch};
+use tokio_rustls::{TlsConnector, client::TlsStream};
 use yuhaiin_chain::{YuubinsyaH2Server, YuubinsyaServerProxy};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, DirectAsyncProxy};
 use yuhaiin_core::yuubinsya::derive_salt;
@@ -74,6 +77,81 @@ pub async fn connect_loopback(address: SocketAddr) -> TcpStream {
         }
     }
     panic!("loopback listener {address} did not become ready");
+}
+
+/// Connect to a runtime TLS inbound using the fixture certificate. The
+/// certificate is intentionally not trusted by the host; the verifier keeps
+/// TLS handshake signature validation enabled while skipping only chain and
+/// hostname validation, matching the outbound `insecure_skip_verify` test
+/// semantics without introducing a system CA dependency.
+pub async fn connect_tls_loopback(address: SocketAddr) -> TlsStream<TcpStream> {
+    let provider = Arc::new(rustls_rustcrypto::provider());
+    let config = ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(SkipServerVerification::new(provider))
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from("localhost").unwrap().to_owned();
+    connector
+        .connect(server_name, connect_loopback(address).await)
+        .await
+        .unwrap()
+}
+
+#[derive(Debug)]
+struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
+
+impl SkipServerVerification {
+    fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Arc<Self> {
+        Arc::new(Self(provider))
+    }
+}
+
+impl ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 /// A small HTTP CONNECT proxy and target server used to prove that the Rust
@@ -1090,6 +1168,63 @@ pub async fn configure_http_chain(
         reqwest::Method::POST,
         "/api/v2/route/rules",
         Some(&rule),
+    )
+    .await;
+}
+
+/// Configure the smallest real TLS-termination inbound: TLS transport,
+/// HTTP proxy protocol, and the built-in direct outbound. Keeping this in the
+/// shared process fixture makes it reusable for future TLS/SOCKS5 and
+/// TLS/HTTP2 inbound matrix tests.
+pub async fn configure_tls_http_inbound(service: &ServiceProcess, inbound: SocketAddr) {
+    use base64::Engine;
+
+    let node = json!({
+        "id":"tls-inbound-direct",
+        "name":"TLS inbound direct outbound",
+        "group":"integration",
+        "enabled":true,
+        "chain":[{"type":"direct","direct":{}}]
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes",
+        Some(&node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes/tls-inbound-direct/use",
+        None,
+    )
+    .await;
+
+    let certificate = base64::engine::general_purpose::STANDARD.encode(LEAF_CERTIFICATE_PEM);
+    let private_key = base64::engine::general_purpose::STANDARD.encode(PRIVATE_KEY_PEM);
+    let inbound = json!({
+        "id":"tls-http-in",
+        "name":"TLS HTTP inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
+        "transports":[{
+            "type":"tls",
+            "tls":{"tls":{
+                "certificates":[{"certBase64":certificate,"keyBase64":private_key}],
+                "nextProtos":[]
+            }}
+        }],
+        "protocol":{"type":"http","http":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
     )
     .await;
 }

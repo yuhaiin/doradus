@@ -33,6 +33,10 @@ The current scenarios cover:
 - authenticated SOCKS5 TCP inbound and Yuubinsya TCP inbound → direct echo in
   the same real runtime process, including protocol handshakes and live
   inbound/outbound metadata.
+- TLS termination → HTTP proxy inbound → direct outbound, using the Go-shaped
+  certificate transport configuration, a real Rust TLS client, CONNECT framing,
+  payload echo, and live connection metadata. This is also available through
+  `make service-chain-smoke`.
 - `scripts/integration/tun-service.sh` builds the real
   `tun-service-smoke` runtime binary, writes a Go-shaped TUN inbound to a
   reusable SQLite state directory, and runs the same `inbound::run_until`
@@ -104,6 +108,7 @@ Run the tests from the repository root:
 cargo test -p yuhaiin-runtime --all-features --offline --test api_contract -- --nocapture
 cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
 scripts/integration/api-contract.sh
+make service-chain-smoke
 ```
 
 By default each test stores its SQLite state below
