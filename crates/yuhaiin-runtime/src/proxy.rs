@@ -387,8 +387,9 @@ impl RuntimeSnapshot {
     ///
     /// The persisted records are reused directly; the method only assembles
     /// the already existing proxy implementations into the routing adapter.
-    /// Empty direct/bypass/drop IDs use safe built-ins. An empty proxy ID is
-    /// an error because silently falling back to direct would leak traffic.
+    /// Empty IDs use safe built-ins. The internal `direct` sentinel is also
+    /// accepted for the selected-node fallback, but unknown non-empty proxy
+    /// IDs remain errors so a missing configured node cannot leak traffic.
     pub async fn build_proxy_selector(
         &self,
         direct_id: &str,
@@ -412,7 +413,13 @@ impl RuntimeSnapshot {
         let direct = self
             .build_proxy_slot(direct_id, timeout, BaseProxyKind::Direct)
             .await?;
-        let proxy = self.build_proxy(proxy_id, timeout).await?.proxy;
+        // Go's empty selected-node state means the built-in direct transport;
+        // it does not create a synthetic `direct` node row. Keep the proxy
+        // slot fail-closed for non-empty unknown IDs while treating only an
+        // empty ID as this explicit direct fallback.
+        let proxy = self
+            .build_proxy_slot(proxy_id, timeout, BaseProxyKind::Direct)
+            .await?;
         let bypass = self
             .build_proxy_slot(bypass_id, timeout, BaseProxyKind::Direct)
             .await?;
@@ -439,7 +446,7 @@ impl RuntimeSnapshot {
         timeout: Duration,
         fallback: BaseProxyKind,
     ) -> Result<Arc<dyn AsyncProxy>> {
-        if id.trim().is_empty() {
+        if id.trim().is_empty() || (id == "direct" && matches!(fallback, BaseProxyKind::Direct)) {
             let is_direct = matches!(fallback, BaseProxyKind::Direct);
             let proxy = BaseProxyConfig {
                 kind: fallback,

@@ -1976,3 +1976,21 @@ test concurrent_stats_readers_survive_flow_updates_and_restart ... ok
 
 这只证明 Rust runtime 自身的并发 reader、流量更新和重启读回边界；它不替代 Go 进程并发
 读写、生产数据库逐字段快照及升级期间锁竞争验收，因此 checklist 的统计项仍保持 `[~]`。
+
+## 53. 2026-08-10 fresh-state default projection parity
+
+Go 新库除了 inbound、resolver 和 route 表，还会写入 settings KV 与 route-extra 元数据；Rust
+现在在首次初始化同一组默认图时同步写入这些兼容行：IPv6/默认网卡/HTTP system proxy、
+debug/save 日志、bootstrap resolver 的 `system=true`、MaxMind 下载状态、LAN route list
+与 priority=1 的 LAN rule。
+
+同时移除了 Rust service 启动时额外持久化的 `rust-builtin/direct` node。Go 的 direct 是
+selector 的内置 fallback，不属于 `nodes_v2` 配置列表；Rust runtime 仍在空 proxy ID 时使用
+direct fallback，因此空库 `nodes.get` 与 Go 一样为空，而 inbound/TUN 数据面仍可 direct。
+
+API 展示也按 Go contract 收敛：route list preview 只返回第一项，bootstrap resolver 保留
+`system=true`。`crates/yuhaiin-runtime/tests/api_contract.rs` 增加了 fresh settings、空节点、
+resolver、route preview/index 和 route-list config 断言；实际 Rust 二进制与 Go fresh process
+的 RPC 对照已在 `~/.cache/yuhaiin-rust/api-parity` 完成。宿主机已有 `127.0.0.1:1080` 时，
+默认 mixed listener 会报告 bind 冲突，这只影响 listener/active-node smoke，应在 Podman
+network namespace 中执行完整 API contract，不应把它误判为 API JSON 不兼容。

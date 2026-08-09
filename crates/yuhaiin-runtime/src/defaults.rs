@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 use yuhaiin_store::{
     ConfigStore, GoInboundRecord, GoResolverRecord, GoRouteListRecord, GoRouteRuleRecord,
-    GoRouteSettingsRecord,
+    GoRouteSettingsRecord, GoSettingsKvRecord,
 };
 
 use crate::Result;
@@ -80,6 +80,9 @@ pub(crate) async fn ensure_go_defaults(store: &ConfigStore) -> Result<()> {
         .await?;
     repository.put_go_route_list(&default_lan_list()).await?;
     repository.put_go_route_rule(&default_lan_rule()).await?;
+    repository
+        .put_go_settings_kv(&default_settings_kv())
+        .await?;
 
     store.put_config(INIT_MARKER, COMPLETE).await
 }
@@ -176,7 +179,7 @@ fn inbound_record(
 }
 
 fn default_resolver() -> GoResolverRecord {
-    let data = json!({"id":"bootstrap", "type":"udp", "host":"8.8.8.8"});
+    let data = json!({"id":"bootstrap", "type":"udp", "host":"8.8.8.8", "system":true});
     GoResolverRecord {
         id: "bootstrap".to_owned(),
         resolver_type: "udp".to_owned(),
@@ -222,12 +225,14 @@ fn default_lan_rule() -> GoRouteRuleRecord {
         "name":"LAN",
         "mode":"direct",
         "tag":"LAN",
-        "rules":[{"type":"host", "host":{"list":"LAN"}}]
+        "resolveStrategy":"default",
+        "udpProxyFqdnStrategy":"udp_proxy_fqdn_strategy_default",
+        "rules":[{"type":"all", "all":[{"type":"host", "host":{"list":"LAN"}}]}]
     });
     GoRouteRuleRecord {
         id: "LAN".to_owned(),
         name: "LAN".to_owned(),
-        priority: 0,
+        priority: 1,
         disabled: false,
         action_mode: "direct".to_owned(),
         match_type: "all".to_owned(),
@@ -235,6 +240,41 @@ fn default_lan_rule() -> GoRouteRuleRecord {
         updated_at: 0,
         data_json: serde_json::to_vec(&data).expect("default route rule JSON"),
     }
+}
+
+fn default_settings_kv() -> Vec<GoSettingsKvRecord> {
+    [
+        ("general", "ipv6", "true"),
+        ("general", "use_default_interface", "true"),
+        ("general", "net_interface", "\"\""),
+        ("system_proxy", "http", "true"),
+        ("system_proxy", "socks5", "false"),
+        ("logcat", "level", "1"),
+        ("logcat", "save", "true"),
+        ("logcat", "ignore_dns_error", "false"),
+        ("logcat", "ignore_timeout_error", "false"),
+        ("advanced", "udp_buffer_size", "0"),
+        ("advanced", "relay_buffer_size", "0"),
+        ("advanced", "udp_ringbuffer_size", "0"),
+        ("advanced", "happyeyeballs_semaphore", "0"),
+        (
+            "route_extra",
+            "refresh_config",
+            r#"{"refresh_interval":0,"last_refresh_time":0}"#,
+        ),
+        (
+            "route_extra",
+            "maxminddb_geoip",
+            r#"{"download_url":"https://raw.githubusercontent.com/Loyalsoldier/geoip/release/Country-without-asn.mmdb","error":"NOT DOWNLOAD"}"#,
+        ),
+    ]
+    .into_iter()
+    .map(|(section, key, value_json)| GoSettingsKvRecord {
+        section: section.to_owned(),
+        key: key.to_owned(),
+        value_json: value_json.to_owned(),
+    })
+    .collect()
 }
 
 fn default_tun_name() -> &'static str {
@@ -283,6 +323,15 @@ mod tests {
         assert_eq!(repository.list_go_route_settings().await.unwrap().len(), 1);
         assert_eq!(repository.list_go_route_lists().await.unwrap().len(), 1);
         assert_eq!(repository.list_go_route_rules().await.unwrap().len(), 1);
+        let settings = repository.list_go_settings_kv().await.unwrap();
+        assert_eq!(settings.len(), 15);
+        assert!(settings.iter().any(|record| {
+            record.section == "general" && record.key == "ipv6" && record.value_json == "true"
+        }));
+        assert_eq!(
+            repository.list_go_route_rules().await.unwrap()[0].priority,
+            1
+        );
 
         ensure_go_defaults(&store).await.unwrap();
         assert_eq!(repository.list_go_inbounds().await.unwrap().len(), 3);

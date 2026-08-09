@@ -17,7 +17,7 @@ use yuhaiin_core::{Error, ErrorKind, Result};
 use yuhaiin_runtime::BuiltinResolverFactory;
 use yuhaiin_runtime::api::ApiState;
 use yuhaiin_runtime::{RuntimeBuilder, RuntimeController, inbound, run_dns_supervisor};
-use yuhaiin_store::{ConfigStore, GoNodeRecord, restore_database};
+use yuhaiin_store::{ConfigStore, restore_database};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RunOptions {
@@ -89,7 +89,6 @@ async fn run(options: RunOptions) -> Result<()> {
         std::fs::create_dir_all(parent).map_err(io_error)?;
     }
     let store = ConfigStore::open(&database).await?;
-    ensure_direct_node(&store).await?;
     console_notice("configuration database opened");
 
     let upstream: Arc<dyn AsyncIpResolver> = Arc::new(SystemAsyncIpResolver);
@@ -187,25 +186,6 @@ async fn run(options: RunOptions) -> Result<()> {
         console_notice("stopped");
     }
     result
-}
-
-async fn ensure_direct_node(store: &ConfigStore) -> Result<()> {
-    if !store.repository().list_go_nodes().await?.is_empty() {
-        return Ok(());
-    }
-    store
-        .repository()
-        .put_go_node(&GoNodeRecord {
-            id: "direct".to_owned(),
-            name: "Direct".to_owned(),
-            group_name: "builtin".to_owned(),
-            origin: "rust-builtin".to_owned(),
-            enabled: true,
-            chain_types_json: br##"["direct"]"##.to_vec(),
-            updated_at: 0,
-            data_json: br##"{"id":"direct","name":"Direct","group":"builtin","origin":"rust-builtin","enabled":true,"protocol":"direct","chain":[{"type":"direct","direct":{}}]}"##.to_vec(),
-        })
-        .await
 }
 
 fn default_database_path() -> PathBuf {

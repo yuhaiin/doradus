@@ -1324,7 +1324,7 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
     let snapshot = state.controller.handle().load();
     let proxy: Arc<dyn AsyncProxy> = match snapshot.build_proxy(&proxy_id, timeout).await {
         Ok(build) => build.proxy,
-        Err(_error) if proxy_id == "direct" => {
+        Err(_error) if proxy_id.is_empty() || proxy_id == "direct" => {
             snapshot.resolve_proxy(Arc::new(DirectAsyncProxy { timeout }))
         }
         Err(error) => return Err(error.into()),
@@ -3188,6 +3188,9 @@ fn resolver_json(record: GoResolverRecord) -> Value {
     set_string(&mut value, "id", record.id);
     set_string(&mut value, "type", record.resolver_type);
     set_string(&mut value, "host", record.host);
+    if value.get("id").and_then(Value::as_str) == Some("bootstrap") {
+        set_bool(&mut value, "system", true);
+    }
     value
 }
 
@@ -3275,12 +3278,7 @@ fn route_list_item_json(record: GoRouteListRecord, route_lists: &RouteListSnapsh
     );
     let name = string_or(&value, "name", &record.name);
     let entries = route_lists.values(&name).unwrap_or_default();
-    let preview = entries
-        .iter()
-        .take(3)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
+    let preview = entries.first().cloned().unwrap_or_default();
     let error_count = u32::from(route_lists.error(&name).is_some());
     json!({
         "name": name,
@@ -4530,7 +4528,7 @@ mod tests {
             .filter(|item| item["name"] == "browser")
             .collect::<Vec<_>>();
         assert_eq!(browser_rules.len(), 1);
-        assert_eq!(browser_rules[0]["index"], 1);
+        assert_eq!(browser_rules[0]["index"], 2);
 
         let fetched = app
             .clone()
@@ -4675,11 +4673,13 @@ mod tests {
             .join("yuhaiin-rust")
             .join("geo-tests")
             .join(format!("api-{}.mmdb", std::process::id()));
-        let _ = write_config_json(
+        let _ = route_lists_config_put_value(
             &state,
-            "route.lists.config",
             json!({
                 "refreshInterval":"0",
+                "lastRefreshTime":"0",
+                "error":"",
+                "hostIndexDisk":true,
                 "maxMindDbGeoIp":{"downloadUrl":format!("http://{address}/Country.mmdb"),"error":""}
             }),
         )

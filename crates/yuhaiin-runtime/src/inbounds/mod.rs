@@ -690,6 +690,8 @@ pub async fn selected_proxy_id(controller: &RuntimeController) -> Result<String>
                 .find(|node| node.enabled)
                 .map(|node| node.id)
         })
+        // The string is an internal selector sentinel only; unlike the old
+        // startup helper it is not persisted as a nodes_v2 row.
         .unwrap_or_else(|| "direct".to_owned()))
 }
 

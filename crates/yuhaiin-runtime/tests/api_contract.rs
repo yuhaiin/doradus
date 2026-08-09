@@ -113,6 +113,47 @@ async fn management_api_round_trips_frontend_contracts_in_one_process() {
     let settings = expect_ok(&service, Method::GET, "/api/v2/settings", None).await;
     assert!(settings["ipv6"].is_boolean());
     assert!(settings["systemProxy"].is_object());
+    assert_eq!(settings["ipv6"], true);
+    assert_eq!(settings["useDefaultInterface"], true);
+    assert_eq!(settings["systemProxy"]["http"], true);
+    assert_eq!(settings["logcat"]["level"], "debug");
+    assert_eq!(settings["logcat"]["save"], true);
+
+    let nodes = expect_ok(
+        &service,
+        Method::GET,
+        "/api/v2/nodes?page=1&page_size=0",
+        None,
+    )
+    .await;
+    assert_eq!(nodes["page"]["total"], 0);
+    let resolvers = expect_ok(
+        &service,
+        Method::GET,
+        "/api/v2/resolvers?page=1&page_size=0",
+        None,
+    )
+    .await;
+    assert_eq!(resolvers["items"][0]["id"], "bootstrap");
+    assert_eq!(resolvers["items"][0]["system"], true);
+    let route_lists = expect_ok(
+        &service,
+        Method::GET,
+        "/api/v2/route/lists?page=1&page_size=0",
+        None,
+    )
+    .await;
+    assert_eq!(route_lists["items"][0]["preview"], "0.0.0.0/8");
+    let route_rules = expect_ok(
+        &service,
+        Method::GET,
+        "/api/v2/route/rules?page=1&page_size=0",
+        None,
+    )
+    .await;
+    assert_eq!(route_rules["items"][0]["index"], 1);
+    let route_config = expect_ok(&service, Method::GET, "/api/v2/route/lists/config", None).await;
+    assert_eq!(route_config["hostIndexDisk"], true);
     assert_eq!(
         expect_ok(
             &service,
