@@ -1455,3 +1455,18 @@ cargo test -p yuhaiin-protocol --tests --offline -- --ignored --nocapture
 ## 22. 2026-08-09 service smoke
 
 使用 `target/debug/yuhaiin -host 127.0.0.1:55123 -path ~/.cache/yuhaiin-rust/service-smoke-<pid>` 启动独立 Rust service，未使用 `/tmp`，并通过 `/api/v2/info`、`/api/v2/settings`、`/api/v2/nodes`、`/api/v2/connections/total` 实际请求后收到 200 响应。空库幂等初始化出 built-in `direct` node，生成 `state.db`、WAL、SHM 和 sidecar lock；随后向该自有 smoke 进程发送 SIGTERM，进程正常退出。该结果覆盖 CLI path/host、SQLite 初始化和最小前端管理面链路，不替代代理流量和 TUN namespace 验收。
+
+## 23. 2026-08-09 管理 API Go/Rust 最小对照
+
+在 sibling Go checkout 构建 `cmd/yuhaiin` 后，使用独立的 `~/.cache/yuhaiin-rust/go-service-smoke-rpc2-<pid>` 状态目录启动 Go service；没有复用 Rust 的 `state.db`，也没有停止宿主机已有服务。Go v2 非流式接口的实际 RPC 路径是 `/api/v2/rpc/{operation}`，请求体为 `{}`。以下四个只读操作均收到 HTTP 200：
+
+```text
+info
+settings.get
+nodes.get
+connections.total
+```
+
+结果确认：Rust 与 Go 的四个响应都保持相同的顶层 JSON 契约（info、settings、分页 nodes、字符串计数器/空 counters），可由现有 React generated client 解码。空库默认值的差异是有意的：Rust 初始化内置 `direct` node，并将 advanced buffer 使用运行时默认值；Go 的 fresh state 返回空 node 列表和 zero advanced values。这里验证的是路径、状态码和字段形状，不把默认值差异误报为协议不兼容；生产库逐表、逐字段和 mutation/reload side effect 快照仍是 checklist 的未完成项。
+
+首次尝试旧的 `/api/v2/info`、`/api/v2/settings` 路径得到 Go 静态文件 fallback 的 404，随后按 Go `v2RoutePattern` 修正为 RPC 路径。该记录保留这个陷阱，避免后续把旧路由 404 当成服务启动失败。
