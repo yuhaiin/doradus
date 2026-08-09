@@ -1481,7 +1481,7 @@ async fn nodes_get_value(state: &ApiState, input: &Value) -> ApiResult {
         .list_go_nodes()
         .await?;
     let values = records.into_iter().map(node_json).collect::<Vec<_>>();
-    Ok(Json(page(values, input)))
+    Ok(Json(page_with_filter(values, input, node_matches_query)))
 }
 
 async fn get_node_value(state: &ApiState, id: String) -> ApiResult {
@@ -1609,9 +1609,10 @@ async fn inbounds_get_value(state: &ApiState, input: &Value) -> ApiResult {
         .repository()
         .list_go_inbounds()
         .await?;
-    Ok(Json(page(
+    Ok(Json(page_with_filter(
         records.into_iter().map(inbound_json).collect(),
         input,
+        inbound_matches_query,
     )))
 }
 
@@ -1686,9 +1687,10 @@ async fn resolvers_get_value(state: &ApiState, input: &Value) -> ApiResult {
         .repository()
         .list_go_resolvers()
         .await?;
-    Ok(Json(page(
+    Ok(Json(page_with_filter(
         records.into_iter().map(resolver_json).collect(),
         input,
+        resolver_matches_query,
     )))
 }
 
@@ -1807,7 +1809,11 @@ async fn route_lists_get_value(state: &ApiState, input: &Value) -> ApiResult {
         .into_iter()
         .map(|record| route_list_item_json(record, &route_lists))
         .collect::<Vec<_>>();
-    Ok(Json(page(values, input)))
+    Ok(Json(page_with_filter(
+        values,
+        input,
+        route_list_matches_query,
+    )))
 }
 
 async fn get_route_list_value(state: &ApiState, id: String) -> ApiResult {
@@ -1883,7 +1889,11 @@ async fn route_rules_get_value(state: &ApiState, input: &Value) -> ApiResult {
         .into_iter()
         .map(route_rule_item_json)
         .collect::<Vec<_>>();
-    Ok(Json(page(values, input)))
+    Ok(Json(page_with_filter(
+        values,
+        input,
+        route_rule_matches_query,
+    )))
 }
 
 async fn get_route_rule_value(state: &ApiState, name: String, index: usize) -> ApiResult {
@@ -2888,6 +2898,29 @@ fn page(mut values: Vec<Value>, input: &Value) -> Value {
         let query = query.to_ascii_lowercase();
         values.retain(|value| value.to_string().to_ascii_lowercase().contains(&query));
     }
+    page_values(values, input)
+}
+
+fn page_with_filter<F>(mut values: Vec<Value>, input: &Value, matches: F) -> Value
+where
+    F: Fn(&Value, &str) -> bool,
+{
+    if let Some(query) = normalized_query(input) {
+        values.retain(|value| matches(value, &query));
+    }
+    page_values(values, input)
+}
+
+fn normalized_query(input: &Value) -> Option<String> {
+    input
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn page_values(values: Vec<Value>, input: &Value) -> Value {
     let total = values.len();
     let page = input
         .get("page")
@@ -2909,6 +2942,65 @@ fn page(mut values: Vec<Value>, input: &Value) -> Value {
             .collect()
     };
     json!({"items": items, "page": {"page": page, "pageSize": size, "total": total}})
+}
+
+fn field_contains(value: &Value, key: &str, query: &str) -> bool {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|field| field.to_ascii_lowercase().contains(query))
+}
+
+fn nested_type_contains(value: &Value, key: &str, query: &str) -> bool {
+    value
+        .get(key)
+        .and_then(|nested| nested.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|field| field.to_ascii_lowercase().contains(query))
+}
+
+fn node_chain_contains_query(value: &Value, query: &str) -> bool {
+    value
+        .get("chain")
+        .and_then(Value::as_array)
+        .is_some_and(|chain| {
+            chain
+                .iter()
+                .any(|protocol| field_contains(protocol, "type", query))
+        })
+}
+
+fn node_matches_query(value: &Value, query: &str) -> bool {
+    ["id", "name", "group", "origin"]
+        .iter()
+        .any(|key| field_contains(value, key, query))
+        || node_chain_contains_query(value, query)
+}
+
+fn inbound_matches_query(value: &Value, query: &str) -> bool {
+    ["id", "name"]
+        .iter()
+        .any(|key| field_contains(value, key, query))
+        || nested_type_contains(value, "network", query)
+        || nested_type_contains(value, "protocol", query)
+}
+
+fn resolver_matches_query(value: &Value, query: &str) -> bool {
+    ["id", "type", "host", "subnet", "tlsServerName"]
+        .iter()
+        .any(|key| field_contains(value, key, query))
+}
+
+fn route_list_matches_query(value: &Value, query: &str) -> bool {
+    ["name", "type", "source", "preview"]
+        .iter()
+        .any(|key| field_contains(value, key, query))
+}
+
+fn route_rule_matches_query(value: &Value, query: &str) -> bool {
+    ["name", "mode", "tag", "resolver"]
+        .iter()
+        .any(|key| field_contains(value, key, query))
 }
 
 fn required_string(value: &Value, key: &str) -> std::result::Result<String, ApiError> {
@@ -3767,6 +3859,61 @@ mod tests {
         );
         assert_eq!(value["items"][0]["id"], "b");
         assert_eq!(value["page"]["pageSize"], 1);
+    }
+
+    #[test]
+    fn list_query_filters_match_go_field_contracts() {
+        assert!(node_matches_query(
+            &json!({"id":"n1", "chain":[{"type":"tls"}]}),
+            "tls"
+        ));
+        assert!(!node_matches_query(
+            &json!({"id":"n1", "description":"tls"}),
+            "tls"
+        ));
+        assert!(inbound_matches_query(
+            &json!({"id":"i1", "network":{"type":"tcp"}, "protocol":{"type":"http"}}),
+            "http"
+        ));
+        assert!(!inbound_matches_query(
+            &json!({"id":"i1", "listen":"http://127.0.0.1"}),
+            "http"
+        ));
+        assert!(resolver_matches_query(
+            &json!({"id":"r1", "type":"doh", "host":"dns.example"}),
+            "example"
+        ));
+        assert!(!resolver_matches_query(
+            &json!({"id":"r1", "description":"doh"}),
+            "doh"
+        ));
+        assert!(route_list_matches_query(
+            &json!({"name":"blocklist", "preview":"ads.example"}),
+            "ads"
+        ));
+        assert!(route_rule_matches_query(
+            &json!({"name":"rule", "mode":"proxy", "tag":"work"}),
+            "work"
+        ));
+        assert!(!route_rule_matches_query(
+            &json!({"name":"rule", "comment":"proxy"}),
+            "proxy"
+        ));
+    }
+
+    #[test]
+    fn list_query_filters_trim_and_paginate_after_filtering() {
+        let value = page_with_filter(
+            vec![
+                json!({"name":"direct"}),
+                json!({"name":"proxy"}),
+                json!({"name":"proxy backup"}),
+            ],
+            &json!({"query":"  PROXY ", "page":2, "pageSize":1}),
+            |value, query| field_contains(value, "name", query),
+        );
+        assert_eq!(value["page"]["total"], 2);
+        assert_eq!(value["items"][0]["name"], "proxy backup");
     }
 
     #[tokio::test]

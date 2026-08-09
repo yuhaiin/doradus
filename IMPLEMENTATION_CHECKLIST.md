@@ -144,7 +144,7 @@ flowchart LR
 
 | 状态 | 功能 | 位置 | 当前结果 | 剩余工作 |
 | --- | --- | --- | --- | --- |
-| `[x]` | 前端 API/RPC | `runtime/src/api.rs` | 对齐现有 generated client；settings、nodes、inbounds、DNS、hosts/FakeDNS、route、TUN、connections 等共用 store/runtime struct；`inbounds.config` 返回/保存 Go 三项布尔设置并触发原子 reload |
+| `[~]` | 前端 API/RPC | `runtime/src/api.rs` | 对齐现有 generated client；settings、nodes、inbounds、DNS、hosts/FakeDNS、route、TUN、connections 等共用 store/runtime struct；列表 API 已补 Go 的 query 字段边界（nodes: id/name/group/origin/chain.type；inbounds: id/name/network.type/protocol.type；resolvers: id/type/host/subnet/tlsServerName；route lists/rules: Go 指定字段）并在过滤后计算 total | 继续用前端 generated-contracts 和真实 Go handler 做 response 字段/错误语义逐项验收；补 production snapshot 的管理面回归 |
 | `[x]` | live connections | `monitor`, `connections` API/SSE | 建立、更新、关闭、数字 ID close、EventSource added/removed |
 | `[~]` | history/traffic/statistics | `monitor`, SQLite persistence | Rust checkpoint 负责频繁 crash recovery；无 checkpoint 时可接管 Go 的 `statistics_kv`、`traffic_hourly`、`connection_history`、`failed_connection_history` 和 telemetry 表；正常 shutdown 会原子写回 Go 兼容统计投影，history 按 Go key 合并 | 生产库更多版本/异常中断 fixture；周期性 Go 表投影和 force-abort 后 Go 表可见性仍需单独验收 |
 | `[x]` | runtime reload | `RuntimeController` | 配置先构建新 snapshot，失败保留旧 snapshot；selector/inbound/DNS 按 owner 收敛 |
@@ -203,3 +203,4 @@ podman run --rm --network=host \
 5. 每完成一项，只修改本模块表格、验收命令和 `MIGRATION.md` 的一条 dated entry，不再把所有历史细节堆回本文件。
 6. 完成 Linux `tproxy`/`redir` 验收：在真正的 network namespace/宿主机 CAP_NET_ADMIN 环境覆盖 TPROXY UDP ancillary、redir IPv4/IPv6、权限失败及多 flow 生命周期；Podman REDIRECT TCP 已有可重复验收记录。
 7. 补统计兼容验收：用真实 Go v6/生产形状数据库验证 Rust takeover、最终 flush 后 Go 读取，以及 force-abort/进程崩溃时 checkpoint 与 Go 表之间的恢复边界。
+8. 补管理 API 契约验收：逐个执行 generated client 的 list/detail/mutation 操作，记录 Rust 与 Go 的 response 字段、分页、query 过滤、错误状态和 reload side effect 差异；优先覆盖 route、inbound、node、resolver。
