@@ -26,6 +26,17 @@ use yuhaiin_core::http2::{H2DohClient, H2DohConnector};
 
 pub trait ResolverTransportFactory: Send + Sync {
     fn build(&self, config: &GoResolverRuntimeConfig) -> Result<Arc<dyn AsyncIpResolver>>;
+
+    /// Build a resolver while honoring the runtime's selected source
+    /// addresses. Existing custom factories remain source-compatible and can
+    /// opt in only when their transport owns a direct socket dialer.
+    fn build_with_policy(
+        &self,
+        config: &GoResolverRuntimeConfig,
+        _local_bind_addresses: &[IpAddr],
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
+        self.build(config)
+    }
 }
 
 /// Controls what happens when a configured resolver transport cannot be
@@ -220,15 +231,24 @@ impl RustCryptoDohResolverFactory {
 #[cfg(feature = "doh-tls")]
 impl ResolverTransportFactory for RustCryptoDohResolverFactory {
     fn build(&self, config: &GoResolverRuntimeConfig) -> Result<Arc<dyn AsyncIpResolver>> {
+        self.build_with_policy(config, &[])
+    }
+
+    fn build_with_policy(
+        &self,
+        config: &GoResolverRuntimeConfig,
+        local_bind_addresses: &[IpAddr],
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
         if config.transport != GoResolverTransport::Doh {
-            return self.builtin.build(config);
+            return self.builtin.build_with_policy(config, local_bind_addresses);
         }
         let endpoint = doh_endpoint(&config.host, &config.id)?;
         let connector = RustCryptoH2Connector::from_config(
             self.client_config.clone(),
             config.tls_server_name.clone(),
             self.builtin.timeout,
-        );
+        )
+        .with_local_bind_addresses(local_bind_addresses);
         let client = H2DohClient {
             endpoint,
             connector,
@@ -260,6 +280,15 @@ fn doh_endpoint(host: &str, id: &str) -> Result<http::Uri> {
 
 impl ResolverTransportFactory for BuiltinResolverFactory {
     fn build(&self, config: &GoResolverRuntimeConfig) -> Result<Arc<dyn AsyncIpResolver>> {
+        self.build_with_policy(config, &[])
+    }
+
+    fn build_with_policy(
+        &self,
+        config: &GoResolverRuntimeConfig,
+        local_bind_addresses: &[IpAddr],
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
+        let local_bind_addresses = Arc::from(local_bind_addresses.to_vec().into_boxed_slice());
         match config.transport {
             GoResolverTransport::System => Ok(Arc::new(SystemAsyncIpResolver)),
             GoResolverTransport::Udp => {
@@ -267,6 +296,7 @@ impl ResolverTransportFactory for BuiltinResolverFactory {
                     server: parse_dns_server(&config.host, 53, &config.id)?,
                     timeout: self.timeout,
                     max_packet_size: self.max_packet_size,
+                    local_bind_addresses,
                 };
                 let resolver = AsyncDnsResolver::new(client)
                     .with_cache(DnsCache::new(self.cache_capacity.max(1))?);
@@ -277,6 +307,7 @@ impl ResolverTransportFactory for BuiltinResolverFactory {
                     server: parse_dns_server(&config.host, 53, &config.id)?,
                     timeout: self.timeout,
                     max_packet_size: self.max_packet_size,
+                    local_bind_addresses,
                 };
                 let resolver = AsyncDnsResolver::new(client)
                     .with_cache(DnsCache::new(self.cache_capacity.max(1))?);
@@ -448,7 +479,10 @@ mod tests {
             let address = server.local_addr().unwrap();
             let factory = BuiltinResolverFactory::new(Duration::from_secs(1), 32);
             let resolver = factory
-                .build(&config(GoResolverTransport::Tcp, &address.to_string()))
+                .build_with_policy(
+                    &config(GoResolverTransport::Tcp, &address.to_string()),
+                    &["127.0.0.2".parse::<IpAddr>().unwrap()],
+                )
                 .unwrap();
             let domain = DomainName::new("example.com").unwrap();
             let (server_result, resolve_result) = tokio::join!(

@@ -40,12 +40,11 @@ use std::time::Instant;
 
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf, split};
-use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify, watch};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use yuhaiin_core::dns_resolver_async::{AsyncIpResolver, SystemAsyncIpResolver};
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, connect_tokio_tcp};
 use yuhaiin_core::{
     BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, ResolveStrategy, Result,
     yuubinsya::derive_salt,
@@ -240,6 +239,14 @@ impl ChainClient {
     /// guarantees one in-flight probe per destination, while the cache lock
     /// only protects lookup and idle eviction.
     pub async fn ping(&self, destination: Endpoint) -> Result<Duration> {
+        self.ping_with_bind(destination, &[]).await
+    }
+
+    pub async fn ping_with_bind(
+        &self,
+        destination: Endpoint,
+        local_bind_addresses: &[std::net::IpAddr],
+    ) -> Result<Duration> {
         self.ensure_open()?;
         if destination.network() != Network::Tcp {
             return Err(Error::invalid("Yuubinsya ping target must use tcp network"));
@@ -293,7 +300,7 @@ impl ChainClient {
             return Ok(elapsed);
         }
 
-        let stream = self.open_h2_stream().await?;
+        let stream = self.open_h2_stream(local_bind_addresses).await?;
         let (session, elapsed) = tokio::time::timeout(
             Duration::from_secs(10),
             AsyncYuubinsyaPingSession::connect(
@@ -319,13 +326,21 @@ impl ChainClient {
         &self,
         destination: Endpoint,
     ) -> Result<AsyncYuubinsyaTcpSession<tokio::io::DuplexStream>> {
+        self.connect_tcp_with_bind(destination, &[]).await
+    }
+
+    pub async fn connect_tcp_with_bind(
+        &self,
+        destination: Endpoint,
+        local_bind_addresses: &[std::net::IpAddr],
+    ) -> Result<AsyncYuubinsyaTcpSession<tokio::io::DuplexStream>> {
         self.ensure_open()?;
         if destination.network() != Network::Tcp {
             return Err(Error::invalid(
                 "Yuubinsya TCP destination must use tcp network",
             ));
         }
-        let stream = self.open_h2_stream().await?;
+        let stream = self.open_h2_stream(local_bind_addresses).await?;
         AsyncYuubinsyaTcpSession::connect(
             stream,
             derive_salt(self.chain.yuubinsya.password.as_bytes()),
@@ -341,6 +356,14 @@ impl ChainClient {
         &self,
         migrate_id: u64,
     ) -> Result<AsyncYuubinsyaUotSession<tokio::io::DuplexStream>> {
+        self.connect_uot_with_bind(migrate_id, &[]).await
+    }
+
+    pub async fn connect_uot_with_bind(
+        &self,
+        migrate_id: u64,
+        local_bind_addresses: &[std::net::IpAddr],
+    ) -> Result<AsyncYuubinsyaUotSession<tokio::io::DuplexStream>> {
         self.ensure_open()?;
         if !self.chain.yuubinsya.udp_over_stream {
             return Err(Error::new(
@@ -348,7 +371,7 @@ impl ChainClient {
                 "chain does not enable yuubinsya udp_over_stream",
             ));
         }
-        let stream = self.open_h2_stream().await?;
+        let stream = self.open_h2_stream(local_bind_addresses).await?;
         AsyncYuubinsyaUotSession::connect(
             stream,
             derive_salt(self.chain.yuubinsya.password.as_bytes()),
@@ -358,7 +381,10 @@ impl ChainClient {
         .await
     }
 
-    async fn open_h2_stream(&self) -> Result<tokio::io::DuplexStream> {
+    async fn open_h2_stream(
+        &self,
+        local_bind_addresses: &[std::net::IpAddr],
+    ) -> Result<tokio::io::DuplexStream> {
         self.ensure_open()?;
         let tls_identity = self.transport_identity();
         let addresses = self.resolve_fixed_addresses().await?;
@@ -368,7 +394,7 @@ impl ChainClient {
                 &addresses,
                 &tls_identity,
                 self.chain.http2.concurrency,
-                |address| self.open_h2_connection(address),
+                |address| self.open_h2_connection(address, local_bind_addresses),
             )
             .await?;
         if self.closed.load(Ordering::Acquire) {
@@ -422,11 +448,17 @@ impl ChainClient {
         Ok(())
     }
 
-    async fn open_h2_connection(&self, address: SocketAddr) -> Result<Arc<H2Connection>> {
-        let stream = tokio::time::timeout(Duration::from_secs(15), TcpStream::connect(address))
-            .await
-            .map_err(|_| Error::new(ErrorKind::Timeout, "fixed TCP connect timed out"))?
-            .map_err(|error| Error::new(ErrorKind::Io, format!("fixed TCP connect: {error}")))?;
+    async fn open_h2_connection(
+        &self,
+        address: SocketAddr,
+        local_bind_addresses: &[std::net::IpAddr],
+    ) -> Result<Arc<H2Connection>> {
+        let local_bind = local_bind_addresses
+            .iter()
+            .copied()
+            .find(|ip| ip.is_ipv4() == address.ip().is_ipv4())
+            .map(|ip| SocketAddr::new(ip, 0));
+        let stream = connect_tokio_tcp(address, local_bind, Duration::from_secs(15)).await?;
         let mut stream: BoxAsyncStream = if self.chain.tls.servernames.is_empty() {
             Box::new(stream)
         } else {
@@ -515,7 +547,9 @@ impl AsyncProxy for ChainProxy {
                 let client = client.clone();
                 let destination = context.effective_destination();
                 Box::pin(async move {
-                    let session = client.connect_tcp(destination).await?;
+                    let session = client
+                        .connect_tcp_with_bind(destination, &context.local_bind_addresses)
+                        .await?;
                     Ok(Box::new(session) as BoxAsyncStream)
                 })
             }
@@ -531,9 +565,13 @@ impl AsyncProxy for ChainProxy {
             ChainProxyBackend::H2(client) => {
                 let client = client.clone();
                 let migrate_id = Arc::clone(&context.udp_migrate_id);
+                let local_bind_addresses = Arc::new(context.local_bind_addresses.clone());
                 Box::pin(async move {
                     let session = client
-                        .connect_uot(migrate_id.load(Ordering::Acquire))
+                        .connect_uot_with_bind(
+                            migrate_id.load(Ordering::Acquire),
+                            local_bind_addresses.as_slice(),
+                        )
                         .await?;
                     let migrate = session.migrate_id;
                     let udp_coalesce = session.udp_coalesce;
@@ -553,6 +591,7 @@ impl AsyncProxy for ChainProxy {
                         shutdown: watch::channel(false).0,
                         next_retry_id: std::sync::atomic::AtomicU64::new(1),
                         retry: Mutex::new(RetryQueue::new()),
+                        local_bind_addresses,
                     }) as Box<dyn AsyncDatagram>)
                 })
             }
@@ -578,7 +617,12 @@ impl AsyncProxy for ChainProxy {
             ChainProxyBackend::H2(client) => {
                 let client = client.clone();
                 let destination = context.effective_destination();
-                Box::pin(async move { client.ping(destination).await })
+                let local_bind_addresses = context.local_bind_addresses.clone();
+                Box::pin(async move {
+                    client
+                        .ping_with_bind(destination, &local_bind_addresses)
+                        .await
+                })
             }
             ChainProxyBackend::DirectUot(proxy) => proxy.ping(context),
         }
@@ -595,6 +639,7 @@ struct ChainDatagram {
     shutdown: watch::Sender<bool>,
     next_retry_id: std::sync::atomic::AtomicU64,
     retry: Mutex<RetryQueue>,
+    local_bind_addresses: Arc<Vec<std::net::IpAddr>>,
 }
 
 struct PendingUotDatagram {
@@ -985,7 +1030,10 @@ impl ChainDatagram {
         // retrying one UDP datagram can therefore duplicate it. UDP callers
         // already need duplicate-tolerant semantics, while a bounded retry
         // prevents a dead H2 stream from permanently wedging the flow.
-        let replacement = self.client.connect_uot(migrate_id).await?;
+        let replacement = self
+            .client
+            .connect_uot_with_bind(migrate_id, self.local_bind_addresses.as_slice())
+            .await?;
         let replacement_id = replacement.migrate_id;
         let udp_coalesce = replacement.udp_coalesce;
         let (reader, writer) = split(replacement.into_inner());

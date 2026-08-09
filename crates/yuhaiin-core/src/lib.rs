@@ -299,6 +299,10 @@ pub struct FlowContext {
     /// observability still reports that the application connected to a
     /// synthetic address.
     pub fake_ip: Option<String>,
+    /// Local source addresses selected by the runtime's interface policy.
+    /// Keeping all addresses allows a dual-stack interface to select the
+    /// family matching the actual upstream socket.
+    pub local_bind_addresses: Vec<IpAddr>,
     /// Management-plane identity of the component that accepted the flow.
     /// These fields are optional so packet-only callers do not need a second
     /// DTO or synthetic values.
@@ -342,6 +346,7 @@ impl FlowContext {
             geo: None,
             hosts: None,
             fake_ip: None,
+            local_bind_addresses: Vec::new(),
             component: None,
             inbound: None,
             inbound_name: None,
@@ -370,6 +375,14 @@ impl FlowContext {
             return self.destination.clone();
         };
         Endpoint::domain(self.network, domain.clone(), port)
+    }
+
+    pub fn local_bind_for(&self, remote: SocketAddr) -> Option<SocketAddr> {
+        self.local_bind_addresses
+            .iter()
+            .copied()
+            .find(|address| address.is_ipv4() == remote.is_ipv4())
+            .map(|address| SocketAddr::new(address, 0))
     }
 }
 
@@ -466,6 +479,24 @@ mod tests {
         assert_eq!(
             context.effective_destination(),
             Endpoint::domain(Network::Udp, DomainName::new("example.com").unwrap(), 443)
+        );
+    }
+
+    #[test]
+    fn local_bind_selects_the_remote_address_family() {
+        let mut context =
+            FlowContext::new(Endpoint::ip(Network::Tcp, "192.0.2.1:443".parse().unwrap()));
+        context.local_bind_addresses = vec![
+            IpAddr::V6("2001:db8::10".parse().unwrap()),
+            IpAddr::V4("192.0.2.10".parse().unwrap()),
+        ];
+        assert_eq!(
+            context.local_bind_for("198.51.100.1:443".parse().unwrap()),
+            Some("192.0.2.10:0".parse().unwrap())
+        );
+        assert_eq!(
+            context.local_bind_for("[2001:db8::20]:443".parse().unwrap()),
+            Some("[2001:db8::10]:0".parse().unwrap())
         );
     }
 

@@ -10,6 +10,8 @@ use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
+use socket2::{Domain, Protocol, Socket, Type};
+
 use crate::{Endpoint, Error, ErrorKind, Result};
 
 #[cfg(feature = "async-proxy")]
@@ -17,6 +19,87 @@ use crate::{BoxFuture, FlowContext, Network};
 
 pub trait StreamConnector: Send + Sync {
     fn connect(&self, destination: &Endpoint) -> Result<TcpStream>;
+
+    fn connect_with_local(
+        &self,
+        destination: &Endpoint,
+        local_bind: Option<SocketAddr>,
+    ) -> Result<TcpStream> {
+        if local_bind.is_some() {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "stream connector does not support a local bind address",
+            ));
+        }
+        self.connect(destination)
+    }
+
+    fn connect_target(&self) -> Option<SocketAddr> {
+        None
+    }
+}
+
+fn connect_std_tcp(
+    address: SocketAddr,
+    local_bind: Option<SocketAddr>,
+    timeout: Duration,
+) -> Result<TcpStream> {
+    let Some(local_bind) = local_bind else {
+        return TcpStream::connect_timeout(&address, timeout)
+            .map_err(|error| Error::new(ErrorKind::Io, error.to_string()));
+    };
+    if local_bind.is_ipv4() != address.is_ipv4() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "local bind address and TCP destination use different address families",
+        ));
+    }
+    let socket = Socket::new(
+        if address.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        },
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )
+    .map_err(|error| Error::new(ErrorKind::Io, format!("create TCP socket: {error}")))?;
+    socket
+        .bind(&local_bind.into())
+        .map_err(|error| Error::new(ErrorKind::Io, format!("bind TCP socket: {error}")))?;
+    socket
+        .connect_timeout(&address.into(), timeout)
+        .map_err(|error| Error::new(ErrorKind::Io, format!("connect TCP socket: {error}")))?;
+    Ok(socket.into())
+}
+
+#[cfg(feature = "async-proxy")]
+pub async fn connect_tokio_tcp(
+    address: SocketAddr,
+    local_bind: Option<SocketAddr>,
+    timeout: Duration,
+) -> Result<tokio::net::TcpStream> {
+    if local_bind.is_some_and(|local| local.is_ipv4() != address.is_ipv4()) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "local bind address and TCP destination use different address families",
+        ));
+    }
+    let socket = if address.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()
+    } else {
+        tokio::net::TcpSocket::new_v6()
+    }
+    .map_err(|error| Error::new(ErrorKind::Io, format!("create TCP socket: {error}")))?;
+    if let Some(local_bind) = local_bind {
+        socket
+            .bind(local_bind)
+            .map_err(|error| Error::new(ErrorKind::Io, format!("bind TCP socket: {error}")))?;
+    }
+    tokio::time::timeout(timeout, socket.connect(address))
+        .await
+        .map_err(|_| Error::new(ErrorKind::Timeout, "TCP connect timed out"))?
+        .map_err(|error| Error::new(ErrorKind::Io, format!("TCP connect: {error}")))
 }
 pub trait SecureStream: Read + Write + Send {}
 impl<T: Read + Write + Send> SecureStream for T {}
@@ -60,8 +143,21 @@ impl StreamConnector for DirectConnector {
                 "direct connector requires an already-resolved IP endpoint",
             )
         })?;
-        TcpStream::connect_timeout(&address, self.timeout)
-            .map_err(|error| Error::new(ErrorKind::Io, format!("direct connect: {error}")))
+        connect_std_tcp(address, None, self.timeout)
+    }
+
+    fn connect_with_local(
+        &self,
+        destination: &Endpoint,
+        local_bind: Option<SocketAddr>,
+    ) -> Result<TcpStream> {
+        let address = destination.addr().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unsupported,
+                "direct connector requires an already-resolved IP endpoint",
+            )
+        })?;
+        connect_std_tcp(address, local_bind, self.timeout)
     }
 }
 
@@ -85,8 +181,19 @@ pub struct FixedConnector {
 
 impl StreamConnector for FixedConnector {
     fn connect(&self, _destination: &Endpoint) -> Result<TcpStream> {
-        TcpStream::connect_timeout(&self.address, self.timeout)
-            .map_err(|error| Error::new(ErrorKind::Io, format!("fixed connect: {error}")))
+        connect_std_tcp(self.address, None, self.timeout)
+    }
+
+    fn connect_with_local(
+        &self,
+        _destination: &Endpoint,
+        local_bind: Option<SocketAddr>,
+    ) -> Result<TcpStream> {
+        connect_std_tcp(self.address, local_bind, self.timeout)
+    }
+
+    fn connect_target(&self) -> Option<SocketAddr> {
+        Some(self.address)
     }
 }
 
@@ -99,8 +206,15 @@ pub struct HttpProxyConnector {
 
 impl StreamConnector for HttpProxyConnector {
     fn connect(&self, destination: &Endpoint) -> Result<TcpStream> {
-        let mut stream = TcpStream::connect_timeout(&self.proxy, self.timeout)
-            .map_err(|error| Error::new(ErrorKind::Io, format!("HTTP proxy connect: {error}")))?;
+        self.connect_with_local(destination, None)
+    }
+
+    fn connect_with_local(
+        &self,
+        destination: &Endpoint,
+        local_bind: Option<SocketAddr>,
+    ) -> Result<TcpStream> {
+        let mut stream = connect_std_tcp(self.proxy, local_bind, self.timeout)?;
         stream
             .set_read_timeout(Some(self.timeout))
             .and_then(|_| stream.set_write_timeout(Some(self.timeout)))
@@ -132,6 +246,10 @@ impl StreamConnector for HttpProxyConnector {
         }
         Ok(stream)
     }
+
+    fn connect_target(&self) -> Option<SocketAddr> {
+        Some(self.proxy)
+    }
 }
 
 pub struct Socks5Connector {
@@ -143,8 +261,15 @@ pub struct Socks5Connector {
 
 impl StreamConnector for Socks5Connector {
     fn connect(&self, destination: &Endpoint) -> Result<TcpStream> {
-        let mut stream = TcpStream::connect_timeout(&self.proxy, self.timeout)
-            .map_err(|error| Error::new(ErrorKind::Io, format!("SOCKS5 connect: {error}")))?;
+        self.connect_with_local(destination, None)
+    }
+
+    fn connect_with_local(
+        &self,
+        destination: &Endpoint,
+        local_bind: Option<SocketAddr>,
+    ) -> Result<TcpStream> {
+        let mut stream = connect_std_tcp(self.proxy, local_bind, self.timeout)?;
         stream
             .set_read_timeout(Some(self.timeout))
             .and_then(|_| stream.set_write_timeout(Some(self.timeout)))
@@ -230,6 +355,10 @@ impl StreamConnector for Socks5Connector {
         stream.read_exact(&mut discard).map_err(io_error)?;
         Ok(stream)
     }
+
+    fn connect_target(&self) -> Option<SocketAddr> {
+        Some(self.proxy)
+    }
 }
 
 pub struct FixedProxy {
@@ -239,6 +368,18 @@ pub struct FixedProxy {
 impl StreamConnector for FixedProxy {
     fn connect(&self, destination: &Endpoint) -> Result<TcpStream> {
         self.inner.connect(destination)
+    }
+
+    fn connect_with_local(
+        &self,
+        destination: &Endpoint,
+        local_bind: Option<SocketAddr>,
+    ) -> Result<TcpStream> {
+        self.inner.connect_with_local(destination, local_bind)
+    }
+
+    fn connect_target(&self) -> Option<SocketAddr> {
+        self.inner.connect_target()
     }
 }
 
@@ -325,12 +466,7 @@ impl AsyncProxy for DirectAsyncProxy {
                 )
             })?;
             let stream =
-                tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(address))
-                    .await
-                    .map_err(|_| Error::new(ErrorKind::Timeout, "direct async connect timed out"))?
-                    .map_err(|error| {
-                        Error::new(ErrorKind::Io, format!("direct async connect: {error}"))
-                    })?;
+                connect_tokio_tcp(address, context.local_bind_for(address), self.timeout).await?;
             Ok(Box::new(stream) as BoxAsyncStream)
         })
     }
@@ -351,6 +487,7 @@ impl AsyncProxy for DirectAsyncProxy {
                 std::net::SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
                 std::net::SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
             };
+            let bind_address = context.local_bind_for(address).unwrap_or(bind_address);
             let socket = tokio::net::UdpSocket::bind(bind_address)
                 .await
                 .map_err(|error| Error::new(ErrorKind::Io, format!("direct UDP bind: {error}")))?;
@@ -404,15 +541,10 @@ pub struct FixedAsyncProxy {
 
 #[cfg(feature = "async-proxy")]
 impl AsyncProxy for FixedAsyncProxy {
-    fn connect<'a>(&'a self, _context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        let local_bind = context.local_bind_for(self.address);
         Box::pin(async move {
-            let stream =
-                tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(self.address))
-                    .await
-                    .map_err(|_| Error::new(ErrorKind::Timeout, "fixed async connect timed out"))?
-                    .map_err(|error| {
-                        Error::new(ErrorKind::Io, format!("fixed async connect: {error}"))
-                    })?;
+            let stream = connect_tokio_tcp(self.address, local_bind, self.timeout).await?;
             Ok(Box::new(stream) as BoxAsyncStream)
         })
     }
@@ -448,10 +580,15 @@ impl AsyncProxy for BlockingStreamProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         let connector = Arc::clone(&self.connector);
         let destination = context.effective_destination();
+        let local_bind = connector
+            .connect_target()
+            .and_then(|address| context.local_bind_for(address));
         Box::pin(async move {
-            let stream = tokio::task::spawn_blocking(move || connector.connect(&destination))
-                .await
-                .map_err(|error| Error::new(ErrorKind::Closed, format!("proxy task: {error}")))??;
+            let stream = tokio::task::spawn_blocking(move || {
+                connector.connect_with_local(&destination, local_bind)
+            })
+            .await
+            .map_err(|error| Error::new(ErrorKind::Closed, format!("proxy task: {error}")))??;
             stream.set_nonblocking(true).map_err(|error| {
                 Error::new(ErrorKind::Io, format!("proxy nonblocking mode: {error}"))
             })?;
@@ -564,16 +701,17 @@ impl AsyncProxy for YuubinsyaUdpProxy {
 
     fn open_datagram<'a>(
         &'a self,
-        _context: &'a FlowContext,
+        context: &'a FlowContext,
     ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
         let server = self.server;
         let password_hash = self.password_hash;
         let socks5_prefix = self.socks5_prefix;
+        let fallback = match server {
+            SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+            SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+        };
+        let bind_address = context.local_bind_for(server).unwrap_or(fallback);
         Box::pin(async move {
-            let bind_address = match server {
-                SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-                SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
-            };
             Ok(Box::new(
                 YuubinsyaUdpDatagram::bind(
                     bind_address,
@@ -875,6 +1013,27 @@ mod tests {
         };
         let _stream = connector.connect(&endpoint()).unwrap();
         assert!(handle.join().is_ok());
+    }
+
+    #[test]
+    fn direct_connector_honors_local_bind_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || listener.accept().unwrap().0.peer_addr().unwrap());
+        let connector = DirectConnector {
+            timeout: Duration::from_secs(1),
+        };
+        let stream = connector
+            .connect_with_local(
+                &Endpoint::ip(Network::Tcp, address),
+                Some("127.0.0.2:0".parse().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            stream.local_addr().unwrap().ip(),
+            "127.0.0.2".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(handle.join().unwrap(), stream.local_addr().unwrap());
     }
 
     #[test]

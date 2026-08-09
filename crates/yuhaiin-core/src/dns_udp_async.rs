@@ -6,6 +6,7 @@
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -21,6 +22,7 @@ pub struct AsyncUdpDnsClient {
     pub server: SocketAddr,
     pub timeout: Duration,
     pub max_packet_size: usize,
+    pub local_bind_addresses: Arc<[IpAddr]>,
 }
 
 impl AsyncUdpDnsClient {
@@ -29,11 +31,18 @@ impl AsyncUdpDnsClient {
         domain: &DomainName,
         record_type: DnsRecordType,
     ) -> Result<DnsResponse> {
-        let bind_address = if self.server.is_ipv4() {
+        let default_bind = if self.server.is_ipv4() {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         } else {
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
         };
+        let bind_address = self
+            .local_bind_addresses
+            .iter()
+            .copied()
+            .find(|address| address.is_ipv4() == self.server.is_ipv4())
+            .map(|address| SocketAddr::new(address, 0))
+            .unwrap_or(default_bind);
         let socket = UdpSocket::bind(bind_address)
             .await
             .map_err(|error| Error::new(ErrorKind::Io, format!("bind DNS UDP socket: {error}")))?;
@@ -221,6 +230,9 @@ mod tests {
                 server: server_address,
                 timeout: Duration::from_secs(1),
                 max_packet_size: 4096,
+                local_bind_addresses: Arc::from(
+                    vec!["127.0.0.2".parse::<IpAddr>().unwrap()].into_boxed_slice(),
+                ),
             };
             let domain = DomainName::new("example.com").unwrap();
             let client_future = async move {
@@ -288,6 +300,7 @@ mod tests {
                 server: server_address,
                 timeout: Duration::from_secs(1),
                 max_packet_size: 4096,
+                local_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
             };
             let client_future = async {
                 let answer = client

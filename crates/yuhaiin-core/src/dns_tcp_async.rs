@@ -5,7 +5,8 @@
 //! fallback does not occupy a blocking pool thread per query.
 
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -28,6 +29,7 @@ pub struct AsyncTcpDnsClient {
     pub server: SocketAddr,
     pub timeout: Duration,
     pub max_packet_size: usize,
+    pub local_bind_addresses: Arc<[IpAddr]>,
 }
 
 impl AsyncTcpDnsClient {
@@ -36,7 +38,36 @@ impl AsyncTcpDnsClient {
         domain: &DomainName,
         record_type: DnsRecordType,
     ) -> Result<DnsResponse> {
-        let mut stream = tokio::time::timeout(self.timeout, TcpStream::connect(self.server))
+        let local_bind = self
+            .local_bind_addresses
+            .iter()
+            .copied()
+            .find(|address| address.is_ipv4() == self.server.is_ipv4())
+            .map(|address| SocketAddr::new(address, 0));
+        let connect = async {
+            if let Some(local_bind) = local_bind {
+                let socket = if self.server.is_ipv4() {
+                    tokio::net::TcpSocket::new_v4()
+                } else {
+                    tokio::net::TcpSocket::new_v6()
+                }
+                .map_err(|error| {
+                    Error::new(ErrorKind::Io, format!("create DNS TCP socket: {error}"))
+                })?;
+                socket.bind(local_bind).map_err(|error| {
+                    Error::new(ErrorKind::Io, format!("bind DNS TCP socket: {error}"))
+                })?;
+                socket
+                    .connect(self.server)
+                    .await
+                    .map_err(|error| Error::new(ErrorKind::Io, format!("connect DNS TCP: {error}")))
+            } else {
+                TcpStream::connect(self.server)
+                    .await
+                    .map_err(|error| Error::new(ErrorKind::Io, format!("connect DNS TCP: {error}")))
+            }
+        };
+        let mut stream = tokio::time::timeout(self.timeout, connect)
             .await
             .map_err(|_| Error::new(ErrorKind::Timeout, "connect DNS TCP timed out"))?
             .map_err(|error| Error::new(ErrorKind::Io, format!("connect DNS TCP: {error}")))?;
@@ -358,6 +389,9 @@ mod tests {
                 server: server.local_addr().unwrap(),
                 timeout: Duration::from_secs(1),
                 max_packet_size: 2048,
+                local_bind_addresses: Arc::from(
+                    vec!["127.0.0.2".parse::<IpAddr>().unwrap()].into_boxed_slice(),
+                ),
             };
             let domain = DomainName::new("example.com").unwrap();
             let (server_result, client_result) =
@@ -427,6 +461,7 @@ mod tests {
                     server: address,
                     timeout: Duration::from_secs(1),
                     max_packet_size: 2048,
+                    local_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
                 };
                 let second = first.clone();
                 let domain = DomainName::new("example.com").unwrap();

@@ -1,5 +1,6 @@
 //! DNS-over-TLS transport using the RFC 1035 two-byte length prefix.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -99,8 +100,16 @@ impl RustCryptoDotResolverFactory {
 
 impl ResolverTransportFactory for RustCryptoDotResolverFactory {
     fn build(&self, config: &GoResolverRuntimeConfig) -> Result<Arc<dyn AsyncIpResolver>> {
+        self.build_with_policy(config, &[])
+    }
+
+    fn build_with_policy(
+        &self,
+        config: &GoResolverRuntimeConfig,
+        local_bind_addresses: &[IpAddr],
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
         if config.transport != GoResolverTransport::Dot {
-            return self.builtin.build(config);
+            return self.builtin.build_with_policy(config, local_bind_addresses);
         }
         let (host, port) = split_dot_endpoint(&config.host, &config.id)?;
         let server_name = config
@@ -112,7 +121,8 @@ impl ResolverTransportFactory for RustCryptoDotResolverFactory {
             dialer: RustCryptoTlsDialer::from_config(
                 self.client_config.clone(),
                 self.builtin.timeout,
-            ),
+            )
+            .with_local_bind_addresses(local_bind_addresses),
             host,
             port,
             server_name,

@@ -1,5 +1,8 @@
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
+
+use crate::RuntimeSettings;
 
 /// The management API contract used by the Go `tools.Interfaces` handler.
 ///
@@ -27,6 +30,7 @@ pub(crate) fn discover_interfaces() -> Vec<InterfaceInfo> {
 /// be created by a platform-specific binder that is not represented in the
 /// portable interface listing, in which case the connection field stays empty
 /// instead of reporting a guessed interface.
+#[cfg(any(feature = "http-api", test))]
 pub(crate) fn interface_for_ip(ip: std::net::IpAddr) -> Option<String> {
     let by_address = discover_interfaces().into_iter().find_map(|interface| {
         interface
@@ -47,6 +51,52 @@ pub(crate) fn interface_for_ip(ip: std::net::IpAddr) -> Option<String> {
     })
 }
 
+/// Resolve the Go-compatible interface settings into concrete source
+/// addresses. Desktop Go leaves the OS route untouched when
+/// `useDefaultInterface` is true; an explicit interface (or `default`) binds
+/// each TCP/UDP socket to the matching address family.
+pub(crate) fn bind_addresses_for_settings(settings: &RuntimeSettings) -> Vec<IpAddr> {
+    #[cfg(target_os = "android")]
+    if settings.use_default_interface {
+        return Vec::new();
+    }
+    #[cfg(not(target_os = "android"))]
+    if settings.use_default_interface {
+        return Vec::new();
+    }
+
+    let requested = settings.net_interface.trim();
+    let name = if requested.eq_ignore_ascii_case("default") {
+        #[cfg(target_os = "linux")]
+        {
+            linux::route_interface_for_ip(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    } else if requested.is_empty() {
+        None
+    } else {
+        Some(requested.to_owned())
+    };
+    let Some(name) = name else {
+        return Vec::new();
+    };
+    discover_interfaces()
+        .into_iter()
+        .find(|interface| interface.name == name)
+        .map(|interface| {
+            interface
+                .addresses
+                .iter()
+                .filter_map(|cidr| cidr.split_once('/').and_then(|(ip, _)| ip.parse().ok()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(any(feature = "http-api", test))]
 fn cidr_contains(cidr: &str, ip: std::net::IpAddr) -> bool {
     let Some((network, prefix)) = cidr.rsplit_once('/') else {
         return false;

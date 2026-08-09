@@ -5,6 +5,7 @@
 //! one persisted resolver list can contain System/UDP/TCP, DoH and DoT
 //! entries without changing the `ResolverTransportFactory` boundary.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,9 +64,17 @@ impl RustCryptoResolverFactory {
 
 impl ResolverTransportFactory for RustCryptoResolverFactory {
     fn build(&self, config: &GoResolverRuntimeConfig) -> Result<Arc<dyn AsyncIpResolver>> {
+        self.build_with_policy(config, &[])
+    }
+
+    fn build_with_policy(
+        &self,
+        config: &GoResolverRuntimeConfig,
+        local_bind_addresses: &[IpAddr],
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
         match config.transport {
-            GoResolverTransport::Doh => self.doh.build(config),
-            GoResolverTransport::Dot => self.dot.build(config),
+            GoResolverTransport::Doh => self.doh.build_with_policy(config, local_bind_addresses),
+            GoResolverTransport::Dot => self.dot.build_with_policy(config, local_bind_addresses),
             GoResolverTransport::Doq | GoResolverTransport::Doh3 => Err(Error::new(
                 ErrorKind::Unsupported,
                 format!(
@@ -74,7 +83,7 @@ impl ResolverTransportFactory for RustCryptoResolverFactory {
                 ),
             )),
             GoResolverTransport::System | GoResolverTransport::Udp | GoResolverTransport::Tcp => {
-                self.builtin.build(config)
+                self.builtin.build_with_policy(config, local_bind_addresses)
             }
         }
     }

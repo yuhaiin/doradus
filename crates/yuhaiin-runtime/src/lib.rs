@@ -15,7 +15,6 @@ mod dot_tls;
 mod handle;
 #[path = "inbounds/mod.rs"]
 pub mod inbound;
-#[cfg(any(feature = "http-api", test))]
 mod interfaces;
 pub mod latency;
 pub mod log;
@@ -122,6 +121,9 @@ pub struct RuntimeSnapshot {
     /// one permit while establishing a TCP proxy connection; reload builds a
     /// new budget without changing existing flows.
     pub(crate) connect_semaphore: Arc<Semaphore>,
+    /// Source addresses used when settings request a named/default network
+    /// interface. An empty list preserves the OS default route.
+    pub(crate) socket_bind_addresses: Arc<[IpAddr]>,
     pub resolver: Arc<dyn AsyncIpResolver>,
     pub hosts: HostsTable,
     pub fakeip: Option<FakeIpPools>,
@@ -275,6 +277,8 @@ impl RuntimeBuilder {
     pub async fn build(&self) -> Result<RuntimeSnapshot> {
         let repository = self.store.repository();
         let settings = RuntimeSettings::load(&self.store).await?;
+        let socket_bind_addresses =
+            Arc::from(interfaces::bind_addresses_for_settings(&settings).into_boxed_slice());
         let nat = repository.get_nat_config_or_default("default").await?;
         let hosts = load_hosts(&repository, &self.store).await?;
         let resolvers = repository.list_go_resolver_runtime_configs().await?;
@@ -342,7 +346,7 @@ impl RuntimeBuilder {
         let resolver_registry_enabled = self.resolver_factory.is_some();
         if let Some(factory) = &self.resolver_factory {
             for config in &resolvers {
-                match factory.build(config) {
+                match factory.build_with_policy(config, &socket_bind_addresses) {
                     Ok(raw) => {
                         let wrapped = wrap_resolver(
                             raw,
@@ -379,6 +383,7 @@ impl RuntimeBuilder {
             resolver,
             settings,
             connect_semaphore,
+            socket_bind_addresses,
             hosts,
             fakeip,
             resolvers,
@@ -809,6 +814,7 @@ mod tests {
         let snapshot = RuntimeSnapshot {
             settings: RuntimeSettings::default(),
             connect_semaphore: Arc::new(Semaphore::new(250)),
+            socket_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
             resolver: main,
             hosts: HostsTable::new(),
             fakeip: None,

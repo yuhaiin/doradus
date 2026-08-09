@@ -449,6 +449,27 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the downloaded Country-without-asn.mmdb fixture"]
+    fn downloaded_country_without_asn_fixture_loads_and_queries() {
+        let path = std::env::var_os("YUHAIIN_MAXMIND_FIXTURE")
+            .map(PathBuf::from)
+            .expect("YUHAIIN_MAXMIND_FIXTURE must point to a local .mmdb fixture");
+        let db = GeoDb::open(path).unwrap();
+        assert_eq!(
+            db.country_code("2.125.160.217".parse().unwrap())
+                .unwrap()
+                .as_deref(),
+            Some("GB")
+        );
+        assert_eq!(
+            db.country_code("::ffff:2.125.160.217".parse().unwrap())
+                .unwrap()
+                .as_deref(),
+            Some("GB")
+        );
+    }
+
+    #[test]
     fn startup_load_rejects_corrupt_or_mismatched_metadata() {
         let path = cache_path("startup.mmdb");
         atomic_install(&path, FIXTURE).unwrap();

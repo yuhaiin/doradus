@@ -13,7 +13,7 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use yuhaiin_core::http2::H2DohConnector;
-use yuhaiin_core::proxy::BoxAsyncStream;
+use yuhaiin_core::proxy::{BoxAsyncStream, connect_tokio_tcp};
 use yuhaiin_core::{BoxFuture, Error, ErrorKind, Result};
 
 pub type RustCryptoTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
@@ -22,6 +22,7 @@ pub type RustCryptoTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 pub struct RustCryptoTlsDialer {
     tls: TlsConnector,
     timeout: Duration,
+    local_bind_addresses: Arc<[IpAddr]>,
 }
 
 impl RustCryptoTlsDialer {
@@ -33,7 +34,13 @@ impl RustCryptoTlsDialer {
         Self {
             tls: TlsConnector::from(config),
             timeout,
+            local_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
         }
+    }
+
+    pub fn with_local_bind_addresses(mut self, addresses: &[IpAddr]) -> Self {
+        self.local_bind_addresses = Arc::from(addresses.to_vec().into_boxed_slice());
+        self
     }
 
     pub fn timeout(&self) -> Duration {
@@ -46,10 +53,27 @@ impl RustCryptoTlsDialer {
         port: u16,
         server_name: &str,
     ) -> Result<RustCryptoTlsStream> {
-        let stream = tokio::time::timeout(self.timeout, TcpStream::connect((host, port)))
+        let mut addresses = tokio::net::lookup_host((host, port))
             .await
-            .map_err(|_| Error::new(ErrorKind::Timeout, "TLS TCP connect timed out"))?
-            .map_err(|error| Error::new(ErrorKind::Io, format!("TLS TCP connect: {error}")))?;
+            .map_err(|error| Error::new(ErrorKind::Io, format!("resolve TLS endpoint: {error}")))?;
+        let mut last_error = None;
+        let stream = loop {
+            let Some(remote) = addresses.next() else {
+                return Err(last_error.unwrap_or_else(|| {
+                    Error::new(ErrorKind::Io, "TLS endpoint has no addresses")
+                }));
+            };
+            let local_bind = self
+                .local_bind_addresses
+                .iter()
+                .copied()
+                .find(|address| address.is_ipv4() == remote.ip().is_ipv4())
+                .map(|address| std::net::SocketAddr::new(address, 0));
+            match connect_tokio_tcp(remote, local_bind, self.timeout).await {
+                Ok(stream) => break stream,
+                Err(error) => last_error = Some(error),
+            }
+        };
         stream
             .set_nodelay(true)
             .map_err(|error| Error::new(ErrorKind::Io, format!("TLS TCP_NODELAY: {error}")))?;
@@ -123,6 +147,11 @@ impl RustCryptoH2Connector {
 
     pub fn timeout(&self) -> Duration {
         self.dialer.timeout()
+    }
+
+    pub fn with_local_bind_addresses(mut self, addresses: &[IpAddr]) -> Self {
+        self.dialer = self.dialer.with_local_bind_addresses(addresses);
+        self
     }
 }
 

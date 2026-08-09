@@ -249,7 +249,10 @@ impl RuntimeSnapshot {
         Ok(ProxyBuild {
             config,
             proxy: Arc::new(ConnectBudgetProxy {
-                inner: proxy,
+                inner: Arc::new(SocketPolicyProxy {
+                    inner: proxy,
+                    bind_addresses: self.socket_bind_addresses.clone(),
+                }),
                 semaphore: self.connect_semaphore.clone(),
             }),
         })
@@ -314,11 +317,58 @@ impl RuntimeSnapshot {
             }
             .build()?;
             return Ok(Arc::new(ConnectBudgetProxy {
-                inner: proxy,
+                inner: Arc::new(SocketPolicyProxy {
+                    inner: proxy,
+                    bind_addresses: self.socket_bind_addresses.clone(),
+                }),
                 semaphore: self.connect_semaphore.clone(),
             }));
         }
         Ok(self.build_proxy(id, timeout).await?.proxy)
+    }
+}
+
+/// Apply the immutable interface policy at the last common proxy boundary.
+/// This keeps protocol implementations independent from runtime settings and
+/// also covers chain transports whose first socket is opened outside core.
+struct SocketPolicyProxy {
+    inner: Arc<dyn AsyncProxy>,
+    bind_addresses: Arc<[std::net::IpAddr]>,
+}
+
+impl AsyncProxy for SocketPolicyProxy {
+    fn connect<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> yuhaiin_core::BoxFuture<'a, Result<yuhaiin_core::proxy::BoxAsyncStream>> {
+        let mut context = context.clone();
+        context.local_bind_addresses = self.bind_addresses.to_vec();
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.connect(&context).await })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> yuhaiin_core::BoxFuture<'a, Result<Box<dyn yuhaiin_core::proxy::AsyncDatagram>>> {
+        let mut context = context.clone();
+        context.local_bind_addresses = self.bind_addresses.to_vec();
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.open_datagram(&context).await })
+    }
+
+    fn ping<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> yuhaiin_core::BoxFuture<'a, Result<Duration>> {
+        let mut context = context.clone();
+        context.local_bind_addresses = self.bind_addresses.to_vec();
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.ping(&context).await })
+    }
+
+    fn close(&self) -> yuhaiin_core::BoxFuture<'_, Result<()>> {
+        self.inner.close()
     }
 }
 
@@ -968,6 +1018,7 @@ mod tests {
         RuntimeSnapshot {
             settings: crate::RuntimeSettings::default(),
             connect_semaphore: Arc::new(tokio::sync::Semaphore::new(250)),
+            socket_bind_addresses: Arc::from(Vec::<std::net::IpAddr>::new().into_boxed_slice()),
             resolver: Arc::new(SystemAsyncIpResolver),
             hosts: yuhaiin_core::dns_hosts::HostsTable::new(),
             fakeip: None,
@@ -1052,8 +1103,8 @@ mod tests {
         assert!(!Arc::ptr_eq(&selected, &direct));
     }
 
-    #[test]
-    fn live_selector_reload_replaces_data_plane_settings() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_selector_reload_replaces_data_plane_settings() {
         let config = GoProxyRuntimeConfig {
             id: "proxy".to_owned(),
             name: "Proxy".to_owned(),
@@ -1069,18 +1120,36 @@ mod tests {
         first.settings.udp_buffer_size = 4096;
         first.settings.relay_buffer_size = 8192;
         first.settings.udp_ringbuffer_size = 512;
-        let selector =
-            block_on(first.build_proxy_selector("", "proxy", "", "", Duration::from_secs(1)))
-                .unwrap();
+        first.socket_bind_addresses =
+            Arc::from(vec!["127.0.0.2".parse::<std::net::IpAddr>().unwrap()].into_boxed_slice());
+        let selector = first
+            .build_proxy_selector("", "proxy", "", "", Duration::from_secs(1))
+            .await
+            .unwrap();
         assert_eq!(selector.udp_buffer_size(), 4096);
         assert_eq!(selector.relay_buffer_size(), 8192);
         assert_eq!(selector.udp_ringbuffer_size(), 512);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || listener.accept().unwrap().0.peer_addr().unwrap());
+        let context = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            address,
+        ));
+        let _stream = selector.select(&context).connect(&context).await.unwrap();
+        assert_eq!(
+            peer.join().unwrap().ip(),
+            "127.0.0.2".parse::<std::net::IpAddr>().unwrap()
+        );
 
         let mut next = snapshot(config);
         next.settings.udp_buffer_size = 2048;
         next.settings.relay_buffer_size = 2049;
         next.settings.udp_ringbuffer_size = 100;
-        let prepared = block_on(selector.prepare(&next)).unwrap();
+        next.socket_bind_addresses =
+            Arc::from(vec!["127.0.0.2".parse::<std::net::IpAddr>().unwrap()].into_boxed_slice());
+        let prepared = selector.prepare(&next).await.unwrap();
         selector.replace(prepared);
         assert_eq!(selector.udp_buffer_size(), 2048);
         assert_eq!(selector.relay_buffer_size(), 2049);

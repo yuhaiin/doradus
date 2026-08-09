@@ -247,6 +247,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v2/tools/interfaces", get(tools_interfaces))
         .route("/api/v2/tools/licenses", get(tools_licenses))
         .route("/api/v2/tools/logs/v2", get(tools_logs_v2))
+        .route("/debug/pprof/", get(pprof_index))
+        .route("/debug/pprof/profile", get(pprof_profile))
         .route(
             "/api/v2/subscriptions",
             get(subscriptions_get)
@@ -357,6 +359,88 @@ async fn authenticate(auth: Option<ApiAuth>, request: Request<Body>, next: Next)
     } else {
         (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PprofQuery {
+    seconds: Option<u64>,
+}
+
+/// Rust-native profiling endpoints.  The payload is the standard protobuf
+/// pprof profile produced by `pprof-rs`; it is intentionally not coupled to
+/// Go's runtime profiler implementation.
+async fn pprof_index(State(state): State<ApiState>) -> Response {
+    if !state.controller.handle().load().settings.pprof {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        "<!doctype html><title>yuhaiin Rust profiles</title>\n<ul><li><a href=\"/debug/pprof/profile?seconds=10\">CPU profile (protobuf)</a></li></ul>\n",
+    )
+        .into_response()
+}
+
+async fn pprof_profile(State(state): State<ApiState>, Query(query): Query<PprofQuery>) -> Response {
+    if !state.controller.handle().load().settings.pprof {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let seconds = query.seconds.unwrap_or(10).clamp(1, 60);
+    let guard = match pprof::ProfilerGuard::new(100) {
+        Ok(guard) => guard,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("cannot start Rust CPU profiler: {error}"),
+            )
+                .into_response();
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(seconds)).await;
+    let report = match guard.report().build() {
+        Ok(report) => report,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot build Rust CPU profile: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let profile = match report.pprof() {
+        Ok(profile) => profile,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot encode Rust CPU profile: {error}"),
+            )
+                .into_response();
+        }
+    };
+    use pprof::protos::Message;
+    let mut body = Vec::new();
+    if let Err(error) = profile.encode(&mut body) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot serialize Rust CPU profile: {error}"),
+        )
+            .into_response();
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"yuhaiin-rust-profile.pb\"",
+        )
+        .body(Body::from(body))
+        .unwrap_or_else(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot create profile response: {error}"),
+            )
+                .into_response()
+        })
 }
 
 fn digest(value: &[u8]) -> [u8; 32] {
@@ -2919,6 +3003,54 @@ mod tests {
             .unwrap();
         assert_eq!(listed.0["items"][0]["chain"][0]["type"], "direct");
         assert_eq!(state.controller.handle().revision(), 1);
+    }
+
+    #[tokio::test]
+    async fn rust_pprof_index_follows_runtime_setting() {
+        let state = state().await;
+        let app = router(state.clone());
+        let enabled = app
+            .clone()
+            .oneshot(Request::get("/debug/pprof/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(enabled.status(), StatusCode::OK);
+        assert_eq!(
+            enabled.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        let profile = app
+            .oneshot(
+                Request::get("/debug/pprof/profile?seconds=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(profile.status(), StatusCode::OK);
+        assert_eq!(
+            profile.headers()[header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        assert!(
+            !to_bytes(profile.into_body(), 16 * 1024 * 1024)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        state
+            .controller
+            .store()
+            .put_config("settings", br#"{"pprof":false}"#)
+            .await
+            .unwrap();
+        state.controller.reload().await.unwrap();
+        let disabled = router(state)
+            .oneshot(Request::get("/debug/pprof/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

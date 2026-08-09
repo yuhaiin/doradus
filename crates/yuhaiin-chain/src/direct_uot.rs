@@ -13,10 +13,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::split;
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, connect_tokio_tcp};
 use yuhaiin_core::yuubinsya::derive_salt;
 use yuhaiin_core::{BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, Result};
 
@@ -210,16 +209,25 @@ impl AsyncProxy for DirectUotProxy {
             context.udp_migrate_id.load(Ordering::Acquire),
         ));
         let context_migrate_id = Arc::clone(&context.udp_migrate_id);
+        let local_bind_addresses = Arc::new(context.local_bind_addresses.clone());
         Box::pin(async move {
             if proxy.closed.load(Ordering::Acquire) {
                 return Err(closed_error());
             }
             let (session, assigned_id) = proxy
-                .connect_session(migrate_id.load(Ordering::Acquire))
+                .connect_session(
+                    migrate_id.load(Ordering::Acquire),
+                    local_bind_addresses.as_slice(),
+                )
                 .await?;
             migrate_id.store(assigned_id, Ordering::Release);
             context_migrate_id.store(assigned_id, Ordering::Release);
-            let datagram = Arc::new(DirectUotDatagram::new(proxy.clone(), migrate_id, session));
+            let datagram = Arc::new(DirectUotDatagram::new(
+                proxy.clone(),
+                migrate_id,
+                session,
+                local_bind_addresses,
+            ));
             if let Err(error) = proxy.register_datagram(&datagram).await {
                 let _ = datagram.close().await;
                 return Err(error);
@@ -261,28 +269,26 @@ impl DirectUotProxy {
         Ok(())
     }
 
-    async fn connect_session(&self, migrate_id: u64) -> Result<(Arc<DirectUotSession>, u64)> {
+    async fn connect_session(
+        &self,
+        migrate_id: u64,
+        local_bind_addresses: &[std::net::IpAddr],
+    ) -> Result<(Arc<DirectUotSession>, u64)> {
         let addresses = resolve_endpoints(&self.endpoints, self.resolver.as_ref()).await?;
         let mut last_error = None;
         for address in addresses {
-            let stream =
-                match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(error)) => {
-                        last_error = Some(Error::new(
-                            ErrorKind::Io,
-                            format!("Yuubinsya UOT connect: {error}"),
-                        ));
-                        continue;
-                    }
-                    Err(_) => {
-                        last_error = Some(Error::new(
-                            ErrorKind::Timeout,
-                            "Yuubinsya UOT connect timed out",
-                        ));
-                        continue;
-                    }
-                };
+            let local_bind = local_bind_addresses
+                .iter()
+                .copied()
+                .find(|ip| ip.is_ipv4() == address.ip().is_ipv4())
+                .map(|ip| SocketAddr::new(ip, 0));
+            let stream = match connect_tokio_tcp(address, local_bind, CONNECT_TIMEOUT).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
             let session = match AsyncYuubinsyaUotSession::connect(
                 stream,
                 self.password_hash,
@@ -330,6 +336,7 @@ async fn resolve_endpoints(
 struct DirectUotDatagram {
     proxy: DirectUotProxy,
     migrate_id: Arc<AtomicU64>,
+    local_bind_addresses: Arc<Vec<std::net::IpAddr>>,
     session: Mutex<Option<Arc<DirectUotSession>>>,
     reconnect_lock: Mutex<()>,
     closed: AtomicBool,
@@ -362,10 +369,12 @@ impl DirectUotDatagram {
         proxy: DirectUotProxy,
         migrate_id: Arc<AtomicU64>,
         session: Arc<DirectUotSession>,
+        local_bind_addresses: Arc<Vec<std::net::IpAddr>>,
     ) -> Self {
         Self {
             proxy,
             migrate_id,
+            local_bind_addresses,
             session: Mutex::new(Some(session)),
             reconnect_lock: Mutex::new(()),
             closed: AtomicBool::new(false),
@@ -392,7 +401,10 @@ impl DirectUotDatagram {
         }
         let (session, assigned_id) = self
             .proxy
-            .connect_session(self.migrate_id.load(Ordering::Acquire))
+            .connect_session(
+                self.migrate_id.load(Ordering::Acquire),
+                self.local_bind_addresses.as_slice(),
+            )
             .await?;
         self.migrate_id.store(assigned_id, Ordering::Release);
         *self.session.lock().await = Some(session);
