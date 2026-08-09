@@ -2045,7 +2045,7 @@ loopback echo，并在 runtime 子进程上采样 Linux `VmRSS` 与 `/proc/<pid>
 | 场景 | 状态 | 说明 |
 | --- | --- | --- |
 | HTTP inbound → router → HTTP CONNECT outbound | 已有可执行基准 | `make benchmark-throughput`；默认 64 MiB、单流、loopback |
-| TUN inbound | 设备/生命周期 smoke | `scripts/integration/tun-service.sh`；真实带宽基准仍需 packet generator/namespace fixture |
+| TUN inbound | 已有可执行 packet 基准 | `make benchmark-tun-throughput`；默认 4 MiB、单流、privileged Podman、TUN → smoltcp → fixed proxy → loopback echo；更长流仍需继续修复/验证 |
 | WireGuard | 未实现/不报告性能 | 当前范围没有 WireGuard backend，不用虚构结果 |
 
 benchmark 数值只能用于同机、同 profile、同 payload 和同 namespace 的回归比较，不能
@@ -2059,3 +2059,15 @@ BENCHMARK {"bytes":67108864,"cpu_ticks":26,"elapsed_ms":309.641875,"mib_per_sec"
 
 该数值是当前机器和当前构建的基线，不是验收阈值；后续改动应在相同参数下重复运行并
 记录变化原因。
+
+本机 TUN packet 基线（2026-08-10，release、privileged Podman、4 MiB、单流，实际
+`tun-rs + smoltcp + fixed proxy + loopback echo`）：
+
+```text
+BENCHMARK {"scenario":"tun-inbound-fixed-proxy-loopback","bytes":4194304,"elapsed_ms":67.218512,"mib_per_sec":59.50741664736643,"peak_rss_kib":29180,"cpu_ticks":7,"proc_samples":378}
+```
+
+该 TUN runner 采用 4 MiB smoltcp TCP RX/TX buffer 和有界 proxy channel，以避免把
+单包 smoke 的结果误当成持续流性能；当前 4/8/16 MiB 在本机通过，64 MiB 长流仍会在
+尾段关闭，故不作为稳定基线。数值只能用于同机、同 profile、同 payload 和同 namespace
+的回归比较，不能直接解释为 Go 与 Rust 的跨机器性能结论。

@@ -908,6 +908,7 @@ pub struct TunProxyRuntime {
     tasks: HashMap<TunFlowKey, ProxyTask>,
     udp_tasks: HashMap<UdpSourceKey, UdpProxyTask>,
     udp_flow_sources: HashMap<TunFlowKey, UdpSourceKey>,
+    pending_tcp: HashMap<TunFlowKey, VecDeque<Vec<u8>>>,
     dns_tasks: Vec<tokio::task::JoinHandle<()>>,
     async_dns_tasks: FuturesUnordered<AsyncDnsTask>,
     tracked_flows: HashSet<TunFlowKey>,
@@ -937,6 +938,7 @@ impl TunProxyRuntime {
             tasks: HashMap::new(),
             udp_tasks: HashMap::new(),
             udp_flow_sources: HashMap::new(),
+            pending_tcp: HashMap::new(),
             dns_tasks: Vec::new(),
             async_dns_tasks: FuturesUnordered::new(),
             tracked_flows: HashSet::new(),
@@ -1208,6 +1210,27 @@ impl TunProxyRuntime {
         self.apply_close_requests(dispatcher)?;
         self.poll_async_dns()?;
         let mut count = 0;
+        let pending_flows = self.pending_tcp.keys().copied().collect::<Vec<_>>();
+        for flow in pending_flows {
+            let mut drained = false;
+            while let Some(payload) = self
+                .pending_tcp
+                .get_mut(&flow)
+                .and_then(VecDeque::pop_front)
+            {
+                if dispatcher.write_tcp(flow, &payload).is_err() {
+                    self.pending_tcp
+                        .entry(flow)
+                        .or_default()
+                        .push_front(payload);
+                    break;
+                }
+                drained = true;
+            }
+            if drained && self.pending_tcp.get(&flow).is_some_and(VecDeque::is_empty) {
+                self.pending_tcp.remove(&flow);
+            }
+        }
         while let Ok(output) = self.output_rx.try_recv() {
             count += 1;
             match output {
@@ -1217,8 +1240,8 @@ impl TunProxyRuntime {
                         observer.bytes(flow, TunFlowDirection::Download, payload.len());
                     }
                     if dispatcher.write_tcp(flow, &payload).is_err() {
-                        self.remove_task(&flow);
-                        self.untrack_flow(&flow)?;
+                        self.pending_tcp.entry(flow).or_default().push_back(payload);
+                        break;
                     }
                 }
                 ProxyOutput::UdpData { flow, payload } => {
@@ -1246,6 +1269,7 @@ impl TunProxyRuntime {
                 }
                 ProxyOutput::TcpClosed { flow } => {
                     let _ = dispatcher.close_tcp(flow);
+                    self.pending_tcp.remove(&flow);
                     self.remove_task(&flow);
                     self.untrack_flow(&flow)?;
                 }
@@ -1452,6 +1476,7 @@ impl TunProxyRuntime {
         if let Some(task) = self.tasks.remove(flow) {
             task.join.abort();
         }
+        self.pending_tcp.remove(flow);
     }
 
     fn remove_flow_task(&mut self, flow: &TunFlowKey) {

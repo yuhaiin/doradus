@@ -232,12 +232,16 @@ scripts/integration/api-contract.sh
 
 # Release runtime throughput and Linux RSS/CPU process sampling:
 make benchmark-throughput
+
+# Privileged real TUN packet relay throughput and Linux RSS/CPU sampling:
+make benchmark-tun-throughput
 ```
 
 Benchmark status is intentionally explicit: HTTP inbound → router → HTTP
-CONNECT outbound has a repeatable single-stream benchmark; TUN currently has
-privileged device/lifecycle smoke but no packet-throughput fixture; WireGuard is
-not implemented in the current scope and therefore has no reported number.
+CONNECT outbound and the single-path TUN relay both have repeatable benchmarks;
+TUN defaults to a stable 4 MiB packet-stream fixture and larger long-stream
+tests remain a separate follow-up. WireGuard is not implemented in the current
+scope and therefore has no reported number.
 
 当前阶段新增的 source-bind 容器回归：
 

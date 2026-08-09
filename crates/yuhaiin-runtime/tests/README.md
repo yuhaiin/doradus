@@ -90,9 +90,13 @@ YUHAIIN_BENCH_BYTES=$((256 * 1024 * 1024)) make benchmark-throughput
 
 The result is only comparable when the machine, profile, payload, network
 namespace, and fixture are held constant. TUN currently has a privileged
-Podman device/lifecycle smoke (`scripts/integration/tun-service.sh`) rather
-than a packet-throughput benchmark; WireGuard is intentionally not implemented
-in the current scope, so no WireGuard performance number is reported.
+Podman packet benchmark (`make benchmark-tun-throughput`) in addition to the
+device/lifecycle smoke (`scripts/integration/tun-service.sh`). The TUN runner
+uses one real `tun-rs + smoltcp + fixed proxy + loopback echo` stream and
+defaults to a stable 4 MiB transfer; increase `YUHAIIN_TUN_BENCH_BYTES` only
+when investigating long-stream behavior. WireGuard is intentionally not
+implemented in the current scope, so no WireGuard performance number is
+reported.
 
 Run the tests from the repository root:
 
@@ -115,6 +119,9 @@ The runtime-owned TUN process smoke uses the same cache convention:
 
 ```bash
 scripts/integration/tun-service.sh
+
+make benchmark-tun-throughput
+YUHAIIN_TUN_BENCH_BYTES=$((16 * 1024 * 1024)) make benchmark-tun-throughput
 ```
 
 The fixtures only use loopback sockets. A container runner should use

@@ -24,6 +24,7 @@ fn main() -> std::io::Result<()> {
     let read_once = env::var_os("YUHAIIN_TUN_READ_ONCE").is_some();
     let echo = env::var_os("YUHAIIN_TUN_ECHO").is_some();
     let proxy_echo = env::var_os("YUHAIIN_TUN_PROXY_ECHO").is_some();
+    let proxy_throughput = env::var_os("YUHAIIN_TUN_PROXY_THROUGHPUT").is_some();
     let dns_echo = env::var_os("YUHAIIN_TUN_DNS_ECHO").is_some();
     let route_smoke = env::var_os("YUHAIIN_TUN_ROUTE_SMOKE").is_some();
     let mut runtime = TunRuntime::open(TunConfig {
@@ -71,6 +72,19 @@ fn main() -> std::io::Result<()> {
             ),
         ])
         .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if proxy_throughput {
+        #[cfg(feature = "async-proxy")]
+        {
+            return run_proxy_throughput(runtime);
+        }
+        #[cfg(not(feature = "async-proxy"))]
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "YUHAIIN_TUN_PROXY_THROUGHPUT requires the async-proxy feature",
+            ));
+        }
+    }
     if proxy_echo {
         #[cfg(feature = "async-proxy")]
         {
@@ -239,6 +253,224 @@ fn main() -> std::io::Result<()> {
     }
     thread::sleep(Duration::from_millis(hold_ms));
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct ProcessUsage {
+    peak_rss_kib: u64,
+    samples: u64,
+    first_cpu_ticks: Option<u64>,
+    last_cpu_ticks: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessUsage {
+    fn cpu_ticks(&self) -> u64 {
+        self.last_cpu_ticks
+            .unwrap_or_default()
+            .saturating_sub(self.first_cpu_ticks.unwrap_or_default())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct ProcessReading {
+    rss_kib: u64,
+    cpu_ticks: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_usage() -> Option<ProcessReading> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let rss_kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:")?.split_whitespace().next())?
+        .parse()
+        .ok()?;
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let fields = stat
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let user_ticks = fields.get(11)?.parse::<u64>().ok()?;
+    let system_ticks = fields.get(12)?.parse::<u64>().ok()?;
+    Some(ProcessReading {
+        rss_kib,
+        cpu_ticks: user_ticks.saturating_add(system_ticks),
+    })
+}
+
+#[cfg(feature = "async-proxy")]
+fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
+
+    use yuhaiin_core::proxy::{AsyncProxy, DropAsyncProxy, FixedAsyncProxy, StaticProxySelector};
+    use yuhaiin_core::tun::{TunDispatcher, TunProxyRuntime};
+
+    let total_bytes = env::var("YUHAIIN_TUN_BENCH_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4 * 1024 * 1024)
+        .max(1);
+    let async_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    async_runtime.block_on(async move {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let target_address = target.local_addr()?;
+        let target_task = tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await?;
+            let mut buffer = vec![0u8; 64 * 1024];
+            let mut remaining = total_bytes;
+            while remaining > 0 {
+                let chunk_len = remaining.min(buffer.len());
+                let length = tokio::io::AsyncReadExt::read(
+                    &mut stream,
+                    &mut buffer[..chunk_len],
+                )
+                .await?;
+                if length == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "TUN benchmark client closed before target received the payload",
+                    ));
+                }
+                tokio::io::AsyncWriteExt::write_all(&mut stream, &buffer[..length]).await?;
+                remaining -= length;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (metrics_tx, metrics_rx) = mpsc::channel();
+        let client = std::thread::spawn(move || -> std::io::Result<()> {
+            let result = (|| -> std::io::Result<()> {
+                let mut stream = std::net::TcpStream::connect_timeout(
+                    &"10.0.0.2:18080".parse().unwrap(),
+                    Duration::from_secs(10),
+                )?;
+                stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+                let payload = vec![0x5a; 64 * 1024];
+                let started = Instant::now();
+                #[cfg(target_os = "linux")]
+                let mut usage = ProcessUsage::default();
+                let mut sent = 0usize;
+                while sent < total_bytes {
+                    let length = (total_bytes - sent).min(payload.len());
+                    stream.write_all(&payload[..length])?;
+                    sent += length;
+                    #[cfg(target_os = "linux")]
+                    if let Some(reading) = read_process_usage() {
+                        usage.peak_rss_kib = usage.peak_rss_kib.max(reading.rss_kib);
+                        usage.samples = usage.samples.saturating_add(1);
+                        usage.first_cpu_ticks.get_or_insert(reading.cpu_ticks);
+                        usage.last_cpu_ticks = Some(reading.cpu_ticks);
+                    }
+                }
+                let mut received = 0usize;
+                let mut response = vec![0u8; 64 * 1024];
+                while received < total_bytes {
+                    let length = stream.read(&mut response)?;
+                    if length == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!("TUN proxy closed after {received} of {total_bytes} bytes"),
+                        ));
+                    }
+                    if response[..length].iter().any(|byte| *byte != 0x5a) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "TUN proxy throughput payload mismatch",
+                        ));
+                    }
+                    received += length;
+                    #[cfg(target_os = "linux")]
+                    if let Some(reading) = read_process_usage() {
+                        usage.peak_rss_kib = usage.peak_rss_kib.max(reading.rss_kib);
+                        usage.samples = usage.samples.saturating_add(1);
+                        usage.first_cpu_ticks.get_or_insert(reading.cpu_ticks);
+                        usage.last_cpu_ticks = Some(reading.cpu_ticks);
+                    }
+                }
+                stream.shutdown(std::net::Shutdown::Write)?;
+                #[cfg(target_os = "linux")]
+                let (peak_rss_kib, cpu_ticks, proc_samples) =
+                    (usage.peak_rss_kib, usage.cpu_ticks(), usage.samples);
+                #[cfg(not(target_os = "linux"))]
+                let (peak_rss_kib, cpu_ticks, proc_samples) = (0, 0, 0);
+                metrics_tx
+                    .send((received, started.elapsed(), peak_rss_kib, cpu_ticks, proc_samples))
+                    .map_err(|_| std::io::Error::other("benchmark metrics receiver closed"))?;
+                Ok(())
+            })();
+            let signal = result.as_ref().map(|_| ()).map_err(ToString::to_string);
+            let _ = done_tx.send(signal);
+            result
+        });
+
+        let proxy: Arc<dyn AsyncProxy> = Arc::new(FixedAsyncProxy {
+            address: target_address,
+            timeout: Duration::from_secs(10),
+        });
+        let drop: Arc<dyn AsyncProxy> = Arc::new(DropAsyncProxy);
+        let selector = Arc::new(StaticProxySelector {
+            direct: Arc::clone(&drop),
+            proxy,
+            bypass: Arc::clone(&drop),
+            drop,
+        });
+        // The benchmark intentionally allows enough packet commands for the
+        // kernel/TUN queue to get ahead of the async proxy task. Production
+        // callers still choose their own bounded channel from config.
+        let mut proxy_runtime = TunProxyRuntime::new(selector, 64 * 1024)
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+            .with_io_timeout(Duration::from_secs(10))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut dispatcher = TunDispatcher::new(4 * 1024 * 1024, 4 * 1024 * 1024, 16 * 1024)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        runtime
+            .run_dispatcher_until(
+                &mut dispatcher,
+                &mut proxy_runtime,
+                Duration::from_millis(1),
+                async move {
+                    let result = done_rx.await.unwrap_or_else(|_| Err("shutdown".into()));
+                    let _ = result_tx.send(result);
+                },
+            )
+            .await?;
+        proxy_runtime.close();
+        if let Err(message) = result_rx
+            .await
+            .map_err(|_| std::io::Error::other("TUN benchmark result channel closed"))?
+        {
+            let _ = client.join();
+            return Err(std::io::Error::other(message));
+        }
+        client
+            .join()
+            .map_err(|_| std::io::Error::other("TUN benchmark client thread panicked"))??;
+        target_task
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))??;
+        let (bytes, elapsed, peak_rss_kib, cpu_ticks, proc_samples) = metrics_rx
+            .recv()
+            .map_err(|_| std::io::Error::other("TUN benchmark metrics missing"))?;
+        println!(
+            "BENCHMARK {{\"scenario\":\"tun-inbound-fixed-proxy-loopback\",\"bytes\":{bytes},\"elapsed_ms\":{},\"mib_per_sec\":{},\"peak_rss_kib\":{},\"cpu_ticks\":{},\"proc_samples\":{}}}",
+            elapsed.as_secs_f64() * 1000.0,
+            (bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64(),
+            peak_rss_kib,
+            cpu_ticks,
+            proc_samples
+        );
+        Ok(())
+    })
 }
 
 #[cfg(feature = "async-proxy")]
