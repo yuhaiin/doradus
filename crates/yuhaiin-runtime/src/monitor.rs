@@ -856,6 +856,10 @@ impl ConnectionMonitor {
         let Some(entry) = state.connections.remove(&flow) else {
             return;
         };
+        // Go's `connections.total.counters` is a live-flow view.  The
+        // per-connection counter is removed together with the connection;
+        // durable totals and history are maintained separately below.
+        state.counters.remove(&entry.id);
         if entry.value.get("mode").and_then(Value::as_str) == Some("block") {
             let protocol = entry
                 .value
@@ -935,7 +939,11 @@ impl ConnectionMonitor {
         state.next_id = persisted.next_id;
         state.total_upload = persisted.total_upload;
         state.total_download = persisted.total_download;
-        state.counters = persisted.counters;
+        // Active sockets are intentionally not restored after a process
+        // restart, so counters from an older checkpoint cannot describe a
+        // live connection. Keep deserializing the legacy field for v1 file
+        // compatibility, but start the live counter map empty like Go.
+        state.counters.clear();
         state.buckets = persisted.buckets;
         state.history = persisted.history;
         state.failed_history = persisted
@@ -1416,8 +1424,11 @@ mod tests {
             0
         );
         assert_eq!(
-            monitor.total_flow_value()["counters"]["1"]["download"],
-            "11"
+            monitor.total_flow_value()["counters"]
+                .as_object()
+                .unwrap()
+                .get("1"),
+            None
         );
         assert_eq!(
             monitor.telemetry_value()["groups"]
@@ -1580,6 +1591,34 @@ mod tests {
         let history = monitor.all_history_value();
         assert_eq!(history["items"].as_array().unwrap().len(), 1);
         assert_eq!(history["items"][0]["count"], "2");
+    }
+
+    #[tokio::test]
+    async fn monitor_does_not_restore_live_counters_without_live_connections() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let monitor = ConnectionMonitor::load_with_store(store.clone())
+            .await
+            .unwrap();
+        let (flow, context) = flow();
+        monitor.opened(flow, context);
+        monitor.bytes(flow.key, TunFlowDirection::Upload, 11);
+        monitor.shutdown().await.unwrap();
+
+        let reloaded = ConnectionMonitor::load_with_store(store).await.unwrap();
+        assert!(
+            reloaded.connections_value()["connections"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reloaded.total_flow_value()["counters"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(reloaded.total_flow_value()["upload"], "11");
+        reloaded.shutdown().await.unwrap();
     }
 
     #[test]

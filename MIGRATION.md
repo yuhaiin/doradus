@@ -1476,3 +1476,9 @@ connections.total
 用上一个 Go RPC smoke 生成的独立 `state.db`，在 Go 进程退出后直接启动 Rust binary；Rust 首次启动曾因严格拒绝 `dns_hosts` 中 Go fresh state 自带的 `example.com -> example.com` self-mapping 而失败。Go 将这类记录当作合法 no-op，Rust 现在在 `insert_target` 兼容加载时忽略该 self-mapping，普通 alias cycle 仍由解析阶段拒绝。
 
 修复后 Rust 成功打开并接管同一 Go fresh state，实际请求 `/api/v2/info`、`/api/v2/settings`、`/api/v2/nodes`、`/api/v2/connections/total` 均收到 HTTP 200，并通过 SIGTERM 正常退出。该回归覆盖了真实 Go SQLite 文件的 hosts/migration/open/runtime 初始化边界；生产库中的更多 hosts、route、resolver、统计异常快照仍需按 checklist 扩充。
+
+## 25. 2026-08-09 live statistics counter semantics
+
+Go `pkg/statistics/statistic.go` 的 `Connections.Remove` 会同时删除连接和其 per-flow counter；`connections.total.counters` 不是历史累计表，而是当前活动 flow 的视图。Rust 之前在 `monitor.close` 后保留 counter，并在重启时从 checkpoint 恢复没有对应 socket 的 counter，导致前端看到已关闭/不存在的连接仍出现在 counters 中。
+
+Rust 现在在关闭 flow 时删除 live counter；恢复旧版 `statistics.runtime` 时继续接受旧 `counters` 字段，但因为活动 socket 不会恢复而清空该 map。新增关闭后与重启后的回归，保留 totals/history/telemetry 的持久化。`yuhaiin-runtime` all-features 单测本轮为 183 项通过。
