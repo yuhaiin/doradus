@@ -66,6 +66,7 @@ impl RuntimeSnapshot {
         } else if matches!(
             config.transport,
             yuhaiin_store::GoProxyTransport::Shadowsocks
+                | yuhaiin_store::GoProxyTransport::Shadowsocksr
                 | yuhaiin_store::GoProxyTransport::Trojan
                 | yuhaiin_store::GoProxyTransport::Vless
                 | yuhaiin_store::GoProxyTransport::Vmess
@@ -97,6 +98,7 @@ impl RuntimeSnapshot {
                 .find(|layer| {
                     layer.kind.eq_ignore_ascii_case(match config.transport {
                         yuhaiin_store::GoProxyTransport::Shadowsocks => "shadowsocks",
+                        yuhaiin_store::GoProxyTransport::Shadowsocksr => "shadowsocksr",
                         yuhaiin_store::GoProxyTransport::Trojan => "trojan",
                         yuhaiin_store::GoProxyTransport::Vless => "vless",
                         yuhaiin_store::GoProxyTransport::Vmess => "vmess",
@@ -119,6 +121,49 @@ impl RuntimeSnapshot {
                         .ok_or_else(|| Error::invalid("Shadowsocks method is missing"))?;
                     Arc::new(yuhaiin_protocol::shadowsocks::ShadowsocksProxy::new(
                         upstream, method, password,
+                    )?) as Arc<dyn AsyncProxy>
+                }
+                yuhaiin_store::GoProxyTransport::Shadowsocksr => {
+                    let password = layer
+                        .config
+                        .get("password")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let method = layer
+                        .config
+                        .get("method")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("chacha20-ietf");
+                    let protocol = layer
+                        .config
+                        .get("protocol")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("origin");
+                    let protocol_param = layer
+                        .config
+                        .get("protoparam")
+                        .or_else(|| layer.config.get("protocol_param"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let obfs = layer
+                        .config
+                        .get("obfs")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("plain");
+                    let obfs_param = layer
+                        .config
+                        .get("obfsparam")
+                        .or_else(|| layer.config.get("obfs_param"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    Arc::new(yuhaiin_protocol::shadowsocksr::ShadowsocksrProxy::new(
+                        upstream,
+                        method,
+                        password,
+                        protocol,
+                        protocol_param,
+                        obfs,
+                        obfs_param,
                     )?) as Arc<dyn AsyncProxy>
                 }
                 yuhaiin_store::GoProxyTransport::Trojan => {
@@ -317,6 +362,7 @@ fn is_chain_config(config: &GoProxyRuntimeConfig) -> bool {
             config.transport,
             yuhaiin_store::GoProxyTransport::Trojan
                 | yuhaiin_store::GoProxyTransport::Shadowsocks
+                | yuhaiin_store::GoProxyTransport::Shadowsocksr
                 | yuhaiin_store::GoProxyTransport::Vless
                 | yuhaiin_store::GoProxyTransport::Vmess
         )
@@ -803,6 +849,45 @@ mod tests {
         };
         let built = snapshot(config)
             .build_proxy("shadowsocks", Duration::from_secs(2))
+            .await
+            .unwrap();
+        let context = yuhaiin_core::FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        assert!(built.proxy.connect(&context).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn go_shadowsocksr_layer_builds_a_runtime_proxy() {
+        let config = GoProxyRuntimeConfig {
+            id: "shadowsocksr".to_owned(),
+            name: "shadowsocksr".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned(), "shadowsocksr".to_owned()],
+            layers: vec![
+                yuhaiin_store::GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({"addresses":[{"host":"127.0.0.1","port":24447}]}),
+                },
+                yuhaiin_store::GoProxyLayer {
+                    kind: "shadowsocksr".to_owned(),
+                    config: serde_json::json!({
+                        "method":"aes-256-ctr",
+                        "password":"secret",
+                        "protocol":"auth_aes128_md5",
+                        "obfs":"plain",
+                        "futureField":true
+                    }),
+                },
+            ],
+            transport: GoProxyTransport::Shadowsocksr,
+            data_json: serde_json::to_vec(&serde_json::json!({"chain":[]})).unwrap(),
+        };
+        let built = snapshot(config)
+            .build_proxy("shadowsocksr", Duration::from_secs(2))
             .await
             .unwrap();
         let context = yuhaiin_core::FlowContext::new(yuhaiin_core::Endpoint::ip(

@@ -5,6 +5,7 @@
 //! the wire and wrappers which can be composed around an [`AsyncProxy`].
 
 pub mod shadowsocks;
+pub mod shadowsocksr;
 #[cfg(feature = "tls-rustcrypto")]
 pub mod tls;
 pub mod trojan;

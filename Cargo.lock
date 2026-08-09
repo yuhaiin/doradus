@@ -3084,10 +3084,13 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "aes-gcm",
+ "base64 0.22.1",
+ "chacha20 0.9.1",
  "chacha20poly1305",
  "crc32fast",
  "futures-util",
  "hkdf",
+ "hmac",
  "md-5",
  "rand 0.10.2",
  "rustls",

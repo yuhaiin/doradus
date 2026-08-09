@@ -59,6 +59,7 @@ impl GoProxyRuntimeConfig {
                         self.transport,
                         GoProxyTransport::Trojan
                             | GoProxyTransport::Shadowsocks
+                            | GoProxyTransport::Shadowsocksr
                             | GoProxyTransport::Vless
                             | GoProxyTransport::Vmess
                     ))
@@ -94,6 +95,7 @@ impl GoProxyRuntimeConfig {
             | GoProxyTransport::HttpProxy
             | GoProxyTransport::Socks5
             | GoProxyTransport::Shadowsocks
+            | GoProxyTransport::Shadowsocksr
             | GoProxyTransport::Trojan
             | GoProxyTransport::Vless
             | GoProxyTransport::Vmess
@@ -127,6 +129,7 @@ impl GoProxyRuntimeConfig {
                 }
             }
             GoProxyTransport::Shadowsocks
+            | GoProxyTransport::Shadowsocksr
             | GoProxyTransport::Trojan
             | GoProxyTransport::Vless
             | GoProxyTransport::Vmess => BaseProxyKind::Fixed {
@@ -166,6 +169,7 @@ fn transport_name(transport: &GoProxyTransport) -> &str {
         GoProxyTransport::HttpProxy => "http",
         GoProxyTransport::Socks5 => "socks5",
         GoProxyTransport::Shadowsocks => "shadowsocks",
+        GoProxyTransport::Shadowsocksr => "shadowsocksr",
         GoProxyTransport::Trojan => "trojan",
         GoProxyTransport::Vless => "vless",
         GoProxyTransport::Vmess => "vmess",

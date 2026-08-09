@@ -918,6 +918,7 @@ server 同时处理 TCP listener 和 UDP listener：
 | SOCKS5 | 是 | UDP ASSOCIATE | 可选 | 必须 |
 | TLS | wrapper | 委托 | 委托 | 必须 |
 | Shadowsocks AEAD | 是 | 加密 UDP packet | 委托 | 已实现（TCP/codec/Go 互操作） |
+| ShadowsocksR | 是 | 加密 UDP packet | 委托 | 已实现（auth_aes128_md5、origin/plain、AES/ChaCha stream cipher、Go wire 互操作；auth_chain/HTTP obfs 仍待补） |
 | Trojan | 是 | UDP-over-TCP ASSOCIATE | 委托 | 已实现 |
 | VLESS | 是 | UDP-over-TCP length framing | 委托 | 已实现（TCP/UDP codec、inbound/outbound、WebSocket transport composition、Go wire 互操作） |
 | VMess modern AEAD | 是 | 固定目标 UDP packet | 委托 | 已实现（alter-id=0 TCP/UDP codec、TLS/WebSocket composition、Go client→Rust wire 互操作） |
@@ -931,6 +932,12 @@ Shadowsocks AEAD 独立放在 `yuhaiin-protocol`：`ShadowsocksProxy` 包裹任�
 标准 salt + target-address + payload 形式。runtime 从 `nodes_v2` 的 tagged layer 读取
 `method/password`，可组合 `fixedv2 -> tls -> shadowsocks`；协议层不自己创建 resolver，
 也不把 ShadowsocksR 的 obfs/auth-chain 状态错误地当成普通 Shadowsocks。
+
+ShadowsocksR 目前由独立的 `ShadowsocksrProxy` 负责，不复用 Shadowsocks AEAD 的 framing。
+首个已迁移组合是 Go 当前实现兼容的 `auth_aes128_md5`，支持 `origin/plain`、TCP 认证首帧、
+后续 little-endian HMAC 分帧、UDP packet，以及 Go 支持的 AES CFB/CTR/OFB、ChaCha20 和
+none 流密码。Go tagged `shadowsocksr` 已能进入 runtime；`auth_chain_*`、`auth_sha1_v4`、
+`tls1.2_ticket_auth` 和 HTTP obfs 会在构造阶段返回显式 unsupported。
 
 VLESS 同样独立放在 `yuhaiin-protocol`：`VlessProxy` 使用 v0 UUID、TCP request/response
 header 和固定目标的 UDP-over-TCP length frame，同时支持作为 inbound parser 将请求交给共享
