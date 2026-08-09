@@ -6,14 +6,18 @@
 //! Unknown fields stay in `data_json`, so the management plane does not become
 //! a second, lossy configuration model.
 
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{Request, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,6 +47,39 @@ pub struct ApiState {
     pub controller: RuntimeController,
     pub version: String,
     shutdown: Option<watch::Sender<bool>>,
+    auth: Option<ApiAuth>,
+}
+
+/// Optional management API credentials. The stored values are SHA-256
+/// digests, matching the Go server's constant-time comparison boundary while
+/// avoiding keeping the clear-text credentials in the long-lived router state.
+#[derive(Clone)]
+pub struct ApiAuth {
+    username: [u8; 32],
+    password: [u8; 32],
+}
+
+impl ApiAuth {
+    pub fn new(username: impl AsRef<[u8]>, password: impl AsRef<[u8]>) -> Self {
+        Self {
+            username: digest(username.as_ref()),
+            password: digest(password.as_ref()),
+        }
+    }
+
+    fn accepts_basic_token(&self, token: &str) -> bool {
+        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(token) else {
+            return false;
+        };
+        let Some(separator) = decoded.iter().position(|byte| *byte == b':') else {
+            return false;
+        };
+        constant_time_equal(&self.username, &digest(&decoded[..separator]))
+            && constant_time_equal(
+                &self.password,
+                &digest(&decoded[separator.saturating_add(1)..]),
+            )
+    }
 }
 
 impl ApiState {
@@ -51,12 +88,26 @@ impl ApiState {
             controller,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             shutdown: None,
+            auth: None,
         }
     }
 
     pub fn with_shutdown(mut self, shutdown: watch::Sender<bool>) -> Self {
         self.shutdown = Some(shutdown);
         self
+    }
+
+    pub fn with_auth(mut self, username: impl AsRef<[u8]>, password: impl AsRef<[u8]>) -> Self {
+        self.auth = Some(ApiAuth::new(username, password));
+        self
+    }
+
+    pub fn with_optional_auth(self, username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
+        if username.as_ref().is_empty() && password.as_ref().is_empty() {
+            self
+        } else {
+            self.with_auth(username.as_ref().as_bytes(), password.as_ref().as_bytes())
+        }
     }
 
     fn request_shutdown(&self) -> bool {
@@ -148,6 +199,7 @@ struct ListQuery {
 /// management endpoint is normally bound to loopback and the existing web UI
 /// may be served from a different local development port.
 pub fn router(state: ApiState) -> Router {
+    let auth = state.auth.clone();
     Router::new()
         .route("/api/v2/info", get(info))
         .route("/api/v2/update/check", post(update_check))
@@ -275,7 +327,82 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/api/v2/rpc/{operation}", post(rpc))
         .layer(CorsLayer::very_permissive())
+        .layer(middleware::from_fn(move |request, next| {
+            let auth = auth.clone();
+            async move { authenticate(auth, request, next).await }
+        }))
         .with_state(state)
+}
+
+async fn authenticate(auth: Option<ApiAuth>, request: Request<Body>, next: Next) -> Response {
+    let Some(auth) = auth else {
+        return next.run(request).await;
+    };
+    if request.method() == axum::http::Method::OPTIONS {
+        return next.run(request).await;
+    }
+    let token = query_token(request.uri().query()).or_else(|| {
+        request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Basic "))
+            .map(str::to_owned)
+    });
+    if token
+        .as_deref()
+        .is_some_and(|token| auth.accepts_basic_token(token))
+    {
+        next.run(request).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
+    }
+}
+
+fn digest(value: &[u8]) -> [u8; 32] {
+    Sha256::digest(value).into()
+}
+
+fn constant_time_equal(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut difference = 0u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
+fn query_token(query: Option<&str>) -> Option<String> {
+    query?.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == "token").then(|| percent_decode(value))
+    })
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                output.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        output.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn hex(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 pub async fn serve(listener: tokio::net::TcpListener, state: ApiState) -> std::io::Result<()> {
@@ -2766,6 +2893,7 @@ mod tests {
     use crate::{RuntimeBuilder, RuntimeController};
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
+    use base64::Engine;
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -3372,5 +3500,64 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["id"], "api-direct");
+    }
+
+    #[tokio::test]
+    async fn management_auth_matches_go_basic_and_eventsource_query_token() {
+        let state = state().await.with_auth("alice", "secret");
+        let app = router(state);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(Request::get("/api/v2/info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v2/info")
+                    .header("authorization", "Basic YWxpY2U6d3Jvbmc=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+        let token = base64::engine::general_purpose::STANDARD.encode("alice:secret");
+        let authorized = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v2/info")
+                    .header("authorization", format!("Basic {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+
+        let eventsource = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v2/info?token={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(eventsource.status(), StatusCode::OK);
+
+        let preflight = app
+            .oneshot(
+                Request::options("/api/v2/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(preflight.status(), StatusCode::UNAUTHORIZED);
     }
 }

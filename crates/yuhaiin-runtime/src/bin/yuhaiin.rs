@@ -73,7 +73,11 @@ async fn run() -> Result<()> {
         .await
         .map_err(|error| Error::new(ErrorKind::Io, format!("bind HTTP API: {error}")))?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let state = ApiState::new(controller.clone()).with_shutdown(shutdown_tx.clone());
+    let username = env_string("YUHAIIN_API_USERNAME", "");
+    let password = env_string("YUHAIIN_API_PASSWORD", "");
+    let state = ApiState::new(controller.clone())
+        .with_shutdown(shutdown_tx.clone())
+        .with_optional_auth(username, password);
     let signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
