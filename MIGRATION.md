@@ -1676,6 +1676,31 @@ traffic、telemetry、failed-history，并在 TCP flow 关闭后确认 history �
 cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
 ```
 
+## 46. 2026-08-10 React management API process contract
+
+新增 `crates/yuhaiin-runtime/tests/api_contract.rs`，用真实 `yuhaiin` 子进程和
+`~/.cache/yuhaiin-rust/integration` 下的 SQLite 状态执行一轮管理面契约验收，而不是只在
+Axum router 内调用 handler。该测试覆盖：
+
+- settings/backup、hosts/FakeDNS、resolver 和 inbound 的读写及 CRUD；
+- node 保存、TCP/UDP selection、真实 inbound selector reload 后的 `nodes.active`；
+- user credential view、publishes/subscriptions；
+- route config、lists、rules、rule test、tags、activation/apply；
+- connections、total、traffic、telemetry、history、failed-history、close；
+- tools、SSE 和代表性的 404 错误响应。
+
+验证过程中保留了两个重要契约边界：`nodes.active` 反映 live proxy selector，而不是仅
+有 `enabled` 的节点行；selection 变更需要等待 inbound owner 收到 reload 后才会反映到
+活动 slot。User 的 token credential 采用 generated contract 的嵌套形状
+`{"type":"token","token":{"token":"..."}}`，返回值再由 Rust 转成 frontend 的
+`CredentialView`。
+
+执行：
+
+```bash
+cargo test -p yuhaiin-runtime --all-features --offline --test api_contract -- --nocapture
+```
+
 ## 43. 2026-08-09 SOCKS5 outbound process-chain regression
 
 新增可复用的纯 Rust SOCKS5 loopback fixture，并通过真实 runtime API 配置

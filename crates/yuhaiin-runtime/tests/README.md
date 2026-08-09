@@ -8,6 +8,13 @@ directly.
 
 The current scenarios cover:
 
+- `api_contract.rs` starts one real service process and round-trips the main
+  React management contracts: settings/backup, hosts/FakeDNS, resolver and
+  inbound CRUD, node selection/active state, users, publishes/subscriptions,
+  route config/lists/rules/tags/apply, connections/statistics, SSE, tools and
+  representative 404 errors. It keeps an enabled HTTP inbound alive while
+  testing node selection so `nodes.active` observes a real selector after
+  reload rather than a synthetic enabled row.
 - HTTP inbound → domain route rule → fixed + HTTP CONNECT outbound, including
   live connection metadata, traffic counters, route testing, and node latency.
 - HTTP inbound + mixed UDP inbound → TLS + HTTP/2 + Yuubinsya UDP-over-TCP
@@ -34,6 +41,7 @@ The current scenarios cover:
 Run the tests from the repository root:
 
 ```bash
+cargo test -p yuhaiin-runtime --all-features --offline --test api_contract -- --nocapture
 cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
 ```
 
