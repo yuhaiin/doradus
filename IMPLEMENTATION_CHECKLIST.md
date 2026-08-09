@@ -101,6 +101,7 @@ flowchart LR
 | `[x]` | Yuubinsya UDP-over-TCP | 是 | 是 | `chain::{h2,UOT,direct_uot}` |
 | `[x]` | WebSocket transport | 是 | 是 | `core::websocket`, runtime/protocol |
 | `[x]` | protocol wrappers | inbound/outbound 共用 | inbound/outbound 共用 | `yuhaiin-protocol` |
+| `[~]` | Go 低频 inbound contract：`tproxy` / `redir` / `reverse_http` / `reverse_tcp` | 否；当前 `start_listeners` 会记录并跳过这些非主路径协议 | 不影响当前 HTTP/SOCKS5/Yuubinsya/TUN 替换主路径，但它们不是 Tailscale 等复杂协议，不能永久遗漏 | 先实现 reverse TCP/HTTP 的共享 router bridge；再按 Linux 原始目标地址能力实现 tproxy/redir，补权限和 Podman 验收 |
 
 ### 6.2 连接链路与策略
 
@@ -195,3 +196,4 @@ podman run --rm --network=host \
 3. 补发布切换/rollback 手册：binary 替换、SQLite backup、失败回滚、旧 Go 并行运行和状态目录锁。
 4. 对现有 frontend generated operations 做一次逐项 route/schema 快照比对；subscription 维持明确的 deferred 状态。
 5. 每完成一项，只修改本模块表格、验收命令和 `MIGRATION.md` 的一条 dated entry，不再把所有历史细节堆回本文件。
+6. 补齐 Go 低频 inbound contract：reverse TCP/HTTP 优先，Linux tproxy/redir 随透明代理 socket/权限测试推进。
