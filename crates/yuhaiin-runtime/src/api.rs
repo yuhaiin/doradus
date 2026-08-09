@@ -4100,6 +4100,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_node_latency_resolves_domain_before_async_socket_connect() {
+        let state = state().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                tokio::io::AsyncReadExt::read_exact(&mut stream, &mut byte)
+                    .await
+                    .unwrap();
+                request.push(byte[0]);
+            }
+            assert!(request.starts_with(b"GET /health HTTP/1.1\r\n"));
+            tokio::io::AsyncWriteExt::write_all(
+                &mut stream,
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+
+        let _ = save_node_value(
+            &state,
+            json!({
+                "id": "direct-latency",
+                "name": "Direct latency",
+                "enabled": true,
+                "chain": [{"type":"direct","direct":{}}]
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = node_latency_value(
+            &state,
+            &json!({
+                "id": "direct-latency",
+                "type": "tcp",
+                "url": format!("http://localhost:{}/health", address.port())
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.0["ok"], true,
+            "direct latency response: {}",
+            response.0
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn active_nodes_reports_live_proxy_slots_not_all_enabled_rows() {
         let state = state().await;
         let _ = save_node_value(
