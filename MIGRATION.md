@@ -1482,3 +1482,9 @@ connections.total
 Go `pkg/statistics/statistic.go` 的 `Connections.Remove` 会同时删除连接和其 per-flow counter；`connections.total.counters` 不是历史累计表，而是当前活动 flow 的视图。Rust 之前在 `monitor.close` 后保留 counter，并在重启时从 checkpoint 恢复没有对应 socket 的 counter，导致前端看到已关闭/不存在的连接仍出现在 counters 中。
 
 Rust 现在在关闭 flow 时删除 live counter；恢复旧版 `statistics.runtime` 时继续接受旧 `counters` 字段，但因为活动 socket 不会恢复而清空该 map。新增关闭后与重启后的回归，保留 totals/history/telemetry 的持久化。`yuhaiin-runtime` all-features 单测本轮为 183 项通过。
+
+## 26. 2026-08-09 frontend RPC read/mutation smoke
+
+在独立 `~/.cache/yuhaiin-rust/api-read-matrix-<pid>` 状态目录启动 Rust service，fresh state 下实际调用 generated client 对应的 31 个核心只读 RPC：info、settings、backup、tools、nodes、inbounds、resolvers、hosts/FakeDNS/server、subscriptions get、publishes、users、connections 统计/历史、route activation/config/lists/rules/tags，全部收到 HTTP 200。统计请求使用真实 RFC3339 时间范围和 limit 边界，不是只发空 body。
+
+另一份独立 fresh state 完成 hosts put/get、route config put/get、resolver create/get/delete、node create/get/use/selected/close/delete、disabled inbound create/get/delete、前端真实形状的 local route list create/get/delete、route rule create/get/delete；每个 mutation 均收到 200 且 reload 后读取到持久化结果。一次故意缺少 Go priority API 所需 `source`/`target` 的请求收到 400，确认错误分类而非把非法请求当成功。订阅 refresh/delete-users 仍按范围明确延期。
