@@ -2030,3 +2030,32 @@ runtime 子进程断言：fresh state 的 `/api/v2/inbounds/mixed` 必须保留
 `/api/v2/nodes/{id}/latency` 验证 direct node 的域名目标会先经 resolver 解析后再建立
 socket。`scripts/integration/api-contract.sh` 不再只运行管理面大测试，而是运行该文件的
 全部 process tests；当前 Podman host-network 结果为 2/2 通过。
+
+## 57. 2026-08-10 process throughput benchmark
+
+新增 `crates/yuhaiin-runtime/tests/throughput.rs` 与
+`scripts/benchmark/throughput.sh`。它使用 release runtime 和真实 SQLite/API
+配置边界，执行 HTTP inbound → route rule → fixed + HTTP CONNECT outbound 的单流
+loopback echo，并在 runtime 子进程上采样 Linux `VmRSS` 与 `/proc/<pid>/stat` CPU ticks。
+输出固定的 `BENCHMARK` JSON 行，构建产物、状态库和日志均放在
+`~/.cache/yuhaiin-rust/benchmarks/http-throughput`，没有使用 `/tmp`。
+
+当前 benchmark 矩阵：
+
+| 场景 | 状态 | 说明 |
+| --- | --- | --- |
+| HTTP inbound → router → HTTP CONNECT outbound | 已有可执行基准 | `make benchmark-throughput`；默认 64 MiB、单流、loopback |
+| TUN inbound | 设备/生命周期 smoke | `scripts/integration/tun-service.sh`；真实带宽基准仍需 packet generator/namespace fixture |
+| WireGuard | 未实现/不报告性能 | 当前范围没有 WireGuard backend，不用虚构结果 |
+
+benchmark 数值只能用于同机、同 profile、同 payload 和同 namespace 的回归比较，不能
+直接解释为 Go 与 Rust 的跨机器性能结论。
+
+本机首次基线（2026-08-10，release、Podman host network、64 MiB、单流）：
+
+```text
+BENCHMARK {"bytes":67108864,"cpu_ticks":26,"elapsed_ms":309.641875,"mib_per_sec":206.69039030977316,"peak_rss_kib":16496,"proc_samples":15,"scenario":"http-inbound-route-http-connect-loopback"}
+```
+
+该数值是当前机器和当前构建的基线，不是验收阈值；后续改动应在相同参数下重复运行并
+记录变化原因。

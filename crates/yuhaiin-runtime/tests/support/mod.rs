@@ -972,6 +972,10 @@ impl ServiceProcess {
             .clone()
     }
 
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     pub async fn shutdown(mut self) {
         if self.child.try_wait().unwrap().is_none() {
             #[cfg(unix)]

@@ -229,7 +229,15 @@ scripts/integration/tun-service.sh
 
 # Frontend management API process contract and reload/observer smoke:
 scripts/integration/api-contract.sh
+
+# Release runtime throughput and Linux RSS/CPU process sampling:
+make benchmark-throughput
 ```
+
+Benchmark status is intentionally explicit: HTTP inbound → router → HTTP
+CONNECT outbound has a repeatable single-stream benchmark; TUN currently has
+privileged device/lifecycle smoke but no packet-throughput fixture; WireGuard is
+not implemented in the current scope and therefore has no reported number.
 
 当前阶段新增的 source-bind 容器回归：
 

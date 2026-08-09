@@ -73,6 +73,27 @@ The current scenarios cover:
   final HTTP/SOCKS5 compositions are covered by the process tests above and
   intentionally remain TCP-only over a raw H2 parent.
 
+## Opt-in throughput benchmark
+
+`throughput.rs` is an integration benchmark, not a microbenchmark. It starts
+the release runtime, configures HTTP inbound → route rule → fixed + HTTP
+CONNECT outbound through the API, sends a known loopback payload, and samples
+the runtime's Linux `/proc` RSS and CPU ticks. It prints one `BENCHMARK {...}`
+JSON line and stores all build/runtime output below `~/.cache`.
+
+Run it with:
+
+```bash
+make benchmark-throughput
+YUHAIIN_BENCH_BYTES=$((256 * 1024 * 1024)) make benchmark-throughput
+```
+
+The result is only comparable when the machine, profile, payload, network
+namespace, and fixture are held constant. TUN currently has a privileged
+Podman device/lifecycle smoke (`scripts/integration/tun-service.sh`) rather
+than a packet-throughput benchmark; WireGuard is intentionally not implemented
+in the current scope, so no WireGuard performance number is reported.
+
 Run the tests from the repository root:
 
 ```bash
