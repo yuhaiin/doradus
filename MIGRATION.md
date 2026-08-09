@@ -920,6 +920,7 @@ server 同时处理 TCP listener 和 UDP listener：
 | Shadowsocks AEAD | 是 | 加密 UDP packet | 委托 | 已实现（TCP/codec/Go 互操作） |
 | Trojan | 是 | UDP-over-TCP ASSOCIATE | 委托 | 已实现 |
 | VLESS | 是 | UDP-over-TCP length framing | 委托 | 已实现（TCP/UDP codec、inbound/outbound、WebSocket transport composition、Go wire 互操作） |
+| VMess modern AEAD | 是 | 待补（Go packet mode） | 委托 | 已实现（alter-id=0 TCP codec、TLS/WebSocket composition、Go client→Rust wire 互操作） |
 | HTTP/2 prior knowledge | CONNECT stream | CONNECT stream | 委托 | 必须 |
 | Yuubinsya | 是 | native + UOT | 是 | 最高优先级 |
 
@@ -938,6 +939,14 @@ WebSocket 只负责 HTTP upgrade 和 byte-stream framing，不把 VLESS 逻辑�
 VLESS 的 UUID、IPv4/domain/IPv6 地址编码、TCP/UDP framing、Rust→Go wire 互操作和
 `fixedv2 -> websocket -> vless` runtime 构造均有自动化测试；HTTP/2 VLESS、early-data、
 XTLS/flow 等高级变体仍明确保持 unsupported，而不是静默降级。
+
+VMess 当前按 Go yuhaiin 的 outbound-only modern path 迁移：`VmessProxy` 使用
+`alter_id=0` 的 AEAD request header、响应 header 和有界 chunk stream，支持 AES-128-GCM、
+ChaCha20-Poly1305 与 none body security；runtime 从 Go layer 的 `id/uuid`、`aid` 和
+`security` 读取配置，并可在 fixed parent 上组合 TLS/WebSocket。响应方向按 Go 语义使用
+request body key/IV 的 SHA-256 前 16 字节派生 key/IV；跨语言 fixture 已由 Go VMess client
+连接 Rust wire server，验证请求、响应和双向 AES-GCM 分块。legacy alter-id、VMess UDP
+packet mode、HTTP/2/early-data 等变体必须返回显式 unsupported，不得静默按 modern TCP 处理。
 
 ## 9. NAT 迁移设计
 
