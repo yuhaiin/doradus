@@ -441,6 +441,45 @@ pub struct FakeIpView {
     reverse_v6: Arc<HashMap<Ipv6Addr, DomainName>>,
 }
 
+/// Synchronous, SQLite-free holder for the latest reverse-lookup view.
+///
+/// Packet callbacks use this holder while the async resolver replaces the
+/// view after allocating a new FakeIP.  The lock is intentionally limited to
+/// a small immutable-map read and is never held across an await.
+#[derive(Clone, Default)]
+pub struct FakeIpViewStore {
+    view: Arc<std::sync::RwLock<FakeIpView>>,
+}
+
+impl FakeIpViewStore {
+    pub fn new(view: FakeIpView) -> Self {
+        Self {
+            view: Arc::new(std::sync::RwLock::new(view)),
+        }
+    }
+
+    pub fn lookup_domain_ip(&self, address: IpAddr) -> Option<DomainName> {
+        self.view
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lookup_domain_ip(address)
+    }
+
+    pub fn replace(&self, view: FakeIpView) {
+        *self
+            .view
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = view;
+    }
+
+    pub fn snapshot(&self) -> FakeIpView {
+        self.view
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
 impl FakeIpView {
     pub fn lookup_domain(&self, address: Ipv4Addr) -> Option<DomainName> {
         self.reverse.get(&address).cloned()

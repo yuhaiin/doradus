@@ -5,18 +5,40 @@ use std::sync::Arc;
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::{BoxFuture, DomainName, IpSet, ResolveStrategy, Result};
 
-use crate::fakeip::{FakeIpPool, FakeIpV6Pool};
+use crate::fakeip::{FakeIpPool, FakeIpV6Pool, FakeIpView, FakeIpViewStore};
 
 /// The two persistent pools used by one resolver snapshot.
 #[derive(Clone)]
 pub struct FakeIpPools {
     pub ipv4: Arc<FakeIpPool>,
     pub ipv6: Arc<FakeIpV6Pool>,
+    view: FakeIpViewStore,
 }
 
 impl FakeIpPools {
     pub fn new(ipv4: Arc<FakeIpPool>, ipv6: Arc<FakeIpV6Pool>) -> Self {
-        Self { ipv4, ipv6 }
+        Self {
+            ipv4,
+            ipv6,
+            view: FakeIpViewStore::default(),
+        }
+    }
+
+    /// Build a SQLite-free reverse view for packet-plane flow creation.
+    ///
+    /// The TUN context provider is synchronous and may run on the packet
+    /// polling boundary.  Capturing this immutable view avoids holding the
+    /// pool's async mutex or moving a store handle into that callback.
+    pub async fn snapshot(&self) -> FakeIpView {
+        let ipv4 = self.ipv4.snapshot().await;
+        let ipv6 = self.ipv6.snapshot().await;
+        let view = ipv4.merge(&ipv6);
+        self.view.replace(view.clone());
+        view
+    }
+
+    pub fn view_store(&self) -> FakeIpViewStore {
+        self.view.clone()
     }
 }
 
@@ -66,6 +88,7 @@ impl AsyncIpResolver for FakeIpResolver {
             {
                 result.v6 = vec![self.pools.ipv6.allocate(domain.clone()).await?];
             }
+            self.pools.snapshot().await;
             Ok(result)
         })
     }
@@ -159,10 +182,54 @@ mod tests {
         assert_eq!(first, second);
         assert!((198..=199).contains(&first.v4[0].octets()[0]));
         assert_eq!(first.v6[0], "fc00::1".parse::<Ipv6Addr>().unwrap());
+        let view = resolver.pools.view_store();
+        assert_eq!(
+            view.lookup_domain_ip(first.v4[0].into()),
+            Some(domain.clone())
+        );
+        assert_eq!(
+            view.lookup_domain_ip(first.v6[0].into()),
+            Some(domain.clone())
+        );
 
         let only_v4 = block_on(resolver.resolve(&domain, ResolveStrategy::OnlyIpv4)).unwrap();
         assert_eq!(only_v4.v4, first.v4);
         assert!(only_v4.v6.is_empty());
+    }
+
+    #[test]
+    fn fakeip_pools_snapshot_merges_ipv4_and_ipv6_reverse_mappings() {
+        let store = block_on(crate::ConfigStore::open_memory()).unwrap();
+        let ipv4 = Arc::new(
+            block_on(FakeIpPool::open(
+                store.clone(),
+                crate::fakeip::FakeIpConfig::new(
+                    Ipv4Addr::new(198, 18, 2, 1),
+                    Ipv4Addr::new(198, 18, 2, 2),
+                )
+                .unwrap(),
+            ))
+            .unwrap(),
+        );
+        let ipv6 = Arc::new(
+            block_on(FakeIpV6Pool::open(
+                store,
+                crate::fakeip::FakeIpV6Config::new(
+                    "fc00:2::1".parse().unwrap(),
+                    "fc00:2::2".parse().unwrap(),
+                )
+                .unwrap(),
+            ))
+            .unwrap(),
+        );
+        let v4_domain = DomainName::new("v4.example.com").unwrap();
+        let v6_domain = DomainName::new("v6.example.com").unwrap();
+        let v4 = block_on(ipv4.allocate(v4_domain.clone())).unwrap();
+        let v6 = block_on(ipv6.allocate(v6_domain.clone())).unwrap();
+
+        let view = block_on(FakeIpPools::new(ipv4, ipv6).snapshot());
+        assert_eq!(view.lookup_domain_ip(v4.into()), Some(v4_domain));
+        assert_eq!(view.lookup_domain_ip(v6.into()), Some(v6_domain));
     }
 
     #[test]

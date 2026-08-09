@@ -951,7 +951,7 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         "outbound": outbound,
         "localAddr": source,
         "destination": original,
-        "fakeIp": "",
+        "fakeIp": context.fake_ip.as_deref().unwrap_or_default(),
         "hosts": "",
         "domain": domain,
         "ip": context.destination.addr().map(|addr| addr.ip().to_string()).unwrap_or_default(),
@@ -1077,6 +1077,7 @@ mod tests {
         context.process = Some("/usr/bin/example-app".to_owned());
         context.process_id = Some(42);
         context.user_id = Some(1000);
+        context.fake_ip = Some("198.18.0.1".to_owned());
         monitor.opened(flow, context);
         let connection = &monitor.connections_value()["connections"][0];
         assert_eq!(connection["inbound"], "socks5");
@@ -1084,6 +1085,7 @@ mod tests {
         assert_eq!(connection["process"], "/usr/bin/example-app");
         assert_eq!(connection["pid"], "42");
         assert_eq!(connection["uid"], "1000");
+        assert_eq!(connection["fakeIp"], "198.18.0.1");
         assert_eq!(connection["component"], "");
     }
 

@@ -170,9 +170,26 @@ impl RuntimeController {
                 .await?,
         );
         let (nat, idle_timeout) = snapshot.new_full_cone_nat()?;
+        let fakeip_view = match &snapshot.fakeip {
+            Some(pools) => {
+                pools.snapshot().await;
+                Some(pools.view_store())
+            }
+            None => None,
+        };
         let mut runtime =
             yuhaiin_core::tun::TunProxyRuntime::new(selector.clone(), channel_capacity)?
                 .with_nat(nat, idle_timeout)?;
+        runtime = runtime.with_context_provider(move |flow| {
+            let mut context = flow.context();
+            if let Some(fakeip_view) = &fakeip_view {
+                if let Some(domain) = fakeip_view.lookup_domain_ip(flow.key.destination.ip()) {
+                    context.original_domain = Some(domain);
+                    context.fake_ip = Some(flow.key.destination.ip().to_string());
+                }
+            }
+            context
+        });
         runtime = runtime.with_observer(self.monitor.clone());
         if let Some(handler) = async_dns_handler {
             runtime = runtime.with_async_dns_handler(handler);
@@ -474,6 +491,71 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(runtime.task_len(), 0);
+    }
+
+    #[cfg(feature = "tun")]
+    #[test]
+    fn tun_runtime_restores_fakeip_domain_before_route_and_monitor_open() {
+        let controller = controller();
+        block_on(controller.store().put_config(
+            "resolver.fakedns",
+            br#"{"enabled":true,"ipv4Range":"198.18.2.0/30","ipv6Range":"fc00:2::/126"}"#,
+        ))
+        .unwrap();
+        block_on(controller.store().repository().put_go_node(&GoNodeRecord {
+            id: "direct".to_owned(),
+            name: "direct".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types_json: br#"["direct"]"#.to_vec(),
+            updated_at: 1,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        }))
+        .unwrap();
+        block_on(controller.reload()).unwrap();
+
+        let domain = yuhaiin_core::DomainName::new("fake.example.com").unwrap();
+        let fake_ip = block_on(
+            controller
+                .handle()
+                .load()
+                .fakeip
+                .as_ref()
+                .expect("FakeIP should be enabled")
+                .ipv4
+                .allocate(domain.clone()),
+        )
+        .unwrap();
+        let mut runtime = block_on(controller.build_tun_proxy_runtime(
+            "direct",
+            "direct",
+            "",
+            "",
+            std::time::Duration::from_secs(1),
+            8,
+        ))
+        .unwrap();
+        let flow = yuhaiin_core::flow::Flow {
+            key: yuhaiin_core::flow::FlowKey {
+                network: Network::Tcp,
+                source: "10.0.0.2:41000".parse().unwrap(),
+                destination: std::net::SocketAddr::new(fake_ip.into(), 443),
+            },
+        };
+        block_on(async {
+            runtime
+                .handle_event(yuhaiin_core::tun::TunEvent::TcpOpened { flow })
+                .unwrap();
+
+            let connection = &controller.monitor().connections_value()["connections"][0];
+            assert_eq!(connection["domain"], domain.to_string());
+            assert_eq!(connection["fakeIp"], fake_ip.to_string());
+            assert_eq!(connection["destination"], format!("tcp://{fake_ip}:443"));
+            runtime
+                .close_graceful(std::time::Duration::from_millis(100))
+                .await;
+        });
     }
 
     #[cfg(feature = "tun")]

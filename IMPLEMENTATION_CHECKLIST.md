@@ -29,6 +29,7 @@
 - [x] TUN inbound 服务级验收：管理 API 写入 Go `inbounds_v2` 的 `empty/tun` 后，privileged `--network=none` runtime 通过 `inbound::run_until` 真实创建命名 TUN；`/sys/class/net`、SIGTERM graceful shutdown、设备消失和同名设备重新打开均通过，supervisor 失败也会进入 monitor 日志
 - [x] 连接元数据契约：普通 HTTP/SOCKS5/Yuubinsya inbound 的 `component` 保持空值，TUN flow 才输出 `component=tun` 并默认 `inbound=tun/inboundName=TUN`；monitor 序列化与 TUN 上下文注入均有回归测试
 - [x] 路由解释元数据链：`RouterRuntime` 会把选中的 Go rule/tag/host-process list/Geo 写入共享 `FlowContext`，runtime selector 提供统一 `route_context` 钩子，HTTP/SOCKS4A/SOCKS5/Trojan/VLESS/Yuubinsya/TUN 在代理选择前调用；monitor 与 `route.rules.test` 输出 Go 兼容的 `matchHistory`/`lists`/`resolver`/`geo`，并有 trie、route compiler、monitor 单测
+- [x] FakeIP/TUN flow 元数据链：TUN runtime 在 snapshot 边界生成 SQLite-free 双栈 `FakeIpView`，新 flow 按目的 IP 恢复原始域名后再执行 Router，并在 `connections` 中保留 `fakeIp`；覆盖 FakeIP pool snapshot、controller runtime 和 monitor 序列化回归
 
 ## 未完成项与下一阶段计划
 

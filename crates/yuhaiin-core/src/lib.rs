@@ -288,6 +288,11 @@ pub struct FlowContext {
     pub lists: Vec<String>,
     pub resolver: Option<String>,
     pub geo: Option<String>,
+    /// The packet destination before FakeIP reverse lookup.  Keeping this
+    /// separate from `destination` lets routing use the restored domain while
+    /// observability still reports that the application connected to a
+    /// synthetic address.
+    pub fake_ip: Option<String>,
     /// Management-plane identity of the component that accepted the flow.
     /// These fields are optional so packet-only callers do not need a second
     /// DTO or synthetic values.
@@ -321,6 +326,7 @@ impl FlowContext {
             lists: Vec::new(),
             resolver: None,
             geo: None,
+            fake_ip: None,
             component: None,
             inbound: None,
             inbound_name: None,

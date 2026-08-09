@@ -32,6 +32,7 @@ use crate::{RuntimeController, parse_dns_server};
 /// policy.
 pub struct RuntimeDnsHandler {
     pub resolver: Arc<dyn AsyncIpResolver>,
+    pub fakeip: Option<yuhaiin_store::FakeIpPools>,
 }
 
 impl AsyncDnsHandler for RuntimeDnsHandler {
@@ -52,6 +53,9 @@ impl AsyncDnsHandler for RuntimeDnsHandler {
                     },
                 )
                 .await?;
+            if let Some(fakeip) = &self.fakeip {
+                fakeip.snapshot().await;
+            }
             encode_response(
                 packet,
                 &DnsResponse {
@@ -333,6 +337,7 @@ pub async fn run_tun_device_until(
             config.channel_capacity,
             Some(Arc::new(RuntimeDnsHandler {
                 resolver: controller.handle().load().resolver.clone(),
+                fakeip: controller.handle().load().fakeip.clone(),
             })),
         )
         .await?;
@@ -381,6 +386,7 @@ pub async fn run_dns_supervisor(
         let address = parse_dns_server(&server, 53, "api-dns")?;
         let handler = RuntimeDnsHandler {
             resolver: controller.handle().load().resolver.clone(),
+            fakeip: controller.handle().load().fakeip.clone(),
         };
         let dns =
             yuhaiin_core::dns_udp_async::AsyncUdpDnsServer::bind(address, handler, 4096).await?;
