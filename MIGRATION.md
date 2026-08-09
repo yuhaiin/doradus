@@ -1994,3 +1994,17 @@ resolver、route preview/index 和 route-list config 断言；实际 Rust 二进
 的 RPC 对照已在 `~/.cache/yuhaiin-rust/api-parity` 完成。宿主机已有 `127.0.0.1:1080` 时，
 默认 mixed listener 会报告 bind 冲突，这只影响 listener/active-node smoke，应在 Podman
 network namespace 中执行完整 API contract，不应把它误判为 API JSON 不兼容。
+
+## 54. 2026-08-10 mixed UDP normalization and direct diagnostic
+
+`mixed` inbound 的 UDP 能力由 protocol 语义决定，不依赖 `protocol_udp` 字段；因此
+`network.tcp_udp.udp=enabled` 的 mixed 配置必须进入 SOCKS5 UDP listener 分支。协议类型
+现在在进入 listener dispatch 前会 trim 并按 ASCII 小写规范化，避免带首尾空白的导入配置
+落入 `protocol has no UDP mode` 兜底日志；新增单测覆盖 `" MIXED "` 和 UDP mode。
+
+direct transport 的 socket connect 仍由 runtime resolver 在最后一跳解析 domain，保留
+`FlowContext` 中的原始 domain 给 TLS/SNI、HTTP/2、Yuubinsya 和远端代理层；当前 direct
+node latency、direct DNS/UDP latency 以及 TLS+HTTP/2+Yuubinsya 进程级链路均已通过。
+如果运行中的二进制仍出现这两个旧错误，先用 `make build` 后执行 Makefile 打印的
+`~/.cache/yuhaiin-rust/cargo-target/debug/yuhaiin`，不要混用旧的 `target/debug/yuhaiin`；
+两条报错分别对应旧 listener normalization 和旧 direct build 路径，不是当前源码的预期行为。

@@ -1745,7 +1745,7 @@ where
 }
 
 fn normalize_inbound_protocol(protocol: &str) -> String {
-    match protocol.to_ascii_lowercase().as_str() {
+    match protocol.trim().to_ascii_lowercase().as_str() {
         "mix" => "mixed".to_owned(),
         "reversehttp" => "reverse_http".to_owned(),
         "reversetcp" => "reverse_tcp".to_owned(),
@@ -2179,6 +2179,28 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         assert_eq!(mixed.protocol, "mixed");
         assert_eq!(mixed.username, "u");
         assert_eq!(mixed.password, "p");
+
+        let mixed_with_whitespace = InboundSpec::from_record(GoInboundRecord {
+            id: "mixed-whitespace".to_owned(),
+            name: "Mixed whitespace".to_owned(),
+            enabled: true,
+            network_type: "tcp_udp".to_owned(),
+            protocol_type: " MIXED ".to_owned(),
+            transport_types_json: br#"[]"#.to_vec(),
+            updated_at: 1,
+            data_json: br#"{
+                "network":{"type":"tcp_udp","tcp_udp":{"host":"127.0.0.1:12348","udp":"enabled"}},
+                "protocol":{"type":" MIXED ","mixed":{"username":"","password":""}}
+            }"#
+            .to_vec(),
+        })
+        .unwrap();
+        assert_eq!(mixed_with_whitespace.protocol, "mixed");
+        assert_eq!(mixed_with_whitespace.udp_mode, UdpMode::Enabled);
+        assert!(supports_socks5_udp(
+            &mixed_with_whitespace.protocol,
+            mixed_with_whitespace.protocol_udp
+        ));
 
         let none = InboundSpec::from_record(GoInboundRecord {
             id: "none".to_owned(),
