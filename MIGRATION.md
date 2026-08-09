@@ -810,7 +810,7 @@ Rust 版管理面位于 `yuhaiin-runtime::api`，不要求前端改写。第一�
 - `route.config.*`、`route.lists.*`、`route.rules.*`、`route.tags.*`：规则/列表原文持久化，常见 domain/CIDR/host-list 表达式编译到当前 Router；
 - `settings.*`、`tun.config.*`、`info`：管理进程和数据面启动配置。
 
-`connections` 由 `yuhaiin-runtime::ConnectionMonitor` 统一维护，TUN、HTTP/SOCKS5/Yuubinsya 入站都使用同一 live snapshot、流量计数、SSE 事件和历史统计。`connections.close` 先按 Go 合约严格校验十进制数字 ID，再通过 per-flow close event 唤醒 TCP relay 或 UDP flow；因此前端关闭普通入站连接时不会只改变列表而遗留底层 socket。TUN 是 inbound supervisor 下的一条 packet dispatcher 路径，和 TCP/UDP listener 共享 `ConnectionMonitor` 的状态、持久化统计及 shutdown/reload owner。traffic/telemetry 管理接口也按 Go 的 RFC3339 `from < to` 合约校验请求；telemetry 以 UTC 小时桶持久化流量和失败维度，查询时按时间范围聚合并执行每个 dimension 的 `limit` 排序截断，旧版没有小时桶的统计状态仍可用聚合兼容读取。
+`connections` 由 `yuhaiin-runtime::ConnectionMonitor` 统一维护，TUN、HTTP/SOCKS5/Yuubinsya 入站都使用同一 live snapshot、流量计数、SSE 事件和历史统计。`connections.close` 先按 Go 合约严格校验十进制数字 ID，再通过 per-flow close event 唤醒 TCP relay 或 UDP flow；因此前端关闭普通入站连接时不会只改变列表而遗留底层 socket。TUN 是 inbound supervisor 下的一条 packet dispatcher 路径，和 TCP/UDP listener 共享 `ConnectionMonitor` 的状态、持久化统计及 shutdown/reload owner。traffic/telemetry 管理接口也按 Go 的 RFC3339 `from < to` 合约校验请求；traffic 查询按 Go 相同的 UTC 小时、日历日、日历月边界聚合，只返回范围内实际有数据的桶；telemetry 以 UTC 小时桶持久化流量和失败维度，查询时按时间范围聚合并执行每个 dimension 的 `limit` 排序截断，旧版没有小时桶的统计状态仍可用聚合兼容读取。
 
 列表响应保持 `{items, page: {page, pageSize, total}}`，记录的未知字段保留在 store 的 `data_json`，secret 脱敏和完整 Go 高级协议属于后续兼容范围。每个写操作先提交 SQLite，再由 `RuntimeController::mutate_and_reload` 串行重建；重建失败时旧 snapshot 继续服务，并通过错误响应告知前端。
 
@@ -1400,4 +1400,4 @@ cargo test -p yuhaiin-protocol --tests --offline -- --ignored --nocapture
 
 同时对照 Go `pkg/net/dns/server/server.go` 确认：Go 的本地 DNS server 只监听配置地址上的 UDP 和 TCP；DoH/DoH3 是 resolver 的上游 transport，并不是本地管理 server endpoint。Rust 因此保持同一边界：`resolver.server` 管理本地 UDP/TCP listener，DoH/HTTP2 位于 resolver client factory；checklist 不再把不存在于 Go 的本地 DoH listener 当作未完成项。
 
-另外以 `yuhaiin-react/src/api/generated.ts` 的 88 个 RPC operation 和 legacy route 为基准做了静态逐项核对：Rust RPC switch 覆盖全部前端可通过 `requestJSON` 调用的 operation；`connections.events`、`tools.logs` 两个流式 operation 按 Go contract 走直接 SSE route，不应被误判为普通 JSON RPC 缺失。Rust 额外保留的 `tun.config.*` 是旧管理面兼容入口，不改变前端已有 operation。当前还剩 response schema/字段语义的逐项快照核对，不把“路径存在”当作 schema 已完全等价。
+另外以 `yuhaiin-react/src/api/generated.ts` 的 88 个 RPC operation 和 legacy route 为基准做了静态逐项核对：Rust RPC switch 覆盖全部前端可通过 `requestJSON` 调用的 operation；`connections.events`、`tools.logs` 两个流式 operation 按 Go contract 走直接 SSE route，不应被误判为普通 JSON RPC 缺失。Rust 额外保留的 `tun.config.*` 是旧管理面兼容入口，不改变前端已有 operation。connections 的 `network` 对象、历史/失败历史字段以及 traffic 的 UTC 日历聚合已加入 Rust 单测；剩余工作仍是完整响应字段和真实生产数据的逐项快照核对，不把“路径存在”当作 schema 已完全等价。

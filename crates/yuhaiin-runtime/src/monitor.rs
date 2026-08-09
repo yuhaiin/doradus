@@ -385,35 +385,30 @@ impl ConnectionMonitor {
             "month" => "month",
             _ => "hour",
         };
-        let step = match interval {
-            "day" => 86_400,
-            "month" => 2_592_000,
-            _ => 3_600,
-        };
         let start = start.min(end);
-        let first = start.div_euclid(step) * step;
-        let last = end.div_euclid(step) * step;
+        let end = end.max(start);
         let state = self.lock();
-        let mut items = Vec::new();
-        let mut cursor = first;
-        while cursor <= last && items.len() < 10_000 {
-            let (download, upload) = state
-                .buckets
-                .iter()
-                .filter(|(bucket, _)| **bucket >= cursor && **bucket < cursor + step)
-                .fold((0_u64, 0_u64), |(download, upload), (_, (down, up))| {
-                    (download.saturating_add(*down), upload.saturating_add(*up))
-                });
-            items.push(json!({
-                "start": format_time(cursor),
+        let mut buckets = BTreeMap::<i64, (u64, u64)>::new();
+        for (bucket, (download, upload)) in &state.buckets {
+            if *bucket < start || *bucket >= end {
+                continue;
+            }
+            let group = traffic_bucket_start(interval, *bucket);
+            let entry = buckets.entry(group).or_default();
+            entry.0 = entry.0.saturating_add(*download);
+            entry.1 = entry.1.saturating_add(*upload);
+        }
+        let items = buckets
+            .into_iter()
+            .take(10_000)
+            .map(|(bucket, (download, upload))| {
+                json!({
+                "start": format_time(bucket),
                 "download": download.to_string(),
                 "upload": upload.to_string(),
-            }));
-            cursor = cursor.saturating_add(step);
-            if cursor == i64::MAX {
-                break;
-            }
-        }
+                })
+            })
+            .collect::<Vec<_>>();
         json!({"interval": interval, "items": items})
     }
 
@@ -1045,6 +1040,24 @@ fn endpoint_string(endpoint: &Endpoint) -> String {
     endpoint.to_string()
 }
 
+fn traffic_bucket_start(interval: &str, timestamp: i64) -> i64 {
+    let datetime =
+        OffsetDateTime::from_unix_timestamp(timestamp).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    match interval {
+        "day" => datetime
+            .date()
+            .with_time(time::Time::MIDNIGHT)
+            .assume_utc()
+            .unix_timestamp(),
+        "month" => time::Date::from_calendar_date(datetime.year(), datetime.month(), 1)
+            .expect("a valid timestamp has a valid calendar date")
+            .with_time(time::Time::MIDNIGHT)
+            .assume_utc()
+            .unix_timestamp(),
+        _ => timestamp.div_euclid(3_600) * 3_600,
+    }
+}
+
 fn route_mode(mode: RouteMode) -> &'static str {
     match mode {
         RouteMode::Bypass => "bypass",
@@ -1203,6 +1216,35 @@ mod tests {
         assert_eq!(connection["component"], "tun");
         assert_eq!(connection["inbound"], "tun");
         assert_eq!(connection["inboundName"], "TUN");
+    }
+
+    #[test]
+    fn monitor_traffic_uses_utc_calendar_buckets_and_skips_empty_ranges() {
+        let monitor = ConnectionMonitor::new();
+        let january = OffsetDateTime::parse("2024-01-31T23:00:00Z", &Rfc3339)
+            .unwrap()
+            .unix_timestamp();
+        let february = OffsetDateTime::parse("2024-02-01T01:00:00Z", &Rfc3339)
+            .unwrap()
+            .unix_timestamp();
+        let march = OffsetDateTime::parse("2024-03-01T01:00:00Z", &Rfc3339)
+            .unwrap()
+            .unix_timestamp();
+        {
+            let mut state = monitor.lock();
+            state.buckets.insert(january, (11, 7));
+            state.buckets.insert(february, (13, 17));
+            state.buckets.insert(march, (19, 23));
+        }
+
+        let value = monitor.traffic_value_range("month", january, march + 3_600);
+        assert_eq!(value["interval"], "month");
+        assert_eq!(value["items"].as_array().unwrap().len(), 3);
+        assert_eq!(value["items"][0]["start"], "2024-01-01T00:00:00Z");
+        assert_eq!(value["items"][0]["download"], "11");
+        assert_eq!(value["items"][1]["start"], "2024-02-01T00:00:00Z");
+        assert_eq!(value["items"][1]["upload"], "17");
+        assert_eq!(value["items"][2]["start"], "2024-03-01T00:00:00Z");
     }
 
     #[test]
