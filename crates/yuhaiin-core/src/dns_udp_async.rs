@@ -143,16 +143,21 @@ impl<H: AsyncDnsHandler> AsyncUdpDnsServer<H> {
     }
 
     pub async fn serve_once(&self) -> Result<usize> {
+        self.serve_once_from().await.map(|(size, _)| size)
+    }
+
+    pub async fn serve_once_from(&self) -> Result<(usize, SocketAddr)> {
         let mut request = vec![0; self.max_packet_size];
         let (size, peer) =
             self.socket.recv_from(&mut request).await.map_err(|error| {
                 Error::new(ErrorKind::Io, format!("receive DNS request: {error}"))
             })?;
         let packet = self.handler.answer(&request[..size]).await?;
-        self.socket
-            .send_to(&packet, peer)
-            .await
-            .map_err(|error| Error::new(ErrorKind::Io, format!("send DNS response: {error}")))
+        let sent =
+            self.socket.send_to(&packet, peer).await.map_err(|error| {
+                Error::new(ErrorKind::Io, format!("send DNS response: {error}"))
+            })?;
+        Ok((sent, peer))
     }
 
     /// Serve requests until the owner signals shutdown.
@@ -222,8 +227,10 @@ mod tests {
                     .unwrap();
             let server_address = server.local_addr().unwrap();
             let server_future = async move {
-                server.serve_once().await.unwrap();
-                server.serve_once().await.unwrap();
+                let (_, first_peer) = server.serve_once_from().await.unwrap();
+                let (_, second_peer) = server.serve_once_from().await.unwrap();
+                assert_eq!(first_peer.ip(), IpAddr::V4("127.0.0.2".parse().unwrap()));
+                assert_eq!(second_peer.ip(), IpAddr::V4("127.0.0.2".parse().unwrap()));
             };
 
             let client = AsyncUdpDnsClient {

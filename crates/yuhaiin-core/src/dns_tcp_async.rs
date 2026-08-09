@@ -184,6 +184,12 @@ impl<H: AsyncDnsHandler> AsyncTcpDnsServer<H> {
         self.serve_one(&mut stream).await
     }
 
+    pub async fn serve_once_from(&self) -> Result<(usize, SocketAddr)> {
+        let (mut stream, peer) = self.accept_from().await?;
+        let size = self.serve_one(&mut stream).await?;
+        Ok((size, peer))
+    }
+
     /// Accept one TCP connection and serve every length-prefixed DNS query
     /// until the peer closes it. RFC 1035 permits multiple messages on one
     /// connection; keeping this path separate preserves `serve_once` as a
@@ -194,7 +200,11 @@ impl<H: AsyncDnsHandler> AsyncTcpDnsServer<H> {
     }
 
     async fn accept(&self) -> Result<TcpStream> {
-        let (stream, _) = self
+        self.accept_from().await.map(|(stream, _)| stream)
+    }
+
+    async fn accept_from(&self) -> Result<(TcpStream, SocketAddr)> {
+        let (stream, peer) = self
             .listener
             .accept()
             .await
@@ -202,7 +212,7 @@ impl<H: AsyncDnsHandler> AsyncTcpDnsServer<H> {
         stream
             .set_nodelay(true)
             .map_err(|error| Error::new(ErrorKind::Io, format!("configure DNS TCP: {error}")))?;
-        Ok(stream)
+        Ok((stream, peer))
     }
 
     async fn serve_stream(&self, mut stream: TcpStream) -> Result<usize> {
@@ -394,9 +404,13 @@ mod tests {
                 ),
             };
             let domain = DomainName::new("example.com").unwrap();
-            let (server_result, client_result) =
-                tokio::join!(server.serve_once(), client.query(&domain, DnsRecordType::A));
-            assert!(server_result.unwrap() > 2);
+            let (server_result, client_result) = tokio::join!(
+                server.serve_once_from(),
+                client.query(&domain, DnsRecordType::A)
+            );
+            let (response_size, peer) = server_result.unwrap();
+            assert!(response_size > 2);
+            assert_eq!(peer.ip(), IpAddr::V4("127.0.0.2".parse().unwrap()));
             assert_eq!(
                 client_result.unwrap().addresses.v4,
                 vec![Ipv4Addr::new(192, 0, 2, 53)]

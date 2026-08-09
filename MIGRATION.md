@@ -1850,3 +1850,30 @@ runtime-tun-closed name=yrtun0
 
 这项强化了 Linux TUN inbound 的进程级证据，但不改变 Android/macOS 的 `[~]` 状态；
 外部 `VpnService`/utun fd、权限、route 和资源实测仍需对应平台环境。
+
+## 48. 2026-08-10 DNS resolver source-address Podman smoke
+
+为把 resolver 的 source-address policy 从单元测试推进到可复用的容器验收，新增
+`scripts/integration/dns-source-bind.sh` 和 `make dns-source-smoke`：脚本复用
+`yuhaiin-core` 中已有的 UDP/TCP async client/server 测试，在 host-network Debian testing
+容器内分别从 `127.0.0.2` 发起请求，并由 `127.0.0.1` 的 DNS server 回包。
+
+这项确认了：
+
+- UDP client 在发送前按地址族绑定配置的本地地址；
+- TCP client 使用 `TcpSocket` 先绑定本地地址再连接；
+- DNS packet transaction、响应解码和两种 transport 的 client/server 闭环未被容器运行时
+  破坏；
+- 构建日志和 Podman 日志保存在 `~/.cache/yuhaiin-rust/integration/dns-source-bind`，
+  没有使用 `/tmp`。
+
+实际执行结果：
+
+```text
+test dns_udp_async::tests::async_udp_client_and_handler_round_trip_with_original_transaction ... ok
+test dns_tcp_async::tests::async_tcp_client_and_server_round_trip_preserves_transaction ... ok
+[dns-source-bind] passed
+```
+
+DoH/DoT 的 source-address 和 SOCKS5 UDP/node latency 的网络验收仍保留在 checklist 下一步，
+因为它们需要额外的 TLS/代理服务端 fixture；本次没有把 UDP/TCP 的已有覆盖重复实现一套。

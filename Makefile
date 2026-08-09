@@ -41,7 +41,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke \
+.PHONY: help build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke dns-source-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -55,6 +55,7 @@ help:
 		'make build-all-bins     build every workspace binary' \
 		'make build-tun-smoke    build the privileged TUN smoke binary' \
 		'make build-tun-service-smoke build the runtime-owned TUN smoke binary' \
+		'make dns-source-smoke   run UDP/TCP resolver source-bind smoke in Podman' \
 		'make run ARGS="..."    run the runtime binary with arguments' \
 		'make version            run the binary version command' \
 		'make check              cargo check for the whole workspace' \
@@ -94,6 +95,9 @@ build-tun-smoke:
 build-tun-service-smoke:
 	$(CARGO) build $(CARGO_COMMON_ARGS) -p $(RUNTIME_PACKAGE) --bin tun-service-smoke --all-features
 	@printf 'binary: %s/debug/tun-service-smoke\n' "$(CARGO_TARGET_DIR)"
+
+dns-source-smoke:
+	./scripts/integration/dns-source-bind.sh
 
 build-chain-smoke:
 	$(CARGO) build $(CARGO_COMMON_ARGS) -p yuhaiin-chain --bin chain-smoke

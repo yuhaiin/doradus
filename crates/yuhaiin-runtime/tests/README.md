@@ -36,6 +36,11 @@ The current scenarios cover:
   reusable SQLite state directory, and runs the same `inbound::run_until`
   owner in a privileged Podman `--network=none` container. It checks that the
   kernel TUN device appears and is removed by the common shutdown path.
+- `scripts/integration/dns-source-bind.sh` runs the existing UDP/TCP resolver
+  source-address tests inside a host-network Podman container. It confirms
+  that the configured local IPv4 address reaches the DNS server for both
+  transports; build and Podman logs are kept under
+  `~/.cache/yuhaiin-rust/integration/dns-source-bind`.
 - standalone Go HTTP/2 transport wire compatibility is covered separately in
   `crates/yuhaiin-chain/tests/standalone_http2.rs`: fixed endpoint resolution,
   plaintext prior-knowledge H2, `CONNECT http://localhost`, raw bidirectional
