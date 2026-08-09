@@ -1652,3 +1652,25 @@ bash scripts/integration/service-chain.sh
 测试默认将状态放在 `~/.cache/yuhaiin-rust/integration/<scenario>/<pid>`；设置
 `YUHAIIN_INTEGRATION_DIR` 可保留 SQLite 供本地或 Podman `--network=host` 任务检查，
 不使用 `/tmp`。
+
+## 40. 2026-08-09 runtime TLS/H2/Yuubinsya service-chain regression
+
+在同一份 `service_chain.rs` 进程级测试中加入真实的 TLS + HTTP/2 + Yuubinsya
+出口 fixture。fixture 使用 `yuhaiin-chain::YuubinsyaH2Server`、RustCrypto TLS
+和一个 loopback TCP/UDP target；Rust runtime 通过 `/api/v2/nodes` 写入 Go 形状的
+`fixed → tls → http2 → yuubinsya` chain，再通过 `/nodes/{id}/use` 使其成为活动
+节点。测试随后通过 HTTP inbound 发送 domain CONNECT，确认 TCP payload 从
+inbound 经 route rule、TLS、H2 CONNECT、Yuubinsya 到 target 后回显；同一节点再由
+mixed UDP inbound 发送 SOCKS5 UDP domain frame，确认 UDP-over-TCP session、server
+side UDP relay 和回包均工作。
+
+测试还检查两条 flow 的 `connections` 均显示正确 inbound/outbound/mode，且同一个
+chain node 的 TCP latency API 返回成功。fixture 中 direct target 的域名映射只存在
+测试 server 侧，用来保留客户端发出的 `example.test`，不依赖宿主机 DNS，也没有把
+测试专用解析逻辑带入生产 runtime。
+
+执行：
+
+```bash
+cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
+```

@@ -8,8 +8,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use support::{
-    ConnectFixture, ServiceProcess, api_json, configure_http_chain, integration_dir,
-    seed_empty_database, wait_for_connection,
+    ConnectFixture, H2YuubinsyaFixture, ServiceProcess, add_mixed_udp_inbound, api_json,
+    configure_http_chain, configure_tls_h2_yuubinsya_chain, integration_dir, seed_empty_database,
+    wait_for_connection,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -160,6 +161,183 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
+    let fixture = H2YuubinsyaFixture::start().await;
+    let _default_mixed_blocker = tokio::net::TcpListener::bind("127.0.0.1:1080").await.ok();
+    let inbound_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let inbound = inbound_listener.local_addr().unwrap();
+    drop(inbound_listener);
+    let (udp_inbound, udp_listener) = loop {
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp_listener.local_addr().unwrap();
+        match tokio::net::UdpSocket::bind(address).await {
+            Ok(udp_listener) => break (address, (tcp_listener, udp_listener)),
+            Err(_) => drop(tcp_listener),
+        }
+    };
+    drop(udp_listener);
+
+    let root = integration_dir("service-tls-h2-yuubinsya");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_tls_h2_yuubinsya_chain(&service, inbound, fixture.outbound).await;
+    add_mixed_udp_inbound(&service, "tls-h2-yuubinsya-udp-in", udp_inbound).await;
+
+    let mut client = None;
+    for _ in 0..100 {
+        match TcpStream::connect(inbound).await {
+            Ok(stream) => {
+                client = Some(stream);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    let mut client = client.expect("TLS/H2/Yuubinsya HTTP inbound did not start");
+    let authority = format!("example.test:{}", fixture.target.port());
+    client
+        .write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut headers = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while !headers.windows(4).any(|window| window == b"\r\n\r\n") {
+        let length = client.read(&mut buffer).await.unwrap();
+        assert!(length > 0, "HTTP inbound closed before chain response");
+        headers.extend_from_slice(&buffer[..length]);
+    }
+    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 200"));
+
+    client.write_all(b"tls-h2-yuubinsya-payload").await.unwrap();
+    let mut payload = [0u8; 24];
+    client.read_exact(&mut payload).await.unwrap();
+    assert_eq!(&payload, b"tls-h2-yuubinsya-payload");
+
+    let connection = wait_for_connection(&service.client, &service.base_url).await;
+    let item = connection["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inboundName"] == "tls-h2-yuubinsya-in")
+        .expect("TLS/H2/Yuubinsya connection must be visible");
+    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["outbound"], "tls-h2-yuubinsya-out");
+    assert_eq!(item["mode"], "proxy");
+    assert!(item["matchHistory"].as_array().is_some_and(|history| {
+        history
+            .iter()
+            .any(|entry| entry["ruleName"] == "proxy-example-test-over-yuubinsya")
+    }));
+
+    let udp_client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_payload = b"tls-h2-yuubinsya-udp";
+    let udp_domain = b"example.test";
+    let mut packet = vec![0, 0, 0, 3, udp_domain.len() as u8];
+    packet.extend_from_slice(udp_domain);
+    packet.extend_from_slice(&fixture.udp_target.port().to_be_bytes());
+    packet.extend_from_slice(udp_payload);
+    let mut udp_response = [0u8; 2048];
+    let mut udp_length = None;
+    for _ in 0..100 {
+        udp_client.send_to(&packet, udp_inbound).await.unwrap();
+        if let Ok(Ok((length, _))) = tokio::time::timeout(
+            Duration::from_millis(50),
+            udp_client.recv_from(&mut udp_response),
+        )
+        .await
+        {
+            udp_length = Some(length);
+            break;
+        }
+    }
+    let udp_length = if let Some(length) = udp_length {
+        length
+    } else {
+        let logs = api_json(
+            &service.client,
+            &service.base_url,
+            reqwest::Method::POST,
+            "/api/v2/rpc/tools.logs",
+            Some(&json!({})),
+        )
+        .await;
+        let inbounds = api_json(
+            &service.client,
+            &service.base_url,
+            reqwest::Method::GET,
+            "/api/v2/inbounds?page=1&pageSize=100",
+            None,
+        )
+        .await;
+        let connections = api_json(
+            &service.client,
+            &service.base_url,
+            reqwest::Method::GET,
+            "/api/v2/connections",
+            None,
+        )
+        .await;
+        panic!(
+            "TLS/H2/Yuubinsya UDP flow did not respond; logs={logs}; inbounds={inbounds}; connections={connections}; stderr={}",
+            service.diagnostics()
+        );
+    };
+    assert!(
+        udp_response
+            .windows(udp_payload.len())
+            .any(|window| window == udp_payload)
+    );
+
+    let mut udp_connection = None;
+    for _ in 0..100 {
+        let current = api_json(
+            &service.client,
+            &service.base_url,
+            reqwest::Method::GET,
+            "/api/v2/connections",
+            None,
+        )
+        .await;
+        udp_connection = current["connections"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["inboundName"] == "tls-h2-yuubinsya-udp-in")
+            })
+            .cloned();
+        if udp_connection.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let udp_item = udp_connection.expect("TLS/H2/Yuubinsya UDP connection must be visible");
+    assert_eq!(udp_item["inbound"], "mixed");
+    assert_eq!(udp_item["outbound"], "tls-h2-yuubinsya-out");
+    assert_eq!(udp_item["mode"], "proxy");
+    assert!(udp_length > udp_payload.len());
+
+    let latency = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes/tls-h2-yuubinsya-out/latency",
+        Some(&json!({
+            "type":"tcp",
+            "url":format!("http://{authority}/health")
+        })),
+    )
+    .await;
+    assert_eq!(latency["ok"], true, "chain latency response: {latency}");
+
+    client.shutdown().await.unwrap();
     service.shutdown().await;
     fixture.shutdown().await;
 }
