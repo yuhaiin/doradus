@@ -39,6 +39,8 @@
 
 > 2026-08-09 route detail 规范化：对照 Go `RouteListStore.decodeRouteListDetail` 与 `RouteRuleStore.decodeRouteRule`，Rust route list/rule 的 detail GET 不再直接回显原始 JSON；保存时持久化 trimmed name、默认 `host/local` source 和默认 `bypass` mode，remote/local section 也按 Go 互斥规范化。mutation response 仍保留 Go 的请求回显语义；新增空 source/type/mode 的 API 回归，priority/apply side effect 继续单独验收。
 
+> 2026-08-10 Go v1 state.db 直接导入：旧 Go 数据库的 `nodes`、`inbounds`、`route_lists`、`node_tags` 表现在由 `yuhaiin-store::migration` 在同一 `BEGIN IMMEDIATE` 导入事务内幂等投影到 v2 contract。节点会把旧 oneof `protocols` 转成 `chain`，空链按 Go 行为补 `direct`，并恢复 `selected_tcp_node_v2`/`selected_udp_node_v2`；入站会把 `tcpudp/empty`、`transport` 和协议 oneof 转成 `network/transports/protocol`，其中 `tcp_udp_control_all` 明确转为 `udp=enabled`，因此旧 mixed 配置不会再丢 UDP；路由列表和标签也按 Go 的 `source`、`name/type/hash` contract 生成。原始 v1 表不删除，未知字段不参与猜测性转换，v2 已有数据时以 v2 为权威，四个 meta marker 防止重复导入。新增确定性 v1 fixture 和 `imports_real_go_v1_snapshot_without_touching_source` ignored 测试；后者已用 `/home/asutorufa/Documents/Programming/yuhaiin/tmp/state.db` 的只读副本通过，源库未修改。
+
 > 2026-08-09 route activation 合并：对照 Go `ScheduleApply`、列表 host-index refresh 和 `route.apply`，Rust route rule 保存/删除/排序及 route list 保存/删除现在写入兼容的 pending activation 时间；`route.activation` 同时合并 `route.lists.activation.hostIndexRefreshAt` 与 `route.activation.ruleApplyAt`，显式 apply 会原子清理两类状态。数据面仍在 typed repository mutation 后立即 reload，activation 只表达管理面可见的 pending/apply 生命周期；新增 priority、list mutation、combined status 和 clear regression。
 
 > 2026-08-09 route activation 生命周期：Rust 管理面按 Go 的一分钟 timer 语义处理过期 deadline；`route.activation` 与 `route.lists.activation` 读取时会将已过期状态报告为 0，避免进程重启或无后台 timer 时前端进度永久卡住。route list refresh 的 `hostIndexRefreshAt` 改为当前时间后一分钟，`lastRefreshAt` 仍保留实际刷新时间；新增过期状态和 refresh deadline 回归。

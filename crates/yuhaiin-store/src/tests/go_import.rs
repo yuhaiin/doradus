@@ -123,6 +123,191 @@ fn additive_go_schema_v7_is_opened_without_dropping_subscription_tables() {
     );
     remove_database_artifacts(&path);
 }
+
+#[test]
+fn imports_go_v1_nodes_inbounds_lists_and_tags_into_v2_contracts() {
+    let path = test_database_path();
+    {
+        let connection = Connection::open(path.to_str().unwrap()).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE migrate (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);
+                INSERT INTO metadata(key, value) VALUES ('schema_version', '1');
+                INSERT INTO migrate(version, name, applied_at) VALUES (1, 'initial_schema', 0);
+                CREATE TABLE nodes (
+                    id INTEGER PRIMARY KEY,
+                    hash TEXT NOT NULL UNIQUE,
+                    group_name TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    origin INTEGER NOT NULL,
+                    selected_tcp INTEGER NOT NULL DEFAULT 0,
+                    selected_udp INTEGER NOT NULL DEFAULT 0,
+                    search_text TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL,
+                    data_json TEXT NOT NULL
+                );
+                INSERT INTO nodes(hash, group_name, name, origin, selected_tcp, selected_udp, updated_at, data_json)
+                VALUES ('legacy-node', 'manual', 'Legacy node', 102, 1, 0, 42,
+                    '{"hash":"legacy-node","name":"Legacy node","group":"manual","origin":"manual","protocols":[{"simple":{"host":"127.0.0.1","port":1080}},{"socks5":{"hostname":"127.0.0.1","user":"","password":"","override_port":0}}]}');
+                CREATE TABLE inbounds (
+                    name TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL,
+                    inbound_type TEXT NOT NULL,
+                    listen_host TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL,
+                    data_json TEXT NOT NULL
+                );
+                INSERT INTO inbounds(name, enabled, inbound_type, updated_at, data_json)
+                VALUES ('mixed', 1, 'mixed', 43,
+                    '{"name":"mixed","enabled":true,"tcpudp":{"host":"127.0.0.1:1080","control":"tcp_udp_control_all"},"transport":[],"mixed":{"username":"","password":""}}');
+                CREATE TABLE route_lists (
+                    name TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL,
+                    data_json TEXT NOT NULL
+                );
+                INSERT INTO route_lists(name, kind, updated_at, data_json)
+                VALUES ('legacy-list', 'host', 44,
+                    '{"name":"legacy-list","list_type":"host","local":{"lists":["example.com"]}}');
+                CREATE TABLE node_tags (
+                    tag_name TEXT NOT NULL,
+                    target_kind TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(tag_name, target_kind, target_id)
+                );
+                INSERT INTO node_tags(tag_name, target_kind, target_id, updated_at)
+                VALUES ('legacy-tag', 'node', 'legacy-node', 45);
+                "#,
+            )
+            .unwrap();
+    }
+
+    let store = block_on(ConfigStore::open(&path)).unwrap();
+    let repository = store.repository();
+    let nodes = block_on(repository.list_go_nodes()).unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].id, "legacy-node");
+    assert_eq!(nodes[0].origin, "manual");
+    let node: serde_json::Value = serde_json::from_slice(&nodes[0].data_json).unwrap();
+    assert_eq!(node["id"], "legacy-node");
+    assert_eq!(node["chain"][0]["type"], "simple");
+    assert_eq!(node["chain"][1]["type"], "socks5");
+    assert_eq!(
+        block_on(repository.get_go_selected_node_id("selected_tcp_node_v2")).unwrap(),
+        Some("legacy-node".to_owned())
+    );
+
+    let inbounds = block_on(repository.list_go_inbounds()).unwrap();
+    assert_eq!(inbounds.len(), 1);
+    let inbound: serde_json::Value = serde_json::from_slice(&inbounds[0].data_json).unwrap();
+    assert_eq!(inbound["network"]["type"], "tcp_udp");
+    assert_eq!(inbound["network"]["tcp_udp"]["udp"], "enabled");
+    assert_eq!(inbound["protocol"]["type"], "mixed");
+
+    let lists = block_on(repository.list_go_route_lists()).unwrap();
+    assert_eq!(lists.len(), 1);
+    assert_eq!(lists[0].name, "legacy-list");
+    assert_eq!(lists[0].source_type, "local");
+    let tags = block_on(repository.list_go_node_tags()).unwrap();
+    assert_eq!(tags.len(), 1);
+    let tag: serde_json::Value = serde_json::from_slice(&tags[0].members_json).unwrap();
+    assert_eq!(tag["type"], "node");
+    assert_eq!(tag["hash"][0], "legacy-node");
+    drop(store);
+
+    let reopened = block_on(ConfigStore::open(&path)).unwrap();
+    assert_eq!(
+        block_on(reopened.repository().list_go_nodes())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        block_on(reopened.repository().list_go_inbounds())
+            .unwrap()
+            .len(),
+        1
+    );
+    remove_database_artifacts(&path);
+}
+
+#[test]
+#[ignore = "requires YUHAIIN_GO_LEGACY_PRODUCTION_DB pointing to a copied Go v1 state.db"]
+fn imports_real_go_v1_snapshot_without_touching_source() {
+    let source = std::env::var_os("YUHAIIN_GO_LEGACY_PRODUCTION_DB")
+        .map(PathBuf::from)
+        .expect("YUHAIIN_GO_LEGACY_PRODUCTION_DB must point to a Go v1 snapshot");
+    assert!(source.is_file(), "Go v1 snapshot does not exist");
+    let source_connection = Connection::open(source.to_str().unwrap()).unwrap();
+    let expected = [
+        (
+            "nodes",
+            table_row_count(&source_connection, "nodes").unwrap(),
+        ),
+        (
+            "inbounds",
+            table_row_count(&source_connection, "inbounds").unwrap(),
+        ),
+        (
+            "dns_resolvers",
+            table_row_count(&source_connection, "dns_resolvers").unwrap(),
+        ),
+        (
+            "route_rules",
+            table_row_count(&source_connection, "route_rules").unwrap(),
+        ),
+        (
+            "route_lists",
+            table_row_count(&source_connection, "route_lists").unwrap(),
+        ),
+        (
+            "node_tags",
+            table_row_count(&source_connection, "node_tags").unwrap(),
+        ),
+    ];
+    drop(source_connection);
+
+    let path = test_database_path().with_file_name(format!(
+        "go-v1-production-import-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::copy(&source, &path).expect("copy Go v1 snapshot");
+    let store = block_on(ConfigStore::open(&path)).expect("open Go v1 snapshot with Rust");
+    let repository = store.repository();
+    assert_eq!(
+        block_on(repository.list_go_nodes()).unwrap().len() as i64,
+        expected[0].1
+    );
+    assert_eq!(
+        block_on(repository.list_go_inbounds()).unwrap().len() as i64,
+        expected[1].1
+    );
+    assert_eq!(
+        block_on(repository.list_go_resolvers()).unwrap().len() as i64,
+        expected[2].1
+    );
+    assert_eq!(
+        block_on(repository.list_go_route_rules()).unwrap().len() as i64,
+        expected[3].1
+    );
+    assert_eq!(
+        block_on(repository.list_go_route_lists()).unwrap().len() as i64,
+        expected[4].1
+    );
+    assert_eq!(
+        block_on(repository.list_go_node_tags()).unwrap().len() as i64,
+        expected[5].1
+    );
+    remove_database_artifacts(&path);
+}
+
 #[test]
 fn go_route_udp_proxy_fqdn_codes_preserve_known_and_unknown_semantics() {
     let base = GoRouteSettingsRecord {

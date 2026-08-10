@@ -1,5 +1,7 @@
 //! Go schema import, legacy upgrades, and migration validation.
 
+use std::collections::BTreeMap;
+
 use super::*;
 
 pub(super) fn import_go_schema(connection: &Connection) -> Result<()> {
@@ -22,6 +24,10 @@ pub(super) fn import_go_schema(connection: &Connection) -> Result<()> {
     let legacy_upgrade_pending = [
         ("go_legacy_dns_resolvers", "go_v1_resolvers_upgraded"),
         ("go_legacy_route_rules", "go_v1_route_rules_upgraded"),
+        ("nodes", "go_v1_nodes_upgraded"),
+        ("inbounds", "go_v1_inbounds_upgraded"),
+        ("route_lists", "go_v1_route_lists_upgraded"),
+        ("node_tags", "go_v1_node_tags_upgraded"),
     ]
     .into_iter()
     .any(|(table, marker)| table_exists(connection, table) && !meta_flag(connection, marker));
@@ -574,6 +580,24 @@ pub(super) fn meta_flag(connection: &Connection, key: &str) -> bool {
 /// the rest of the Go import.  The raw legacy object is retained as the base
 /// of the generated JSON, so fields unknown to Rust remain recoverable.
 fn upgrade_go_v1_legacy_tables(connection: &Connection, _source_version: i64) -> Result<()> {
+    if table_exists(connection, "nodes") && !meta_flag(connection, "go_v1_nodes_upgraded") {
+        upgrade_go_v1_nodes(connection)?;
+        set_meta_flag(connection, "go_v1_nodes_upgraded")?;
+    }
+    if table_exists(connection, "inbounds") && !meta_flag(connection, "go_v1_inbounds_upgraded") {
+        upgrade_go_v1_inbounds(connection)?;
+        set_meta_flag(connection, "go_v1_inbounds_upgraded")?;
+    }
+    if table_exists(connection, "route_lists")
+        && !meta_flag(connection, "go_v1_route_lists_upgraded")
+    {
+        upgrade_go_v1_route_lists(connection)?;
+        set_meta_flag(connection, "go_v1_route_lists_upgraded")?;
+    }
+    if table_exists(connection, "node_tags") && !meta_flag(connection, "go_v1_node_tags_upgraded") {
+        upgrade_go_v1_node_tags(connection)?;
+        set_meta_flag(connection, "go_v1_node_tags_upgraded")?;
+    }
     if table_exists(connection, "go_legacy_dns_resolvers")
         && !meta_flag(connection, "go_v1_resolvers_upgraded")
     {
@@ -587,6 +611,410 @@ fn upgrade_go_v1_legacy_tables(connection: &Connection, _source_version: i64) ->
         set_meta_flag(connection, "go_v1_route_rules_upgraded")?;
     }
     Ok(())
+}
+
+fn upgrade_go_v1_nodes(connection: &Connection) -> Result<()> {
+    require_go_table(
+        connection,
+        "nodes",
+        &[
+            "hash",
+            "group_name",
+            "name",
+            "origin",
+            "selected_tcp",
+            "selected_udp",
+            "updated_at",
+            "data_json",
+        ],
+    )?;
+    if table_row_count(connection, "nodes_v2")? != 0 {
+        return Ok(());
+    }
+
+    let rows = connection
+        .query(
+            "SELECT hash, group_name, name, origin, selected_tcp, selected_udp,
+                    updated_at, data_json
+             FROM nodes ORDER BY hash",
+        )
+        .map_err(storage_error)?;
+    for row in &rows {
+        let id = row_text(row, 0, "nodes.hash")?;
+        let group_name = row_text(row, 1, "nodes.group_name")?;
+        let name = row_text(row, 2, "nodes.name")?;
+        let origin_value = row_integer(row, 3, "nodes.origin")?;
+        let updated_at = row_integer(row, 6, "nodes.updated_at")?;
+        validate_id(&id)?;
+        validate_id(&name)?;
+        validate_go_compat_text(&group_name, "nodes.group_name")?;
+        validate_go_timestamp(updated_at)?;
+
+        let mut object = legacy_json_object(
+            &row_blob_or_text(row, 7, "nodes.data_json")?,
+            "nodes.data_json",
+        )?;
+        let chain = object
+            .remove("protocols")
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|protocol| legacy_protocol_contract(&protocol))
+            .collect::<Vec<_>>();
+        let chain = if chain.is_empty() {
+            vec![serde_json::json!({"type": "direct", "direct": {}})]
+        } else {
+            chain
+        };
+        let origin = json_string(&object, &["origin"])
+            .or_else(|| match origin_value {
+                101 => Some("remote".to_owned()),
+                102 => Some("manual".to_owned()),
+                _ => Some("reserve".to_owned()),
+            })
+            .unwrap_or_else(|| "reserve".to_owned());
+        let chain_types = chain
+            .iter()
+            .filter_map(|protocol| protocol.get("type").and_then(serde_json::Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        object.insert("id".to_owned(), serde_json::Value::String(id.clone()));
+        object.insert("name".to_owned(), serde_json::Value::String(name.clone()));
+        object.insert(
+            "group".to_owned(),
+            serde_json::Value::String(group_name.clone()),
+        );
+        object.insert(
+            "origin".to_owned(),
+            serde_json::Value::String(origin.clone()),
+        );
+        object.insert("enabled".to_owned(), serde_json::Value::Bool(true));
+        object.insert("chain".to_owned(), serde_json::Value::Array(chain));
+        let data_json = json_object_bytes(object, "legacy node")?;
+        let chain_types_json = serde_json::to_vec(&chain_types).map_err(|error| {
+            Error::new(
+                ErrorKind::Storage,
+                format!("encode legacy node chain types {id:?} failed: {error}"),
+            )
+        })?;
+        connection
+            .execute_with_params(
+                "INSERT INTO nodes_v2
+                 (id, name, group_name, origin, enabled, chain_types_json, updated_at, data_json)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)",
+                &[
+                    SqliteValue::from(id),
+                    SqliteValue::from(name),
+                    SqliteValue::from(group_name),
+                    SqliteValue::from(origin),
+                    SqliteValue::from(chain_types_json),
+                    SqliteValue::from(updated_at),
+                    SqliteValue::from(data_json),
+                ],
+            )
+            .map_err(storage_error)?;
+    }
+
+    for (metadata_key, selected_column) in [
+        ("selected_tcp_node_v2", "selected_tcp"),
+        ("selected_udp_node_v2", "selected_udp"),
+    ] {
+        connection
+            .execute_with_params(
+                &format!(
+                    "INSERT INTO metadata(key, value)
+                     SELECT ?1, hash FROM nodes
+                     WHERE {selected_column} = 1
+                       AND EXISTS (SELECT 1 FROM nodes_v2 WHERE id = nodes.hash)
+                     LIMIT 1
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                     WHERE metadata.value = ''
+                        OR NOT EXISTS (SELECT 1 FROM nodes_v2 WHERE id = metadata.value)"
+                ),
+                &[SqliteValue::from(metadata_key)],
+            )
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+fn upgrade_go_v1_inbounds(connection: &Connection) -> Result<()> {
+    require_go_table(
+        connection,
+        "inbounds",
+        &["name", "enabled", "inbound_type", "updated_at", "data_json"],
+    )?;
+    if table_row_count(connection, "inbounds_v2")? != 0 {
+        return Ok(());
+    }
+    let rows = connection
+        .query(
+            "SELECT name, enabled, inbound_type, updated_at, data_json
+             FROM inbounds ORDER BY name",
+        )
+        .map_err(storage_error)?;
+    for row in &rows {
+        let id = row_text(row, 0, "inbounds.name")?;
+        let enabled = row_integer(row, 1, "inbounds.enabled")? != 0;
+        let inbound_type = row_text(row, 2, "inbounds.inbound_type")?;
+        let updated_at = row_integer(row, 3, "inbounds.updated_at")?;
+        validate_id(&id)?;
+        validate_id(&inbound_type)?;
+        validate_go_timestamp(updated_at)?;
+        let legacy = legacy_json_object(
+            &row_blob_or_text(row, 4, "inbounds.data_json")?,
+            "inbounds.data_json",
+        )?;
+        let name = json_string(&legacy, &["name"])
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| id.clone());
+        let (network_type, network) = legacy_inbound_network(&legacy);
+        let protocol_type = canonical_inbound_name(&inbound_type);
+        let protocol_config = legacy
+            .get(&inbound_type)
+            .or_else(|| legacy.get(&protocol_type))
+            .or_else(|| {
+                legacy.iter().find_map(|(key, value)| {
+                    (!matches!(
+                        key.as_str(),
+                        "name" | "enabled" | "tcpudp" | "empty" | "transport"
+                    ))
+                    .then_some(value)
+                })
+            })
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        let protocol_type =
+            if legacy.contains_key(&inbound_type) || legacy.contains_key(&protocol_type) {
+                protocol_type
+            } else {
+                "none".to_owned()
+            };
+        let mut protocol = serde_json::Map::new();
+        protocol.insert(
+            "type".to_owned(),
+            serde_json::Value::String(protocol_type.clone()),
+        );
+        protocol.insert(protocol_type.clone(), protocol_config);
+
+        let transports = legacy
+            .get("transport")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(legacy_protocol_contract)
+            .collect::<Vec<_>>();
+        let transport_types = transports
+            .iter()
+            .filter_map(|transport| transport.get("type").cloned())
+            .collect::<Vec<_>>();
+        let mut contract = serde_json::Map::new();
+        contract.insert("id".to_owned(), serde_json::Value::String(id.clone()));
+        contract.insert("name".to_owned(), serde_json::Value::String(name.clone()));
+        contract.insert("enabled".to_owned(), serde_json::Value::Bool(enabled));
+        contract.insert("network".to_owned(), network);
+        contract.insert(
+            "transports".to_owned(),
+            serde_json::Value::Array(transports),
+        );
+        contract.insert("protocol".to_owned(), serde_json::Value::Object(protocol));
+        let data_json = json_object_bytes(contract, "legacy inbound")?;
+        let transport_types_json = serde_json::to_vec(&transport_types).map_err(|error| {
+            Error::new(
+                ErrorKind::Storage,
+                format!("encode legacy inbound transport types {id:?} failed: {error}"),
+            )
+        })?;
+        connection
+            .execute_with_params(
+                "INSERT INTO inbounds_v2
+                 (id, name, enabled, network_type, protocol_type,
+                  transport_types_json, updated_at, data_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    SqliteValue::from(id.clone()),
+                    SqliteValue::from(name),
+                    SqliteValue::from(i64::from(enabled)),
+                    SqliteValue::from(network_type),
+                    SqliteValue::from(protocol_type),
+                    SqliteValue::from(transport_types_json),
+                    SqliteValue::from(updated_at),
+                    SqliteValue::from(data_json),
+                ],
+            )
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+fn legacy_inbound_network(
+    legacy: &serde_json::Map<String, serde_json::Value>,
+) -> (String, serde_json::Value) {
+    if let Some(tcpudp) = legacy.get("tcpudp") {
+        let mut config = tcpudp.as_object().cloned().unwrap_or_default();
+        let udp = match config.get("control").and_then(serde_json::Value::as_str) {
+            Some("disable_tcp") => "udp_only",
+            Some("disable_udp") => "tcp_only",
+            _ => "enabled",
+        };
+        config.insert("udp".to_owned(), serde_json::Value::String(udp.to_owned()));
+        let mut network = serde_json::Map::new();
+        network.insert(
+            "type".to_owned(),
+            serde_json::Value::String("tcp_udp".to_owned()),
+        );
+        network.insert("tcp_udp".to_owned(), serde_json::Value::Object(config));
+        ("tcp_udp".to_owned(), serde_json::Value::Object(network))
+    } else {
+        (
+            "empty".to_owned(),
+            serde_json::json!({"type": "empty", "empty": {}}),
+        )
+    }
+}
+
+fn upgrade_go_v1_route_lists(connection: &Connection) -> Result<()> {
+    require_go_table(
+        connection,
+        "route_lists",
+        &["name", "kind", "updated_at", "data_json"],
+    )?;
+    if table_row_count(connection, "route_lists_v2")? != 0 {
+        return Ok(());
+    }
+    let rows = connection
+        .query("SELECT name, kind, updated_at, data_json FROM route_lists ORDER BY name")
+        .map_err(storage_error)?;
+    for row in &rows {
+        let fallback_name = row_text(row, 0, "route_lists.name")?;
+        let kind = row_text(row, 1, "route_lists.kind")?;
+        let updated_at = row_integer(row, 2, "route_lists.updated_at")?;
+        validate_id(&fallback_name)?;
+        validate_go_timestamp(updated_at)?;
+        let mut legacy = legacy_json_object(
+            &row_blob_or_text(row, 3, "route_lists.data_json")?,
+            "route_lists.data_json",
+        )?;
+        let name = json_string(&legacy, &["name"])
+            .filter(|value| !value.is_empty())
+            .unwrap_or(fallback_name);
+        let list_type = json_string(&legacy, &["type", "listType", "list_type"])
+            .or_else(|| (!kind.is_empty()).then_some(kind))
+            .unwrap_or_else(|| "host".to_owned());
+        let source_type = if legacy.contains_key("remote") {
+            "remote"
+        } else {
+            "local"
+        };
+        let source_config = legacy
+            .remove(source_type)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let mut source = serde_json::Map::new();
+        source.insert(
+            "type".to_owned(),
+            serde_json::Value::String(source_type.to_owned()),
+        );
+        source.insert(source_type.to_owned(), source_config);
+        let mut contract = serde_json::Map::new();
+        contract.insert("name".to_owned(), serde_json::Value::String(name.clone()));
+        contract.insert(
+            "type".to_owned(),
+            serde_json::Value::String(list_type.clone()),
+        );
+        contract.insert(
+            "errorMsgs".to_owned(),
+            legacy
+                .remove("errorMsgs")
+                .unwrap_or_else(|| serde_json::json!([])),
+        );
+        contract.insert("source".to_owned(), serde_json::Value::Object(source));
+        let data_json = json_object_bytes(contract, "legacy route list")?;
+        connection
+            .execute_with_params(
+                "INSERT INTO route_lists_v2
+                 (name, list_type, source_type, updated_at, data_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    SqliteValue::from(name),
+                    SqliteValue::from(list_type),
+                    SqliteValue::from(source_type),
+                    SqliteValue::from(updated_at),
+                    SqliteValue::from(data_json),
+                ],
+            )
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+fn upgrade_go_v1_node_tags(connection: &Connection) -> Result<()> {
+    require_go_table(
+        connection,
+        "node_tags",
+        &["tag_name", "target_kind", "target_id", "updated_at"],
+    )?;
+    if table_row_count(connection, "node_tags_v2")? != 0 {
+        return Ok(());
+    }
+    let rows = connection
+        .query(
+            "SELECT tag_name, target_kind, target_id, updated_at
+             FROM node_tags ORDER BY tag_name, target_kind, target_id",
+        )
+        .map_err(storage_error)?;
+    let mut tags: BTreeMap<String, (String, Vec<String>, i64)> = BTreeMap::new();
+    for row in &rows {
+        let name = row_text(row, 0, "node_tags.tag_name")?;
+        let target_kind = row_text(row, 1, "node_tags.target_kind")?;
+        let target_id = row_text(row, 2, "node_tags.target_id")?;
+        let updated_at = row_integer(row, 3, "node_tags.updated_at")?;
+        validate_id(&name)?;
+        validate_id(&target_id)?;
+        validate_go_timestamp(updated_at)?;
+        let entry = tags
+            .entry(name)
+            .or_insert_with(|| ("node".to_owned(), Vec::new(), updated_at));
+        if target_kind == "tag" {
+            entry.0 = "mirror".to_owned();
+        }
+        entry.1.push(target_id);
+        entry.2 = entry.2.max(updated_at);
+    }
+    for (name, (tag_type, members, updated_at)) in tags {
+        let data_json = json_object_bytes(
+            serde_json::Map::from_iter([
+                ("name".to_owned(), serde_json::Value::String(name.clone())),
+                ("type".to_owned(), serde_json::Value::String(tag_type)),
+                (
+                    "hash".to_owned(),
+                    serde_json::Value::Array(
+                        members.into_iter().map(serde_json::Value::String).collect(),
+                    ),
+                ),
+            ]),
+            "legacy node tag",
+        )?;
+        connection
+            .execute_with_params(
+                "INSERT INTO node_tags_v2(id, name, members_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    SqliteValue::from(name.clone()),
+                    SqliteValue::from(name),
+                    SqliteValue::from(data_json),
+                    SqliteValue::from(updated_at),
+                ],
+            )
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+fn canonical_inbound_name(value: &str) -> String {
+    match value {
+        "mix" => "mixed".to_owned(),
+        other => canonical_protocol_name(other),
+    }
 }
 
 fn set_meta_flag(connection: &Connection, key: &str) -> Result<()> {
