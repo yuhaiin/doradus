@@ -99,6 +99,10 @@ The current scenarios cover:
   visible on stderr, and then checks a clean SIGTERM shutdown. This protects
   the foreground behavior that makes a manually launched binary distinguishable
   from a hung process.
+- `service_chain.rs` also creates a schema-v6 central basic user through the
+  real API after the HTTP inbound is already running. It waits for the inbound
+  owner to reload, proves invalid credentials are rejected, then sends an
+  authenticated CONNECT through the same router and HTTP outbound fixture.
 - `scripts/integration/api-contract.sh` runs the frontend management API
   process contract in Podman, including CRUD, reload, selection, connections,
   statistics, SSE, and representative error responses. It uses host networking

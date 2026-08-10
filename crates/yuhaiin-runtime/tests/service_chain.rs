@@ -1,5 +1,6 @@
 mod support;
 
+use base64::Engine;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -508,6 +509,133 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn central_basic_user_authenticates_http_inbound_chain() {
+    let fixture = ConnectFixture::start().await;
+    let _default_mixed_blocker = tokio::net::TcpListener::bind("127.0.0.1:1080").await.ok();
+    let inbound_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let inbound = inbound_listener.local_addr().unwrap();
+    drop(inbound_listener);
+
+    let root = integration_dir("service-central-http-auth");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_http_chain(&service, inbound, fixture.outbound).await;
+
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/users",
+        Some(&json!({
+            "id":"central-http-user",
+            "name":"Central HTTP user",
+            "enabled":true,
+            "origin":"manual",
+            "usage":"inbound",
+            "credential":{
+                "type":"basic",
+                "basic":{
+                    "username":"central-user",
+                    "password":"central-password"
+                }
+            }
+        })),
+    )
+    .await;
+
+    let good_token =
+        base64::engine::general_purpose::STANDARD.encode("central-user:central-password");
+    let bad_token = base64::engine::general_purpose::STANDARD.encode("central-user:wrong");
+    let authority = format!("example.test:{}", fixture.target.port());
+    let mut central_auth_ready = false;
+    let mut last_probe_headers = Vec::new();
+    for _ in 0..100 {
+        let mut probe = connect_loopback(inbound).await;
+        probe
+            .write_all(
+                format!(
+                    "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Basic {bad_token}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut headers = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !headers.windows(4).any(|window| window == b"\r\n\r\n") {
+            let length = probe.read(&mut buffer).await.unwrap();
+            if length == 0 {
+                break;
+            }
+            headers.extend_from_slice(&buffer[..length]);
+        }
+        let rejected = String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 403");
+        last_probe_headers = headers;
+        let _ = probe.shutdown().await;
+        if rejected {
+            central_auth_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        central_auth_ready,
+        "central inbound auth snapshot did not reload; headers={:?}; logs={}",
+        String::from_utf8_lossy(&last_probe_headers),
+        service.diagnostics()
+    );
+
+    let mut client = connect_loopback(inbound).await;
+    client
+        .write_all(
+            format!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Basic {good_token}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut headers = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while !headers.windows(4).any(|window| window == b"\r\n\r\n") {
+        let length = client.read(&mut buffer).await.unwrap();
+        assert!(
+            length > 0,
+            "central-auth HTTP inbound closed before response"
+        );
+        headers.extend_from_slice(&buffer[..length]);
+    }
+    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 200"));
+
+    let payload = b"central-auth-http-payload";
+    client.write_all(payload).await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, payload);
+
+    let connection = wait_for_connection(&service.client, &service.base_url).await;
+    let item = connection["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inboundName"] == "http-chain-in")
+        .expect("central-auth HTTP inbound connection must be visible");
+    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["outbound"], fixture.outbound.to_string());
+    assert!(item["matchHistory"].as_array().is_some_and(|history| {
+        history
+            .iter()
+            .any(|entry| entry["ruleName"] == "proxy-example-test")
+    }));
+
+    client.shutdown().await.unwrap();
     service.shutdown().await;
     fixture.shutdown().await;
 }

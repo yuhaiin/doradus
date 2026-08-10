@@ -2525,3 +2525,21 @@ AEAD 外层 UDP 仍是单密码设计，暂不声称支持中心多密码；它�
 -p yuhaiin-core -p yuhaiin-runtime --lib --all-features --offline` 通过 129 + 213 个测试，
 并且真实 `service_chain` 进程测试 11/11 通过。构建和测试缓存均在
 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
+## 77. 2026-08-10 user mutation reloads inbound authentication
+
+真实 service-chain 测试发现了一个此前单测无法覆盖的生命周期缺口：`users` API 的 create/update/delete
+虽然已经写入 schema-v6 SQLite，但没有调用 `RuntimeController::mutate_and_reload`。因此已经运行的
+HTTP/SOCKS5/Yuubinsya listener 仍然持有旧的 `InboundAuth` 快照，前端看见的是新用户，数据面却没有
+同步，属于典型的“控制面成功、数据面未更新”。
+
+现在用户 create、update、delete 都与 node/inbound/resolver/route mutation 共用同一个 reload boundary：
+事务写入成功后重新构建 snapshot、刷新 live selector、发布 reload event，由 inbound owner 原子重建
+listener set。创建用户时保留原有生成 UUID 和返回 view 的语义；更新/删除失败时不会发布半成品 snapshot。
+
+新增 `central_basic_user_authenticates_http_inbound_chain` 进程级回归：先通过 `/api/v2` 写入 inbound、
+route 和 HTTP outbound，再创建中心 basic 用户；错误密码得到 HTTP 403，正确密码经 HTTP inbound →
+router → HTTP CONNECT outbound → loopback target 双向回显，并检查 live connection 的 inbound/outbound
+metadata。该测试与 `api-contract`、`api-reload-flow`、`stats-concurrency` 和 Go/Rust shared SQLite
+smoke 均通过。前台启动日志也用当前构建的 binary 实测输出到 stderr；只有显式设置 `YUHAIIN_QUIET=1`
+才会关闭 console logs。
