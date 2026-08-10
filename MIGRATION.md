@@ -2568,3 +2568,20 @@ Podman 可能创建出部分 namespace/iptables 状态，但不能提供可靠�
 问题。现在脚本在启动容器前读取 Podman rootless 状态；rootless + 强制 TPROXY 直接以退出码 2
 报告需要 rootful Podman 或宿主机 `CAP_NET_ADMIN`。默认模式仍只运行 REDIRECT TCP 并明确记录
 TPROXY skip，IPv4 REDIRECT 和 IPv4+IPv6 REDIRECT 两个 gate 均重新通过。
+
+## 80. 2026-08-10 native service-manager lifecycle
+
+之前 Rust binary 只兼容 Go service command 的参数形状；执行 `install`、`start`、`stop`、
+`restart` 或 `uninstall` 时，仍会把 action 当作运行参数，无法直接替换 Go 的系统服务入口。
+
+现在 `crates/yuhaiin-runtime/src/bin/service/mod.rs` 接管这些 action：Linux 使用
+`/usr/local/bin/yuhaiin`、`/etc/systemd/system/yuhaiin.service` 和 `systemctl`，macOS 使用
+`/usr/local/bin/yuhaiin`、`/Library/LaunchDaemons/com.asutorufa.yuhaiin.plist` 和 `launchctl`。
+安装会检查 root、复制当前 executable、创建数据目录、原子写入 service 配置，然后执行
+daemon reload/bootstrap、enable 和 start；已有运行实例则 restart。卸载会停止/禁用或 bootout、
+移除配置，并保留 symlink binary。`-host`、`-path`/`-p`、`-nfs-mode` 与 Go service command
+保持兼容，路径/host 在 systemd/XML 配置中分别做转义。
+
+已通过 Linux unit renderer 单测、workspace clippy/check，以及重新构建后的非 root fail-fast
+验证；当前环境 uid=1000，因此没有触碰宿主机已有的 `/etc/systemd/system/yuhaiin.service`。
+完整 systemd/launchd 的现场 install/rollback 仍需相应平台权限，不能用本机 rootless 检查替代。

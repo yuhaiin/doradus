@@ -27,7 +27,7 @@ async fn http_connect_with_auth(
     address: SocketAddr,
     authority: &str,
     token: Option<&str>,
-) -> (TcpStream, String) {
+) -> std::io::Result<(TcpStream, String)> {
     let mut stream = connect_loopback(address).await;
     let authorization = token
         .map(|token| format!("Proxy-Authorization: Basic {token}\r\n"))
@@ -37,8 +37,7 @@ async fn http_connect_with_auth(
             format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n{authorization}\r\n")
                 .as_bytes(),
         )
-        .await
-        .unwrap();
+        .await?;
     let mut headers = Vec::new();
     let mut buffer = [0u8; 1024];
     while !headers.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -51,7 +50,7 @@ async fn http_connect_with_auth(
         }
         headers.extend_from_slice(&buffer[..length]);
     }
-    (stream, String::from_utf8_lossy(&headers).into_owned())
+    Ok((stream, String::from_utf8_lossy(&headers).into_owned()))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -590,8 +589,12 @@ async fn central_basic_user_authenticates_http_inbound_chain() {
     let mut central_auth_ready = false;
     let mut last_probe_headers = Vec::new();
     for _ in 0..100 {
-        let (mut probe, response) =
-            http_connect_with_auth(inbound, &authority, Some(&bad_token)).await;
+        let Ok((mut probe, response)) =
+            http_connect_with_auth(inbound, &authority, Some(&bad_token)).await
+        else {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
+        };
         let rejected = response.starts_with("HTTP/1.1 403");
         last_probe_headers = response.into_bytes();
         let _ = probe.shutdown().await;
@@ -608,8 +611,9 @@ async fn central_basic_user_authenticates_http_inbound_chain() {
         service.diagnostics()
     );
 
-    let (mut client, response) =
-        http_connect_with_auth(inbound, &authority, Some(&good_token)).await;
+    let (mut client, response) = http_connect_with_auth(inbound, &authority, Some(&good_token))
+        .await
+        .unwrap();
     assert!(response.starts_with("HTTP/1.1 200"));
 
     let payload = b"central-auth-http-payload";
@@ -659,8 +663,12 @@ async fn central_basic_user_authenticates_http_inbound_chain() {
         base64::engine::general_purpose::STANDARD.encode("central-user-v2:central-password-v2");
     let mut updated = false;
     for _ in 0..100 {
-        let (mut probe, response) =
-            http_connect_with_auth(inbound, &authority, Some(&old_token)).await;
+        let Ok((mut probe, response)) =
+            http_connect_with_auth(inbound, &authority, Some(&old_token)).await
+        else {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
+        };
         let rejected = response.starts_with("HTTP/1.1 403");
         let _ = probe.shutdown().await;
         if rejected {
@@ -671,7 +679,9 @@ async fn central_basic_user_authenticates_http_inbound_chain() {
     }
     assert!(updated, "updated central user credential did not reload");
     let (mut updated_client, response) =
-        http_connect_with_auth(inbound, &authority, Some(&new_token)).await;
+        http_connect_with_auth(inbound, &authority, Some(&new_token))
+            .await
+            .unwrap();
     assert!(response.starts_with("HTTP/1.1 200"));
     updated_client
         .write_all(b"central-auth-http-updated-payload")
@@ -692,7 +702,11 @@ async fn central_basic_user_authenticates_http_inbound_chain() {
     .await;
     let mut deleted = false;
     for _ in 0..100 {
-        let (mut probe, response) = http_connect_with_auth(inbound, &authority, None).await;
+        let Ok((mut probe, response)) = http_connect_with_auth(inbound, &authority, None).await
+        else {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
+        };
         let available = response.starts_with("HTTP/1.1 200");
         let _ = probe.shutdown().await;
         if available {

@@ -70,6 +70,20 @@ sqlite3 "$backup" 'PRAGMA quick_check;'
 
 Rust binary 继续使用 Go service 的参数语义：`-path DIR` 指向 `DIR/state.db`，默认监听 `0.0.0.0:50051`；如果 service unit 使用显式 `YUHAIIN_DB`/`YUHAIIN_HTTP`，以 unit 为准。
 
+Rust binary 也可以直接接管 Linux service 生命周期。`install` 会原子替换
+`/usr/local/bin/yuhaiin`、写入 `/etc/systemd/system/yuhaiin.service`、创建数据目录并执行
+`daemon-reload`、`enable` 和 `start`；已有运行实例会自动 `restart`：
+
+```bash
+sudo "$HOME/.cache/yuhaiin-rust/release/yuhaiin.new" install \
+  -host 0.0.0.0:50051 -path /var/lib/yuhaiin
+sudo systemctl is-active yuhaiin.service
+```
+
+可用的生命周期命令是 `sudo /usr/local/bin/yuhaiin start|stop|restart`；卸载使用
+`sudo /usr/local/bin/yuhaiin uninstall`。`status` 不是 Rust/Go CLI 的服务 action，健康检查仍使用
+`systemctl is-active` 和 HTTP `/api/v2/info`。
+
 ```bash
 sudo systemctl stop yuhaiin.service
 if systemctl is-active --quiet yuhaiin.service; then
@@ -103,6 +117,18 @@ sudo launchctl kickstart -kp "$domain"
 ```
 
 确认 plist 中的 `-path`、`-host`、`-eweb` 和日志路径没有改变；`bootout` 后应确认旧 PID 已退出，再进行 SQLite 备份或替换。
+
+Rust binary 也可以直接安装或重装 LaunchDaemon：
+
+```bash
+sudo "$HOME/.cache/yuhaiin-rust/release/yuhaiin.new" install \
+  -host 0.0.0.0:50051 -path "/Library/Application Support/yuhaiin"
+sudo /usr/local/bin/yuhaiin restart
+sudo /usr/local/bin/yuhaiin uninstall
+```
+
+安装、重启和卸载都会使用 `/Library/LaunchDaemons/com.asutorufa.yuhaiin.plist`；现场回滚前仍要先备份
+SQLite 并确认旧 PID 已退出。
 
 ## 5. 回滚
 
