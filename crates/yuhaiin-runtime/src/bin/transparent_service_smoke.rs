@@ -68,8 +68,10 @@ async fn run() -> Result<()> {
             .join(".cache/yuhaiin-rust/integration/transparent-service/state.sqlite")
         });
     let target = parse_addr_env("YUHAIIN_TARGET_ADDR", "127.0.0.2:18080")?;
+    let target_v6 = parse_optional_addr_env("YUHAIIN_TARGET_V6_ADDR")?;
     let udp_target = parse_addr_env("YUHAIIN_UDP_TARGET_ADDR", "127.0.0.2:18082")?;
     let redir = parse_addr_env("YUHAIIN_REDIR_ADDR", "127.0.0.1:18081")?;
+    let redir_v6 = parse_optional_addr_env("YUHAIIN_REDIR_V6_ADDR")?;
     let tproxy = parse_addr_env("YUHAIIN_TPROXY_ADDR", "127.0.0.1:18083")?;
     let tproxy_enabled = std::env::var("YUHAIIN_TPROXY_ENABLED")
         .map(|value| value != "0")
@@ -80,16 +82,19 @@ async fn run() -> Result<()> {
     let udp_done_file = std::env::var_os("YUHAIIN_UDP_CLIENT_DONE")
         .map(PathBuf::from)
         .unwrap_or_else(|| database.with_file_name("udp-client.done"));
+    let ipv6_done_file = std::env::var_os("YUHAIIN_IPV6_CLIENT_DONE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| database.with_file_name("ipv6-client.done"));
 
     let target_listener = TcpListener::bind(target).await.map_err(io_error)?;
+    let target_listener_v6 = match target_v6 {
+        Some(target) => Some(TcpListener::bind(target).await.map_err(io_error)?),
+        None => None,
+    };
     let target_task = tokio::spawn(async move {
-        let mut received = Vec::with_capacity(TCP_PAYLOADS.len());
-        for _ in TCP_PAYLOADS {
-            let (mut stream, _) = target_listener.accept().await.map_err(io_error)?;
-            let mut payload = Vec::new();
-            stream.read_to_end(&mut payload).await.map_err(io_error)?;
-            stream.write_all(&payload).await.map_err(io_error)?;
-            received.push(payload);
+        let mut received = accept_echo_flows(target_listener, TCP_PAYLOADS.len()).await?;
+        if let Some(target_listener) = target_listener_v6 {
+            received.extend(accept_echo_flows(target_listener, TCP_PAYLOADS.len()).await?);
         }
         Ok::<Vec<Vec<u8>>, Error>(received)
     });
@@ -102,8 +107,9 @@ async fn run() -> Result<()> {
     }
     let _ = std::fs::remove_file(&done_file);
     let _ = std::fs::remove_file(&udp_done_file);
+    let _ = std::fs::remove_file(&ipv6_done_file);
     let store = ConfigStore::open(&database).await?;
-    seed_fixture(&store, redir, tproxy_enabled.then_some(tproxy)).await?;
+    seed_fixture(&store, redir, redir_v6, tproxy_enabled.then_some(tproxy)).await?;
 
     let mut build_options = RuntimeBuildOptions::default();
     build_options.route_fallback.mode = RouteMode::Proxy;
@@ -114,7 +120,23 @@ async fn run() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let service = tokio::task::spawn_local(inbound::run_until(controller.clone(), shutdown_rx));
-    if tproxy_enabled {
+    if let Some(redir_v6) = redir_v6 {
+        println!(
+            "transparent-ready redir={} redir_v6={} tproxy_udp={} target={} target_v6={} database={}",
+            redir,
+            redir_v6,
+            if tproxy_enabled {
+                tproxy.to_string()
+            } else {
+                "disabled".to_owned()
+            },
+            target,
+            target_v6
+                .map(|target| target.to_string())
+                .unwrap_or_else(|| "disabled".to_owned()),
+            database.display()
+        );
+    } else if tproxy_enabled {
         println!(
             "transparent-ready redir={} tproxy_udp={} target={} udp_target={} database={}",
             redir,
@@ -133,7 +155,10 @@ async fn run() -> Result<()> {
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    while !done_file.exists() || (tproxy_enabled && !udp_done_file.exists()) {
+    while !done_file.exists()
+        || (target_v6.is_some() && !ipv6_done_file.exists())
+        || (tproxy_enabled && !udp_done_file.exists())
+    {
         if service.is_finished() {
             let result = service.await.map_err(join_error)?;
             return Err(result.err().unwrap_or_else(|| {
@@ -201,17 +226,27 @@ async fn run() -> Result<()> {
         .map_err(|_| Error::new(ErrorKind::Closed, "transparent shutdown receiver closed"))?;
     service.await.map_err(join_error)??;
     let received = target_task.await.map_err(join_error)??;
-    if received.len() != TCP_PAYLOADS.len()
-        || received
-            .iter()
-            .zip(TCP_PAYLOADS)
-            .any(|(received, expected)| received != expected)
-    {
+    let address_families = 1 + usize::from(target_v6.is_some());
+    let expected_tcp_flows = TCP_PAYLOADS.len() * address_families;
+    let expected_per_payload = address_families;
+    let payloads_match = received.len() == expected_tcp_flows
+        && TCP_PAYLOADS.iter().all(|expected| {
+            received
+                .iter()
+                .filter(|received| received.as_slice() == *expected)
+                .count()
+                == expected_per_payload
+        });
+    if !payloads_match {
         return Err(Error::new(
             ErrorKind::Io,
             format!(
-                "transparent outbound payload mismatch: received {} flows",
+                "transparent outbound payload mismatch: received {} flows {:?}",
                 received.len(),
+                received
+                    .iter()
+                    .map(|payload| String::from_utf8_lossy(payload).into_owned())
+                    .collect::<Vec<_>>(),
             ),
         ));
     }
@@ -223,6 +258,9 @@ async fn run() -> Result<()> {
         upload,
         download
     );
+    if target_v6.is_some() {
+        println!("transparent-redir-ipv6-ok flows={}", TCP_PAYLOADS.len());
+    }
     if tproxy_enabled {
         println!(
             "transparent-tproxy-udp-ok flows={} packets={}",
@@ -239,6 +277,7 @@ async fn run() -> Result<()> {
 async fn seed_fixture(
     store: &ConfigStore,
     redir: SocketAddr,
+    redir_v6: Option<SocketAddr>,
     tproxy: Option<SocketAddr>,
 ) -> Result<()> {
     store
@@ -282,6 +321,29 @@ async fn seed_fixture(
             data_json: serde_json::to_vec(&data).map_err(io_error)?,
         })
         .await?;
+    if let Some(redir_v6) = redir_v6 {
+        let data = json!({
+            "id":"transparent-service-ipv6-smoke",
+            "name":"transparent-service-ipv6-smoke",
+            "enabled":true,
+            "network":{"type":"empty","empty":{}},
+            "transports":[],
+            "protocol":{"type":"redir","redir":{"host":redir_v6.to_string()}}
+        });
+        store
+            .repository()
+            .put_go_inbound(&GoInboundRecord {
+                id: "transparent-service-ipv6-smoke".to_owned(),
+                name: "transparent-service-ipv6-smoke".to_owned(),
+                enabled: true,
+                network_type: "empty".to_owned(),
+                protocol_type: "redir".to_owned(),
+                transport_types_json: br"[]".to_vec(),
+                updated_at: 0,
+                data_json: serde_json::to_vec(&data).map_err(io_error)?,
+            })
+            .await?;
+    }
     if let Some(tproxy) = tproxy {
         let data = json!({
             "id":"transparent-tproxy-udp-smoke",
@@ -306,6 +368,18 @@ async fn seed_fixture(
             .await?;
     }
     Ok(())
+}
+
+async fn accept_echo_flows(listener: TcpListener, count: usize) -> Result<Vec<Vec<u8>>> {
+    let mut received = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (mut stream, _) = listener.accept().await.map_err(io_error)?;
+        let mut payload = Vec::new();
+        stream.read_to_end(&mut payload).await.map_err(io_error)?;
+        stream.write_all(&payload).await.map_err(io_error)?;
+        received.push(payload);
+    }
+    Ok(received)
 }
 
 fn run_client() -> std::io::Result<()> {
@@ -412,6 +486,17 @@ fn parse_addr_env(name: &str, default: &str) -> Result<SocketAddr> {
         .unwrap_or_else(|_| default.to_owned())
         .parse()
         .map_err(|error| Error::invalid(format!("{name} is not a socket address: {error}")))
+}
+
+fn parse_optional_addr_env(name: &str) -> Result<Option<SocketAddr>> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map(Some)
+            .map_err(|error| Error::invalid(format!("{name} is not a socket address: {error}"))),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(Error::invalid(format!("{name} is invalid: {error}"))),
+    }
 }
 
 fn io_error(error: impl std::fmt::Display) -> Error {

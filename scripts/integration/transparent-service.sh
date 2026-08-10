@@ -9,6 +9,10 @@ binary="${target_dir}/debug/transparent-service-smoke"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 service_ip="${YUHAIIN_TRANSPARENT_SERVICE_IP:-10.253.0.2}"
 client_ip="${YUHAIIN_TRANSPARENT_CLIENT_IP:-10.253.0.3}"
+service_ipv6="${YUHAIIN_TRANSPARENT_SERVICE_IPV6:-fd00:253::2}"
+client_ipv6="${YUHAIIN_TRANSPARENT_CLIENT_IPV6:-fd00:253::3}"
+target_v6_addr="${YUHAIIN_TARGET_V6_ADDR:-[fd00:253::2]:18084}"
+redir_v6_addr="${YUHAIIN_REDIR_V6_ADDR:-[::]:18085}"
 target_addr="${YUHAIIN_TARGET_ADDR:-${service_ip}:18080}"
 udp_target_addr="${YUHAIIN_UDP_TARGET_ADDR:-10.254.1.2:18082}"
 redir_addr="${YUHAIIN_REDIR_ADDR:-0.0.0.0:18081}"
@@ -18,6 +22,13 @@ state_dir="${scenario_dir}/state"
 runtime_log="${state_dir}/runtime.log"
 client_log="${state_dir}/client.log"
 udp_client_log="${state_dir}/udp-client.log"
+ipv6_client_log="${state_dir}/ipv6-client.log"
+
+ipv6_mode="${YUHAIIN_TRANSPARENT_IPV6:-0}"
+if [[ "${ipv6_mode}" != 0 && "${ipv6_mode}" != 1 ]]; then
+  echo "YUHAIIN_TRANSPARENT_IPV6 must be 0 or 1" >&2
+  exit 1
+fi
 
 xtables_multi="${YUHAIIN_XTABLES_MULTI:-$(command -v xtables-nft-multi || true)}"
 host_loader="${YUHAIIN_LD_LINUX:-/usr/lib64/ld-linux-x86-64.so.2}"
@@ -29,10 +40,10 @@ if [[ ! -x "${xtables_multi}" || ! -x "${host_loader}" || ! -x "${host_ip}" ]]; 
 fi
 
 mkdir -p "${state_dir}"
-rm -f "${runtime_log}" "${client_log}" "${udp_client_log}" \
+rm -f "${runtime_log}" "${client_log}" "${udp_client_log}" "${ipv6_client_log}" \
   "${state_dir}/udp-target.log" "${state_dir}/tproxy.log" \
-  "${state_dir}/client.done" "${state_dir}/udp-client.done" \
-  "${state_dir}/iptables" "${state_dir}/state.sqlite" \
+  "${state_dir}/client.done" "${state_dir}/ipv6-client.done" "${state_dir}/udp-client.done" \
+  "${state_dir}/iptables" "${state_dir}/ip6tables" "${state_dir}/state.sqlite" \
   "${state_dir}/state.sqlite-wal" "${state_dir}/state.sqlite-shm"
 
 cd "${repo_dir}"
@@ -50,6 +61,10 @@ target_ip="${target_addr%:*}"
 target_port="${target_addr##*:}"
 udp_target_ip="${udp_target_addr%:*}"
 udp_target_port="${udp_target_addr##*:}"
+target_v6_port="${target_v6_addr##*:}"
+target_v6_port="${target_v6_port%]}"
+redir_v6_port="${redir_v6_addr##*:}"
+redir_v6_port="${redir_v6_port%]}"
 redir_port="${redir_addr##*:}"
 tproxy_port="${tproxy_addr##*:}"
 
@@ -67,6 +82,18 @@ fi
 if [[ "${tproxy_enabled}" != 0 && "${tproxy_enabled}" != 1 ]]; then
   echo "YUHAIIN_TPROXY_ENABLED must be 0, 1, or auto" >&2
   exit 1
+fi
+
+ipv6_env_args=()
+if [[ "${ipv6_mode}" -eq 1 ]]; then
+  ipv6_env_args+=(
+    -e "YUHAIIN_TARGET_V6_ADDR=${target_v6_addr}"
+    -e "YUHAIIN_REDIR_V6_ADDR=${redir_v6_addr}"
+    -e "YUHAIIN_IPV6_CLIENT_DONE=/state/ipv6-client.done"
+  )
+  echo "[transparent-service] IPv6 REDIRECT enabled: ${target_v6_addr} -> ${redir_v6_addr}"
+else
+  echo "[transparent-service] IPv6 REDIRECT skipped: set YUHAIIN_TRANSPARENT_IPV6=1 to require it"
 fi
 
 echo "[transparent-service] running isolated REDIRECT TCP + TPROXY UDP smoke in Podman"
@@ -101,20 +128,33 @@ podman run --rm --privileged --name "${main_container}" --network=none \
   -e YUHAIIN_TPROXY_PORT="${tproxy_port}" \
   -e YUHAIIN_CLIENT_IP="${client_ip}" \
   -e YUHAIIN_SERVICE_IP="${service_ip}" \
+  -e YUHAIIN_SERVICE_IPV6="${service_ipv6}" \
+  -e YUHAIIN_CLIENT_IPV6="${client_ipv6}" \
+  -e YUHAIIN_TARGET_V6_PORT="${target_v6_port}" \
+  -e YUHAIIN_REDIR_V6_PORT="${redir_v6_port}" \
+  -e YUHAIIN_TRANSPARENT_IPV6="${ipv6_mode}" \
   -e YUHAIIN_TPROXY_ENABLED="${tproxy_enabled}" \
   -e YUHAIIN_HOST_NSENTER="/host/nsenter" \
   -e YUHAIIN_HOST_UNSHARE="/host/unshare" \
   -e YUHAIIN_HOST_LOADER="/host${host_loader}" \
+  "${ipv6_env_args[@]}" \
   --entrypoint /bin/sh \
   "${image}" \
   -ceu '
     ln -sf /host/xtables-nft-multi /state/iptables
+    ln -sf /host/xtables-nft-multi /state/ip6tables
     ln -sf /host/ip /state/ip
     run_iptables() {
       XTABLES_LIBDIR=/host/usr/lib/xtables \
         "$YUHAIIN_HOST_LOADER" \
         --library-path /host/usr/lib/x86_64-linux-gnu:/host/usr/lib:/host/usr/lib64 \
         /state/iptables "$@"
+    }
+    run_ip6tables() {
+      XTABLES_LIBDIR=/host/usr/lib/xtables \
+        "$YUHAIIN_HOST_LOADER" \
+        --library-path /host/usr/lib/x86_64-linux-gnu:/host/usr/lib:/host/usr/lib64 \
+        /state/ip6tables "$@"
     }
     run_ip() {
       "$YUHAIIN_HOST_LOADER" \
@@ -153,6 +193,10 @@ podman run --rm --privileged --name "${main_container}" --network=none \
     run_ns_ip "$client_ns_pid" addr add "${YUHAIIN_CLIENT_IP}/24" dev client0
     run_ns_ip "$client_ns_pid" link set client0 up
     run_ns_ip "$client_ns_pid" route add "${YUHAIIN_UDP_TARGET_IP}/32" via "${YUHAIIN_SERVICE_IP}"
+    if [ "$YUHAIIN_TRANSPARENT_IPV6" -eq 1 ]; then
+      run_ip -6 addr add "${YUHAIIN_SERVICE_IPV6}/64" dev service-client nodad
+      run_ns_ip "$client_ns_pid" -6 addr add "${YUHAIIN_CLIENT_IPV6}/64" dev client0 nodad
+    fi
 
     if [ "$YUHAIIN_TPROXY_ENABLED" -eq 1 ]; then
       run_ip link add service-target type veth peer name target0
@@ -182,6 +226,7 @@ podman run --rm --privileged --name "${main_container}" --network=none \
     fi
 
     rule_installed=0
+    ipv6_rule_installed=0
     tproxy_rule_installed=0
     route_installed=0
     cleanup() {
@@ -191,6 +236,12 @@ podman run --rm --privileged --name "${main_container}" --network=none \
           -d "${YUHAIIN_SERVICE_IP}/32" -p tcp \
           -m tcp --dport "${YUHAIIN_TARGET_PORT}" \
           -j REDIRECT --to-ports "${YUHAIIN_REDIR_PORT}" || true
+      fi
+      if [ "$ipv6_rule_installed" -eq 1 ]; then
+        run_ip6tables -t nat -D PREROUTING -s "${YUHAIIN_CLIENT_IPV6}/128" \
+          -d "${YUHAIIN_SERVICE_IPV6}/128" -p tcp \
+          -m tcp --dport "${YUHAIIN_TARGET_V6_PORT}" \
+          -j REDIRECT --to-ports "${YUHAIIN_REDIR_V6_PORT}" || true
       fi
       if [ "$tproxy_rule_installed" -eq 1 ]; then
         run_iptables -t mangle -D PREROUTING -s "${YUHAIIN_CLIENT_IP}/32" \
@@ -221,6 +272,13 @@ podman run --rm --privileged --name "${main_container}" --network=none \
       -m tcp --dport "${YUHAIIN_TARGET_PORT}" \
       -j REDIRECT --to-ports "${YUHAIIN_REDIR_PORT}"
     rule_installed=1
+    if [ "$YUHAIIN_TRANSPARENT_IPV6" -eq 1 ]; then
+      run_ip6tables -t nat -A PREROUTING -s "${YUHAIIN_CLIENT_IPV6}/128" \
+        -d "${YUHAIIN_SERVICE_IPV6}/128" -p tcp \
+        -m tcp --dport "${YUHAIIN_TARGET_V6_PORT}" \
+        -j REDIRECT --to-ports "${YUHAIIN_REDIR_V6_PORT}"
+      ipv6_rule_installed=1
+    fi
 
     if [ "$YUHAIIN_TPROXY_ENABLED" -eq 1 ]; then
       run_ip rule add fwmark 1 table 100
@@ -259,6 +317,17 @@ podman run --rm --privileged --name "${main_container}" --network=none \
     fi
     touch /state/client.done
 
+    if [ "$YUHAIIN_TRANSPARENT_IPV6" -eq 1 ]; then
+      if ! run_ns "$client_ns_pid" env \
+        YUHAIIN_TARGET_ADDR="${YUHAIIN_TARGET_V6_ADDR}" \
+        /usr/sbin/runuser -u nobody -- /usr/local/bin/transparent-service-smoke --client \
+        >/state/ipv6-client.log 2>&1; then
+        cat /state/ipv6-client.log >&2
+        exit 1
+      fi
+      touch /state/ipv6-client.done
+    fi
+
     if [ "$YUHAIIN_TPROXY_ENABLED" -eq 1 ]; then
       if ! run_ns "$client_ns_pid" env \
         YUHAIIN_UDP_TARGET_ADDR="${YUHAIIN_UDP_TARGET_ADDR}" \
@@ -286,7 +355,7 @@ if wait "${main_pid}"; then
 else
   main_status=$?
 fi
-for log_file in "${scenario_dir}/container.log" "${runtime_log}" "${client_log}" "${udp_client_log}"; do
+for log_file in "${scenario_dir}/container.log" "${runtime_log}" "${client_log}" "${ipv6_client_log}" "${udp_client_log}"; do
   if [[ -f "${log_file}" ]]; then
     cat "${log_file}"
   fi
@@ -300,6 +369,10 @@ grep -Fq "transparent-ready" "${runtime_log}"
 grep -Fq "transparent-redir-tcp-ok" "${runtime_log}"
 grep -Fq "transparent-closed" "${runtime_log}"
 grep -Fq "transparent-client-ok" "${client_log}"
+if [[ "${ipv6_mode}" -eq 1 ]]; then
+  grep -Fq "transparent-redir-ipv6-ok" "${runtime_log}"
+  grep -Fq "transparent-client-ok" "${ipv6_client_log}"
+fi
 if [[ "${tproxy_enabled}" -eq 1 ]]; then
   grep -Fq "transparent-udp-client-ok" "${udp_client_log}"
   grep -Fq "transparent-tproxy-udp-ok" "${runtime_log}"

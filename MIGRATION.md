@@ -13,7 +13,9 @@
 
 > 2026-08-10 UDP flow teardown：透明、SOCKS5、Yuubinsya 和 Trojan 的每个 UDP flow 现在保存对应的 receiver `JoinHandle`；close request、idle reap、listener exit 都先 abort 并 await receiver，再关闭 outbound datagram。新增 receiver cancellation 单测，避免仅依赖 `AsyncDatagram::close()` 导致旧 receiver 持有 `Arc` 残留；这不改变 Go 的 90 秒 idle 语义，只收紧 Rust 的任务所有权和强制终止路径。
 
-> 2026-08-10 transparent multi-flow acceptance：`transparent-service.sh` 的 rootless Podman REDIRECT TCP 场景现在在同一个 transparent inbound listener 上连续建立两条 TCP flow，分别校验 payload echo、累计 upload/download 统计和服务关闭；当前输出为 `flows=2 bytes=68 upload=68 download=68`。TPROXY UDP 仍按权限明确 skip，IPv4/IPv6 redir 进程级矩阵和 rootful TPROXY gate 保留为后续验收。
+> 2026-08-10 transparent multi-flow acceptance：`transparent-service.sh` 的 rootless Podman REDIRECT TCP 场景现在在同一个 transparent inbound listener 上连续建立两条 TCP flow，分别校验 payload echo、累计 upload/download 统计和服务关闭；当前输出为 `flows=2 bytes=68 upload=68 download=68`。TPROXY UDP 仍按权限明确 skip；IPv6 REDIRECT 已由独立 strict gate 覆盖，rootful TPROXY gate 和异常 teardown 矩阵保留为后续验收。
+
+> 2026-08-10 transparent IPv6 acceptance：`YUHAIIN_TRANSPARENT_IPV6=1 make transparent-service-smoke` 在隔离 Podman namespace 中为 service/client veth 配置 `nodad` IPv6 地址，真实执行 IPv4+IPv6 REDIRECT TCP 各两条 flow，覆盖 `IP6T_SO_ORIGINAL_DST`、direct outbound、payload 和统计；当前输出为 `flows=4 bytes=136 upload=136 download=136`。IPv6 默认 gate 仍关闭以兼容无 IPv6 kernel 的 CI，rootful TPROXY UDP 仍待宿主机 `CAP_NET_ADMIN`。
 
 > 2026-08-10 connections socket/protocol metadata：对照 Go `statistics.getConnection`，共享 `FlowContext` 新增 socket-backed inbound 的 `local_addr` 与应用层 `protocol`；`InboundSpec` 统一注入监听 endpoint，并为 TLS transport 标记 `tls`，HTTP proxy 在消费 CONNECT/forward headers 后保留 `http`，共享 relay sniff 则按 TLS 优先、HTTP 次之填充协议。monitor 以 Go `net.Addr.String()` 的裸 `host:port` 格式输出 `localAddr`，由 endpoint network 填充 `network.underlyingType`，`connections.protocol` 不再错误复用 `tcp/udp`，未识别时为空。新增 monitor/common relay 单测和真实 HTTP inbound → outbound API 集成断言；TUN/无 socket 的 packet-only flow 仍保留平台可提供元数据的扩展边界。
 
