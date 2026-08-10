@@ -16,6 +16,7 @@ cargo build --target-dir "${target_dir}" -p yuhaiin-runtime --bin tun-service-sm
 if ! podman run --rm --privileged --network=none \
     -e YUHAIIN_DB=/state/state.sqlite \
     -e YUHAIIN_TUN_NAME="${tun_name}" \
+    -e YUHAIIN_TUN_MTU="${YUHAIIN_TUN_MTU:-1500}" \
     -e YUHAIIN_TUN_TRAFFIC=1 \
     -e YUHAIIN_TUN_HOLD_MS=750 \
     -v "${binary}:/usr/local/bin/tun-service-smoke:ro" \

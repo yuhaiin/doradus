@@ -51,7 +51,7 @@
 | SQLite / 生产库 | `[~]` | 增加更多生产版本快照；逐表核对 route/resolver projection；补异常关闭后的未建模表检查 | 默认 3 份真实快照已通过 `make production-parity-smoke`；store fixture tests |
 | FakeIP | `[~]` | 增加真实生产 FakeIP 表快照，并验证双栈池容量/TTL/重启后的分配稳定性 | FakeIP store tests + Go state takeover |
 | Linux transparent inbound | `[~]` | 在具备 `CAP_NET_ADMIN` 的独立 namespace 中验证 TPROXY UDP、redir IPv4/IPv6 和多 flow teardown | 默认 `make transparent-service-smoke` 已真实验证隔离 namespace REDIRECT TCP：非 root client → Rust redir → `SO_ORIGINAL_DST` → direct outbound → echo，并检查 upload/download counters、shutdown；rootless Podman 会明确输出 TPROXY skip。强制 gate `YUHAIIN_TPROXY_ENABLED=1 make transparent-service-smoke` 已确认规则命中但 rootless 用户 namespace 无法把非本地 UDP 交给透明 socket；剩余是 rootful/宿主机 `CAP_NET_ADMIN` 的 TPROXY UDP、IPv4/IPv6 redir 和多 flow teardown |
-| TUN / NAT | `[~]` | 增加 MTU/fragment/namespace teardown 矩阵；补 Android VpnService fd 和 macOS utun 实机验收 | `tun-service.sh`、`p0_tun`、平台设备日志 |
+| TUN / NAT | `[~]` | Linux MTU 边界矩阵已通过；继续补 namespace teardown、fragment 长流，以及 Android VpnService fd 和 macOS utun 实机验收 | `tun-service.sh`、`tun-mtu.sh`、`p0_tun`、平台设备日志 |
 | API / reload | `[~]` | 已覆盖 node mutation 后新连接切换出口、latency、traffic/history 和同库重启读回；Go/Rust parity 已覆盖核心 node/inbound/resolver/route mutation，以及前端配置 API 的独立副本闭环；错误矩阵已严格对照 HTTP status/RPC code，Go typed request 的缺失字段零值和空 `connections.close` 也已对齐；剩余是 route.rules.test 的复杂 history 和更多生产快照 | `api-reload-flow.sh`、`api-contract.sh`、`go-api-parity.sh` |
 | connections / statistics | `[~]` | 增加更多 production telemetry 快照；逐字段核对长时间范围与升级期间锁竞争 | `stats-concurrency.sh`、`go-rust-stats.sh` |
 | 更新 / 发布 | `[~]` | 在至少一种 systemd 和一种 launchd 环境做替换、回滚、SIGTERM 和备份恢复演练 | `docs/RELEASE_REPLACEMENT.md` |
@@ -66,6 +66,16 @@
 > 资源、统计范围、telemetry limit、连接关闭、route test/priority、backup restore 和
 > deferred subscription update；status/code 严格比较，校验 message 仅归一化 Go 类型名等实现
 > 细节。API 项仍保持 `[~]`，复杂 matcher history、完整 response 字段和更多生产快照未完成。
+
+> **2026-08-10 集成复核：** `production-parity.sh` 对 `tmp/v2/state.db`、`tmp/yuhaiin/state.db`
+> 和 `tmp/aws/yuhaiin/state.db` 三份停止快照全部通过，日志位于
+> `~/.cache/yuhaiin-rust/production-parity-current`；`stats-concurrency.sh` 的并发读取/重启
+> 通过；`transparent-service.sh` 的 REDIRECT TCP 通过并明确记录 rootless 下 TPROXY UDP skip；
+> runtime-owned TUN、启动日志也通过。最新 HTTP benchmark 为 145.58 MiB/s、peak RSS 17,004 KiB，
+> TUN benchmark 为 55.73 MiB/s、peak RSS 12,444 KiB；证据位于
+> `~/.cache/yuhaiin-rust/benchmarks/{http-throughput-current,tun-throughput-current}`。随后
+> `tun-mtu.sh` 在 privileged Podman 中用独立设备和 SQLite 状态通过了 576、1280、1500、9000、
+> 9216 五个 MTU 用例，日志位于 `~/.cache/yuhaiin-rust/integration/tun-mtu-current`。
 
 ```mermaid
 flowchart LR
@@ -203,8 +213,8 @@ flowchart LR
 | `[x]` | 单一路径 TUN | `core::tun` | `tun-rs AsyncDevice + smoltcp`；不并行实现 tun2socket 和用户态 stack 两条路径 |
 | `[x]` | inbound owner | `runtime::inbound::run_until` | TUN record 会在同一个 inbound listener task 集合中创建 device；与 SOCKS5/HTTP/Yuubinsya/UDP listener 共同 reload、shutdown、abort，不再由独立 supervisor 管理 |
 | `[x]` | TCP/UDP/ICMP | `core::tun` | dispatcher、proxy bridge、DNS hijack、FakeIP reverse、NAT、bounded queue/backpressure |
-| `[x]` | Linux Podman | `tun-smoke`, `tun-service-smoke`, `p0_tun`, `tun_fakeip_smoke` | privileged/network=none 创建、runtime inbound owner、AnyIP routed TCP、route、DNS/FakeIP、selected fixed proxy echo、SIGTERM 和设备重开；`make tun-service-smoke` 复用 `~/.cache/yuhaiin-rust/integration/tun-service` 并保留失败日志；2026-08-10 实测 lifecycle/echo 通过，4 MiB TUN→fixed→loopback benchmark 为 55.77 MiB/s、peak RSS 12,440 KiB |
-| `[~]` | 设备异常与 namespace | 测试已有设备消失、kernel cleanup、同名重开基础覆盖；在独立 rootless user/network namespace 中执行 `p0_tun` 的 loopback netem loss 与 matrix 测试均通过 | 继续补 namespace teardown、真实 MTU/fragment 长矩阵 |
+| `[x]` | Linux Podman | `tun-smoke`, `tun-service-smoke`, `tun-mtu.sh`, `p0_tun`, `tun_fakeip_smoke` | privileged/network=none 创建、runtime inbound owner、AnyIP routed TCP、route、DNS/FakeIP、selected fixed proxy echo、SIGTERM 和设备重开；`make tun-service-smoke` 复用 `~/.cache/yuhaiin-rust/integration/tun-service` 并保留失败日志；`tun-mtu.sh` 对 576/1280/1500/9000/9216 分别验证真实设备、流量和关闭；当前 4 MiB TUN→fixed→loopback benchmark 为 55.73 MiB/s、peak RSS 12,444 KiB |
+| `[~]` | 设备异常与 namespace | 测试已有设备消失、kernel cleanup、同名重开基础覆盖；在独立 rootless user/network namespace 中执行 `p0_tun` 的 loopback netem loss 与 matrix 测试均通过 | 继续补 namespace teardown、fragment 长流，以及 Android/macOS 实机 |
 | `[~]` | Android/macOS TUN | `TunRuntime::from_async_device` + `inbound::run_until_with_tun_runtime` 可把外部设备接入同一个 inbound owner；reload 复用设备并重建 proxy/dispatcher | Android VpnService fd、macOS utun/权限/route/生命周期实机验收 |
 
 ## 9. 管理 API、实时 connections 与统计

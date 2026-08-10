@@ -2284,3 +2284,49 @@ handler 返回 JSON 404，这是框架路径表面的差异，不是 generated f
 本轮只使用 `~/.cache/yuhaiin-rust` 保存副本、日志和构建缓存，不使用 `/tmp`。管理 API 仍为
 `[~]`，剩余项是完整 response 字段、复杂 matcher history 和更多 production snapshot，不能
 因为错误矩阵通过就把整个 API 或 Rust 重写标成完成。
+
+## 68. 2026-08-10 production parity, statistics and data-plane recheck
+
+在 §67 的错误矩阵之后，本轮没有修改生产源库，而是用相同的停止快照和可复用 Podman 测试
+重新验证当前替换路径：`production-parity.sh` 对 Go 的 `tmp/v2/state.db`、`tmp/yuhaiin/state.db`
+和 `tmp/aws/yuhaiin/state.db` 三份副本全部通过。每份都完成 26 个稳定只读响应、核心资源
+mutation/config 闭环、route rule test、错误 status/code 矩阵和空/非法 connections close；日志、
+Go/Rust 副本位于 `~/.cache/yuhaiin-rust/production-parity-current`。
+
+`stats-concurrency.sh` 通过了真实 runtime 进程在流量更新期间的并发统计读取、停止、同库重启
+和 traffic/history 读回；`transparent-service.sh` 在 rootless Podman 中通过 REDIRECT TCP
+原目标恢复、非 root client、双向计数和 shutdown。TPROXY UDP 按环境实际记录为 skip，因为
+rootless user namespace 没有宿主机 `CAP_NET_ADMIN`；要完成该项仍需 rootful Podman 或宿主机
+network namespace 的策略路由验收。
+
+数据面和可观测性也重新验收：foreground binary 的启动日志默认输出 database、HTTP bind、
+ready 和 stopped；runtime-owned TUN 的开关、流量和关闭通过；HTTP inbound → router → HTTP
+CONNECT loopback benchmark 为 64 MiB、145.58 MiB/s、peak RSS 17,004 KiB；单路径 TUN
+inbound → fixed → loopback benchmark 为 4 MiB、55.73 MiB/s、peak RSS 12,444 KiB。原始日志和
+结果分别位于 `~/.cache/yuhaiin-rust/integration/{production-parity-current,
+stats-concurrency,startup-logs-current,transparent-service-current,tun-service-current}` 和
+`~/.cache/yuhaiin-rust/benchmarks/{http-throughput-current,tun-throughput-current}`。
+
+本轮缓存复核约为 15G，其中主要是可复用的 `cargo-target` 和历史副本；所有临时副本仍在
+`~/.cache/yuhaiin-rust`，没有使用 `/tmp`。这轮证据强化了 Linux 主路径，但没有改变 checklist
+中 Android/macOS 实机、rootful TPROXY、长时间 production telemetry 和发布回滚等 `[~]` 状态。
+
+## 69. 2026-08-10 runtime-owned TUN MTU boundary matrix
+
+此前 runtime-owned TUN 的进程级 smoke 固定使用 MTU 1500，只能证明默认配置下的设备和
+数据面闭环。现在 `crates/yuhaiin-runtime/src/bin/tun_service_smoke.rs` 读取
+`YUHAIIN_TUN_MTU`，并与 `TunConfig` 相同地限制在 576–9216；`scripts/integration/tun-service.sh`
+也支持通过该变量复用单个用例。新增 `scripts/integration/tun-mtu.sh` 使用每个 MTU 独立的
+设备名和 SQLite 状态，在 privileged `network=none` Podman 中启动真实 runtime inbound，检查
+设备出现、固定 outbound 回环流量和 shutdown 后设备消失。
+
+本机验证通过以下五个边界/常用值：
+
+```text
+576, 1280, 1500, 9000, 9216
+```
+
+每个用例均输出 `runtime-tun-opened`、`runtime-tun-traffic-ok` 和 `runtime-tun-closed`；可复用
+日志和数据库位于 `~/.cache/yuhaiin-rust/integration/tun-mtu-current`。这补齐了 Linux TUN
+MTU 的进程级边界证据，但不把 namespace teardown、fragment 长流或 Android/macOS 设备验收
+提前标为完成。当前缓存复核为约 16G，仍全部位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。

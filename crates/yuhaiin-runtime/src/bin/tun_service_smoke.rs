@@ -49,6 +49,15 @@ async fn run() -> Result<()> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(750);
+    let mtu = std::env::var("YUHAIIN_TUN_MTU")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1500);
+    if !(576..=9216).contains(&mtu) {
+        return Err(Error::invalid(format!(
+            "YUHAIIN_TUN_MTU must be between 576 and 9216, got {mtu}"
+        )));
+    }
     let traffic = std::env::var_os("YUHAIIN_TUN_TRAFFIC").is_some();
 
     let (target_address, target_task) = if traffic {
@@ -80,7 +89,7 @@ async fn run() -> Result<()> {
         std::fs::create_dir_all(parent).map_err(io_error)?;
     }
     let store = ConfigStore::open(&database).await?;
-    seed_runtime_fixture(&store, &name, target_address).await?;
+    seed_runtime_fixture(&store, &name, target_address, mtu).await?;
 
     let mut build_options = RuntimeBuildOptions::default();
     build_options.route_fallback.mode = RouteMode::Proxy;
@@ -186,6 +195,7 @@ async fn seed_runtime_fixture(
     store: &ConfigStore,
     name: &str,
     target_address: Option<SocketAddr>,
+    mtu: usize,
 ) -> Result<()> {
     if store.repository().list_go_nodes().await?.is_empty() {
         store
@@ -213,7 +223,7 @@ async fn seed_runtime_fixture(
             "type": "tun",
             "tun": {
                 "name": format!("tun://{name}"),
-                "mtu": 1500,
+                "mtu": mtu,
                 "portal": "198.18.0.1/15",
                 "routes": ["198.18.0.2/32"],
                 "excludes": []
