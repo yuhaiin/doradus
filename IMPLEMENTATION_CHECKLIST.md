@@ -37,7 +37,7 @@
 | Proxy/transport | 20 | 2 | 95.5% | raw standalone HTTP/2 不携带目标地址、Linux transparent UDP、平台 listen 绑定、复杂协议 |
 | NAT | 3 | 1 | 87.5% | Android/macOS route/NAT 生命周期 |
 | TUN inbound | 4 | 2 | 83.3% | namespace 长矩阵、Android/macOS 实机 |
-| 管理 API/connections/统计 | 3 | 3 | 75.0% | 已补真实 node/inbound/route reload→数据面与统计→重启读回，并以独立 Go/Rust SQLite 副本逐响应验证核心 mutation、settings/backup/inbound config/hosts/FakeDNS/server/route config/list config、原生 publishes CRUD/resolve、update.status 和 users CRUD；users 已使用 Go refact-user schema-v6 的原生表，出站节点 `userId` 在 runtime snapshot 中解析为临时凭据，HTTP/SOCKS5/mixed、Yuubinsya TCP/UOT/native UDP、Trojan/AEAD inbound 已消费中心认证快照；仍需更多生成客户端语义、users 边界、错误矩阵和并发统计锁竞争 |
+| 管理 API/connections/统计 | 3 | 3 | 75.0% | 已补真实 node/inbound/route reload→数据面与统计→重启读回，并以独立 Go/Rust SQLite 副本逐响应验证核心 mutation、settings/backup/inbound config/hosts/FakeDNS/server/route config/list config、原生 publishes CRUD/resolve、update.status 和 users CRUD；users 已使用 Go refact-user schema-v6 的原生表，出站节点 `userId` 在 runtime snapshot 中解析为临时凭据，HTTP/SOCKS5/mixed、Yuubinsya TCP/UOT/native UDP、Trojan/AEAD inbound 已消费中心认证快照；新增真实 Linux 进程级 process + inbound matcher 链路，确认 selector 选中 HTTP outbound 时保留 route-list membership 和 match history；仍需更多生成客户端语义、users 边界、错误矩阵和并发统计锁竞争 |
 | 平台与发布 | 2 | 3 | 70.0% | Android/macOS 实机、service-manager 现场回滚 |
 
 覆盖率不会把 `[~]` 自动改成 `[x]`；只有对应的测试、进程级验证或平台证据完成后才更新条目状态。
@@ -368,4 +368,4 @@ podman run --rm --network=host \
 5. 每完成一项，只修改本模块表格、验收命令和 `MIGRATION.md` 的一条 dated entry，不再把所有历史细节堆回本文件。
 6. 完成 Linux `tproxy`/`redir` 验收：在真正的 network namespace/宿主机 CAP_NET_ADMIN 环境覆盖 TPROXY UDP ancillary、redir IPv4/IPv6、权限失败及多 flow 生命周期；Podman REDIRECT TCP 已有可重复验收记录。
 7. 补统计兼容验收：Go fresh state 的 Rust takeover、native Rust state 的 Go reverse-open startup smoke、真实 schema-7 原始 telemetry 表经 Rust 转换后由 Go 成功读取，以及 Rust 进程内并发统计 reader + 重启读回 smoke 已通过；仍需用更多真实 Go v6/生产形状数据库验证 source normalization、Rust 最终 flush 后 Go 的逐字段长范围结果、Go 进程并发读写/升级期间锁竞争，以及 force-abort/进程崩溃时 checkpoint 与 Go 表之间的恢复边界。
-8. 补管理 API 契约验收：`tests/api_contract.rs` 与 `go-api-parity.sh` 已覆盖主要真实进程路径、核心 node/inbound/resolver/route mutation、publishes CRUD/resolve 和前端配置 put/get；继续逐项执行 generated client 的剩余 list/detail/mutation 操作，优先处理 users.* 与 Go 主分支的实现缺口，记录 Rust 与 Go 的 response 字段、分页、query 过滤、错误状态和 reload side effect 差异；单独收敛 `route.rules.test` 的全量 match history，再补更多 production snapshot。
+8. 补管理 API 契约验收：`tests/api_contract.rs` 与 `go-api-parity.sh` 已覆盖主要真实进程路径、核心 node/inbound/resolver/route mutation、publishes CRUD/resolve 和前端配置 put/get；继续逐项执行 generated client 的剩余 list/detail/mutation 操作，优先处理 users.* 与 Go 主分支的实现缺口，记录 Rust 与 Go 的 response 字段、分页、query 过滤、错误状态和 reload side effect 差异；`process + inbound` 的真实 HTTP 链路、membership 和 history 已由 `make service-chain-smoke` 覆盖；仍需单独收敛 `route.rules.test` 的全量 match history，再补更多 production snapshot。

@@ -1212,6 +1212,93 @@ pub async fn configure_http_chain(
     .await;
 }
 
+/// Configure an HTTP inbound whose route is selected only when the runtime
+/// can recover both the real client process and the inbound name. This keeps
+/// the integration test on the persisted Go-shaped route-list/rule contract.
+pub async fn configure_http_process_inbound_chain(
+    service: &ServiceProcess,
+    inbound: SocketAddr,
+    outbound: SocketAddr,
+    process_path: &str,
+) {
+    let node = json!({
+        "id":"http-process-out",
+        "name":"HTTP process matcher outbound",
+        "group":"integration",
+        "enabled":true,
+        "chain":[
+            {"type":"fixed","fixed":{"host":"127.0.0.1","port":outbound.port()}},
+            {"type":"http","http":{"user":"","password":""}}
+        ]
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes",
+        Some(&node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes/http-process-out/use",
+        None,
+    )
+    .await;
+
+    let inbound = json!({
+        "id":"http-process-in",
+        "name":"HTTP process matcher inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":{"type":"http","http":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+
+    let list = json!({
+        "name":"process-current",
+        "type":"process",
+        "source":{"type":"local","local":{"lists":[process_path]}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/route/lists",
+        Some(&list),
+    )
+    .await;
+
+    let rule = json!({
+        "name":"proxy-process-inbound",
+        "mode":"proxy",
+        "rules":[{"type":"all","all":[
+            {"type":"process","process":{"list":"process-current"}},
+            {"type":"inbound","inbound":{"names":["http-process-in"]}},
+            {"type":"network","network":{"network":"tcp"}}
+        ]}],
+        "tag":"process-inbound-integration"
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/route/rules",
+        Some(&rule),
+    )
+    .await;
+}
+
 /// Configure the smallest real TLS-termination inbound: TLS transport,
 /// HTTP proxy protocol, and the built-in direct outbound. Keeping this in the
 /// shared process fixture makes it reusable for future TLS/SOCKS5 and

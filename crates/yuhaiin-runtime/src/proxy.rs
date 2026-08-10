@@ -18,6 +18,7 @@ use yuhaiin_store::GoProxyRuntimeConfig;
 use yuhaiin_trie::router::RuntimeRoutedProxySelector;
 
 use crate::RuntimeSnapshot;
+use crate::route::RouteListSnapshot;
 
 #[path = "proxy/common.rs"]
 pub(crate) mod common;
@@ -625,6 +626,7 @@ pub struct RuntimeProxySelector {
 #[derive(Clone, Default)]
 struct ProxyContextMetadata {
     hosts: yuhaiin_core::dns_hosts::HostsTable,
+    route_lists: RouteListSnapshot,
     geo: Option<Arc<dyn GeoLookup>>,
     endpoints: BTreeMap<String, SocketAddr>,
 }
@@ -789,16 +791,22 @@ pub(crate) struct PreparedProxySelector {
 
 impl AsyncProxySelector for RuntimeProxySelector {
     fn route_context(&self, context: &mut FlowContext) {
-        let current = self
-            .current
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        current.route_context(context);
         let metadata = self
             .metadata
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let matched_lists = metadata.route_lists.matching_names(context);
+        context.lists = matched_lists.clone();
+        let current = self
+            .current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        current.route_context(context);
+        // The trie evaluates List matchers against the membership populated
+        // above. Restore the complete snapshot-derived membership afterward
+        // so connection metadata is independent of which rule was selected.
+        context.lists = matched_lists;
         annotate_connection_metadata(
             context,
             &metadata,
@@ -840,6 +848,7 @@ impl RuntimeSnapshot {
         }
         Ok(ProxyContextMetadata {
             hosts: self.hosts.clone(),
+            route_lists: self.route_lists.clone(),
             geo: self.geo.clone(),
             endpoints,
         })

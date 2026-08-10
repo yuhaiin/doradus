@@ -17,10 +17,10 @@ use support::{
     ConnectFixture, H2FinalProtocol, H2ProtocolFixture, H2YuubinsyaFixture, ServiceProcess,
     Socks5Fixture, YUUBINSYA_PASSWORD, add_mixed_udp_inbound, add_socks5_inbound,
     add_yuubinsya_inbound, api_json, configure_h2_http_chain, configure_h2_http_inbound,
-    configure_h2_socks5_chain, configure_http_chain, configure_socks5_chain,
-    configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound,
-    connect_loopback, connect_tls_h2_loopback, connect_tls_loopback, integration_dir,
-    seed_empty_database, wait_for_connection,
+    configure_h2_socks5_chain, configure_http_chain, configure_http_process_inbound_chain,
+    configure_socks5_chain, configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain,
+    configure_tls_http_inbound, connect_loopback, connect_tls_h2_loopback, connect_tls_loopback,
+    integration_dir, seed_empty_database, wait_for_connection,
 };
 
 async fn http_connect_with_auth(
@@ -539,6 +539,81 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn process_and_inbound_route_matchers_select_real_http_outbound() {
+    let fixture = ConnectFixture::start().await;
+    let _default_mixed_blocker = tokio::net::TcpListener::bind("127.0.0.1:1080").await.ok();
+    let inbound_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let inbound = inbound_listener.local_addr().unwrap();
+    drop(inbound_listener);
+
+    let root = integration_dir("service-process-inbound-route");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    let process_path = std::env::current_exe().unwrap();
+    configure_http_process_inbound_chain(
+        &service,
+        inbound,
+        fixture.outbound,
+        process_path.to_str().unwrap(),
+    )
+    .await;
+
+    let authority = format!("example.test:{}", fixture.target.port());
+    let (mut client, headers) = http_connect_with_auth(inbound, &authority, None)
+        .await
+        .unwrap();
+    assert!(
+        headers.starts_with("HTTP/1.1 200"),
+        "HTTP response: {headers}"
+    );
+    let payload = b"process-inbound-route-payload";
+    client.write_all(payload).await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, payload);
+
+    let connection = wait_for_connection(&service.client, &service.base_url).await;
+    let item = connection["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inboundName"] == "http-process-in")
+        .expect("process/inbound matcher connection must be visible");
+    assert_eq!(item["mode"], "proxy");
+    assert_eq!(item["outbound"], fixture.outbound.to_string());
+    assert!(item["process"].as_str().is_some_and(|value| {
+        value == process_path.to_str().unwrap() || value.ends_with(" (deleted)")
+    }));
+    assert!(
+        item["lists"]
+            .as_array()
+            .is_some_and(|lists| { lists.iter().any(|value| value == "process-current") }),
+        "connection metadata: {item}"
+    );
+    assert!(item["matchHistory"].as_array().is_some_and(|history| {
+        history
+            .iter()
+            .any(|entry| entry["ruleName"] == "proxy-process-inbound")
+    }));
+    let authorities = fixture
+        .connect_authorities
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert!(
+        authorities.iter().any(|value| value == &authority),
+        "HTTP outbound authorities: {authorities:?}"
+    );
+
+    client.shutdown().await.unwrap();
     service.shutdown().await;
     fixture.shutdown().await;
 }

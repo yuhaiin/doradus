@@ -2684,3 +2684,23 @@ server 的 echo response。显式执行
 `cargo test -p yuhaiin-chain --test standalone_http2 --all-features --offline \
 legacy_go_http2_v1_client_round_trips_against_rust_server -- --exact --ignored --nocapture`
 通过，证明当前 Rust H2 CONNECT wire boundary 不只兼容 Go v2 helper，也兼容 Go v1 transport。
+
+## 86. 2026-08-10 process/inbound route metadata in a real flow
+
+此前 route matcher 的单测能够证明 process、inbound 和 network 条件可以选中规则，但真实
+socket flow 暴露出一个兼容性缺口：`RuntimeProxySelector::route_context` 直接调用 trie
+router 时没有先用当前 snapshot 计算所有 route-list membership。规则本身仍会选中正确的
+HTTP outbound，但连接观测中的 `lists` 为空，无法与 Go `ConnOptions.Lists()` 对齐。
+
+现在 selector 的 metadata snapshot 同时携带 `RouteListSnapshot`。每次 flow route evaluation
+先以这份不可变 snapshot 填充 `FlowContext::lists`，再执行 trie 的短路匹配和 history 记录，最后
+恢复完整 membership 后写入 connection metadata。这样 reload 时 route rules、list membership
+和连接观测使用同一个 snapshot，也不会把“被选中规则携带的 list”误当成全部匹配 list。
+
+新增 Linux 真实进程级 `process_and_inbound_route_matchers_select_real_http_outbound`：通过
+HTTP inbound 发送 CONNECT，process list 使用当前测试进程路径，inbound + process + TCP
+嵌套 `all` 规则选择 HTTP outbound，随后断言 echo、outbound authority、`process`、
+`process-current` membership 和 `proxy-process-inbound` match history。定向测试通过，
+`make service-chain-smoke` 的 13 个真实 inbound/router/outbound 场景全部通过。这个入口复用
+`~/.cache/yuhaiin-rust/integration-reusable`，不是 Podman；TUN、透明代理和统计等需要
+namespace 的测试继续由各自 Podman 脚本负责，所有临时状态均不使用 `/tmp`。
