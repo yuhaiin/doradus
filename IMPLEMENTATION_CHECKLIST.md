@@ -76,9 +76,9 @@ producer-side bounded adapter，并把 TLS/H2/Yuubinsya 的 peak RSS 从当前
 > 和 `tmp/aws/yuhaiin/state.db` 三份停止快照全部通过，日志位于
 > `~/.cache/yuhaiin-rust/production-parity-current`；`stats-concurrency.sh` 的并发读取/重启
 > 通过；`transparent-service.sh` 的 REDIRECT TCP 通过并明确记录 rootless 下 TPROXY UDP skip；
-> runtime-owned TUN、启动日志也通过。最新 HTTP benchmark 为 146.13 MiB/s、peak RSS 16,660 KiB；
-> TLS/H2/Yuubinsya benchmark 为 23.20 MiB/s、peak RSS 75,400 KiB；
-> TUN benchmark 为 55.73 MiB/s、peak RSS 12,444 KiB；证据位于
+> runtime-owned TUN、启动日志也通过。最新 release benchmark 为 HTTP CONNECT 135.01 MiB/s、peak RSS
+> 17,096 KiB；TLS/H2/Yuubinsya 为 10.10 MiB/s、peak RSS 72,912 KiB；TUN benchmark 为 36.87 MiB/s、
+> peak RSS 12,456 KiB；证据位于
 > `~/.cache/yuhaiin-rust/benchmarks/{http-throughput-current,tun-throughput-current}`。随后
 > `tun-mtu.sh` 在 privileged Podman 中用独立设备和 SQLite 状态通过了 576、1280、1500、9000、
 > 9216 五个 MTU 用例，日志位于 `~/.cache/yuhaiin-rust/integration/tun-mtu-current`。
@@ -131,7 +131,7 @@ flowchart LR
 | `[x]` | schema/migration | `schema.rs`, `migration.rs` | Rust schema v3、Go v1/v5/v6 compatibility、未来版本 fail-closed、事务回滚/修复重试 |
 | `[x]` | typed repository | `repository.rs` | nodes、inbounds、resolvers、routes、lists、tags、settings、NAT、MaxMind、FakeIP 读写；未知 Go JSON 保留 |
 | `[x]` | 并发与异常终止 | `src/tests`, `tests/cross_process` | WAL 多进程 writer/reader、未提交事务 force-stop、sidecar lock、损坏库 fail-closed |
-| `[~]` | 真实生产库兼容覆盖 | store tests | 已有真实 Go v5/v6-shaped fixture 和 415MB 导出；默认 `production-parity-smoke` 已对 `tmp/v2/state.db`、`tmp/yuhaiin/state.db`、`tmp/aws/yuhaiin/state.db` 三份停止快照完成 Go/Rust 双进程、逐操作 API 对照；覆盖 nodes、resolvers、inbounds、route rules/lists、settings、统计、FakeDNS、hosts、server、interfaces、licenses；Rust 现在能直接把旧 Go v1 `nodes/inbounds/route_lists/node_tags` 投影为 v2 contract，并在 `YUHAIIN_GO_LEGACY_PRODUCTION_DB=.../tmp/state.db` 的真实 ignored snapshot 中按源表行数验证，保留原表/未知 JSON/selected-node metadata；修复了旧 telemetry migration ledger、partial network_split、带端口 dns_hosts、禁用 FakeIP 空 CIDR 和 route list persisted metrics；`tmp/state.db` 仍可用 `YUHAIIN_SOURCE_DB` 显式诊断，但 Go 自己的重复 `fakeip_entries` migration 失败仍不计入默认 smoke；仍需更多生产版本验证 route/resolver projection 逐行语义、未建模表和异常快照 |
+| `[~]` | 真实生产库兼容覆盖 | store/runtime tests | 已有真实 Go v5/v6-shaped fixture 和 415MB 导出；默认 `production-parity-smoke` 已对 `tmp/v2/state.db`、`tmp/yuhaiin/state.db`、`tmp/aws/yuhaiin/state.db` 三份停止快照完成 Go/Rust 双进程、逐操作 API 对照；覆盖 nodes、resolvers、inbounds、route rules/lists、settings、统计、FakeDNS、hosts、server、interfaces、licenses；Rust 现在能直接把旧 Go v1 `nodes/inbounds/route_lists/node_tags` 投影为 v2 contract，并在 `YUHAIIN_GO_LEGACY_PRODUCTION_DB=.../tmp/state.db` 的真实 store/runtime ignored snapshot 中按源表行数和 runtime snapshot 构建验证，保留原表/未知 JSON/selected-node metadata；修复了旧 telemetry migration ledger、partial network_split、带端口 dns_hosts、禁用 FakeIP 空 CIDR 和 route list persisted metrics；`tmp/state.db` 仍可用 `YUHAIIN_SOURCE_DB` 显式诊断，但 Go 自己的重复 `fakeip_entries` migration 失败仍不计入默认 smoke；仍需更多生产版本验证 route/resolver projection 逐行语义、未建模表和异常快照 |
 | `延期` | fsqlite | — | 已停止实验；性能、内存和生态不满足要求，不再作为候选后端 |
 
 ## 3. FakeIP
@@ -219,7 +219,7 @@ flowchart LR
 | `[x]` | 单一路径 TUN | `core::tun` | `tun-rs AsyncDevice + smoltcp`；不并行实现 tun2socket 和用户态 stack 两条路径 |
 | `[x]` | inbound owner | `runtime::inbound::run_until` | TUN record 会在同一个 inbound listener task 集合中创建 device；与 SOCKS5/HTTP/Yuubinsya/UDP listener 共同 reload、shutdown、abort，不再由独立 supervisor 管理 |
 | `[x]` | TCP/UDP/ICMP | `core::tun` | dispatcher、proxy bridge、DNS hijack、FakeIP reverse、NAT、bounded queue/backpressure |
-| `[x]` | Linux Podman | `tun-smoke`, `tun-service-smoke`, `tun-chain-service.sh`, `tun-mtu.sh`, `p0_tun`, `tun_fakeip_smoke` | privileged/network=none 创建、runtime inbound owner、AnyIP routed TCP、route、DNS/FakeIP、selected fixed proxy echo、SIGTERM 和设备重开；`make tun-service-smoke` 复用 `~/.cache/yuhaiin-rust/integration/tun-service` 并保留失败日志；`make tun-chain-service-smoke` 进一步验证真实 TUN → SQLite 选中的 fixed → TLS → HTTP/2 → Yuubinsya TCP → loopback echo，并覆盖客户端立即半关闭；`tun-mtu.sh` 对 576/1280/1500/9000/9216 分别验证真实设备、流量和关闭；当前 4 MiB TUN→fixed→loopback benchmark 为 55.73 MiB/s、peak RSS 12,444 KiB |
+| `[x]` | Linux Podman | `tun-smoke`, `tun-service-smoke`, `tun-chain-service.sh`, `tun-mtu.sh`, `p0_tun`, `tun_fakeip_smoke` | privileged/network=none 创建、runtime inbound owner、AnyIP routed TCP、route、DNS/FakeIP、selected fixed proxy echo、SIGTERM 和设备重开；`make tun-service-smoke` 复用 `~/.cache/yuhaiin-rust/integration/tun-service` 并保留失败日志；`make tun-chain-service-smoke` 进一步验证真实 TUN → SQLite 选中的 fixed → TLS → HTTP/2 → Yuubinsya TCP → loopback echo，并覆盖客户端立即半关闭；`tun-mtu.sh` 对 576/1280/1500/9000/9216 分别验证真实设备、流量和关闭；当前 4 MiB TUN→fixed→loopback benchmark 为 36.87 MiB/s、peak RSS 12,456 KiB |
 | `[~]` | 设备异常与 namespace | 测试已有设备消失、kernel cleanup、同名重开基础覆盖；在独立 rootless user/network namespace 中执行 `p0_tun` 的 loopback netem loss 与 matrix 测试均通过 | 继续补 namespace teardown、fragment 长流，以及 Android/macOS 实机 |
 | `[~]` | Android/macOS TUN | `TunRuntime::from_async_device` + `inbound::run_until_with_tun_runtime` 可把外部设备接入同一个 inbound owner；reload 复用设备并重建 proxy/dispatcher | Android VpnService fd、macOS utun/权限/route/生命周期实机验收 |
 
@@ -313,6 +313,9 @@ make go-rust-stats-smoke
 
 # Go/Rust management parity over all discovered stopped production snapshots:
 make production-parity-smoke
+
+# Go v1 state.db -> store + shared runtime snapshot (requires a copied source):
+YUHAIIN_GO_LEGACY_PRODUCTION_DB=/path/to/state.db make legacy-v1-runtime-smoke
 
 # Release runtime throughput and Linux RSS/CPU process sampling:
 make benchmark-throughput

@@ -42,7 +42,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-chain-service-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke production-parity-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
+.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-chain-service-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -65,6 +65,7 @@ help:
 		'make api-reload-flow-smoke verify mutation reloads the real data plane and survives restart' \
 		'make go-api-parity-smoke compare read and core mutation API responses against a Go state snapshot' \
 		'make production-parity-smoke compare several stopped production SQLite snapshots' \
+		'make legacy-v1-runtime-smoke build a runtime snapshot from a copied Go v1 state.db' \
 		'make go-rust-stats-smoke run concurrent Go/Rust SQLite statistics smoke in Podman' \
 		'make service-chain-smoke run inbound/router/outbound protocol chains in Podman' \
 		'make benchmark-throughput run the release inbound/router/outbound throughput benchmark in Podman' \
@@ -145,6 +146,15 @@ go-api-parity-smoke:
 
 production-parity-smoke:
 	./scripts/integration/production-parity.sh
+
+legacy-v1-runtime-smoke:
+	@test -n "$${YUHAIIN_GO_LEGACY_PRODUCTION_DB:-}" || { \
+		echo "set YUHAIIN_GO_LEGACY_PRODUCTION_DB to a copied Go v1 state.db" >&2; \
+		exit 1; \
+	}
+	YUHAIIN_GO_LEGACY_PRODUCTION_DB="$${YUHAIIN_GO_LEGACY_PRODUCTION_DB}" \
+		$(CARGO) test $(CARGO_COMMON_ARGS) -p $(RUNTIME_PACKAGE) --all-features --offline \
+			--test legacy_v1_runtime -- --ignored --nocapture
 
 go-rust-stats-smoke:
 	./scripts/integration/go-rust-stats.sh
