@@ -28,6 +28,7 @@ use yuhaiin_runtime::{RuntimeBuildOptions, RuntimeBuilder, RuntimeController, in
 use yuhaiin_store::{ConfigStore, GoInboundRecord, GoNodeRecord};
 
 const PAYLOAD: &[u8] = b"transparent-redir-service-smoke";
+const TCP_PAYLOADS: [&[u8]; 2] = [PAYLOAD, b"transparent-redir-service-second-flow"];
 const UDP_PAYLOADS: [&[u8]; 2] = [
     b"transparent-tproxy-udp-flow-a",
     b"transparent-tproxy-udp-flow-b",
@@ -82,11 +83,15 @@ async fn run() -> Result<()> {
 
     let target_listener = TcpListener::bind(target).await.map_err(io_error)?;
     let target_task = tokio::spawn(async move {
-        let (mut stream, _) = target_listener.accept().await.map_err(io_error)?;
-        let mut received = Vec::new();
-        stream.read_to_end(&mut received).await.map_err(io_error)?;
-        stream.write_all(&received).await.map_err(io_error)?;
-        Ok::<Vec<u8>, Error>(received)
+        let mut received = Vec::with_capacity(TCP_PAYLOADS.len());
+        for _ in TCP_PAYLOADS {
+            let (mut stream, _) = target_listener.accept().await.map_err(io_error)?;
+            let mut payload = Vec::new();
+            stream.read_to_end(&mut payload).await.map_err(io_error)?;
+            stream.write_all(&payload).await.map_err(io_error)?;
+            received.push(payload);
+        }
+        Ok::<Vec<Vec<u8>>, Error>(received)
     });
 
     if let Some(parent) = database.parent() {
@@ -196,19 +201,25 @@ async fn run() -> Result<()> {
         .map_err(|_| Error::new(ErrorKind::Closed, "transparent shutdown receiver closed"))?;
     service.await.map_err(join_error)??;
     let received = target_task.await.map_err(join_error)??;
-    if received != PAYLOAD {
+    if received.len() != TCP_PAYLOADS.len()
+        || received
+            .iter()
+            .zip(TCP_PAYLOADS)
+            .any(|(received, expected)| received != expected)
+    {
         return Err(Error::new(
             ErrorKind::Io,
             format!(
-                "transparent outbound payload mismatch: received {} bytes",
-                received.len()
+                "transparent outbound payload mismatch: received {} flows",
+                received.len(),
             ),
         ));
     }
     controller.persist_monitor().await?;
     println!(
-        "transparent-redir-tcp-ok bytes={} upload={} download={}",
+        "transparent-redir-tcp-ok flows={} bytes={} upload={} download={}",
         received.len(),
+        received.iter().map(Vec::len).sum::<usize>(),
         upload,
         download
     );
@@ -302,37 +313,32 @@ fn run_client() -> std::io::Result<()> {
         .unwrap_or_else(|_| "127.0.0.2:18080".to_owned())
         .parse::<SocketAddr>()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let mut last_error = None;
-    for _ in 0..300 {
-        match TcpStream::connect_timeout(&target, Duration::from_millis(200)) {
-            Ok(mut stream) => {
-                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-                stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-                stream.write_all(PAYLOAD)?;
-                stream.shutdown(Shutdown::Write)?;
-                let mut echoed = Vec::new();
-                stream.read_to_end(&mut echoed)?;
-                if echoed != PAYLOAD {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "transparent echo payload mismatch",
-                    ));
+    for payload in TCP_PAYLOADS {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match TcpStream::connect_timeout(&target, Duration::from_millis(200)) {
+                Ok(stream) => break stream,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
                 }
-                println!("transparent-client-ok");
-                return Ok(());
+                Err(error) => return Err(error),
             }
-            Err(error) => {
-                last_error = Some(error);
-                std::thread::sleep(Duration::from_millis(20));
-            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        stream.write_all(payload)?;
+        stream.shutdown(Shutdown::Write)?;
+        let mut echoed = Vec::new();
+        stream.read_to_end(&mut echoed)?;
+        if echoed != *payload {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "transparent echo payload mismatch",
+            ));
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "transparent client connect timeout",
-        )
-    }))
+    println!("transparent-client-ok flows={}", TCP_PAYLOADS.len());
+    Ok(())
 }
 
 async fn run_udp_target() -> Result<()> {
