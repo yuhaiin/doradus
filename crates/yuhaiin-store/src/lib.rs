@@ -69,6 +69,8 @@ const MAX_SUPPORTED_GO_SCHEMA_VERSION: i64 = 7;
 pub const DEFAULT_NAT_IDLE_TIMEOUT_MS: i64 = 30_000;
 const BUSY_RETRY_ATTEMPTS: usize = 64;
 const BUSY_RETRY_MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
+const STARTUP_COMPACT_MIN_FREE_BYTES: i64 = 4 << 20;
+const STARTUP_COMPACT_MIN_FREE_RATIO: i64 = 10;
 
 // SQLite file initialization and WAL bootstrap must not be raced by separate
 // handles for the same path. Gates are keyed by path so unrelated databases
@@ -613,14 +615,20 @@ impl ConfigStore {
         result
     }
 
-    /// Compact the database only when SQLite reports enough free pages. This
-    /// keeps the expensive `VACUUM` operation explicit and thresholded rather
-    /// than imposing a startup write/battery cost on every open.
-    pub async fn compact_if_needed(&self, minimum_free_pages: i64) -> Result<bool> {
-        if minimum_free_pages <= 0 {
-            return Err(Error::invalid("minimum SQLite free pages must be positive"));
-        }
+    /// Compact the database only when SQLite reports enough reusable space.
+    /// This keeps the expensive `VACUUM` operation thresholded rather than
+    /// imposing a full database rewrite on every open.
+    pub async fn compact_if_needed(&self) -> Result<bool> {
+        self.compact_if_needed_sync()
+    }
+
+    fn compact_if_needed_sync(&self) -> Result<bool> {
         self.with_write_retry(|connection| {
+            connection
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .map_err(storage_error)?;
+            let page_count = pragma_integer(connection, "page_count")?;
+            let page_size = pragma_integer(connection, "page_size")?;
             let rows = connection
                 .query("PRAGMA freelist_count")
                 .map_err(storage_error)?;
@@ -633,13 +641,21 @@ impl ConfigStore {
                     ));
                 }
             };
-            if free_pages < minimum_free_pages {
+            let free_bytes = free_pages.saturating_mul(page_size);
+            let free_ratio = if page_count > 0 {
+                free_pages.saturating_mul(100) / page_count
+            } else {
+                0
+            };
+            if free_bytes < STARTUP_COMPACT_MIN_FREE_BYTES
+                && free_ratio < STARTUP_COMPACT_MIN_FREE_RATIO
+            {
                 return Ok(false);
             }
+            connection.execute("VACUUM").map_err(storage_error)?;
             connection
                 .execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 .map_err(storage_error)?;
-            connection.execute("VACUUM").map_err(storage_error)?;
             Ok(true)
         })
     }
@@ -1095,6 +1111,10 @@ impl ConfigStore {
         store.migrate().map_err(|error| {
             Error::new(error.kind, format!("migrate database: {}", error.message))
         })?;
+        drop(_initialization_lock);
+        // Match Go's state-db startup policy: reclaim substantial reusable
+        // space, but do not rewrite a healthy database on every launch.
+        store.compact_if_needed_sync()?;
         Ok(store)
     }
 
@@ -1886,6 +1906,16 @@ fn row_integer(row: &Row, index: usize, field: &str) -> Result<i64> {
             format!("typed store field {field} is not INTEGER"),
         )),
     }
+}
+
+fn pragma_integer(connection: &Connection, name: &str) -> Result<i64> {
+    let row = connection
+        .query(&format!("PRAGMA {name}"))
+        .map_err(storage_error)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::new(ErrorKind::Storage, format!("PRAGMA {name} returned no row")))?;
+    row_integer(&row, 0, name)
 }
 
 fn fakeip_entry_from_row(row: &Row) -> Result<FakeIpEntryRecord> {

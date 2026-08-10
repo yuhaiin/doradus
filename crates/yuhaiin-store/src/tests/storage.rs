@@ -97,7 +97,6 @@ fn sqlite_backup_restore_is_consistent_and_atomic() {
 fn sqlite_compact_is_thresholded_and_preserves_state() {
     let path = test_database_path();
     let store = block_on(ConfigStore::open(&path)).unwrap();
-    assert!(!block_on(store.compact_if_needed(i64::MAX)).unwrap());
     for index in 0..96 {
         block_on(store.put_config(&format!("compact.{index}"), &vec![index as u8; 32 * 1024]))
             .unwrap();
@@ -105,12 +104,40 @@ fn sqlite_compact_is_thresholded_and_preserves_state() {
     for index in 0..96 {
         assert!(block_on(store.delete_config(&format!("compact.{index}"))).unwrap());
     }
-    assert!(block_on(store.compact_if_needed(1)).unwrap());
+    assert!(block_on(store.compact_if_needed()).unwrap());
     assert_eq!(block_on(store.get_config("compact.0")).unwrap(), None);
     store.close().unwrap();
 
     let reopened = block_on(ConfigStore::open(&path)).unwrap();
     assert_eq!(block_on(reopened.get_config("compact.95")).unwrap(), None);
+    reopened.close().unwrap();
+    remove_database_artifacts(&path);
+}
+
+#[test]
+fn sqlite_startup_compacts_reusable_space_with_go_thresholds() {
+    let path = test_database_path();
+    let before_reopen = {
+        let store = block_on(ConfigStore::open(&path)).unwrap();
+        for index in 0..32 {
+            block_on(store.put_config(
+                &format!("startup-compact.{index}"),
+                &vec![index as u8; 32 * 1024],
+            ))
+            .unwrap();
+        }
+        for index in 0..32 {
+            assert!(block_on(store.delete_config(&format!("startup-compact.{index}"))).unwrap());
+        }
+        store.close().unwrap();
+        fs::metadata(&path).unwrap().len()
+    };
+
+    let reopened = block_on(ConfigStore::open(&path)).unwrap();
+    let status = reopened.status().unwrap();
+    let after_reopen = fs::metadata(&path).unwrap().len();
+    assert_eq!(status.freelist_pages, 0);
+    assert!(after_reopen <= before_reopen);
     reopened.close().unwrap();
     remove_database_artifacts(&path);
 }
