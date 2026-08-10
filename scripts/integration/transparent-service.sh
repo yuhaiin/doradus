@@ -69,8 +69,8 @@ redir_port="${redir_addr##*:}"
 tproxy_port="${tproxy_addr##*:}"
 
 tproxy_mode="${YUHAIIN_TPROXY_ENABLED:-auto}"
+podman_rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || echo true)"
 if [[ "${tproxy_mode}" == "auto" ]]; then
-  podman_rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || echo true)"
   if [[ "${podman_rootless}" == "true" ]]; then
     tproxy_enabled=0
   else
@@ -82,6 +82,11 @@ fi
 if [[ "${tproxy_enabled}" != 0 && "${tproxy_enabled}" != 1 ]]; then
   echo "YUHAIIN_TPROXY_ENABLED must be 0, 1, or auto" >&2
   exit 1
+fi
+if [[ "${tproxy_enabled}" -eq 1 && "${podman_rootless}" == "true" ]]; then
+  echo "TPROXY UDP gate requires rootful Podman or a host namespace with CAP_NET_ADMIN" >&2
+  echo "rootless Podman can only run the REDIRECT TCP portion; use YUHAIIN_TPROXY_ENABLED=auto" >&2
+  exit 2
 fi
 
 ipv6_env_args=()

@@ -69,8 +69,11 @@ The current scenarios cover:
   Linux namespace with a host `iptables` helper, redirects a non-root TCP
   client into the Rust `redir` inbound, verifies `SO_ORIGINAL_DST`, direct
   outbound echo, flow counters, and shutdown, and probes the TPROXY socket
-  capability. Host firewall state is not modified; rule changes are confined
-  to the Podman network namespace and removed by a trap.
+  capability. Rootless Podman records a deterministic TPROXY skip; explicitly
+  setting `YUHAIIN_TPROXY_ENABLED=1` now fails fast with a clear rootful/
+  `CAP_NET_ADMIN` requirement instead of entering a partial nested namespace.
+  Host firewall state is not modified; rule changes are confined to the
+  Podman network namespace and removed by a trap.
 - `scripts/integration/dns-source-bind.sh` runs the existing UDP/TCP resolver
   source-address tests inside a host-network Podman container. It confirms
   that the configured local IPv4 address reaches the DNS server for both

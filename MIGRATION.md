@@ -2559,3 +2559,12 @@ static-pie。`make android-aarch64` 也已实际通过，使用
 `/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang`
 生成 `~/.cache/yuhaiin-rust/cargo-target/aarch64-linux-android/release/yuhaiin`。这只是交叉编译
 证据，尚未把本机编译当作 Android 真机 VpnService 验收。
+
+## 79. 2026-08-10 transparent TPROXY gate reports rootless capability clearly
+
+在本机强制执行 `YUHAIIN_TPROXY_ENABLED=1 make transparent-service-smoke` 时确认：rootless
+Podman 可能创建出部分 namespace/iptables 状态，但不能提供可靠的 TPROXY UDP 验收，旧脚本会在
+后段以 `Resource temporarily unavailable` 或不完整 flow statistics 失败，容易误判为 Rust 数据面
+问题。现在脚本在启动容器前读取 Podman rootless 状态；rootless + 强制 TPROXY 直接以退出码 2
+报告需要 rootful Podman 或宿主机 `CAP_NET_ADMIN`。默认模式仍只运行 REDIRECT TCP 并明确记录
+TPROXY skip，IPv4 REDIRECT 和 IPv4+IPv6 REDIRECT 两个 gate 均重新通过。

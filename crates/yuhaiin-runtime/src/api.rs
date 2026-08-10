@@ -3586,6 +3586,7 @@ fn nested_type(value: &Value, key: &str) -> String {
         .to_owned()
 }
 
+#[cfg(test)]
 fn page(mut values: Vec<Value>, input: &Value) -> Value {
     if let Some(query) = input
         .get("query")
