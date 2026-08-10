@@ -9,6 +9,8 @@
 //! construction logic.
 
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
@@ -183,6 +185,26 @@ pub async fn run_until_with_tun_runtime(
     }
     let _ = tun_task.await;
     result
+}
+
+/// Run all normal inbounds together with a TUN descriptor created by the
+/// platform host. The descriptor is consumed and owned by the inbound
+/// supervisor for the lifetime of the call.
+///
+/// This keeps the TUN entry point in the inbound module, alongside SOCKS5,
+/// HTTP, Yuubinsya and UDP listeners. Platform code only supplies the
+/// already-established FD; routing, proxy selection, reload and shutdown
+/// remain shared with the desktop path.
+#[cfg(all(feature = "tun", unix))]
+pub async fn run_until_with_tun_fd(
+    controller: RuntimeController,
+    shutdown: watch::Receiver<bool>,
+    fd: OwnedFd,
+    config: crate::TunRuntimeConfig,
+) -> Result<()> {
+    let tun = yuhaiin_core::tun::TunRuntime::from_owned_fd(config.tun.clone(), fd)
+        .map_err(|error| Error::new(ErrorKind::Io, format!("open injected TUN fd: {error}")))?;
+    run_until_with_tun_runtime(controller, shutdown, tun, config).await
 }
 
 async fn run_until_inner(

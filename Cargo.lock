@@ -3627,7 +3627,7 @@ dependencies = [
  "socket2",
  "tokio",
  "tokio-tungstenite",
- "tun-rs",
+ "yuhaiin-platform",
 ]
 
 [[package]]
@@ -3637,6 +3637,13 @@ dependencies = [
  "maxminddb",
  "sha2 0.11.0",
  "yuhaiin-core",
+]
+
+[[package]]
+name = "yuhaiin-platform"
+version = "0.1.0"
+dependencies = [
+ "tun-rs",
 ]
 
 [[package]]

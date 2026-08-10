@@ -18,14 +18,16 @@ use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
 #[cfg(all(feature = "tun-routes", target_os = "linux"))]
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "async-proxy")]
 use std::time::Duration;
-use tun_rs::AsyncDevice;
+use yuhaiin_platform::AsyncDevice;
 #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
-use tun_rs::DeviceBuilder;
+use yuhaiin_platform::DeviceBuilder;
 
 #[cfg(feature = "async-proxy")]
 use tokio::sync::mpsc;
@@ -2360,6 +2362,26 @@ impl TunRuntime {
             #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
             configured_name,
         })
+    }
+
+    /// Build the TUN runtime from an owned platform file descriptor.
+    ///
+    /// The caller transfers ownership of `fd` to this method. On success the
+    /// returned runtime closes it when the runtime is dropped; on an invalid
+    /// configuration the `OwnedFd` is left to its normal drop path. This is
+    /// the safe boundary for Android `VpnService`, iOS `PacketTunnelProvider`
+    /// and macOS utun hosts that already created the device outside Rust.
+    ///
+    /// `tun-rs` still requires the descriptor to refer to a real TUN/TAP
+    /// device. A plain socket or pipe is not a supported substitute and is
+    /// rejected by the platform data plane when it is used.
+    #[cfg(unix)]
+    pub fn from_owned_fd(config: TunConfig, fd: OwnedFd) -> io::Result<Self> {
+        config
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let device = yuhaiin_platform::async_device_from_owned_fd(fd)?;
+        Self::from_async_device(config, device)
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]

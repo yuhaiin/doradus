@@ -1,0 +1,19 @@
+[package]
+name = "yuhaiin-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+tun = ["dep:tun-rs"]
+
+[dependencies]
+tun-rs = { version = "2.8.8", optional = true, default-features = false, features = ["async_io"] }
+
+# This crate is the deliberately tiny platform/unsafe boundary.  The rest of
+# the workspace keeps unsafe_code=forbid; only this adapter may call the
+# dependency's raw-fd constructor after validating ownership with OwnedFd.
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"

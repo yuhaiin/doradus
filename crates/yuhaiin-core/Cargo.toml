@@ -9,7 +9,7 @@ default = []
 http2 = ["dep:bytes", "dep:futures-util", "dep:h2", "dep:http", "dep:tokio"]
 async-proxy = ["dep:futures-util", "dep:tokio"]
 tls-rustcrypto = ["dep:rustls", "dep:rustls-rustcrypto"]
-tun = ["dep:futures-lite", "dep:smoltcp", "dep:tun-rs"]
+tun = ["dep:futures-lite", "dep:smoltcp", "dep:yuhaiin-platform"]
 tun-routes = ["tun", "dep:route_manager"]
 websocket = ["async-proxy", "dep:tokio-tungstenite"]
 
@@ -27,7 +27,7 @@ socket2 = { version = "0.6.5", default-features = false }
 smoltcp = { version = "0.13.1", optional = true, default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "async"] }
 tokio = { version = "1.50.0", optional = true, default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite = { version = "0.28.0", optional = true, default-features = false, features = ["handshake"] }
-tun-rs = { version = "2.8.8", optional = true, default-features = false, features = ["async_io"] }
+yuhaiin-platform = { path = "../yuhaiin-platform", optional = true, features = ["tun"] }
 
 [[bin]]
 name = "tun-smoke"

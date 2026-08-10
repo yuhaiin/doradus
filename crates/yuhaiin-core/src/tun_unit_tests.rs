@@ -111,6 +111,26 @@ fn config_rejects_invalid_mtu_and_queue() {
     assert!(config.validate().is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn owned_fd_entrypoint_rejects_invalid_config_before_claiming_descriptor() {
+    use std::fs::File;
+    use std::os::fd::OwnedFd;
+
+    let file = File::open("/dev/null").unwrap();
+    let fd: OwnedFd = file.into();
+    let config = TunConfig {
+        mtu: 128,
+        ..TunConfig::default()
+    };
+    let error = match TunRuntime::from_owned_fd(config, fd) {
+        Ok(_) => panic!("invalid TUN config unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("MTU"));
+}
+
 #[cfg(all(feature = "tun-routes", target_os = "linux"))]
 #[test]
 fn linux_capability_probe_only_accepts_the_effective_capability_bit() {
