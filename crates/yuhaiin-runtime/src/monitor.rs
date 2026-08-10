@@ -1346,8 +1346,7 @@ fn telemetry_dimensions(connection: &Value) -> Vec<(String, String)> {
         .into_iter()
         .flatten()
         .filter_map(|match_value| match_value.get("ruleName").and_then(Value::as_str))
-        .filter(|rule| !rule.is_empty())
-        .last()
+        .rfind(|rule| !rule.is_empty())
     {
         values.insert("rule".to_owned(), rule.to_owned());
     }

@@ -43,7 +43,7 @@ pub trait ProcessResolver: Send + Sync {
 pub fn default_process_resolver() -> Option<Arc<dyn ProcessResolver>> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        return Some(Arc::new(LinuxProcResolver::default()));
+        Some(Arc::new(LinuxProcResolver::default()))
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -125,10 +125,7 @@ impl LinuxProcResolver {
 
     fn find_process(&self, inode: u64, uid: u32) -> io::Result<Option<ProcessInfo>> {
         let expected = format!("socket:[{inode}]");
-        let entries = match std::fs::read_dir(&self.proc_root) {
-            Ok(entries) => entries,
-            Err(error) => return Err(error),
-        };
+        let entries = std::fs::read_dir(&self.proc_root)?;
 
         for entry in entries {
             let entry = match entry {

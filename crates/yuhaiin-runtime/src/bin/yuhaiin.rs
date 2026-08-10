@@ -273,6 +273,7 @@ fn console_notice(message: impl std::fmt::Display) {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{RunOptions, parse_run_options};
     use std::ffi::OsString;

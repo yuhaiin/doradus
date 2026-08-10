@@ -470,7 +470,7 @@ fn route_rule(pattern: &str) -> RouteRule {
 async fn run_stream_proxy_tun(kind: StreamProxyKind) {
     let (proxy_address, target_address, fixture) = spawn_stream_proxy(kind);
     let target_ip = match target_address.ip() {
-        std::net::IpAddr::V4(address) => Ipv4Address::from(address),
+        std::net::IpAddr::V4(address) => address,
         std::net::IpAddr::V6(_) => panic!("stream fixture unexpectedly used IPv6"),
     };
     let connector: Arc<dyn yuhaiin_core::proxy::StreamConnector> = match kind {
@@ -631,7 +631,7 @@ fn spawn_target_echo() -> (SocketAddr, JoinHandle<()>) {
 async fn fixed_async_proxy_runs_through_tun_tcp_runtime() {
     let (target_address, target_task) = spawn_target_echo();
     let target_ip = match target_address.ip() {
-        std::net::IpAddr::V4(address) => Ipv4Address::from(address),
+        std::net::IpAddr::V4(address) => address,
         std::net::IpAddr::V6(_) => panic!("fixed fixture unexpectedly used IPv6"),
     };
     let fixed: Arc<dyn AsyncProxy> = Arc::new(FixedAsyncProxy {
@@ -1036,7 +1036,7 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
             .unwrap();
     });
     let payload = b"through-router";
-    let destination = Ipv4Address::from(fake_ip);
+    let destination = fake_ip;
     device
         .enqueue_rx(udp_packet(application, destination, 41001, 443, payload))
         .unwrap();

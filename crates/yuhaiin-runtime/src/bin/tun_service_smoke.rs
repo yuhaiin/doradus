@@ -43,12 +43,10 @@ async fn run() -> Result<()> {
     let database = std::env::var_os("YUHAIIN_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(".")),
-            )
-            .join(".cache/yuhaiin-rust/integration/tun-service/state.sqlite")
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".cache/yuhaiin-rust/integration/tun-service/state.sqlite")
         });
     let name = std::env::var("YUHAIIN_TUN_NAME").unwrap_or_else(|_| "yuhaiin-smoke0".to_owned());
     let hold_ms = std::env::var("YUHAIIN_TUN_HOLD_MS")
@@ -629,10 +627,7 @@ impl AsyncDatagram for FixedTargetDatagram {
 impl AsyncProxy for FixedTargetProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         let mapped = self.mapped_context(context);
-        Box::pin(async move {
-            let result = self.direct.connect(&mapped).await;
-            result
-        })
+        Box::pin(async move { self.direct.connect(&mapped).await })
     }
 
     fn open_datagram<'a>(

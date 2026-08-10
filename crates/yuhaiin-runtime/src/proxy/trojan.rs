@@ -132,18 +132,18 @@ where
         tokio::select! {
             received = trojan::read_udp_frame(&mut reader, &mut packet) => {
                 let (length, target) = received?;
-                if target.port() == Some(53) {
-                    if let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await {
-                        if let Ok(response) = answer {
-                            trojan::write_udp_frame(
-                                &mut *writer.lock().await,
-                                &target,
-                                &response,
-                            )
-                            .await?;
-                        }
-                        continue;
+                if target.port() == Some(53)
+                    && let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await
+                {
+                    if let Ok(response) = answer {
+                        trojan::write_udp_frame(
+                            &mut *writer.lock().await,
+                            &target,
+                            &response,
+                        )
+                        .await?;
                     }
+                    continue;
                 }
                 let (datagram, flow) = if let Some(state) = flows.get(&target) {
                     (Arc::clone(&state.datagram), state.key)
@@ -166,12 +166,9 @@ where
                     let id = target.clone();
                     let receiver_task = tokio::spawn(async move {
                         let mut buffer = vec![0u8; udp_buffer_size];
-                        loop {
-                            match receiver.recv_from(&mut buffer).await {
-                                Ok((length, target)) => {
-                                    if reply_tx.send(UdpReply { id: id.clone(), target, payload: buffer[..length].to_vec() }).await.is_err() { break; }
-                                }
-                                Err(_) => break,
+                        while let Ok((length, target)) = receiver.recv_from(&mut buffer).await {
+                            if reply_tx.send(UdpReply { id: id.clone(), target, payload: buffer[..length].to_vec() }).await.is_err() {
+                                break;
                             }
                         }
                     });

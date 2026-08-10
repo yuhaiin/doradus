@@ -288,9 +288,7 @@ fn http_authorization(
         return HttpAuthorization::Allowed;
     }
     let Some(token) = headers.lines().find_map(|line| {
-        let Some((name, value)) = line.split_once(':') else {
-            return None;
-        };
+        let (name, value) = line.split_once(':')?;
         if !name.eq_ignore_ascii_case("Proxy-Authorization") {
             return None;
         }

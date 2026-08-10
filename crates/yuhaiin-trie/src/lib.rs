@@ -119,7 +119,7 @@ fn search_domain<'a, T>(
     let wildcard = node.children.get("*");
     let exact_result = exact.and_then(|child| search_domain(child, labels, depth + 1, best));
     let wildcard_result = (depth + 1 == labels.len())
-        .then(|| wildcard)
+        .then_some(wildcard)
         .flatten()
         .and_then(|child| search_domain(child, labels, depth + 1, best));
     exact_result.or(wildcard_result).or(best)

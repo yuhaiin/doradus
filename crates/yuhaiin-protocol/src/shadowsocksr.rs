@@ -595,6 +595,7 @@ impl ProtocolState {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum StreamCipher {
     None,
     Aes(AesStream),

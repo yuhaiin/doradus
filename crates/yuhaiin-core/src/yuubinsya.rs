@@ -218,13 +218,11 @@ pub fn decode_udp_packet_any<'a>(
         ));
     }
     let mut cursor = 32;
-    if socks5_prefix {
-        if take(packet, &mut cursor, 3)? != [0, 0, 0] {
-            return Err(Error::new(
-                ErrorKind::Protocol,
-                "invalid Yuubinsya SOCKS5 prefix",
-            ));
-        }
+    if socks5_prefix && take(packet, &mut cursor, 3)? != [0, 0, 0] {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "invalid Yuubinsya SOCKS5 prefix",
+        ));
     }
     let destination = decode_endpoint(packet, &mut cursor, Network::Udp)?;
     Ok((destination, &packet[cursor..], selected))

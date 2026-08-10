@@ -1457,7 +1457,7 @@ impl ConfigRepository {
                         record
                             .geo_country
                             .as_deref()
-                            .map_or(SqliteValue::Null, |value| SqliteValue::from(value)),
+                            .map_or(SqliteValue::Null, SqliteValue::from),
                         SqliteValue::from(record.resolver_policy.as_slice()),
                     ],
                 )

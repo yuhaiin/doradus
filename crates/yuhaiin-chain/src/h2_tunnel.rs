@@ -976,9 +976,7 @@ mod tests {
                 }
                 result = async {
                     while connection.accept().await.is_some() {}
-                } => {
-                    let _ = result;
-                }
+                } => result,
             }
         });
         let connection = H2Connection::handshake_with_limits(client_io, 128)

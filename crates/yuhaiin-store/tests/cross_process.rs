@@ -200,11 +200,10 @@ fn concurrent_process_readers_observe_writers_without_corrupting_wal() {
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
         .unwrap();
     assert_eq!(integrity, "ok");
-    assert_eq!(
+    assert!(
         block_on(store.repository().get_nat_config_or_default("default"))
             .unwrap()
             .full_cone,
-        true,
         "cross-process pressure must preserve Full Cone NAT default semantics"
     );
     remove_database_artifacts(&path);

@@ -181,6 +181,14 @@ impl HostsTable {
             .map_err(|_| Error::new(ErrorKind::Closed, "DNS hosts lock poisoned"))?
             .len())
     }
+
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self
+            .entries
+            .read()
+            .map_err(|_| Error::new(ErrorKind::Closed, "DNS hosts lock poisoned"))?
+            .is_empty())
+    }
 }
 
 /// Return the hostname part of the address-like strings accepted by Go's
@@ -188,14 +196,14 @@ impl HostsTable {
 /// as `name.example:443` or `[2001:db8::1]:443`; DNS itself only indexes the
 /// hostname, so the optional port is intentionally discarded here.
 pub fn host_without_port(value: &str) -> &str {
+    if value.starts_with('[')
+        && let Some(end) = value.find(']')
+        && value.as_bytes().get(end + 1) == Some(&b':')
+        && value[end + 2..].parse::<u16>().is_ok()
+    {
+        return &value[1..end];
+    }
     if value.starts_with('[') {
-        if let Some(end) = value.find(']') {
-            if value.as_bytes().get(end + 1) == Some(&b':')
-                && value[end + 2..].parse::<u16>().is_ok()
-            {
-                return &value[1..end];
-            }
-        }
         return value;
     }
     if value.parse::<IpAddr>().is_ok() {

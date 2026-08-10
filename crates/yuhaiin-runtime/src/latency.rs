@@ -170,15 +170,11 @@ impl LatencyRequest {
         }
     }
 
-    fn host_or_default(&self, tcp: bool) -> String {
+    fn host_or_default(&self, _tcp: bool) -> String {
         if !self.host.trim().is_empty() {
             return self.host.trim().to_owned();
         }
-        if tcp {
-            "stun.l.google.com:19302".to_owned()
-        } else {
-            "stun.l.google.com:19302".to_owned()
-        }
+        "stun.l.google.com:19302".to_owned()
     }
 
     fn dns_host_or_default(&self) -> String {
@@ -609,7 +605,7 @@ async fn wrap_tls_if_needed(
             .await
             .map_err(|_| Error::new(ErrorKind::Timeout, "TLS handshake timed out"))?
             .map_err(|error| Error::new(ErrorKind::Protocol, format!("TLS: {error}")))?;
-        return Ok(Box::new(tls));
+        Ok(Box::new(tls))
     }
     #[cfg(not(feature = "doh-tls"))]
     {

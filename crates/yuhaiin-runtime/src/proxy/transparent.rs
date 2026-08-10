@@ -101,13 +101,13 @@ pub(crate) async fn serve_udp_listener(
                     }
                 };
                 let target = Endpoint::ip(Network::Udp, destination);
-                if target.port() == Some(53) {
-                    if let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await {
-                        if let Ok(response) = answer {
-                            send_udp_reply(&response, destination, peer).await?;
-                        }
-                        continue;
+                if target.port() == Some(53)
+                    && let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await
+                {
+                    if let Ok(response) = answer {
+                        send_udp_reply(&response, destination, peer).await?;
                     }
+                    continue;
                 }
                 let id = UdpFlowId {
                     peer,
@@ -141,18 +141,13 @@ pub(crate) async fn serve_udp_listener(
                     let id_for_task = id.clone();
                     let receiver_task = tokio::spawn(async move {
                         let mut buffer = vec![0u8; udp_buffer_size];
-                        loop {
-                            match receiver.recv_from(&mut buffer).await {
-                                Ok((length, target)) => {
-                                    if reply_tx.send(UdpReply {
-                                        id: id_for_task.clone(),
-                                        target,
-                                        payload: buffer[..length].to_vec(),
-                                    }).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
+                        while let Ok((length, target)) = receiver.recv_from(&mut buffer).await {
+                            if reply_tx.send(UdpReply {
+                                id: id_for_task.clone(),
+                                target,
+                                payload: buffer[..length].to_vec(),
+                            }).await.is_err() {
+                                break;
                             }
                         }
                     });
@@ -403,9 +398,8 @@ async fn handle_connection(
         .select(&context)
         .connect(&context)
         .await
-        .map_err(|error| {
+        .inspect_err(|error| {
             monitor.record_failure(protocol, &endpoint.to_string(), &error.to_string());
-            error
         })?;
     relay_counted_with_buffer(
         stream,

@@ -152,14 +152,12 @@ fn split_dot_endpoint(value: &str, id: &str) -> Result<(String, u16)> {
     if value.parse::<std::net::IpAddr>().is_ok() {
         return Ok((value.to_owned(), 853));
     }
-    if let Some((host, port)) = value.rsplit_once(':') {
-        if !host.contains(':') {
-            if let Ok(port) = port.parse::<u16>() {
-                if port != 0 {
-                    return Ok((host.trim_matches(['[', ']']).to_owned(), port));
-                }
-            }
-        }
+    if let Some((host, port)) = value.rsplit_once(':')
+        && !host.contains(':')
+        && let Ok(port) = port.parse::<u16>()
+        && port != 0
+    {
+        return Ok((host.trim_matches(['[', ']']).to_owned(), port));
     }
     Ok((value.trim_matches(['[', ']']).to_owned(), 853))
 }

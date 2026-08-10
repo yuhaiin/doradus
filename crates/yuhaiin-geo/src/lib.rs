@@ -197,25 +197,25 @@ impl GeoDatabaseManager {
                 self.max_bytes
             )));
         }
-        if let Some(expected) = request.expected_size {
-            if expected != bytes.len() as u64 {
-                return Err(Error::new(
-                    ErrorKind::Protocol,
-                    format!(
-                        "GeoIP response length mismatch: expected {expected}, got {}",
-                        bytes.len()
-                    ),
-                ));
-            }
+        if let Some(expected) = request.expected_size
+            && expected != bytes.len() as u64
+        {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                format!(
+                    "GeoIP response length mismatch: expected {expected}, got {}",
+                    bytes.len()
+                ),
+            ));
         }
         let actual_hash = sha256(&bytes);
-        if let Some(expected) = request.expected_sha256.as_deref() {
-            if expected != actual_hash.as_slice() {
-                return Err(Error::new(
-                    ErrorKind::Protocol,
-                    "GeoIP response SHA-256 mismatch",
-                ));
-            }
+        if let Some(expected) = request.expected_sha256.as_deref()
+            && expected != actual_hash.as_slice()
+        {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "GeoIP response SHA-256 mismatch",
+            ));
         }
         let metadata = GeoMetadata {
             id: request.id,

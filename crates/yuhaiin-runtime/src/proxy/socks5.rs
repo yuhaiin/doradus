@@ -193,14 +193,14 @@ pub(crate) async fn serve_socks5_udp_loop(
                 } else {
                     client = Some(peer);
                 }
-                if target.port() == Some(53) {
-                    if let Some(answer) = answer_dns_packet(&monitor, payload).await {
-                        if let Ok(response) = answer {
-                            let packet = encode_socks_udp_packet(&target, &response)?;
-                            socket.send_to(&packet, peer).await.map_err(io_error)?;
-                        }
-                        continue;
+                if target.port() == Some(53)
+                    && let Some(answer) = answer_dns_packet(&monitor, payload).await
+                {
+                    if let Ok(response) = answer {
+                        let packet = encode_socks_udp_packet(&target, &response)?;
+                        socket.send_to(&packet, peer).await.map_err(io_error)?;
                     }
+                    continue;
                 }
                 let id = UdpFlowId {
                     peer,
@@ -226,18 +226,13 @@ pub(crate) async fn serve_socks5_udp_loop(
                     let id_for_task = id.clone();
                     let receiver_task = tokio::spawn(async move {
                         let mut buffer = vec![0u8; udp_buffer_size];
-                        loop {
-                            match receiver.recv_from(&mut buffer).await {
-                                Ok((length, target)) => {
-                                    if reply_tx.send(UdpReply {
-                                        id: id_for_task.clone(),
-                                        target,
-                                        payload: buffer[..length].to_vec(),
-                                    }).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
+                        while let Ok((length, target)) = receiver.recv_from(&mut buffer).await {
+                            if reply_tx.send(UdpReply {
+                                id: id_for_task.clone(),
+                                target,
+                                payload: buffer[..length].to_vec(),
+                            }).await.is_err() {
+                                break;
                             }
                         }
                     });
@@ -288,6 +283,7 @@ pub(crate) async fn serve_socks5_udp_loop(
     Ok(())
 }
 
+#[allow(clippy::type_complexity)]
 pub(crate) trait InboundUdpSocket: Send + Unpin + 'static {
     fn recv_from<'a>(
         &'a mut self,

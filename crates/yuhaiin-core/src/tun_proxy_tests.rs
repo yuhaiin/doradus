@@ -146,8 +146,10 @@ async fn proxy_runtime_shares_one_udp_proxy_per_source_for_full_cone_nat() {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    type Packet = (Vec<u8>, Endpoint);
+
     struct EchoDatagram {
-        packets: Arc<Mutex<VecDeque<(Vec<u8>, Endpoint)>>>,
+        packets: Arc<Mutex<VecDeque<Packet>>>,
         notify: Arc<tokio::sync::Notify>,
     }
 

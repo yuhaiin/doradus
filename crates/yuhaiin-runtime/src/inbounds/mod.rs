@@ -1623,6 +1623,7 @@ async fn serve_websocket_listener(
     result
 }
 #[cfg(feature = "websocket")]
+#[allow(clippy::result_large_err)]
 async fn accept_websocket_stream<S>(
     stream: S,
 ) -> Result<(crate::proxy::websocket::WebSocketIo<S>, Vec<u8>)>
@@ -1639,23 +1640,25 @@ where
                 .get("early_data")
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.eq_ignore_ascii_case("base64"));
-            if wants_early_data {
-                if let Some(key) = request.headers().get("Sec-WebSocket-Key") {
-                    if let Ok(decoded) =
-                        base64::engine::general_purpose::STANDARD_NO_PAD.decode(key.as_bytes())
-                    {
-                        if decoded.len() <= 2048 {
-                            early_data = decoded;
-                            response.headers_mut().insert(
-                                "early_data",
-                                tokio_tungstenite::tungstenite::http::HeaderValue::from_static(
-                                    "true",
-                                ),
-                            );
-                        }
-                    }
-                }
+            if !wants_early_data {
+                return Ok(response);
             }
+            let Some(key) = request.headers().get("Sec-WebSocket-Key") else {
+                return Ok(response);
+            };
+            let Ok(decoded) =
+                base64::engine::general_purpose::STANDARD_NO_PAD.decode(key.as_bytes())
+            else {
+                return Ok(response);
+            };
+            if decoded.len() > 2048 {
+                return Ok(response);
+            }
+            early_data = decoded;
+            response.headers_mut().insert(
+                "early_data",
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_static("true"),
+            );
             Ok(response)
         },
     )
@@ -2056,10 +2059,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 };
                 tokio::spawn(async move {
                     let mut buffer = [0u8; 4096];
-                    loop {
-                        let Ok(size) = stream.read(&mut buffer).await else {
-                            break;
-                        };
+                    while let Ok(size) = stream.read(&mut buffer).await {
                         if size == 0 || stream.write_all(&buffer[..size]).await.is_err() {
                             break;
                         }
@@ -3501,7 +3501,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             use std::io::Cursor;
 
             use base64::Engine;
-            use rustls::pki_types::{CertificateDer, ServerName};
+            use rustls::pki_types::ServerName;
             use tokio_rustls::TlsConnector;
 
             let (echo_address, echo_task) = echo_server().await;
@@ -3559,7 +3559,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     .next()
                     .unwrap()
                     .unwrap();
-                roots.add(CertificateDer::from(certificate)).unwrap();
+                roots.add(certificate).unwrap();
                 let client = rustls::ClientConfig::builder_with_provider(Arc::new(
                     rustls_rustcrypto::provider(),
                 ))

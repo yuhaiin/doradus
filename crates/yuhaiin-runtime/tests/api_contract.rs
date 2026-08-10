@@ -70,7 +70,7 @@ async fn expect_sse(service: &ServiceProcess, path: &str) {
 async fn wait_for_active_node(service: &ServiceProcess, id: &str) -> Value {
     let mut last = Value::Null;
     for _ in 0..100 {
-        let active = expect_ok(&service, Method::GET, "/api/v2/nodes/active", None).await;
+        let active = expect_ok(service, Method::GET, "/api/v2/nodes/active", None).await;
         last = active.clone();
         if active["items"]
             .as_array()

@@ -129,17 +129,15 @@ pub fn http_host(bytes: &[u8]) -> Option<String> {
 }
 
 fn strip_host_port(value: &str) -> String {
-    if let Some(rest) = value.strip_prefix('[') {
-        if let Some((host, suffix)) = rest.split_once(']') {
-            if suffix.is_empty()
-                || suffix
-                    .strip_prefix(':')
-                    .and_then(|port| port.parse::<u16>().ok())
-                    .is_some()
-            {
-                return host.to_owned();
-            }
-        }
+    if let Some(rest) = value.strip_prefix('[')
+        && let Some((host, suffix)) = rest.split_once(']')
+        && (suffix.is_empty()
+            || suffix
+                .strip_prefix(':')
+                .and_then(|port| port.parse::<u16>().ok())
+                .is_some())
+    {
+        return host.to_owned();
     }
     if let Some((host, port)) = value.rsplit_once(':')
         && !host.contains(':')

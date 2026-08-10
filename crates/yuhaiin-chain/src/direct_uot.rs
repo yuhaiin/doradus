@@ -501,8 +501,10 @@ mod tests {
     use tokio::sync::Notify;
     use yuhaiin_core::Network;
 
+    type DatagramPacket = (Vec<u8>, Endpoint);
+
     struct EchoDatagram {
-        queue: Arc<Mutex<VecDeque<(Vec<u8>, Endpoint)>>>,
+        queue: Arc<Mutex<VecDeque<DatagramPacket>>>,
         notify: Arc<Notify>,
     }
 

@@ -279,14 +279,12 @@ impl DnsCache {
         entries.retain(|_, entry| entry.expires_at > now);
         if entries.len() >= self.max_entries
             && !entries.contains_key(&(domain.clone(), record_type))
-        {
-            if let Some(oldest) = entries
+            && let Some(oldest) = entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.expires_at)
                 .map(|(key, _)| key.clone())
-            {
-                entries.remove(&oldest);
-            }
+        {
+            entries.remove(&oldest);
         }
         entries.insert(
             (domain, record_type),
@@ -310,6 +308,13 @@ impl DnsCache {
             .lock()
             .map_err(|_| Error::new(ErrorKind::Closed, "DNS cache lock poisoned"))
             .map(|entries| entries.len())
+    }
+
+    pub fn is_empty(&self) -> Result<bool> {
+        self.entries
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Closed, "DNS cache lock poisoned"))
+            .map(|entries| entries.is_empty())
     }
 }
 

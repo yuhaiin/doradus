@@ -238,5 +238,5 @@ where
 }
 
 fn websocket_io_error(error: tokio_tungstenite::tungstenite::Error) -> IoError {
-    IoError::new(IoErrorKind::Other, format!("WebSocket: {error}"))
+    IoError::other(format!("WebSocket: {error}"))
 }

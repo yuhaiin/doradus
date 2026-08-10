@@ -493,6 +493,7 @@ struct TypedIndexInfo {
     columns: Vec<String>,
 }
 
+#[allow(clippy::type_complexity)]
 pub(super) fn validate_typed_schema(connection: &Connection) -> Result<()> {
     // These tables are owned by the Rust store.  Checking only column names
     // would let a pre-existing table with an incompatible SQLite affinity or
@@ -722,7 +723,6 @@ pub(super) fn validate_typed_schema(connection: &Connection) -> Result<()> {
 /// of being silently discarded.  A marker in our metadata table makes the
 /// operation idempotent across restart and also records the source schema
 /// version used for the field-difference report.
-
 pub(super) fn prepare_go_legacy_tables(connection: &Connection) -> Result<()> {
     if !table_exists(connection, "metadata") || !table_exists(connection, "migrate") {
         return Ok(());

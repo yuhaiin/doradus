@@ -1249,10 +1249,10 @@ impl FakeIpPool {
                 evicted_domain.as_ref().map(ToString::to_string).as_deref(),
             )
             .await?;
-        if let Some(evicted_domain) = evicted_domain {
-            if let Some(mapping) = state.forward.remove(&evicted_domain) {
-                state.reverse.remove(&mapping.address);
-            }
+        if let Some(evicted_domain) = evicted_domain
+            && let Some(mapping) = state.forward.remove(&evicted_domain)
+        {
+            state.reverse.remove(&mapping.address);
         }
         state.next = next;
         state.reverse.insert(address, domain.clone());
@@ -1296,13 +1296,13 @@ impl FakeIpPool {
             if address < start || address > end {
                 return Err(Error::invalid("legacy FakeIP address is outside the pool"));
             }
-            if let Some(existing) = imported_ips.insert(entry.address, entry.domain.clone()) {
-                if existing != entry.domain {
-                    return Err(Error::new(
-                        ErrorKind::Storage,
-                        "legacy FakeIP export contains duplicate addresses",
-                    ));
-                }
+            if let Some(existing) = imported_ips.insert(entry.address, entry.domain.clone())
+                && existing != entry.domain
+            {
+                return Err(Error::new(
+                    ErrorKind::Storage,
+                    "legacy FakeIP export contains duplicate addresses",
+                ));
             }
             if let Some(existing) = imported_domains.insert(entry.domain.clone(), entry.address)
                 && existing != entry.address
@@ -1337,7 +1337,7 @@ impl FakeIpPool {
                 last_used_at: unix_now(),
             });
         }
-        let next = snapshot.next.unwrap_or_else(|| self.config.start);
+        let next = snapshot.next.unwrap_or(self.config.start);
         if u32::from(next) < start || u32::from(next) > end {
             return Err(Error::invalid("legacy FakeIP cursor is outside the pool"));
         }
@@ -1420,10 +1420,10 @@ impl FakeIpPool {
             .touch_fakeip_entries(4, &self.prefix, &touches)
             .await?;
         for (domain, _) in &touches {
-            if let Ok(domain) = DomainName::new(domain) {
-                if let Some(mapping) = state.forward.get_mut(&domain) {
-                    mapping.persisted_last_used_at = mapping.last_used_at;
-                }
+            if let Ok(domain) = DomainName::new(domain)
+                && let Some(mapping) = state.forward.get_mut(&domain)
+            {
+                mapping.persisted_last_used_at = mapping.last_used_at;
             }
         }
         Ok(updated)
@@ -1431,6 +1431,10 @@ impl FakeIpPool {
 
     pub async fn len(&self) -> usize {
         self.state.lock().await.forward.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
     }
 
     pub fn contains(&self, address: Ipv4Addr) -> bool {
@@ -1739,10 +1743,10 @@ impl FakeIpV6Pool {
         self.store
             .replace_fakeip_entry(&entry, &cursor, evicted_domain_name.as_deref())
             .await?;
-        if let Some(evicted_domain) = evicted_domain {
-            if let Some(mapping) = state.forward.remove(&evicted_domain) {
-                state.reverse.remove(&mapping.address);
-            }
+        if let Some(evicted_domain) = evicted_domain
+            && let Some(mapping) = state.forward.remove(&evicted_domain)
+        {
+            state.reverse.remove(&mapping.address);
         }
         state.next = next;
         state.reverse.insert(address, domain.clone());
@@ -1786,13 +1790,13 @@ impl FakeIpV6Pool {
                     "legacy FakeIP IPv6 address is outside the pool",
                 ));
             }
-            if let Some(existing) = imported_ips.insert(entry.address, entry.domain.clone()) {
-                if existing != entry.domain {
-                    return Err(Error::new(
-                        ErrorKind::Storage,
-                        "legacy FakeIP IPv6 export contains duplicate addresses",
-                    ));
-                }
+            if let Some(existing) = imported_ips.insert(entry.address, entry.domain.clone())
+                && existing != entry.domain
+            {
+                return Err(Error::new(
+                    ErrorKind::Storage,
+                    "legacy FakeIP IPv6 export contains duplicate addresses",
+                ));
             }
             if let Some(existing) = imported_domains.insert(entry.domain.clone(), entry.address)
                 && existing != entry.address
@@ -1912,10 +1916,10 @@ impl FakeIpV6Pool {
             .touch_fakeip_entries(6, &self.prefix, &touches)
             .await?;
         for (domain, _) in &touches {
-            if let Ok(domain) = DomainName::new(domain) {
-                if let Some(mapping) = state.forward.get_mut(&domain) {
-                    mapping.persisted_last_used_at = mapping.last_used_at;
-                }
+            if let Ok(domain) = DomainName::new(domain)
+                && let Some(mapping) = state.forward.get_mut(&domain)
+            {
+                mapping.persisted_last_used_at = mapping.last_used_at;
             }
         }
         Ok(updated)
@@ -1923,6 +1927,10 @@ impl FakeIpV6Pool {
 
     pub async fn len(&self) -> usize {
         self.state.lock().await.forward.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
     }
 
     pub fn contains(&self, address: Ipv6Addr) -> bool {

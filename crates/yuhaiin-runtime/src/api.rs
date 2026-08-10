@@ -527,12 +527,13 @@ fn percent_decode(value: &str) -> String {
     let mut output = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
-                output.push((high << 4) | low);
-                index += 3;
-                continue;
-            }
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2]))
+        {
+            output.push((high << 4) | low);
+            index += 3;
+            continue;
         }
         output.push(bytes[index]);
         index += 1;
@@ -2111,22 +2112,22 @@ async fn save_route_rule_value(
     let returned = value.clone();
     let mut persisted_value = normalize_route_rule_value(&value, &name);
     let (match_type, pattern) = route_match(&persisted_value);
-    if !pattern.is_empty() {
-        if let Some(object) = persisted_value.as_object_mut() {
-            let mut matcher = Map::new();
-            matcher.insert(
-                if match_type == "cidr" {
-                    "cidr"
-                } else {
-                    "domain"
-                }
-                .to_owned(),
-                Value::String(pattern),
-            );
-            object
-                .entry("match".to_owned())
-                .or_insert_with(|| Value::Object(matcher));
-        }
+    if !pattern.is_empty()
+        && let Some(object) = persisted_value.as_object_mut()
+    {
+        let mut matcher = Map::new();
+        matcher.insert(
+            if match_type == "cidr" {
+                "cidr"
+            } else {
+                "domain"
+            }
+            .to_owned(),
+            Value::String(pattern),
+        );
+        object
+            .entry("match".to_owned())
+            .or_insert_with(|| Value::Object(matcher));
     }
     let record = GoRouteRuleRecord {
         // Go's v2 store uses the public rule name as the compatibility row
@@ -2286,11 +2287,11 @@ async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
         Endpoint::Ip { addr, .. } => vec![addr.ip().to_string()],
         Endpoint::Domain { host, .. } => {
             let mut resolved = Vec::new();
-            if let Ok(resolver) = snapshot.resolver_for_route_mode(decision.mode) {
-                if let Ok(addresses) = resolver.resolve(host, ResolveStrategy::Default).await {
-                    resolved.extend(addresses.v4.into_iter().map(|address| address.to_string()));
-                    resolved.extend(addresses.v6.into_iter().map(|address| address.to_string()));
-                }
+            if let Ok(resolver) = snapshot.resolver_for_route_mode(decision.mode)
+                && let Ok(addresses) = resolver.resolve(host, ResolveStrategy::Default).await
+            {
+                resolved.extend(addresses.v4.into_iter().map(|address| address.to_string()));
+                resolved.extend(addresses.v6.into_iter().map(|address| address.to_string()));
             }
             resolved
         }
@@ -2327,10 +2328,10 @@ fn split_rule_test_target(value: &str) -> std::result::Result<(String, u16), Api
             .unwrap_or(0);
         return Ok((host.to_owned(), port));
     }
-    if let Some((host, port)) = value.rsplit_once(':') {
-        if let Ok(port) = port.parse::<u16>() {
-            return Ok((host.to_owned(), port));
-        }
+    if let Some((host, port)) = value.rsplit_once(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return Ok((host.to_owned(), port));
     }
     Ok((value.to_owned(), 0))
 }
@@ -2607,7 +2608,7 @@ async fn tag_delete_value(state: &ApiState, tag: String) -> ApiResult {
 }
 
 async fn update_check_value(state: &ApiState, body: &Value) -> ApiResult {
-    let channel = string_or(&body, "channel", "stable");
+    let channel = string_or(body, "channel", "stable");
     match state.update.check(&channel).await {
         Ok(result) => json_value(serde_json::to_value(result).unwrap_or_else(|_| json!({}))),
         Err(error) => Err(ApiError::unavailable(error)),
@@ -3069,7 +3070,7 @@ async fn user_save_value(state: &ApiState, value: Value, id: Option<String>) -> 
             .repository()
             .get_go_user_view(&id)
             .await?;
-        return json_value(serde_json::to_value(view)?);
+        json_value(serde_json::to_value(view)?)
     } else {
         let write: GoUserWrite = serde_json::from_value(value)
             .map_err(|error| ApiError::bad(format!("invalid user contract: {error}")))?;
@@ -3087,7 +3088,7 @@ async fn user_save_value(state: &ApiState, value: Value, id: Option<String>) -> 
             .repository()
             .get_go_user_view(&id)
             .await?;
-        return json_value(serde_json::to_value(view)?);
+        json_value(serde_json::to_value(view)?)
     }
 }
 
@@ -3510,23 +3511,22 @@ fn route_match(value: &Value) -> (String, String) {
             for (key, value) in object {
                 let lower = key.to_ascii_lowercase();
                 if ["domain", "host", "cidr", "ip", "network", "pattern"].contains(&lower.as_str())
+                    && let Some(value) = value.as_str()
                 {
-                    if let Some(value) = value.as_str() {
-                        return Some((
-                            if lower == "cidr" || lower == "ip" {
-                                "cidr"
-                            } else {
-                                "domain"
-                            }
-                            .to_owned(),
-                            value.to_owned(),
-                        ));
-                    }
+                    return Some((
+                        if lower == "cidr" || lower == "ip" {
+                            "cidr"
+                        } else {
+                            "domain"
+                        }
+                        .to_owned(),
+                        value.to_owned(),
+                    ));
                 }
-                if lower == "list" {
-                    if let Some(value) = value.as_str() {
-                        return Some(("domain".to_owned(), value.to_owned()));
-                    }
+                if lower == "list"
+                    && let Some(value) = value.as_str()
+                {
+                    return Some(("domain".to_owned(), value.to_owned()));
                 }
                 if let Some(found) = walk(value) {
                     return Some(found);
@@ -3898,10 +3898,8 @@ fn settings_value_from_go_kv(values: &[GoSettingsKvRecord]) -> Value {
         } else {
             value.is_boolean()
         };
-        if accepts {
-            if let Some(destination) = result.pointer_mut(path) {
-                *destination = value;
-            }
+        if accepts && let Some(destination) = result.pointer_mut(path) {
+            *destination = value;
         }
     }
     result

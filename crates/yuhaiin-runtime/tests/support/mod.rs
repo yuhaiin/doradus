@@ -4,6 +4,8 @@
 //! directory. `YUHAIIN_INTEGRATION_DIR` can point at a persistent directory
 //! when a developer or Podman job wants to inspect/reuse the SQLite state.
 
+#![allow(dead_code)]
+
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -1062,10 +1064,9 @@ impl ServiceProcess {
                 .get(format!("{}/api/v2/info", service.base_url))
                 .send()
                 .await
+                && response.status().is_success()
             {
-                if response.status().is_success() {
-                    return service;
-                }
+                return service;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

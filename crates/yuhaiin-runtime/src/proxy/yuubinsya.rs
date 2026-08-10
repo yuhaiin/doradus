@@ -115,20 +115,20 @@ pub(crate) async fn serve_udp(
             received = server.recv_from_authenticated(&mut packet) => {
                 let (length, target, peer, password_hash) = received?;
                 let peer_addr = peer.addr().ok_or_else(|| Error::invalid("Yuubinsya UDP peer has no IP address"))?;
-                if target.port() == Some(53) {
-                    if let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await {
-                        if let Ok(response) = answer {
-                            server
-                                .send_to_with_password_hash(
-                                    &response,
-                                    target,
-                                    peer.clone(),
-                                    password_hash,
-                                )
-                                .await?;
-                        }
-                        continue;
+                if target.port() == Some(53)
+                    && let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await
+                {
+                    if let Ok(response) = answer {
+                        server
+                            .send_to_with_password_hash(
+                                &response,
+                                target,
+                                peer.clone(),
+                                password_hash,
+                            )
+                            .await?;
                     }
+                    continue;
                 }
                 let id = UdpFlowId {
                     peer: peer_addr,
@@ -153,18 +153,13 @@ pub(crate) async fn serve_udp(
                     let id_for_task = id.clone();
                     let receiver_task = tokio::spawn(async move {
                         let mut buffer = vec![0u8; udp_buffer_size];
-                        loop {
-                            match receiver.recv_from(&mut buffer).await {
-                                Ok((length, target)) => {
-                                    if reply_tx.send(UdpReply {
-                                        id: id_for_task.clone(),
-                                        target,
-                                        payload: buffer[..length].to_vec(),
-                                    }).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
+                        while let Ok((length, target)) = receiver.recv_from(&mut buffer).await {
+                            if reply_tx.send(UdpReply {
+                                id: id_for_task.clone(),
+                                target,
+                                payload: buffer[..length].to_vec(),
+                            }).await.is_err() {
+                                break;
                             }
                         }
                     });

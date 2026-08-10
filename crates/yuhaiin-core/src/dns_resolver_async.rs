@@ -170,10 +170,10 @@ impl<Q: AsyncDnsQuery> AsyncDnsResolver<Q> {
         record_type: DnsRecordType,
     ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
         Box::pin(async move {
-            if let Some(cache) = &self.cache {
-                if let Some(response) = cache.get(domain, record_type)? {
-                    return Ok(response);
-                }
+            if let Some(cache) = &self.cache
+                && let Some(response) = cache.get(domain, record_type)?
+            {
+                return Ok(response);
             }
             let response = self.upstream.query(domain, record_type).await?;
             if let Some(cache) = &self.cache {
@@ -218,10 +218,10 @@ impl<Q: SendAsyncDnsQuery> AsyncDnsResolver<Q> {
         record_type: DnsRecordType,
     ) -> BoxFuture<'a, Result<DnsResponse>> {
         Box::pin(async move {
-            if let Some(cache) = &self.cache {
-                if let Some(response) = cache.get(domain, record_type)? {
-                    return Ok(response);
-                }
+            if let Some(cache) = &self.cache
+                && let Some(response) = cache.get(domain, record_type)?
+            {
+                return Ok(response);
             }
             let response = self.upstream.query_send(domain, record_type).await?;
             if let Some(cache) = &self.cache {

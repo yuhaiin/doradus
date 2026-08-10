@@ -522,7 +522,7 @@ impl YuubinsyaServerProxy {
                     )
                 })?;
                 let mut inbound = AsyncYuubinsyaTcpSession {
-                    stream: stream,
+                    stream,
                     password_hash,
                     write_shutdown: false,
                 };
@@ -538,27 +538,25 @@ impl YuubinsyaServerProxy {
                     }
                 });
                 let mut prefix = Vec::new();
-                if destination.port() == Some(53) {
-                    if let Some(handler) = dns_handler.as_deref() {
-                        match intercept_dns_tcp(&mut inbound, handler).await? {
-                            DnsTcpDecision::Answered { upload, download } => {
-                                if let (Some(observed), Some(flow)) = (observed.as_ref(), flow) {
-                                    let _observation = FlowObserverGuard::open(
-                                        Arc::clone(&observed.observer),
-                                        Flow { key: flow },
-                                        context,
-                                    );
-                                    observed.observer.bytes(flow, FlowDirection::Upload, upload);
-                                    observed.observer.bytes(
-                                        flow,
-                                        FlowDirection::Download,
-                                        download,
-                                    );
-                                }
-                                return Ok(());
+                if destination.port() == Some(53)
+                    && let Some(handler) = dns_handler.as_deref()
+                {
+                    match intercept_dns_tcp(&mut inbound, handler).await? {
+                        DnsTcpDecision::Answered { upload, download } => {
+                            if let (Some(observed), Some(flow)) = (observed.as_ref(), flow) {
+                                let _observation = FlowObserverGuard::open(
+                                    Arc::clone(&observed.observer),
+                                    Flow { key: flow },
+                                    context,
+                                );
+                                observed.observer.bytes(flow, FlowDirection::Upload, upload);
+                                observed
+                                    .observer
+                                    .bytes(flow, FlowDirection::Download, download);
                             }
-                            DnsTcpDecision::Forward(bytes) => prefix = bytes,
+                            return Ok(());
                         }
+                        DnsTcpDecision::Forward(bytes) => prefix = bytes,
                     }
                 }
                 let mut outbound = self.upstream.connect(&context).await?;
@@ -697,13 +695,12 @@ impl YuubinsyaServerProxy {
                 tokio::select! {
                     incoming = session.recv_from() => {
                         let (destination, payload) = incoming?;
-                        if destination.port() == Some(53) {
-                            if let Some(handler) = dns_handler {
-                                if let Some(response) = answer_dns_packet(handler, &payload).await? {
-                                    session.send_to(&destination, &response).await?;
-                                    continue;
-                                }
-                            }
+                        if destination.port() == Some(53)
+                            && let Some(handler) = dns_handler
+                            && let Some(response) = answer_dns_packet(handler, &payload).await?
+                        {
+                            session.send_to(&destination, &response).await?;
+                            continue;
                         }
                         if let Some(observed) = observed {
                             let flow = if let Some(flow) = observed_flows.get(&destination) {
@@ -742,14 +739,14 @@ impl YuubinsyaServerProxy {
                             Some(ServerUdpMessage::Data { source, payload }) => {
                                 shared.touch();
                                 session.send_to(&source, &payload).await?;
-                                if let Some(observed) = observed {
-                                    if let Some(flow) = observed_flows.get(&source) {
-                                        observed.observer.bytes(
-                                            flow.flow,
-                                            FlowDirection::Download,
-                                            payload.len(),
-                                        );
-                                    }
+                                if let Some(observed) = observed
+                                    && let Some(flow) = observed_flows.get(&source)
+                                {
+                                    observed.observer.bytes(
+                                        flow.flow,
+                                        FlowDirection::Download,
+                                        payload.len(),
+                                    );
                                 }
                             }
                             Some(ServerUdpMessage::Closed) | None => {

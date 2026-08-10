@@ -337,7 +337,7 @@ pub(crate) fn open_tun(config: &TunRuntimeConfig) -> Result<yuhaiin_core::tun::T
         let mut tun = tun;
         let routes = parse_tun_routes(&config.routes)?;
         tun.install_linux_routes(&routes).map_err(io_error)?;
-        return Ok(tun);
+        Ok(tun)
     }
     #[cfg(not(all(feature = "tun-routes", target_os = "linux")))]
     {

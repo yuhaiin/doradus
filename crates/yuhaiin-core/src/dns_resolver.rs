@@ -73,10 +73,10 @@ impl DnsResolver {
     }
 
     pub fn query(&self, domain: &DomainName, record_type: DnsRecordType) -> Result<DnsResponse> {
-        if let Some(cache) = &self.cache {
-            if let Some(response) = cache.get(domain, record_type)? {
-                return Ok(response);
-            }
+        if let Some(cache) = &self.cache
+            && let Some(response) = cache.get(domain, record_type)?
+        {
+            return Ok(response);
         }
         let response = self.query_uncached(domain, record_type)?;
         if let Some(cache) = &self.cache {

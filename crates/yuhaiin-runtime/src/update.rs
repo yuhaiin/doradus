@@ -390,7 +390,7 @@ fn select_release(
         "yuhaiin-{}-{}{}",
         target_os,
         target_arch,
-        (target_os == "windows").then_some(".exe").unwrap_or("")
+        if target_os == "windows" { ".exe" } else { "" }
     );
     let mut candidates = releases
         .iter()
@@ -654,13 +654,12 @@ mod tests {
             .unwrap(),
             hash
         );
-        assert_eq!(
+        assert!(
             parse_checksum(
                 &format!("SHA256 (yuhaiin-linux-amd64) = {hash}\n"),
                 "yuhaiin-linux-amd64"
             )
-            .is_err(),
-            true
+            .is_err()
         );
     }
 

@@ -751,10 +751,10 @@ fn user_from_row(row: &Row) -> Result<GoUserRecord> {
 fn count_user_ids(value: &Value, references: &mut HashMap<String, i64>) {
     match value {
         Value::Object(object) => {
-            if let Some(Value::String(user_id)) = object.get("userId") {
-                if !user_id.is_empty() {
-                    *references.entry(user_id.clone()).or_default() += 1;
-                }
+            if let Some(Value::String(user_id)) = object.get("userId")
+                && !user_id.is_empty()
+            {
+                *references.entry(user_id.clone()).or_default() += 1;
             }
             for value in object.values() {
                 count_user_ids(value, references);

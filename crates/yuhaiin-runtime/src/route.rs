@@ -767,7 +767,7 @@ pub fn expand_go_route_rule(
         // makes that matcher return false until the list is refreshed.
         return Ok(Vec::new());
     }
-    Ok(variants
+    variants
         .into_iter()
         .map(|variant| {
             Ok(RouteRule {
@@ -799,7 +799,7 @@ pub fn expand_go_route_rule(
                 priority,
             })
         })
-        .collect::<Result<Vec<_>>>()?)
+        .collect::<Result<Vec<_>>>()
 }
 
 fn route_rule_from_root(record: &GoRouteRuleRecord, root: &Value) -> Result<Option<RouteRule>> {
@@ -1211,10 +1211,10 @@ fn combine_all(
                 let mut excluded_patterns = left.excluded_patterns.clone();
                 excluded_patterns.extend(right.excluded_patterns.iter().cloned());
                 let mut additional_patterns = left.additional_patterns.clone();
-                if let Some(pattern) = right.pattern.clone() {
-                    if left.pattern.is_some() {
-                        additional_patterns.push(pattern);
-                    }
+                if let Some(pattern) = right.pattern.clone()
+                    && left.pattern.is_some()
+                {
+                    additional_patterns.push(pattern);
                 }
                 additional_patterns.extend(right.additional_patterns.iter().cloned());
                 let mut excluded_networks = left.excluded_networks.clone();

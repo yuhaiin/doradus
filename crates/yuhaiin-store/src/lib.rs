@@ -1064,7 +1064,7 @@ impl ConfigStore {
         let _open_guard = open_gate
             .lock()
             .map_err(|_| Error::new(ErrorKind::Storage, "database open mutex is poisoned"))?;
-        let write_lock_path = write_lock_path(&path);
+        let write_lock_path = write_lock_path(path);
         let _initialization_lock = write_lock_path
             .as_ref()
             .map(|path| lock_write_file(path.as_path()))
@@ -1175,16 +1175,16 @@ pub async fn restore_database(
         ));
     }
     let source_wal = PathBuf::from(format!("{}-wal", source.display()));
-    if let Ok(metadata) = std::fs::metadata(&source_wal) {
-        if metadata.len() != 0 {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "SQLite backup has a non-empty WAL sidecar: {}",
-                    source_wal.display()
-                ),
-            ));
-        }
+    if let Ok(metadata) = std::fs::metadata(&source_wal)
+        && metadata.len() != 0
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "SQLite backup has a non-empty WAL sidecar: {}",
+                source_wal.display()
+            ),
+        ));
     }
     let (destination_parent, destination_name) = database_destination_parts(destination)?;
     std::fs::create_dir_all(&destination_parent).map_err(|error| {
@@ -1403,16 +1403,16 @@ async fn install_go_snapshot_inner(
         .map_err(|error| Error::new(ErrorKind::Storage, format!("stat Go snapshot: {error}")))?
         .len();
     let source_wal = PathBuf::from(format!("{}-wal", source.display()));
-    if let Ok(metadata) = std::fs::metadata(&source_wal) {
-        if metadata.len() != 0 {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "Go snapshot has a non-empty WAL sidecar: {}; run the Go consistent exporter first",
-                    source_wal.display()
-                ),
-            ));
-        }
+    if let Ok(metadata) = std::fs::metadata(&source_wal)
+        && metadata.len() != 0
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "Go snapshot has a non-empty WAL sidecar: {}; run the Go consistent exporter first",
+                source_wal.display()
+            ),
+        ));
     }
     if let Some(manifest) = manifest {
         verify_go_snapshot_manifest(source, manifest, source_bytes)?;
@@ -1764,6 +1764,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 fn lock_write_file(path: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)

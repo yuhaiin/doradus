@@ -120,14 +120,13 @@ impl RouteRule {
                 return false;
             }
         }
-        if let Some(port) = endpoint.port() {
-            if self
+        if let Some(port) = endpoint.port()
+            && self
                 .excluded_ports
                 .iter()
                 .any(|(start, end)| port >= *start && port <= *end)
-            {
-                return false;
-            }
+        {
+            return false;
         }
         if let Some(expected) = self.geo_country.as_deref() {
             let Some(address) = endpoint.addr().map(|address| address.ip()) else {
@@ -143,18 +142,15 @@ impl RouteRule {
                 return false;
             }
         }
-        if !self.excluded_geo_countries.is_empty() {
-            if let (Some(address), Some(geo)) = (endpoint.addr().map(|address| address.ip()), geo) {
-                if let Ok(Some(actual)) = geo.country_code(address) {
-                    if self
-                        .excluded_geo_countries
-                        .iter()
-                        .any(|expected| actual.eq_ignore_ascii_case(expected))
-                    {
-                        return false;
-                    }
-                }
-            }
+        if !self.excluded_geo_countries.is_empty()
+            && let (Some(address), Some(geo)) = (endpoint.addr().map(|address| address.ip()), geo)
+            && let Ok(Some(actual)) = geo.country_code(address)
+            && self
+                .excluded_geo_countries
+                .iter()
+                .any(|expected| actual.eq_ignore_ascii_case(expected))
+        {
+            return false;
         }
         if !self.inbound_names.is_empty() {
             let Some(context) = context else {
@@ -375,10 +371,9 @@ impl Router {
                 .effective_destination()
                 .addr()
                 .map(|address| address.ip()),
-        ) {
-            if let Ok(Some(country)) = geo.country_code(address) {
-                context.geo = Some(country);
-            }
+        ) && let Ok(Some(country)) = geo.country_code(address)
+        {
+            context.geo = Some(country);
         }
         context.match_history = self.match_history(context, selected_key.as_ref());
         decision
@@ -453,17 +448,16 @@ fn append_rule_history(
         matched
     };
     if let Some((start, end)) = rule.port {
-        if let Some(port) = endpoint.port() {
-            if !record(format!("Port {port}"), (start..=end).contains(&port)) {
-                return;
-            }
+        if let Some(port) = endpoint.port()
+            && !record(format!("Port {port}"), (start..=end).contains(&port))
+        {
+            return;
         }
-    } else if let Some((start, end)) = rule.excluded_ports.first() {
-        if let Some(port) = endpoint.port() {
-            if !record(format!("Port {port}"), (*start..=*end).contains(&port)) {
-                return;
-            }
-        }
+    } else if let Some((start, end)) = rule.excluded_ports.first()
+        && let Some(port) = endpoint.port()
+        && !record(format!("Port {port}"), (*start..=*end).contains(&port))
+    {
+        return;
     }
     if let Some(expected) = rule
         .network

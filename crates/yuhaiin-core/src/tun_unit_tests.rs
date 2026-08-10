@@ -101,8 +101,10 @@ fn tx_token_drops_packets_larger_than_mtu() {
 
 #[test]
 fn config_rejects_invalid_mtu_and_queue() {
-    let mut config = TunConfig::default();
-    config.mtu = 100;
+    let mut config = TunConfig {
+        mtu: 100,
+        ..TunConfig::default()
+    };
     assert!(config.validate().is_err());
     config.mtu = DEFAULT_MTU;
     config.queue_capacity = 0;

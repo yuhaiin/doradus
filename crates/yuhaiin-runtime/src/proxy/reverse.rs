@@ -104,9 +104,8 @@ where
         .select(&context)
         .connect(&context)
         .await
-        .map_err(|error| {
+        .inspect_err(|error| {
             monitor.record_failure("reverse_http", &destination.to_string(), &error.to_string());
-            error
         })?;
     let outbound = wrap_https_if_needed(outbound, &config).await?;
     let flow = flow_key(peer, &destination);
@@ -123,6 +122,7 @@ where
     .map_err(io_error)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_to_target<S>(
     stream: S,
     peer: SocketAddr,
@@ -142,9 +142,8 @@ where
         .select(&context)
         .connect(&context)
         .await
-        .map_err(|error| {
+        .inspect_err(|error| {
             monitor.record_failure(protocol, &target.to_string(), &error.to_string());
-            error
         })?;
     let flow = flow_key(peer, &target);
     relay_counted_with_prefix_and_buffer(

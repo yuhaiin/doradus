@@ -858,16 +858,16 @@ fn annotate_connection_metadata(
             .original_domain
             .as_ref()
             .or_else(|| context.destination.host());
-        if let Some(domain) = domain {
-            if metadata.hosts.resolve(domain).ok().flatten().is_some() {
-                context.hosts = Some(
-                    context
-                        .destination
-                        .port()
-                        .map(|port| format!("{domain}:{port}"))
-                        .unwrap_or_else(|| domain.to_string()),
-                );
-            }
+        if let Some(domain) = domain
+            && metadata.hosts.resolve(domain).ok().flatten().is_some()
+        {
+            context.hosts = Some(
+                context
+                    .destination
+                    .port()
+                    .map(|port| format!("{domain}:{port}"))
+                    .unwrap_or_else(|| domain.to_string()),
+            );
         }
     }
 

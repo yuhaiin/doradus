@@ -176,6 +176,7 @@ impl RuntimeController {
     /// resolver is intentionally an IP-resolution trait; this keeps DoH/UDP/
     /// FakeIP packet policy in the DNS layer instead of duplicating it here.
     #[cfg(feature = "tun")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn build_tun_proxy_runtime_with_dns(
         &self,
         direct_id: &str,
@@ -206,11 +207,11 @@ impl RuntimeController {
                 .with_nat(nat, idle_timeout)?;
         runtime = runtime.with_context_provider(move |flow| {
             let mut context = flow.context();
-            if let Some(fakeip_view) = &fakeip_view {
-                if let Some(domain) = fakeip_view.lookup_domain_ip(flow.key.destination.ip()) {
-                    context.original_domain = Some(domain);
-                    context.fake_ip = Some(flow.key.destination.ip().to_string());
-                }
+            if let Some(fakeip_view) = &fakeip_view
+                && let Some(domain) = fakeip_view.lookup_domain_ip(flow.key.destination.ip())
+            {
+                context.original_domain = Some(domain);
+                context.fake_ip = Some(flow.key.destination.ip().to_string());
             }
             context
         });

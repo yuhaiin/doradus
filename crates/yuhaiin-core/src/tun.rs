@@ -1066,21 +1066,19 @@ impl TunProxyRuntime {
         }
         let needs_process =
             context.process.is_none() || context.process_id.is_none() || context.user_id.is_none();
-        if needs_process {
-            if let Some(resolver) = &self.process_resolver {
-                if let Ok(Some(process)) =
-                    resolver.resolve(flow.key.network, flow.key.source, flow.key.destination)
-                {
-                    if context.process.is_none() {
-                        context.process = Some(process.path);
-                    }
-                    if context.process_id.is_none() {
-                        context.process_id = Some(process.pid);
-                    }
-                    if context.user_id.is_none() {
-                        context.user_id = Some(process.uid);
-                    }
-                }
+        if needs_process
+            && let Some(resolver) = &self.process_resolver
+            && let Ok(Some(process)) =
+                resolver.resolve(flow.key.network, flow.key.source, flow.key.destination)
+        {
+            if context.process.is_none() {
+                context.process = Some(process.path);
+            }
+            if context.process_id.is_none() {
+                context.process_id = Some(process.pid);
+            }
+            if context.user_id.is_none() {
+                context.user_id = Some(process.uid);
             }
         }
         context
@@ -1155,16 +1153,16 @@ impl TunProxyRuntime {
                 if let Some(observer) = &self.observer {
                     observer.bytes(flow.key, TunFlowDirection::Upload, payload.len());
                 }
-                if flow.key.destination.port() == 53 {
-                    if let Some(handler) = self.dns_handler.clone() {
-                        let output = self.output_tx.clone();
-                        let timeout = self.timeouts.read;
-                        let join = tokio::spawn(async move {
-                            run_dns_query(handler, flow.key, payload, output, timeout).await;
-                        });
-                        self.dns_tasks.push(join);
-                        return Ok(());
-                    }
+                if flow.key.destination.port() == 53
+                    && let Some(handler) = self.dns_handler.clone()
+                {
+                    let output = self.output_tx.clone();
+                    let timeout = self.timeouts.read;
+                    let join = tokio::spawn(async move {
+                        run_dns_query(handler, flow.key, payload, output, timeout).await;
+                    });
+                    self.dns_tasks.push(join);
+                    return Ok(());
                 }
                 let target = context.effective_destination();
                 let source = udp_source_key(flow.key);
@@ -1825,8 +1823,7 @@ async fn run_udp_proxy(
         network: Network::Udp,
         addr: translated,
     }) = datagram.local_addr()
-    {
-        if !emit_output(
+        && !emit_output(
             &output,
             ProxyOutput::UdpBound {
                 source: udp_source_key(initial_flow),
@@ -1835,10 +1832,9 @@ async fn run_udp_proxy(
             timeouts.idle,
         )
         .await
-        {
-            let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
-            return;
-        }
+    {
+        let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
+        return;
     }
     let mut buffer = vec![0u8; 65_535];
     let mut routes = HashMap::<Endpoint, TunFlowKey>::new();
@@ -1984,8 +1980,8 @@ fn parse_transport_tuple(packet: &[u8]) -> Result<Option<TransportTuple>> {
             let packet = smoltcp::wire::Ipv4Packet::new_checked(packet)
                 .map_err(|_| Error::invalid("malformed IPv4 packet"))?;
             (
-                SocketAddr::new(IpAddr::V4(packet.src_addr().into()), 0),
-                SocketAddr::new(IpAddr::V4(packet.dst_addr().into()), 0),
+                SocketAddr::new(IpAddr::V4(packet.src_addr()), 0),
+                SocketAddr::new(IpAddr::V4(packet.dst_addr()), 0),
                 packet.next_header(),
                 packet.payload(),
             )
@@ -1994,8 +1990,8 @@ fn parse_transport_tuple(packet: &[u8]) -> Result<Option<TransportTuple>> {
             let packet = smoltcp::wire::Ipv6Packet::new_checked(packet)
                 .map_err(|_| Error::invalid("malformed IPv6 packet"))?;
             (
-                SocketAddr::new(IpAddr::V6(packet.src_addr().into()), 0),
-                SocketAddr::new(IpAddr::V6(packet.dst_addr().into()), 0),
+                SocketAddr::new(IpAddr::V6(packet.src_addr()), 0),
+                SocketAddr::new(IpAddr::V6(packet.dst_addr()), 0),
                 packet.next_header(),
                 packet.payload(),
             )
@@ -2175,12 +2171,11 @@ impl phy::TxToken for QueueTxToken {
     {
         let mut packet = vec![0u8; len];
         let result = f(&mut packet);
-        if len <= self.mtu {
-            if let Ok(mut queue) = self.queue.lock() {
-                if queue.tx.len() < queue.capacity {
-                    queue.tx.push_back(packet);
-                }
-            }
+        if len <= self.mtu
+            && let Ok(mut queue) = self.queue.lock()
+            && queue.tx.len() < queue.capacity
+        {
+            queue.tx.push_back(packet);
         }
         let _ = self.timestamp;
         result

@@ -521,6 +521,13 @@ impl NatTable {
             .map(|state| state.entries.len())
     }
 
+    pub fn is_empty(&self) -> Result<bool> {
+        self.state
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Closed, "NAT table lock poisoned"))
+            .map(|state| state.entries.is_empty())
+    }
+
     /// Return a lock-bounded snapshot of active Full Cone mappings and the
     /// monotonic lifecycle counters accumulated by this table.
     pub fn stats(&self) -> Result<NatStats> {
@@ -663,15 +670,14 @@ impl UdpNatRelay {
             .lock()
             .map_err(|_| Error::new(ErrorKind::Closed, "UDP NAT mapping lock poisoned"))?;
         let removed = self.table.sweep()?;
-        if removed != 0 {
-            if let Some(key) = mapping.as_ref()
-                && self
-                    .table
-                    .lookup_translated(self.local_addr()?, key.source)?
-                    .is_none()
-            {
-                *mapping = None;
-            }
+        if removed != 0
+            && let Some(key) = mapping.as_ref()
+            && self
+                .table
+                .lookup_translated(self.local_addr()?, key.source)?
+                .is_none()
+        {
+            *mapping = None;
         }
         Ok(removed)
     }

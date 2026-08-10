@@ -103,14 +103,9 @@ where
     let receiver = Arc::clone(&datagram);
     let receive_task = tokio::spawn(async move {
         let mut buffer = vec![0u8; udp_buffer_size];
-        loop {
-            match receiver.recv_from(&mut buffer).await {
-                Ok((length, _target)) => {
-                    if reply_tx.send(buffer[..length].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok((length, _target)) = receiver.recv_from(&mut buffer).await {
+            if reply_tx.send(buffer[..length].to_vec()).await.is_err() {
+                break;
             }
         }
     });
@@ -125,15 +120,15 @@ where
                         return Err(Error::invalid("VLESS UDP payload is too large"));
                     }
                     reader.read_exact(&mut packet[..length]).await.map_err(io_error)?;
-                    if destination.port() == Some(53) {
-                        if let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await {
-                            if let Ok(response) = answer {
-                                let mut writer = writer.lock().await;
-                                writer.write_u16(response.len() as u16).await.map_err(io_error)?;
-                                writer.write_all(&response).await.map_err(io_error)?;
-                            }
-                            continue;
+                    if destination.port() == Some(53)
+                        && let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await
+                    {
+                        if let Ok(response) = answer {
+                            let mut writer = writer.lock().await;
+                            writer.write_u16(response.len() as u16).await.map_err(io_error)?;
+                            writer.write_all(&response).await.map_err(io_error)?;
                         }
+                        continue;
                     }
                     datagram.send_to(&packet[..length], destination.clone()).await?;
                     monitor.bytes(flow, TunFlowDirection::Upload, length);

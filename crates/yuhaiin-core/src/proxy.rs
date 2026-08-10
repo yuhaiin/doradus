@@ -1855,10 +1855,13 @@ mod tests {
     }
 
     #[cfg(feature = "async-proxy")]
+    type DatagramPacket = (Vec<u8>, Endpoint);
+
+    #[cfg(feature = "async-proxy")]
     #[derive(Clone, Default)]
     struct MemoryDatagram {
-        sent: Arc<Mutex<Vec<(Vec<u8>, Endpoint)>>>,
-        received: Arc<Mutex<VecDeque<(Vec<u8>, Endpoint)>>>,
+        sent: Arc<Mutex<Vec<DatagramPacket>>>,
+        received: Arc<Mutex<VecDeque<DatagramPacket>>>,
     }
 
     #[cfg(feature = "async-proxy")]
@@ -1917,14 +1920,15 @@ mod tests {
             YuubinsyaUdpDatagram::new(Box::new(transport), password, server.clone(), true).unwrap();
         let target = Endpoint::domain(Network::Udp, DomainName::new("example.com").unwrap(), 53);
         assert_eq!(adapter.send_to(b"query", target.clone()).await.unwrap(), 5);
-        let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        let (decoded_target, decoded_payload) =
-            crate::yuubinsya::decode_udp_packet(&password, &sent[0].0, true).unwrap();
-        assert_eq!(sent[0].1, server);
-        assert_eq!(decoded_target, target);
-        assert_eq!(decoded_payload, b"query");
-        drop(sent);
+        {
+            let sent = sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            let (decoded_target, decoded_payload) =
+                crate::yuubinsya::decode_udp_packet(&password, &sent[0].0, true).unwrap();
+            assert_eq!(sent[0].1, server);
+            assert_eq!(decoded_target, target);
+            assert_eq!(decoded_payload, b"query");
+        }
 
         let response =
             crate::yuubinsya::encode_udp_packet(&password, &target, b"answer", true).unwrap();
@@ -1965,13 +1969,15 @@ mod tests {
                 .unwrap(),
             6
         );
-        let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].1, peer);
-        let (response_target, response_payload) =
-            crate::yuubinsya::decode_udp_packet(&password, &sent[0].0, true).unwrap();
-        assert_eq!(response_target, target);
-        assert_eq!(response_payload, b"answer");
+        {
+            let sent = sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].1, peer);
+            let (response_target, response_payload) =
+                crate::yuubinsya::decode_udp_packet(&password, &sent[0].0, true).unwrap();
+            assert_eq!(response_target, target);
+            assert_eq!(response_payload, b"answer");
+        }
 
         let invalid_peer =
             Endpoint::domain(Network::Udp, DomainName::new("peer.test").unwrap(), 53);

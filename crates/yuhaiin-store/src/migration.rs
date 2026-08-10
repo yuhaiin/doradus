@@ -370,10 +370,10 @@ fn recover_partial_network_splits(
             current_index += 1;
             continue;
         }
-        if expected_type == "network_split" {
-            if let Some(protocol) = legacy_network_split_contract(legacy) {
-                recovered.push(protocol);
-            }
+        if expected_type == "network_split"
+            && let Some(protocol) = legacy_network_split_contract(legacy)
+        {
+            recovered.push(protocol);
         }
     }
     recovered.extend(current.iter().skip(current_index).cloned());

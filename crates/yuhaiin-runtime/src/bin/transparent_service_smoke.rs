@@ -60,12 +60,10 @@ async fn run() -> Result<()> {
     let database = std::env::var_os("YUHAIIN_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(".")),
-            )
-            .join(".cache/yuhaiin-rust/integration/transparent-service/state.sqlite")
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".cache/yuhaiin-rust/integration/transparent-service/state.sqlite")
         });
     let target = parse_addr_env("YUHAIIN_TARGET_ADDR", "127.0.0.2:18080")?;
     let target_v6 = parse_optional_addr_env("YUHAIIN_TARGET_V6_ADDR")?;

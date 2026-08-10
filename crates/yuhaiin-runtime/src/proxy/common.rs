@@ -240,8 +240,7 @@ where
         TunFlowDirection::Download,
         buffer_size,
     );
-    let result = tokio::try_join!(upload, download).map(|_| ());
-    result
+    tokio::try_join!(upload, download).map(|_| ())
 }
 
 const DNS_TCP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -281,8 +280,7 @@ where
     let Some(answer) = answer_dns_packet(monitor, &packet).await else {
         return Ok(DnsTcpDecision::Forward(framed));
     };
-    let response = answer
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
+    let response = answer.map_err(|error| std::io::Error::other(error.to_string()))?;
     if response.len() > usize::from(u16::MAX) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -385,6 +383,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
