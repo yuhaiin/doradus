@@ -13,6 +13,8 @@
 
 > 2026-08-10 connections socket/protocol metadata：对照 Go `statistics.getConnection`，共享 `FlowContext` 新增 socket-backed inbound 的 `local_addr` 与应用层 `protocol`；`InboundSpec` 统一注入监听 endpoint，并为 TLS transport 标记 `tls`，HTTP proxy 在消费 CONNECT/forward headers 后保留 `http`，共享 relay sniff 则按 TLS 优先、HTTP 次之填充协议。monitor 以 Go `net.Addr.String()` 的裸 `host:port` 格式输出 `localAddr`，由 endpoint network 填充 `network.underlyingType`，`connections.protocol` 不再错误复用 `tcp/udp`，未识别时为空。新增 monitor/common relay 单测和真实 HTTP inbound → outbound API 集成断言；TUN/无 socket 的 packet-only flow 仍保留平台可提供元数据的扩展边界。
 
+> 2026-08-10 connections outbound endpoint：对照 Go `getConnection` 的 `getRemote(conn)`，`FlowContext` 新增 `outbound_addr`；selector 根据当前 route mode 记录实际出站 proxy socket endpoint，monitor 将 `connections.outbound` 输出为裸 `IP:port`，同时保留 `nodeId/nodeName` 作为配置节点身份。真实 direct、HTTP、SOCKS5、TLS/HTTP2/Yuubinsya、TCP/UDP service-chain 均新增 endpoint 断言，避免把节点 ID 与实际远端地址混用。
+
 > 2026-08-10 TUN 组合链路验收：新增 `make tun-chain-service-smoke`，在 privileged、`--network=none` 的 Podman 容器中用同一个 `inbound::run_until` 和 SQLite 配置验证真实 kernel TUN → `fixed` → RustCrypto TLS → HTTP/2 → Yuubinsya TCP → loopback echo。测试客户端写入后立即半关闭，修复并回归 HTTP/2 relay 只关闭请求方向、仍持续转发响应方向的语义；同时让 H2 server 等待 response bridge 排空，避免已回写的数据在 `serve_connect` 返回时被 abort。状态与日志统一放在 `~/.cache/yuhaiin-rust/integration/tun-chain-service`，不使用 `/tmp`。Android/macOS TUN fd/route/lifecycle 和 UDP 版 runtime chain 仍是独立验收项。
 
 > 2026-08-10 多 inbound 组合验收：`service_chain.rs` 新增同一真实 runtime 进程中的 SOCKS5 inbound、Yuubinsya inbound → TLS → HTTP/2 → Yuubinsya outbound 测试。两条 inbound 都使用域名目标进入共享 router，验证 payload echo、`connections` 的 inbound/outbound/mode/matchHistory 和 node latency，避免只证明 HTTP inbound 能工作而遗漏其他实际入口。

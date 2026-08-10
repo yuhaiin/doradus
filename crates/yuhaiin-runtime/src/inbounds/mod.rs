@@ -3222,7 +3222,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             .expect("SOCKS5 UDP ASSOCIATE flow should reach the monitor");
             let connection = monitor.connections_value()["connections"][0].clone();
             assert_eq!(connection["inboundName"], "socks-associate-inbound");
-            assert_eq!(connection["outbound"], "direct");
+            assert_eq!(connection["outbound"], target_address.to_string());
 
             listener_task.abort();
             let _ = listener_task.await;

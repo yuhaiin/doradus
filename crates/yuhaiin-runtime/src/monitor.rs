@@ -1248,9 +1248,11 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         .or_else(|| is_tun.then_some("TUN"))
         .unwrap_or_default();
     let outbound = context
-        .outbound
-        .as_deref()
-        .unwrap_or_else(|| route_mode(context.route_mode));
+        .outbound_addr
+        .as_ref()
+        .and_then(Endpoint::addr)
+        .map(|address| address.to_string())
+        .unwrap_or_default();
     json!({
         "id": id,
         "addr": destination,
@@ -1786,6 +1788,11 @@ mod tests {
             Network::Tcp,
             "127.0.0.1:1080".parse().unwrap(),
         ));
+        context.outbound = Some("node-id".to_owned());
+        context.outbound_addr = Some(Endpoint::ip(
+            Network::Tcp,
+            "192.0.2.10:8443".parse().unwrap(),
+        ));
         context.hosts = Some("hosts".to_owned());
         context.protocol = Some("http".to_owned());
         context.tls_server_name = Some("example.com".to_owned());
@@ -1802,6 +1809,8 @@ mod tests {
         assert_eq!(connection["localAddr"], "127.0.0.1:1080");
         assert_eq!(connection["network"]["underlyingType"], "tcp");
         assert_eq!(connection["protocol"], "http");
+        assert_eq!(connection["outbound"], "192.0.2.10:8443");
+        assert_eq!(connection["nodeId"], "node-id");
     }
 
     #[test]

@@ -75,7 +75,7 @@ async fn tls_http_inbound_terminates_tls_and_routes_through_direct_outbound() {
         .find(|item| item["inboundName"] == "tls-http-in")
         .expect("TLS HTTP inbound connection must be visible");
     assert_eq!(item["inbound"], "http");
-    assert_eq!(item["outbound"], "tls-inbound-direct");
+    assert_eq!(item["outbound"], fixture.target.to_string());
     assert_eq!(item["protocol"], "tls");
 
     client.shutdown().await.unwrap();
@@ -146,7 +146,7 @@ async fn run_h2_protocol_chain(protocol: H2FinalProtocol) {
         .find(|item| item["inboundName"] == inbound_id)
         .expect("HTTP/2 protocol chain connection must be visible");
     assert_eq!(item["inbound"], "http");
-    assert_eq!(item["outbound"], node_id);
+    assert_eq!(item["outbound"], fixture.outbound.to_string());
     assert_eq!(item["mode"], "proxy");
     assert!(
         item["matchHistory"]
@@ -253,7 +253,7 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
         .find(|item| item["inboundName"] == "http-chain-in")
         .expect("HTTP inbound connection must be visible");
     assert_eq!(item["inbound"], "http");
-    assert_eq!(item["outbound"], "http-out");
+    assert_eq!(item["outbound"], fixture.outbound.to_string());
     assert_eq!(item["mode"], "proxy");
     assert_eq!(item["localAddr"], inbound.to_string());
     assert_eq!(item["network"]["underlyingType"], "tcp");
@@ -368,7 +368,7 @@ async fn http_inbound_routes_through_socks5_outbound() {
         .find(|item| item["inboundName"] == "socks5-chain-in")
         .expect("SOCKS5 outbound chain connection must be visible");
     assert_eq!(item["inbound"], "http");
-    assert_eq!(item["outbound"], "socks5-out");
+    assert_eq!(item["outbound"], fixture.outbound.to_string());
     assert!(item["matchHistory"].as_array().is_some_and(|history| {
         history
             .iter()
@@ -480,7 +480,7 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
         .find(|item| item["inboundName"] == "tls-h2-yuubinsya-in")
         .expect("TLS/H2/Yuubinsya connection must be visible");
     assert_eq!(item["inbound"], "http");
-    assert_eq!(item["outbound"], "tls-h2-yuubinsya-out");
+    assert_eq!(item["outbound"], fixture.outbound.to_string());
     assert_eq!(item["mode"], "proxy");
     assert!(item["matchHistory"].as_array().is_some_and(|history| {
         history
@@ -628,7 +628,7 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
     }
     let udp_item = udp_connection.expect("TLS/H2/Yuubinsya UDP connection must be visible");
     assert_eq!(udp_item["inbound"], "mixed");
-    assert_eq!(udp_item["outbound"], "tls-h2-yuubinsya-out");
+    assert_eq!(udp_item["outbound"], fixture.outbound.to_string());
     assert_eq!(udp_item["mode"], "proxy");
     assert!(udp_length > udp_payload.len());
 
@@ -767,7 +767,7 @@ async fn socks5_and_yuubinsya_inbounds_route_through_tls_h2_yuubinsya_outbound()
             .find(|item| item["inboundName"] == inbound)
             .unwrap_or_else(|| panic!("connection for {inbound} is missing"));
         assert_eq!(item["inbound"], protocol);
-        assert_eq!(item["outbound"], "tls-h2-yuubinsya-out");
+        assert_eq!(item["outbound"], fixture.outbound.to_string());
         assert_eq!(item["mode"], "proxy");
         assert!(item["matchHistory"].as_array().is_some_and(|history| {
             history
@@ -890,7 +890,7 @@ async fn mixed_inbound_exposes_socks5_udp_and_keeps_supervisor_alive() {
         .find(|item| item["inboundName"] == "mixed")
         .expect("mixed UDP connection must be visible");
     assert_eq!(item["inbound"], "mixed");
-    assert_eq!(item["outbound"], "direct");
+    assert_eq!(item["outbound"], target_address.to_string());
     assert!(length > payload.len());
 
     let _ = target_task.await;
@@ -977,13 +977,13 @@ async fn socks5_and_yuubinsya_inbounds_route_through_the_runtime_process() {
         .find(|item| item["inboundName"] == "socks5-required-in")
         .expect("SOCKS5 inbound connection must be visible");
     assert_eq!(socks5_connection["inbound"], "socks5");
-    assert_eq!(socks5_connection["outbound"], "direct");
+    assert_eq!(socks5_connection["outbound"], fixture.target.to_string());
     let yuubinsya_connection = connections
         .iter()
         .find(|item| item["inboundName"] == "yuubinsya-required-in")
         .expect("Yuubinsya inbound connection must be visible");
     assert_eq!(yuubinsya_connection["inbound"], "yuubinsya");
-    assert_eq!(yuubinsya_connection["outbound"], "direct");
+    assert_eq!(yuubinsya_connection["outbound"], fixture.target.to_string());
 
     yuubinsya.shutdown().await.unwrap();
     socks5.shutdown().await.unwrap();

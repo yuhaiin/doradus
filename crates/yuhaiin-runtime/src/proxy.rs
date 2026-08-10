@@ -886,6 +886,9 @@ fn annotate_connection_metadata(
     let Some(endpoint) = endpoint else {
         return;
     };
+    if context.outbound_addr.is_none() {
+        context.outbound_addr = Some(Endpoint::ip(context.network, endpoint));
+    }
     #[cfg(feature = "http-api")]
     if context.interface.is_none() {
         context.interface = crate::interfaces::interface_for_ip(endpoint.ip());
@@ -1526,6 +1529,13 @@ mod tests {
 
         assert_eq!(context.hosts.as_deref(), Some("hosts.example:443"));
         assert_eq!(context.outbound_geo.as_deref(), Some("ZZ"));
+        assert_eq!(
+            context.outbound_addr,
+            Some(Endpoint::ip(
+                yuhaiin_core::Network::Tcp,
+                "192.0.2.44:443".parse().unwrap(),
+            ))
+        );
     }
 
     #[tokio::test]
