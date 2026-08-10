@@ -177,7 +177,6 @@ async fn serve_connect(
     let bridge = tokio::spawn(bridge_h2_stream(request.into_body(), send, bridge_io));
 
     let result = proxy.serve(proxy_io).await;
-    bridge.abort();
     let _ = bridge.await;
     result
 }

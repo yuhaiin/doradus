@@ -537,17 +537,21 @@ async fn relay(
     let _active = ActiveGuard(&active_streams);
     let (mut reader, mut writer) = split(relay_side);
     let mut buffer = vec![0u8; 16 * 1024];
+    let mut request_closed = false;
     if *shutdown.borrow() {
         let _ = writer.shutdown().await;
         return;
     }
     loop {
         tokio::select! {
-            result = reader.read(&mut buffer) => {
+            result = reader.read(&mut buffer), if !request_closed => {
                 let Ok(length) = result else { return };
                 if length == 0 {
-                    let _ = send_stream.send_data(Bytes::new(), true);
-                    return;
+                    if send_stream.send_data(Bytes::new(), true).is_err() {
+                        return;
+                    }
+                    request_closed = true;
+                    continue;
                 }
                 if send_h2_data(&mut send_stream, &buffer[..length]).await.is_err() {
                     return;
@@ -646,10 +650,10 @@ mod tests {
             .unwrap();
         let mut tunnel = connection.open_connect_stream(8).await.unwrap();
         tunnel.write_all(b"hello over h2").await.unwrap();
+        tunnel.shutdown().await.unwrap();
         let mut response = vec![0; 13];
         tunnel.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"hello over h2");
-        tunnel.shutdown().await.unwrap();
         server.abort();
         let _ = server.await;
     }

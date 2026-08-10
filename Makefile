@@ -42,7 +42,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke production-parity-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
+.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-chain-service-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke production-parity-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -58,6 +58,7 @@ help:
 		'make build-tun-smoke    build the privileged TUN smoke binary' \
 		'make build-tun-service-smoke build the runtime-owned TUN smoke binary' \
 		'make tun-service-smoke run the runtime-owned TUN lifecycle and echo smoke' \
+		'make tun-chain-service-smoke run TUN inbound -> TLS + HTTP/2 + Yuubinsya chain smoke' \
 		'make tun-mtu-smoke run the runtime-owned TUN MTU boundary matrix' \
 		'make transparent-service-smoke run REDIRECT TCP smoke; rootless Podman records TPROXY skip' \
 		'make api-contract-smoke run the frontend management API process contract in Podman' \
@@ -119,6 +120,9 @@ build-tun-service-smoke:
 
 tun-service-smoke:
 	./scripts/integration/tun-service.sh
+
+tun-chain-service-smoke:
+	./scripts/integration/tun-chain-service.sh
 
 tun-mtu-smoke:
 	./scripts/integration/tun-mtu.sh

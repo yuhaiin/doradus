@@ -213,7 +213,7 @@ flowchart LR
 | `[x]` | 单一路径 TUN | `core::tun` | `tun-rs AsyncDevice + smoltcp`；不并行实现 tun2socket 和用户态 stack 两条路径 |
 | `[x]` | inbound owner | `runtime::inbound::run_until` | TUN record 会在同一个 inbound listener task 集合中创建 device；与 SOCKS5/HTTP/Yuubinsya/UDP listener 共同 reload、shutdown、abort，不再由独立 supervisor 管理 |
 | `[x]` | TCP/UDP/ICMP | `core::tun` | dispatcher、proxy bridge、DNS hijack、FakeIP reverse、NAT、bounded queue/backpressure |
-| `[x]` | Linux Podman | `tun-smoke`, `tun-service-smoke`, `tun-mtu.sh`, `p0_tun`, `tun_fakeip_smoke` | privileged/network=none 创建、runtime inbound owner、AnyIP routed TCP、route、DNS/FakeIP、selected fixed proxy echo、SIGTERM 和设备重开；`make tun-service-smoke` 复用 `~/.cache/yuhaiin-rust/integration/tun-service` 并保留失败日志；`tun-mtu.sh` 对 576/1280/1500/9000/9216 分别验证真实设备、流量和关闭；当前 4 MiB TUN→fixed→loopback benchmark 为 55.73 MiB/s、peak RSS 12,444 KiB |
+| `[x]` | Linux Podman | `tun-smoke`, `tun-service-smoke`, `tun-chain-service.sh`, `tun-mtu.sh`, `p0_tun`, `tun_fakeip_smoke` | privileged/network=none 创建、runtime inbound owner、AnyIP routed TCP、route、DNS/FakeIP、selected fixed proxy echo、SIGTERM 和设备重开；`make tun-service-smoke` 复用 `~/.cache/yuhaiin-rust/integration/tun-service` 并保留失败日志；`make tun-chain-service-smoke` 进一步验证真实 TUN → SQLite 选中的 fixed → TLS → HTTP/2 → Yuubinsya TCP → loopback echo，并覆盖客户端立即半关闭；`tun-mtu.sh` 对 576/1280/1500/9000/9216 分别验证真实设备、流量和关闭；当前 4 MiB TUN→fixed→loopback benchmark 为 55.73 MiB/s、peak RSS 12,444 KiB |
 | `[~]` | 设备异常与 namespace | 测试已有设备消失、kernel cleanup、同名重开基础覆盖；在独立 rootless user/network namespace 中执行 `p0_tun` 的 loopback netem loss 与 matrix 测试均通过 | 继续补 namespace teardown、fragment 长流，以及 Android/macOS 实机 |
 | `[~]` | Android/macOS TUN | `TunRuntime::from_async_device` + `inbound::run_until_with_tun_runtime` 可把外部设备接入同一个 inbound owner；reload 复用设备并重建 proxy/dispatcher | Android VpnService fd、macOS utun/权限/route/生命周期实机验收 |
 
@@ -285,6 +285,9 @@ scripts/integration/tun-service.sh
 
 # Same smoke through the Makefile entry point:
 make tun-service-smoke
+
+# Real TUN inbound -> TLS -> HTTP/2 -> Yuubinsya TCP outbound:
+make tun-chain-service-smoke
 
 # Isolated Linux transparent inbound: REDIRECT TCP; rootless Podman records a TPROXY skip:
 make transparent-service-smoke

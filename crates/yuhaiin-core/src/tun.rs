@@ -1672,8 +1672,8 @@ async fn run_tcp_proxy(
 ) {
     let stream = match tokio::time::timeout(timeouts.connect, proxy.connect(&context)).await {
         Ok(Ok(stream)) => stream,
-        Ok(Err(_)) => {
-            tun_debug(format!("TCP proxy connect failed flow={flow:?}"));
+        Ok(Err(error)) => {
+            tun_debug(format!("TCP proxy connect failed flow={flow:?}: {error}"));
             let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
             return;
         }

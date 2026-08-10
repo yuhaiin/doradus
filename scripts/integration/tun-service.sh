@@ -8,6 +8,15 @@ binary="${target_dir}/debug/tun-service-smoke"
 database_dir="${cache_dir}/state"
 log_path="${cache_dir}/podman.log"
 tun_name="yrtun0"
+chain_mode="${YUHAIIN_TUN_CHAIN:-}"
+
+chain_env=()
+if [[ -n "${chain_mode}" ]]; then
+  chain_env=(-e "YUHAIIN_TUN_CHAIN=${chain_mode}")
+fi
+if [[ -n "${YUHAIIN_TUN_DEBUG:-}" ]]; then
+  chain_env+=( -e "YUHAIIN_TUN_DEBUG=${YUHAIIN_TUN_DEBUG}" )
+fi
 
 mkdir -p "${database_dir}"
 cd "${repo_dir}"
@@ -19,6 +28,7 @@ if ! podman run --rm --privileged --network=none \
     -e YUHAIIN_TUN_MTU="${YUHAIIN_TUN_MTU:-1500}" \
     -e YUHAIIN_TUN_TRAFFIC=1 \
     -e YUHAIIN_TUN_HOLD_MS=750 \
+    "${chain_env[@]}" \
     -v "${binary}:/usr/local/bin/tun-service-smoke:ro" \
     -v "${database_dir}:/state:Z" \
     --entrypoint /usr/local/bin/tun-service-smoke \
@@ -31,3 +41,6 @@ printf '%s\n' "${output}"
 grep -Fq "runtime-tun-opened name=${tun_name}" <<<"${output}"
 grep -Fq "runtime-tun-traffic-ok" <<<"${output}"
 grep -Fq "runtime-tun-closed name=${tun_name}" <<<"${output}"
+if [[ -n "${chain_mode}" ]]; then
+  grep -Fq "runtime-tun-chain-ready mode=${chain_mode}" <<<"${output}"
+fi

@@ -51,6 +51,12 @@ The current scenarios cover:
   reusable SQLite state directory, and runs the same `inbound::run_until`
   owner in a privileged Podman `--network=none` container. It checks that the
   kernel TUN device appears and is removed by the common shutdown path.
+- `scripts/integration/tun-chain-service.sh` runs the same real kernel TUN
+  inbound with a SQLite-selected `fixed -> TLS -> HTTP/2 -> Yuubinsya` TCP
+  outbound and a loopback echo target. It deliberately half-closes the client
+  immediately after writing, covering bidirectional HTTP/2 half-close behavior.
+  State and logs remain under `~/.cache/yuhaiin-rust/integration/tun-chain-service`;
+  run it with `make tun-chain-service-smoke`.
 - `scripts/integration/transparent-service.sh` runs an isolated privileged
   Linux namespace with a host `iptables` helper, redirects a non-root TCP
   client into the Rust `redir` inbound, verifies `SO_ORIGINAL_DST`, direct
