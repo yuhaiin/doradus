@@ -195,6 +195,11 @@ pub struct RouteDecision {
 #[derive(Clone)]
 pub struct Router {
     rules: CombinedTrie<Vec<RouteRule>>,
+    /// Expanded rules in the same persisted-priority order used by Go's
+    /// matcher.  The indexes above are for fast selection; this flat view is
+    /// retained so connection metadata can explain rules that were tried and
+    /// rejected before the selected rule.
+    all_rules: Vec<RouteRule>,
     /// Rules without a domain/CIDR matcher (for example Go's network-only or
     /// empty `all` rule) are evaluated for every endpoint. Keeping them out of
     /// the trie avoids inventing a fake domain that would not match IP flows.
@@ -214,8 +219,10 @@ pub struct RouterRuntime {
 impl Router {
     pub fn compile(mut rules: Vec<RouteRule>, fallback: RouteDecision) -> crate::Result<Self> {
         rules.sort_by_key(|rule| rule.priority);
+        let all_rules = rules.clone();
         let mut index = Self {
             rules: CombinedTrie::new(),
+            all_rules,
             global_rules: Vec::new(),
             fallback,
             geo: None,
@@ -322,6 +329,9 @@ impl Router {
     /// Apply the same route decision as `decide_context` and retain the
     /// selected rule's explainability metadata on the flow.
     pub fn apply_to_context(&self, context: &mut FlowContext) -> RouteDecision {
+        let selected_key = self
+            .selected_rule(context)
+            .map(|rule| (rule.rule_name.clone(), rule.priority));
         let decision = self
             .selected_rule(context)
             .map(|rule| RouteDecision {
@@ -345,19 +355,6 @@ impl Router {
             context.lists = rule.list_names.clone();
             context.lists.sort();
             context.lists.dedup();
-            if !rule.rule_name.is_empty() {
-                context.match_history.push(MatchHistoryEntry {
-                    rule_name: rule.rule_name.clone(),
-                    history: rule
-                        .list_names
-                        .iter()
-                        .map(|list_name| MatchResult {
-                            list_name: list_name.clone(),
-                            matched: true,
-                        })
-                        .collect(),
-                });
-            }
         }
         if let (Some(geo), Some(address)) = (
             self.geo.as_deref(),
@@ -370,7 +367,158 @@ impl Router {
                 context.geo = Some(country);
             }
         }
+        context.match_history = self.match_history(context, selected_key.as_ref());
         decision
+    }
+
+    fn pattern_matches(&self, rule: &RouteRule, endpoint: &Endpoint) -> bool {
+        if rule.pattern.trim().is_empty() {
+            return true;
+        }
+        self.rules
+            .search(endpoint)
+            .is_some_and(|rules| rules.iter().any(|candidate| candidate == rule))
+    }
+
+    fn rule_matches(&self, rule: &RouteRule, endpoint: &Endpoint, context: &FlowContext) -> bool {
+        self.pattern_matches(rule, endpoint)
+            && rule.matches_with_context(endpoint, self.geo.as_deref(), Some(context))
+    }
+
+    fn match_history(
+        &self,
+        context: &FlowContext,
+        selected_key: Option<&(String, i32)>,
+    ) -> Vec<MatchHistoryEntry> {
+        let mut output = Vec::new();
+        let mut offset = 0;
+        while offset < self.all_rules.len() {
+            let first = &self.all_rules[offset];
+            let key = (first.rule_name.clone(), first.priority);
+            let mut history = Vec::new();
+            let mut matched = false;
+            while offset < self.all_rules.len()
+                && self.all_rules[offset].rule_name == key.0
+                && self.all_rules[offset].priority == key.1
+            {
+                let rule = &self.all_rules[offset];
+                let endpoint = context.effective_destination();
+                matched |= self.rule_matches(rule, &context.destination, context)
+                    || (context.original_domain.is_some()
+                        && self.rule_matches(rule, &endpoint, context));
+                append_rule_history(&mut history, rule, self, context, &endpoint);
+                offset += 1;
+            }
+            if !key.0.is_empty() {
+                output.push(MatchHistoryEntry {
+                    rule_name: key.0.clone(),
+                    history,
+                });
+            }
+            if selected_key == Some(&key) || matched && selected_key.is_none() {
+                break;
+            }
+        }
+        output
+    }
+}
+
+fn append_rule_history(
+    history: &mut Vec<MatchResult>,
+    rule: &RouteRule,
+    router: &Router,
+    context: &FlowContext,
+    endpoint: &Endpoint,
+) {
+    if let Some(expected) = rule
+        .network
+        .or_else(|| rule.excluded_networks.first().copied())
+    {
+        let label = match expected {
+            Network::Tcp => Some("Net TCP"),
+            Network::Udp => Some("Net UDP"),
+            Network::Icmp | Network::Any => None,
+        };
+        if let Some(label) = label {
+            history.push(MatchResult {
+                list_name: label.to_owned(),
+                matched: endpoint.network() == expected,
+            });
+        }
+    }
+    if let Some((start, end)) = rule.port {
+        if let Some(port) = endpoint.port() {
+            history.push(MatchResult {
+                list_name: format!("Port {port}"),
+                matched: (start..=end).contains(&port),
+            });
+        }
+    } else if let Some((start, end)) = rule.excluded_ports.first() {
+        if let Some(port) = endpoint.port() {
+            history.push(MatchResult {
+                list_name: format!("Port {port}"),
+                matched: (*start..=*end).contains(&port),
+            });
+        }
+    }
+    if !rule.process_names.is_empty() || !rule.excluded_process_names.is_empty() {
+        let process = context.process.as_deref().unwrap_or_default();
+        let matched = rule
+            .process_names
+            .iter()
+            .chain(rule.excluded_process_names.iter())
+            .any(|name| name == process);
+        for list_name in &rule.list_names {
+            history.push(MatchResult {
+                list_name: format!("List {list_name}"),
+                matched,
+            });
+        }
+    }
+    if !rule.inbound_names.is_empty() || !rule.excluded_inbound_names.is_empty() {
+        let inbound = context
+            .inbound_name
+            .as_deref()
+            .or(context.inbound.as_deref())
+            .unwrap_or_default();
+        let matched = rule
+            .inbound_names
+            .iter()
+            .chain(rule.excluded_inbound_names.iter())
+            .any(|name| name == inbound);
+        history.push(MatchResult {
+            list_name: inbound.to_owned(),
+            matched,
+        });
+    }
+    if rule.geo_country.is_some() || !rule.excluded_geo_countries.is_empty() {
+        let country = context.geo.as_deref().unwrap_or_default();
+        let matched = rule
+            .geo_country
+            .as_deref()
+            .into_iter()
+            .chain(rule.excluded_geo_countries.iter().map(String::as_str))
+            .any(|expected| expected.eq_ignore_ascii_case(country));
+        history.push(MatchResult {
+            list_name: format!("Geoip {country}"),
+            matched,
+        });
+    }
+    if !rule.list_names.is_empty()
+        && rule.process_names.is_empty()
+        && rule.excluded_process_names.is_empty()
+    {
+        let matched = if !rule.pattern.is_empty() {
+            router.pattern_matches(rule, endpoint)
+        } else {
+            rule.excluded_patterns.search(endpoint).is_some()
+        };
+        for list_name in &rule.list_names {
+            history.push(MatchResult {
+                list_name: format!("List {list_name}"),
+                matched,
+            });
+        }
     }
 }
 
@@ -599,8 +747,48 @@ mod tests {
         assert_eq!(context.geo.as_deref(), Some("CN"));
         assert_eq!(context.match_history.len(), 1);
         assert_eq!(context.match_history[0].rule_name, "media-rule");
-        assert_eq!(context.match_history[0].history[0].list_name, "media-hosts");
+        assert_eq!(
+            context.match_history[0].history[0].list_name,
+            "List media-hosts"
+        );
         assert!(context.match_history[0].history[0].matched);
+    }
+
+    #[test]
+    fn route_match_history_keeps_rejected_rules_before_the_selected_rule() {
+        let mut rejected = rule("not-example.com", RuleAction::Direct, 1);
+        rejected.rule_name = "rejected-rule".to_owned();
+        rejected.list_names = vec!["not-example".to_owned()];
+        let mut selected = rule("example.com", RuleAction::Proxy, 2);
+        selected.rule_name = "selected-rule".to_owned();
+        selected.list_names = vec!["example".to_owned()];
+        let router = Router::compile(
+            vec![rejected, selected],
+            RouteDecision {
+                mode: RouteMode::Direct,
+                resolver_policy: ResolverPolicy::default(),
+                priority: 100,
+            },
+        )
+        .unwrap();
+        let mut context = FlowContext::new(Endpoint::domain(
+            Network::Tcp,
+            DomainName::new("www.example.com").unwrap(),
+            443,
+        ));
+        router.apply_to_context(&mut context);
+
+        assert_eq!(context.match_history.len(), 2);
+        assert_eq!(context.match_history[0].rule_name, "rejected-rule");
+        assert_eq!(
+            context.match_history[0].history[0],
+            MatchResult {
+                list_name: "List not-example".to_owned(),
+                matched: false,
+            }
+        );
+        assert_eq!(context.match_history[1].rule_name, "selected-rule");
+        assert!(context.match_history[1].history[0].matched);
     }
 
     #[test]

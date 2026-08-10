@@ -2235,7 +2235,10 @@ async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
     let route_lists = &snapshot.route_lists;
     let selected_rule_name = context
         .match_history
-        .first()
+        // Router history is ordered like Go's matcher: rejected rules first,
+        // then the selected rule. The last entry is therefore the selected
+        // rule (or the last attempted rule when the fallback was used).
+        .last()
         .map(|entry| entry.rule_name.as_str());
     let selected = selected_rule_name.and_then(|name| {
         snapshot
