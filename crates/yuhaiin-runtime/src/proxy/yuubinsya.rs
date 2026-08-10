@@ -24,23 +24,23 @@ use crate::{ConnectionMonitor, RuntimeProxySelector};
 pub(crate) fn new_server(
     spec: &InboundSpec,
     selector: Arc<RuntimeProxySelector>,
-) -> Arc<YuubinsyaServerProxy> {
+) -> Option<Arc<YuubinsyaServerProxy>> {
     let upstream: Arc<dyn AsyncProxy> = Arc::new(RoutedProxy { selector });
-    let password_hashes = spec
-        .auth
-        .as_ref()
-        .map(|auth| {
-            auth.inbound_passwords()
-                .into_iter()
-                .map(|password| derive_salt(&password))
-                .collect::<Vec<_>>()
-        })
-        .filter(|passwords| !passwords.is_empty())
-        .unwrap_or_else(|| vec![derive_salt(spec.password.as_bytes())]);
-    Arc::new(YuubinsyaServerProxy::new_with_password_hashes(
+    let password_hashes = if let Some(auth) = spec.auth.as_ref() {
+        auth.inbound_passwords()
+            .into_iter()
+            .map(|password| derive_salt(&password))
+            .collect::<Vec<_>>()
+    } else {
+        vec![derive_salt(spec.password.as_bytes())]
+    };
+    if password_hashes.is_empty() {
+        return None;
+    }
+    Some(Arc::new(YuubinsyaServerProxy::new_with_password_hashes(
         password_hashes,
         upstream,
-    ))
+    )))
 }
 
 struct ChainDnsHandler(Arc<dyn crate::monitor::SocketDnsHandler>);
@@ -61,7 +61,12 @@ pub(crate) async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let server = new_server(&spec, Arc::clone(&selector));
+    let server = new_server(&spec, Arc::clone(&selector)).ok_or_else(|| {
+        Error::new(
+            yuhaiin_core::ErrorKind::Unsupported,
+            "Yuubinsya inbound has no concrete password hash",
+        )
+    })?;
     serve_with_server(stream, peer, spec, selector, server, monitor).await
 }
 

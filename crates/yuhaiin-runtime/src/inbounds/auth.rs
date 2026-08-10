@@ -37,10 +37,18 @@ impl InboundAuth {
     }
 
     pub(crate) fn has_basic_users(&self) -> bool {
-        self.users.iter().any(|user| {
-            (user.username.is_some() || user.allow_any_username)
-                && (user.password.is_some() || user.allow_any_password)
-        })
+        self.users.iter().any(InboundBasicUser::is_active)
+    }
+
+    /// Password-hash protocols such as Yuubinsya and Trojan cannot represent
+    /// an arbitrary password. They must fail closed when an active inbound
+    /// user uses `allowAnyPassword`, rather than silently falling back to an
+    /// empty or zero hash.
+    pub(crate) fn has_unrepresentable_password(&self) -> bool {
+        self.users
+            .iter()
+            .filter(|user| user.is_active())
+            .any(|user| user.allow_any_password)
     }
 
     pub(crate) fn authenticate_basic(&self, username: &[u8], password: &[u8]) -> bool {
@@ -59,6 +67,13 @@ impl InboundAuth {
             .filter(|user| user.password.is_some())
             .filter_map(|user| user.password.clone())
             .collect()
+    }
+}
+
+impl InboundBasicUser {
+    fn is_active(&self) -> bool {
+        (self.username.is_some() || self.allow_any_username)
+            && (self.password.is_some() || self.allow_any_password)
     }
 }
 
@@ -189,6 +204,21 @@ mod tests {
         assert!(auth.has_basic_users());
         assert!(auth.authenticate_basic(b"u", b"anything"));
         assert!(auth.inbound_passwords().is_empty());
+        assert!(auth.has_unrepresentable_password());
+    }
+
+    #[test]
+    fn concrete_passwords_are_representable_by_hash_protocols() {
+        let auth = InboundAuth::from_users(vec![user(
+            "concrete",
+            true,
+            "inbound",
+            Some("u"),
+            Some("p"),
+            false,
+            false,
+        )]);
+        assert!(!auth.has_unrepresentable_password());
     }
 
     #[test]

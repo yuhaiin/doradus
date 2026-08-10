@@ -329,6 +329,18 @@ async fn start_listeners(
             }
             spec.auth = Some(Arc::clone(&inbound_auth));
         }
+        if matches!(spec.protocol.as_str(), "yuubinsya" | "trojan")
+            && spec
+                .auth
+                .as_ref()
+                .is_some_and(|auth| auth.has_unrepresentable_password())
+        {
+            monitor.warn(format!(
+                "skip inbound {}: central user allowAnyPassword cannot be represented by {} password hashes",
+                spec.id, spec.protocol
+            ));
+            continue;
+        }
         if !spec.transports.is_empty()
             && spec.transports.iter().any(|transport| {
                 !transport.eq_ignore_ascii_case("normal")
@@ -1206,7 +1218,8 @@ async fn serve_h2_listener(
     use tokio::task::JoinSet;
 
     let yuubinsya_server = (spec.protocol == "yuubinsya")
-        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()));
+        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()))
+        .flatten();
     let mut connections = JoinSet::new();
     let result = async {
         loop {
@@ -1460,7 +1473,8 @@ async fn serve_listener(
 
     let protocol = spec.protocol.clone();
     let yuubinsya_server = (protocol == "yuubinsya")
-        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()));
+        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()))
+        .flatten();
     let mut connections = JoinSet::new();
     let result = async {
         loop {
@@ -1567,7 +1581,8 @@ async fn serve_websocket_listener(
 
     let protocol = spec.protocol.clone();
     let yuubinsya_server = (protocol == "yuubinsya")
-        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()));
+        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()))
+        .flatten();
     let mut connections = JoinSet::new();
     let result = async {
         loop {
@@ -1703,7 +1718,8 @@ async fn serve_websocket_h2_listener(
     use tokio::task::JoinSet;
 
     let yuubinsya_server = (spec.protocol == "yuubinsya")
-        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()));
+        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()))
+        .flatten();
     let mut connections = JoinSet::new();
     let result = async {
         loop {
