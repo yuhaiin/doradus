@@ -108,7 +108,11 @@ impl Default for RuntimeBuildOptions {
             fakeip_options: None,
             fakeip_skip_check_upstream: false,
             route_fallback: RouteDecision {
-                mode: RouteMode::Direct,
+                // Go's Matchers.Match returns ProxyMode when no persisted
+                // rule matches. Keep the service default proxy-oriented;
+                // callers that intentionally run a direct-only fixture can
+                // still override this in RuntimeBuildOptions.
+                mode: RouteMode::Proxy,
                 resolver_policy: ResolverPolicy::default(),
                 priority: 0,
             },
@@ -881,13 +885,13 @@ mod tests {
             rejected
                 .history
                 .iter()
-                .any(|entry| entry.list_name == "List domains" && entry.matched)
+                .any(|entry| entry.list_name == "List apps" && !entry.matched)
         );
         assert!(
-            rejected
+            !rejected
                 .history
                 .iter()
-                .any(|entry| entry.list_name == "List apps" && !entry.matched)
+                .any(|entry| entry.list_name == "List domains")
         );
     }
 

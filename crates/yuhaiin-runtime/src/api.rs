@@ -41,8 +41,8 @@ use yuhaiin_store::{
 use crate::update::UpdateService;
 use crate::{
     ProxyRouteListTransport, RouteListTransport, RuntimeController,
-    download_route_url_with_transport, expand_go_route_rule, interfaces::discover_interfaces,
-    latency::LatencyRequest, log::log_batch_value, refresh_route_list_caches_with_transport,
+    download_route_url_with_transport, interfaces::discover_interfaces, latency::LatencyRequest,
+    log::log_batch_value, refresh_route_list_caches_with_transport,
 };
 
 // Go keeps TCP and UDP node selection independently in metadata.  Keep the
@@ -2236,7 +2236,6 @@ async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
         yuhaiin_core::RouteMode::Bypass => "bypass",
         yuhaiin_core::RouteMode::Block => "drop",
     };
-    let route_lists = &snapshot.route_lists;
     let selected_rule_name = snapshot.router.selected_rule_name(&context);
     let selected = selected_rule_name.as_deref().and_then(|name| {
         snapshot
@@ -2255,76 +2254,25 @@ async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
         .as_ref()
         .map(|value| string_or(value, "resolver", ""))
         .unwrap_or_default();
-    let effective_destination = context.effective_destination();
-    let mut match_result = Vec::new();
-    for record in &snapshot.route_rules {
-        if record.disabled {
-            continue;
-        }
-        let mut history = Vec::new();
-        let root = raw_json(&record.data_json, json!({}));
-        let mut list_names = Vec::new();
-        collect_route_rule_list_names(&root, &mut list_names);
-        for name in &list_names {
-            history.push(json!({
-                "listName": format!("List {name}"),
-                "matched": context.lists.iter().any(|list| list == name),
-            }));
-        }
-        for rule in expand_go_route_rule(record, route_lists)? {
-            let mut append_history = |list_name: String, value: bool| {
-                if let Some(existing) = history
-                    .iter_mut()
-                    .find(|entry: &&mut Value| entry["listName"] == list_name)
-                {
-                    if value {
-                        existing["matched"] = json!(true);
-                    }
-                } else {
-                    history.push(json!({"listName": list_name, "matched": value}));
-                }
-            };
-            if let Some(network) = rule.network {
-                let name = match effective_destination.network() {
-                    Network::Tcp => Some("Net TCP"),
-                    Network::Udp => Some("Net UDP"),
-                    Network::Icmp | Network::Any => None,
-                };
-                if let Some(name) = name {
-                    append_history(name.to_owned(), network == effective_destination.network());
-                }
-            }
-            if rule.port.is_some() {
-                if let Some(port) = effective_destination.port() {
-                    append_history(
-                        format!("Port {port}"),
-                        rule.port
-                            .is_some_and(|(start, end)| (start..=end).contains(&port)),
-                    );
-                }
-            }
-            if !rule.inbound_names.is_empty() {
-                let inbound = context.inbound_name.as_deref().unwrap_or_default();
-                append_history(
-                    inbound.to_owned(),
-                    rule.inbound_names.iter().any(|name| name == inbound),
-                );
-            }
-            if rule.geo_country.is_some() {
-                let country = context.geo.as_deref().unwrap_or_default();
-                append_history(
-                    format!("Geoip {country}"),
-                    rule.geo_country
-                        .as_deref()
-                        .is_some_and(|expected| expected.eq_ignore_ascii_case(country)),
-                );
-            }
-        }
-        match_result.push(json!({
-            "ruleName": record.name,
-            "history": history,
-        }));
-    }
+    let match_result = context
+        .match_history
+        .iter()
+        .map(|entry| {
+            json!({
+                "ruleName": entry.rule_name,
+                "history": entry
+                    .history
+                    .iter()
+                    .map(|result| {
+                        json!({
+                            "listName": result.list_name,
+                            "matched": result.matched,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
     let ips = match &context.destination {
         Endpoint::Ip { addr, .. } => vec![addr.ip().to_string()],
         Endpoint::Domain { host, .. } => {
@@ -2347,33 +2295,6 @@ async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
         "ips": ips,
         "matchResult": match_result,
     }))
-}
-
-fn collect_route_rule_list_names(value: &Value, names: &mut Vec<String>) {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                collect_route_rule_list_names(value, names);
-            }
-        }
-        Value::Object(object) => {
-            for key in ["host", "process"] {
-                if let Some(Value::Object(matcher)) = object.get(key) {
-                    if let Some(name) = matcher
-                        .get("list")
-                        .or_else(|| matcher.get("name"))
-                        .and_then(Value::as_str)
-                    {
-                        names.push(name.to_owned());
-                    }
-                }
-            }
-            for value in object.values() {
-                collect_route_rule_list_names(value, names);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn endpoint_authority(endpoint: &Endpoint) -> String {
@@ -4678,11 +4599,11 @@ mod tests {
         assert_eq!(value["mode"], "drop");
         assert_eq!(value["afterAddr"], "example.com:443");
         let match_result = value["matchResult"].as_array().unwrap();
-        assert!(
-            match_result.iter().all(|entry| {
-                entry["ruleName"].as_str().is_some() && entry["history"].is_array()
-            })
-        );
+        let selected = match_result
+            .iter()
+            .find(|entry| entry["ruleName"] == "drop-example")
+            .expect("selected route rule must be present in match history");
+        assert!(selected["history"].is_array());
 
         let _ = route_apply_value(&state).await.unwrap();
         let applied = route_activation_value(&state).await.unwrap();

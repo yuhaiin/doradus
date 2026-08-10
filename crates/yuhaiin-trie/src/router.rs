@@ -39,6 +39,9 @@ pub struct RouteRule {
     /// Names of Go host/process lists contributing to this expanded rule.
     pub list_names: Vec<String>,
     pub pattern: String,
+    /// Preserve a rule whose Go list is not loaded yet, but keep it
+    /// fail-closed until the list contents become available.
+    pub always_false: bool,
     pub action: RuleAction,
     pub network: Option<Network>,
     /// Negative network constraints from Go's `not` expression.
@@ -79,6 +82,9 @@ impl RouteRule {
         geo: Option<&dyn GeoLookup>,
         context: Option<&FlowContext>,
     ) -> bool {
+        if self.always_false {
+            return false;
+        }
         if self.excluded_patterns.search(endpoint).is_some() {
             return false;
         }
@@ -425,6 +431,29 @@ fn append_rule_history(
     context: &FlowContext,
     endpoint: &Endpoint,
 ) {
+    // Go sorts nested predicates before evaluating them and stops an `all`
+    // expression at its first false child. The expanded Rust rule may carry
+    // several variants for one Go rule, so also suppress the duplicate
+    // explainability entries produced by those variants.
+    let mut record = |list_name: String, matched: bool| {
+        if !history.iter().any(|result| result.list_name == list_name) {
+            history.push(MatchResult { list_name, matched });
+        }
+        matched
+    };
+    if let Some((start, end)) = rule.port {
+        if let Some(port) = endpoint.port() {
+            if !record(format!("Port {port}"), (start..=end).contains(&port)) {
+                return;
+            }
+        }
+    } else if let Some((start, end)) = rule.excluded_ports.first() {
+        if let Some(port) = endpoint.port() {
+            if !record(format!("Port {port}"), (*start..=*end).contains(&port)) {
+                return;
+            }
+        }
+    }
     if let Some(expected) = rule
         .network
         .or_else(|| rule.excluded_networks.first().copied())
@@ -434,26 +463,10 @@ fn append_rule_history(
             Network::Udp => Some("Net UDP"),
             Network::Icmp | Network::Any => None,
         };
-        if let Some(label) = label {
-            history.push(MatchResult {
-                list_name: label.to_owned(),
-                matched: endpoint.network() == expected,
-            });
-        }
-    }
-    if let Some((start, end)) = rule.port {
-        if let Some(port) = endpoint.port() {
-            history.push(MatchResult {
-                list_name: format!("Port {port}"),
-                matched: (start..=end).contains(&port),
-            });
-        }
-    } else if let Some((start, end)) = rule.excluded_ports.first() {
-        if let Some(port) = endpoint.port() {
-            history.push(MatchResult {
-                list_name: format!("Port {port}"),
-                matched: (*start..=*end).contains(&port),
-            });
+        if let Some(label) = label
+            && !record(label.to_owned(), endpoint.network() == expected)
+        {
+            return;
         }
     }
     if !rule.inbound_names.is_empty() || !rule.excluded_inbound_names.is_empty() {
@@ -467,10 +480,9 @@ fn append_rule_history(
             .iter()
             .chain(rule.excluded_inbound_names.iter())
             .any(|name| name == inbound);
-        history.push(MatchResult {
-            list_name: inbound.to_owned(),
-            matched,
-        });
+        if !record(inbound.to_owned(), matched) {
+            return;
+        }
     }
     if rule.geo_country.is_some() || !rule.excluded_geo_countries.is_empty() {
         let country = context.geo.as_deref().unwrap_or_default();
@@ -480,20 +492,21 @@ fn append_rule_history(
             .into_iter()
             .chain(rule.excluded_geo_countries.iter().map(String::as_str))
             .any(|expected| expected.eq_ignore_ascii_case(country));
-        history.push(MatchResult {
-            list_name: format!("Geoip {country}"),
-            matched,
-        });
+        if !record(format!("Geoip {country}"), matched) {
+            return;
+        }
     }
     // Go's nested List matcher consults the host/process trie membership that
     // was populated before route evaluation. It does not re-run the rule's
     // domain/process expression here; a rule can therefore report a matched
     // list even when a later matcher rejects the whole rule.
     for list_name in &rule.list_names {
-        history.push(MatchResult {
-            list_name: format!("List {list_name}"),
-            matched: context.lists.iter().any(|name| name == list_name),
-        });
+        if !record(
+            format!("List {list_name}"),
+            context.lists.iter().any(|name| name == list_name),
+        ) {
+            return;
+        }
     }
 }
 
@@ -658,6 +671,7 @@ mod tests {
             tag: String::new(),
             list_names: Vec::new(),
             pattern: pattern.to_owned(),
+            always_false: false,
             action,
             network: None,
             excluded_networks: Vec::new(),

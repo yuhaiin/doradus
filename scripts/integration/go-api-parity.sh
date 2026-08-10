@@ -302,7 +302,10 @@ if [[ "${YUHAIIN_MUTATION_PARITY:-1}" == "1" ]]; then
   compare_mutation route-list-post route.lists.post "${list_body}"
   compare_mutation route-list-get route.list.get "$(jq -cn --arg id "${list_id}" '{id:$id}')"
 
-  rule_body="$(jq -cn --arg name "${rule_id}" --arg list "${list_id}" '{name:$name,mode:"direct",tag:"parity",rules:[{type:"host",host:{list:$list}}]}')"
+  # Exercise a nested matcher rather than only a single host-list predicate:
+  # parity.example is in the list but the requested port (443) is outside the
+  # rule's 8443 range, so both services must expose the rejected rule history.
+  rule_body="$(jq -cn --arg name "${rule_id}" --arg list "${list_id}" '{name:$name,mode:"direct",tag:"parity",rules:[{type:"all",all:[{type:"host",host:{list:$list}},{type:"port",port:{ports:"8443"}}]}]}')"
   compare_mutation route-rule-post route.rules.post "${rule_body}"
   compare_mutation route-rule-get route.rule.get "$(jq -cn --arg name "${rule_id}" '{name:$name,index:0}')"
   compare_mutation route-apply route.apply '{}'

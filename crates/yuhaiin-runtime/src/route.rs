@@ -775,6 +775,7 @@ pub fn expand_go_route_rule(
                 tag: record.tag.clone(),
                 list_names: variant.list_names,
                 pattern: variant.pattern.unwrap_or_default(),
+                always_false: variant.always_false,
                 action,
                 network: variant.network,
                 excluded_networks: variant.excluded_networks,
@@ -844,6 +845,7 @@ fn route_rule_from_root(record: &GoRouteRuleRecord, root: &Value) -> Result<Opti
         tag: record.tag.clone(),
         list_names: Vec::new(),
         pattern,
+        always_false: false,
         action,
         network,
         excluded_networks: Vec::new(),
@@ -891,6 +893,7 @@ struct RuleVariant {
     excluded_process_names: Option<Vec<String>>,
     excluded_patterns: Vec<String>,
     list_names: Vec<String>,
+    always_false: bool,
 }
 
 fn parse_rule_expression(
@@ -959,7 +962,11 @@ fn parse_rule_expression_inner(
                 // A missing/empty route list must not turn a negated matcher
                 // into an accidental global rule. Keep the same fail-closed
                 // behavior as the positive list expansion.
-                return Ok(Vec::new());
+                return Ok(vec![RuleVariant {
+                    list_names: vec![name],
+                    always_false: !negated,
+                    ..RuleVariant::default()
+                }]);
             }
             if negated {
                 Ok(vec![RuleVariant {
@@ -1210,6 +1217,7 @@ fn combine_all(
                     excluded_process_names,
                     excluded_patterns,
                     list_names,
+                    always_false: left.always_false || right.always_false,
                 });
             }
         }

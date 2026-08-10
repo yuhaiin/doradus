@@ -448,6 +448,7 @@ fn route_rule(pattern: &str) -> RouteRule {
         tag: String::new(),
         list_names: Vec::new(),
         pattern: pattern.to_owned(),
+        always_false: false,
         action: RuleAction::Proxy,
         network: Some(Network::Udp),
         excluded_networks: Vec::new(),

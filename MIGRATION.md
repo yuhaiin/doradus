@@ -2330,3 +2330,26 @@ stats-concurrency,startup-logs-current,transparent-service-current,tun-service-c
 日志和数据库位于 `~/.cache/yuhaiin-rust/integration/tun-mtu-current`。这补齐了 Linux TUN
 MTU 的进程级边界证据，但不把 namespace teardown、fragment 长流或 Android/macOS 设备验收
 提前标为完成。当前缓存复核为约 16G，仍全部位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
+## 70. 2026-08-10 mixed UDP、direct 域名解析与 route history parity
+
+本轮复核了运行日志中的两个错误：`protocol "mixed" has no UDP mode` 和
+`direct async proxy requires an already-resolved IP endpoint`。它们对应 `0bae7c1` 之前的旧
+二进制；当前源码已统一 trim/大小写处理 `mixed`/`mix`，mixed 默认支持 SOCKS5 UDP，且
+`DirectAsyncProxy` 会在没有 runtime resolver wrapper 时使用 Tokio resolver，并按 source
+interface 偏好 IPv4/IPv6 后逐个尝试连接。当前构建产物中已不存在旧的 direct error 文案。
+
+定向证据：
+
+- `cargo test -p yuhaiin-core --all-features --offline direct_async_proxy_resolves_domain_when_called_without_runtime_wrapper` 通过；
+- `cargo test -p yuhaiin-runtime --all-features --offline mixed_inbound_exposes_socks5_udp_and_keeps_supervisor_alive` 通过；
+- `make build` 成功，debug binary 位于 `~/.cache/yuhaiin-rust/cargo-target/debug/yuhaiin`。
+
+同时修复了上一轮 route test parity 暴露的真实差异：Go 无规则命中时 `Matchers.Match` 返回
+`ProxyMode`，Rust 默认 fallback 改为 `proxy`；route history 现在按 Go nested matcher 的
+排序和短路规则记录，expanded variants 不重复吞掉同一 Go list，缺失 list 以 fail-closed
+rule 保留其 `List ...: false` history。使用停止的 `tmp/v2/state.db` 独立副本运行
+`go-api-parity.sh`，包括 nested `all(host-list, port)`、缺失 list、route rule test、配置
+mutation 和错误矩阵，Go/Rust 全部逐响应通过；日志位于
+`~/.cache/yuhaiin-rust/integration/go-api-route-history-current3`。源库没有修改，也没有使用
+`/tmp`。

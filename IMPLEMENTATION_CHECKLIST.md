@@ -225,10 +225,11 @@ flowchart LR
 > **Live list membership note:** `RuntimeSnapshot::apply_route` 现在复用同一 route-list snapshot
 > 对所有 host/process list 做 membership，`context.lists` 与 Go `ConnOptions.Lists()` 不再只显示
 > 选中规则携带的 list；`RuntimeSnapshot::apply_route` 会在 Router 前填充 membership，Router
-> 再按 Go nested matcher 记录选中前已尝试的 route rule 和 `List/Net/Port/Geoip` history，
-> 即使后续 process/inbound 条件拒绝规则，已命中的 list 仍保留为 true；route-list membership
-> 单测、Router history 单测、RuntimeSnapshot process-gated 单测、完整 service-chain 和
-> Go/Rust parity 已通过。
+> 再按 Go nested matcher 的短路顺序记录选中前已尝试的 route rule 和
+> `List/Net/Port/Geoip` history；`all` 在第一个 false 子 matcher 处停止，`any` 则继续记录
+> 后续分支。缺失的 Go list 仍保留为 fail-closed 的 rule history，不会被误当成全局规则。
+> route-list membership 单测、Router history 单测、RuntimeSnapshot process-gated 单测、完整
+> service-chain 和 Go/Rust parity 已通过。
 >
 > **Fresh-state note:** Rust 的 Go 默认投影已补齐：首次初始化同步 `settings_kv`、
 > `route_extra`、`bootstrap.system=true`、LAN rule priority=1 和 Go 的 route preview，并移除
