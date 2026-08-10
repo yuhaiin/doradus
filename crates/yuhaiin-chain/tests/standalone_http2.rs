@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -7,6 +9,70 @@ use tokio::net::TcpListener;
 use tokio::time::timeout;
 use yuhaiin_chain::{ChainClient, ChainProxy};
 use yuhaiin_core::{Endpoint, Network};
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires the Go checkout and an available Go toolchain"]
+async fn legacy_go_http2_v1_client_round_trips_against_rust_server() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(socket).await.unwrap();
+        let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+        assert_eq!(request.method(), http::Method::CONNECT);
+        assert_eq!(request.uri().host(), Some("localhost"));
+
+        let mut body = request.into_body();
+        let mut send = respond.send_response(Response::new(()), false).unwrap();
+        while let Some(data) = body.data().await {
+            let data = data.unwrap();
+            body.flow_control().release_capacity(data.len()).unwrap();
+            send.send_data(data, false).unwrap();
+        }
+        send.send_data(Bytes::new(), true).unwrap();
+
+        while let Some(result) = connection.accept().await {
+            if result.is_err() {
+                break;
+            }
+        }
+    });
+
+    let helper =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/interop/http2_v1_go_client.go");
+    let go_root = std::env::var_os("YUHAIIN_GO_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/home/asutorufa/Documents/Programming/yuhaiin"));
+    let go_tmp = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from(".cache"))
+        .join("yuhaiin-rust/go-tmp/http2-v1");
+    std::fs::create_dir_all(&go_tmp).unwrap();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new("go")
+            .args(["run", helper.to_str().unwrap(), &address.to_string()])
+            .current_dir(go_root)
+            .env("GOEXPERIMENT", "jsonv2,greenteagc")
+            .env("GOTMPDIR", go_tmp)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        output.status.success(),
+        "Go HTTP/2 v1 interoperability failed: status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    timeout(Duration::from_secs(2), server)
+        .await
+        .expect("Rust H2 server did not close after Go v1 client")
+        .unwrap();
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn standalone_http2_matches_go_raw_connect_wire_contract() {

@@ -2660,3 +2660,27 @@ relay 关闭、shutdown 或远端流结束时会被回收；待发送数据只�
 
 这次修复确认的是窗口耗尽时的正确性和有界发送行为，不把单机 loopback 数值当作 Go/Rust
 跨机器性能结论；并发 stream、超长 soak 和 Android/macOS 设备验收仍按 checklist 保留。
+
+## 85. 2026-08-10 TUN abnormal termination and legacy Go HTTP/2 interoperability
+
+TUN 的正常 shutdown 已有进程级证据，但此前没有把“设备已经打开后宿主进程被强制终止，再
+用同一个 SQLite 和同名设备重新启动”固定为可复用 smoke。`scripts/integration/tun-service.sh`
+现在接受 `YUHAIIN_TUN_FORCE_STOP=1`：先在 privileged、`network=none` 的 Podman 容器中以
+较大的流量上限启动 runtime-owned TUN，等待 `runtime-tun-opened` 后发送 `SIGKILL` 并移除
+容器，再运行原有的正常流量/关闭断言。所有日志和状态仍位于 `~/.cache/yuhaiin-rust`，不
+使用 `/tmp`。
+
+实际执行 `YUHAIIN_TUN_FORCE_STOP=1 make tun-chain-service-smoke` 通过：第一次强制终止后，
+第二次仍使用 `yrtun0` 和同一 SQLite，成功完成 TUN → fixed → TLS → HTTP/2 → Yuubinsya
+TCP → loopback echo，输出 `runtime-tun-force-stop-ok`、`runtime-tun-opened`、
+`runtime-tun-traffic-ok` 和 `runtime-tun-closed`。这补强了设备/kernel namespace cleanup
+和数据库 takeover 的异常终止证据；超过 IPv6 有界重组上限的长 wire-fragment 进程测试及
+Android/macOS 设备仍保留在 checklist 的 `[~]`。
+
+同时新增 `crates/yuhaiin-chain/tests/interop/http2_v1_go_client.go` 与 ignored Rust
+integration test，使用 Go `golang.org/x/net/http2.Transport` 的旧 v1 client，通过
+`DialTLSContext` 接入 prior-knowledge HTTP/2 listener，发送 CONNECT body 并完整读取 Rust
+server 的 echo response。显式执行
+`cargo test -p yuhaiin-chain --test standalone_http2 --all-features --offline \
+legacy_go_http2_v1_client_round_trips_against_rust_server -- --exact --ignored --nocapture`
+通过，证明当前 Rust H2 CONNECT wire boundary 不只兼容 Go v2 helper，也兼容 Go v1 transport。
