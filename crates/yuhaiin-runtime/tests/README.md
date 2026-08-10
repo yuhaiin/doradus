@@ -42,6 +42,9 @@ The current scenarios cover:
 - authenticated SOCKS5 TCP inbound and Yuubinsya TCP inbound → direct echo in
   the same real runtime process, including protocol handshakes and live
   inbound/outbound metadata.
+- SOCKS5 inbound and Yuubinsya inbound → TLS + HTTP/2 + Yuubinsya outbound,
+  including domain targets, shared route match history, live connection
+  metadata, payload echo, and node latency in one runtime process.
 - TLS termination → HTTP proxy inbound → direct outbound, using the Go-shaped
   certificate transport configuration, a real Rust TLS client, CONNECT framing,
   payload echo, and live connection metadata. This is also available through

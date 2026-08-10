@@ -13,6 +13,8 @@
 
 > 2026-08-10 TUN 组合链路验收：新增 `make tun-chain-service-smoke`，在 privileged、`--network=none` 的 Podman 容器中用同一个 `inbound::run_until` 和 SQLite 配置验证真实 kernel TUN → `fixed` → RustCrypto TLS → HTTP/2 → Yuubinsya TCP → loopback echo。测试客户端写入后立即半关闭，修复并回归 HTTP/2 relay 只关闭请求方向、仍持续转发响应方向的语义；同时让 H2 server 等待 response bridge 排空，避免已回写的数据在 `serve_connect` 返回时被 abort。状态与日志统一放在 `~/.cache/yuhaiin-rust/integration/tun-chain-service`，不使用 `/tmp`。Android/macOS TUN fd/route/lifecycle 和 UDP 版 runtime chain 仍是独立验收项。
 
+> 2026-08-10 多 inbound 组合验收：`service_chain.rs` 新增同一真实 runtime 进程中的 SOCKS5 inbound、Yuubinsya inbound → TLS → HTTP/2 → Yuubinsya outbound 测试。两条 inbound 都使用域名目标进入共享 router，验证 payload echo、`connections` 的 inbound/outbound/mode/matchHistory 和 node latency，避免只证明 HTTP inbound 能工作而遗漏其他实际入口。
+
 > 2026-08-09 Go statistics takeover bridge：`yuhaiin-store` 新增 Go 统计表的 typed projection boundary。Rust 启动时在没有 `statistics.runtime` checkpoint 的情况下读取 `statistics_kv`、`traffic_hourly`、`connection_history`、`failed_connection_history` 以及 v6 telemetry dimension 表；`ConnectionMonitor` 的 history 按 Go 的 `(protocol, addr, process)` key 合并，并保留 `dumpProcessEnabled`、计数、最近时间和 JSON connection。正常 `shutdown()` 先写 Rust checkpoint，再在同一个 SQLite 写事务中替换 Go 兼容统计投影，使旧 Go 管理面可以继续看到最终 totals/traffic/history/telemetry。频繁写入仍使用紧凑 checkpoint，故 force-abort 后“checkpoint 可恢复”与“Go 统计表已更新”是两个明确边界，生产库版本矩阵和异常中断验证继续列在 checklist。
 
 > 2026-08-09 统计运行期投影：保留 2 秒级紧凑 `statistics.runtime` checkpoint 作为 crash recovery；checkpoint 成功后首次触发 Go 表投影，之后最多每 30 秒重写一次 `statistics_kv`、traffic/history/failure/telemetry 投影，避免每个 flow 都重写整套 Go 表。最终 shutdown 仍执行一次完整原子投影；异常中断时 Go 表只保证最近一次低频投影，完整恢复以 checkpoint 为准，跨进程可见性仍需 Podman/进程级验证。

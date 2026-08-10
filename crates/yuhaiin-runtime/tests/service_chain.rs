@@ -8,7 +8,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use yuhaiin_chain::AsyncYuubinsyaTcpSession;
-use yuhaiin_core::{Endpoint, Network};
+use yuhaiin_core::{DomainName, Endpoint, Network};
 
 use support::{
     ConnectFixture, H2FinalProtocol, H2ProtocolFixture, H2YuubinsyaFixture, ServiceProcess,
@@ -674,6 +674,142 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
 
     service.shutdown().await;
     fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socks5_and_yuubinsya_inbounds_route_through_tls_h2_yuubinsya_outbound() {
+    let fixture = H2YuubinsyaFixture::start().await;
+    let _default_mixed_blocker = tokio::net::TcpListener::bind("127.0.0.1:1080").await.ok();
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_inbound = http_listener.local_addr().unwrap();
+    drop(http_listener);
+    let socks5_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks5_inbound = socks5_listener.local_addr().unwrap();
+    drop(socks5_listener);
+    let yuubinsya_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yuubinsya_inbound = yuubinsya_listener.local_addr().unwrap();
+    drop(yuubinsya_listener);
+
+    let root = integration_dir("service-required-inbounds-tls-h2-yuubinsya");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_tls_h2_yuubinsya_chain(&service, http_inbound, fixture.outbound).await;
+    add_socks5_inbound(
+        &service,
+        "tls-h2-yuubinsya-socks5-in",
+        socks5_inbound,
+        "integration-user",
+        "integration-password",
+    )
+    .await;
+    add_yuubinsya_inbound(&service, "tls-h2-yuubinsya-yuubinsya-in", yuubinsya_inbound).await;
+
+    let authority = format!("example.test:{}", fixture.target.port());
+    let mut socks5 = connect_loopback(socks5_inbound).await;
+    socks5.write_all(&[5, 1, 2]).await.unwrap();
+    let mut method = [0u8; 2];
+    socks5.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [5, 2]);
+    let username = b"integration-user";
+    let password = b"integration-password";
+    let mut auth = vec![1, username.len() as u8];
+    auth.extend_from_slice(username);
+    auth.push(password.len() as u8);
+    auth.extend_from_slice(password);
+    socks5.write_all(&auth).await.unwrap();
+    let mut auth_reply = [0u8; 2];
+    socks5.read_exact(&mut auth_reply).await.unwrap();
+    assert_eq!(auth_reply, [1, 0]);
+    let host = b"example.test";
+    let mut request = vec![5, 1, 0, 3, host.len() as u8];
+    request.extend_from_slice(host);
+    request.extend_from_slice(&fixture.target.port().to_be_bytes());
+    socks5.write_all(&request).await.unwrap();
+    read_socks5_reply(&mut socks5).await;
+    let socks5_payload = b"socks5-to-tls-h2-yuubinsya";
+    socks5.write_all(socks5_payload).await.unwrap();
+    let mut socks5_echo = vec![0u8; socks5_payload.len()];
+    socks5.read_exact(&mut socks5_echo).await.unwrap();
+    assert_eq!(&socks5_echo, socks5_payload);
+
+    let yuubinsya_stream = connect_loopback(yuubinsya_inbound).await;
+    let mut yuubinsya = AsyncYuubinsyaTcpSession::connect(
+        yuubinsya_stream,
+        yuhaiin_core::yuubinsya::derive_salt(YUUBINSYA_PASSWORD.as_bytes()),
+        Endpoint::domain(
+            Network::Tcp,
+            DomainName::new("example.test").unwrap(),
+            fixture.target.port(),
+        ),
+    )
+    .await
+    .unwrap();
+    let yuubinsya_payload = b"yuubinsya-to-tls-h2-yuubinsya";
+    yuubinsya.write_all(yuubinsya_payload).await.unwrap();
+    let mut yuubinsya_echo = vec![0u8; yuubinsya_payload.len()];
+    yuubinsya.read_exact(&mut yuubinsya_echo).await.unwrap();
+    assert_eq!(&yuubinsya_echo, yuubinsya_payload);
+
+    let connections = wait_for_connection(&service.client, &service.base_url).await;
+    let connections = connections["connections"].as_array().unwrap();
+    for (inbound, protocol) in [
+        ("tls-h2-yuubinsya-socks5-in", "socks5"),
+        ("tls-h2-yuubinsya-yuubinsya-in", "yuubinsya"),
+    ] {
+        let item = connections
+            .iter()
+            .find(|item| item["inboundName"] == inbound)
+            .unwrap_or_else(|| panic!("connection for {inbound} is missing"));
+        assert_eq!(item["inbound"], protocol);
+        assert_eq!(item["outbound"], "tls-h2-yuubinsya-out");
+        assert_eq!(item["mode"], "proxy");
+        assert!(item["matchHistory"].as_array().is_some_and(|history| {
+            history
+                .iter()
+                .any(|entry| entry["ruleName"] == "proxy-example-test-over-yuubinsya")
+        }));
+    }
+
+    let latency = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes/tls-h2-yuubinsya-out/latency",
+        Some(&json!({
+            "type":"tcp",
+            "url":format!("http://{authority}/health")
+        })),
+    )
+    .await;
+    assert_eq!(
+        latency["ok"], true,
+        "multi-inbound chain latency: {latency}"
+    );
+
+    yuubinsya.shutdown().await.unwrap();
+    socks5.shutdown().await.unwrap();
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+async fn read_socks5_reply(stream: &mut TcpStream) {
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).await.unwrap();
+    assert_eq!(header[..3], [5, 0, 0]);
+    let address_length = match header[3] {
+        1 => 4,
+        3 => {
+            let mut length = [0u8; 1];
+            stream.read_exact(&mut length).await.unwrap();
+            usize::from(length[0])
+        }
+        4 => 16,
+        atyp => panic!("unexpected SOCKS5 reply address type {atyp}"),
+    };
+    let mut address_and_port = vec![0u8; address_length + 2];
+    stream.read_exact(&mut address_and_port).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
