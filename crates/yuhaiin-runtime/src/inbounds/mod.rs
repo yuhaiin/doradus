@@ -856,6 +856,16 @@ impl InboundSpec {
         if context.local_addr.is_none() {
             context.local_addr = Some(Endpoint::ip(context.network, self.listen));
         }
+        if self
+            .transports
+            .iter()
+            .any(|transport| transport.eq_ignore_ascii_case("tls"))
+        {
+            // Go's inbound sniffer observes the raw connection before the
+            // TLS listener unwraps it, so TLS has precedence over the
+            // application protocol carried inside the encrypted stream.
+            context.protocol = Some("tls".to_owned());
+        }
         if !self.outbound_id.is_empty() {
             context.outbound = Some(self.outbound_id.clone());
         }

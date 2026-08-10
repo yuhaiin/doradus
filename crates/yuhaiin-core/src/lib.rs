@@ -319,6 +319,11 @@ pub struct FlowContext {
     pub inbound_name: Option<String>,
     pub outbound: Option<String>,
     pub outbound_name: Option<String>,
+    /// Application protocol discovered while accepting or sniffing a flow.
+    /// This is intentionally separate from `network`: Go's connection API
+    /// reports values such as `http`/`tls` here, and leaves it empty when no
+    /// protocol was identified.
+    pub protocol: Option<String>,
     /// Protocol metadata discovered while accepting or sniffing a flow.
     pub tls_server_name: Option<String>,
     pub http_host: Option<String>,
@@ -362,6 +367,7 @@ impl FlowContext {
             inbound_name: None,
             outbound: None,
             outbound_name: None,
+            protocol: None,
             tls_server_name: None,
             http_host: None,
             interface: None,

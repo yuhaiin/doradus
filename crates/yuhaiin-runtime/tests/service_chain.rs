@@ -76,6 +76,7 @@ async fn tls_http_inbound_terminates_tls_and_routes_through_direct_outbound() {
         .expect("TLS HTTP inbound connection must be visible");
     assert_eq!(item["inbound"], "http");
     assert_eq!(item["outbound"], "tls-inbound-direct");
+    assert_eq!(item["protocol"], "tls");
 
     client.shutdown().await.unwrap();
     service.shutdown().await;
@@ -256,6 +257,7 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
     assert_eq!(item["mode"], "proxy");
     assert_eq!(item["localAddr"], inbound.to_string());
     assert_eq!(item["network"]["underlyingType"], "tcp");
+    assert_eq!(item["protocol"], "http");
     assert!(item["matchHistory"].as_array().is_some_and(|history| {
         history
             .iter()

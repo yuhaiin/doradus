@@ -63,6 +63,9 @@ where
         let mut context = FlowContext::new(destination.clone());
         context.source = Some(source);
         context.original_domain = destination.host().cloned();
+        // The HTTP proxy consumes the CONNECT request before the shared relay
+        // can sniff it, so preserve the application protocol explicitly.
+        context.protocol = Some("http".to_owned());
         spec.annotate_context(&mut context);
         selector.route_context(&mut context);
         let proxy = selector.select(&context);
@@ -99,6 +102,7 @@ where
     let mut context = FlowContext::new(destination.clone());
     context.source = Some(source);
     context.original_domain = destination.host().cloned();
+    context.protocol = Some("http".to_owned());
     context.http_host = yuhaiin_core::sniff::http_host(headers.as_bytes());
     spec.annotate_context(&mut context);
     selector.route_context(&mut context);

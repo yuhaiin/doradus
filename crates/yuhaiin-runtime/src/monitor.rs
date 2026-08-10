@@ -1269,7 +1269,7 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         "tag": context.tag.as_deref().unwrap_or_default(),
         "nodeId": context.outbound.as_deref().unwrap_or_default(),
         "nodeName": context.outbound_name.as_deref().unwrap_or_default(),
-        "protocol": flow.key.network.to_string(),
+        "protocol": context.protocol.as_deref().unwrap_or_default(),
         "process": context.process.as_deref().unwrap_or_default(),
         "pid": context.process_id.map(|value| value.to_string()).unwrap_or_default(),
         "uid": context.user_id.map(|value| value.to_string()).unwrap_or_default(),
@@ -1787,6 +1787,7 @@ mod tests {
             "127.0.0.1:1080".parse().unwrap(),
         ));
         context.hosts = Some("hosts".to_owned());
+        context.protocol = Some("http".to_owned());
         context.tls_server_name = Some("example.com".to_owned());
         context.http_host = Some("example.com:443".to_owned());
         context.interface = Some("eth0".to_owned());
@@ -1800,6 +1801,7 @@ mod tests {
         assert_eq!(connection["outboundGeo"], "US");
         assert_eq!(connection["localAddr"], "127.0.0.1:1080");
         assert_eq!(connection["network"]["underlyingType"], "tcp");
+        assert_eq!(connection["protocol"], "http");
     }
 
     #[test]
@@ -2045,7 +2047,9 @@ mod tests {
         monitor.closed(flow.key);
 
         let value = monitor.block_history_value();
-        assert_eq!(value["items"][0]["protocol"], "tcp");
+        // History uses the same application-protocol field as connections;
+        // an un-sniffed blocked flow must not fall back to its TCP transport.
+        assert_eq!(value["items"][0]["protocol"], "");
         assert_eq!(value["items"][0]["host"], "blocked.example");
         assert_eq!(value["items"][0]["blockCount"], "2");
         assert_eq!(value["dumpProcessEnabled"], false);

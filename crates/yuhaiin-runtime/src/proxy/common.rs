@@ -193,6 +193,15 @@ where
     if context.http_host.is_none() {
         context.http_host = metadata.http_host;
     }
+    if context.protocol.is_none() {
+        context.protocol = if context.tls_server_name.is_some() {
+            Some("tls".to_owned())
+        } else if context.http_host.is_some() {
+            Some("http".to_owned())
+        } else {
+            None
+        };
+    }
     let left = PrefixedStream::new(sniffed, left);
     let _observation = FlowObserverGuard::open(monitor.clone(), TunFlow { key: flow }, context);
     let (mut left_read, mut left_write) = split(left);
@@ -493,6 +502,10 @@ mod tests {
         assert_eq!(
             monitor.connections_value()["connections"][0]["httpHost"],
             "example.com"
+        );
+        assert_eq!(
+            monitor.connections_value()["connections"][0]["protocol"],
+            "http"
         );
 
         remote.write_all(b"ok").await.unwrap();
