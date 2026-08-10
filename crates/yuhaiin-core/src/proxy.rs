@@ -5,9 +5,12 @@
 //! without Tokio. UDP/Yuubinsya are separate boundaries and do not share this
 //! TCP handshake state.
 
+use std::any::Any;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -18,7 +21,7 @@ use crate::{DomainName, Endpoint, Error, ErrorKind, Result};
 use crate::{BoxFuture, FlowContext, Network};
 
 #[cfg(feature = "async-proxy")]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 pub trait StreamConnector: Send + Sync {
     fn connect(&self, destination: &Endpoint) -> Result<TcpStream>;
@@ -433,13 +436,94 @@ impl StreamConnector for FixedProxy {
 }
 
 #[cfg(feature = "async-proxy")]
-pub trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send + Any {
+    fn as_any(&self) -> &dyn Any;
+}
 
 #[cfg(feature = "async-proxy")]
-impl<T> AsyncStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T> AsyncStream for T
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + Any,
+{
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 #[cfg(feature = "async-proxy")]
 pub type BoxAsyncStream = Box<dyn AsyncStream>;
+
+/// Preserve the socket's local endpoint while protocol layers replace the
+/// concrete stream type (TLS, HTTP/2, Yuubinsya, and WebSocket all do this).
+/// The runtime uses this metadata for loopback protection; it is deliberately
+/// optional because in-memory test streams do not have a socket endpoint.
+#[cfg(feature = "async-proxy")]
+pub struct LocalAddrStream {
+    inner: BoxAsyncStream,
+    local_addr: SocketAddr,
+}
+
+#[cfg(feature = "async-proxy")]
+impl LocalAddrStream {
+    pub fn new(inner: BoxAsyncStream, local_addr: SocketAddr) -> Self {
+        Self { inner, local_addr }
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+}
+
+#[cfg(feature = "async-proxy")]
+impl AsyncRead for LocalAddrStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buffer)
+    }
+}
+
+#[cfg(feature = "async-proxy")]
+impl AsyncWrite for LocalAddrStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, data)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(feature = "async-proxy")]
+pub fn stream_local_addr(stream: &dyn AsyncStream) -> Option<SocketAddr> {
+    stream
+        .as_any()
+        .downcast_ref::<LocalAddrStream>()
+        .map(LocalAddrStream::local_addr)
+}
+
+#[cfg(feature = "async-proxy")]
+pub fn with_stream_local_addr(
+    stream: BoxAsyncStream,
+    local_addr: Option<SocketAddr>,
+) -> BoxAsyncStream {
+    match local_addr {
+        Some(local_addr) if stream_local_addr(&*stream).is_none() => {
+            Box::new(LocalAddrStream::new(stream, local_addr))
+        }
+        _ => stream,
+    }
+}
 
 #[cfg(feature = "async-proxy")]
 pub trait AsyncDatagram: Send + Sync {
@@ -518,7 +602,13 @@ impl AsyncProxy for DirectAsyncProxy {
                 match connect_tokio_tcp(address, context.local_bind_for(address), self.timeout)
                     .await
                 {
-                    Ok(stream) => return Ok(Box::new(stream) as BoxAsyncStream),
+                    Ok(stream) => {
+                        let local_addr = stream.local_addr().ok();
+                        return Ok(with_stream_local_addr(
+                            Box::new(stream) as BoxAsyncStream,
+                            local_addr,
+                        ));
+                    }
                     Err(error) => last_error = Some(error),
                 }
             }
@@ -647,7 +737,11 @@ impl AsyncProxy for FixedAsyncProxy {
         let local_bind = context.local_bind_for(self.address);
         Box::pin(async move {
             let stream = connect_tokio_tcp(self.address, local_bind, self.timeout).await?;
-            Ok(Box::new(stream) as BoxAsyncStream)
+            let local_addr = stream.local_addr().ok();
+            Ok(with_stream_local_addr(
+                Box::new(stream) as BoxAsyncStream,
+                local_addr,
+            ))
         })
     }
 
@@ -697,7 +791,11 @@ impl AsyncProxy for BlockingStreamProxy {
             let stream = tokio::net::TcpStream::from_std(stream).map_err(|error| {
                 Error::new(ErrorKind::Io, format!("proxy Tokio stream: {error}"))
             })?;
-            Ok(Box::new(stream) as BoxAsyncStream)
+            let local_addr = stream.local_addr().ok();
+            Ok(with_stream_local_addr(
+                Box::new(stream) as BoxAsyncStream,
+                local_addr,
+            ))
         })
     }
 
@@ -753,7 +851,11 @@ impl AsyncProxy for Socks5AsyncProxy {
             })
             .await
             .map_err(|_| Error::new(ErrorKind::Timeout, "SOCKS5 CONNECT timed out"))??;
-            Ok(Box::new(result) as BoxAsyncStream)
+            let local_addr = result.local_addr().ok();
+            Ok(with_stream_local_addr(
+                Box::new(result) as BoxAsyncStream,
+                local_addr,
+            ))
         })
     }
 
@@ -1499,6 +1601,20 @@ mod tests {
 
     fn endpoint() -> Endpoint {
         Endpoint::domain(Network::Tcp, DomainName::new("example.com").unwrap(), 443)
+    }
+
+    #[cfg(feature = "async-proxy")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_stream_metadata_survives_async_io_delegation() {
+        let (mut peer, stream) = tokio::io::duplex(64);
+        let local = "127.0.0.1:24568".parse().unwrap();
+        let mut stream = with_stream_local_addr(Box::new(stream), Some(local));
+        assert_eq!(stream_local_addr(&*stream), Some(local));
+
+        peer.write_all(b"ping").await.unwrap();
+        let mut buffer = [0; 4];
+        stream.read_exact(&mut buffer).await.unwrap();
+        assert_eq!(&buffer, b"ping");
     }
 
     #[test]

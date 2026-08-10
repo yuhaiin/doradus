@@ -2,371 +2,315 @@
 
 更新时间：2026-08-10
 
-这份文件是“当前实现状态”的唯一入口；详细迁移设计、Go 源码映射和历史验收记录放在 [MIGRATION.md](MIGRATION.md)。这里不再使用 P0/P1/P2，所有事项按模块组织。
+这份文件只回答四个问题：现在有什么、完成到哪里、还缺什么、下一步怎么验收。
+Go 源码映射、设计取舍和历史结果放在 [MIGRATION.md](MIGRATION.md)，不在这里重复堆长段落。
 
-状态含义：
+## 读法与总体进度
 
-- `[x]` 已实现，并有自动化测试或运行验收。
-- `[~]` 主路径已实现，但仍有明确的兼容、平台或生产验收缺口。
-- `[ ]` 尚未实现。
-- `不适用` 表示 Go 当前版本没有对应能力，不能把它当作 Rust 缺口。
-- `延期` 表示当前范围明确不阻塞 Rust 替换 Go；不是“忘记了”。
+- `[x]`：功能已实现，并有单元测试或进程级验收。
+- `[~]`：主路径可用，但仍有明确的兼容、平台、生产或现场验收缺口。
+- `[ ]`：尚未实现。
+- `延期`：按当前范围暂不阻塞 Rust 替换；不是“忘记了”。
+- `不适用`：Go 当前版本没有对应能力。
 
-## 当前迁移覆盖率
+| 指标 | 当前值 |
+| --- | ---: |
+| 当前替换范围 | 66 项 |
+| 已完成 `[x]` | 53 项（80.3%） |
+| 主路径完成 `[~]` | 13 项（19.7%） |
+| 加权覆盖率 | **90.2%**（`(53 + 13 × 0.5) / 66`） |
+| 明确延期 | 订阅、DoQ/DoH3、Shadowsocks/SSR、Tailscale、Reality、Mux、QUIC 等复杂协议 |
+| 当前总体状态 | **未完成**：Linux 主链路已可运行，平台/生产/少数边界证据仍缺 |
 
-> 更新时间：2026-08-10。这个百分比按本文件的“功能条目”计算，不是代码行数、性能比例或最终质量分数。
-
-| 指标 | 数值 | 说明 |
-| --- | ---: | --- |
-| 当前范围条目 | 66 | `[x]` 已实现 + `[~]` 主路径已实现但仍有缺口；明确 `延期`/`不适用` 不计入当前替换范围 |
-| 完成条目 | 53 / 66 | `[x]`，80.3% |
-| 部分完成条目 | 13 / 66 | `[~]`，19.7%；每个部分完成条目按 50% 计入加权覆盖率 |
-| 加权迁移覆盖率 | **59.5 / 66 = 90.2%** | `(53 + 13 × 0.5) / 66` |
-| 明确延期 | 4 | 订阅、DoQ/DoH3、Shadowsocks/SSR、低频复杂协议等，不阻塞当前主路径 |
-| Go 没有对应能力 | 1 | 本地 DoH 管理端点 |
-
-模块分布如下；“覆盖率”沿用同一规则，因此能直接看出剩余工作集中在哪里：
-
-| 模块 | `[x]` | `[~]` | 当前覆盖率 | 主要剩余边界 |
-| --- | ---: | ---: | ---: | --- |
-| 公共核心/workspace | 3 | 0 | 100.0% | Android/macOS 权限与设备验收 |
-| SQLite 配置与状态 | 4 | 1 | 90.0% | 更多生产版本、未建模表、异常快照 |
-| FakeIP | 3 | 1 | 87.5% | 更多生产数据样本 |
-| DNS resolver/server | 6 | 0 | 100.0% | DoQ/DoH3 明确延期；更多生产异常快照 |
-| Router/Trie/GeoIP | 5 | 0 | 100.0% | 发布策略中的数据库更新验收 |
-| Proxy/transport | 20 | 2 | 95.5% | raw standalone HTTP/2 不携带目标地址、Linux transparent UDP、平台 listen 绑定、复杂协议 |
-| NAT | 3 | 1 | 87.5% | Android/macOS route/NAT 生命周期 |
-| TUN inbound | 4 | 2 | 83.3% | namespace 长矩阵、Android/macOS 实机 |
-| 管理 API/connections/统计 | 3 | 3 | 75.0% | 已补真实 node/inbound/route reload→数据面与统计→重启读回，并以独立 Go/Rust SQLite 副本逐响应验证核心 mutation、settings/backup/inbound config/hosts/FakeDNS/server/route config/list config、原生 publishes CRUD/resolve、update.status 和 users CRUD；users 已使用 Go refact-user schema-v6 的原生表，出站节点 `userId` 在 runtime snapshot 中解析为临时凭据，HTTP/SOCKS5/mixed、Yuubinsya TCP/UOT/native UDP、Trojan/AEAD inbound 已消费中心认证快照；新增真实 Linux 进程级 process + inbound matcher 链路，确认 selector 选中 HTTP outbound 时保留 route-list membership 和 match history；仍需更多生成客户端语义、users 边界、错误矩阵和并发统计锁竞争 |
-| 平台与发布 | 2 | 3 | 70.0% | Android/macOS 实机、service-manager 现场回滚 |
-
-覆盖率不会把 `[~]` 自动改成 `[x]`；只有对应的测试、进程级验证或平台证据完成后才更新条目状态。
-
-## 当前模块执行面板
-
-下面只列仍会产生实际工作量的项目；已经通过主路径验收的能力保留在后面的模块证据表中。每一项都对应一个可直接执行的下一步，避免把多个不相关缺口塞进一行。
-
-| 模块 | 当前状态 | 下一步可执行项 | 验收证据 |
-| --- | --- | --- | --- |
-| SQLite / 生产库 | `[~]` | 增加更多生产版本快照；逐表核对 route/resolver projection；补异常关闭后的未建模表检查 | 默认 3 份真实快照已通过 `make production-parity-smoke`；Rust 启动现在按 Go 的 4 MiB 或 10% freelist 阈值 checkpoint/VACUUM；store fixture tests |
-| FakeIP | `[~]` | 增加真实生产 FakeIP 表快照，并验证双栈池容量/TTL/重启后的分配稳定性 | FakeIP store tests + Go state takeover |
-| Linux transparent inbound | `[~]` | 在具备 `CAP_NET_ADMIN` 的独立 namespace 中验证 TPROXY UDP；继续补多 flow 的异常关闭矩阵 | 默认 `make transparent-service-smoke` 已真实验证隔离 namespace REDIRECT IPv4 TCP：非 root client → Rust redir → `SO_ORIGINAL_DST` → direct outbound → 同一 listener 上两条 TCP flow → echo，并检查累计 upload/download counters、shutdown；`YUHAIIN_TRANSPARENT_IPV6=1 make transparent-service-smoke` 又验证 IPv4+IPv6 共四条 flow 和 `IP6T_SO_ORIGINAL_DST`。auto 模式明确 skip TPROXY；rootless 下显式 gate 现在在启动容器前以 exit 77 明确拒绝，不能替代 rootful/宿主机 `CAP_NET_ADMIN` 的 TPROXY UDP 与异常 teardown |
-| TUN / NAT | `[~]` | Linux MTU 边界矩阵、1 MiB 内容校验长流、IPv4/IPv6 out-of-order fragment 重组和 TUN→TLS→HTTP/2→Yuubinsya 长流已通过；继续补 namespace teardown、超过有界重组上限的 wire-fragment 长流，以及 Android VpnService fd 和 macOS utun 实机验收 | `tun-long-service-smoke`、`tun-chain-service.sh`、`tun-mtu.sh`、`p0_tun`、`dispatcher_reassembles_out_of_order_ipv4_udp_fragments`、`ipv6_fragment_reassembler_reassembles_out_of_order_udp`、平台设备日志 |
-| API / reload | `[~]` | 已覆盖 node/user/inbound/resolver/route mutation 后新数据面切换、central basic user 的真实 HTTP inbound create/update/delete 认证 reload、latency、traffic/history 和同库重启读回；Go/Rust parity 已覆盖核心 node/inbound/resolver/route mutation，以及前端配置 API 的独立副本闭环；错误矩阵已严格对照 HTTP status/RPC code，Go typed request 的缺失字段零值和空 `connections.close` 也已对齐；`route.rules.test` 现在支持嵌套 `all` 的多个正向 host/CIDR 约束并保留 Go 短路 history；socket-backed inbound 的 `connections.localAddr`、`network.underlyingType`、应用层 `protocol` 和实际出站 `outbound` endpoint 已按 Go 语义输出，`nodeId/nodeName` 保留节点身份，未识别协议保持空值；SSE 现在同时覆盖初始快照和真实 live `connections_added`/`connections_removed`；这些均由 monitor/selector 单测及真实 HTTP/TLS/H2/Yuubinsya 集成测试断言；剩余是更多 process/inbound/negative matcher、users 边界和生产快照 | `api-reload-flow.sh`、`api-contract.sh`、`go-api-parity.sh`、`service-chain.sh` |
-| connections / statistics | `[~]` | 已补 Go daily telemetry bucket 的区间重叠语义：SQLite/checkpoint 保留 hourly/daily span，半天范围查询不再丢失前一天数据；继续增加 production telemetry 快照，并逐字段核对长时间范围与升级期间锁竞争 | `monitor_telemetry_includes_daily_buckets_that_overlap_a_partial_day`、store statistics tests、`stats-concurrency.sh`（并发读取、优雅重启、force-stop 后同库接管）、`go-rust-stats.sh` |
-| 更新 / 发布 | `[~]` | service manager 命令已经实现：Linux systemd 的 install/uninstall/start/stop/restart 与 macOS LaunchDaemon 的对应生命周期均生成原生配置并做原子写入；继续在至少一种 systemd 和一种 launchd 环境做替换、回滚、SIGTERM 和备份恢复演练 | `src/bin/service/mod.rs` 单测、`docs/RELEASE_REPLACEMENT.md`、现场 service-manager smoke |
-| Android | `[~]` | 真机验证 VpnService fd、权限、route 生命周期和电量/RSS | Android instrumentation/runtime log |
-| macOS | `[~]` | 获得 SDK/clang 后编译 runtime，验证 utun、权限、route、LaunchDaemon 和 SIGTERM | macOS target check + runtime log |
-| 明确延期 | `延期` | subscriptions、DoQ/DoH3、Shadowsocks/SSR、Tailscale/WireGuard/Reality/Mux/QUIC 不阻塞当前替换 | 需求变更时单独建项 |
-
-H2 relay 的大流量正确性和 producer-side backpressure 已完成：`send_h2_data` 只在
-h2 分配发送窗口后提交固定大小 frame，并由独立发送 task 等待窗口，避免停止消费反向
-流导致全双工死锁。64 MiB Podman benchmark 已通过，TLS/H2/Yuubinsya peak RSS 为
-`18,904 KiB`；对应的窗口阻塞单测和 service-chain/TUN-chain 进程验证也已通过。后续
-仍可在更多并发 stream 和长时间运行场景中补充性能样本，但不再有当前 H2 adapter 收尾项。
-
-### 本轮执行顺序
-
-> 2026-08-10 API 错误矩阵已通过：证据位于
-> `~/.cache/yuhaiin-rust/integration/go-api-error-matrix-7`。它覆盖非对象请求、缺失/不存在
-> 资源、统计范围、telemetry limit、连接关闭、route test/priority、backup restore 和
-> deferred subscription update；status/code 严格比较，校验 message 仅归一化 Go 类型名等实现
-> 细节。API 项仍保持 `[~]`，复杂 matcher history、完整 response 字段和更多生产快照未完成。
-
-> **2026-08-10 集成复核：** `production-parity.sh` 对 `tmp/v2/state.db`、`tmp/yuhaiin/state.db`
-> 和 `tmp/aws/yuhaiin/state.db` 三份停止快照全部通过，日志位于
-> `~/.cache/yuhaiin-rust/production-parity-current`；`stats-concurrency.sh` 的并发读取/重启
-> 通过；`transparent-service.sh` 的 REDIRECT TCP 通过并明确记录 rootless 下 TPROXY UDP skip；
-> runtime-owned TUN、启动日志也通过。上一轮 TUN benchmark 为 36.87 MiB/s、peak RSS 12,456 KiB；本轮
-> release HTTP benchmark 为 HTTP CONNECT 116.14 MiB/s、peak RSS 17,516 KiB；TLS/H2/Yuubinsya 为
-> 19.59 MiB/s、peak RSS 19,120 KiB。旧的 HTTP benchmark 数值仍保留在 MIGRATION 历史章节，不能混作当前基线；
-> TUN benchmark 为 36.87 MiB/s、peak RSS 12,456 KiB；证据位于
-> `~/.cache/yuhaiin-rust/benchmarks/{http-throughput-current,tun-throughput-current}`。随后
-> `tun-mtu.sh` 在 privileged Podman 中用独立设备和 SQLite 状态通过了 576、1280、1500、9000、
-> 9216 五个 MTU 用例，日志位于 `~/.cache/yuhaiin-rust/integration/tun-mtu-current`。
-
-> **2026-08-10 users/runtime 复核：** users native store/API 的 credential variant、分页、引用冲突、
-> `userId` 出站解析和 secret 不回写单测通过；第一次生产 parity 启动发现 SSR 的内部
-> `protocol=auth_aes128_sha1` 被错误当作代理类型，已改为优先继承链层 `type` 并回归。修复后
-> `make production-parity-smoke` 对三份停止生产快照全部通过，`make build` 产出
-> `~/.cache/yuhaiin-rust/cargo-target/debug/yuhaiin`。inbound 中心用户认证已覆盖 HTTP/SOCKS5/mixed、
-> Yuubinsya TCP/UOT/native UDP、Trojan 请求头和 AEAD TCP transport；refact-user Go handler 逐响应
-> parity 及更广的 inbound 负向矩阵仍保持 `[~]`。
+### 主链路
 
 ```mermaid
 flowchart LR
-    A[生产快照与 API 长生命周期] --> B[统计 telemetry 字段与锁竞争]
-    B --> C[Linux TPROXY / redir namespace]
-    C --> D[TUN MTU / namespace teardown]
-    D --> E[Android / macOS 实机验收]
-    E --> F[发布替换与回滚演练]
-```
-
-每完成一项，先补对应自动化证据，再只修改该项状态；不因单元测试通过而把平台或生产验收提前标成 `[x]`。
-
-## 替换目标
-
-Rust 服务必须能够复用现有 `yuhaiin-react`，从 inbound 到 outbound 经过同一个 snapshot/router/monitor 链路：
-
-```mermaid
-flowchart LR
-    UI[yuhaiin-react] --> API[管理 API / RPC]
-    API --> STORE[(rusqlite bundled SQLite)]
-    STORE --> SNAP[RuntimeSnapshot 原子 reload]
-    IN[TUN / SOCKS5 / HTTP / Yuubinsya / reverse inbound] --> FLOW[FlowContext]
-    FLOW --> ROUTER[域名/CIDR/Geo Router]
+    UI[yuhaiin-react] --> API[HTTP API / RPC]
+    API --> DB[(Go-compatible SQLite)]
+    DB --> SNAP[RuntimeSnapshot + atomic reload]
+    IN[TUN / SOCKS5 / HTTP / Yuubinsya / reverse] --> FLOW[FlowContext]
+    FLOW --> ROUTER[domain / CIDR / GeoIP / loopback]
     ROUTER --> OUT[direct / fixed / HTTP / SOCKS5 / TLS / HTTP2 / Yuubinsya]
-    OUT --> MON[connections / history / traffic / SSE]
-    MON --> STORE
+    OUT --> MON[connections / traffic / history / SSE]
+    MON --> DB
     SNAP --> IN
     SNAP --> ROUTER
     SNAP --> OUT
 ```
 
-当前总体结论：`[~]`。Linux 单一路径的数据面、管理面、SQLite、FakeIP、DNS、Router、NAT、核心代理组合和 Rust-native pprof 已能运行；完整替换仍受平台路径、少数低频兼容协议、发布切换手册和订阅等明确缺口限制。
-
 ## 1. 公共核心与 workspace
 
-| 状态 | 模块 | Rust 位置 | 当前结果 | 剩余工作 |
-| --- | --- | --- | --- | --- |
-| `[x]` | workspace 分层 | `crates/yuhaiin-core`, `chain`, `protocol`, `store`, `geo`, `trie`, `runtime` | 共用类型、proxy/transport、存储、路由、运行时边界已拆开；HTTP API 复用 store/runtime struct | Android/macOS 的权限、TUN fd/route 和实机验收 |
-| `[x]` | Flow/Proxy contract | `yuhaiin-core::FlowContext`, `proxy::{AsyncProxy,AsyncDatagram,AsyncProxySelector}` | TCP、UDP、ping、close、取消、timeout、backpressure 统一到一个可扩展边界；透明/SOCKS5/Yuubinsya/Trojan UDP flow 显式持有并回收 receiver task | 少数协议专属错误语义继续补齐 |
-| `[x]` | 纯 Rust 网络基础 | core 的 DNS/TUN/NAT/protocol，以及 `socket2` | 默认不引入 TLS/OpenSSL/C 网络绑定；SQLite bundled C binding 是批准的例外 | 不为不需要的 Go 包机械复刻 |
+### 已完成
+
+- `[x]` crate 边界：`yuhaiin-core`、`chain`、`protocol`、`store`、`geo`、`trie`、`runtime`。
+- `[x]` 共用 `FlowContext`、`Endpoint`、`AsyncProxy`、`AsyncDatagram`、selector、错误和超时边界。
+- `[x]` 默认网络基础使用 Rust 实现；SQLite 的 `rusqlite + bundled SQLite` 是明确批准的 C binding 例外。
+
+### 未完成与下一步
+
+- 无 Linux 主路径缺口。
+- Android/macOS 的权限、设备 fd、route 和真实生命周期归入第 10 节验收。
 
 ## 2. SQLite 配置与状态
 
-| 状态 | 功能 | 位置 | 验收 |
-| --- | --- | --- | --- |
-| `[x]` | 经过验证的 SQLite 后端 | `crates/yuhaiin-store/src/sqlite.rs` | `rusqlite 0.40 + bundled SQLite`；WAL/NORMAL、busy timeout、quick_check、backup/restore、资源 probe |
-| `[x]` | schema/migration | `schema.rs`, `migration.rs` | Rust schema v3、Go v1/v5/v6 compatibility、未来版本 fail-closed、事务回滚/修复重试 |
-| `[x]` | typed repository | `repository.rs` | nodes、inbounds、resolvers、routes、lists、tags、settings、NAT、MaxMind、FakeIP 读写；未知 Go JSON 保留 |
-| `[x]` | 并发与异常终止 | `src/tests`, `tests/cross_process` | WAL 多进程 writer/reader、未提交事务 force-stop、sidecar lock、损坏库 fail-closed |
-| `[~]` | 真实生产库兼容覆盖 | store/runtime tests | 已有真实 Go v5/v6-shaped fixture 和 415MB 导出；默认 `production-parity-smoke` 已对 `tmp/v2/state.db`、`tmp/yuhaiin/state.db`、`tmp/aws/yuhaiin/state.db` 三份停止快照完成 Go/Rust 双进程、逐操作 API 对照；覆盖 nodes、resolvers、inbounds、route rules/lists、settings、统计、FakeDNS、hosts、server、interfaces、licenses；Rust 现在能直接把旧 Go v1 `nodes/inbounds/route_lists/node_tags` 投影为 v2 contract，并在 `YUHAIIN_GO_LEGACY_PRODUCTION_DB=.../tmp/state.db` 的真实 store/runtime ignored snapshot 中按源表行数和 runtime snapshot 构建验证，保留原表/未知 JSON/selected-node metadata；修复了旧 telemetry migration ledger、partial network_split、带端口 dns_hosts、禁用 FakeIP 空 CIDR、route list persisted metrics，以及真实 schema-7 `metadata=6 + migrate=7` 增量 user/subscription-link 快照接管；本轮三份生产快照的 API 读/写/错误矩阵均通过；Rust 启动回收已对齐 Go 的 `wal_checkpoint(TRUNCATE)` → `free_pages * page_size >= 4 MiB || free_pages * 100 / page_count >= 10` → `VACUUM` → checkpoint 策略，并有启动重开回归；`tmp/state.db` 仍可用 `YUHAIIN_SOURCE_DB` 显式诊断，但 Go 自己的重复 `fakeip_entries` migration 失败仍不计入默认 smoke；仍需更多生产版本验证 route/resolver projection 逐行语义、未建模表和异常快照 |
-| `延期` | fsqlite | — | 已停止实验；性能、内存和生态不满足要求，不再作为候选后端 |
+### 已完成
+
+- `[x]` 成熟 SQLite 后端：WAL、busy timeout、quick check、backup/restore、事务回滚。
+- `[x]` Go v1/v5/v6/schema-7 增量兼容、未知 JSON 保留、未来版本 fail-closed。
+- `[x]` typed repository：nodes、inbounds、resolvers、routes/lists/tags、settings、NAT、MaxMind、FakeIP、统计。
+- `[x]` 多进程 reader/writer、未提交事务强停、WAL/sidecar 重开恢复。
+- `延期` fsqlite：实测性能/内存/生态不满足要求，不作为生产后端。
+
+### 未完成与下一步
+
+- `[~]` 更多真实生产版本、未建模表和异常快照逐表核对。
+- 下一步：增加生产数据库版本样本；强停后对未知表、route/resolver projection 做 schema diff。
+
+### 证据
+
+- `make production-parity-smoke`
+- `cargo test -p yuhaiin-store --all-features --offline`
+- `~/.cache/yuhaiin-rust/production-parity/`
 
 ## 3. FakeIP
 
-| 状态 | 功能 | 位置 | 当前结果 | 剩余工作 |
-| --- | --- | --- | --- | --- |
-| `[x]` | 双栈池与持久化 | `yuhaiin-store/src/fakeip.rs` | IPv4/IPv6 独立 namespace、cursor、allocate/release/reopen、反向映射、容量 LRU、TTL、touch flush |
-| `[x]` | DNS transform | `FakeIpAsyncDnsHandler`, `FakeIpView` | A/AAAA/PTR/HTTPS/SVCB hint、FakeIP→域名恢复、DNS/TUN/router 闭环 |
-| `[x]` | 异常与压力 | FakeIP tests | Go Pebble NDJSON/Go v6 import、force-stop、双栈 soak、冲突 snapshot 原子失败 |
-| `[~]` | 更多生产数据 | store fixture | 继续增加真实生产库样本；不影响当前主路径 |
+### 已完成
+
+- `[x]` IPv4/IPv6 独立池、容量、cursor、TTL、touch、release、重启恢复和冲突快照保护。
+- `[x]` DNS A/AAAA/PTR/HTTPS/SVCB hint、FakeIP 反解、TUN/router/monitor 闭环。
+- `[x]` Go Pebble NDJSON、Go v6 表和 force-stop 接管。
+
+### 未完成与下一步
+
+- `[~]` 真实生产 FakeIP 数据样本不足。
+- 下一步：从更多停止快照核对双栈容量、TTL、分配稳定性和旧条目回收。
+
+### 证据
+
+- `yuhaiin-store` FakeIP tests
+- `make production-parity-smoke`
+- `make tun-chain-service-smoke`
 
 ## 4. DNS resolver 与 server
 
-| 状态 | 功能 | 位置 | 当前结果 | 剩余工作 |
-| --- | --- | --- | --- | --- |
-| `[x]` | resolver facade | `yuhaiin-core/src/dns*`, `runtime/src/resolver.rs` | system/UDP/TCP、hosts、FakeIP、IPv4/IPv6 policy、按 route 选择 resolver、query fallback |
-| `[x]` | UDP/TCP | `dns_udp_async.rs`, `dns_tcp_async.rs`, runtime DNS supervisor | 纯 Tokio client/server、RFC1035 TCP fallback、多连接、同地址 UDP+TCP listener、owner cancellation |
-| `[x]` | DoH/DoT client | `runtime::{doh_tls,dot_tls,resolver}.rs` | RustCrypto TLS、HTTP/2 DoH、DoT length-prefix、可注入 proxy/bootstrap connector |
-| `[x]` | DNS/TUN/Inbound 闭环 | `RuntimeDnsHandler`, `ConnectionMonitor`, TUN dispatcher, socket inbound adapters | TUN 与 socket inbound 共用 snapshot 选择 resolver/FakeIP；公共 TCP relay、SOCKS5/Trojan/VLESS/Yuubinsya/透明 UDP 及 Yuubinsya chain TCP/UOT 都在协议边界接管 DNS request，并按各自 wire framing 回写；非法 DNS payload 仍转发 |
-| `[x]` | DNS 上游 interface policy | resolver factories | UDP/TCP、RustCrypto DoH/DoT direct dialer 接受和 outbound 相同的 source-address policy；自定义 factory 保持默认兼容，selector reload 会重建 resolver；`scripts/integration/dns-source-bind.sh` 在 host-network Podman 中复用 UDP/TCP 真实 async client/server 测试并确认源 IPv4 地址 |
-| `[x]` | Go 空配置启动基线 | `RuntimeSettings`, `runtime::defaults`, `data_plane::configured_dns_server`, `api::default_settings` | 无持久 settings 时对齐 Go 的 IPv6、HTTP system proxy、debug/save 日志默认值；无 DNS row/overlay 时默认监听 `127.0.0.1:5353`；真正空库首次构建时幂等写入 mixed/TUN/yuubinsya、bootstrap resolver、LAN route/list；API 与运行时共用同一默认对象 | 真实生产库的更多部分/异常快照继续补 fixture；删除默认项后不自动恢复 |
-| `延期` | DoQ / DoH3 | — | 使用量低，等纯 Rust QUIC/HTTP3 方案稳定后再加入；不阻塞当前替换 |
-| `不适用` | 本地 DoH server 管理端点 | — | Go `pkg/net/dns/server/server.go` 的本地 DNS server 只启动 UDP/TCP；DoH 是 resolver 的上游 client transport，现有 Rust 已实现 DoH/HTTP2 client 和 `resolver.server` UDP/TCP 管理 API | 若未来前端明确新增本地 DoH listener，再作为独立能力设计；当前不为填补表格增加 Go 没有的功能 |
+### 已完成
+
+- `[x]` system、UDP、TCP、hosts、FakeIP、IPv4/IPv6 policy、按 route 选择 resolver、query fallback。
+- `[x]` DoH/DoT client：RustCrypto TLS、HTTP/2、bootstrap/proxy/source-address policy。
+- `[x]` 本地 DNS server：同地址 UDP+TCP、并发 accept、owner shutdown、配置 API。
+- `[x]` DNS hijack：TUN、HTTP、SOCKS5、透明 UDP、Trojan/VLESS/Yuubinsya chain 共用 resolver snapshot。
+
+### 未完成与下一步
+
+- `延期` DoQ/DoH3：使用量低，等待稳定的纯 Rust QUIC/HTTP3 方案。
+- 下一步：继续用生产快照核对异常 resolver/server 配置；不新增 Go 没有的本地 DoH listener。
+
+### 证据
+
+- `make dns-source-smoke`
+- `make doh-source-smoke`
+- `make node-latency-dns-smoke`
+- `cargo test -p yuhaiin-core --all-features --offline`
 
 ## 5. Router、Trie、GeoIP
 
-| 状态 | 功能 | 位置 | 当前结果 | 剩余工作 |
-| --- | --- | --- | --- | --- |
-| `[x]` | domain trie | `yuhaiin-trie` | parent、wildcard、优先级、规范化、网络/端口约束 |
-| `[x]` | CIDR trie | `yuhaiin-trie` | IPv4/IPv6 longest-prefix lookup、随机对照回归 |
-| `[x]` | runtime router | `runtime/src/route.rs`, `trie::router`, `runtime/src/loopback.rs` | immutable snapshot、publish/rollback、resolver policy、direct/proxy/bypass/block；兼容 Go route expression 中单端口字符串（例如 `"6969"`）并保持真正非法范围 fail-closed；统一 selector 已接入入站监听地址自环和自身进程回环保护，命中后 fail-closed 为 block | 发布策略中的数据库更新验收；出站 socket 本地端点注册仍待接入所有 transport |
-| `[x]` | connection explainability | `FlowContext`, monitor | rule/tag/list/matchHistory/resolver/geo 与实际 proxy 选择共用同一 snapshot |
-| `[x]` | MaxMindDB | `crates/yuhaiin-geo` | reader、坏库错误、校验下载、atomic refresh、IPv4-mapped IPv6、route 注入、真实 `Country-without-asn.mmdb` 查询验收均已完成；fixture 保存在 `~/.cache/yuhaiin-rust-maxmind`，SHA-256 为 `1d900f73aa4644d255793548319410ff559ef9294a662ec1a0354f106c794155` | 后续只需按发布策略更新并重新验收数据库 |
+### 已完成
 
-## 6. Proxy 与 transport（inbound / outbound）
+- `[x]` domain trie：parent、wildcard、规范化、优先级、网络/端口约束。
+- `[x]` CIDR trie：IPv4/IPv6 longest-prefix lookup 和随机对照。
+- `[x]` route snapshot：publish/rollback、resolver policy、direct/proxy/bypass/block、nested `all/any/not`、history。
+- `[x]` host/process/inbound/negative matcher、list membership、GeoIP country matcher。
+- `[x]` MaxMindDB reader、坏库保护、校验下载、atomic refresh、IPv4-mapped IPv6。
+- `[x]` 统一 loopback guard：监听地址自环、自身进程 path/PID；命中后 `Block + skip_route`。
 
-所有支持的 inbound 都在 `yuhaiin-runtime::inbound::run_until` 下启动；outbound 通过 `RuntimeSnapshot::build_proxy_selector` 进入同一个 router/monitor 链路。协议 wire codec 和可复用 transport 放在 `yuhaiin-protocol` / `yuhaiin-chain`，不是散落到 inbound 文件中。
+### 未完成与下一步
 
-### 6.1 已支持的协议矩阵
+- `[~]` 出站 socket 的本地端点注册已接入 direct/fixed/HTTP CONNECT/SOCKS5 及 TLS 包装层；guard 按连接生命周期 reference-counted 回收。
+- 下一步：补 HTTP/2 pool 真实底层连接的 endpoint 透传，并做 TUN→proxy 自环进程验收；未暴露 socket endpoint 的内存/复用 transport 仍保持安全降级。
+- 下一步：补更多生产 route/resolver projection 和负向 matcher fixture。
 
-| 状态 | 能力 | Inbound | Outbound | 主要位置 |
-| --- | --- | --- | --- | --- |
-| `[x]` | direct / drop / fixed | — / fixed listener 边界 | 是 | `core::proxy`, `proxy_factory` |
-| `[x]` | HTTP proxy / CONNECT | 是 | 是 | `runtime::inbound`, `core::proxy` |
-| `[x]` | SOCKS5 | 是 | 是 | `runtime::inbound`, `core::proxy`；outbound 已覆盖 TCP CONNECT + UDP ASSOCIATE、认证和 domain framing |
-| `[x]` | SOCKS4A | 是 | — | `runtime/src/proxy/socks4a.rs` |
-| `[x]` | TLS transport | 是 | 是 | `runtime::doh_tls`, `protocol::tls`; chain 和 Trojan/VLESS/VMess 等协议层 outbound 默认使用纯 Rust Mozilla WebPKI roots，追加 Go `ca_cert`，并支持 `insecure_skip_verify` |
-| `[x]` | HTTP/2 transport | 是 | 是 | `chain`, runtime HTTP2 inbound；新增真实进程 HTTP/2 inbound 与 TLS+HTTP/2 inbound → route rule → fixed + HTTP CONNECT outbound，覆盖 H2 CONNECT、TLS ALPN、内层 HTTP framing、domain authority、connections/统计和 shutdown |
-| `[x]` | Go standalone HTTP/2 raw transport | 是（transport） | raw transport；可叠加 HTTP CONNECT/SOCKS5 作为 TCP outbound | `yuhaiin-chain::ChainClient`, `h2_tunnel`, `yuhaiin-protocol::{http,socks5}`；`[fixedv2,http2]` 保持 raw stream 且最终出站 fail-closed，`[fixedv2,http2,http]` 与 `[fixedv2,http2,socks5]` 已完成协议握手、认证、domain framing、双向 relay、latency 和 runtime 子进程回归。raw H2 没有 UDP datagram parent，因此 HTTP/SOCKS5 UDP 明确返回 unsupported；不能把 standalone H2 单独当成带目标地址的最终出站 |
-| `[x]` | Yuubinsya TCP | 是 | 是 | `core::yuubinsya`, `chain` |
-| `[x]` | Yuubinsya native UDP | 是 | 是 | `core::proxy`, `chain` |
-| `[x]` | Yuubinsya UDP-over-TCP | 是 | 是 | `chain::{h2,UOT,direct_uot}` |
-| `[x]` | WebSocket transport | 是 | 是 | `core::websocket`, runtime/protocol |
-| `[x]` | protocol wrappers | inbound/outbound 共用 | inbound/outbound 共用 | `yuhaiin-protocol` |
-| `[x]` | Go inbound protocol aliases / noop | `none` accept-and-close；`mix`、`reverseHttp`、`reverseTcp` 旧 JSON 拼写归一化并保留 section 配置 | 与 Go contract oneof 的兼容字段回归 | `runtime::inbounds::normalize_inbound_protocol` |
-| `[x]` | Go 低频 inbound：`reverse_http` / `reverse_tcp` | 是；目标地址/URL 解析后复用共享 router、outbound、relay 和 monitor | reverse TCP 原始流、reverse HTTP 请求改写/原始流回退均有 loopback 单测；HTTPS target 受 `doh-tls` feature 控制 | 继续补 Go fixture 互操作 |
-| `[~]` | Linux 透明 inbound：`tproxy` / `redir` | TCP 已接入；TPROXY UDP 已接入；redir 按 Go contract 禁用 UDP | Linux TCP 使用 `IP_TRANSPARENT`、`SO_ORIGINAL_DST`/`IP6T_SO_ORIGINAL_DST`；TPROXY UDP 使用原目标 ancillary；默认 smoke 真实验证 IPv4 REDIRECT 两条 flow，严格 IPv6 gate 真实验证 IPv4+IPv6 四条 flow、IPv6 original destination、direct outbound、统计和 shutdown，并验证 TPROXY socket capability；TLS/WS 等透明 transport fail-closed | 用真实 Linux network namespace/宿主机 CAP_NET_ADMIN 重跑 TPROXY UDP 策略路由和异常 teardown |
+### 证据
 
-### 6.2 连接链路与策略
+- `cargo test -p yuhaiin-trie --all-features --offline`
+- `cargo test -p yuhaiin-runtime --lib`
+- `make service-chain-smoke`
+- MaxMind fixture：`~/.cache/yuhaiin-rust-maxmind/`
 
-| 状态 | 功能 | 当前结果 | 剩余工作 |
-| --- | --- | --- | --- |
-| `[x]` | inbound → router → outbound | HTTP/SOCKS5/SOCKS4A/Trojan/VLESS/Yuubinsya/TUN 都走共享 FlowContext 和 selector；有真实 loopback relay 回归；域名目标会按同一 resolver snapshot 先解析为 socket endpoint，同时保留原始域名供 TLS/HTTP2/Yuubinsya 使用；Podman 已验证 HTTP inbound → direct 的 IP/域名目标；`tests/service_chain.rs` 进一步用真实子进程/API 验证 HTTP inbound → route rule → HTTP CONNECT outbound、HTTP/2 inbound 与 TLS+HTTP/2 inbound → route rule → HTTP CONNECT outbound、固定 + SOCKS5 outbound（保留 domain framing）、固定 + HTTP/2 + HTTP/SOCKS5 outbound、认证 SOCKS5 TCP inbound → direct、Yuubinsya TCP inbound → direct、TLS termination → HTTP inbound → direct、mixed inbound → SOCKS5 UDP → direct、HTTP + mixed UDP → TLS + HTTP/2 + Yuubinsya UOT outbound，以及 SOCKS5/Yuubinsya inbound → TLS + HTTP/2 + Yuubinsya TCP outbound，并检查 TCP/UDP connections、route matchHistory 与 latency | 继续增加 Go fixture，不改变主链路 |
-| `[x]` | inbound settings | `store::InboundSettings`, `RuntimeSnapshot`, `ConnectionMonitor` | Go legacy `inbound_settings` 与 Rust overlay、前端 API、reload 已统一；`sniff` 影响公共 relay，DNS 三项同时作用于 TUN、socket inbound 和 Yuubinsya chain；reload 原子替换 resolver handler |
-| `[x]` | HTTP/2 pool | fixed endpoint、TLS identity、ALPN、multi-stream/multi-connection、idle/drain、GOAWAY replacement、metrics | h2 公共 API 无法主动发送 client GOAWAY，保持 application-level drain |
-| `[x]` | Yuubinsya reliability | migrate ID、coalesce、bounded retry/replay、UOT/native UDP、ping、服务端 demux、TLS/H2 listener | 主动 GOAWAY 同上；继续 Go 低版本 fixture |
-| `[x]` | outbound source interface | `SocketPolicyProxy` 统一覆盖 direct/fixed/HTTP CONNECT/SOCKS5、protocol wrappers、HTTP/2 Yuubinsya、direct UOT 和 native UDP；reload 替换 policy；UDP/TCP/DoH/DoT resolver dialer 也复用同一 source-address policy | inbound listen socket 的平台专用绑定仍需按平台验收 |
-| `[x]` | node latency DNS/UDP/IP | `runtime::latency` | `dns`/`udp` 经由共享 `AsyncProxy::open_datagram` 发起 DNS A 查询并校验事务 ID；`ip` 通过运行时 resolver 并行解析 A/AAAA，再将具体 IPv4/IPv6 endpoint 交给 proxy，同时保留 Host/SNI；默认 resolver/target 与 Go 兼容；DoQ 继续延期 | 增加远端节点和 Podman 网络环境的长期回归 |
-| `[~]` | 低频/复杂 Go 协议 | 现有可用协议已优先完成；Tailscale、WireGuard、Reality、Mux、QUIC 等不纳入当前 Rust 主路径 | 仅在实际前端配置/需求出现时评估，不伪装为已兼容 |
-| `延期` | Shadowsocks / ShadowsocksR | 仓库已有部分历史实现，但当前范围不以它们为替换门槛 | 按用户决定暂不继续扩展；后续可删除或单独维护 |
+## 6. Proxy、transport 与 inbound/outbound
+
+所有 inbound 都在 `yuhaiin-runtime::inbound::run_until` 下拥有生命周期；inbound 和 outbound
+协议实现分别放在 `core`/`protocol`/`chain`，统一经过 selector/router/monitor。
+
+### 6.1 已完成协议矩阵
+
+| 协议/transport | Inbound | Outbound | 状态 |
+| --- | :---: | :---: | --- |
+| direct / drop / fixed | — / fixed listener | 是 | `[x]` |
+| HTTP proxy / CONNECT | 是 | 是 | `[x]` |
+| SOCKS5 TCP | 是 | 是 | `[x]` |
+| SOCKS5 UDP ASSOCIATE | 是 | 是 | `[x]` |
+| SOCKS4A | 是 | — | `[x]` |
+| TLS | 是 | 是 | `[x]` |
+| HTTP/2 prior knowledge | 是 | 是 | `[x]` |
+| Yuubinsya TCP | 是 | 是 | `[x]` |
+| Yuubinsya native UDP | 是 | 是 | `[x]` |
+| Yuubinsya UOT / dup over TCP | 是 | 是 | `[x]` |
+| reverse HTTP/TCP | 是 | — | `[x]` |
+| `redir` TCP / `tproxy` UDP | 是 | — | `[~]`：TPROXY 仍缺 rootful namespace 证据 |
+
+### 6.2 主链路证据
+
+- `[x]` HTTP/SOCKS5/SOCKS4A/Trojan/VLESS/Yuubinsya/TUN → router → outbound 共用 `FlowContext`。
+- `[x]` 域名先按同一 resolver snapshot 解析 socket endpoint，同时保留 domain 给 TLS/H2/Yuubinsya framing。
+- `[x]` HTTP、TLS、HTTP/2、SOCKS5、mixed、Yuubinsya 的 TCP/UDP 真实进程链路已通过。
+- `[x]` HTTP/2 bounded backpressure、半关闭、GOAWAY/drain、Yuubinsya UOT/native UDP 生命周期已验证。
+
+### 6.3 未完成与下一步
+
+- `[~]` Linux `tproxy` UDP：实现已存在，但当前 rootless Podman 只允许明确 skip；需要 rootful/CAP_NET_ADMIN namespace 验收多 flow、异常 teardown。
+- `[~]` inbound listen socket 的平台专用绑定仍需 Android/macOS 验收。
+- `延期` Shadowsocks/SSR、Tailscale、Reality、Mux、QUIC；不作为当前替换门槛。
+
+### 证据
+
+- `make service-chain-smoke`
+- `make socks5-udp-associate-smoke`
+- `make transparent-service-smoke`
+- `make benchmark-throughput`
+- `cargo test -p yuhaiin-chain --all-features --offline`
 
 ## 7. NAT
 
-| 状态 | 功能 | 位置 | 当前结果 |
-| --- | --- | --- | --- |
-| `[x]` | Full Cone table | `core::nat`, store NAT config | source/migrate ID、endpoint-independent forward/reverse mapping、默认 full cone |
-| `[x]` | UDP relay | `core::tun`, runtime inbound | 同 source 多目标共享 relay，任意外部 peer 回包，translated endpoint rebind |
-| `[x]` | 生命周期 | `TunProxyRuntime`, `NatTable` | idle/touch/sweep、graceful close、force abort、backpressure、runtime drop、跨进程重启回收 |
-| `[~]` | 平台 NAT/route 细节 | Linux 已有纯 Rust netlink route backend | Android/macOS fd/route 生命周期仍待实机验收 |
+### 已完成
+
+- `[x]` Full Cone NAT：source/migration ID、endpoint-independent forward/reverse mapping。
+- `[x]` TUN/UDP relay：同 source 多目标共享 relay，外部 peer 回包、rebind、idle/touch/sweep。
+- `[x]` graceful close、force abort、backpressure、runtime drop、重启回收。
+
+### 未完成与下一步
+
+- `[~]` Android/macOS 的平台 route/NAT 生命周期未实机验证。
+- 下一步：随第 10 节平台 fd/route 测试验证 NAT 清理和重启。
 
 ## 8. TUN（inbound）
 
-| 状态 | 功能 | 位置 | 当前结果 | 剩余工作 |
-| --- | --- | --- | --- | --- |
-| `[x]` | 单一路径 TUN | `core::tun` | `tun-rs AsyncDevice + smoltcp`；不并行实现 tun2socket 和用户态 stack 两条路径 |
-| `[x]` | inbound owner | `runtime::inbound::run_until` | TUN record 会在同一个 inbound listener task 集合中创建 device；与 SOCKS5/HTTP/Yuubinsya/UDP listener 共同 reload、shutdown、abort，不再由独立 supervisor 管理 |
-| `[x]` | TCP/UDP/ICMP | `core::tun` | dispatcher、proxy bridge、DNS hijack、FakeIP reverse、NAT、bounded queue/backpressure |
-| `[x]` | Linux Podman | `tun-smoke`, `tun-service-smoke`, `tun-long-service-smoke`, `tun-chain-service.sh`, `tun-mtu.sh`, `p0_tun`, `tun_fakeip_smoke` | privileged/network=none 创建、runtime inbound owner、AnyIP routed TCP、route、DNS/FakeIP、selected fixed proxy echo、SIGTERM 和设备重开；`make tun-service-smoke` 复用 `~/.cache/yuhaiin-rust/integration/tun-service` 并保留失败日志；`make tun-long-service-smoke` 以 1 MiB 分块双向并发、逐字节确定性 payload 校验真实 runtime-owned TUN → fixed → loopback，并覆盖 smoltcp TX partial write/backpressure；`make tun-chain-service-smoke` 在同一校验下进一步验证真实 TUN → SQLite 选中的 fixed → TLS → HTTP/2 → Yuubinsya TCP → loopback echo，并覆盖客户端立即半关闭；`tun-mtu.sh` 对 576/1280/1500/9000/9216 分别验证真实设备、流量和关闭；当前 4 MiB TUN→fixed→loopback benchmark 为 36.87 MiB/s、peak RSS 12,456 KiB |
-| `[~]` | 设备异常与 namespace | 测试已有设备消失、kernel cleanup、同名重开基础覆盖；在独立 rootless user/network namespace 中执行 `p0_tun` 的 loopback netem loss 与 matrix 测试均通过；IPv4 由 smoltcp、IPv6 由 TUN ingress bounded reassembler 处理，并覆盖乱序/重叠/超时 UDP fragment 单测；新增 129 片 wire-fragment 上限和同 key 后续 datagram 恢复单测；`YUHAIIN_TUN_FORCE_STOP=1 make tun-chain-service-smoke` 现在先强制终止 Podman TUN 进程，再用同一 SQLite/同名设备完成第二次 TLS/H2/Yuubinsya 流量回归 | 继续补超出有界重组上限的长流进程级证据、更多 namespace teardown 矩阵、Android/macOS 实机 |
-| `[~]` | Android/macOS TUN | `TunRuntime::from_owned_fd` + `inbound::run_until_with_tun_fd` 安全接管宿主已创建的 TUN FD；`from_async_device` 仍支持已包装设备；两者都进入同一个 inbound owner，reload 复用设备并重建 proxy/dispatcher，非法配置在接管 FD 前 fail-closed | Android VpnService fd、macOS utun/权限/route/生命周期实机验收 |
+### 已完成
 
-## 9. 管理 API、实时 connections 与统计
+- `[x]` 单一路径：`tun-rs AsyncDevice + smoltcp`，不并行实现 tun2socket 和第二套 userspace IP stack。
+- `[x]` TUN 作为 inbound owner 的一部分，与 SOCKS5/HTTP/Yuubinsya/UDP 共用 reload/shutdown/abort。
+- `[x]` TCP/UDP/ICMP dispatcher、DNS hijack、FakeIP reverse、NAT、bounded queue/backpressure。
+- `[x]` Linux Podman：设备创建、route、MTU 576/1280/1500/9000/9216、1 MiB 长流、TLS/H2/Yuubinsya chain、force-stop 重开。
 
-| 状态 | 功能 | 位置 | 当前结果 | 剩余工作 |
-| --- | --- | --- | --- | --- |
-| `[~]` | 前端 API/RPC | `runtime/src/api.rs` | 对齐现有 generated client；settings、nodes、inbounds、DNS、hosts/FakeDNS、route、TUN、connections 等共用 store/runtime struct；列表 API 已补 Go 的 query 字段边界并在过滤后计算 total；核心错误已按 Go RPC 分类为 400/404/503/500；node.use/nodes.selected 已对齐 Go 的独立 TCP/UDP 选择、Go `metadata` 原始字符串及旧 key 回退；nodes.active 已按 live proxy selector 而非 enabled 行返回；node.close 现在按 Go `ProxyStore.Delete` 关闭 live slot、保留配置，成功 reload 后可重建；node save 返回的 origin 对齐 Go 的 `manual`，空 group 保留 Go 的空字符串；inbound save 返回持久化后的 contract，resolver system/default 字段在存储后规范化；settings 现在按 Go contract 返回默认值、写回 `settings_kv`，backup config 同时读写 Go `backup_settings`；route list/rule detail GET 与持久化层已补 Go 的默认值规范化并隐藏 Rust 内部 `match` 字段，route tags 已改为读写 Go `node_tags_v2` 并按 `name/type/hash` 过滤；route mutation 会维护 rule/list pending activation，`route.activation` 合并两类状态，显式 apply 同时清理，过期 activation 按 Go timer 生命周期惰性归零，route list refresh 使用未来一分钟的 host-index deadline；route list config 现在优先读写 Go `settings_kv.route_extra`，Rust overlay 作为新库 fallback，并按 Go contract 规范化数字字符串；publishes 现在读写 Go 原生 `publishes` 表，按 Go 的已知字段解码并对齐 resolve/delete 语义，`update.status` 初始状态也与 Go 零值一致；users 现在读写 Go refact-user schema-v6 的 `users_v2` 及三类 credential 表，create/update/delete、query/pagination、reference conflict 和真实 generated client 形状已有覆盖；runtime 构建节点时把出站 `userId` 解析为临时 basic/UUID/token 凭据，原始节点 JSON 不写入 secret；fresh Rust service 的 31 个核心只读 RPC 及节点/resolver/inbound/route mutation smoke 已实际验证 200；`tests/api_contract.rs` 在单个真实进程中覆盖主要 React CRUD、分页/query、reload 后 `nodes.active`、connections/traffic/telemetry/history、SSE、tools 和代表性 404；`tests/api_reload_flow.rs` 以两个真实 HTTP CONNECT 出口证明 node PUT 后新连接切换出口，以旧监听关闭/新监听可用证明 inbound PUT reload，并以 route PUT 后直连 fixture 未收到 CONNECT 证明 route reload；同时验证 latency、traffic/history 与同库重启读回；已静态核对 React generated.ts 的 88 个 operation，并新增 88 项按实际传输方式（87 个 JSON-RPC + `connections.events` GET/SSE）的自动路由覆盖测试，流式 `connections.events`/`tools.logs` 按 Go 的直接 SSE 路由处理；`go-api-parity.sh` 现覆盖 28 个稳定只读响应、核心 node/inbound/resolver/route mutation 的 create/update/use/apply/delete 闭环、publishes CRUD/resolve、前端配置 API put/get，以及非对象请求、缺失/不存在资源、时间范围、telemetry limit、连接关闭、route test/priority、backup restore 等错误矩阵；错误矩阵严格比较 HTTP status 和 RPC code，三份默认生产快照均通过，校验运行于 `~/.cache/yuhaiin-rust/production-parity`；当前 Go main 缺少 users 对照 handler，但 refact-user 分支提供 schema/contract 来源，因此 users 已不是临时 overlay；HTTP/SOCKS5 已覆盖中心 basic 用户认证，Yuubinsya/Trojan 的 `allowAnyPassword` 已明确 fail-closed；剩余是更多 users 边界、复杂 process/inbound/negative matcher 和生产 history 样本 |
-> **Live list membership note:** `RuntimeSnapshot::apply_route` 现在复用同一 route-list snapshot
-> 对所有 host/process list 做 membership，`context.lists` 与 Go `ConnOptions.Lists()` 不再只显示
-> 选中规则携带的 list；`RuntimeSnapshot::apply_route` 会在 Router 前填充 membership，Router
-> 再按 Go nested matcher 的短路顺序记录选中前已尝试的 route rule 和
-> `List/Net/Port/Geoip` history；`all` 在第一个 false 子 matcher 处停止，多个正向 host/CIDR 条件会同时约束候选；`any` 则继续记录
-> 后续分支。缺失的 Go list 仍保留为 fail-closed 的 rule history，不会被误当成全局规则。
-> route-list membership 单测、Router history 单测、RuntimeSnapshot process-gated 单测、完整
-> service-chain 和 Go/Rust parity 已通过。
->
-> **Fresh-state note:** Rust 的 Go 默认投影已补齐：首次初始化同步 `settings_kv`、
-> `route_extra`、`bootstrap.system=true`、LAN rule priority=1 和 Go 的 route preview，并移除
-> 不属于 Go `nodes_v2` 的 `rust-builtin/direct` 持久化节点；实际 Rust/Go fresh RPC 对照记录见
-> `MIGRATION.md` §53。宿主机已有 `127.0.0.1:1080` 时，API contract 的 active-node 进程 smoke
-> 需放到 Podman 独立 network namespace，避免默认 mixed listener 端口冲突。
+### 未完成与下一步
 
-> **Process regression note:** `tests/api_contract.rs` 现在还会在真实 runtime 子进程中
-> 校验 fresh mixed inbound 的 `tcp_udp.udp=enabled`，并通过 loopback HTTP server 验证
-> direct node 的域名 latency；`scripts/integration/api-contract.sh` 会运行该文件的全部
-> process tests，而不是只运行管理面大测试。
+- `[~]` 超过有界 fragment 重组上限的长流、更多 namespace teardown 矩阵。
+- `[~]` Android VpnService fd/权限/route/电量/RSS；macOS utun/权限/route。
+- 下一步：先补 Linux 超限 fragment 的进程级恢复证据，再做 Android/macOS 实机验收。
 
-| `[x]` | live connections | `monitor`, `connections` API/SSE | 建立、更新、关闭、数字 ID close、EventSource added/removed |
-| `[~]` | history/traffic/statistics | `monitor`, SQLite persistence | Rust checkpoint 负责频繁 crash recovery；无 checkpoint 时可接管 Go 的 `statistics_kv`、`traffic_hourly`、`connection_history`、`failed_connection_history` 和 telemetry 表；运行期间首次写入及每 30 秒低频写回 Go 兼容统计投影，SQLite 锁导致的投影失败按 2 秒起、60 秒封顶指数退避，正常 shutdown 先收敛 persistence worker 再做最终原子投影；history 按 Go key 合并，旧 checkpoint 中重复 `(protocol, addr, process)` 也会先合并，避免真实生产库最终 flush 的 UNIQUE 冲突；`connections.total.counters` 现在只保留活动 flow，关闭和重启都会清除 live counter，与 Go `Connections.Remove` 一致；统计 projection 现在创建 Go v6 所需的 hourly/daily 四张 telemetry 表，按 Go 的 30 天 hourly retention 将旧数据按 UTC 日聚合；若生产库因历史 schema version 复用仍只有 Go v5 文本维度表，Rust 接管写回会在同一事务内转换为 compact `telemetry_dimension_values` + hourly/daily 表；真实 schema-7 原始生产副本经 Rust 优雅停止后，Go `connections.telemetry` 已返回 200；独立文件库 reader、真实 schema-7 takeover 和真实子进程 `Child::kill` 已验证 checkpoint、Go 表及 WAL/sidecar 重开恢复；`tests/service_chain.rs` 现在还用真实 TLS/H2/Yuubinsya TCP/UOT UDP flow 读取 traffic、telemetry、failed-history，并在 TCP 关闭后读取 history；新增真实 runtime 进程测试，在流量更新期间并发读取六类统计 API，停止后重启同一 SQLite 并读回 traffic/history，且有 Podman 入口；新增 `scripts/integration/go-rust-stats.sh`，让 Go/Rust 在独立 Podman namespace 共享同一 SQLite，各自通过 mixed inbound 产生真实流量并并发读取 RPC 统计，最终两边统计均为非零 | 生产库更多版本/异常中断 fixture；升级期间统计表锁竞争与更多 telemetry source/逐字段长范围快照仍需补充 |
-> **Telemetry projection note (2026-08-10):** `ConnectionMonitor` 现在按 Go `dimensionsForConnection` 生成非空维度：优先 `inboundName`/`nodeName`，归一化 IPv4/IPv6/HTTP2 source，FakeIP 地址回退到 domain/hosts，FakeIP 不写 destination，并取最后一个非空 rule；公共 summary 仍按 Go 固定 9 维和顺序返回空组；旧 Rust checkpoint 的 `source` 维度在恢复时也会归一化。`monitor` 维度/FakeIP/source 单测、11 条真实 service-chain、统计并发重启测试、Go/Rust 共享 SQLite 进程读写 smoke 及扩展 Go/Rust 管理面对照均通过。剩余是更多生产快照和逐字段长范围对照。 |
-| `[x]` | runtime reload | `RuntimeController` | 配置先构建新 snapshot，失败保留旧 snapshot；selector/inbound/DNS 按 owner 收敛 |
-| `[~]` | 软件更新 | `runtime/src/update.rs`, `/api/v2/update/*`, `src/bin/service/mod.rs` | releases 分页、stable/beta/main、平台 asset、checksum、进度状态、`~/.cache` 下载和 Unix detached helper；Linux systemd/macOS launchd 的 install/uninstall/start/stop/restart 已接入运行 binary，service 文件使用原子写入；RustCrypto reqwest 无 native TLS | 不同发行版 service manager 的现场升级/回滚验收 |
-| `[x]` | pprof | `pprof-rs` Rust-native profiler、`/debug/pprof/` index 和 `/debug/pprof/profile?seconds=N` protobuf profile endpoint；沿用 settings `pprof` gate，禁用时返回 404 | profile 格式遵循 Rust `pprof` crate，不承诺 Go wire compatibility |
-| `延期` | subscriptions | API 保留兼容形状 | refresh/update 仍返回未实现；按用户决定暂不阻塞替换 |
+### 证据
 
-## 10. 平台与发布
+- `make tun-service-smoke`
+- `make tun-long-service-smoke`
+- `make tun-chain-service-smoke`
+- `YUHAIIN_TUN_FORCE_STOP=1 make tun-chain-service-smoke`
+- `make tun-mtu-smoke`
 
-| 状态 | 平台/能力 | 当前结果 | 验收缺口 |
-| --- | --- | --- | --- |
-| `[x]` | Linux desktop | binary、SQLite、HTTP API、DNS、inbound owner、TUN、Podman smoke | 持续增加真实生产配置回归 |
-| `[x]` | Linux container | Podman host-network / privileged network=none smoke | 已有；每次新增数据面模块继续复用 `~/.cache` 状态目录 |
-| `[~]` | Android | `yuhaiin-core` 与 `yuhaiin-runtime --all-features` 均已通过 `aarch64-linux-android` target check；bundled SQLite 使用 `/opt/android-ndk/.../aarch64-linux-android35-clang`；已有外部 fd 注入的 inbound owner API | VpnService fd、权限、电量/内存实测；继续补 Android 原生 route/生命周期验收 |
-| `[~]` | macOS | `yuhaiin-core` 的 `async-proxy,tun` 已通过 `aarch64-apple-darwin` target check；runtime 仍需 macOS SDK/clang 编译 bundled SQLite | macOS SDK/clang runtime target check；utun、LaunchDaemon、权限、SIGTERM/route 实机验收 |
-| `[~]` | 发布替换手册 | Rust binary 已兼容 Go service command 的 `-host/-path/-u/-p/-eweb/-nfs-mode`；`-path DIR` 使用 `DIR/state.db`，默认监听 `0.0.0.0:50051`，`-eweb DIR` 提供同一 listener 的静态资源和 SPA fallback，显式 `YUHAIIN_DB/YUHAIIN_HTTP` 仍可覆盖；新增 `docs/RELEASE_REPLACEMENT.md`，覆盖 `/opt/android-ndk` Android 构建、SQLite backup、systemd/launchd 替换与回滚、旧 Go 并行限制和健康检查 | Windows service 安装、不同发行版 service manager 与现场 backup/rollback 演练 |
+## 9. 管理 API、connections、traffic 与 history
 
-## 11. 必跑验证
+### 已完成
 
-这些命令通过后，才可以把对应模块从 `[~]` 改为 `[x]`：
+- `[x]` 前端 generated client 的 operation 已有自动路由覆盖；`connections.events`、`tools.logs` 的直接 SSE 路由单独验证。
+- `[x]` settings、nodes、inbounds、resolvers、DNS、hosts/FakeDNS、routes/lists/tags、NAT、users、publishes 共用 store/runtime struct。
+- `[x]` API mutation → atomic reload → 新数据面生效；旧 snapshot/旧 flow 不被破坏。
+- `[x]` connections 建立、更新、关闭、数字 ID close、SSE added/removed、local/outbound/protocol/process/route metadata。
+- `[x]` traffic、telemetry、failed history、history、checkpoint、Go projection、跨进程 SQLite 接管。
+- `[x]` fresh state、三份生产快照、核心错误矩阵、API reload flow 已逐响应对照 Go。
+
+### 未完成与下一步
+
+- `[~]` users：当前 Go main 没有 refact-user handler；Rust 已按 refact-user schema-v6 实现，但逐响应 Go handler parity 仍缺。
+- `[~]` process/inbound/negative matcher、完整 response 字段和更多 history/telemetry 生产样本。
+- `[~]` 升级期间 SQLite 表锁竞争与更长时间范围逐字段对照。
+- 下一步：优先补 refact-user 可运行 Go fixture；然后增加长时间 telemetry/history snapshot 和 lock contention。
+
+### 证据
+
+- `make api-contract-smoke`
+- `make api-reload-flow-smoke`
+- `make go-api-parity-smoke`
+- `make production-parity-smoke`
+- `make go-rust-stats-smoke`
+- `make stats-concurrency-smoke`
+
+## 10. 平台、更新与发布
+
+### 已完成
+
+- `[x]` Linux desktop/container：binary、SQLite、API、DNS、inbound owner、TUN、Podman smoke。
+- `[x]` Rust-native pprof：按 Rust `pprof` crate，不承诺 Go wire compatibility。
+- `[x]` Linux systemd/macOS LaunchDaemon 的 install/uninstall/start/stop/restart 配置生成和原子写入。
+- `[x]` Android 构建入口默认使用 `/opt/android-ndk`，支持 `aarch64-linux-android` target check/build。
+- `[x]` musl build：`make build MUSL=1`、`make build-release-musl`。
+
+### 未完成与下一步
+
+- `[~]` Android：真实 VpnService fd、权限、route、生命周期、电量/RSS。
+- `[~]` macOS：runtime SDK/clang 编译、utun、权限、route、LaunchDaemon、SIGTERM。
+- `[~]` 发布替换：至少一种真实 systemd 和一种 launchd 环境的替换、回滚、backup/health-check 演练。
+- 下一步：平台可用环境优先做 runtime target build，再做设备/服务管理现场 smoke。
+
+## 11. 下一阶段执行顺序
+
+按影响整体替换能力排序，不按提交数量排序：
+
+1. **Router loopback 完整接线**：为 TCP transport 暴露本地 endpoint，补 TUN→proxy 自环进程验收。
+2. **生产与统计边界**：更多 schema/telemetry/history 样本，补升级期间 SQLite lock contention。
+3. **Linux transparent TPROXY**：rootful/CAP_NET_ADMIN namespace 的 UDP、多 flow、异常 teardown。
+4. **TUN Linux 收尾**：超限 fragment 长流恢复和 namespace teardown matrix。
+5. **Android/macOS**：fd、route、权限、设备生命周期、RSS/电量。
+6. **发布替换现场**：systemd/launchd 真实替换、回滚、备份恢复和健康检查。
+7. **仅按实际需要评估延期协议**：订阅、DoQ/DoH3、Shadowsocks/SSR、Tailscale、Reality、Mux、QUIC。
+
+## 12. 必跑命令与缓存规则
+
+基础验证：
 
 ```bash
-cargo fmt --all -- --check
-cargo check -p yuhaiin-runtime --no-default-features --offline
-cargo test --workspace --all-features --offline --quiet
+make fmt-check
+make check
+make test
 git diff --check
 ```
 
-关键 Podman 验收使用 `~/.cache`，禁止把状态或临时数据库放到 `/tmp`：
+主链路与控制面：
 
 ```bash
-cargo build -p yuhaiin-core --bin tun-smoke --all-features --offline
-podman run --rm --privileged --network=none \
-  -v /home/asutorufa/Documents/Programming/yuhaiin-rust/target/debug/tun-smoke:/usr/local/bin/tun-smoke:ro \
-  --entrypoint /bin/sh docker.io/library/debian:testing -c \
-  'YUHAIIN_TUN_NAME=yuhaiin-codex0 YUHAIIN_TUN_HOLD_MS=250 /usr/local/bin/tun-smoke'
-
-# Real runtime inbound owner, SQLite fixture and shutdown cleanup:
-scripts/integration/tun-service.sh
-
-# Same smoke through the Makefile entry point:
-make tun-service-smoke
-
-# Real TUN inbound -> TLS -> HTTP/2 -> Yuubinsya TCP outbound:
-make tun-chain-service-smoke
-
-# Force-stop a first TUN process/container, then reuse the same SQLite and
-# device name for a second real TUN -> TLS -> HTTP/2 -> Yuubinsya run:
-YUHAIIN_TUN_FORCE_STOP=1 make tun-chain-service-smoke
-
-# Isolated Linux transparent inbound: REDIRECT TCP; rootless Podman records a TPROXY skip:
-make transparent-service-smoke
-
-# Required IPv4+IPv6 REDIRECT gate; exercises IP6T_SO_ORIGINAL_DST:
-YUHAIIN_TRANSPARENT_IPV6=1 make transparent-service-smoke
-
-# Required full TPROXY UDP gate; needs rootful Podman or a host namespace with CAP_NET_ADMIN:
-YUHAIIN_TPROXY_ENABLED=1 make transparent-service-smoke
-
-# Frontend management API process contract and reload/observer smoke:
-scripts/integration/api-contract.sh
+make service-chain-smoke
+make api-contract-smoke
 make api-reload-flow-smoke
-
-# Foreground binary startup/readiness logs and clean SIGTERM:
-make startup-logs-smoke
-
-# Go/Rust shared SQLite statistics read/write interoperability:
-make go-rust-stats-smoke
-
-# Go/Rust management parity over all discovered stopped production snapshots:
 make production-parity-smoke
+make go-rust-stats-smoke
+make stats-concurrency-smoke
+```
 
-# Go v1 state.db -> store + shared runtime snapshot (requires a copied source):
-YUHAIIN_GO_LEGACY_PRODUCTION_DB=/path/to/state.db make legacy-v1-runtime-smoke
+TUN/透明/性能：
 
-# Release runtime throughput and Linux RSS/CPU process sampling:
+```bash
+make tun-chain-service-smoke
+make tun-mtu-smoke
+make transparent-service-smoke
 make benchmark-throughput
-
-# Privileged real TUN packet relay throughput and Linux RSS/CPU sampling:
 make benchmark-tun-throughput
 ```
 
-Benchmark status is intentionally explicit: HTTP inbound → router → HTTP
-CONNECT outbound, HTTP inbound → router → TLS → HTTP/2 → Yuubinsya, and the
-single-path TUN relay have repeatable benchmarks. The HTTP benchmark runs the
-first two scenarios as a matrix and records throughput, CPU ticks, and peak
-RSS. TUN defaults to a stable 4 MiB packet-stream fixture and larger long-stream
-tests remain a separate follow-up. WireGuard is not implemented in the current
-scope and therefore has no reported number.
-
-当前阶段新增的 source-bind 容器回归：
+所有临时数据库、Podman 状态、失败日志和 benchmark 输出放在
+`~/.cache/yuhaiin-rust`；禁止使用 `/tmp`。检查缓存：
 
 ```bash
-podman run --rm --network=host \
-  -v /home/asutorufa/Documents/Programming/yuhaiin-rust/target/debug/deps/yuhaiin_core-b469181d7e2ccc9d:/usr/local/bin/yuhaiin-core-test:ro \
-  --entrypoint /usr/local/bin/yuhaiin-core-test docker.io/library/debian:testing \
-  proxy::tests::direct_connector_honors_local_bind_address --exact --nocapture
+make cache-usage
+du -sh ~/.cache/yuhaiin-rust
+df -h /
 ```
 
-上面的 hash 是一次构建产物示例；实际运行时从 `target/debug/deps` 选择最新的 core test binary。
-
-## 12. 下一步执行顺序
-
-1. 补 node latency 在更多代理协议/失败重试下的长生命周期回归；UDP/TCP resolver source-address 已由 `scripts/integration/dns-source-bind.sh` 覆盖，RustCrypto DoH/DoT 已由 `scripts/integration/doh-source-bind.sh` 覆盖，真实 SOCKS5 UDP ASSOCIATE 已由 `scripts/integration/socks5-udp-associate.sh` 覆盖，API node latency → direct proxy datagram → DNS UDP 已由 `scripts/integration/node-latency-dns.sh` 覆盖，内置 resolver 已完成 policy 接入，自定义 factory 仍可按需覆写扩展入口。blocking `DirectConnector` 现在也可解析域名 endpoint，避免 TLS/HTTP2 组合链路误要求预解析 IP。Go 互操作测试已在本机显式运行并通过，详见 `MIGRATION.md` 2026-08-09 记录。
-2. 补 Android/macOS target、权限、TUN fd/route 生命周期和实际资源消耗验收。
-3. 补发布切换/rollback 手册：binary 替换、SQLite backup、失败回滚、旧 Go 并行运行和状态目录锁。
-4. 对现有 frontend generated operations 做一次逐项 route/schema 快照比对；四个核心只读 RPC、publishes、update.status 已与 Go fresh/production state 实际收到 200 并核对字段，`tests/service_chain.rs` 已覆盖真实配置 mutation/reload 后的数据面与观测面；subscription 维持明确的 deferred 状态；当前 React 的 users.* 与本地 Go 主分支不成对，需先决定补 Go 对照还是将其标为前端超前能力；剩余是完整 operation、生产数据和 mutation/reload side effect 快照。
-5. 每完成一项，只修改本模块表格、验收命令和 `MIGRATION.md` 的一条 dated entry，不再把所有历史细节堆回本文件。
-6. 完成 Linux `tproxy`/`redir` 验收：在真正的 network namespace/宿主机 CAP_NET_ADMIN 环境覆盖 TPROXY UDP ancillary、redir IPv4/IPv6、权限失败及多 flow 生命周期；Podman REDIRECT TCP 已有可重复验收记录。
-7. 补统计兼容验收：Go fresh state 的 Rust takeover、native Rust state 的 Go reverse-open startup smoke、真实 schema-7 原始 telemetry 表经 Rust 转换后由 Go 成功读取，以及 Rust 进程内并发统计 reader + 重启读回 smoke 已通过；仍需用更多真实 Go v6/生产形状数据库验证 source normalization、Rust 最终 flush 后 Go 的逐字段长范围结果、Go 进程并发读写/升级期间锁竞争，以及 force-abort/进程崩溃时 checkpoint 与 Go 表之间的恢复边界。
-8. 补管理 API 契约验收：`tests/api_contract.rs` 与 `go-api-parity.sh` 已覆盖主要真实进程路径、核心 node/inbound/resolver/route mutation、publishes CRUD/resolve 和前端配置 put/get；继续逐项执行 generated client 的剩余 list/detail/mutation 操作，优先处理 users.* 与 Go 主分支的实现缺口，记录 Rust 与 Go 的 response 字段、分页、query 过滤、错误状态和 reload side effect 差异；`process + inbound` 的真实 HTTP 链路、membership 和 history 已由 `make service-chain-smoke` 覆盖；仍需单独收敛 `route.rules.test` 的全量 match history，再补更多 production snapshot。
+详细历史证据索引：见 [MIGRATION.md](MIGRATION.md) 的最新日期条目和协议/平台章节。

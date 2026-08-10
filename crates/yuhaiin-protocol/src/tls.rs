@@ -5,7 +5,9 @@ use std::sync::Arc;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
+use yuhaiin_core::proxy::{
+    AsyncDatagram, AsyncProxy, BoxAsyncStream, stream_local_addr, with_stream_local_addr,
+};
 use yuhaiin_core::{BoxFuture, Error, ErrorKind, FlowContext, Result};
 
 /// Wrap an already-connected stream proxy with client-side TLS.
@@ -124,6 +126,7 @@ impl AsyncProxy for RustCryptoTlsProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         Box::pin(async move {
             let stream = self.upstream.connect(context).await?;
+            let local_addr = stream_local_addr(&*stream);
             let name = ServerName::try_from(self.server_name.clone())
                 .map_err(|_| Error::new(ErrorKind::InvalidInput, "invalid TLS server name"))?;
             let stream = self
@@ -131,7 +134,10 @@ impl AsyncProxy for RustCryptoTlsProxy {
                 .connect(name, stream)
                 .await
                 .map_err(tls_error)?;
-            Ok(Box::new(stream) as BoxAsyncStream)
+            Ok(with_stream_local_addr(
+                Box::new(stream) as BoxAsyncStream,
+                local_addr,
+            ))
         })
     }
 

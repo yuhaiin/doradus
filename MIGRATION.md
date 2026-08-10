@@ -7,7 +7,9 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
-> 2026-08-10 loopback route guard：对照 Go `pkg/route/loopback.go`，Rust 新增 runtime 级 `LoopbackDetector`，并在 `RuntimeProxySelector::route_context` 的统一入口执行入站监听地址自环检查、当前代理进程 path/PID 检查，以及为同步/平台 socket adapter 预留的出站本地端点引用计数注册。命中后设置 `RouteMode::Block` 与 `skip_route`，不会再被 trie 规则覆盖；普通未解析域名在没有 FakeIP/hosts 元数据时保留 Go 的例外。新增 3 个 detector 单测和真实 selector 拦截测试；`cargo test -p yuhaiin-runtime --lib` 220 项通过。`cfg(test)` 不注入测试可执行文件自身身份，避免同进程 fixture 被误判；出站 transport 的本地端点注册仍作为后续 adapter 接线项。
+> 2026-08-10 loopback outbound endpoint wiring：`AsyncStream` 现在可以携带可选的真实本地 `SocketAddr` 元数据；direct/fixed、blocking HTTP CONNECT、SOCKS5 以及 RustCrypto TLS 包装均保留该元数据。`RuntimeProxySelector` 对选中的 proxy 统一包一层 stream/datagram lifetime guard，注册采用引用计数，连接释放或 datagram close 后自动移除；新增 core 元数据 I/O 单测。HTTP/2 pool 的共享底层连接 endpoint 透传仍需单独收口，未暴露 socket 的内存 transport 安全降级。
+
+> 2026-08-10 loopback route guard：对照 Go `pkg/route/loopback.go`，Rust 新增 runtime 级 `LoopbackDetector`，并在 `RuntimeProxySelector::route_context` 的统一入口执行入站监听地址自环检查、当前代理进程 path/PID 检查，以及为同步/平台 socket adapter 预留的出站本地端点引用计数注册。命中后设置 `RouteMode::Block` 与 `skip_route`，不会再被 trie 规则覆盖；普通未解析域名在没有 FakeIP/hosts 元数据时保留 Go 的例外。新增 3 个 detector 单测和真实 selector 拦截测试；`cargo test -p yuhaiin-runtime --lib` 220 项通过。`cfg(test)` 不注入测试可执行文件自身身份，避免同进程 fixture 被误判；后续只剩 HTTP/2 pool endpoint 透传和真实 TUN 自环验收。
 
 > 2026-08-10 SQLite startup compaction parity：Go 状态库启动时先执行 `wal_checkpoint(TRUNCATE)`，再按空闲页的字节数（至少 4 MiB）或数据库占比（至少 10%）决定是否 `VACUUM`，完成后再次 checkpoint。Rust `ConfigStore::open` 现在在迁移完成并释放初始化锁后执行同一策略；健康数据库不会因每次启动而重写，达到阈值才回收可复用页。`sqlite_startup_compacts_reusable_space_with_go_thresholds` 覆盖写入、删除、关闭、重开后的 freelist 回收，`yuhaiin-store` 全部 127 个可运行单元测试通过。
 
