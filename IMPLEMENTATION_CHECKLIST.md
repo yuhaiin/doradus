@@ -59,10 +59,11 @@
 | macOS | `[~]` | 获得 SDK/clang 后编译 runtime，验证 utun、权限、route、LaunchDaemon 和 SIGTERM | macOS target check + runtime log |
 | 明确延期 | `延期` | subscriptions、DoQ/DoH3、Shadowsocks/SSR、Tailscale/WireGuard/Reality/Mux/QUIC 不阻塞当前替换 | 需求变更时单独建项 |
 
-H2 relay 的大流量正确性已经由协议矩阵 benchmark 覆盖；当前仍有一个可执行的
-性能收尾项：将 h2 自身 pending send queue 替换为经过 64 MiB+ 回归的
-producer-side bounded adapter，并把 TLS/H2/Yuubinsya 的 peak RSS 从当前
-`75,400 KiB` 基线压回可解释范围。该项不改变当前功能条目的完成状态。
+H2 relay 的大流量正确性和 producer-side backpressure 已完成：`send_h2_data` 只在
+h2 分配发送窗口后提交固定大小 frame，并由独立发送 task 等待窗口，避免停止消费反向
+流导致全双工死锁。64 MiB Podman benchmark 已通过，TLS/H2/Yuubinsya peak RSS 为
+`18,904 KiB`；对应的窗口阻塞单测和 service-chain/TUN-chain 进程验证也已通过。后续
+仍可在更多并发 stream 和长时间运行场景中补充性能样本，但不再有当前 H2 adapter 收尾项。
 
 ### 本轮执行顺序
 

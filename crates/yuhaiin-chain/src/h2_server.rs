@@ -187,19 +187,32 @@ async fn bridge_h2_stream(
     relay_side: DuplexStream,
 ) -> Result<()> {
     let (mut reader, mut writer) = split(relay_side);
-    let mut buffer = vec![0u8; H2_RELAY_CAPACITY];
     let mut request_done = false;
+
+    // The response sender may wait for the client's H2 flow-control window.
+    // It must not block this task from consuming request data, otherwise a
+    // full-duplex Yuubinsya stream can deadlock while both directions wait
+    // for capacity updates.
+    let mut send_task = tokio::spawn(async move {
+        let mut buffer = vec![0u8; H2_RELAY_CAPACITY];
+        loop {
+            let length = reader.read(&mut buffer).await.map_err(io_error)?;
+            if length == 0 {
+                send.send_data(Bytes::new(), true)
+                    .map_err(|error| protocol_error(format!("HTTP/2 response end: {error}")))?;
+                return Ok::<(), Error>(());
+            }
+            send_h2_data(&mut send, &buffer[..length]).await?;
+        }
+    });
 
     loop {
         tokio::select! {
-            result = reader.read(&mut buffer) => {
-                let length = result.map_err(io_error)?;
-                if length == 0 {
-                    send.send_data(Bytes::new(), true)
-                        .map_err(|error| protocol_error(format!("HTTP/2 response end: {error}")))?;
-                    return Ok(());
-                }
-                send_h2_data(&mut send, &buffer[..length]).await?;
+            result = &mut send_task => {
+                return match result {
+                    Ok(result) => result,
+                    Err(error) => Err(protocol_error(format!("HTTP/2 response task: {error}"))),
+                };
             }
             result = body.data(), if !request_done => {
                 let Some(result) = result else {

@@ -2098,10 +2098,9 @@ BENCHMARK {"bytes":67108864,"cpu_ticks":36,"elapsed_ms":437.95469199999997,"mib_
 BENCHMARK {"bytes":67108864,"cpu_ticks":188,"elapsed_ms":2758.042342,"mib_per_sec":23.204864923716244,"peak_rss_kib":75400,"proc_samples":131,"runtime_pid":18,"scenario":"http-inbound-route-tls-h2-yuubinsya-loopback","target":"loopback; one stream; release; TLS + HTTP/2 + Yuubinsya"}
 ```
 
-该路径目前使用 h2 自身的发送队列承接窗口等待，调用方只提交固定 16 KiB
-relay frame；它已通过大 payload 数据正确性回归，但 `peak_rss_kib` 说明这还不是
-严格的 producer-side bounded backpressure。后续应增加经过大流量回归的 h2 bounded
-adapter，再重新记录这条基线。
+这组历史结果使用的是 h2 自身的 pending send queue；调用方虽然只提交固定 16 KiB
+relay frame，但当窗口耗尽时仍可能在 h2 内部排队，因此不能把它当作严格的
+producer-side bounded backpressure 基线。后续的 bounded adapter 修复和新基线见 §84。
 
 该数值是当前机器和当前构建的基线，不是验收阈值；后续改动应在相同参数下重复运行并
 记录变化原因。
@@ -2632,3 +2631,32 @@ TCP flow，连续读取并断言 `connections_added` 和 `connections_removed` �
 这证明前端使用 EventSource 时不只路由存在，live connections 也能从 monitor 穿过 HTTP stream
 到达客户端；traffic/telemetry 仍通过独立 API 和进程级统计 smoke 验证，生产长时锁竞争继续保留
 在 checklist 的 `[~]`。
+
+## 84. 2026-08-10 H2 producer-side bounded backpressure regression
+
+上一轮 H2 relay 使用 `h2::SendStream::send_data` 直接提交 frame。该 API 在 peer flow-control
+window 耗尽时会把未发送的 payload 保留在 h2 自身队列中；调用方 buffer 固定为 16 KiB，仍不能
+证明 producer-side 内存有界。更直接的问题是，若 relay 在 `tokio::select!` 的读本地方向分支中
+等待发送窗口，就会停止消费远端方向，TLS + HTTP/2 + Yuubinsya 的全双工长流可能互相等待。
+
+现在 `send_h2_data` 先调用 `reserve_capacity`/`poll_capacity`，只把已分配窗口内的最多 16 KiB
+提交给 h2；窗口等待被放进独立的 relay send task，主 relay 继续消费另一方向并释放接收窗口。
+服务端 `bridge_h2_stream` 使用同一模型，避免 inbound H2 bridge 复现同类死锁。发送 task 在
+relay 关闭、shutdown 或远端流结束时会被回收；待发送数据只存在本地固定 buffer、一个当前 frame
+和 h2 已明确分配的窗口中。
+
+新增/保留的证据包括：
+
+- `bounded_h2_sender_waits_for_peer_window_before_accepting_more_data`：对 128 KiB payload
+  验证 peer window 耗尽时发送 future 保持 pending，而不是继续接收无界数据；
+- `cargo test -p yuhaiin-chain --all-features --offline`：51 个 library tests、HTTP/2
+  protocol tests 和 12 个 P0 TUN/chain tests 通过；chain clippy `-D warnings` 通过；
+- `make service-chain-smoke`：12 个真实进程 inbound/router/outbound 场景通过；
+- `make tun-chain-service-smoke`：真实 runtime TUN → fixed → TLS → HTTP/2 → Yuubinsya
+  进程链路通过；
+- `make benchmark-throughput`：Podman、release、64 MiB、单流 loopback 中，HTTP CONNECT 为
+  `125.96 MiB/s`、peak RSS `17,164 KiB`，TLS/H2/Yuubinsya 为 `16.62 MiB/s`、peak RSS
+  `18,904 KiB`；两个测试均报告 `test result: ok`。
+
+这次修复确认的是窗口耗尽时的正确性和有界发送行为，不把单机 loopback 数值当作 Go/Rust
+跨机器性能结论；并发 stream、超长 soak 和 Android/macOS 设备验收仍按 checklist 保留。

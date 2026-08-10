@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use http::Request;
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -536,45 +536,71 @@ async fn relay(
     }
     let _active = ActiveGuard(&active_streams);
     let (mut reader, mut writer) = split(relay_side);
-    let mut buffer = vec![0u8; 16 * 1024];
-    let mut request_closed = false;
     if *shutdown.borrow() {
         let _ = writer.shutdown().await;
         return;
     }
+
+    // Sending a request body can wait for the peer's H2 window. Keep that
+    // wait in a separate task so the relay continues consuming response data
+    // and can therefore release the peer's response capacity. Waiting inside
+    // the select branch would deadlock full-duplex protocols such as
+    // TLS+H2+Yuubinsya once either direction fills its flow-control window.
+    let mut send_shutdown = shutdown.clone();
+    let mut send_task = tokio::spawn(async move {
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            tokio::select! {
+                result = reader.read(&mut buffer) => {
+                    let Ok(length) = result else { return Err(()); };
+                    if length == 0 {
+                        return send_stream.send_data(Bytes::new(), true).map_err(|_| ());
+                    }
+                    if send_h2_data(&mut send_stream, &buffer[..length])
+                        .await
+                        .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+                result = send_shutdown.changed() => {
+                    return if result.is_ok() { Ok(()) } else { Err(()) };
+                }
+            }
+        }
+    });
+
+    let mut send_done = false;
     loop {
         tokio::select! {
-            result = reader.read(&mut buffer), if !request_closed => {
-                let Ok(length) = result else { return };
-                if length == 0 {
-                    if send_stream.send_data(Bytes::new(), true).is_err() {
-                        return;
-                    }
-                    request_closed = true;
-                    continue;
-                }
-                if send_h2_data(&mut send_stream, &buffer[..length])
-                    .await
-                    .is_err()
-                {
+            result = &mut send_task, if !send_done => {
+                send_done = true;
+                if !matches!(result, Ok(Ok(()))) {
                     return;
                 }
             }
             result = recv_stream.data() => {
                 let Some(result) = result else {
                     let _ = writer.shutdown().await;
+                    send_task.abort();
                     return;
                 };
-                let Ok(data) = result else { return };
+                let Ok(data) = result else {
+                    send_task.abort();
+                    return;
+                };
                 if recv_stream.flow_control().release_capacity(data.len()).is_err() {
+                    send_task.abort();
                     return;
                 }
                 if writer.write_all(&data).await.is_err() {
+                    send_task.abort();
                     return;
                 }
             }
             _ = shutdown.changed() => {
                 let _ = writer.shutdown().await;
+                send_task.abort();
                 return;
             }
         }
@@ -582,14 +608,34 @@ async fn relay(
 }
 
 pub(crate) async fn send_h2_data(stream: &mut h2::SendStream<Bytes>, data: &[u8]) -> Result<()> {
-    // Relay callers pass at most their fixed 16 KiB buffer. `h2` owns the
-    // stream/connection window and queues the frame until capacity becomes
-    // available; reproducing its reservation state here can deadlock after a
-    // partial window update in nested H2 bridges. The pending queue is not a
-    // strict producer-side memory bound yet; that adapter remains follow-up.
-    stream
-        .send_data(Bytes::copy_from_slice(data), false)
-        .map_err(|error| protocol_error(format!("HTTP/2 send data: {error}")))
+    // `h2::SendStream::send_data` buffers without a producer-side bound when
+    // the peer's flow-control window is exhausted. Never hand it bytes until
+    // capacity has been assigned; this keeps the relay's pending memory
+    // bounded by its caller-owned buffer and one h2 frame.
+    let mut offset = 0;
+    while offset < data.len() {
+        let available = stream.capacity();
+        if available == 0 {
+            let requested = (data.len() - offset).min(16 * 1024);
+            stream.reserve_capacity(requested);
+            poll_fn(|context| stream.poll_capacity(context))
+                .await
+                .ok_or_else(|| {
+                    protocol_error("HTTP/2 send stream closed while waiting for capacity")
+                })?
+                .map_err(|error| protocol_error(format!("HTTP/2 capacity update: {error}")))?;
+            continue;
+        }
+        let length = available.min(data.len() - offset);
+        stream
+            .send_data(
+                Bytes::copy_from_slice(&data[offset..offset + length]),
+                false,
+            )
+            .map_err(|error| protocol_error(format!("HTTP/2 send data: {error}")))?;
+        offset += length;
+    }
+    Ok(())
 }
 
 fn protocol_error(message: impl Into<String>) -> Error {
@@ -645,6 +691,62 @@ mod tests {
         let mut response = vec![0; 13];
         tunnel.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"hello over h2");
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_h2_sender_waits_for_peer_window_before_accepting_more_data() {
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let request = connection.accept().await.unwrap().unwrap();
+            let (request, mut respond) = request;
+            let _ = respond.send_response(Response::new(()), false).unwrap();
+            let mut body = request.into_body();
+            let (_release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let reader = tokio::spawn(async move {
+                let _ = release_rx.await;
+                let mut received = 0usize;
+                while let Some(result) = body.data().await {
+                    let Ok(data) = result else { break };
+                    received += data.len();
+                    if body.flow_control().release_capacity(data.len()).is_err() {
+                        break;
+                    }
+                }
+                received
+            });
+            // Keep the connection driver active while the application body
+            // is deliberately not released. The client must stop at the
+            // initial flow-control window instead of growing h2's queue.
+            let _ = connection.accept().await;
+            let _ = reader.await;
+        });
+
+        let (mut sender, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let request = Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("http://localhost")
+            .body(())
+            .unwrap();
+        let (response, mut stream) = sender.send_request(request, false).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        let payload = vec![0x5a; 128 * 1024];
+        let send = tokio::spawn(async move { send_h2_data(&mut stream, &payload).await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!send.is_finished(), "sender buffered past the peer window");
+
+        // Closing the test driver is enough to release the pending sender;
+        // the test's assertion above is the important boundedness check.
+        driver.abort();
+        let _ = driver.await;
+        let _ = send.await;
         server.abort();
         let _ = server.await;
     }
