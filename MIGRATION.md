@@ -2565,11 +2565,16 @@ static-pie。`make android-aarch64` 也已实际通过，使用
 ## 79. 2026-08-10 transparent TPROXY gate reports rootless capability clearly
 
 在本机强制执行 `YUHAIIN_TPROXY_ENABLED=1 make transparent-service-smoke` 时确认：rootless
-Podman 可能创建出部分 namespace/iptables 状态，但不能提供可靠的 TPROXY UDP 验收，旧脚本会在
-后段以 `Resource temporarily unavailable` 或不完整 flow statistics 失败，容易误判为 Rust 数据面
-问题。现在脚本在启动容器前读取 Podman rootless 状态；rootless + 强制 TPROXY 直接以退出码 2
-报告需要 rootful Podman 或宿主机 `CAP_NET_ADMIN`。默认模式仍只运行 REDIRECT TCP 并明确记录
-TPROXY skip，IPv4 REDIRECT 和 IPv4+IPv6 REDIRECT 两个 gate 均重新通过。
+Podman 可以创建部分 namespace、veth、iptables TPROXY 规则并通过透明 socket capability probe，
+但非本地 UDP 包仍不能可靠到达 TPROXY listener，最终以 `Resource temporarily unavailable` 和
+`udp_connections=0` 失败。旧脚本在启动前直接退出，反而隐藏了这个证据；现在 `auto` 模式仍保守
+跳过，显式 `YUHAIIN_TPROXY_ENABLED=1` 会真正尝试并保留完整 `container.log`、iptables 和 runtime
+日志。测试夹具的 TPROXY 默认监听地址也改为 wildcard `0.0.0.0:18083`，避免原目标地址与透明
+socket lookup 不匹配。
+
+因此本轮没有把 rootless 的部分成功标成完整 TPROXY UDP；默认 REDIRECT TCP、IPv4+IPv6 REDIRECT
+仍通过，完整 UDP 仍需要 rootful Podman 或宿主机 `CAP_NET_ADMIN`，并继续保留在 checklist 的
+`[~]`。
 
 ## 80. 2026-08-10 native service-manager lifecycle
 

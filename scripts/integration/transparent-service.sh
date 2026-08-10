@@ -16,7 +16,10 @@ redir_v6_addr="${YUHAIIN_REDIR_V6_ADDR:-[::]:18085}"
 target_addr="${YUHAIIN_TARGET_ADDR:-${service_ip}:18080}"
 udp_target_addr="${YUHAIIN_UDP_TARGET_ADDR:-10.254.1.2:18082}"
 redir_addr="${YUHAIIN_REDIR_ADDR:-0.0.0.0:18081}"
-tproxy_addr="${YUHAIIN_TPROXY_ADDR:-${service_ip}:18083}"
+# A TPROXY UDP socket must be wildcard-bound: packets retain their original
+# destination, so binding only to the service veth address would not match the
+# kernel's transparent socket lookup for 10.254.1.2:18082.
+tproxy_addr="${YUHAIIN_TPROXY_ADDR:-0.0.0.0:18083}"
 main_container="${YUHAIIN_TRANSPARENT_CONTAINER:-yuhaiin-transparent-${BASHPID}}"
 state_dir="${scenario_dir}/state"
 runtime_log="${state_dir}/runtime.log"
@@ -84,9 +87,8 @@ if [[ "${tproxy_enabled}" != 0 && "${tproxy_enabled}" != 1 ]]; then
   exit 1
 fi
 if [[ "${tproxy_enabled}" -eq 1 && "${podman_rootless}" == "true" ]]; then
-  echo "TPROXY UDP gate requires rootful Podman or a host namespace with CAP_NET_ADMIN" >&2
-  echo "rootless Podman can only run the REDIRECT TCP portion; use YUHAIIN_TPROXY_ENABLED=auto" >&2
-  exit 2
+  echo "[transparent-service] rootless Podman: attempting the explicit TPROXY UDP gate"
+  echo "[transparent-service] if namespace capability setup fails, inspect ${scenario_dir}/container.log"
 fi
 
 ipv6_env_args=()
@@ -103,7 +105,7 @@ fi
 
 echo "[transparent-service] running isolated REDIRECT TCP + TPROXY UDP smoke in Podman"
 if [[ "${tproxy_enabled}" -eq 0 ]]; then
-  echo "[transparent-service] TPROXY UDP skipped: rootless Podman; set YUHAIIN_TPROXY_ENABLED=1 to require it"
+  echo "[transparent-service] TPROXY UDP skipped by auto capability policy; set YUHAIIN_TPROXY_ENABLED=1 to require it"
 fi
 cleanup_main() {
   podman rm -f "${main_container}" >/dev/null 2>&1 || true
