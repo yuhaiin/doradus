@@ -565,7 +565,21 @@ async fn start_listeners(
                     ));
                     continue;
                 }
-                let password_hash = yuhaiin_core::yuubinsya::derive_salt(spec.password.as_bytes());
+                let password_hashes = spec
+                    .auth
+                    .as_ref()
+                    .map(|auth| {
+                        auth.inbound_passwords()
+                            .into_iter()
+                            .map(|password| yuhaiin_core::yuubinsya::derive_salt(&password))
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|passwords| !passwords.is_empty())
+                    .unwrap_or_else(|| {
+                        vec![yuhaiin_core::yuubinsya::derive_salt(
+                            spec.password.as_bytes(),
+                        )]
+                    });
                 let socket = if let Some(password) = spec.aead_password.clone() {
                     let raw = match UdpSocket::bind(spec.listen).await {
                         Ok(socket) => socket,
@@ -583,7 +597,7 @@ async fn start_listeners(
                             password,
                             spec.aead_method,
                         )),
-                        password_hash,
+                        password_hashes[0],
                         false,
                     )
                 } else {
@@ -591,9 +605,9 @@ async fn start_listeners(
                     // format without the SOCKS5 three-byte prefix.  The
                     // prefix is only used when Yuubinsya wraps a SOCKS5
                     // UDP association.
-                    match yuhaiin_core::proxy::YuubinsyaUdpServer::bind(
+                    match yuhaiin_core::proxy::YuubinsyaUdpServer::bind_with_password_hashes(
                         spec.listen,
-                        password_hash,
+                        password_hashes,
                         false,
                     )
                     .await

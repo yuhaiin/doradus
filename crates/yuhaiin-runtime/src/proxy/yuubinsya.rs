@@ -112,18 +112,29 @@ pub(crate) async fn serve_udp(
     let mut packet = vec![0u8; udp_buffer_size];
     loop {
         tokio::select! {
-            received = server.recv_from(&mut packet) => {
-                let (length, target, peer) = received?;
+            received = server.recv_from_authenticated(&mut packet) => {
+                let (length, target, peer, password_hash) = received?;
                 let peer_addr = peer.addr().ok_or_else(|| Error::invalid("Yuubinsya UDP peer has no IP address"))?;
                 if target.port() == Some(53) {
                     if let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await {
                         if let Ok(response) = answer {
-                            server.send_to(&response, target, peer.clone()).await?;
+                            server
+                                .send_to_with_password_hash(
+                                    &response,
+                                    target,
+                                    peer.clone(),
+                                    password_hash,
+                                )
+                                .await?;
                         }
                         continue;
                     }
                 }
-                let id = UdpFlowId { peer: peer_addr, target: target.clone() };
+                let id = UdpFlowId {
+                    peer: peer_addr,
+                    target: target.clone(),
+                    authentication: Some(password_hash),
+                };
                 let state = if let Some(state) = flows.get(&id) {
                     state
                 } else {
@@ -183,7 +194,15 @@ pub(crate) async fn serve_udp(
             }
             Some(reply) = reply_rx.recv() => {
                 let Some(state) = flows.get(&reply.id) else { continue; };
-                server.send_to(&reply.payload, reply.target, state.peer.clone()).await?;
+                let Some(password_hash) = reply.id.authentication else { continue; };
+                server
+                    .send_to_with_password_hash(
+                        &reply.payload,
+                        reply.target,
+                        state.peer.clone(),
+                        password_hash,
+                    )
+                    .await?;
                 monitor.bytes(state.key, TunFlowDirection::Download, reply.payload.len());
                 if let Some(state) = flows.get_mut(&reply.id) {
                     state.last_seen = std::time::Instant::now();

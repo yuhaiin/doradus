@@ -2480,7 +2480,7 @@ ShadowsocksR/Trojan/AEAD 的 password 和 Tailscale token。缺少用户、disab
 `~/.cache/yuhaiin-rust/production-parity`；`make build` 成功，产物在
 `~/.cache/yuhaiin-rust/cargo-target/debug/yuhaiin`。本轮后 inbound 中心认证已覆盖
 HTTP/SOCKS5/mixed，以及 concrete password 的 Yuubinsya TCP/UOT、Trojan 请求头和 AEAD
-TCP transport；native Yuubinsya UDP 多密码、refact-user Go handler 逐响应 parity 和更广
+TCP transport；native Yuubinsya UDP 已补多密码，refact-user Go handler 逐响应 parity 和更广
 的 inbound 负向矩阵仍未完成，故本项继续保持部分完成。
 
 ## 75. 2026-08-10 inbound central authentication and bounded multi-password handshakes
@@ -2494,10 +2494,34 @@ mixed）在有可用中心 basic 用户时忽略旧 inbound JSON 中的 inline c
 密码 hash 协议不再为了支持多个用户而复制 listener：Yuubinsya 的首个 header 在多个 hash 中选出
 匹配项，后续 TCP/UOT session 沿用选中的 hash；Trojan request header 和 Go AEAD TCP transport
 也支持 bounded password set。旧的单密码 public API 继续调用同一套路径。native Yuubinsya UDP
-datagram 仍是单密码边界，避免在尚未完成 packet-session 生命周期审计前引入错误的 replay/peer
-语义；它是下一项明确工作，不会被误记为已完成。
+datagram 随后也扩展为 bounded password set；接收时返回命中的 hash，runtime 将认证身份纳入
+UDP flow key，异步回包沿用同一 hash，避免同一 peer/target 下不同用户互相串包。AEAD 外层 UDP
+仍是单密码设计，暂不声称支持中心多密码。
 
 新增/通过的测试包括：InboundAuth 的 enabled/usage、wildcard、constant-time 和 concrete
-password 规则；HTTP central user allow/reject；Yuubinsya `decode_header_any`；Trojan 多 hash；
-AEAD server 多 password；runtime 定向测试仍通过 213 项。工作区最终验收继续使用
+password 规则；HTTP central user allow/reject；Yuubinsya `decode_header_any` 与
+`decode_udp_packet_any`；native UDP server 的多密码接收/命中 hash 回包；Trojan 多 hash；
+AEAD server 多 password。core/runtime 定向单元测试分别通过 129/213 项，真实
+`cargo test -p yuhaiin-runtime --test service_chain --all-features --offline` 的 11 个
+inbound→router→outbound 场景也全部通过。工作区最终验收继续使用
 `~/.cache/yuhaiin-rust` 作为构建、互操作和临时状态目录。
+
+## 76. 2026-08-10 native Yuubinsya UDP central authentication
+
+native Yuubinsya UDP listener 现在从 `InboundAuth` 收集 bounded concrete passwords，派生出有限的
+SHA-256 password hash 集合后共用一个 UDP socket。`decode_udp_packet_any` 对固定 32 字节 hash
+逐个做 constant-time 比较，并把实际命中的 hash 返回给 server；`YuubinsyaUdpServer` 的旧
+`bind/new/recv_from/send_to` API 保持单密码兼容，新增 `*_with_password_hashes` 和
+`recv_from_authenticated`/`send_to_with_password_hash` 用于中心用户路径。
+
+runtime 的 UDP flow identity 增加可选 authentication hash。这样同一个 UDP peer 和目标地址同时
+使用两个中心用户时会创建两个独立 flow；receiver task 生成的异步 reply 带着原始 flow identity，
+回包不会错误使用另一个用户的 hash。DNS 本地应答和正常 outbound reply 都沿用命中 hash。
+AEAD 外层 UDP 仍是单密码设计，暂不声称支持中心多密码；它需要单独的 replay/session 生命周期
+设计，和 native packet auth 不能混为一项。
+
+验证证据：新增 `udp_packet_accepts_any_bounded_password_hash_and_returns_the_match`、
+`yuubinsya_native_udp_server_preserves_the_authenticated_password_for_replies`；`cargo test
+-p yuhaiin-core -p yuhaiin-runtime --lib --all-features --offline` 通过 129 + 213 个测试，
+并且真实 `service_chain` 进程测试 11/11 通过。构建和测试缓存均在
+`~/.cache/yuhaiin-rust`，没有使用 `/tmp`。

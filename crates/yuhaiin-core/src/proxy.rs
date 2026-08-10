@@ -1202,7 +1202,7 @@ impl AsyncProxy for YuubinsyaUdpProxy {
 #[cfg(feature = "async-proxy")]
 pub struct YuubinsyaUdpServer {
     transport: Box<dyn AsyncDatagram>,
-    password_hash: [u8; 32],
+    password_hashes: Arc<[[u8; 32]]>,
     socks5_prefix: bool,
 }
 
@@ -1213,14 +1213,22 @@ impl YuubinsyaUdpServer {
         password_hash: [u8; 32],
         socks5_prefix: bool,
     ) -> Result<Self> {
+        Self::bind_with_password_hashes(address, vec![password_hash], socks5_prefix).await
+    }
+
+    pub async fn bind_with_password_hashes(
+        address: SocketAddr,
+        password_hashes: Vec<[u8; 32]>,
+        socks5_prefix: bool,
+    ) -> Result<Self> {
         let socket = tokio::net::UdpSocket::bind(address)
             .await
             .map_err(|error| {
                 Error::new(ErrorKind::Io, format!("bind Yuubinsya UDP server: {error}"))
             })?;
-        Ok(Self::new(
+        Ok(Self::new_with_password_hashes(
             Box::new(TokioDatagram { socket }),
-            password_hash,
+            password_hashes,
             socks5_prefix,
         ))
     }
@@ -1230,18 +1238,39 @@ impl YuubinsyaUdpServer {
         password_hash: [u8; 32],
         socks5_prefix: bool,
     ) -> Self {
+        Self::new_with_password_hashes(transport, vec![password_hash], socks5_prefix)
+    }
+
+    pub fn new_with_password_hashes(
+        transport: Box<dyn AsyncDatagram>,
+        password_hashes: Vec<[u8; 32]>,
+        socks5_prefix: bool,
+    ) -> Self {
+        let password_hashes = if password_hashes.is_empty() {
+            vec![[0u8; 32]]
+        } else {
+            password_hashes
+        };
         Self {
             transport,
-            password_hash,
+            password_hashes: password_hashes.into(),
             socks5_prefix,
         }
     }
 
     pub async fn recv_from(&self, buffer: &mut [u8]) -> Result<(usize, Endpoint, Endpoint)> {
+        let (length, target, peer, _) = self.recv_from_authenticated(buffer).await?;
+        Ok((length, target, peer))
+    }
+
+    pub async fn recv_from_authenticated(
+        &self,
+        buffer: &mut [u8],
+    ) -> Result<(usize, Endpoint, Endpoint, [u8; 32])> {
         let mut packet = vec![0u8; crate::yuubinsya::MAX_SEGMENT_SIZE + 32 + 3 + 260];
         let (length, peer) = self.transport.recv_from(&mut packet).await?;
-        let (target, payload) = crate::yuubinsya::decode_udp_packet(
-            &self.password_hash,
+        let (target, payload, password_hash) = crate::yuubinsya::decode_udp_packet_any(
+            &self.password_hashes,
             &packet[..length],
             self.socks5_prefix,
         )?;
@@ -1252,17 +1281,28 @@ impl YuubinsyaUdpServer {
             ));
         }
         buffer[..payload.len()].copy_from_slice(payload);
-        Ok((payload.len(), target, peer))
+        Ok((payload.len(), target, peer, password_hash))
     }
 
     pub async fn send_to(&self, payload: &[u8], target: Endpoint, peer: Endpoint) -> Result<usize> {
+        self.send_to_with_password_hash(payload, target, peer, self.password_hashes[0])
+            .await
+    }
+
+    pub async fn send_to_with_password_hash(
+        &self,
+        payload: &[u8],
+        target: Endpoint,
+        peer: Endpoint,
+        password_hash: [u8; 32],
+    ) -> Result<usize> {
         if peer.network() != Network::Udp || peer.addr().is_none() {
             return Err(Error::invalid(
                 "Yuubinsya UDP peer must be an IP UDP endpoint",
             ));
         }
         let packet = crate::yuubinsya::encode_udp_packet(
-            &self.password_hash,
+            &password_hash,
             &target,
             payload,
             self.socks5_prefix,
@@ -1941,6 +1981,46 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[cfg(feature = "async-proxy")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn yuubinsya_native_udp_server_preserves_the_authenticated_password_for_replies() {
+        let transport = MemoryDatagram::default();
+        let received = transport.received.clone();
+        let sent = transport.sent.clone();
+        let first = crate::yuubinsya::derive_salt(b"first");
+        let second = crate::yuubinsya::derive_salt(b"second");
+        let target = Endpoint::domain(Network::Udp, DomainName::new("example.com").unwrap(), 53);
+        let peer = Endpoint::ip(Network::Udp, "198.51.100.9:4444".parse().unwrap());
+        let packet =
+            crate::yuubinsya::encode_udp_packet(&second, &target, b"query", false).unwrap();
+        received.lock().unwrap().push_back((packet, peer.clone()));
+
+        let server = YuubinsyaUdpServer::new_with_password_hashes(
+            Box::new(transport),
+            vec![first, second],
+            false,
+        );
+        let mut buffer = [0u8; 32];
+        let (length, decoded_target, decoded_peer, selected) =
+            server.recv_from_authenticated(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..length], b"query");
+        assert_eq!(decoded_target, target);
+        assert_eq!(decoded_peer, peer);
+        assert_eq!(selected, second);
+
+        server
+            .send_to_with_password_hash(b"answer", target.clone(), peer.clone(), selected)
+            .await
+            .unwrap();
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let (response_target, response_payload) =
+            crate::yuubinsya::decode_udp_packet(&second, &sent[0].0, false).unwrap();
+        assert_eq!(response_target, target);
+        assert_eq!(response_payload, b"answer");
+        assert!(crate::yuubinsya::decode_udp_packet(&first, &sent[0].0, false).is_err());
     }
 
     #[cfg(feature = "async-proxy")]

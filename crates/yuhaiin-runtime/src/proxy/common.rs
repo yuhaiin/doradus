@@ -25,6 +25,10 @@ pub(crate) const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 pub(crate) struct UdpFlowId {
     pub(crate) peer: SocketAddr,
     pub(crate) target: Endpoint,
+    /// Optional inbound authentication identity. Native Yuubinsya UDP needs
+    /// this because one socket can serve several passwords while preserving
+    /// the matching password for asynchronous replies.
+    pub(crate) authentication: Option<[u8; 32]>,
 }
 
 pub(crate) struct UdpFlowState {

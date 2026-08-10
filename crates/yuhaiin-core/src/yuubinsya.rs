@@ -182,20 +182,42 @@ pub fn decode_udp_packet<'a>(
     packet: &'a [u8],
     socks5_prefix: bool,
 ) -> Result<(Endpoint, &'a [u8])> {
-    if packet.len() < password_hash.len() + usize::from(socks5_prefix) * 3 {
-        return Err(Error::new(
-            ErrorKind::Protocol,
-            "Yuubinsya UDP packet is truncated",
-        ));
+    let password_hash: [u8; 32] = password_hash
+        .try_into()
+        .map_err(|_| Error::invalid("Yuubinsya password hash must be 32 bytes"))?;
+    let (destination, payload, _) =
+        decode_udp_packet_any(std::slice::from_ref(&password_hash), packet, socks5_prefix)?;
+    Ok((destination, payload))
+}
+
+/// Decode a native UDP packet against multiple accepted hashes and return the
+/// hash that authenticated it. The caller can use that hash for the response
+/// packet, preserving per-user authentication on a shared UDP socket.
+pub fn decode_udp_packet_any<'a>(
+    password_hashes: &[[u8; 32]],
+    packet: &'a [u8],
+    socks5_prefix: bool,
+) -> Result<(Endpoint, &'a [u8], [u8; 32])> {
+    let expected = packet
+        .get(..32)
+        .ok_or_else(|| Error::new(ErrorKind::Protocol, "Yuubinsya UDP packet is truncated"))?;
+    let mut selected = [0u8; 32];
+    let mut found = 0u8;
+    for candidate in password_hashes {
+        let matched = u8::from(constant_time_eq(expected, candidate));
+        let mask = 0u8.wrapping_sub(matched);
+        for (selected_byte, candidate_byte) in selected.iter_mut().zip(candidate) {
+            *selected_byte = (*selected_byte & !mask) | (*candidate_byte & mask);
+        }
+        found |= matched;
     }
-    let mut cursor = 0;
-    let password = take(packet, &mut cursor, password_hash.len())?;
-    if !constant_time_eq(password, password_hash) {
+    if found == 0 {
         return Err(Error::new(
             ErrorKind::Protocol,
             "Yuubinsya password is incorrect",
         ));
     }
+    let mut cursor = 32;
     if socks5_prefix {
         if take(packet, &mut cursor, 3)? != [0, 0, 0] {
             return Err(Error::new(
@@ -205,7 +227,7 @@ pub fn decode_udp_packet<'a>(
         }
     }
     let destination = decode_endpoint(packet, &mut cursor, Network::Udp)?;
-    Ok((destination, &packet[cursor..]))
+    Ok((destination, &packet[cursor..], selected))
 }
 
 pub fn encode_uot_frame(destination: &Endpoint, payload: &[u8]) -> Result<Vec<u8>> {
@@ -487,6 +509,22 @@ mod tests {
         let (decoded, payload) = decode_udp_packet(&password(), &packet, true).unwrap();
         assert_eq!(decoded, destination);
         assert_eq!(payload, b"payload");
+    }
+
+    #[test]
+    fn udp_packet_accepts_any_bounded_password_hash_and_returns_the_match() {
+        let destination =
+            Endpoint::domain(Network::Udp, DomainName::new("example.com").unwrap(), 53);
+        let first = derive_salt(b"first");
+        let second = derive_salt(b"second");
+        let packet = encode_udp_packet(&second, &destination, b"payload", false).unwrap();
+
+        let (decoded, payload, selected) =
+            decode_udp_packet_any(&[first, second], &packet, false).unwrap();
+        assert_eq!(decoded, destination);
+        assert_eq!(payload, b"payload");
+        assert_eq!(selected, second);
+        assert!(decode_udp_packet_any(&[first], &packet, false).is_err());
     }
 
     #[test]

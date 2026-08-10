@@ -202,7 +202,11 @@ pub(crate) async fn serve_socks5_udp_loop(
                         continue;
                     }
                 }
-                let id = UdpFlowId { peer, target: target.clone() };
+                let id = UdpFlowId {
+                    peer,
+                    target: target.clone(),
+                    authentication: None,
+                };
                 let state = if let Some(state) = flows.get(&id) {
                     state
                 } else {

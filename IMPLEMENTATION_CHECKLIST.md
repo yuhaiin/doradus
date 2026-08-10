@@ -37,7 +37,7 @@
 | Proxy/transport | 20 | 2 | 95.5% | raw standalone HTTP/2 不携带目标地址、Linux transparent UDP、平台 listen 绑定、复杂协议 |
 | NAT | 3 | 1 | 87.5% | Android/macOS route/NAT 生命周期 |
 | TUN inbound | 4 | 2 | 83.3% | namespace 长矩阵、Android/macOS 实机 |
-| 管理 API/connections/统计 | 3 | 3 | 75.0% | 已补真实 node/inbound/route reload→数据面与统计→重启读回，并以独立 Go/Rust SQLite 副本逐响应验证核心 mutation、settings/backup/inbound config/hosts/FakeDNS/server/route config/list config、原生 publishes CRUD/resolve、update.status 和 users CRUD；users 已使用 Go refact-user schema-v6 的原生表，出站节点 `userId` 在 runtime snapshot 中解析为临时凭据，HTTP/SOCKS5/mixed 与多密码 Yuubinsya/Trojan/AEAD inbound 已消费中心认证快照；仍需 native UDP 多密码、更多生成客户端语义、users 边界、错误矩阵和并发统计锁竞争 |
+| 管理 API/connections/统计 | 3 | 3 | 75.0% | 已补真实 node/inbound/route reload→数据面与统计→重启读回，并以独立 Go/Rust SQLite 副本逐响应验证核心 mutation、settings/backup/inbound config/hosts/FakeDNS/server/route config/list config、原生 publishes CRUD/resolve、update.status 和 users CRUD；users 已使用 Go refact-user schema-v6 的原生表，出站节点 `userId` 在 runtime snapshot 中解析为临时凭据，HTTP/SOCKS5/mixed、Yuubinsya TCP/UOT/native UDP、Trojan/AEAD inbound 已消费中心认证快照；仍需更多生成客户端语义、users 边界、错误矩阵和并发统计锁竞争 |
 | 平台与发布 | 2 | 3 | 70.0% | Android/macOS 实机、service-manager 现场回滚 |
 
 覆盖率不会把 `[~]` 自动改成 `[x]`；只有对应的测试、进程级验证或平台证据完成后才更新条目状态。
@@ -88,8 +88,8 @@ producer-side bounded adapter，并把 TLS/H2/Yuubinsya 的 peak RSS 从当前
 > `protocol=auth_aes128_sha1` 被错误当作代理类型，已改为优先继承链层 `type` 并回归。修复后
 > `make production-parity-smoke` 对三份停止生产快照全部通过，`make build` 产出
 > `~/.cache/yuhaiin-rust/cargo-target/debug/yuhaiin`。inbound 中心用户认证已覆盖 HTTP/SOCKS5/mixed、
-> Yuubinsya TCP/UOT、Trojan 请求头和 AEAD TCP transport；native Yuubinsya UDP 的多密码认证、
-> refact-user Go handler 逐响应 parity 及更广的 inbound 负向矩阵仍保持 `[~]`。
+> Yuubinsya TCP/UOT/native UDP、Trojan 请求头和 AEAD TCP transport；refact-user Go handler 逐响应
+> parity 及更广的 inbound 负向矩阵仍保持 `[~]`。
 
 ```mermaid
 flowchart LR
