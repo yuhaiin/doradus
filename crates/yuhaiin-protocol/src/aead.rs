@@ -95,9 +95,20 @@ pub async fn server(
     password: &[u8],
     method: CryptoMethod,
 ) -> Result<BoxAsyncStream> {
+    server_with_passwords(stream, &[password.to_vec()], method).await
+}
+
+/// Perform the server handshake against a bounded set of central-user
+/// passwords. The candidate is selected from the signed/timestamped client
+/// header before any protected stream bytes are accepted.
+pub async fn server_with_passwords(
+    stream: BoxAsyncStream,
+    passwords: &[Vec<u8>],
+    method: CryptoMethod,
+) -> Result<BoxAsyncStream> {
     tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        handshake_server(stream, password, method),
+        handshake_server(stream, passwords, method),
     )
     .await
     .map_err(|_| Error::new(ErrorKind::Timeout, "AEAD handshake timed out"))?
@@ -449,23 +460,29 @@ async fn handshake_client(
 
 async fn handshake_server(
     mut stream: BoxAsyncStream,
-    password: &[u8],
+    passwords: &[Vec<u8>],
     method: CryptoMethod,
 ) -> Result<BoxAsyncStream> {
-    let signing_key = signing_key(&password_salt(password))?;
     let mut client_header = [0u8; HEADER_SIZE];
     stream
         .read_exact(&mut client_header)
         .await
         .map_err(io_error)?;
-    verify_header(&client_header, &signing_key)?;
     let client_salt = client_header[SIGNATURE_SIZE..SIGNATURE_SIZE + HASH_SIZE].to_vec();
-    let client_time = decrypt_timestamp(
-        password,
-        &client_salt,
-        &client_header[SIGNATURE_SIZE + HASH_SIZE..SIGNATURE_SIZE + HASH_SIZE + TIME_SIZE],
-    )?;
-    validate_timestamp(&client_time)?;
+    let encrypted_client_time =
+        &client_header[SIGNATURE_SIZE + HASH_SIZE..SIGNATURE_SIZE + HASH_SIZE + TIME_SIZE];
+    let Some((password, client_time, signing_key)) = passwords.iter().find_map(|password| {
+        let signing_key = signing_key(&password_salt(password)).ok()?;
+        verify_header(&client_header, &signing_key).ok()?;
+        let client_time = decrypt_timestamp(password, &client_salt, encrypted_client_time).ok()?;
+        validate_timestamp(&client_time).ok()?;
+        Some((password.as_slice(), client_time, signing_key))
+    }) else {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "AEAD handshake credentials are invalid",
+        ));
+    };
     let client_public =
         PublicKey::from_sec1_bytes(&client_header[SIGNATURE_SIZE + HASH_SIZE + TIME_SIZE..])
             .map_err(|_| Error::new(ErrorKind::Protocol, "invalid AEAD client public key"))?;
@@ -934,6 +951,30 @@ mod tests {
             client.read_exact(&mut response).await.unwrap();
             assert_eq!(&response, b"server-to-client");
         }
+    }
+
+    #[tokio::test]
+    async fn server_accepts_a_central_password_from_a_bounded_set() {
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let passwords = vec![b"old-password".to_vec(), b"central-password".to_vec()];
+        let (client, server) = tokio::join!(
+            super::client(
+                Box::new(client_io),
+                b"central-password",
+                CryptoMethod::Chacha20Poly1305
+            ),
+            super::server_with_passwords(
+                Box::new(server_io),
+                &passwords,
+                CryptoMethod::Chacha20Poly1305
+            ),
+        );
+        let mut client = client.unwrap();
+        let mut server = server.unwrap();
+        client.write_all(b"central-authenticated").await.unwrap();
+        let mut request = vec![0u8; 21];
+        server.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"central-authenticated");
     }
 
     #[test]

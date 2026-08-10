@@ -125,9 +125,23 @@ pub async fn read_request<R: AsyncRead + Unpin>(
     reader: &mut R,
     expected_hash: &[u8; PASSWORD_HASH_LENGTH],
 ) -> Result<Request> {
+    read_request_any(reader, std::slice::from_ref(expected_hash)).await
+}
+
+/// Read a Trojan request while accepting a bounded set of central-user
+/// password hashes. The wire format carries the hash before the command, so
+/// the selected credential does not need to be retained after this request.
+pub async fn read_request_any<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    expected_hashes: &[[u8; PASSWORD_HASH_LENGTH]],
+) -> Result<Request> {
     let mut hash = [0u8; PASSWORD_HASH_LENGTH];
     reader.read_exact(&mut hash).await.map_err(io_error)?;
-    if !constant_time_eq(&hash, expected_hash) {
+    let mut matched = 0u8;
+    for expected_hash in expected_hashes {
+        matched |= u8::from(constant_time_eq(&hash, expected_hash));
+    }
+    if matched == 0 {
         return Err(Error::new(
             ErrorKind::Protocol,
             "Trojan password is incorrect",
@@ -416,5 +430,24 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.kind, ErrorKind::Protocol);
+    }
+
+    #[tokio::test]
+    async fn async_request_reader_accepts_a_central_password_from_multiple_hashes() {
+        let request = encode_request(
+            &password_hash(b"central-password"),
+            Command::Connect,
+            &tcp_domain(),
+        )
+        .unwrap();
+        let hashes = [
+            password_hash(b"old-password"),
+            password_hash(b"central-password"),
+        ];
+        let parsed = read_request_any(&mut Cursor::new(request), &hashes)
+            .await
+            .unwrap();
+        assert_eq!(parsed.command, Command::Connect);
+        assert_eq!(parsed.destination, tcp_domain());
     }
 }

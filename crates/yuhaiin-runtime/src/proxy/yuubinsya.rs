@@ -26,8 +26,19 @@ pub(crate) fn new_server(
     selector: Arc<RuntimeProxySelector>,
 ) -> Arc<YuubinsyaServerProxy> {
     let upstream: Arc<dyn AsyncProxy> = Arc::new(RoutedProxy { selector });
-    Arc::new(YuubinsyaServerProxy::new(
-        derive_salt(spec.password.as_bytes()),
+    let password_hashes = spec
+        .auth
+        .as_ref()
+        .map(|auth| {
+            auth.inbound_passwords()
+                .into_iter()
+                .map(|password| derive_salt(&password))
+                .collect::<Vec<_>>()
+        })
+        .filter(|passwords| !passwords.is_empty())
+        .unwrap_or_else(|| vec![derive_salt(spec.password.as_bytes())]);
+    Arc::new(YuubinsyaServerProxy::new_with_password_hashes(
+        password_hashes,
         upstream,
     ))
 }

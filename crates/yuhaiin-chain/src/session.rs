@@ -12,8 +12,8 @@ use tokio::sync::{Mutex, mpsc};
 use yuhaiin_core::flow::{Flow, FlowDirection, FlowKey, FlowObserver, FlowObserverGuard};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy};
 use yuhaiin_core::yuubinsya::{
-    YuubinsyaHeader, YuubinsyaProtocol, decode_header, decode_uot_frame, encode_header,
-    encode_uot_frame,
+    YuubinsyaHeader, YuubinsyaProtocol, decode_header, decode_header_any, decode_uot_frame,
+    encode_header, encode_uot_frame,
 };
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Result};
 
@@ -409,7 +409,7 @@ impl ServerUdpSession {
 /// are keyed by migrate id, so a new HTTP/2 stream can continue an existing
 /// UDP flow instead of creating a second upstream datagram.
 pub struct YuubinsyaServerProxy {
-    password_hash: [u8; 32],
+    password_hashes: Arc<[[u8; 32]]>,
     upstream: Arc<dyn AsyncProxy>,
     next_migrate_id: AtomicU64,
     udp_sessions: Mutex<HashMap<u64, Arc<ServerUdpSession>>>,
@@ -429,8 +429,20 @@ struct ObservedFlow {
 
 impl YuubinsyaServerProxy {
     pub fn new(password_hash: [u8; 32], upstream: Arc<dyn AsyncProxy>) -> Self {
+        Self::new_with_password_hashes(vec![password_hash], upstream)
+    }
+
+    pub fn new_with_password_hashes(
+        password_hashes: Vec<[u8; 32]>,
+        upstream: Arc<dyn AsyncProxy>,
+    ) -> Self {
+        let password_hashes = if password_hashes.is_empty() {
+            vec![[0u8; 32]]
+        } else {
+            password_hashes
+        };
         Self {
-            password_hash,
+            password_hashes: password_hashes.into(),
             upstream,
             next_migrate_id: AtomicU64::new(1),
             udp_sessions: Mutex::new(HashMap::new()),
@@ -500,7 +512,7 @@ impl YuubinsyaServerProxy {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let header_bytes = read_header_bytes(&mut *stream).await?;
-        let (header, _) = decode_header(&self.password_hash, &header_bytes)?;
+        let (header, _, password_hash) = decode_header_any(&self.password_hashes, &header_bytes)?;
         match header.protocol {
             YuubinsyaProtocol::Tcp => {
                 let destination = header.destination.ok_or_else(|| {
@@ -511,7 +523,7 @@ impl YuubinsyaServerProxy {
                 })?;
                 let mut inbound = AsyncYuubinsyaTcpSession {
                     stream: stream,
-                    password_hash: self.password_hash,
+                    password_hash,
                     write_shutdown: false,
                 };
                 let mut context = FlowContext::new(destination.clone());
@@ -602,7 +614,7 @@ impl YuubinsyaServerProxy {
                 };
                 let mut session = AsyncYuubinsyaUotServerSession {
                     stream,
-                    password_hash: self.password_hash,
+                    password_hash,
                     migrate_id,
                 };
                 session

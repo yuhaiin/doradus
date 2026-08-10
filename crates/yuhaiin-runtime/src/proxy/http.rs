@@ -9,7 +9,7 @@ use yuhaiin_core::proxy::AsyncProxySelector;
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 use super::common::{io_error, relay_counted_with_buffer, relay_counted_with_prefix_and_buffer};
-use crate::inbound::InboundSpec;
+use crate::inbound::{InboundAuth, InboundSpec};
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
 const MAX_HEADERS: usize = 64 * 1024;
@@ -32,7 +32,12 @@ where
     let mut fields = request.split_whitespace();
     let method = fields.next().unwrap_or_default();
     let target = fields.next().unwrap_or_default();
-    match http_authorization(&headers, &spec.username, &spec.password) {
+    match http_authorization(
+        &headers,
+        &spec.username,
+        &spec.password,
+        spec.auth.as_deref(),
+    ) {
         HttpAuthorization::Allowed => {}
         HttpAuthorization::Missing => {
             stream
@@ -272,12 +277,16 @@ enum HttpAuthorization {
     Invalid,
 }
 
-fn http_authorization(headers: &str, username: &str, password: &str) -> HttpAuthorization {
-    if username.is_empty() && password.is_empty() {
+fn http_authorization(
+    headers: &str,
+    username: &str,
+    password: &str,
+    auth: Option<&InboundAuth>,
+) -> HttpAuthorization {
+    let central = auth.filter(|auth| auth.has_basic_users());
+    if central.is_none() && username.is_empty() && password.is_empty() {
         return HttpAuthorization::Allowed;
     }
-    let expected =
-        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
     let Some(token) = headers.lines().find_map(|line| {
         let Some((name, value)) = line.split_once(':') else {
             return None;
@@ -289,7 +298,22 @@ fn http_authorization(headers: &str, username: &str, password: &str) -> HttpAuth
     }) else {
         return HttpAuthorization::Missing;
     };
-    if token == expected {
+
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(token) else {
+        return HttpAuthorization::Invalid;
+    };
+    let Some(separator) = decoded.iter().position(|byte| *byte == b':') else {
+        return HttpAuthorization::Invalid;
+    };
+    let (actual_username, actual_password) = decoded.split_at(separator);
+    let actual_password = &actual_password[1..];
+    if let Some(auth) = central {
+        if auth.authenticate_basic(actual_username, actual_password) {
+            return HttpAuthorization::Allowed;
+        }
+        return HttpAuthorization::Invalid;
+    }
+    if decoded == format!("{username}:{password}").as_bytes() {
         HttpAuthorization::Allowed
     } else {
         HttpAuthorization::Invalid
@@ -354,11 +378,50 @@ mod tests {
         let token = base64::engine::general_purpose::STANDARD.encode("u:p");
         let headers = format!("GET / HTTP/1.1\r\nproxy-authorization: Basic {token}\r\n\r\n");
         assert_eq!(
-            http_authorization(&headers, "u", "p"),
+            http_authorization(&headers, "u", "p", None),
             HttpAuthorization::Allowed
         );
         assert_eq!(
-            http_authorization(&headers, "u", "wrong"),
+            http_authorization(&headers, "u", "wrong", None),
+            HttpAuthorization::Invalid
+        );
+    }
+
+    #[test]
+    fn central_inbound_users_replace_inline_http_credentials() {
+        let auth = InboundAuth::from_users(vec![yuhaiin_store::GoUserRecord {
+            id: "central-http".to_owned(),
+            name: "central-http".to_owned(),
+            enabled: true,
+            origin: "manual".to_owned(),
+            usage: "inbound".to_owned(),
+            credential: yuhaiin_store::GoCredential {
+                kind: "basic".to_owned(),
+                basic: Some(yuhaiin_store::GoBasicCredential {
+                    username: Some("central-user".to_owned()),
+                    password: Some("central-password".to_owned()),
+                    allow_any_username: false,
+                    allow_any_password: false,
+                }),
+                uuid: None,
+                token: None,
+            },
+            updated_at: 0,
+        }]);
+        let token =
+            base64::engine::general_purpose::STANDARD.encode("central-user:central-password");
+        let headers = format!(
+            "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic {token}\r\n\r\n"
+        );
+        assert_eq!(
+            http_authorization(&headers, "legacy", "legacy", Some(&auth)),
+            HttpAuthorization::Allowed
+        );
+        let wrong_token =
+            base64::engine::general_purpose::STANDARD.encode("central-user:wrong-password");
+        let wrong = headers.replace(&token, &wrong_token);
+        assert_eq!(
+            http_authorization(&wrong, "legacy", "legacy", Some(&auth)),
             HttpAuthorization::Invalid
         );
     }
@@ -366,7 +429,7 @@ mod tests {
     #[test]
     fn proxy_authorization_distinguishes_missing_from_invalid() {
         assert_eq!(
-            http_authorization("GET / HTTP/1.1\r\n\r\n", "u", "p"),
+            http_authorization("GET / HTTP/1.1\r\n\r\n", "u", "p", None),
             HttpAuthorization::Missing
         );
     }

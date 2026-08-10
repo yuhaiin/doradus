@@ -32,8 +32,18 @@ pub(crate) async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let hash = trojan::password_hash(spec.password.as_bytes());
-    let request = trojan::read_request(&mut stream, &hash).await?;
+    let hashes = spec
+        .auth
+        .as_ref()
+        .map(|auth| {
+            auth.inbound_passwords()
+                .into_iter()
+                .map(|password| trojan::password_hash(&password))
+                .collect::<Vec<_>>()
+        })
+        .filter(|hashes| !hashes.is_empty())
+        .unwrap_or_else(|| vec![trojan::password_hash(spec.password.as_bytes())]);
+    let request = trojan::read_request_any(&mut stream, &hashes).await?;
     if request.command == Command::Associate {
         return serve_udp(stream, peer, spec, selector, monitor).await;
     }

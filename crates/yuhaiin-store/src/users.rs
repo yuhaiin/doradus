@@ -250,6 +250,13 @@ impl From<GoUserWrite> for GoUserRecord {
 }
 
 impl ConfigRepository {
+    /// Return the credential-bearing user records needed by inbound runtime
+    /// authentication. The runtime receives an owned snapshot and never
+    /// keeps the SQLite connection or exposes these records through the API.
+    pub async fn list_go_user_records_for_runtime(&self) -> Result<Vec<GoUserRecord>> {
+        self.list_go_user_records()
+    }
+
     /// Resolve central outbound credentials into an ephemeral node snapshot.
     ///
     /// Go stores only `userId` in `nodes_v2`.  Runtime builders still consume

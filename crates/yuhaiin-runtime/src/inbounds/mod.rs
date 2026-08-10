@@ -27,6 +27,10 @@ use yuhaiin_store::GoInboundRecord;
 
 use crate::{ConnectionMonitor, RuntimeController, RuntimeProxySelector};
 
+#[path = "auth.rs"]
+mod auth;
+pub(crate) use auth::InboundAuth;
+
 #[cfg(feature = "doh-tls")]
 pub(crate) type InboundTlsAcceptor = tokio_rustls::TlsAcceptor;
 #[cfg(not(feature = "doh-tls"))]
@@ -56,6 +60,7 @@ pub(crate) struct InboundSpec {
     pub(crate) listen: SocketAddr,
     pub(crate) username: String,
     pub(crate) password: String,
+    pub(crate) auth: Option<Arc<InboundAuth>>,
     pub(crate) udp_mode: UdpMode,
     pub(crate) protocol_udp: bool,
     pub(crate) transports: Vec<String>,
@@ -221,6 +226,13 @@ async fn start_listeners(
     open_tun: bool,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
     let records = controller.store().repository().list_go_inbounds().await?;
+    let inbound_auth = Arc::new(InboundAuth::from_users(
+        controller
+            .store()
+            .repository()
+            .list_go_user_records_for_runtime()
+            .await?,
+    ));
     let proxy_id = selected_proxy_id(controller).await?;
     let selector = controller
         .build_proxy_selector("", &proxy_id, "", "", Duration::from_secs(30))
@@ -288,6 +300,13 @@ async fn start_listeners(
             }
         };
         spec.outbound_id = proxy_id.clone();
+        if inbound_auth.has_basic_users() || !inbound_auth.inbound_passwords().is_empty() {
+            spec.username.clear();
+            if inbound_auth.has_basic_users() {
+                spec.password.clear();
+            }
+            spec.auth = Some(Arc::clone(&inbound_auth));
+        }
         if !spec.transports.is_empty()
             && spec.transports.iter().any(|transport| {
                 !transport.eq_ignore_ascii_case("normal")
@@ -831,6 +850,7 @@ impl InboundSpec {
             listen,
             username,
             password,
+            auth: None,
             udp_mode,
             protocol_udp,
             transports,
@@ -1437,12 +1457,31 @@ async fn serve_listener(
                                 Box::new(stream)
                             };
                             let stream = if let Some(password) = spec.aead_password.as_deref() {
-                                yuhaiin_protocol::aead::server(
-                                    stream,
-                                    password.as_bytes(),
-                                    spec.aead_method,
-                                )
-                                .await?
+                                if let Some(auth) = spec.auth.as_ref() {
+                                    let passwords = auth.inbound_passwords();
+                                    if passwords.is_empty() {
+                                        yuhaiin_protocol::aead::server(
+                                            stream,
+                                            password.as_bytes(),
+                                            spec.aead_method,
+                                        )
+                                        .await?
+                                    } else {
+                                        yuhaiin_protocol::aead::server_with_passwords(
+                                            stream,
+                                            &passwords,
+                                            spec.aead_method,
+                                        )
+                                        .await?
+                                    }
+                                } else {
+                                    yuhaiin_protocol::aead::server(
+                                        stream,
+                                        password.as_bytes(),
+                                        spec.aead_method,
+                                    )
+                                    .await?
+                                }
                             } else {
                                 stream
                             };
@@ -2028,6 +2067,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             listen: "127.0.0.1:19084".parse().unwrap(),
             username: String::new(),
             password: String::new(),
+            auth: None,
             udp_mode: UdpMode::Disabled,
             protocol_udp: false,
             transports: vec!["normal".to_owned()],
@@ -2077,6 +2117,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             listen: "127.0.0.1:19085".parse().unwrap(),
             username: String::new(),
             password: String::new(),
+            auth: None,
             udp_mode: UdpMode::Disabled,
             protocol_udp: false,
             transports: vec!["normal".to_owned()],
@@ -2253,6 +2294,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 listen: "127.0.0.1:12347".parse().unwrap(),
                 username: String::new(),
                 password: String::new(),
+                auth: None,
                 udp_mode: UdpMode::Disabled,
                 protocol_udp: false,
                 transports: Vec::new(),
@@ -2283,6 +2325,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             listen: address,
             username: String::new(),
             password: String::new(),
+            auth: None,
             udp_mode: UdpMode::Disabled,
             protocol_udp: false,
             transports: vec!["aead".to_owned()],
@@ -2352,6 +2395,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             listen: "127.0.0.1:19080".parse().unwrap(),
             username: String::new(),
             password: "secret".to_owned(),
+            auth: None,
             udp_mode: UdpMode::Disabled,
             protocol_udp: false,
             transports: vec!["normal".to_owned()],
@@ -2393,6 +2437,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             listen: "127.0.0.1:19082".parse().unwrap(),
             username: String::new(),
             password: "00112233-4455-6677-8899-aabbccddeeff".to_owned(),
+            auth: None,
             udp_mode: UdpMode::Disabled,
             protocol_udp: false,
             transports: vec!["normal".to_owned()],
@@ -2443,6 +2488,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             listen: "127.0.0.1:19083".parse().unwrap(),
             username: String::new(),
             password: "00112233-4455-6677-8899-aabbccddeeff".to_owned(),
+            auth: None,
             udp_mode: UdpMode::Enabled,
             protocol_udp: true,
             transports: vec!["normal".to_owned()],
@@ -2495,6 +2541,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             listen: "127.0.0.1:19081".parse().unwrap(),
             username: String::new(),
             password: "secret".to_owned(),
+            auth: None,
             udp_mode: UdpMode::Enabled,
             protocol_udp: true,
             transports: vec!["normal".to_owned()],
@@ -2579,6 +2626,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             listen: "127.0.0.1:18080".parse().unwrap(),
             username: String::new(),
             password: String::new(),
+            auth: None,
             udp_mode: UdpMode::Disabled,
             protocol_udp: false,
             transports: vec!["normal".to_owned()],
@@ -2626,6 +2674,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 listen,
                 username: String::new(),
                 password: String::new(),
+                auth: None,
                 udp_mode: UdpMode::Disabled,
                 protocol_udp: false,
                 transports: vec!["normal".to_owned()],
@@ -2667,6 +2716,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     listen: inbound_address,
                     username: String::new(),
                     password: String::new(),
+                    auth: None,
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["normal".to_owned()],
@@ -2730,6 +2780,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     listen: inbound_address,
                     username: String::new(),
                     password: String::new(),
+                    auth: None,
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["normal".to_owned()],
@@ -2790,6 +2841,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     listen: inbound_address,
                     username: String::new(),
                     password: String::new(),
+                    auth: None,
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["normal".to_owned()],
@@ -2887,6 +2939,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     listen: inbound_address,
                     username: String::new(),
                     password: String::new(),
+                    auth: None,
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["normal".to_owned()],
@@ -2964,6 +3017,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     listen: inbound_address,
                     username: String::new(),
                     password: String::new(),
+                    auth: None,
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["normal".to_owned()],
@@ -3059,6 +3113,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     listen: server_address,
                     username: String::new(),
                     password: String::new(),
+                    auth: None,
                     udp_mode: UdpMode::Enabled,
                     protocol_udp: true,
                     transports: vec!["normal".to_owned()],
@@ -3151,6 +3206,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                         listen: inbound_address,
                         username: String::new(),
                         password: String::new(),
+                        auth: None,
                         udp_mode: UdpMode::Enabled,
                         protocol_udp: true,
                         transports: vec!["normal".to_owned()],
@@ -3246,6 +3302,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     listen: inbound_address,
                     username: String::new(),
                     password: String::new(),
+                    auth: None,
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["normal".to_owned()],
@@ -3306,6 +3363,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     listen: inbound_address,
                     username: String::new(),
                     password: String::new(),
+                    auth: None,
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["websocket".to_owned()],
@@ -3384,6 +3442,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     listen: inbound_address,
                     username: String::new(),
                     password: "test-password".to_owned(),
+                    auth: None,
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["normal".to_owned()],
@@ -3465,6 +3524,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     listen: inbound_address,
                     username: String::new(),
                     password: String::new(),
+                    auth: None,
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["tls".to_owned()],
@@ -3556,6 +3616,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     listen: inbound_address,
                     username: String::new(),
                     password: String::new(),
+                    auth: None,
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["websocket".to_owned(), "http2".to_owned()],
@@ -3645,6 +3706,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     listen: inbound_address,
                     username: String::new(),
                     password: String::new(),
+                    auth: None,
                     udp_mode: UdpMode::Disabled,
                     protocol_udp: false,
                     transports: vec!["http2".to_owned()],

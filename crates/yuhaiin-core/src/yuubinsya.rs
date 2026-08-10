@@ -109,6 +109,49 @@ pub fn decode_header(password_hash: &[u8], packet: &[u8]) -> Result<(YuubinsyaHe
     ))
 }
 
+/// Decode a header against a bounded set of accepted password hashes and
+/// return the hash that authenticated it. The selected hash is copied into
+/// the session, so later framing keeps the same authentication key without
+/// retaining the whole credential set.
+pub fn decode_header_any(
+    password_hashes: &[[u8; 32]],
+    packet: &[u8],
+) -> Result<(YuubinsyaHeader, usize, [u8; 32])> {
+    if packet.is_empty() {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "Yuubinsya header is truncated",
+        ));
+    }
+    let protocol = YuubinsyaProtocol::from_byte(packet[0])?;
+    let password_offset = if matches!(protocol, YuubinsyaProtocol::UdpWithMigrateId) {
+        9
+    } else {
+        1
+    };
+    let expected = packet
+        .get(password_offset..password_offset + 32)
+        .ok_or_else(|| Error::new(ErrorKind::Protocol, "Yuubinsya header is truncated"))?;
+    let mut selected = [0u8; 32];
+    let mut found = 0u8;
+    for candidate in password_hashes {
+        let matched = u8::from(constant_time_eq(expected, candidate));
+        let mask = 0u8.wrapping_sub(matched);
+        for (selected_byte, candidate_byte) in selected.iter_mut().zip(candidate) {
+            *selected_byte = (*selected_byte & !mask) | (*candidate_byte & mask);
+        }
+        found |= matched;
+    }
+    if found == 0 {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "Yuubinsya password is incorrect",
+        ));
+    }
+    let (header, consumed) = decode_header(&selected, packet)?;
+    Ok((header, consumed, selected))
+}
+
 pub fn encode_udp_packet(
     password_hash: &[u8],
     destination: &Endpoint,
@@ -413,6 +456,27 @@ mod tests {
         let (decoded, consumed) = decode_header(&password(), &encoded).unwrap();
         assert_eq!(decoded, header);
         assert_eq!(consumed, encoded.len());
+    }
+
+    #[test]
+    fn header_accepts_any_bounded_password_hash_and_returns_the_match() {
+        let header = YuubinsyaHeader {
+            protocol: YuubinsyaProtocol::Tcp,
+            migrate_id: None,
+            destination: Some(Endpoint::domain(
+                Network::Tcp,
+                DomainName::new("example.com").unwrap(),
+                443,
+            )),
+        };
+        let first = derive_salt(b"first");
+        let second = derive_salt(b"second");
+        let encoded = encode_header(&second, &header).unwrap();
+        let (decoded, consumed, selected) = decode_header_any(&[first, second], &encoded).unwrap();
+        assert_eq!(decoded, header);
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(selected, second);
+        assert!(decode_header_any(&[first], &encoded).is_err());
     }
 
     #[test]

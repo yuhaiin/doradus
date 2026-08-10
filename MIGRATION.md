@@ -2478,5 +2478,26 @@ ShadowsocksR/Trojan/AEAD 的 password 和 Tailscale token。缺少用户、disab
 通过；`make production-parity-smoke` 对 `tmp/v2/state.db`、`tmp/yuhaiin/state.db`、
 `tmp/aws/yuhaiin/state.db` 三份停止快照逐响应通过，日志在
 `~/.cache/yuhaiin-rust/production-parity`；`make build` 成功，产物在
-`~/.cache/yuhaiin-rust/cargo-target/debug/yuhaiin`。inbound HTTP/SOCKS5/Yuubinsya 的中心
-用户认证及 refact-user Go handler 的逐响应 parity 仍未完成，故本项继续保持部分完成。
+`~/.cache/yuhaiin-rust/cargo-target/debug/yuhaiin`。本轮后 inbound 中心认证已覆盖
+HTTP/SOCKS5/mixed，以及 concrete password 的 Yuubinsya TCP/UOT、Trojan 请求头和 AEAD
+TCP transport；native Yuubinsya UDP 多密码、refact-user Go handler 逐响应 parity 和更广
+的 inbound 负向矩阵仍未完成，故本项继续保持部分完成。
+
+## 75. 2026-08-10 inbound central authentication and bounded multi-password handshakes
+
+`yuhaiin-runtime::inbound::InboundAuth` 在 listener reload 时从 `users_v2` 创建不可变内存快照，
+只保留 enabled 且 usage 为 `inbound`/`both` 的 basic 用户。HTTP Proxy 和 SOCKS5（因此也包括
+mixed）在有可用中心 basic 用户时忽略旧 inbound JSON 中的 inline credential，并用 constant-time
+字段比较校验中心用户名/密码；没有相关中心能力时仍保留旧 inline 行为。wildcard username/password
+遵守 Go `allowAny*` 语义，但 wildcard password 不会被拿去派生密码 hash。
+
+密码 hash 协议不再为了支持多个用户而复制 listener：Yuubinsya 的首个 header 在多个 hash 中选出
+匹配项，后续 TCP/UOT session 沿用选中的 hash；Trojan request header 和 Go AEAD TCP transport
+也支持 bounded password set。旧的单密码 public API 继续调用同一套路径。native Yuubinsya UDP
+datagram 仍是单密码边界，避免在尚未完成 packet-session 生命周期审计前引入错误的 replay/peer
+语义；它是下一项明确工作，不会被误记为已完成。
+
+新增/通过的测试包括：InboundAuth 的 enabled/usage、wildcard、constant-time 和 concrete
+password 规则；HTTP central user allow/reject；Yuubinsya `decode_header_any`；Trojan 多 hash；
+AEAD server 多 password；runtime 定向测试仍通过 213 项。工作区最终验收继续使用
+`~/.cache/yuhaiin-rust` 作为构建、互操作和临时状态目录。

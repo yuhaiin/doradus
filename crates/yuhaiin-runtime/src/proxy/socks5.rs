@@ -40,7 +40,9 @@ where
     }
     let mut methods = vec![0u8; usize::from(greeting[1])];
     stream.read_exact(&mut methods).await.map_err(io_error)?;
-    let requires_auth = !spec.username.is_empty() || !spec.password.is_empty();
+    let central_auth = spec.auth.as_deref().filter(|auth| auth.has_basic_users());
+    let requires_auth =
+        central_auth.is_some() || !spec.username.is_empty() || !spec.password.is_empty();
     let selected = if requires_auth && methods.contains(&2) {
         2
     } else if !requires_auth && methods.contains(&0) {
@@ -73,7 +75,11 @@ where
             .map_err(io_error)?;
         let mut password = vec![0u8; usize::from(password_len[0])];
         stream.read_exact(&mut password).await.map_err(io_error)?;
-        let ok = username == spec.username.as_bytes() && password == spec.password.as_bytes();
+        let ok = if let Some(auth) = central_auth {
+            auth.authenticate_basic(&username, &password)
+        } else {
+            username == spec.username.as_bytes() && password == spec.password.as_bytes()
+        };
         stream
             .write_all(&[1, if ok { 0 } else { 1 }])
             .await
