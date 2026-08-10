@@ -2213,9 +2213,11 @@ create → get → update/use/apply → delete 顺序清理，不改源库。默
 rule test 的 `afterAddr` 使用 Go 的 authority 形式（例如 `example.com:443`），不带 Rust
 内部的 `tcp://` 前缀。对应的 API 单测和真实 Go/Rust 双进程 parity 均通过。
 
-`route.rules.test` 本身暂不纳入严格逐字节矩阵：它返回运行时 list-evaluation history，Go
-返回所有已配置规则的历史，Rust 当前返回选中规则的历史；这是可见的剩余兼容差异，不能用
-排序或删除字段掩盖。它仍由 Rust API 单测覆盖，后续应单独对齐 history 生成语义。
+随后又把 `route.rules.test` 纳入严格逐响应矩阵：Rust 现在保留 Go 的按规则分组
+`matchResult`，包含未选中规则的 list history、`List ...`/`Port ...`/`Net ...`/`Geoip ...`
+诊断项，并从同一 runtime snapshot 的选中 resolver 查询 `ips`。生产 schema-7 副本上的
+route rule create → apply → test → delete 对照已通过；后续仍需扩展到 process/inbound/negative
+matcher 的真实历史样本，不能把当前单一诊断样本当作所有复杂表达式已逐字段等价。
 
 ## 65. 2026-08-10 Go/Rust frontend configuration mutation parity
 
@@ -2232,8 +2234,8 @@ FakeDNS、resolver server、route config 和 route list config 的 put → get�
   error；只有 MaxMindDB 下载 URL 变化时才清空已有 GeoIP error。Rust 现在先读当前
   `settings_kv.route_extra`，复用同样的保留/清理规则，并有同 URL、换 URL 的回归测试。
 
-最终对照使用真实停止的 Go schema-7 state snapshot，日志和两个运行副本位于
-`~/.cache/yuhaiin-rust/integration/go-api-config-debug3`，没有修改源库，也没有使用 `/tmp`；
+最终对照使用真实停止的 Go schema-7 state snapshot，日志和运行副本位于
+`~/.cache/yuhaiin-rust/integration/go-api-route-test-final5`，没有修改源库，也没有使用 `/tmp`；
 settings/backup/inbound config/hosts/FakeDNS/server/route config/list config 以及此前的核心资源
-mutation 全部通过。`route.rules.test` 的 Go 全量 history 与 Rust 选中 rule history 差异仍保持显式
-延期，不能因本轮配置 API 通过而标记为完成。
+mutation，以及 route rule test 全量 history 对照全部通过；复杂 matcher 的更多真实样本仍按
+上段列为后续验收项。

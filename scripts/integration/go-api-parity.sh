@@ -305,10 +305,8 @@ if [[ "${YUHAIIN_MUTATION_PARITY:-1}" == "1" ]]; then
   rule_body="$(jq -cn --arg name "${rule_id}" --arg list "${list_id}" '{name:$name,mode:"direct",tag:"parity",rules:[{type:"host",host:{list:$list}}]}')"
   compare_mutation route-rule-post route.rules.post "${rule_body}"
   compare_mutation route-rule-get route.rule.get "$(jq -cn --arg name "${rule_id}" '{name:$name,index:0}')"
-  # route.rules.test includes process-local list-evaluation history. Go
-  # reports every configured rule while Rust reports the selected rule; keep
-  # this runtime-diagnostic surface outside strict mutation parity.
   compare_mutation route-apply route.apply '{}'
+  compare_mutation route-rules-test route.rules.test '{"host":"parity.example:443"}'
   compare_mutation route-list-delete route.list.delete "$(jq -cn --arg id "${list_id}" '{id:$id}')"
   compare_mutation route-tag-put route.tag.put "$(jq -cn --arg tag "${tag_id}" '{tag:$tag,type:"node",hash:""}')"
   compare_mutation route-tag-get route.tags.get "$(jq -cn --arg query "${tag_id}" '{query:$query}')"

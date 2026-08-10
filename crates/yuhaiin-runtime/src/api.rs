@@ -29,7 +29,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use yuhaiin_core::proxy::{AsyncProxy, DirectAsyncProxy};
-use yuhaiin_core::{BoxFuture, DomainName, Endpoint, FlowContext, Network};
+use yuhaiin_core::{BoxFuture, DomainName, Endpoint, FlowContext, Network, ResolveStrategy};
 use yuhaiin_geo::{GeoDatabaseManager, GeoDownloadTransport, GeoRefreshRequest};
 
 use yuhaiin_store::{
@@ -2232,52 +2232,147 @@ async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
         yuhaiin_core::RouteMode::Bypass => "bypass",
         yuhaiin_core::RouteMode::Block => "drop",
     };
-    let mut matched = Vec::new();
     let route_lists = &snapshot.route_lists;
-    for record in &snapshot.route_rules {
-        for rule in expand_go_route_rule(record, route_lists)? {
-            let is_match = rule.matches(&context.effective_destination());
-            if is_match {
-                matched.push((record, rule));
-            }
-        }
-    }
-    let selected = matched
-        .iter()
-        .min_by_key(|(_, rule)| rule.priority)
-        .map(|(record, _)| raw_json(&record.data_json, json!({})));
+    let selected_rule_name = context
+        .match_history
+        .first()
+        .map(|entry| entry.rule_name.as_str());
+    let selected = selected_rule_name.and_then(|name| {
+        snapshot
+            .route_rules
+            .iter()
+            .find(|record| record.name == name)
+            .map(|record| raw_json(&record.data_json, json!({})))
+    });
     let tag = context.tag.clone().unwrap_or_else(|| {
         selected
             .as_ref()
             .map(|value| string_or(value, "tag", ""))
             .unwrap_or_default()
     });
-    let resolver = context.resolver.clone().unwrap_or_else(|| {
-        selected
-            .as_ref()
-            .map(|value| string_or(value, "resolver", ""))
-            .unwrap_or_default()
-    });
-    let match_result = context
-        .match_history
-        .iter()
-        .flat_map(|entry| entry.history.iter())
-        .map(|item| {
-            json!({
-                "listName": item.list_name,
-                "matched": item.matched,
-            })
-        })
-        .collect::<Vec<_>>();
+    let resolver = selected
+        .as_ref()
+        .map(|value| string_or(value, "resolver", ""))
+        .unwrap_or_default();
+    let effective_destination = context.effective_destination();
+    let mut match_result = Vec::new();
+    for record in &snapshot.route_rules {
+        if record.disabled {
+            continue;
+        }
+        let mut history = Vec::new();
+        let root = raw_json(&record.data_json, json!({}));
+        let mut list_names = Vec::new();
+        collect_route_rule_list_names(&root, &mut list_names);
+        for name in &list_names {
+            history.push(json!({
+                "listName": format!("List {name}"),
+                "matched": selected_rule_name == Some(record.name.as_str()),
+            }));
+        }
+        for rule in expand_go_route_rule(record, route_lists)? {
+            let mut append_history = |list_name: String, value: bool| {
+                if let Some(existing) = history
+                    .iter_mut()
+                    .find(|entry: &&mut Value| entry["listName"] == list_name)
+                {
+                    if value {
+                        existing["matched"] = json!(true);
+                    }
+                } else {
+                    history.push(json!({"listName": list_name, "matched": value}));
+                }
+            };
+            if let Some(network) = rule.network {
+                let name = match effective_destination.network() {
+                    Network::Tcp => Some("Net TCP"),
+                    Network::Udp => Some("Net UDP"),
+                    Network::Icmp | Network::Any => None,
+                };
+                if let Some(name) = name {
+                    append_history(name.to_owned(), network == effective_destination.network());
+                }
+            }
+            if rule.port.is_some() {
+                if let Some(port) = effective_destination.port() {
+                    append_history(
+                        format!("Port {port}"),
+                        rule.port
+                            .is_some_and(|(start, end)| (start..=end).contains(&port)),
+                    );
+                }
+            }
+            if !rule.inbound_names.is_empty() {
+                let inbound = context.inbound_name.as_deref().unwrap_or_default();
+                append_history(
+                    inbound.to_owned(),
+                    rule.inbound_names.iter().any(|name| name == inbound),
+                );
+            }
+            if rule.geo_country.is_some() {
+                let country = context.geo.as_deref().unwrap_or_default();
+                append_history(
+                    format!("Geoip {country}"),
+                    rule.geo_country
+                        .as_deref()
+                        .is_some_and(|expected| expected.eq_ignore_ascii_case(country)),
+                );
+            }
+        }
+        match_result.push(json!({
+            "ruleName": record.name,
+            "history": history,
+        }));
+    }
+    let ips = match &context.destination {
+        Endpoint::Ip { addr, .. } => vec![addr.ip().to_string()],
+        Endpoint::Domain { host, .. } => {
+            let mut resolved = Vec::new();
+            if let Ok(resolver) = snapshot.resolver_for_route_mode(decision.mode) {
+                if let Ok(addresses) = resolver.resolve(host, ResolveStrategy::Default).await {
+                    resolved.extend(addresses.v4.into_iter().map(|address| address.to_string()));
+                    resolved.extend(addresses.v6.into_iter().map(|address| address.to_string()));
+                }
+            }
+            resolved
+        }
+    };
     json_value(json!({
         "mode": mode,
         "tag": tag,
         "resolver": resolver,
         "afterAddr": endpoint_authority(&context.destination),
         "lists": context.lists,
-        "ips": [],
+        "ips": ips,
         "matchResult": match_result,
     }))
+}
+
+fn collect_route_rule_list_names(value: &Value, names: &mut Vec<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_route_rule_list_names(value, names);
+            }
+        }
+        Value::Object(object) => {
+            for key in ["host", "process"] {
+                if let Some(Value::Object(matcher)) = object.get(key) {
+                    if let Some(name) = matcher
+                        .get("list")
+                        .or_else(|| matcher.get("name"))
+                        .and_then(Value::as_str)
+                    {
+                        names.push(name.to_owned());
+                    }
+                }
+            }
+            for value in object.values() {
+                collect_route_rule_list_names(value, names);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn endpoint_authority(endpoint: &Endpoint) -> String {
@@ -4562,7 +4657,12 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["mode"], "drop");
         assert_eq!(value["afterAddr"], "example.com:443");
-        assert!(value.get("matchResult").is_some());
+        let match_result = value["matchResult"].as_array().unwrap();
+        assert!(
+            match_result.iter().all(|entry| {
+                entry["ruleName"].as_str().is_some() && entry["history"].is_array()
+            })
+        );
 
         let _ = route_apply_value(&state).await.unwrap();
         let applied = route_activation_value(&state).await.unwrap();
