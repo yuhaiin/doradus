@@ -2233,14 +2233,8 @@ async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
         yuhaiin_core::RouteMode::Block => "drop",
     };
     let route_lists = &snapshot.route_lists;
-    let selected_rule_name = context
-        .match_history
-        // Router history is ordered like Go's matcher: rejected rules first,
-        // then the selected rule. The last entry is therefore the selected
-        // rule (or the last attempted rule when the fallback was used).
-        .last()
-        .map(|entry| entry.rule_name.as_str());
-    let selected = selected_rule_name.and_then(|name| {
+    let selected_rule_name = snapshot.router.selected_rule_name(&context);
+    let selected = selected_rule_name.as_deref().and_then(|name| {
         snapshot
             .route_rules
             .iter()
@@ -2270,7 +2264,7 @@ async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
         for name in &list_names {
             history.push(json!({
                 "listName": format!("List {name}"),
-                "matched": selected_rule_name == Some(record.name.as_str()),
+                "matched": context.lists.iter().any(|list| list == name),
             }));
         }
         for rule in expand_go_route_rule(record, route_lists)? {

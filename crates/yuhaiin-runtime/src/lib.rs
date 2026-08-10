@@ -221,12 +221,13 @@ impl RuntimeSnapshot {
 
     pub fn apply_route(&self, context: &mut FlowContext) -> RouteDecision {
         let matched_lists = self.route_lists.matching_names(context);
+        // Go fills ConnOptions.lists from the host/process tries before the
+        // nested route matcher runs. Router history must see that immutable
+        // membership while each List matcher records its result.
+        context.lists = matched_lists.clone();
         let decision = self.router.apply_to_context(context);
-        // Go populates ConnOptions.lists from the host/process tries before
-        // evaluating route rules.  Do the same at the shared snapshot seam;
-        // Router metadata remains responsible for the selected rule, while
-        // this list is the complete flow-level membership used by API and
-        // connection statistics.
+        // Keep the same snapshot-derived list after routing as well. This is
+        // the complete flow-level membership used by API and statistics.
         context.lists = matched_lists;
         context.resolver = self.route.as_ref().and_then(|route| {
             let id = match decision.mode {
@@ -801,6 +802,92 @@ mod tests {
         assert_eq!(
             snapshot.router.decide(&endpoint).mode,
             yuhaiin_core::RouteMode::Proxy
+        );
+    }
+
+    #[test]
+    fn apply_route_exposes_go_list_membership_to_rejected_nested_matchers() {
+        let store = block_on(ConfigStore::open_memory()).unwrap();
+        for (name, list_type, values) in [
+            ("domains", "host", "example.test"),
+            ("apps", "process", "/usr/bin/curl"),
+        ] {
+            block_on(store.repository().put_go_route_list(&GoRouteListRecord {
+                name: name.to_owned(),
+                list_type: list_type.to_owned(),
+                source_type: "local".to_owned(),
+                updated_at: 1,
+                data_json: format!(
+                    r#"{{"type":"{list_type}","source":{{"type":"local","local":{{"lists":["{values}"]}}}}}}"#
+                )
+                .into_bytes(),
+            }))
+            .unwrap();
+        }
+        block_on(
+            store.repository().put_go_route_rule(&GoRouteRuleRecord {
+                id: "process-gated".to_owned(),
+                name: "process-gated".to_owned(),
+                priority: 1,
+                disabled: false,
+                action_mode: "direct".to_owned(),
+                match_type: "all".to_owned(),
+                tag: "test".to_owned(),
+                updated_at: 1,
+                data_json: br#"{
+                "mode":"direct",
+                "rules":[{"type":"all","all":[
+                    {"type":"host","host":{"list":"domains"}},
+                    {"type":"process","process":{"list":"apps"}}
+                ]}]
+            }"#
+                .to_vec(),
+            }),
+        )
+        .unwrap();
+        block_on(
+            store.repository().put_go_route_rule(&GoRouteRuleRecord {
+                id: "host-fallback".to_owned(),
+                name: "host-fallback".to_owned(),
+                priority: 2,
+                disabled: false,
+                action_mode: "proxy".to_owned(),
+                match_type: "host".to_owned(),
+                tag: "test".to_owned(),
+                updated_at: 2,
+                data_json: br#"{
+                "mode":"proxy",
+                "rules":[{"type":"host","host":{"list":"domains"}}]
+            }"#
+                .to_vec(),
+            }),
+        )
+        .unwrap();
+
+        let snapshot =
+            block_on(RuntimeBuilder::new(store, Arc::new(SystemAsyncIpResolver)).build()).unwrap();
+        let mut context = FlowContext::new(yuhaiin_core::Endpoint::domain(
+            yuhaiin_core::Network::Tcp,
+            DomainName::new("www.example.test").unwrap(),
+            443,
+        ));
+        context.process = Some("/usr/bin/browser".to_owned());
+
+        assert_eq!(snapshot.apply_route(&mut context).mode, RouteMode::Proxy);
+        assert_eq!(context.lists, vec!["domains"]);
+        let rejected = &context.match_history[0];
+        assert_eq!(rejected.rule_name, "process-gated");
+        assert!(
+            rejected
+                .history
+                .iter()
+                .any(|entry| entry.list_name == "List domains" && entry.matched)
+        );
+        assert!(
+            rejected
+                .history
+                .iter()
+                .any(|entry| entry.list_name == "List apps" && !entry.matched)
         );
     }
 

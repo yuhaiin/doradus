@@ -348,13 +348,9 @@ impl Router {
         context.resolver_policy = decision.resolver_policy;
         context.tag = None;
         context.match_history.clear();
-        context.lists.clear();
         context.geo = None;
         if let Some(rule) = self.selected_rule(context) {
             context.tag = (!rule.tag.is_empty()).then(|| rule.tag.clone());
-            context.lists = rule.list_names.clone();
-            context.lists.sort();
-            context.lists.dedup();
         }
         if let (Some(geo), Some(address)) = (
             self.geo.as_deref(),
@@ -406,7 +402,7 @@ impl Router {
                 matched |= self.rule_matches(rule, &context.destination, context)
                     || (context.original_domain.is_some()
                         && self.rule_matches(rule, &endpoint, context));
-                append_rule_history(&mut history, rule, self, context, &endpoint);
+                append_rule_history(&mut history, rule, context, &endpoint);
                 offset += 1;
             }
             if !key.0.is_empty() {
@@ -426,7 +422,6 @@ impl Router {
 fn append_rule_history(
     history: &mut Vec<MatchResult>,
     rule: &RouteRule,
-    router: &Router,
     context: &FlowContext,
     endpoint: &Endpoint,
 ) {
@@ -461,20 +456,6 @@ fn append_rule_history(
             });
         }
     }
-    if !rule.process_names.is_empty() || !rule.excluded_process_names.is_empty() {
-        let process = context.process.as_deref().unwrap_or_default();
-        let matched = rule
-            .process_names
-            .iter()
-            .chain(rule.excluded_process_names.iter())
-            .any(|name| name == process);
-        for list_name in &rule.list_names {
-            history.push(MatchResult {
-                list_name: format!("List {list_name}"),
-                matched,
-            });
-        }
-    }
     if !rule.inbound_names.is_empty() || !rule.excluded_inbound_names.is_empty() {
         let inbound = context
             .inbound_name
@@ -504,21 +485,15 @@ fn append_rule_history(
             matched,
         });
     }
-    if !rule.list_names.is_empty()
-        && rule.process_names.is_empty()
-        && rule.excluded_process_names.is_empty()
-    {
-        let matched = if !rule.pattern.is_empty() {
-            router.pattern_matches(rule, endpoint)
-        } else {
-            rule.excluded_patterns.search(endpoint).is_some()
-        };
-        for list_name in &rule.list_names {
-            history.push(MatchResult {
-                list_name: format!("List {list_name}"),
-                matched,
-            });
-        }
+    // Go's nested List matcher consults the host/process trie membership that
+    // was populated before route evaluation. It does not re-run the rule's
+    // domain/process expression here; a rule can therefore report a matched
+    // list even when a later matcher rejects the whole rule.
+    for list_name in &rule.list_names {
+        history.push(MatchResult {
+            list_name: format!("List {list_name}"),
+            matched: context.lists.iter().any(|name| name == list_name),
+        });
     }
 }
 
@@ -571,6 +546,16 @@ impl RouterRuntime {
 
     pub fn apply_to_context(&self, context: &mut yuhaiin_core::FlowContext) -> RouteDecision {
         self.snapshot().apply_to_context(context)
+    }
+
+    /// Return the rule that actually selected the current context, if any.
+    /// This is distinct from the last match-history entry: Go keeps rejected
+    /// rules in that history even when the fallback mode is ultimately used.
+    pub fn selected_rule_name(&self, context: &yuhaiin_core::FlowContext) -> Option<String> {
+        self.snapshot()
+            .selected_rule(context)
+            .filter(|rule| !rule.rule_name.is_empty())
+            .map(|rule| rule.rule_name.clone())
     }
 }
 
@@ -738,6 +723,7 @@ mod tests {
             Network::Tcp,
             "198.51.100.7:443".parse().unwrap(),
         ));
+        context.lists = vec!["media-hosts".to_owned()];
 
         router.apply_to_context(&mut context);
 
@@ -776,6 +762,7 @@ mod tests {
             DomainName::new("www.example.com").unwrap(),
             443,
         ));
+        context.lists = vec!["example".to_owned()];
         router.apply_to_context(&mut context);
 
         assert_eq!(context.match_history.len(), 2);
@@ -789,6 +776,71 @@ mod tests {
         );
         assert_eq!(context.match_history[1].rule_name, "selected-rule");
         assert!(context.match_history[1].history[0].matched);
+    }
+
+    #[test]
+    fn route_match_history_keeps_list_match_when_a_later_process_match_rejects_rule() {
+        let mut rejected = rule("example.com", RuleAction::Direct, 1);
+        rejected.rule_name = "process-rejected".to_owned();
+        rejected.list_names = vec!["shared-hosts".to_owned()];
+        rejected.process_names = vec!["curl".to_owned()];
+        let mut selected = rule("example.com", RuleAction::Proxy, 2);
+        selected.rule_name = "fallback-rule".to_owned();
+        selected.list_names = vec!["selected-hosts".to_owned()];
+        let router = Router::compile(
+            vec![rejected, selected],
+            RouteDecision {
+                mode: RouteMode::Direct,
+                resolver_policy: ResolverPolicy::default(),
+                priority: 100,
+            },
+        )
+        .unwrap();
+        let mut context = FlowContext::new(Endpoint::domain(
+            Network::Tcp,
+            DomainName::new("www.example.com").unwrap(),
+            443,
+        ));
+        context.process = Some("browser".to_owned());
+        context.lists = vec!["shared-hosts".to_owned(), "selected-hosts".to_owned()];
+
+        router.apply_to_context(&mut context);
+
+        assert_eq!(context.match_history.len(), 2);
+        assert_eq!(context.match_history[0].rule_name, "process-rejected");
+        assert_eq!(
+            context.match_history[0].history[0].list_name,
+            "List shared-hosts"
+        );
+        assert!(context.match_history[0].history[0].matched);
+        assert_eq!(context.match_history[1].rule_name, "fallback-rule");
+        assert!(context.match_history[1].history[0].matched);
+    }
+
+    #[test]
+    fn runtime_selected_rule_name_ignores_last_rejected_rule_on_fallback() {
+        let mut rejected = rule("example.com", RuleAction::Direct, 1);
+        rejected.rule_name = "rejected-rule".to_owned();
+        let router = RouterRuntime::new(
+            Router::compile(
+                vec![rejected],
+                RouteDecision {
+                    mode: RouteMode::Proxy,
+                    resolver_policy: ResolverPolicy::default(),
+                    priority: 100,
+                },
+            )
+            .unwrap(),
+        );
+        let mut context = FlowContext::new(Endpoint::domain(
+            Network::Tcp,
+            DomainName::new("other.example").unwrap(),
+            443,
+        ));
+
+        assert_eq!(router.apply_to_context(&mut context).mode, RouteMode::Proxy);
+        assert_eq!(context.match_history.len(), 1);
+        assert!(router.selected_rule_name(&context).is_none());
     }
 
     #[test]

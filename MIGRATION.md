@@ -2249,13 +2249,13 @@ list；Go 则在 route matcher 运行前调用 host trie 和 process trie，把�
 
 现在 `RouteListSnapshot` 保存规范化 list kind、host/CIDR trie 和 process values，新增
 `matching_names(&FlowContext)`；`RuntimeSnapshot::apply_route` 在同一 immutable snapshot
-边界先计算全量 membership，再交给 router 选择 mode/tag/resolver。`yuhaiin-trie::Router`
-同时保留展开后的 priority 顺序，在连接 metadata 中记录选中前已尝试的规则以及
+边界先计算全量 membership，并在交给 router 前放入 `FlowContext`，再选择 mode/tag/resolver。
+`yuhaiin-trie::Router` 不再用选中规则覆盖这个 membership，同时保留展开后的 priority 顺序，在连接 metadata 中记录选中前已尝试的规则以及
 `List ...`/`Net ...`/`Port ...`/`Geoip ...` matcher history，而不是只记录最终规则。这样
 TUN、socket inbound、`route.rules.test` 和 connections/telemetry 共用同一 list 结果，不新增
 DTO，也不改变现有前端 contract。
 
-验证结果：route-list host/CIDR/process membership 单测、Router rejected-rule history 单测、route API 单测、完整 8 条
+验证结果：route-list host/CIDR/process membership 单测、Router rejected-rule/process-gated history 单测、route API 单测、完整 8 条
 `service_chain` 数据面测试，以及 Go/Rust 26 个只读响应和 mutation/config parity 全部通过。
-对照日志保存在 `~/.cache/yuhaiin-rust/integration/go-api-route-history-final9`，没有使用
+对照日志保存在 `~/.cache/yuhaiin-rust/integration/go-api-route-history-final11`，没有使用
 `/tmp`；复杂 matcher 的逐项 match history 仍单独列为后续工作。
