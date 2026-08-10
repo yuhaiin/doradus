@@ -141,6 +141,7 @@ normalize() {
 
 declare -a operations=(
   'info|{}'
+  'update.status|{}'
   'settings.get|{}'
   'backup.config.get|{}'
   'inbounds.config.get|{}'
@@ -156,6 +157,7 @@ declare -a operations=(
   'resolver.hosts.get|{}'
   'resolver.fakedns.get|{}'
   'resolver.server.get|{}'
+  'publishes|{}'
   'route.activation|{}'
   'route.config.get|{}'
   'route.lists.get|{"page":1,"page_size":1000}'
@@ -315,6 +317,14 @@ if [[ "${YUHAIIN_MUTATION_PARITY:-1}" == "1" ]]; then
   compare_mutation route-tag-get route.tags.get "$(jq -cn --arg query "${tag_id}" '{query:$query}')"
   compare_mutation route-tag-delete route.tag.delete "$(jq -cn --arg tag "${tag_id}" '{tag:$tag}')"
   compare_mutation route-rule-delete route.rule.delete "$(jq -cn --arg name "${rule_id}" '{name:$name,index:0}')"
+
+  publish_name="rust-api-parity-publish-${mutation_suffix}"
+  publish_body="$(jq -cn --arg name "${publish_name}" '{name:$name,points:[],path:"parity",password:"secret",address:"",insecure:false}')"
+  compare_mutation publish-put publish.put "${publish_body}"
+  compare_mutation publishes-after-put publishes '{}'
+  compare_mutation publish-resolve publish.resolve "$(jq -cn --arg name "${publish_name}" '{name:$name,path:"parity",password:"secret"}')"
+  compare_mutation publish-delete publish.delete "$(jq -cn --arg name "${publish_name}" '{name:$name}')"
+  compare_mutation publishes-after-delete publishes '{}'
 fi
 
 # Go's typed CloseRequest decodes a missing/null ids field as an empty slice;

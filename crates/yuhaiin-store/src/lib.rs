@@ -322,6 +322,16 @@ pub struct GoSubscriptionLinkRecord {
     pub data_json: Vec<u8>,
 }
 
+/// Raw Go `publishes` row.  The HTTP contract is decoded at the API boundary,
+/// while the original JSON is retained here so future Go fields are not
+/// silently discarded by the storage layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoPublishRecord {
+    pub name: String,
+    pub updated_at: i64,
+    pub data_json: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub struct ConfigRepository {
     store: ConfigStore,

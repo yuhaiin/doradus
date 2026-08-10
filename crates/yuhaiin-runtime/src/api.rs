@@ -33,9 +33,9 @@ use yuhaiin_core::{BoxFuture, DomainName, Endpoint, FlowContext, Network, Resolv
 use yuhaiin_geo::{GeoDatabaseManager, GeoDownloadTransport, GeoRefreshRequest};
 
 use yuhaiin_store::{
-    GoBackupSettingsRecord, GoInboundRecord, GoNodeRecord, GoResolverRecord, GoRouteListRecord,
-    GoRouteRuleRecord, GoRouteSettingsRecord, GoSettingsKvRecord, GoSubscriptionLinkRecord,
-    InboundSettings, MaxMindMetadataRecord,
+    GoBackupSettingsRecord, GoInboundRecord, GoNodeRecord, GoPublishRecord, GoResolverRecord,
+    GoRouteListRecord, GoRouteRuleRecord, GoRouteSettingsRecord, GoSettingsKvRecord,
+    GoSubscriptionLinkRecord, InboundSettings, MaxMindMetadataRecord,
 };
 
 use crate::update::UpdateService;
@@ -2861,41 +2861,77 @@ fn subscription_json(record: GoSubscriptionLinkRecord) -> Value {
 }
 
 async fn publishes_get_value(state: &ApiState) -> ApiResult {
-    Ok(Json(
-        json!({"items": config_items(state, "publishes.items").await?}),
-    ))
+    let items = state
+        .controller
+        .store()
+        .repository()
+        .list_go_publishes()
+        .await?
+        .into_iter()
+        .map(decode_publish_record)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(Json(json!({"items": items})))
 }
 
-async fn publish_put_value(state: &ApiState, mut value: Value) -> ApiResult {
-    let name = required_string(&value, "name")?;
-    set_string(&mut value, "name", name.clone());
-    let mut items = config_items(state, "publishes.items").await?;
-    items.retain(|item| item.get("name").and_then(Value::as_str) != Some(name.as_str()));
-    items.push(value);
-    let _ = write_config_json(state, "publishes.items", json!({"items": items})).await?;
+async fn publish_put_value(state: &ApiState, value: Value) -> ApiResult {
+    let mut publish = parse_publish_contract(&value)?;
+    publish.name = publish.name.trim().to_owned();
+    if publish.name.is_empty() {
+        return Err(ApiError::bad("publish name is empty"));
+    }
+    let data_json = serde_json::to_vec(&publish)
+        .map_err(|error| ApiError::bad(format!("encode publish failed: {error}")))?;
+    state
+        .controller
+        .store()
+        .repository()
+        .put_go_publish(&GoPublishRecord {
+            name: publish.name.clone(),
+            updated_at: unix_seconds(),
+            data_json,
+        })
+        .await?;
     empty()
 }
 
 async fn publish_delete_value(state: &ApiState, name: String) -> ApiResult {
-    let mut items = config_items(state, "publishes.items").await?;
-    items.retain(|item| item.get("name").and_then(Value::as_str) != Some(name.as_str()));
-    let _ = write_config_json(state, "publishes.items", json!({"items": items})).await?;
+    let deleted = state
+        .controller
+        .store()
+        .repository()
+        .delete_go_publish(&name)
+        .await?;
+    if !deleted {
+        return Err(ApiError::not_found(format!(
+            "publish {name:?} was not found"
+        )));
+    }
     empty()
 }
 
 async fn publish_resolve_value(state: &ApiState, value: &Value) -> ApiResult {
     let name = required_string(value, "name")?;
-    let publish = config_items(state, "publishes.items")
+    let publish = state
+        .controller
+        .store()
+        .repository()
+        .list_go_publishes()
         .await?
         .into_iter()
-        .find(|item| item.get("name").and_then(Value::as_str) == Some(name.as_str()))
-        .ok_or_else(|| ApiError::not_found(format!("publish {name:?} was not found")))?;
+        .find(|record| record.name == name)
+        .map(decode_publish_contract)
+        .transpose()?;
+    let Some(publish) = publish else {
+        return json_value(json!({"points": Value::Null}));
+    };
+    let requested_path = string_or(value, "path", "");
+    let requested_password = string_or(value, "password", "");
+    if publish.path != requested_path || publish.password != requested_password {
+        return json_value(json!({"points": Value::Null}));
+    }
     let points = publish
-        .get("points")
-        .and_then(Value::as_array)
+        .points
         .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
         .collect::<std::collections::HashSet<_>>();
     let nodes = state
         .controller
@@ -2904,10 +2940,52 @@ async fn publish_resolve_value(state: &ApiState, value: &Value) -> ApiResult {
         .list_go_nodes()
         .await?
         .into_iter()
-        .filter(|node| points.is_empty() || points.contains(node.id.as_str()))
+        .filter(|node| points.contains(node.id.as_str()))
         .map(node_json)
         .collect::<Vec<_>>();
     json_value(json!({"points": nodes}))
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct PublishContract {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    points: Vec<String>,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    address: String,
+    #[serde(default)]
+    insecure: bool,
+}
+
+fn parse_publish_contract(value: &Value) -> Result<PublishContract, ApiError> {
+    serde_json::from_value(value.clone())
+        .map_err(|error| ApiError::bad(format!("invalid publish contract: {error}")))
+}
+
+fn decode_publish_record(record: GoPublishRecord) -> Result<Value, ApiError> {
+    let publish = decode_publish_contract(record)?;
+    serde_json::to_value(publish)
+        .map_err(|error| ApiError::internal(format!("encode publish response: {error}")))
+}
+
+fn decode_publish_contract(record: GoPublishRecord) -> Result<PublishContract, ApiError> {
+    let mut publish: PublishContract =
+        serde_json::from_slice(&record.data_json).map_err(|error| {
+            ApiError::internal(format!("decode publish {:?}: {error}", record.name))
+        })?;
+    publish.name = publish.name.trim().to_owned();
+    if publish.name.is_empty() {
+        publish.name = record.name;
+    }
+    if publish.name.is_empty() {
+        return Err(ApiError::internal("stored publish name is empty"));
+    }
+    Ok(publish)
 }
 
 async fn users_get_value(state: &ApiState, input: &Value) -> ApiResult {
@@ -5128,6 +5206,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(invalid_limit.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn publishes_read_native_go_rows_and_preserve_resolve_semantics() {
+        let state = state().await;
+        state
+            .controller
+            .store()
+            .repository()
+            .put_go_publish(&GoPublishRecord {
+                name: "public".to_owned(),
+                updated_at: 1,
+                data_json: br#"{"points":[],"path":"feed","password":"secret"}"#.to_vec(),
+            })
+            .await
+            .unwrap();
+        let app = router(state);
+
+        let list = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v2/publishes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let list: Value =
+            serde_json::from_slice(&to_bytes(list.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(list["items"][0]["name"], "public");
+        assert_eq!(list["items"][0]["points"], json!([]));
+
+        let resolved = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v2/publishes/public/resolve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"path":"feed","password":"secret"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.status(), StatusCode::OK);
+        let resolved: Value =
+            serde_json::from_slice(&to_bytes(resolved.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(resolved["points"], json!([]));
+
+        let mismatch = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v2/publishes/public/resolve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"path":"wrong","password":"secret"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mismatch.status(), StatusCode::OK);
+        let mismatch: Value =
+            serde_json::from_slice(&to_bytes(mismatch.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert!(mismatch["points"].is_null());
     }
 
     #[tokio::test]

@@ -476,3 +476,46 @@ fn nat_config_rejects_restricted_mode_on_write_and_read() {
     assert!(error.message.contains("Full Cone NAT"));
     remove_database_artifacts(&path);
 }
+
+#[test]
+fn go_publishes_round_trip_through_native_table() {
+    let store = block_on(ConfigStore::open_memory()).unwrap();
+    let repository = store.repository();
+
+    block_on(repository.put_go_publish(&GoPublishRecord {
+        name: "  public  ".to_owned(),
+        updated_at: 0,
+        data_json: br#"{"points":[],"path":"feed","password":"secret"}"#.to_vec(),
+    }))
+    .unwrap();
+
+    let rows = block_on(repository.list_go_publishes()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, "public");
+    assert!(rows[0].updated_at > 0);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&rows[0].data_json).unwrap()["path"],
+        "feed"
+    );
+
+    assert!(block_on(repository.delete_go_publish("public")).unwrap());
+    assert!(!block_on(repository.delete_go_publish("public")).unwrap());
+    assert!(block_on(repository.list_go_publishes()).unwrap().is_empty());
+}
+
+#[test]
+fn go_publish_rejects_invalid_contract_json() {
+    let store = block_on(ConfigStore::open_memory()).unwrap();
+    let error = block_on(store.repository().put_go_publish(&GoPublishRecord {
+        name: "invalid".to_owned(),
+        updated_at: 1,
+        data_json: b"not-json".to_vec(),
+    }))
+    .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Storage);
+    assert!(
+        error
+            .message
+            .contains("decode publishes.data_json as JSON failed")
+    );
+}

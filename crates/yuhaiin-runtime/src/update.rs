@@ -159,7 +159,9 @@ impl UpdateService {
             target_os: release_os(),
             target_arch: release_arch(),
             status: Arc::new(Mutex::new(Status {
-                stage: "idle".to_owned(),
+                // Go's zero-value update.Status has an empty stage before the
+                // first check/apply operation.
+                stage: String::new(),
                 ..Status::default()
             })),
         }
