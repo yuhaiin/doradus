@@ -512,6 +512,62 @@ fn dispatcher_emits_udp_flow_and_writes_response_back_to_tun() {
 }
 
 #[test]
+fn dispatcher_reassembles_out_of_order_ipv4_udp_fragments() {
+    let local = Ipv4Address::new(10, 0, 0, 1);
+    let remote = Ipv4Address::new(10, 0, 0, 2);
+    let whole = udp_packet(remote, local, 41000, 5353, b"fragmented-query");
+    let first = ipv4_fragment(&whole, 0, true, 16);
+    let second = ipv4_fragment(&whole, 16, false, whole.len() - 20 - 16);
+
+    let mut device = SmoltcpTunDevice::new(1500, 8).unwrap();
+    let mut interface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(IpAddress::Ipv4(local), 24))
+            .unwrap();
+    });
+    let mut dispatcher = TunDispatcher::new(2048, 2048, 4).unwrap();
+
+    // The second fragment arrives first. The dispatcher must not try to
+    // parse transport ports from its payload; smoltcp will hold it until the
+    // first fragment completes the datagram.
+    device.enqueue_rx(second).unwrap();
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(1))
+        .unwrap();
+    assert!(dispatcher.events().next().is_none());
+
+    device.enqueue_rx(first).unwrap();
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(2))
+        .unwrap();
+    let events: Vec<_> = dispatcher.events().collect();
+    let [TunEvent::UdpDatagram { flow, payload }] = events.as_slice() else {
+        panic!("expected one reassembled UDP event, got {events:?}");
+    };
+    assert_eq!(payload, b"fragmented-query");
+    assert_eq!(flow.key.source, "10.0.0.2:41000".parse().unwrap());
+    assert_eq!(flow.key.destination, "10.0.0.1:5353".parse().unwrap());
+}
+
+fn ipv4_fragment(packet: &[u8], payload_offset: usize, more: bool, payload_len: usize) -> Vec<u8> {
+    let mut fragment = vec![0; 20 + payload_len];
+    fragment[..20].copy_from_slice(&packet[..20]);
+    fragment[20..].copy_from_slice(&packet[20 + payload_offset..20 + payload_offset + payload_len]);
+    let fragment_len = fragment.len() as u16;
+    let mut ip = Ipv4Packet::new_unchecked(&mut fragment);
+    ip.set_total_len(fragment_len);
+    ip.set_more_frags(more);
+    ip.set_frag_offset(payload_offset as u16);
+    ip.fill_checksum();
+    fragment
+}
+
+#[test]
 fn dispatcher_registers_tcp_syn_and_emits_open_event() {
     let local = Ipv4Address::new(10, 0, 0, 1);
     let remote = Ipv4Address::new(10, 0, 0, 2);

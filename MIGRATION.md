@@ -2592,3 +2592,19 @@ daemon reload/bootstrap、enable 和 start；已有运行实例则 restart。卸
 已通过 Linux unit renderer 单测、workspace clippy/check，以及重新构建后的非 root fail-fast
 验证；当前环境 uid=1000，因此没有触碰宿主机已有的 `/etc/systemd/system/yuhaiin.service`。
 完整 systemd/launchd 的现场 install/rollback 仍需相应平台权限，不能用本机 rootless 检查替代。
+
+## 81. 2026-08-10 TUN IPv4 fragment reassembly boundary
+
+smoltcp 0.13 已提供纯 Rust IPv4 fragment reassembly，但 `yuhaiin-core` 之前没有打开
+`proto-ipv4-fragmentation` feature；同时 dispatcher 的 `prepare_rx` 会在非首片上直接按
+完整 TCP/UDP 包解析，合法的 out-of-order fragment 因此可能被当成 malformed packet。
+
+现在启用 smoltcp 自带的 bounded IPv4 reassembly，并让 dispatcher 对非首片跳过 transport
+解析；首片只读取固定 transport header 字段来提前建立 UDP/TCP socket，完整长度、checksum 和
+重组后的 payload 仍由 smoltcp 校验。新增
+`dispatcher_reassembles_out_of_order_ipv4_udp_fragments`，实际以 second fragment → first
+fragment 顺序验证 UDP event 和 source/destination flow identity。
+
+这不是 IPv6 fragment 的完成声明：smoltcp 当前不实现 IPv6 reassembly，Rust TUN 仍会识别并
+丢弃这类 fragment；smoltcp 的 IPv4 reassembly buffer 也是有界的，超过其配置上限的长 datagram
+和真实 namespace/Android/macOS 设备验收继续保留在 checklist。
