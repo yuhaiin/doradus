@@ -37,6 +37,9 @@ The current scenarios cover:
 - HTTP inbound → fixed + HTTP/2 + authenticated HTTP CONNECT outbound, and
   HTTP inbound → fixed + HTTP/2 + authenticated SOCKS5 outbound, including
   prior-knowledge H2 stream relay, route metadata, payload echo, and latency.
+- prior-knowledge HTTP/2 inbound → route rule → fixed + HTTP CONNECT outbound,
+  including the inner HTTP CONNECT framing, proxy-side domain authority,
+  live connections, upload/download counters, and shutdown.
 - mixed inbound → SOCKS5 UDP framing → direct UDP, including the Go-compatible
   mixed UDP mode and a conflicting default `127.0.0.1:1080` listener.
 - authenticated SOCKS5 TCP inbound and Yuubinsya TCP inbound → direct echo in
@@ -172,6 +175,11 @@ scenario directory for inspection or a Podman job, set an explicit cache path:
 YUHAIIN_INTEGRATION_DIR="$HOME/.cache/yuhaiin-rust/integration-reusable" \
   cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
 ```
+
+固定目录会保留日志和 fixture 文件，便于复盘；如果要从干净的 SQLite
+配置开始，设置 `YUHAIIN_RESET_INTEGRATION_STATE=1`，或直接运行
+`make service-chain-smoke`。reset gate 只删除该 service-chain fixture 的
+`state.sqlite`、`-wal` 和 `-shm`，不会清理整个缓存目录。
 
 The runtime-owned TUN process smoke uses the same cache convention:
 

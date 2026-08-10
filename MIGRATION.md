@@ -17,6 +17,8 @@
 
 > 2026-08-10 transparent IPv6 acceptance：`YUHAIIN_TRANSPARENT_IPV6=1 make transparent-service-smoke` 在隔离 Podman namespace 中为 service/client veth 配置 `nodad` IPv6 地址，真实执行 IPv4+IPv6 REDIRECT TCP 各两条 flow，覆盖 `IP6T_SO_ORIGINAL_DST`、direct outbound、payload 和统计；当前输出为 `flows=4 bytes=136 upload=136 download=136`。IPv6 默认 gate 仍关闭以兼容无 IPv6 kernel 的 CI，rootful TPROXY UDP 仍待宿主机 `CAP_NET_ADMIN`。
 
+> 2026-08-10 HTTP/2 inbound chain acceptance：`service_chain.rs` 新增真实 runtime 进程的 prior-knowledge HTTP/2 inbound → route rule → fixed + HTTP CONNECT outbound 链路；客户端通过 H2 CONNECT 发送内层 HTTP CONNECT 和 payload，验证 HTTP proxy fixture 收到正确 domain authority、echo、connections inbound/protocol/outbound、累计 upload/download 以及服务关闭。完整 `service-chain-smoke` 现为 10 条场景，workspace 全量测试通过。
+
 > 2026-08-10 connections socket/protocol metadata：对照 Go `statistics.getConnection`，共享 `FlowContext` 新增 socket-backed inbound 的 `local_addr` 与应用层 `protocol`；`InboundSpec` 统一注入监听 endpoint，并为 TLS transport 标记 `tls`，HTTP proxy 在消费 CONNECT/forward headers 后保留 `http`，共享 relay sniff 则按 TLS 优先、HTTP 次之填充协议。monitor 以 Go `net.Addr.String()` 的裸 `host:port` 格式输出 `localAddr`，由 endpoint network 填充 `network.underlyingType`，`connections.protocol` 不再错误复用 `tcp/udp`，未识别时为空。新增 monitor/common relay 单测和真实 HTTP inbound → outbound API 集成断言；TUN/无 socket 的 packet-only flow 仍保留平台可提供元数据的扩展边界。
 
 > 2026-08-10 connections outbound endpoint：对照 Go `getConnection` 的 `getRemote(conn)`，`FlowContext` 新增 `outbound_addr`；selector 根据当前 route mode 记录实际出站 proxy socket endpoint，monitor 将 `connections.outbound` 输出为裸 `IP:port`，同时保留 `nodeId/nodeName` 作为配置节点身份。真实 direct、HTTP、SOCKS5、TLS/HTTP2/Yuubinsya、TCP/UDP service-chain 均新增 endpoint 断言，避免把节点 ID 与实际远端地址混用。
@@ -54,7 +56,7 @@
 > 2026-08-10 Go v1 state.db 直接导入：旧 Go 数据库的 `nodes`、`inbounds`、`route_lists`、`node_tags` 表现在由 `yuhaiin-store::migration` 在同一 `BEGIN IMMEDIATE` 导入事务内幂等投影到 v2 contract。节点会把旧 oneof `protocols` 转成 `chain`，空链按 Go 行为补 `direct`，并恢复 `selected_tcp_node_v2`/`selected_udp_node_v2`；入站会把 `tcpudp/empty`、`transport` 和协议 oneof 转成 `network/transports/protocol`，其中 `tcp_udp_control_all` 明确转为 `udp=enabled`，因此旧 mixed 配置不会再丢 UDP；路由列表和标签也按 Go 的 `source`、`name/type/hash` contract 生成。原始 v1 表不删除，未知字段不参与猜测性转换，v2 已有数据时以 v2 为权威，四个 meta marker 防止重复导入。新增确定性 v1 fixture 和 `imports_real_go_v1_snapshot_without_touching_source` ignored 测试；后者已用 `/home/asutorufa/Documents/Programming/yuhaiin/tmp/state.db` 的只读副本通过，源库未修改。
 > 2026-08-10 Go v1 runtime snapshot gate：在 store 行级导入测试之外，新增 `crates/yuhaiin-runtime/tests/legacy_v1_runtime.rs` 和 `make legacy-v1-runtime-smoke`。它复制旧 `state.db` 到 `~/.cache/yuhaiin-rust/integration/legacy-v1-runtime`，确认旧 mixed/TUN/Yuubinsya 三个 inbound、节点和代理链进入同一个 `RuntimeController`/`RuntimeSnapshot`，并在真实 `/home/asutorufa/Documents/Programming/yuhaiin/tmp/state.db` 副本上通过；测试不会修改源库，也不使用 `/tmp`。
 
-> 2026-08-10 完整替换回归与 benchmark：重新执行 `make production-parity-smoke`，三份停止的 Go v5/v6 生产快照均通过管理 API 读/写/错误矩阵对照；`make service-chain-smoke` 的 9 条 inbound→router→outbound 链、`make api-contract-smoke` 的 3 条真实进程管理面用例、`make api-reload-flow-smoke`、`make tun-chain-service-smoke` 和 `make stats-concurrency-smoke`（并发读、优雅重启、force-stop 接管）均通过。当前 Podman release benchmark 结果为 HTTP CONNECT 135.01 MiB/s、TLS→HTTP/2→Yuubinsya 10.10 MiB/s、TUN→fixed 36.87 MiB/s；对应 peak RSS 分别为 17,096 KiB、72,912 KiB、12,456 KiB。原始日志和 JSON 结果位于 `~/.cache/yuhaiin-rust/{production-parity,integration,benchmarks}`，本轮仍未使用 `/tmp`。
+> 2026-08-10 完整替换回归与 benchmark：重新执行 `make production-parity-smoke`，三份停止的 Go v5/v6 生产快照均通过管理 API 读/写/错误矩阵对照；`make service-chain-smoke` 的 10 条 inbound→router→outbound 链、`make api-contract-smoke` 的 3 条真实进程管理面用例、`make api-reload-flow-smoke`、`make tun-chain-service-smoke` 和 `make stats-concurrency-smoke`（并发读、优雅重启、force-stop 接管）均通过。当前 Podman release benchmark 结果为 HTTP CONNECT 135.01 MiB/s、TLS→HTTP/2→Yuubinsya 10.10 MiB/s、TUN→fixed 36.87 MiB/s；对应 peak RSS 分别为 17,096 KiB、72,912 KiB、12,456 KiB。原始日志和 JSON 结果位于 `~/.cache/yuhaiin-rust/{production-parity,integration,benchmarks}`，本轮仍未使用 `/tmp`。
 
 > 2026-08-09 route activation 合并：对照 Go `ScheduleApply`、列表 host-index refresh 和 `route.apply`，Rust route rule 保存/删除/排序及 route list 保存/删除现在写入兼容的 pending activation 时间；`route.activation` 同时合并 `route.lists.activation.hostIndexRefreshAt` 与 `route.activation.ruleApplyAt`，显式 apply 会原子清理两类状态。数据面仍在 typed repository mutation 后立即 reload，activation 只表达管理面可见的 pending/apply 生命周期；新增 priority、list mutation、combined status 和 clear regression。
 
@@ -2288,7 +2290,7 @@ list；Go 则在 route matcher 运行前调用 host trie 和 process trie，把�
 TUN、socket inbound、`route.rules.test` 和 connections/telemetry 共用同一 list 结果，不新增
 DTO，也不改变现有前端 contract。
 
-验证结果：route-list host/CIDR/process membership 单测、Router rejected-rule/process-gated history 单测、route API 单测、完整 8 条
+验证结果：route-list host/CIDR/process membership 单测、Router rejected-rule/process-gated history 单测、route API 单测、完整 10 条
 `service_chain` 数据面测试，以及 Go/Rust 26 个只读响应和 mutation/config parity 全部通过。
 对照日志保存在 `~/.cache/yuhaiin-rust/integration/go-api-route-history-final11`，没有使用
 `/tmp`；复杂 matcher 的逐项 match history 仍单独列为后续工作。

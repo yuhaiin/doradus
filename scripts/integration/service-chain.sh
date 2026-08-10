@@ -7,4 +7,5 @@ mkdir -p "${cache_dir}"
 
 cd "${repo_dir}"
 YUHAIIN_INTEGRATION_DIR="${cache_dir}" \
+YUHAIIN_RESET_INTEGRATION_STATE=1 \
   cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture

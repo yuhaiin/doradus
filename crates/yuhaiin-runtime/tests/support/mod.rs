@@ -958,6 +958,20 @@ pub async fn seed_empty_database(path: &Path) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
+    // The reusable Podman smoke scripts deliberately keep their cache mount
+    // so logs and fixture directories survive a run. Their explicit reset
+    // gate makes the database itself disposable and prevents a prior test's
+    // selected node/inbound from changing a later scenario.
+    if std::env::var("YUHAIIN_RESET_INTEGRATION_STATE").as_deref() == Ok("1") {
+        for suffix in ["", "-wal", "-shm"] {
+            let candidate = if suffix.is_empty() {
+                path.to_owned()
+            } else {
+                PathBuf::from(format!("{}{}", path.display(), suffix))
+            };
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
     let store = ConfigStore::open(path).await.unwrap();
     drop(store);
 }
@@ -1235,6 +1249,75 @@ pub async fn configure_tls_http_inbound(service: &ServiceProcess, inbound: Socke
         reqwest::Method::POST,
         "/api/v2/inbounds",
         Some(&inbound),
+    )
+    .await;
+}
+
+/// Configure a prior-knowledge HTTP/2 inbound over the same runtime owner as
+/// the other socket inbounds. The selected outbound is an HTTP CONNECT proxy
+/// so the process test proves that the H2 transport, router, and outbound
+/// protocol are all part of one data-plane chain.
+pub async fn configure_h2_http_inbound(
+    service: &ServiceProcess,
+    inbound: SocketAddr,
+    outbound: SocketAddr,
+) {
+    let node = json!({
+        "id":"h2-inbound-http-out",
+        "name":"HTTP/2 inbound HTTP outbound",
+        "group":"integration",
+        "enabled":true,
+        "chain":[
+            {"type":"fixed","fixed":{"host":"127.0.0.1","port":outbound.port()}},
+            {"type":"http","http":{"user":"","password":""}}
+        ]
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes",
+        Some(&node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes/h2-inbound-http-out/use",
+        None,
+    )
+    .await;
+
+    let inbound = json!({
+        "id":"h2-http-in",
+        "name":"HTTP/2 HTTP inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"http2","http2":{}}],
+        "protocol":{"type":"http","http":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+
+    let rule = json!({
+        "name":"proxy-example-test-over-h2-inbound",
+        "mode":"proxy",
+        "match":{"domain":"example.test"},
+        "tag":"integration"
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/route/rules",
+        Some(&rule),
     )
     .await;
 }
