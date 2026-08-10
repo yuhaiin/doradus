@@ -59,6 +59,11 @@
 | macOS | `[~]` | 获得 SDK/clang 后编译 runtime，验证 utun、权限、route、LaunchDaemon 和 SIGTERM | macOS target check + runtime log |
 | 明确延期 | `延期` | subscriptions、DoQ/DoH3、Shadowsocks/SSR、Tailscale/WireGuard/Reality/Mux/QUIC 不阻塞当前替换 | 需求变更时单独建项 |
 
+H2 relay 的大流量正确性已经由协议矩阵 benchmark 覆盖；当前仍有一个可执行的
+性能收尾项：将 h2 自身 pending send queue 替换为经过 64 MiB+ 回归的
+producer-side bounded adapter，并把 TLS/H2/Yuubinsya 的 peak RSS 从当前
+`75,400 KiB` 基线压回可解释范围。该项不改变当前功能条目的完成状态。
+
 ### 本轮执行顺序
 
 > 2026-08-10 API 错误矩阵已通过：证据位于
@@ -71,7 +76,8 @@
 > 和 `tmp/aws/yuhaiin/state.db` 三份停止快照全部通过，日志位于
 > `~/.cache/yuhaiin-rust/production-parity-current`；`stats-concurrency.sh` 的并发读取/重启
 > 通过；`transparent-service.sh` 的 REDIRECT TCP 通过并明确记录 rootless 下 TPROXY UDP skip；
-> runtime-owned TUN、启动日志也通过。最新 HTTP benchmark 为 145.58 MiB/s、peak RSS 17,004 KiB，
+> runtime-owned TUN、启动日志也通过。最新 HTTP benchmark 为 146.13 MiB/s、peak RSS 16,660 KiB；
+> TLS/H2/Yuubinsya benchmark 为 23.20 MiB/s、peak RSS 75,400 KiB；
 > TUN benchmark 为 55.73 MiB/s、peak RSS 12,444 KiB；证据位于
 > `~/.cache/yuhaiin-rust/benchmarks/{http-throughput-current,tun-throughput-current}`。随后
 > `tun-mtu.sh` 在 privileged Podman 中用独立设备和 SQLite 状态通过了 576、1280、1500、9000、
@@ -316,8 +322,10 @@ make benchmark-tun-throughput
 ```
 
 Benchmark status is intentionally explicit: HTTP inbound → router → HTTP
-CONNECT outbound and the single-path TUN relay both have repeatable benchmarks;
-TUN defaults to a stable 4 MiB packet-stream fixture and larger long-stream
+CONNECT outbound, HTTP inbound → router → TLS → HTTP/2 → Yuubinsya, and the
+single-path TUN relay have repeatable benchmarks. The HTTP benchmark runs the
+first two scenarios as a matrix and records throughput, CPU ticks, and peak
+RSS. TUN defaults to a stable 4 MiB packet-stream fixture and larger long-stream
 tests remain a separate follow-up. WireGuard is not implemented in the current
 scope and therefore has no reported number.
 

@@ -53,10 +53,15 @@ podman run --rm \
   "${image}" \
   -ec '
     set -eu
-    /usr/local/bin/yuhaiin-throughput --ignored --nocapture
+    for test_name in \
+      http_inbound_route_http_connect_throughput \
+      http_inbound_route_tls_h2_yuubinsya_throughput; do
+      /usr/local/bin/yuhaiin-throughput "${test_name}" --exact --ignored --nocapture
+    done
   ' \
   | tee "${scenario_dir}/podman.log"
 
-grep -q '^BENCHMARK ' "${scenario_dir}/podman.log"
-grep -q 'test result: ok' "${scenario_dir}/podman.log"
+test "$(grep -c '^BENCHMARK ' "${scenario_dir}/podman.log")" -eq 2
+test "$(grep -c 'test result: ok' "${scenario_dir}/podman.log")" -eq 2
+echo "[throughput] matrix: HTTP CONNECT and TLS/H2/Yuubinsya"
 echo "[throughput] passed; result/logs=${scenario_dir}"

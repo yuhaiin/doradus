@@ -118,10 +118,17 @@ The current scenarios cover:
 ## Opt-in throughput benchmark
 
 `throughput.rs` is an integration benchmark, not a microbenchmark. It starts
-the release runtime, configures HTTP inbound → route rule → fixed + HTTP
-CONNECT outbound through the API, sends a known loopback payload, and samples
-the runtime's Linux `/proc` RSS and CPU ticks. It prints one `BENCHMARK {...}`
-JSON line and stores all build/runtime output below `~/.cache`.
+the release runtime, configures the data plane through the API, sends a known
+loopback payload, and samples the runtime's Linux `/proc` RSS and CPU ticks.
+`scripts/benchmark/throughput.sh` runs both the short HTTP CONNECT path and the
+full TLS → HTTP/2 → Yuubinsya path, printing one `BENCHMARK {...}` JSON line per
+scenario. All build/runtime output is stored below `~/.cache`.
+
+The current H2 relay deliberately uses h2's own flow-control queue after a
+reservation-based adapter exposed a deadlock at partial window updates. The
+relay submits fixed 16 KiB frames, but the producer-side queue is not yet a
+strict memory bound; the 64 MiB TLS/H2/Yuubinsya baseline therefore records RSS
+as a regression signal until a separately tested bounded adapter replaces it.
 
 Run it with:
 
@@ -131,7 +138,9 @@ YUHAIIN_BENCH_BYTES=$((256 * 1024 * 1024)) make benchmark-throughput
 ```
 
 The result is only comparable when the machine, profile, payload, network
-namespace, and fixture are held constant. TUN currently has a privileged
+namespace, and fixture are held constant. The benchmark matrix currently
+covers HTTP inbound → route → HTTP CONNECT outbound and HTTP inbound → route →
+TLS → HTTP/2 → Yuubinsya TCP-over-stream outbound. TUN currently has a privileged
 Podman packet benchmark (`make benchmark-tun-throughput`) in addition to the
 device/lifecycle smoke (`scripts/integration/tun-service.sh`). The TUN runner
 uses one real `tun-rs + smoltcp + fixed proxy + loopback echo` stream and

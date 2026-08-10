@@ -553,7 +553,10 @@ async fn relay(
                     request_closed = true;
                     continue;
                 }
-                if send_h2_data(&mut send_stream, &buffer[..length]).await.is_err() {
+                if send_h2_data(&mut send_stream, &buffer[..length])
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -563,10 +566,10 @@ async fn relay(
                     return;
                 };
                 let Ok(data) = result else { return };
-                if writer.write_all(&data).await.is_err() {
+                if recv_stream.flow_control().release_capacity(data.len()).is_err() {
                     return;
                 }
-                if recv_stream.flow_control().release_capacity(data.len()).is_err() {
+                if writer.write_all(&data).await.is_err() {
                     return;
                 }
             }
@@ -579,26 +582,14 @@ async fn relay(
 }
 
 pub(crate) async fn send_h2_data(stream: &mut h2::SendStream<Bytes>, data: &[u8]) -> Result<()> {
-    let mut offset = 0;
-    while offset < data.len() {
-        stream.reserve_capacity(data.len() - offset);
-        let capacity = std::future::poll_fn(|context| stream.poll_capacity(context))
-            .await
-            .ok_or_else(|| protocol_error("HTTP/2 stream closed while sending"))?
-            .map_err(|error| protocol_error(format!("HTTP/2 send capacity: {error}")))?;
-        if capacity == 0 {
-            continue;
-        }
-        let length = capacity.min(data.len() - offset);
-        stream
-            .send_data(
-                Bytes::copy_from_slice(&data[offset..offset + length]),
-                false,
-            )
-            .map_err(|error| protocol_error(format!("HTTP/2 send data: {error}")))?;
-        offset += length;
-    }
-    Ok(())
+    // Relay callers pass at most their fixed 16 KiB buffer. `h2` owns the
+    // stream/connection window and queues the frame until capacity becomes
+    // available; reproducing its reservation state here can deadlock after a
+    // partial window update in nested H2 bridges. The pending queue is not a
+    // strict producer-side memory bound yet; that adapter remains follow-up.
+    stream
+        .send_data(Bytes::copy_from_slice(data), false)
+        .map_err(|error| protocol_error(format!("HTTP/2 send data: {error}")))
 }
 
 fn protocol_error(message: impl Into<String>) -> Error {

@@ -2042,8 +2042,8 @@ socket。`scripts/integration/api-contract.sh` 不再只运行管理面大测试
 
 新增 `crates/yuhaiin-runtime/tests/throughput.rs` 与
 `scripts/benchmark/throughput.sh`。它使用 release runtime 和真实 SQLite/API
-配置边界，执行 HTTP inbound → route rule → fixed + HTTP CONNECT outbound 的单流
-loopback echo，并在 runtime 子进程上采样 Linux `VmRSS` 与 `/proc/<pid>/stat` CPU ticks。
+配置边界，执行 HTTP inbound → route rule → outbound 协议矩阵的单流 loopback
+echo，并在 runtime 子进程上采样 Linux `VmRSS` 与 `/proc/<pid>/stat` CPU ticks。
 输出固定的 `BENCHMARK` JSON 行，构建产物、状态库和日志均放在
 `~/.cache/yuhaiin-rust/benchmarks/http-throughput`，没有使用 `/tmp`。
 
@@ -2052,17 +2052,29 @@ loopback echo，并在 runtime 子进程上采样 Linux `VmRSS` 与 `/proc/<pid>
 | 场景 | 状态 | 说明 |
 | --- | --- | --- |
 | HTTP inbound → router → HTTP CONNECT outbound | 已有可执行基准 | `make benchmark-throughput`；默认 64 MiB、单流、loopback |
+| HTTP inbound → router → TLS → HTTP/2 → Yuubinsya TCP-over-stream outbound | 已有可执行基准 | 同一命令运行协议矩阵；真实 SQLite/API 配置、TLS、H2 和 Yuubinsya loopback echo |
 | TUN inbound | 已有可执行 packet 基准 | `make benchmark-tun-throughput`；默认 4 MiB、单流、privileged Podman、TUN → smoltcp → fixed proxy → loopback echo；16/64/256 MiB 长流已通过 |
 | WireGuard | 未实现/不报告性能 | 当前范围没有 WireGuard backend，不用虚构结果 |
 
 benchmark 数值只能用于同机、同 profile、同 payload 和同 namespace 的回归比较，不能
 直接解释为 Go 与 Rust 的跨机器性能结论。
 
-本机首次基线（2026-08-10，release、Podman host network、64 MiB、单流）：
+本机最近基线（2026-08-10，release、Podman host network、64 MiB、单流）：
 
 ```text
-BENCHMARK {"bytes":67108864,"cpu_ticks":26,"elapsed_ms":309.641875,"mib_per_sec":206.69039030977316,"peak_rss_kib":16496,"proc_samples":15,"scenario":"http-inbound-route-http-connect-loopback"}
+BENCHMARK {"bytes":67108864,"cpu_ticks":36,"elapsed_ms":437.95469199999997,"mib_per_sec":146.1338379724449,"peak_rss_kib":16660,"proc_samples":21,"runtime_pid":8,"scenario":"http-inbound-route-http-connect-loopback","target":"loopback; one stream; debug/release selected by runner"}
 ```
+
+同一轮协议矩阵中的 TLS/H2/Yuubinsya 结果为：
+
+```text
+BENCHMARK {"bytes":67108864,"cpu_ticks":188,"elapsed_ms":2758.042342,"mib_per_sec":23.204864923716244,"peak_rss_kib":75400,"proc_samples":131,"runtime_pid":18,"scenario":"http-inbound-route-tls-h2-yuubinsya-loopback","target":"loopback; one stream; release; TLS + HTTP/2 + Yuubinsya"}
+```
+
+该路径目前使用 h2 自身的发送队列承接窗口等待，调用方只提交固定 16 KiB
+relay frame；它已通过大 payload 数据正确性回归，但 `peak_rss_kib` 说明这还不是
+严格的 producer-side bounded backpressure。后续应增加经过大流量回归的 h2 bounded
+adapter，再重新记录这条基线。
 
 该数值是当前机器和当前构建的基线，不是验收阈值；后续改动应在相同参数下重复运行并
 记录变化原因。

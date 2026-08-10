@@ -209,10 +209,10 @@ async fn bridge_h2_stream(
                 };
                 let data = result
                     .map_err(|error| protocol_error(format!("HTTP/2 request body: {error}")))?;
-                writer.write_all(&data).await.map_err(io_error)?;
                 body.flow_control()
                     .release_capacity(data.len())
                     .map_err(|error| protocol_error(format!("HTTP/2 request capacity: {error}")))?;
+                writer.write_all(&data).await.map_err(io_error)?;
             }
         }
     }
