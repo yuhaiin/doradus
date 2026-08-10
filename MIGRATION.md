@@ -2407,3 +2407,34 @@ process/inbound/negative matcher fixture、完整 response 字段和生产 snaps
 升级期间的 SQLite 锁竞争/退避观测仍未完成。当前缓存约 18G，主要是 `cargo-target` 12G、
 integration 3.1G、api-parity 1.2G 和 production parity 副本；本轮未使用 `/tmp`，也没有
 删除可复用证据。
+
+## 73. 2026-08-10 TUN runtime long-stream content integrity
+
+runtime-owned TUN smoke 原先只发送几十字节固定字符串，无法发现 TCP 回写的中间字节丢失；
+本轮将 `YUHAIIN_TUN_TRAFFIC_BYTES` 接入同一个 SQLite/runtime fixture，客户端用独立 writer
+线程分块上传、同时读取回显，并按绝对 offset 生成确定性 payload 逐字节校验。默认新增的
+`make tun-long-service-smoke` 使用 1 MiB，避免把普通 debug smoke 变成长时间吞吐基准；需要
+更大流量时可显式设置 `YUHAIIN_TUN_TRAFFIC_BYTES`，上限为 512 MiB。
+
+该回归第一次在第 110,796 字节发现真实数据错位。原因是 smoltcp `tcp::Socket::send_slice`
+在 bounded TX buffer 不足时会返回 `Ok(partial_bytes)`；Rust runtime 之前只判断 `Err`，把
+短写误当成整包成功，直接丢弃 payload 尾部。现在 `TunProxyRuntime::poll_outputs` 在 pending
+队列的两个路径都保留 `payload[written..]`，下一个 poll 继续写；`TunDispatcher::write_tcp`
+也明确记录了 short-write contract。
+
+修复后的 privileged `network=none` Podman 结果：
+
+```text
+make tun-long-service-smoke
+runtime-tun-traffic-ok bytes=1048576
+runtime-tun-closed name=yrtun0
+
+YUHAIIN_TUN_TRAFFIC_BYTES=1048576 make tun-chain-service-smoke
+runtime-tun-chain-ready mode=tls-h2-yuubinsya
+runtime-tun-traffic-ok bytes=1048576
+runtime-tun-closed name=yrtun0
+```
+
+因此当前 runtime-owned Linux TUN 的长流/代理链内容完整性已纳入替换 gate；这不等价于
+已经完成 wire fragment 重组、独立 namespace teardown 矩阵或 Android/macOS 实机验收，后三项
+继续保留在 checklist 的 `[~]`。

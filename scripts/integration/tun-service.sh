@@ -27,6 +27,7 @@ if ! podman run --rm --privileged --network=none \
     -e YUHAIIN_TUN_NAME="${tun_name}" \
     -e YUHAIIN_TUN_MTU="${YUHAIIN_TUN_MTU:-1500}" \
     -e YUHAIIN_TUN_TRAFFIC=1 \
+    -e YUHAIIN_TUN_TRAFFIC_BYTES="${YUHAIIN_TUN_TRAFFIC_BYTES:-32}" \
     -e YUHAIIN_TUN_HOLD_MS=750 \
     "${chain_env[@]}" \
     -v "${binary}:/usr/local/bin/tun-service-smoke:ro" \

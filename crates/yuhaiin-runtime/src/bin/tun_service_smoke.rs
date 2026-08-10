@@ -65,6 +65,22 @@ async fn run() -> Result<()> {
         )));
     }
     let traffic = std::env::var_os("YUHAIIN_TUN_TRAFFIC").is_some();
+    let traffic_bytes = std::env::var("YUHAIIN_TUN_TRAFFIC_BYTES")
+        .ok()
+        .map(|value| {
+            value.parse::<usize>().map_err(|_| {
+                Error::invalid(format!(
+                    "YUHAIIN_TUN_TRAFFIC_BYTES must be a positive integer, got {value:?}"
+                ))
+            })
+        })
+        .transpose()?
+        .unwrap_or(32);
+    if traffic_bytes == 0 || traffic_bytes > 512 * 1024 * 1024 {
+        return Err(Error::invalid(
+            "YUHAIIN_TUN_TRAFFIC_BYTES must be between 1 and 536870912",
+        ));
+    }
     let chain_mode = std::env::var("YUHAIIN_TUN_CHAIN")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -193,10 +209,11 @@ async fn run() -> Result<()> {
     println!("runtime-tun-opened name={device_name}");
 
     if traffic {
-        let traffic_result = tokio::task::spawn_blocking(run_tun_traffic_client)
-            .await
-            .map_err(join_error)?
-            .map_err(io_error);
+        let traffic_result =
+            tokio::task::spawn_blocking(move || run_tun_traffic_client(traffic_bytes))
+                .await
+                .map_err(join_error)?
+                .map_err(io_error);
         if let Err(error) = &traffic_result {
             eprintln!(
                 "runtime-tun-logs {:?}",
@@ -213,7 +230,7 @@ async fn run() -> Result<()> {
             }
             return Err(error.clone());
         }
-        println!("runtime-tun-traffic-ok");
+        println!("runtime-tun-traffic-ok bytes={traffic_bytes}");
     } else {
         tokio::time::sleep(Duration::from_millis(hold_ms)).await;
     }
@@ -223,19 +240,19 @@ async fn run() -> Result<()> {
     inbound_task.await.map_err(join_error)??;
     if let Some(target_task) = target_task {
         let received = target_task.await.map_err(join_error)??;
-        if received == 0 {
+        if received != traffic_bytes {
             return Err(Error::new(
                 ErrorKind::Io,
-                "runtime TUN traffic target received no bytes",
+                format!("runtime TUN traffic target received {received} of {traffic_bytes} bytes"),
             ));
         }
     }
     if let Some(chain_fixture) = chain_fixture {
         let received = chain_fixture.shutdown().await?;
-        if received == 0 {
+        if received != traffic_bytes {
             return Err(Error::new(
                 ErrorKind::Io,
-                "runtime TUN chain target received no bytes",
+                format!("runtime TUN chain target received {received} of {traffic_bytes} bytes"),
             ));
         }
     }
@@ -368,26 +385,71 @@ async fn seed_runtime_fixture(
     Ok(())
 }
 
-fn run_tun_traffic_client() -> std::io::Result<()> {
+fn traffic_byte(offset: usize) -> u8 {
+    (offset as u64)
+        .wrapping_mul(31)
+        .wrapping_add(17)
+        .to_le_bytes()[0]
+}
+
+fn fill_traffic_chunk(buffer: &mut [u8], offset: usize) {
+    for (index, byte) in buffer.iter_mut().enumerate() {
+        *byte = traffic_byte(offset + index);
+    }
+}
+
+fn run_tun_traffic_client(total_bytes: usize) -> std::io::Result<()> {
     use std::io::{Read, Write};
 
     let address = "198.18.0.2:18080";
     let mut stream =
         TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_secs(10))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let payload = b"runtime-owned-tun-fixed-outbound";
-    stream.write_all(payload)?;
-    stream.shutdown(std::net::Shutdown::Write)?;
-    let mut echoed = vec![0u8; payload.len()];
-    stream.read_exact(&mut echoed)?;
-    if echoed != payload {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "runtime TUN fixed outbound echo mismatch",
-        ));
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(120)))?;
+    let mut writer_stream = stream.try_clone()?;
+    writer_stream.set_write_timeout(Some(Duration::from_secs(120)))?;
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        let mut payload = vec![0u8; 64 * 1024];
+        let mut sent = 0usize;
+        while sent < total_bytes {
+            let length = (total_bytes - sent).min(payload.len());
+            fill_traffic_chunk(&mut payload[..length], sent);
+            writer_stream.write_all(&payload[..length])?;
+            sent += length;
+        }
+        writer_stream.shutdown(std::net::Shutdown::Write)
+    });
+    let mut echoed = vec![0u8; 64 * 1024];
+    let mut received = 0usize;
+    let mut read_result = Ok(());
+    while received < total_bytes {
+        let length = (total_bytes - received).min(echoed.len());
+        if let Err(error) = stream.read_exact(&mut echoed[..length]) {
+            read_result = Err(error);
+            break;
+        }
+        for (index, byte) in echoed[..length].iter().enumerate() {
+            if *byte != traffic_byte(received + index) {
+                read_result = Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("runtime TUN echo mismatch at byte {}", received + index),
+                ));
+                break;
+            }
+        }
+        if read_result.is_err() {
+            break;
+        }
+        received += length;
     }
-    Ok(())
+    if read_result.is_err() {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+    let writer_result = writer
+        .join()
+        .map_err(|_| std::io::Error::other("runtime TUN traffic writer panicked"))?;
+    read_result?;
+    writer_result
 }
 
 const YUUBINSYA_PASSWORD: &str = "runtime-tun-smoke-yuubinsya";

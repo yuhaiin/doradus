@@ -553,6 +553,12 @@ impl TunDispatcher {
         }
     }
 
+    /// Queue as much TCP payload as the smoltcp TX buffer accepts.
+    ///
+    /// `send_slice` is intentionally allowed to return a short write when the
+    /// bounded socket buffer is nearly full. Callers must retain and retry
+    /// `payload[written..]`; treating `Ok(written)` as an all-or-nothing
+    /// result silently drops bytes under sustained TUN output.
     pub fn write_tcp(&mut self, flow: TunFlowKey, payload: &[u8]) -> Result<usize> {
         let handle = self
             .tcp_by_key
@@ -1238,14 +1244,25 @@ impl TunProxyRuntime {
                 .get_mut(&flow)
                 .and_then(VecDeque::pop_front)
             {
-                if dispatcher.write_tcp(flow, &payload).is_err() {
-                    self.pending_tcp
-                        .entry(flow)
-                        .or_default()
-                        .push_front(payload);
-                    break;
+                match dispatcher.write_tcp(flow, &payload) {
+                    Ok(written) if written == payload.len() => {
+                        drained = true;
+                    }
+                    Ok(written) => {
+                        self.pending_tcp
+                            .entry(flow)
+                            .or_default()
+                            .push_front(payload[written..].to_vec());
+                        break;
+                    }
+                    Err(_) => {
+                        self.pending_tcp
+                            .entry(flow)
+                            .or_default()
+                            .push_front(payload);
+                        break;
+                    }
                 }
-                drained = true;
             }
             if drained && self.pending_tcp.get(&flow).is_some_and(VecDeque::is_empty) {
                 self.pending_tcp.remove(&flow);
@@ -1259,12 +1276,26 @@ impl TunProxyRuntime {
                     if let Some(observer) = &self.observer {
                         observer.bytes(flow, TunFlowDirection::Download, payload.len());
                     }
-                    if let Err(error) = dispatcher.write_tcp(flow, &payload) {
-                        tun_debug(format!(
-                            "TCP output backpressure/close flow={flow:?}: {error}"
-                        ));
-                        self.pending_tcp.entry(flow).or_default().push_back(payload);
-                        break;
+                    match dispatcher.write_tcp(flow, &payload) {
+                        Ok(written) if written == payload.len() => {}
+                        Ok(written) => {
+                            tun_debug(format!(
+                                "TCP output backpressure flow={flow:?}: wrote {written} of {}",
+                                payload.len()
+                            ));
+                            self.pending_tcp
+                                .entry(flow)
+                                .or_default()
+                                .push_back(payload[written..].to_vec());
+                            break;
+                        }
+                        Err(error) => {
+                            tun_debug(format!(
+                                "TCP output backpressure/close flow={flow:?}: {error}"
+                            ));
+                            self.pending_tcp.entry(flow).or_default().push_back(payload);
+                            break;
+                        }
                     }
                 }
                 ProxyOutput::UdpData { flow, payload } => {
