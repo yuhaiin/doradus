@@ -232,6 +232,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncYuubinsyaTcpSession<S> {
         &self.password_hash
     }
 
+    pub fn transport(&self) -> &S {
+        &self.stream
+    }
+
     pub fn into_inner(self) -> S {
         self.stream
     }
@@ -1023,6 +1027,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncYuubinsyaUotSession<S> {
 
     pub fn password_hash(&self) -> &[u8; 32] {
         &self.password_hash
+    }
+
+    pub fn transport(&self) -> &S {
+        &self.stream
     }
 
     pub fn into_inner(self) -> S {

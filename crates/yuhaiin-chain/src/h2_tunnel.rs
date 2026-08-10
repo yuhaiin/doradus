@@ -33,6 +33,7 @@ pub struct H2Connection {
     active_streams: Arc<AtomicUsize>,
     max_streams: usize,
     last_used_millis: AtomicU64,
+    local_addr: Option<SocketAddr>,
 }
 
 /// Monotonic operational counters for the HTTP/2 pool.
@@ -80,7 +81,19 @@ fn monotonic_millis() -> u64 {
 }
 
 impl H2Connection {
+    #[cfg(test)]
     pub async fn handshake_with_limits<S>(tls_stream: S, max_streams: usize) -> Result<Arc<Self>>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::handshake_with_limits_and_local_addr(tls_stream, max_streams, None).await
+    }
+
+    pub async fn handshake_with_limits_and_local_addr<S>(
+        tls_stream: S,
+        max_streams: usize,
+        local_addr: Option<SocketAddr>,
+    ) -> Result<Arc<Self>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -98,6 +111,7 @@ impl H2Connection {
             active_streams: Arc::new(AtomicUsize::new(0)),
             max_streams: max_streams.max(1),
             last_used_millis: AtomicU64::new(monotonic_millis()),
+            local_addr,
         });
         let closed = result.closed.clone();
         let shutdown = result.shutdown.clone();
@@ -130,7 +144,18 @@ impl H2Connection {
         self.active_streams.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub async fn open_connect_stream(&self, concurrency: usize) -> Result<DuplexStream> {
+        Ok(self
+            .open_connect_stream_with_local_addr(concurrency)
+            .await?
+            .0)
+    }
+
+    pub async fn open_connect_stream_with_local_addr(
+        &self,
+        concurrency: usize,
+    ) -> Result<(DuplexStream, Option<SocketAddr>)> {
         if self.is_closed() || self.is_draining() {
             return Err(protocol_error("HTTP/2 connection is closed"));
         }
@@ -216,7 +241,7 @@ impl H2Connection {
             self.shutdown.subscribe(),
         ));
         self.relay_tasks.lock().await.push(relay_task);
-        Ok(application)
+        Ok((application, self.local_addr))
     }
 
     fn release_stream(&self) {
@@ -339,6 +364,7 @@ impl H2Pool {
             .await
     }
 
+    #[cfg(test)]
     pub async fn open_with_identity<F, Fut>(
         &self,
         addresses: &[SocketAddr],
@@ -346,6 +372,23 @@ impl H2Pool {
         concurrency: usize,
         connect: F,
     ) -> Result<DuplexStream>
+    where
+        F: Fn(SocketAddr) -> Fut,
+        Fut: Future<Output = Result<Arc<H2Connection>>>,
+    {
+        Ok(self
+            .open_with_identity_and_local_addr(addresses, tls_identity, concurrency, connect)
+            .await?
+            .0)
+    }
+
+    pub async fn open_with_identity_and_local_addr<F, Fut>(
+        &self,
+        addresses: &[SocketAddr],
+        tls_identity: &str,
+        concurrency: usize,
+        connect: F,
+    ) -> Result<(DuplexStream, Option<SocketAddr>)>
     where
         F: Fn(SocketAddr) -> Fut,
         Fut: Future<Output = Result<Arc<H2Connection>>>,
@@ -369,7 +412,10 @@ impl H2Pool {
                 .cloned()
                 .unwrap_or_default();
             for connection in connections {
-                match connection.open_connect_stream(concurrency).await {
+                match connection
+                    .open_connect_stream_with_local_addr(concurrency)
+                    .await
+                {
                     Ok(stream) => return Ok(stream),
                     Err(_) if connection.is_closed() => {
                         self.remove_connection(&key, &connection).await;
@@ -404,7 +450,10 @@ impl H2Pool {
                 .cloned()
                 .unwrap_or_default();
             for connection in connections {
-                match connection.open_connect_stream(concurrency).await {
+                match connection
+                    .open_connect_stream_with_local_addr(concurrency)
+                    .await
+                {
                     Ok(stream) => return Ok(stream),
                     Err(_) if connection.is_closed() => {
                         self.remove_connection(&key, &connection).await;
@@ -437,7 +486,10 @@ impl H2Pool {
                     return Err(error);
                 }
             };
-            let stream = match connection.open_connect_stream(concurrency).await {
+            let stream = match connection
+                .open_connect_stream_with_local_addr(concurrency)
+                .await
+            {
                 Ok(stream) => stream,
                 Err(error) => {
                     self.metrics
@@ -648,6 +700,31 @@ mod tests {
     use http::Response;
     use std::collections::VecDeque;
     use tokio::net::TcpListener;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_connect_stream_preserves_underlying_local_endpoint() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(request.method(), http::Method::CONNECT);
+            respond.send_response(Response::new(()), true).unwrap();
+            while connection.accept().await.is_some() {}
+        });
+
+        let local = "192.0.2.10:45678".parse().unwrap();
+        let connection =
+            H2Connection::handshake_with_limits_and_local_addr(client_io, 1, Some(local))
+                .await
+                .unwrap();
+        let (_stream, observed) = connection
+            .open_connect_stream_with_local_addr(1)
+            .await
+            .unwrap();
+        assert_eq!(observed, Some(local));
+        connection.close().await;
+        let _ = server.await;
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn connect_stream_relays_bytes_in_both_directions() {

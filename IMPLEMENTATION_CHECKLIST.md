@@ -16,9 +16,9 @@ Go 源码映射、设计取舍和历史结果放在 [MIGRATION.md](MIGRATION.md)
 | 指标 | 当前值 |
 | --- | ---: |
 | 当前替换范围 | 66 项 |
-| 已完成 `[x]` | 53 项（80.3%） |
-| 主路径完成 `[~]` | 13 项（19.7%） |
-| 加权覆盖率 | **90.2%**（`(53 + 13 × 0.5) / 66`） |
+| 已完成 `[x]` | 54 项（81.8%） |
+| 主路径完成 `[~]` | 12 项（18.2%） |
+| 加权覆盖率 | **90.9%**（`(54 + 12 × 0.5) / 66`） |
 | 明确延期 | 订阅、DoQ/DoH3、Shadowsocks/SSR、Tailscale、Reality、Mux、QUIC 等复杂协议 |
 | 当前总体状态 | **未完成**：Linux 主链路已可运行，平台/生产/少数边界证据仍缺 |
 
@@ -126,8 +126,8 @@ flowchart LR
 
 ### 未完成与下一步
 
-- `[~]` 出站 socket 的本地端点注册已接入 direct/fixed/HTTP CONNECT/SOCKS5 及 TLS 包装层；guard 按连接生命周期 reference-counted 回收。
-- 下一步：补 HTTP/2 pool 真实底层连接的 endpoint 透传，并做 TUN→proxy 自环进程验收；未暴露 socket endpoint 的内存/复用 transport 仍保持安全降级。
+- `[x]` 出站 socket 的本地端点注册已接入 direct/fixed/HTTP CONNECT/SOCKS5、TLS、HTTP/2 pool、Yuubinsya TCP/UOT；guard 按连接生命周期 reference-counted 回收。
+- `[~]` TUN→proxy 自环进程验收仍需真实进程元数据和 endpoint 命中证据；未暴露 socket endpoint 的内存 transport 保持安全降级。
 - 下一步：补更多生产 route/resolver projection 和负向 matcher fixture。
 
 ### 证据
@@ -264,7 +264,7 @@ flowchart LR
 
 按影响整体替换能力排序，不按提交数量排序：
 
-1. **Router loopback 完整接线**：为 TCP transport 暴露本地 endpoint，补 TUN→proxy 自环进程验收。
+1. **Router loopback 现场验收**：补 TUN→proxy 自环进程验收，并确认 endpoint guard 在真实 TUN flow 结束后回收。
 2. **生产与统计边界**：更多 schema/telemetry/history 样本，补升级期间 SQLite lock contention。
 3. **Linux transparent TPROXY**：rootful/CAP_NET_ADMIN namespace 的 UDP、多 flow、异常 teardown。
 4. **TUN Linux 收尾**：超限 fragment 长流恢复和 namespace teardown matrix。
