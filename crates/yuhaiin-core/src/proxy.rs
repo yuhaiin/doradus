@@ -6,7 +6,7 @@
 //! TCP handshake state.
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -76,6 +76,64 @@ fn connect_std_tcp(
     Ok(socket.into())
 }
 
+fn resolve_std_tcp_addresses(destination: &Endpoint) -> Result<Vec<SocketAddr>> {
+    if let Some(address) = destination.addr() {
+        return Ok(vec![address]);
+    }
+    let host = destination
+        .host()
+        .ok_or_else(|| Error::invalid("direct destination has no host"))?;
+    let port = destination
+        .port()
+        .ok_or_else(|| Error::invalid("direct destination has no port"))?;
+    let addresses = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("resolve direct destination {host}:{port}: {error}"),
+            )
+        })?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(Error::new(
+            ErrorKind::Io,
+            format!("resolve direct destination {host}:{port}: no addresses"),
+        ));
+    }
+    Ok(addresses)
+}
+
+fn connect_direct_tcp(
+    destination: &Endpoint,
+    local_bind: Option<SocketAddr>,
+    timeout: Duration,
+) -> Result<TcpStream> {
+    let addresses = resolve_std_tcp_addresses(destination)?;
+    let mut last_error = None;
+    let mut family_mismatch = false;
+    for address in addresses {
+        if local_bind.is_some_and(|local| local.is_ipv4() != address.is_ipv4()) {
+            family_mismatch = true;
+            continue;
+        }
+        match connect_std_tcp(address, local_bind, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if let Some(error) = last_error {
+        return Err(error);
+    }
+    if family_mismatch {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "local bind address and TCP destination use different address families",
+        ));
+    }
+    Err(Error::invalid("direct destination has no usable address"))
+}
+
 #[cfg(feature = "async-proxy")]
 pub async fn connect_tokio_tcp(
     address: SocketAddr,
@@ -140,13 +198,7 @@ pub struct DirectConnector {
 
 impl StreamConnector for DirectConnector {
     fn connect(&self, destination: &Endpoint) -> Result<TcpStream> {
-        let address = destination.addr().ok_or_else(|| {
-            Error::new(
-                ErrorKind::Unsupported,
-                "direct connector requires an already-resolved IP endpoint",
-            )
-        })?;
-        connect_std_tcp(address, None, self.timeout)
+        connect_direct_tcp(destination, None, self.timeout)
     }
 
     fn connect_with_local(
@@ -154,13 +206,7 @@ impl StreamConnector for DirectConnector {
         destination: &Endpoint,
         local_bind: Option<SocketAddr>,
     ) -> Result<TcpStream> {
-        let address = destination.addr().ok_or_else(|| {
-            Error::new(
-                ErrorKind::Unsupported,
-                "direct connector requires an already-resolved IP endpoint",
-            )
-        })?;
-        connect_std_tcp(address, local_bind, self.timeout)
+        connect_direct_tcp(destination, local_bind, self.timeout)
     }
 }
 
@@ -1454,6 +1500,24 @@ mod tests {
             stream.local_addr().unwrap().ip(),
             "127.0.0.2".parse::<std::net::IpAddr>().unwrap()
         );
+        assert_eq!(handle.join().unwrap(), stream.local_addr().unwrap());
+    }
+
+    #[test]
+    fn direct_connector_resolves_domain_endpoint_and_tries_available_families() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || listener.accept().unwrap().0.peer_addr().unwrap());
+        let connector = DirectConnector {
+            timeout: Duration::from_secs(1),
+        };
+        let destination = Endpoint::domain(
+            Network::Tcp,
+            DomainName::new("localhost").unwrap(),
+            address.port(),
+        );
+        let stream = connector.connect(&destination).unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), address);
         assert_eq!(handle.join().unwrap(), stream.local_addr().unwrap());
     }
 
