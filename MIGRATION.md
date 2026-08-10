@@ -2384,3 +2384,21 @@ pattern，并为其余正向条件编译独立 `CombinedTrie`；候选必须同�
 列表单独命中时的 fallback，以及 `matchResult` 中两个 list 的 true/false history。Rust
 route unit test 和 API contract test 均通过；功能仍保持 API `[~]`，剩余是更多
 process/inbound/negative matcher fixture、完整 response 字段和生产 snapshot parity。
+
+## 72. 2026-08-10 statistics force-stop takeover
+
+统计并发测试现在覆盖两个真实 runtime 子进程生命周期：原有的流量更新期间六类统计 API
+并发读取、优雅停止和同库重启，以及新增的 `force_stop_during_stats_reads_reopens_same_database`。
+后者在真实 HTTP inbound 流量和 `connections.total` 读取同时进行时直接终止 runtime，随后
+立即用同一个 SQLite 文件启动新进程，验证 `connections.total` 的 upload/download 字段仍
+保持合法、live connections 不会从上一个进程泄漏，history API 仍可读。测试使用真实
+`Child::kill`，不调用 shutdown persistence path，因此覆盖 WAL/sidecar 重开而不是只验证
+优雅关闭。
+
+`scripts/integration/stats-concurrency.sh` 已改为在 Podman 中执行该测试文件的全部用例，
+本轮本机和 Podman 均为 2/2 通过，日志位于
+`~/.cache/yuhaiin-rust/integration/stats-concurrency`。这加强了 connections/统计的进程级
+接管证据，但该模块仍保持 `[~]`：长期 production telemetry 的逐字段 Go/Rust 对照，以及
+升级期间的 SQLite 锁竞争/退避观测仍未完成。当前缓存约 18G，主要是 `cargo-target` 12G、
+integration 3.1G、api-parity 1.2G 和 production parity 副本；本轮未使用 `/tmp`，也没有
+删除可复用证据。

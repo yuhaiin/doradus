@@ -47,8 +47,7 @@ podman run --rm \
   -ec '
     set -eu
     /usr/local/bin/yuhaiin-stats-test \
-      concurrent_stats_readers_survive_flow_updates_and_restart \
-      --exact --nocapture
+      --nocapture
   ' \
   | tee "${scenario_dir}/podman.log"
 

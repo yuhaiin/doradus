@@ -53,7 +53,7 @@
 | Linux transparent inbound | `[~]` | 在具备 `CAP_NET_ADMIN` 的独立 namespace 中验证 TPROXY UDP、redir IPv4/IPv6 和多 flow teardown | 默认 `make transparent-service-smoke` 已真实验证隔离 namespace REDIRECT TCP：非 root client → Rust redir → `SO_ORIGINAL_DST` → direct outbound → echo，并检查 upload/download counters、shutdown；rootless Podman 会明确输出 TPROXY skip。强制 gate `YUHAIIN_TPROXY_ENABLED=1 make transparent-service-smoke` 已确认规则命中但 rootless 用户 namespace 无法把非本地 UDP 交给透明 socket；剩余是 rootful/宿主机 `CAP_NET_ADMIN` 的 TPROXY UDP、IPv4/IPv6 redir 和多 flow teardown |
 | TUN / NAT | `[~]` | Linux MTU 边界矩阵已通过；继续补 namespace teardown、fragment 长流，以及 Android VpnService fd 和 macOS utun 实机验收 | `tun-service.sh`、`tun-mtu.sh`、`p0_tun`、平台设备日志 |
 | API / reload | `[~]` | 已覆盖 node mutation 后新连接切换出口、latency、traffic/history 和同库重启读回；Go/Rust parity 已覆盖核心 node/inbound/resolver/route mutation，以及前端配置 API 的独立副本闭环；错误矩阵已严格对照 HTTP status/RPC code，Go typed request 的缺失字段零值和空 `connections.close` 也已对齐；`route.rules.test` 现在支持嵌套 `all` 的多个正向 host/CIDR 约束并保留 Go 短路 history；剩余是更多 process/inbound/negative matcher、完整 response 字段和生产快照 | `api-reload-flow.sh`、`api-contract.sh`、`go-api-parity.sh` |
-| connections / statistics | `[~]` | 增加更多 production telemetry 快照；逐字段核对长时间范围与升级期间锁竞争 | `stats-concurrency.sh`、`go-rust-stats.sh` |
+| connections / statistics | `[~]` | 增加更多 production telemetry 快照；逐字段核对长时间范围与升级期间锁竞争 | `stats-concurrency.sh`（并发读取、优雅重启、force-stop 后同库接管）、`go-rust-stats.sh` |
 | 更新 / 发布 | `[~]` | 在至少一种 systemd 和一种 launchd 环境做替换、回滚、SIGTERM 和备份恢复演练 | `docs/RELEASE_REPLACEMENT.md` |
 | Android | `[~]` | 真机验证 VpnService fd、权限、route 生命周期和电量/RSS | Android instrumentation/runtime log |
 | macOS | `[~]` | 获得 SDK/clang 后编译 runtime，验证 utun、权限、route、LaunchDaemon 和 SIGTERM | macOS target check + runtime log |

@@ -1076,6 +1076,16 @@ impl ServiceProcess {
         }
         let _ = self.child.wait();
     }
+
+    /// Terminate the runtime without giving the persistence worker a
+    /// shutdown opportunity. This deliberately models SIGKILL/force-stop so
+    /// callers can verify SQLite WAL recovery and the next process takeover.
+    pub async fn force_stop(mut self) {
+        if self.child.try_wait().unwrap().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for ServiceProcess {

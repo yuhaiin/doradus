@@ -1,6 +1,7 @@
 mod support;
 
 use serde_json::Value;
+use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -140,6 +141,95 @@ async fn concurrent_stats_readers_survive_flow_updates_and_restart() {
             .as_array()
             .is_some_and(|items| !items.is_empty())
     );
+    restarted.shutdown().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn force_stop_during_stats_reads_reopens_same_database() {
+    let fixture = ConnectFixture::start().await;
+    let inbound = reserve_loopback().await;
+    let root = integration_dir("stats-concurrency-force-stop");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+
+    let service = ServiceProcess::start(&database).await;
+    configure_http_chain(&service, inbound, fixture.outbound).await;
+    let mut client = connect_loopback(inbound).await;
+    client
+        .write_all(
+            format!(
+                "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+                fixture.target, fixture.target
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let headers = read_headers(&mut client).await;
+    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 200"));
+
+    let base_url = service.base_url.clone();
+    let reader = tokio::spawn(async move {
+        let http = reqwest::Client::new();
+        for _ in 0..120 {
+            let _ =
+                assert_json_success(&http, &format!("{base_url}/api/v2/connections/total")).await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    });
+
+    let payload = vec![b'f'; 16 * 1024];
+    for _ in 0..48 {
+        client.write_all(&payload).await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, payload);
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    // Do not call shutdown: the next process must recover from the abrupt
+    // owner loss and still expose a valid management/statistics surface.
+    service.force_stop().await;
+    let _ = reader.await;
+    drop(client);
+
+    let restarted = ServiceProcess::start(&database).await;
+    let total = api_json(
+        &restarted.client,
+        &restarted.base_url,
+        reqwest::Method::GET,
+        "/api/v2/connections/total",
+        None,
+    )
+    .await;
+    assert!(total["upload"].is_string());
+    assert!(total["download"].is_string());
+
+    let connections = api_json(
+        &restarted.client,
+        &restarted.base_url,
+        reqwest::Method::GET,
+        "/api/v2/connections",
+        None,
+    )
+    .await;
+    assert!(
+        connections["connections"]
+            .as_array()
+            .is_some_and(|items| items.is_empty())
+    );
+
+    let history = api_json(
+        &restarted.client,
+        &restarted.base_url,
+        reqwest::Method::GET,
+        "/api/v2/connections/history",
+        None,
+    )
+    .await;
+    assert!(history["items"].is_array());
     restarted.shutdown().await;
     fixture.shutdown().await;
 }
