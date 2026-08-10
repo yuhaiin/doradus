@@ -19,6 +19,7 @@ pub mod inbound;
 mod interfaces;
 pub mod latency;
 pub mod log;
+mod loopback;
 pub mod monitor;
 mod proxy;
 mod resolver;

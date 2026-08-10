@@ -172,7 +172,7 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | `[x]` | domain trie | `yuhaiin-trie` | parent、wildcard、优先级、规范化、网络/端口约束 |
 | `[x]` | CIDR trie | `yuhaiin-trie` | IPv4/IPv6 longest-prefix lookup、随机对照回归 |
-| `[x]` | runtime router | `runtime/src/route.rs`, `trie::router` | immutable snapshot、publish/rollback、resolver policy、direct/proxy/bypass/block；兼容 Go route expression 中单端口字符串（例如 `"6969"`）并保持真正非法范围 fail-closed |
+| `[x]` | runtime router | `runtime/src/route.rs`, `trie::router`, `runtime/src/loopback.rs` | immutable snapshot、publish/rollback、resolver policy、direct/proxy/bypass/block；兼容 Go route expression 中单端口字符串（例如 `"6969"`）并保持真正非法范围 fail-closed；统一 selector 已接入入站监听地址自环和自身进程回环保护，命中后 fail-closed 为 block | 发布策略中的数据库更新验收；出站 socket 本地端点注册仍待接入所有 transport |
 | `[x]` | connection explainability | `FlowContext`, monitor | rule/tag/list/matchHistory/resolver/geo 与实际 proxy 选择共用同一 snapshot |
 | `[x]` | MaxMindDB | `crates/yuhaiin-geo` | reader、坏库错误、校验下载、atomic refresh、IPv4-mapped IPv6、route 注入、真实 `Country-without-asn.mmdb` 查询验收均已完成；fixture 保存在 `~/.cache/yuhaiin-rust-maxmind`，SHA-256 为 `1d900f73aa4644d255793548319410ff559ef9294a662ec1a0354f106c794155` | 后续只需按发布策略更新并重新验收数据库 |
 

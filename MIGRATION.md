@@ -7,6 +7,8 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
+> 2026-08-10 loopback route guard：对照 Go `pkg/route/loopback.go`，Rust 新增 runtime 级 `LoopbackDetector`，并在 `RuntimeProxySelector::route_context` 的统一入口执行入站监听地址自环检查、当前代理进程 path/PID 检查，以及为同步/平台 socket adapter 预留的出站本地端点引用计数注册。命中后设置 `RouteMode::Block` 与 `skip_route`，不会再被 trie 规则覆盖；普通未解析域名在没有 FakeIP/hosts 元数据时保留 Go 的例外。新增 3 个 detector 单测和真实 selector 拦截测试；`cargo test -p yuhaiin-runtime --lib` 220 项通过。`cfg(test)` 不注入测试可执行文件自身身份，避免同进程 fixture 被误判；出站 transport 的本地端点注册仍作为后续 adapter 接线项。
+
 > 2026-08-10 SQLite startup compaction parity：Go 状态库启动时先执行 `wal_checkpoint(TRUNCATE)`，再按空闲页的字节数（至少 4 MiB）或数据库占比（至少 10%）决定是否 `VACUUM`，完成后再次 checkpoint。Rust `ConfigStore::open` 现在在迁移完成并释放初始化锁后执行同一策略；健康数据库不会因每次启动而重写，达到阈值才回收可复用页。`sqlite_startup_compacts_reusable_space_with_go_thresholds` 覆盖写入、删除、关闭、重开后的 freelist 回收，`yuhaiin-store` 全部 127 个可运行单元测试通过。
 
 > 2026-08-10 hash-only inbound auth fail-closed：中心 basic 用户的 `allowAnyPassword` 可以被 HTTP/SOCKS5 的明文认证表达，但 Yuubinsya/Trojan 只能接收具体密码哈希。Rust 现在在 listener 构建阶段识别这个不可表达的配置并跳过入站、写入明确 warning；Yuubinsya server 构造器也拒绝空 password-hash 列表，不再因清空 inline password 而退回全零哈希。具体密码、多用户 hash 仍保持兼容，Wildcard 认证单测和 13 条 service-chain 集成测试通过。

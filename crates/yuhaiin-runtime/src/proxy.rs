@@ -18,6 +18,7 @@ use yuhaiin_store::GoProxyRuntimeConfig;
 use yuhaiin_trie::router::RuntimeRoutedProxySelector;
 
 use crate::RuntimeSnapshot;
+use crate::loopback::LoopbackDetector;
 use crate::route::RouteListSnapshot;
 
 #[path = "proxy/common.rs"]
@@ -621,6 +622,7 @@ pub struct RuntimeProxySelector {
     closed_nodes: RwLock<BTreeSet<String>>,
     metadata: RwLock<ProxyContextMetadata>,
     settings: RwLock<crate::RuntimeSettings>,
+    loopback: LoopbackDetector,
 }
 
 #[derive(Clone, Default)]
@@ -674,6 +676,7 @@ impl RuntimeProxySelector {
                     .await?,
             ),
             settings: RwLock::new(snapshot.settings.clone()),
+            loopback: LoopbackDetector::new(),
         })
     }
 
@@ -798,11 +801,18 @@ impl AsyncProxySelector for RuntimeProxySelector {
             .clone();
         let matched_lists = metadata.route_lists.matching_names(context);
         context.lists = matched_lists.clone();
-        let current = self
-            .current
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        current.route_context(context);
+        if let Some(reason) = self.loopback.reason(context) {
+            context.route_mode = yuhaiin_core::RouteMode::Block;
+            context.skip_route = true;
+            context.tag = Some(reason.to_owned());
+            context.match_history.clear();
+        } else {
+            let current = self
+                .current
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            current.route_context(context);
+        }
         // The trie evaluates List matchers against the membership populated
         // above. Restore the complete snapshot-derived membership afterward
         // so connection metadata is independent of which rule was selected.
@@ -1360,6 +1370,44 @@ mod tests {
         context.route_mode = RouteMode::Direct;
         let direct = selector.select(&context);
         assert!(!Arc::ptr_eq(&selected, &direct));
+    }
+
+    #[test]
+    fn runtime_selector_blocks_inbound_listener_cycle_before_route_rules() {
+        let config = GoProxyRuntimeConfig {
+            id: "proxy".to_owned(),
+            name: "Proxy".to_owned(),
+            group_name: String::new(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["direct".to_owned()],
+            layers: Vec::new(),
+            transport: GoProxyTransport::Direct,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        };
+        let selector = block_on(snapshot(config).build_proxy_selector(
+            "",
+            "proxy",
+            "",
+            "",
+            Duration::from_secs(1),
+        ))
+        .unwrap();
+        let address = "127.0.0.1:18080".parse().unwrap();
+        let mut context = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            address,
+        ));
+        context.local_addr = Some(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            address,
+        ));
+
+        selector.route_context(&mut context);
+
+        assert_eq!(context.route_mode, RouteMode::Block);
+        assert!(context.skip_route);
+        assert_eq!(context.tag.as_deref(), Some("loopback cycle"));
     }
 
     #[tokio::test(flavor = "current_thread")]
