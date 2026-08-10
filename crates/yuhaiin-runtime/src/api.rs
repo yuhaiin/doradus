@@ -5958,4 +5958,62 @@ mod tests {
         assert!(first.contains("event: connections_added"));
         assert!(first.contains(r#""connections":[]"#));
     }
+
+    #[tokio::test]
+    async fn connections_event_stream_delivers_live_add_and_remove_events() {
+        let state = state().await;
+        let monitor = state.controller.monitor();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/api/v2/connections/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = response.into_body();
+        let first = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("event: connections_added"));
+
+        let flow = yuhaiin_core::flow::Flow {
+            key: yuhaiin_core::flow::FlowKey {
+                network: Network::Tcp,
+                source: "127.0.0.1:41000".parse().unwrap(),
+                destination: "127.0.0.1:443".parse().unwrap(),
+            },
+        };
+        let context = FlowContext::new(Endpoint::ip(Network::Tcp, flow.key.destination));
+        yuhaiin_core::flow::FlowObserver::opened(monitor.as_ref(), flow, context);
+        let added = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        let added = String::from_utf8_lossy(&added);
+        assert!(added.contains("event: connections_added"));
+        assert!(added.contains(r#""id":"1""#));
+
+        yuhaiin_core::flow::FlowObserver::closed(monitor.as_ref(), flow.key);
+        let removed = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        let removed = String::from_utf8_lossy(&removed);
+        assert!(removed.contains("event: connections_removed"));
+        assert!(removed.contains(r#""ids":["1"]"#));
+    }
 }

@@ -2617,3 +2617,16 @@ dispatcher。每个 assembly 最多 128 片、32 个并行 datagram、64 KiB 总
 `ipv6_fragment_reassembler_drops_overlap_and_expires_assemblies`，覆盖 second fragment 先到、完整
 UDP payload、重叠冲突和确定性过期。IPv4 仍使用 smoltcp 自带的 bounded reassembly；超出各自上限的
 wire-fragment 长流、真实 namespace teardown，以及 Android/macOS 设备验收仍保持 checklist 的部分状态。
+
+## 83. 2026-08-10 live connections SSE add/remove regression
+
+Go 的 `Connections.Events` 先发送当前连接快照，再持续推送连接新增和删除事件。Rust 原先只在
+API 层验证了 SSE route 和空快照，monitor 本身虽然已有事件单测，但没有把 HTTP stream 两端连
+起来验证消费行为。
+
+新增 `connections_event_stream_delivers_live_add_and_remove_events`：打开真实 Axum SSE body，先
+读取 `connections_added` 空快照，再通过同一个 `ConnectionMonitor` 的 `FlowObserver` 打开/关闭
+TCP flow，连续读取并断言 `connections_added` 和 `connections_removed` 事件及 Go 兼容 payload。
+这证明前端使用 EventSource 时不只路由存在，live connections 也能从 monitor 穿过 HTTP stream
+到达客户端；traffic/telemetry 仍通过独立 API 和进程级统计 smoke 验证，生产长时锁竞争继续保留
+在 checklist 的 `[~]`。
