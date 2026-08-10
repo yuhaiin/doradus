@@ -50,7 +50,8 @@ pub use compat_runtime::{
 pub use resolver::{FakeIpPools, FakeIpResolver};
 pub use statistics::{
     GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsSnapshot,
-    GoTelemetryBucketRecord, GoTrafficBucketRecord,
+    GoTelemetryBucketRecord, GoTrafficBucketRecord, TELEMETRY_DAILY_BUCKET_SECONDS,
+    TELEMETRY_HOURLY_BUCKET_SECONDS,
 };
 pub use status::StorageStatus;
 pub use users::{

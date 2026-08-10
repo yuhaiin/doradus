@@ -23,7 +23,8 @@ use yuhaiin_core::flow::{
 use yuhaiin_core::{BoxFuture, Endpoint, FlowContext, RouteMode};
 use yuhaiin_store::{
     ConfigStore, GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsSnapshot,
-    GoTelemetryBucketRecord, GoTrafficBucketRecord,
+    GoTelemetryBucketRecord, GoTrafficBucketRecord, TELEMETRY_DAILY_BUCKET_SECONDS,
+    TELEMETRY_HOURLY_BUCKET_SECONDS,
 };
 
 use crate::RuntimeLog;
@@ -51,6 +52,18 @@ const GO_TELEMETRY_DIMENSIONS: [&str; 9] = [
     "destination",
 ];
 
+fn default_telemetry_bucket_span_seconds() -> i64 {
+    TELEMETRY_HOURLY_BUCKET_SECONDS
+}
+
+fn normalize_telemetry_bucket_span_seconds(span_seconds: i64) -> i64 {
+    if span_seconds <= 0 {
+        TELEMETRY_HOURLY_BUCKET_SECONDS
+    } else {
+        span_seconds
+    }
+}
+
 /// Socket inbound tasks are spawned on Tokio's multithread executor. This
 /// runtime-local boundary deliberately requires a Send future while the core
 /// TUN API keeps its more permissive LocalBoxFuture contract.
@@ -72,6 +85,9 @@ struct ConnectionEntry {
     download: u64,
 }
 
+type TelemetryBucketKey = (i64, i64, String, String);
+type TelemetryBucketValue = (u64, u64, u64);
+
 struct PersistenceState {
     store: ConfigStore,
     dirty: Arc<Notify>,
@@ -89,7 +105,7 @@ struct MonitorState {
     counters: BTreeMap<String, (u64, u64)>,
     buckets: BTreeMap<i64, (u64, u64)>,
     telemetry: BTreeMap<(String, String), (u64, u64, u64)>,
-    telemetry_buckets: BTreeMap<(i64, String, String), (u64, u64, u64)>,
+    telemetry_buckets: BTreeMap<TelemetryBucketKey, TelemetryBucketValue>,
     history: Vec<Value>,
     failed_history: BTreeMap<(String, String, String), FailedEntry>,
     block_history: BTreeMap<(String, String, String), BlockEntry>,
@@ -127,6 +143,8 @@ struct PersistedTelemetry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedTelemetryBucket {
     bucket: i64,
+    #[serde(default = "default_telemetry_bucket_span_seconds")]
+    span_seconds: i64,
     dimension: String,
     value: String,
     download: u64,
@@ -481,10 +499,17 @@ impl ConnectionMonitor {
                     .insert(value.clone(), (*download, *upload, *failures));
             }
         } else {
-            for ((bucket, dimension, value), (download, upload, failures)) in
+            for ((bucket, span_seconds, dimension, value), (download, upload, failures)) in
                 &state.telemetry_buckets
             {
-                if *bucket < from || *bucket >= to {
+                let span_seconds = normalize_telemetry_bucket_span_seconds(*span_seconds);
+                let in_range = if span_seconds == TELEMETRY_DAILY_BUCKET_SECONDS {
+                    let bucket_end = bucket.saturating_add(span_seconds);
+                    *bucket < to && bucket_end > from
+                } else {
+                    *bucket >= from && *bucket < to
+                };
+                if !in_range {
                     continue;
                 }
                 let item = dimensions
@@ -720,7 +745,7 @@ impl ConnectionMonitor {
             item.2 = item.2.saturating_add(1);
             let item = state
                 .telemetry_buckets
-                .entry((bucket, dimension, value))
+                .entry((bucket, TELEMETRY_HOURLY_BUCKET_SECONDS, dimension, value))
                 .or_default();
             item.2 = item.2.saturating_add(1);
         }
@@ -839,7 +864,13 @@ impl ConnectionMonitor {
             }
             let item = state
                 .telemetry_buckets
-                .entry((now.div_euclid(3600) * 3600, dimension, value))
+                .entry((
+                    now.div_euclid(TELEMETRY_HOURLY_BUCKET_SECONDS)
+                        * TELEMETRY_HOURLY_BUCKET_SECONDS,
+                    TELEMETRY_HOURLY_BUCKET_SECONDS,
+                    dimension,
+                    value,
+                ))
                 .or_default();
             match direction {
                 TunFlowDirection::Upload => item.1 = item.1.saturating_add(bytes),
@@ -850,7 +881,7 @@ impl ConnectionMonitor {
         while state
             .telemetry_buckets
             .first_key_value()
-            .is_some_and(|((bucket, _, _), _)| *bucket < telemetry_cutoff)
+            .is_some_and(|((bucket, _, _, _), _)| *bucket < telemetry_cutoff)
         {
             let Some(key) = state
                 .telemetry_buckets
@@ -1005,7 +1036,12 @@ impl ConnectionMonitor {
             .map(|entry| {
                 let value = normalize_persisted_telemetry_value(&entry.dimension, entry.value);
                 (
-                    (entry.bucket, entry.dimension, value),
+                    (
+                        entry.bucket,
+                        normalize_telemetry_bucket_span_seconds(entry.span_seconds),
+                        entry.dimension,
+                        value,
+                    ),
                     (entry.download, entry.upload, entry.failures),
                 )
             })
@@ -1067,7 +1103,12 @@ impl ConnectionMonitor {
             aggregate.2 = aggregate.2.saturating_add(item.failures);
             let bucket = state
                 .telemetry_buckets
-                .entry((item.bucket, item.dimension, value))
+                .entry((
+                    item.bucket,
+                    normalize_telemetry_bucket_span_seconds(item.span_seconds),
+                    item.dimension,
+                    value,
+                ))
                 .or_default();
             bucket.0 = bucket.0.saturating_add(item.download);
             bucket.1 = bucket.1.saturating_add(item.upload);
@@ -1138,9 +1179,10 @@ impl ConnectionMonitor {
                 .telemetry_buckets
                 .iter()
                 .map(
-                    |((bucket, dimension, value), (download, upload, failures))| {
+                    |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
                         GoTelemetryBucketRecord {
                             bucket: *bucket,
+                            span_seconds: *span_seconds,
                             dimension: dimension.clone(),
                             value: value.clone(),
                             download: *download,
@@ -1179,9 +1221,10 @@ impl ConnectionMonitor {
                 .telemetry_buckets
                 .iter()
                 .map(
-                    |((bucket, dimension, value), (download, upload, failures))| {
+                    |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
                         PersistedTelemetryBucket {
                             bucket: *bucket,
+                            span_seconds: *span_seconds,
                             dimension: dimension.clone(),
                             value: value.clone(),
                             download: *download,
@@ -2037,6 +2080,71 @@ mod tests {
                 .iter()
                 .any(|item| item["value"] == "http" && item["failures"] == "1")
         );
+    }
+
+    #[test]
+    fn monitor_telemetry_includes_daily_buckets_that_overlap_a_partial_day() {
+        let monitor = ConnectionMonitor::new();
+        let day = 1_704_067_200_i64; // 2024-01-01T00:00:00Z
+        {
+            let mut state = monitor.lock();
+            state.telemetry_buckets.insert(
+                (
+                    day,
+                    TELEMETRY_DAILY_BUCKET_SECONDS,
+                    "protocol".to_owned(),
+                    "tcp".to_owned(),
+                ),
+                (100, 50, 2),
+            );
+            state.telemetry_buckets.insert(
+                (
+                    day + TELEMETRY_DAILY_BUCKET_SECONDS,
+                    TELEMETRY_HOURLY_BUCKET_SECONDS,
+                    "protocol".to_owned(),
+                    "tcp".to_owned(),
+                ),
+                (3, 4, 1),
+            );
+            state.telemetry_buckets.insert(
+                (
+                    day + 11 * 3_600,
+                    TELEMETRY_HOURLY_BUCKET_SECONDS,
+                    "protocol".to_owned(),
+                    "tcp".to_owned(),
+                ),
+                (70, 80, 9),
+            );
+        }
+
+        let value = monitor.telemetry_value_range(
+            day + 12 * 3_600,
+            day + TELEMETRY_DAILY_BUCKET_SECONDS + 12 * 3_600,
+            8,
+        );
+        let protocol = value["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|group| group["dimension"] == "protocol")
+            .unwrap();
+        assert_eq!(protocol["items"][0]["value"], "tcp");
+        assert_eq!(protocol["items"][0]["download"], "103");
+        assert_eq!(protocol["items"][0]["upload"], "54");
+        assert_eq!(protocol["items"][0]["failures"], "3");
+
+        let after_daily = monitor.telemetry_value_range(
+            day + TELEMETRY_DAILY_BUCKET_SECONDS + 12 * 3_600,
+            day + 2 * TELEMETRY_DAILY_BUCKET_SECONDS,
+            8,
+        );
+        let protocol = after_daily["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|group| group["dimension"] == "protocol")
+            .unwrap();
+        assert!(protocol["items"].as_array().unwrap().is_empty());
     }
 
     #[test]

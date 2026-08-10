@@ -39,6 +39,8 @@
 
 > 2026-08-09 Go statistics takeover bridge：`yuhaiin-store` 新增 Go 统计表的 typed projection boundary。Rust 启动时在没有 `statistics.runtime` checkpoint 的情况下读取 `statistics_kv`、`traffic_hourly`、`connection_history`、`failed_connection_history` 以及 v6 telemetry dimension 表；`ConnectionMonitor` 的 history 按 Go 的 `(protocol, addr, process)` key 合并，并保留 `dumpProcessEnabled`、计数、最近时间和 JSON connection。正常 `shutdown()` 先写 Rust checkpoint，再在同一个 SQLite 写事务中替换 Go 兼容统计投影，使旧 Go 管理面可以继续看到最终 totals/traffic/history/telemetry。频繁写入仍使用紧凑 checkpoint，故 force-abort 后“checkpoint 可恢复”与“Go 统计表已更新”是两个明确边界，生产库版本矩阵和异常中断验证继续列在 checklist。
 
+> 2026-08-10 Go telemetry daily-range parity：Go 的 `statistics.telemetryDimension` 对 `traffic_dimension_daily`/`failure_dimension_daily` 使用“bucket 与查询区间重叠”条件，而 Rust 之前只按 bucket 起点过滤，导致从非午夜开始的长范围漏掉前一天的 daily 数据。`GoTelemetryBucketRecord`、`ConnectionMonitor` 内存状态和 `statistics.runtime` checkpoint 现在保留 hourly/daily `span_seconds`；查询使用半开区间 overlap，实时流继续写 1 小时 bucket，旧 checkpoint 缺失该字段时按 hourly 兼容。新增跨日单测，并通过 `make go-rust-stats-smoke` 与 `make stats-concurrency-smoke`。
+
 > 2026-08-09 统计运行期投影：保留 2 秒级紧凑 `statistics.runtime` checkpoint 作为 crash recovery；checkpoint 成功后首次触发 Go 表投影，之后最多每 30 秒重写一次 `statistics_kv`、traffic/history/failure/telemetry 投影，避免每个 flow 都重写整套 Go 表。最终 shutdown 仍执行一次完整原子投影；异常中断时 Go 表只保证最近一次低频投影，完整恢复以 checkpoint 为准，跨进程可见性仍需 Podman/进程级验证。
 
 > 2026-08-09 统计投影重试：Go 兼容表投影只有在 `replace_go_statistics` 成功后才推进 30 秒节流时间点；SQLite 暂时锁冲突或其他写入失败不会被误记为成功，后续 checkpoint 会继续尝试。新增独立文件库 reader 回归，在 monitor shutdown 前验证另一 `ConfigStore` 已能读到 totals/history。

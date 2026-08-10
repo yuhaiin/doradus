@@ -15,6 +15,8 @@ use crate::sqlite::{Connection, Row};
 
 const TELEMETRY_HOURLY_RETENTION_SECONDS: i64 = 30 * 86_400;
 const TELEMETRY_SECONDS_PER_DAY: i64 = 86_400;
+pub const TELEMETRY_HOURLY_BUCKET_SECONDS: i64 = 3_600;
+pub const TELEMETRY_DAILY_BUCKET_SECONDS: i64 = TELEMETRY_SECONDS_PER_DAY;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GoTrafficBucketRecord {
@@ -46,6 +48,8 @@ pub struct GoFailedHistoryRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GoTelemetryBucketRecord {
     pub bucket: i64,
+    /// The span covered by this record: hourly or compacted daily.
+    pub span_seconds: i64,
     pub dimension: String,
     pub value: String,
     pub download: u64,
@@ -178,8 +182,11 @@ fn load_telemetry(
     if !table_exists(connection, "telemetry_dimension_values") {
         return load_legacy_telemetry(connection, output);
     }
-    let mut merged = BTreeMap::<(i64, String, String), (u64, u64, u64)>::new();
-    for table in ["traffic_dimension_hourly", "traffic_dimension_daily"] {
+    let mut merged = BTreeMap::<(i64, i64, String, String), (u64, u64, u64)>::new();
+    for (table, span_seconds) in [
+        ("traffic_dimension_hourly", TELEMETRY_HOURLY_BUCKET_SECONDS),
+        ("traffic_dimension_daily", TELEMETRY_DAILY_BUCKET_SECONDS),
+    ] {
         if !table_exists(connection, table) {
             continue;
         }
@@ -192,6 +199,7 @@ fn load_telemetry(
         for row in connection.query(&sql).map_err(storage_error)? {
             let key = (
                 row_i64(&row, 0, "traffic_dimension.bucket_start_utc")?,
+                span_seconds,
                 row_text(&row, 1, "telemetry_dimension_values.dimension")?,
                 row_text(&row, 2, "telemetry_dimension_values.value")?,
             );
@@ -204,7 +212,10 @@ fn load_telemetry(
                 .saturating_add(row_u64(&row, 4, "traffic_dimension.upload_bytes")?);
         }
     }
-    for table in ["failure_dimension_hourly", "failure_dimension_daily"] {
+    for (table, span_seconds) in [
+        ("failure_dimension_hourly", TELEMETRY_HOURLY_BUCKET_SECONDS),
+        ("failure_dimension_daily", TELEMETRY_DAILY_BUCKET_SECONDS),
+    ] {
         if !table_exists(connection, table) {
             continue;
         }
@@ -216,6 +227,7 @@ fn load_telemetry(
         for row in connection.query(&sql).map_err(storage_error)? {
             let key = (
                 row_i64(&row, 0, "failure_dimension.bucket_start_utc")?,
+                span_seconds,
                 row_text(&row, 1, "telemetry_dimension_values.dimension")?,
                 row_text(&row, 2, "telemetry_dimension_values.value")?,
             );
@@ -228,13 +240,16 @@ fn load_telemetry(
     *output = merged
         .into_iter()
         .map(
-            |((bucket, dimension, value), (download, upload, failures))| GoTelemetryBucketRecord {
-                bucket,
-                dimension,
-                value,
-                download,
-                upload,
-                failures,
+            |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
+                GoTelemetryBucketRecord {
+                    bucket,
+                    span_seconds,
+                    dimension,
+                    value,
+                    download,
+                    upload,
+                    failures,
+                }
             },
         )
         .collect();
@@ -245,7 +260,7 @@ fn load_legacy_telemetry(
     connection: &Connection,
     output: &mut Vec<GoTelemetryBucketRecord>,
 ) -> Result<()> {
-    let mut merged = BTreeMap::<(i64, String, String), (u64, u64, u64)>::new();
+    let mut merged = BTreeMap::<(i64, i64, String, String), (u64, u64, u64)>::new();
     if table_exists(connection, "traffic_dimension_hourly") {
         for row in connection
             .query(
@@ -257,6 +272,7 @@ fn load_legacy_telemetry(
         {
             let key = (
                 row_i64(&row, 0, "traffic_dimension_hourly.bucket_start_utc")?,
+                TELEMETRY_HOURLY_BUCKET_SECONDS,
                 row_text(&row, 1, "traffic_dimension_hourly.dimension")?,
                 row_text(&row, 2, "traffic_dimension_hourly.value")?,
             );
@@ -282,6 +298,7 @@ fn load_legacy_telemetry(
         {
             let key = (
                 row_i64(&row, 0, "failure_dimension_hourly.bucket_start_utc")?,
+                TELEMETRY_HOURLY_BUCKET_SECONDS,
                 row_text(&row, 1, "failure_dimension_hourly.dimension")?,
                 row_text(&row, 2, "failure_dimension_hourly.value")?,
             );
@@ -295,13 +312,16 @@ fn load_legacy_telemetry(
     *output = merged
         .into_iter()
         .map(
-            |((bucket, dimension, value), (download, upload, failures))| GoTelemetryBucketRecord {
-                bucket,
-                dimension,
-                value,
-                download,
-                upload,
-                failures,
+            |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
+                GoTelemetryBucketRecord {
+                    bucket,
+                    span_seconds,
+                    dimension,
+                    value,
+                    download,
+                    upload,
+                    failures,
+                }
             },
         )
         .collect();
@@ -751,6 +771,7 @@ mod tests {
             }],
             telemetry: vec![GoTelemetryBucketRecord {
                 bucket: recent_bucket,
+                span_seconds: TELEMETRY_HOURLY_BUCKET_SECONDS,
                 dimension: "protocol".to_owned(),
                 value: "tcp".to_owned(),
                 download: 11,
@@ -782,6 +803,7 @@ mod tests {
             telemetry: vec![
                 GoTelemetryBucketRecord {
                     bucket: old_bucket_a,
+                    span_seconds: TELEMETRY_HOURLY_BUCKET_SECONDS,
                     dimension: "protocol".to_owned(),
                     value: "tcp".to_owned(),
                     download: 11,
@@ -790,6 +812,7 @@ mod tests {
                 },
                 GoTelemetryBucketRecord {
                     bucket: old_bucket_b,
+                    span_seconds: TELEMETRY_HOURLY_BUCKET_SECONDS,
                     dimension: "protocol".to_owned(),
                     value: "tcp".to_owned(),
                     download: 13,
@@ -798,6 +821,7 @@ mod tests {
                 },
                 GoTelemetryBucketRecord {
                     bucket: recent_bucket,
+                    span_seconds: TELEMETRY_HOURLY_BUCKET_SECONDS,
                     dimension: "protocol".to_owned(),
                     value: "tcp".to_owned(),
                     download: 17,
@@ -865,6 +889,7 @@ mod tests {
             .iter()
             .find(|item| item.bucket == old_day)
             .unwrap();
+        assert_eq!(daily.span_seconds, TELEMETRY_DAILY_BUCKET_SECONDS);
         assert_eq!(daily.download, 24);
         assert_eq!(daily.upload, 12);
         assert_eq!(daily.failures, 5);
@@ -873,6 +898,7 @@ mod tests {
             .iter()
             .find(|item| item.bucket == recent_bucket)
             .unwrap();
+        assert_eq!(hourly.span_seconds, TELEMETRY_HOURLY_BUCKET_SECONDS);
         assert_eq!(hourly.download, 17);
         assert_eq!(hourly.upload, 19);
         assert_eq!(hourly.failures, 4);
@@ -911,6 +937,7 @@ mod tests {
         let result = store.replace_go_statistics(&GoStatisticsSnapshot {
             telemetry: vec![GoTelemetryBucketRecord {
                 bucket: 1,
+                span_seconds: TELEMETRY_HOURLY_BUCKET_SECONDS,
                 dimension: "protocol".to_owned(),
                 value: "tcp".to_owned(),
                 download: u64::MAX,
