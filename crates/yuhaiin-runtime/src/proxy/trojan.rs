@@ -83,9 +83,21 @@ struct UdpReply {
 
 struct UdpFlowState {
     datagram: Arc<dyn AsyncDatagram>,
+    receiver_task: tokio::task::JoinHandle<()>,
     key: TunFlowKey,
     last_seen: std::time::Instant,
     _observation: FlowObserverGuard,
+}
+
+async fn shutdown_udp_flow(state: UdpFlowState) {
+    let UdpFlowState {
+        datagram,
+        receiver_task,
+        ..
+    } = state;
+    receiver_task.abort();
+    let _ = receiver_task.await;
+    let _ = datagram.close().await;
 }
 
 async fn serve_udp<S>(
@@ -142,7 +154,7 @@ where
                     let receiver = Arc::clone(&datagram);
                     let reply_tx = reply_tx.clone();
                     let id = target.clone();
-                    tokio::spawn(async move {
+                    let receiver_task = tokio::spawn(async move {
                         let mut buffer = vec![0u8; udp_buffer_size];
                         loop {
                             match receiver.recv_from(&mut buffer).await {
@@ -157,6 +169,7 @@ where
                         target.clone(),
                         UdpFlowState {
                             datagram: Arc::clone(&datagram),
+                            receiver_task,
                             key: flow,
                             last_seen: std::time::Instant::now(),
                             _observation: observation,
@@ -194,8 +207,7 @@ where
                     .collect::<Vec<_>>();
                 for id in expired {
                     if let Some(state) = flows.remove(&id) {
-                        let _ = state.datagram.close().await;
-                        drop(state);
+                        shutdown_udp_flow(state).await;
                     }
                 }
             }
@@ -203,8 +215,7 @@ where
         }
     }
     for (_, state) in flows {
-        let _ = state.datagram.close().await;
-        drop(state);
+        shutdown_udp_flow(state).await;
     }
     Ok(())
 }

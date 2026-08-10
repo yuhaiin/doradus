@@ -120,7 +120,7 @@ flowchart LR
 | 状态 | 模块 | Rust 位置 | 当前结果 | 剩余工作 |
 | --- | --- | --- | --- | --- |
 | `[x]` | workspace 分层 | `crates/yuhaiin-core`, `chain`, `protocol`, `store`, `geo`, `trie`, `runtime` | 共用类型、proxy/transport、存储、路由、运行时边界已拆开；HTTP API 复用 store/runtime struct | Android/macOS 的权限、TUN fd/route 和实机验收 |
-| `[x]` | Flow/Proxy contract | `yuhaiin-core::FlowContext`, `proxy::{AsyncProxy,AsyncDatagram,AsyncProxySelector}` | TCP、UDP、ping、close、取消、timeout、backpressure 统一到一个可扩展边界 | 少数协议专属错误语义继续补齐 |
+| `[x]` | Flow/Proxy contract | `yuhaiin-core::FlowContext`, `proxy::{AsyncProxy,AsyncDatagram,AsyncProxySelector}` | TCP、UDP、ping、close、取消、timeout、backpressure 统一到一个可扩展边界；透明/SOCKS5/Yuubinsya/Trojan UDP flow 显式持有并回收 receiver task | 少数协议专属错误语义继续补齐 |
 | `[x]` | 纯 Rust 网络基础 | core 的 DNS/TUN/NAT/protocol，以及 `socket2` | 默认不引入 TLS/OpenSSL/C 网络绑定；SQLite bundled C binding 是批准的例外 | 不为不需要的 Go 包机械复刻 |
 
 ## 2. SQLite 配置与状态

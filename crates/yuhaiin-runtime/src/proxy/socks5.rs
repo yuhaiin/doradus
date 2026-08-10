@@ -18,7 +18,7 @@ use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network,
 
 use super::common::{
     UDP_IDLE_TIMEOUT, UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows,
-    io_error, reap_expired_udp_flows, relay_counted_with_buffer, udp_flow_key,
+    io_error, reap_expired_udp_flows, relay_counted_with_buffer, shutdown_udp_flow, udp_flow_key,
 };
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -214,7 +214,7 @@ pub(crate) async fn serve_socks5_udp_loop(
                     let receiver = Arc::clone(&datagram);
                     let reply_tx = reply_tx.clone();
                     let id_for_task = id.clone();
-                    tokio::spawn(async move {
+                    let receiver_task = tokio::spawn(async move {
                         let mut buffer = vec![0u8; udp_buffer_size];
                         loop {
                             match receiver.recv_from(&mut buffer).await {
@@ -233,6 +233,7 @@ pub(crate) async fn serve_socks5_udp_loop(
                     });
                     flows.entry(id.clone()).or_insert(UdpFlowState {
                         datagram,
+                        receiver_task,
                         key,
                         peer: source,
                         last_seen: std::time::Instant::now(),
@@ -271,8 +272,7 @@ pub(crate) async fn serve_socks5_udp_loop(
         }
     }
     for state in flows.into_values() {
-        let _ = state.datagram.close().await;
-        drop(state);
+        shutdown_udp_flow(state).await;
     }
     let _ = spec;
     Ok(())

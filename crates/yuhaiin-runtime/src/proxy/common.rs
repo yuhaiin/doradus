@@ -29,6 +29,7 @@ pub(crate) struct UdpFlowId {
 
 pub(crate) struct UdpFlowState {
     pub(crate) datagram: Arc<dyn AsyncDatagram>,
+    pub(crate) receiver_task: tokio::task::JoinHandle<()>,
     pub(crate) key: TunFlowKey,
     pub(crate) peer: Endpoint,
     pub(crate) last_seen: std::time::Instant,
@@ -39,6 +40,17 @@ pub(crate) struct UdpReply {
     pub(crate) id: UdpFlowId,
     pub(crate) target: Endpoint,
     pub(crate) payload: Vec<u8>,
+}
+
+pub(crate) async fn shutdown_udp_flow(state: UdpFlowState) {
+    let UdpFlowState {
+        datagram,
+        receiver_task,
+        ..
+    } = state;
+    receiver_task.abort();
+    let _ = receiver_task.await;
+    let _ = datagram.close().await;
 }
 
 pub(crate) async fn close_udp_flows(
@@ -52,8 +64,7 @@ pub(crate) async fn close_udp_flows(
         .collect::<Vec<_>>();
     for id in ids {
         if let Some(state) = flows.remove(&id) {
-            let _ = state.datagram.close().await;
-            drop(state);
+            shutdown_udp_flow(state).await;
         }
     }
 }
@@ -76,8 +87,7 @@ pub(crate) async fn reap_expired_udp_flows(flows: &mut HashMap<UdpFlowId, UdpFlo
     let count = ids.len();
     for id in ids {
         if let Some(state) = flows.remove(&id) {
-            let _ = state.datagram.close().await;
-            drop(state);
+            shutdown_udp_flow(state).await;
         }
     }
     count
@@ -373,6 +383,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use tokio::io::duplex;
 
@@ -394,6 +405,85 @@ mod tests {
             now,
             UDP_IDLE_TIMEOUT,
         ));
+    }
+
+    struct CloseTrackingDatagram {
+        closed: Arc<AtomicBool>,
+    }
+
+    impl AsyncDatagram for CloseTrackingDatagram {
+        fn send_to<'a>(
+            &'a self,
+            payload: &'a [u8],
+            _target: Endpoint,
+        ) -> BoxFuture<'a, Result<usize>> {
+            Box::pin(async move { Ok(payload.len()) })
+        }
+
+        fn recv_from<'a>(
+            &'a self,
+            _buffer: &'a mut [u8],
+        ) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn local_addr(&self) -> Result<Endpoint> {
+            Ok(Endpoint::ip(Network::Udp, "127.0.0.1:0".parse().unwrap()))
+        }
+
+        fn close(&self) -> BoxFuture<'_, Result<()>> {
+            let closed = Arc::clone(&self.closed);
+            Box::pin(async move {
+                closed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_udp_flow_cancels_receiver_before_closing_datagram() {
+        let receiver_dropped = Arc::new(AtomicBool::new(false));
+        let receiver_dropped_guard = Arc::clone(&receiver_dropped);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let receiver_task = tokio::spawn(async move {
+            struct ReceiverGuard(Arc<AtomicBool>);
+            impl Drop for ReceiverGuard {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+
+            let _guard = ReceiverGuard(receiver_dropped_guard);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        let datagram_closed = Arc::new(AtomicBool::new(false));
+        let key = TunFlowKey {
+            network: Network::Udp,
+            source: "127.0.0.1:41000".parse().unwrap(),
+            destination: "127.0.0.1:53".parse().unwrap(),
+        };
+        let monitor = Arc::new(ConnectionMonitor::new());
+        let observation = FlowObserverGuard::open(
+            monitor,
+            TunFlow { key },
+            FlowContext::new(Endpoint::ip(Network::Udp, key.destination)),
+        );
+        shutdown_udp_flow(UdpFlowState {
+            datagram: Arc::new(CloseTrackingDatagram {
+                closed: Arc::clone(&datagram_closed),
+            }),
+            receiver_task,
+            key,
+            peer: Endpoint::ip(Network::Udp, key.source),
+            last_seen: Instant::now(),
+            _observation: observation,
+        })
+        .await;
+
+        assert!(receiver_dropped.load(Ordering::SeqCst));
+        assert!(datagram_closed.load(Ordering::SeqCst));
     }
 
     struct EchoDnsHandler;
