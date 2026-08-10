@@ -40,6 +40,8 @@ The current scenarios cover:
 - prior-knowledge HTTP/2 inbound → route rule → fixed + HTTP CONNECT outbound,
   including the inner HTTP CONNECT framing, proxy-side domain authority,
   live connections, upload/download counters, and shutdown.
+- TLS + HTTP/2 inbound → route rule → fixed + HTTP CONNECT outbound, including
+  TLS ALPN `h2` negotiation and the same live data-plane assertions.
 - mixed inbound → SOCKS5 UDP framing → direct UDP, including the Go-compatible
   mixed UDP mode and a conflicting default `127.0.0.1:1080` listener.
 - authenticated SOCKS5 TCP inbound and Yuubinsya TCP inbound → direct echo in

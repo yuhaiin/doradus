@@ -85,13 +85,28 @@ pub async fn connect_loopback(address: SocketAddr) -> TcpStream {
 /// hostname validation, matching the outbound `insecure_skip_verify` test
 /// semantics without introducing a system CA dependency.
 pub async fn connect_tls_loopback(address: SocketAddr) -> TlsStream<TcpStream> {
+    connect_tls_loopback_with_alpn(address, &[]).await
+}
+
+/// Connect to an inbound TLS listener while advertising the given ALPN
+/// protocols. HTTP/2 inbound tests must negotiate `h2`; ordinary TLS/HTTP
+/// tests intentionally keep the list empty and exercise HTTP/1.1 fallback.
+pub async fn connect_tls_h2_loopback(address: SocketAddr) -> TlsStream<TcpStream> {
+    connect_tls_loopback_with_alpn(address, &[b"h2"]).await
+}
+
+async fn connect_tls_loopback_with_alpn(
+    address: SocketAddr,
+    alpn_protocols: &[&[u8]],
+) -> TlsStream<TcpStream> {
     let provider = Arc::new(rustls_rustcrypto::provider());
-    let config = ClientConfig::builder_with_provider(Arc::clone(&provider))
+    let mut config = ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .unwrap()
         .dangerous()
         .with_custom_certificate_verifier(SkipServerVerification::new(provider))
         .with_no_client_auth();
+    config.alpn_protocols = alpn_protocols.iter().map(|value| value.to_vec()).collect();
     let connector = TlsConnector::from(Arc::new(config));
     let server_name = ServerName::try_from("localhost").unwrap().to_owned();
     connector
@@ -1308,6 +1323,85 @@ pub async fn configure_h2_http_inbound(
 
     let rule = json!({
         "name":"proxy-example-test-over-h2-inbound",
+        "mode":"proxy",
+        "match":{"domain":"example.test"},
+        "tag":"integration"
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/route/rules",
+        Some(&rule),
+    )
+    .await;
+}
+
+/// Configure TLS termination followed by HTTP/2 prior-knowledge framing.
+/// The selected outbound is fixed → HTTP CONNECT so this fixture exercises
+/// TLS ALPN negotiation, H2 stream handling, router selection, and proxy-side
+/// domain authority in one process-level chain.
+pub async fn configure_tls_h2_http_inbound(
+    service: &ServiceProcess,
+    inbound: SocketAddr,
+    outbound: SocketAddr,
+) {
+    use base64::Engine;
+
+    let node = json!({
+        "id":"tls-h2-inbound-http-out",
+        "name":"TLS HTTP/2 inbound HTTP outbound",
+        "group":"integration",
+        "enabled":true,
+        "chain":[
+            {"type":"fixed","fixed":{"host":"127.0.0.1","port":outbound.port()}},
+            {"type":"http","http":{"user":"","password":""}}
+        ]
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes",
+        Some(&node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes/tls-h2-inbound-http-out/use",
+        None,
+    )
+    .await;
+
+    let certificate = base64::engine::general_purpose::STANDARD.encode(LEAF_CERTIFICATE_PEM);
+    let private_key = base64::engine::general_purpose::STANDARD.encode(PRIVATE_KEY_PEM);
+    let inbound = json!({
+        "id":"tls-h2-http-in",
+        "name":"TLS HTTP/2 inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
+        "transports":[
+            {"type":"tls","tls":{"tls":{
+                "certificates":[{"certBase64":certificate,"keyBase64":private_key}],
+                "nextProtos":[]
+            }}},
+            {"type":"http2","http2":{}}
+        ],
+        "protocol":{"type":"http","http":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+
+    let rule = json!({
+        "name":"proxy-example-test-over-tls-h2-inbound",
         "mode":"proxy",
         "match":{"domain":"example.test"},
         "tag":"integration"

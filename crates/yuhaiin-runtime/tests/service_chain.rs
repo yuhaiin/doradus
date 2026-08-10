@@ -17,8 +17,9 @@ use support::{
     Socks5Fixture, YUUBINSYA_PASSWORD, add_mixed_udp_inbound, add_socks5_inbound,
     add_yuubinsya_inbound, api_json, configure_h2_http_chain, configure_h2_http_inbound,
     configure_h2_socks5_chain, configure_http_chain, configure_socks5_chain,
-    configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound, connect_loopback,
-    connect_tls_loopback, integration_dir, seed_empty_database, wait_for_connection,
+    configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound,
+    connect_loopback, connect_tls_h2_loopback, connect_tls_loopback, integration_dir,
+    seed_empty_database, wait_for_connection,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -178,6 +179,94 @@ async fn tls_http_inbound_terminates_tls_and_routes_through_direct_outbound() {
     assert_eq!(item["protocol"], "tls");
 
     client.shutdown().await.unwrap();
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_http2_inbound_routes_through_http_outbound() {
+    let fixture = ConnectFixture::start().await;
+    let inbound_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let inbound = inbound_listener.local_addr().unwrap();
+    drop(inbound_listener);
+
+    let root = integration_dir("service-tls-h2-http-inbound");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_tls_h2_http_inbound(&service, inbound, fixture.outbound).await;
+
+    let transport = connect_tls_h2_loopback(inbound).await;
+    let (mut client, connection) = h2::client::handshake(transport).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = Request::builder()
+        .method(http::Method::CONNECT)
+        .uri("https://localhost")
+        .body(())
+        .unwrap();
+    let (response, mut request_body) = client.send_request(request, false).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+
+    let authority = format!("example.test:{}", fixture.target.port());
+    request_body
+        .send_data(
+            Bytes::from(format!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n"
+            )),
+            false,
+        )
+        .unwrap();
+    let payload = b"tls-h2-inbound-http-outbound";
+    request_body
+        .send_data(Bytes::from_static(payload), true)
+        .unwrap();
+
+    let mut body = response.into_body();
+    let mut received = Vec::new();
+    while let Some(data) = body.data().await {
+        let data = data.unwrap();
+        body.flow_control().release_capacity(data.len()).unwrap();
+        received.extend_from_slice(&data);
+        if received.ends_with(payload) {
+            break;
+        }
+    }
+    assert!(
+        received.starts_with(b"HTTP/1.1 200 Connection Established\r\n\r\n"),
+        "TLS/H2 inbound response: {received:?}"
+    );
+    assert!(received.ends_with(payload));
+
+    let connection_value = wait_for_connection(&service.client, &service.base_url).await;
+    let item = connection_value["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inboundName"] == "tls-h2-http-in")
+        .expect("TLS/HTTP2 inbound connection must be visible");
+    assert_eq!(item["inbound"], "http");
+    // TLS is intentionally retained as the protocol metadata when the
+    // inbound transport is TLS-wrapped; this matches the existing Go-facing
+    // precedence used by `InboundSpec::annotate_context`.
+    assert_eq!(item["protocol"], "tls");
+    assert_eq!(item["outbound"], fixture.outbound.to_string());
+
+    let authorities = fixture
+        .connect_authorities
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert!(
+        authorities.iter().any(|value| value == &authority),
+        "HTTP outbound authorities: {authorities:?}"
+    );
+
+    connection_task.abort();
+    let _ = connection_task.await;
     service.shutdown().await;
     fixture.shutdown().await;
 }
