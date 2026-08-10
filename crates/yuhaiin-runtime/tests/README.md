@@ -102,7 +102,10 @@ The current scenarios cover:
 - `service_chain.rs` also creates a schema-v6 central basic user through the
   real API after the HTTP inbound is already running. It waits for the inbound
   owner to reload, proves invalid credentials are rejected, then sends an
-  authenticated CONNECT through the same router and HTTP outbound fixture.
+  authenticated CONNECT through the same router and HTTP outbound fixture. The
+  same process then updates the credential and proves the old credential is
+  rejected, deletes the user, and proves the inbound returns to its no-auth
+  behavior after each reload.
 - `scripts/integration/api-contract.sh` runs the frontend management API
   process contract in Podman, including CRUD, reload, selection, connections,
   statistics, SSE, and representative error responses. It uses host networking

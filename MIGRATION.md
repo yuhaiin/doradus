@@ -2540,6 +2540,22 @@ listener set。创建用户时保留原有生成 UUID 和返回 view 的语义�
 新增 `central_basic_user_authenticates_http_inbound_chain` 进程级回归：先通过 `/api/v2` 写入 inbound、
 route 和 HTTP outbound，再创建中心 basic 用户；错误密码得到 HTTP 403，正确密码经 HTTP inbound →
 router → HTTP CONNECT outbound → loopback target 双向回显，并检查 live connection 的 inbound/outbound
-metadata。该测试与 `api-contract`、`api-reload-flow`、`stats-concurrency` 和 Go/Rust shared SQLite
-smoke 均通过。前台启动日志也用当前构建的 binary 实测输出到 stderr；只有显式设置 `YUHAIIN_QUIET=1`
-才会关闭 console logs。
+metadata。随后通过同一 API 更新 credential，验证旧密码失效、新密码仍能完成回显；删除用户后验证
+无认证请求恢复成功，覆盖 create/update/delete 的 listener reload boundary。测试使用 create 返回的
+UUID，而不是假定请求里的 `id` 会被保留，符合 Go users handler 的生成 ID 语义。该测试与
+`api-contract`、`api-reload-flow`、`stats-concurrency` 和 Go/Rust shared SQLite smoke 均通过。前台
+启动日志也用当前构建的 binary 实测输出到 stderr；只有显式设置 `YUHAIIN_QUIET=1` 才会关闭 console
+logs。
+
+## 78. 2026-08-10 central users lifecycle integration and musl build
+
+`service_chain.rs` 的 central basic 用户场景现已覆盖完整生命周期：create 使用 API 返回的 UUID，
+update 后旧凭据返回 403、新凭据可以再次通过 HTTP inbound → router → HTTP CONNECT outbound，delete
+后无认证请求恢复成功。`make service-chain-smoke` 的 12 个真实进程场景全部通过。
+
+当前环境也已验证 `make build-musl`：`x86_64-unknown-linux-musl` debug binary 成功生成于
+`~/.cache/yuhaiin-rust/cargo-target/x86_64-unknown-linux-musl/debug/yuhaiin`，`file` 确认为
+static-pie。`make android-aarch64` 也已实际通过，使用
+`/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang`
+生成 `~/.cache/yuhaiin-rust/cargo-target/aarch64-linux-android/release/yuhaiin`。这只是交叉编译
+证据，尚未把本机编译当作 Android 真机 VpnService 验收。
