@@ -25,6 +25,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "async-proxy")]
 use std::time::Duration;
+use std::time::{Duration as StdDuration, Instant as StdInstant};
 use yuhaiin_platform::AsyncDevice;
 #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
 use yuhaiin_platform::DeviceBuilder;
@@ -67,6 +68,10 @@ fn tun_debug(message: impl std::fmt::Display) {
 pub const DEFAULT_MTU: usize = 1500;
 pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
 const MAX_TCP_EVENT_BYTES_PER_POLL: usize = 64 * 1024;
+const IPV6_FRAGMENT_MAX_ENTRIES: usize = 32;
+const IPV6_FRAGMENT_MAX_FRAGMENTS: usize = 128;
+const IPV6_FRAGMENT_MAX_PACKET: usize = 64 * 1024;
+const IPV6_FRAGMENT_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 
 #[cfg(feature = "async-proxy")]
 const DEFAULT_GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -434,9 +439,8 @@ pub struct PacketInfo {
     /// Whether this packet is one fragment of an IPv4/IPv6 datagram.
     ///
     /// This is a classification flag only. IPv4 reassembly is delegated to
-    /// smoltcp; IPv6 fragment headers are currently detected and ignored by
-    /// the first TUN dispatcher because smoltcp does not implement IPv6
-    /// reassembly yet.
+    /// smoltcp; IPv6 fragments are reassembled at the TUN receive boundary
+    /// before they reach smoltcp.
     pub fragmented: bool,
 }
 
@@ -549,8 +553,9 @@ impl TunDispatcher {
         // smoltcp performs IPv4 reassembly after this hook. A non-initial
         // fragment has no transport header at its payload offset, so trying
         // to parse it here would turn a valid datagram into a malformed-packet
-        // error. IPv6 fragments are not reassembled by smoltcp yet and are
-        // deliberately left for the interface to discard.
+        // error. IPv6 fragments have already been reassembled at the TUN
+        // receive boundary; this guard remains for directly injected device
+        // packets and prevents extension fragments from reaching this hook.
         if is_non_initial_fragment(&packet)? {
             return Ok(());
         }
@@ -2133,49 +2138,306 @@ pub fn inspect_ip_packet_with_mtu(packet: &[u8], mtu: usize) -> Result<PacketInf
     Ok(info)
 }
 
-fn ipv6_has_fragment_header(bytes: &[u8]) -> bool {
+#[derive(Debug, Clone, Copy)]
+struct Ipv6FragmentMetadata<'a> {
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    identification: u32,
+    fragment_offset: usize,
+    more_fragments: bool,
+    next_header: u8,
+    previous_next_header_offset: usize,
+    unfragmentable_prefix: &'a [u8],
+    payload: &'a [u8],
+}
+
+fn parse_ipv6_fragment_metadata(bytes: &[u8]) -> Result<Option<Ipv6FragmentMetadata<'_>>> {
+    if bytes.is_empty() || bytes[0] >> 4 != 6 {
+        return Ok(None);
+    }
+    if bytes.len() < 40 {
+        return Err(Error::invalid("malformed IPv6 packet"));
+    }
+    let payload_len = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    let packet_len = 40usize
+        .checked_add(payload_len)
+        .ok_or_else(|| Error::invalid("IPv6 packet length overflow"))?;
+    if packet_len > bytes.len() {
+        return Err(Error::invalid("malformed IPv6 packet length"));
+    }
+    let bytes = &bytes[..packet_len];
+    let source = Ipv6Addr::from(
+        <[u8; 16]>::try_from(&bytes[8..24])
+            .map_err(|_| Error::invalid("malformed IPv6 source address"))?,
+    );
+    let destination = Ipv6Addr::from(
+        <[u8; 16]>::try_from(&bytes[24..40])
+            .map_err(|_| Error::invalid("malformed IPv6 destination address"))?,
+    );
     let mut next_header = bytes[6];
+    let mut previous_next_header_offset = 6usize;
     let mut offset = 40usize;
 
-    // Hop-by-hop, routing and destination options are all TLV extension
-    // headers whose length is expressed in eight-octet units.  AH uses
-    // four-octet units.  Stop at ESP/unknown headers rather than guessing
-    // offsets from attacker-controlled bytes.
+    // Hop-by-hop, routing and destination options are TLV extension headers
+    // whose length is expressed in eight-octet units. AH uses four-octet
+    // units. Stop at ESP/unknown headers rather than guessing offsets from
+    // attacker-controlled bytes.
     for _ in 0..16 {
         match next_header {
             44 => {
                 if offset + 8 > bytes.len() {
-                    return false;
+                    return Err(Error::invalid("truncated IPv6 fragment header"));
                 }
-                let fragment = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]);
-                return fragment & 0xfff9 != 0;
+                let raw_offset_and_flags =
+                    u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]);
+                let fragment_offset = ((raw_offset_and_flags >> 3) as usize) * 8;
+                let more_fragments = raw_offset_and_flags & 1 != 0;
+                let fragment_payload = &bytes[offset + 8..];
+                if more_fragments
+                    && (fragment_payload.is_empty() || !fragment_payload.len().is_multiple_of(8))
+                {
+                    return Err(Error::invalid("invalid IPv6 fragment payload alignment"));
+                }
+                // RFC 8200 permits an atomic fragment, but it is not a
+                // reassembly input. Passing it through preserves the raw
+                // packet contract; smoltcp will decide whether the following
+                // extension chain is supported.
+                if fragment_offset == 0 && !more_fragments {
+                    return Ok(None);
+                }
+                return Ok(Some(Ipv6FragmentMetadata {
+                    source,
+                    destination,
+                    identification: u32::from_be_bytes([
+                        bytes[offset + 4],
+                        bytes[offset + 5],
+                        bytes[offset + 6],
+                        bytes[offset + 7],
+                    ]),
+                    fragment_offset,
+                    more_fragments,
+                    next_header: bytes[offset],
+                    previous_next_header_offset,
+                    unfragmentable_prefix: &bytes[..offset],
+                    payload: fragment_payload,
+                }));
             }
             0 | 43 | 60 => {
                 if offset + 2 > bytes.len() {
-                    return false;
+                    return Err(Error::invalid("truncated IPv6 extension header"));
                 }
                 let header_len = (bytes[offset + 1] as usize + 1) * 8;
                 if header_len < 8 || offset + header_len > bytes.len() {
-                    return false;
+                    return Err(Error::invalid("invalid IPv6 extension header length"));
                 }
+                previous_next_header_offset = offset;
                 next_header = bytes[offset];
                 offset += header_len;
             }
             51 => {
                 if offset + 2 > bytes.len() {
-                    return false;
+                    return Err(Error::invalid("truncated IPv6 AH header"));
                 }
                 let header_len = (bytes[offset + 1] as usize + 2) * 4;
                 if header_len < 12 || offset + header_len > bytes.len() {
-                    return false;
+                    return Err(Error::invalid("invalid IPv6 AH header length"));
                 }
+                previous_next_header_offset = offset;
                 next_header = bytes[offset];
                 offset += header_len;
             }
-            _ => return false,
+            _ => return Ok(None),
         }
     }
-    false
+    Err(Error::invalid("IPv6 extension header chain is too long"))
+}
+
+fn ipv6_has_fragment_header(bytes: &[u8]) -> bool {
+    parse_ipv6_fragment_metadata(bytes).ok().flatten().is_some()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Ipv6FragmentKey {
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    identification: u32,
+    next_header: u8,
+}
+
+#[derive(Debug)]
+struct Ipv6FragmentPiece {
+    start: usize,
+    end: usize,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct Ipv6FragmentAssembly {
+    unfragmentable_prefix: Vec<u8>,
+    previous_next_header_offset: usize,
+    next_header: u8,
+    pieces: Vec<Ipv6FragmentPiece>,
+    received_bytes: usize,
+    total_payload: Option<usize>,
+    expires_at: StdInstant,
+}
+
+impl Ipv6FragmentAssembly {
+    fn complete(&self) -> Option<usize> {
+        let total = self.total_payload?;
+        let mut pieces = self
+            .pieces
+            .iter()
+            .map(|piece| (piece.start, piece.end))
+            .collect::<Vec<_>>();
+        pieces.sort_unstable_by_key(|(start, _)| *start);
+        let mut covered = 0usize;
+        for (start, end) in pieces {
+            if start != covered {
+                return None;
+            }
+            covered = end;
+        }
+        (covered == total).then_some(total)
+    }
+
+    fn finish(self, total_payload: usize) -> Option<Vec<u8>> {
+        let payload_length = self
+            .unfragmentable_prefix
+            .len()
+            .checked_sub(40)?
+            .checked_add(total_payload)?;
+        if payload_length > u16::MAX as usize {
+            return None;
+        }
+        let mut packet = self.unfragmentable_prefix;
+        packet[self.previous_next_header_offset] = self.next_header;
+        packet[4..6].copy_from_slice(&(payload_length as u16).to_be_bytes());
+        let payload_start = packet.len();
+        packet.resize(payload_start + total_payload, 0);
+        for piece in self.pieces {
+            packet[payload_start + piece.start..payload_start + piece.end]
+                .copy_from_slice(&piece.payload);
+        }
+        Some(packet)
+    }
+}
+
+fn ipv6_unfragmentable_prefixes_match(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len() && left.get(..4) == right.get(..4) && left.get(6..) == right.get(6..)
+}
+
+#[derive(Debug, Default)]
+struct Ipv6FragmentReassembler {
+    assemblies: HashMap<Ipv6FragmentKey, Ipv6FragmentAssembly>,
+}
+
+impl Ipv6FragmentReassembler {
+    fn expire(&mut self, now: StdInstant) {
+        self.assemblies
+            .retain(|_, assembly| assembly.expires_at > now);
+    }
+
+    /// Return the packet to enqueue, or `None` for an incomplete/invalid
+    /// assembly. Invalid and resource-exhausted fragments are intentionally
+    /// dropped without poisoning the TUN runtime.
+    fn push(&mut self, packet: &[u8], now: StdInstant) -> Result<Option<Vec<u8>>> {
+        self.expire(now);
+        let Some(metadata) = parse_ipv6_fragment_metadata(packet)? else {
+            return Ok(Some(packet.to_vec()));
+        };
+        let fragment_end = metadata
+            .fragment_offset
+            .checked_add(metadata.payload.len())
+            .ok_or_else(|| Error::invalid("IPv6 fragment offset overflow"))?;
+        if fragment_end > IPV6_FRAGMENT_MAX_PACKET
+            || metadata.unfragmentable_prefix.len() > IPV6_FRAGMENT_MAX_PACKET
+            || metadata
+                .unfragmentable_prefix
+                .len()
+                .saturating_add(fragment_end)
+                > IPV6_FRAGMENT_MAX_PACKET
+        {
+            return Ok(None);
+        }
+        let key = Ipv6FragmentKey {
+            source: metadata.source,
+            destination: metadata.destination,
+            identification: metadata.identification,
+            next_header: metadata.next_header,
+        };
+        if !self.assemblies.contains_key(&key) {
+            if self.assemblies.len() >= IPV6_FRAGMENT_MAX_ENTRIES {
+                return Ok(None);
+            }
+            self.assemblies.insert(
+                key,
+                Ipv6FragmentAssembly {
+                    unfragmentable_prefix: metadata.unfragmentable_prefix.to_vec(),
+                    previous_next_header_offset: metadata.previous_next_header_offset,
+                    next_header: metadata.next_header,
+                    pieces: Vec::new(),
+                    received_bytes: 0,
+                    total_payload: None,
+                    expires_at: now + IPV6_FRAGMENT_TIMEOUT,
+                },
+            );
+        }
+
+        let Some(assembly) = self.assemblies.get_mut(&key) else {
+            return Ok(None);
+        };
+        if !ipv6_unfragmentable_prefixes_match(
+            &assembly.unfragmentable_prefix,
+            metadata.unfragmentable_prefix,
+        ) || assembly.previous_next_header_offset != metadata.previous_next_header_offset
+            || assembly.next_header != metadata.next_header
+            || assembly.pieces.len() >= IPV6_FRAGMENT_MAX_FRAGMENTS
+            || assembly
+                .received_bytes
+                .saturating_add(metadata.payload.len())
+                > IPV6_FRAGMENT_MAX_PACKET
+        {
+            self.assemblies.remove(&key);
+            return Ok(None);
+        }
+        if assembly
+            .pieces
+            .iter()
+            .any(|piece| metadata.fragment_offset < piece.end && fragment_end > piece.start)
+        {
+            // Overlap handling is deliberately fail-closed. Accepting either
+            // first- or last-fragment bytes creates ambiguous security policy.
+            self.assemblies.remove(&key);
+            return Ok(None);
+        }
+        if let Some(total) = assembly.total_payload
+            && fragment_end > total
+        {
+            self.assemblies.remove(&key);
+            return Ok(None);
+        }
+        if !metadata.more_fragments {
+            if let Some(total) = assembly.total_payload
+                && total != fragment_end
+            {
+                self.assemblies.remove(&key);
+                return Ok(None);
+            }
+            assembly.total_payload = Some(fragment_end);
+        }
+        assembly.received_bytes += metadata.payload.len();
+        assembly.pieces.push(Ipv6FragmentPiece {
+            start: metadata.fragment_offset,
+            end: fragment_end,
+            payload: metadata.payload.to_vec(),
+        });
+        let Some(total) = assembly.complete() else {
+            return Ok(None);
+        };
+        let assembly = self.assemblies.remove(&key).expect("assembly exists");
+        Ok(assembly.finish(total))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2377,6 +2639,7 @@ pub struct TunRuntime {
     smoltcp_device: SmoltcpTunDevice,
     interface: Interface,
     buffer: Vec<u8>,
+    ipv6_fragments: Ipv6FragmentReassembler,
     #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
     configured_name: Option<String>,
 }
@@ -2423,6 +2686,7 @@ impl TunRuntime {
             smoltcp_device,
             interface,
             buffer: vec![0; config.mtu.max(65535)],
+            ipv6_fragments: Ipv6FragmentReassembler::default(),
             #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
             configured_name,
         })
@@ -2621,7 +2885,17 @@ impl TunRuntime {
 
     pub async fn recv_from_tun(&mut self) -> io::Result<usize> {
         let length = self.device.recv(&mut self.buffer).await?;
-        let packet = self.buffer[..length].to_vec();
+        let packet = self
+            .ipv6_fragments
+            .push(&self.buffer[..length], StdInstant::now())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let Some(packet) = packet else {
+            // A fragment assembly is either waiting for more wire packets or
+            // has been deliberately discarded (overlap, size, or capacity).
+            // The TUN read itself succeeded, so do not tear down the whole
+            // inbound just because one hostile datagram was dropped.
+            return Ok(length);
+        };
         let accepted = self
             .smoltcp_device
             .enqueue_rx(packet)
@@ -2633,6 +2907,11 @@ impl TunRuntime {
             ));
         }
         Ok(length)
+    }
+
+    #[cfg(feature = "async-proxy")]
+    fn expire_ipv6_fragments(&mut self) {
+        self.ipv6_fragments.expire(StdInstant::now());
     }
 
     pub async fn send_to_tun(&self) -> io::Result<Option<usize>> {
@@ -2720,6 +2999,7 @@ impl TunRuntime {
                 }
             }
             let elapsed = started.elapsed();
+            self.expire_ipv6_fragments();
             let timestamp = Instant::from_millis(elapsed.as_millis().min(i64::MAX as u128) as i64);
             if let Err(error) = dispatcher.poll(self, timestamp) {
                 proxy_runtime.close();

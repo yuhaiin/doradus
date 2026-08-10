@@ -805,11 +805,11 @@ yuhaiin-tun adapter -> FlowContext -> Router -> Proxy/NAT
 
 - 无权限环境测试 `TunDevice` builder 的配置校验、packet-info offset、MTU、名称冲突和 close 顺序，不要求真实设备。
 - privileged CI 在 Linux 用 network namespace 创建临时 TUN，测试 tun-rs + smoltcp 的 IPv4/IPv6 TCP echo、UDP echo、DNS hijack、FakeIP、route block/direct/proxy 和回写。
-- 单独测试 malformed IP header、短 TCP/UDP/ICMP、错误 checksum、fragment、超 MTU、未知 protocol、队列满和 reader close。当前 packet adapter 会分类 IPv4/IPv6 fragment，保留每个合法 fragment，不做第二套重组；ingress/egress 对每个 wire fragment 执行 MTU 边界检查。
+- 单独测试 malformed IP header、短 TCP/UDP/ICMP、错误 checksum、fragment、超 MTU、未知 protocol、队列满和 reader close。当前 packet adapter 会分类 IPv4/IPv6 fragment；IPv4 交给 smoltcp bounded reassembly，IPv6 在 ingress 用 bounded reassembler 处理重叠、超时和乱序，ingress/egress 对每个 wire fragment 执行 MTU 边界检查。
 - 用 deterministic clock 测试 smoltcp TCP retransmission、socket timer、UDP mapping timeout、NAT idle timeout 和 TUN shutdown；不要依赖真实 sleep 才能判定。
 - TUN 与 Yuubinsya native UDP/UOT、SOCKS5 UDP、DoH endpoint、MaxMindDB domain lookup 做组合测试。
 
-当前 Rust 实现已覆盖无权限的 UDP、TCP SYN/SYN-ACK、ICMP echo、IPv4/IPv6 fragment 分类、per-fragment MTU、超 MTU TX 丢弃和 TX queue backpressure 单元测试，并提供 `yuhaiin-core` 的 `tun-smoke` binary。Podman 特权 namespace 已验证设备创建、真实 IPv6 控制包过滤、IPv4 ICMP ingress、smoltcp ICMP socket 收包、真实 checksum 回包和 Linux kernel ping echo（0% loss）。
+当前 Rust 实现已覆盖无权限的 UDP、TCP SYN/SYN-ACK、ICMP echo、IPv4/IPv6 fragment 分类与重组、重叠/超时丢弃、per-fragment MTU、超 MTU TX 丢弃和 TX queue backpressure 单元测试，并提供 `yuhaiin-core` 的 `tun-smoke` binary。Podman 特权 namespace 已验证设备创建、真实 IPv6 控制包过滤、IPv4 ICMP ingress、smoltcp ICMP socket 收包、真实 checksum 回包和 Linux kernel ping echo（0% loss）。
 
 #### TUN 当前代码入口
 
@@ -2605,6 +2605,15 @@ smoltcp 0.13 已提供纯 Rust IPv4 fragment reassembly，但 `yuhaiin-core` 之
 `dispatcher_reassembles_out_of_order_ipv4_udp_fragments`，实际以 second fragment → first
 fragment 顺序验证 UDP event 和 source/destination flow identity。
 
-这不是 IPv6 fragment 的完成声明：smoltcp 当前不实现 IPv6 reassembly，Rust TUN 仍会识别并
-丢弃这类 fragment；smoltcp 的 IPv4 reassembly buffer 也是有界的，超过其配置上限的长 datagram
-和真实 namespace/Android/macOS 设备验收继续保留在 checklist。
+## 82. 2026-08-10 TUN IPv6 fragment ingress reassembly
+
+在 IPv4 smoltcp reassembly 之外，TUN ingress 新增了 IPv6 fragment boundary：按源/目标/identification/
+next-header 建立有界 assembly，支持乱序片段和前置 hop/routing/destination/AH extension header，
+完成后移除 Fragment Header、修正上一层 next-header 和 IPv6 payload length，再交给同一套 smoltcp
+dispatcher。每个 assembly 最多 128 片、32 个并行 datagram、64 KiB 总包，并在 15 秒后过期；任何
+重叠、长度冲突或容量超限都 fail-closed 丢弃，不影响后续 TUN 流量。
+
+新增 `ipv6_fragment_reassembler_reassembles_out_of_order_udp` 与
+`ipv6_fragment_reassembler_drops_overlap_and_expires_assemblies`，覆盖 second fragment 先到、完整
+UDP payload、重叠冲突和确定性过期。IPv4 仍使用 smoltcp 自带的 bounded reassembly；超出各自上限的
+wire-fragment 长流、真实 namespace teardown，以及 Android/macOS 设备验收仍保持 checklist 的部分状态。

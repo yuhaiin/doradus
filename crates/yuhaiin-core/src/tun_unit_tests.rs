@@ -81,14 +81,103 @@ fn fragmented_packets_are_preserved_but_each_fragment_must_fit_mtu() {
 
 #[test]
 fn ipv6_fragment_header_is_classified_without_reassembly() {
-    let mut packet = vec![0u8; 48];
+    let mut packet = vec![0u8; 56];
     packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&16u16.to_be_bytes());
     packet[6] = 44;
     packet[7] = 64;
     packet[40] = 17;
     packet[42] = 0;
     packet[43] = 1;
     assert!(inspect_ip_packet(&packet).unwrap().fragmented);
+}
+
+#[test]
+fn ipv6_fragment_reassembler_reassembles_out_of_order_udp() {
+    let source = Ipv6Addr::LOCALHOST;
+    let destination = Ipv6Addr::LOCALHOST;
+    let whole = ipv6_udp_packet(source, destination, 41000, 5353, b"fragmented-ipv6");
+    let first = ipv6_fragment(&whole, 0, true, 16, 0x0102_0304);
+    let second = ipv6_fragment(&whole, 16, false, whole.len() - 40 - 16, 0x0102_0304);
+    let now = StdInstant::now();
+    let mut reassembler = Ipv6FragmentReassembler::default();
+
+    assert!(reassembler.push(&second, now).unwrap().is_none());
+    let reassembled = reassembler.push(&first, now).unwrap().unwrap();
+    assert_eq!(reassembled, whole);
+    assert_eq!(reassembled[6], 17);
+    assert_eq!(
+        u16::from_be_bytes([reassembled[4], reassembled[5]]) as usize,
+        whole.len() - 40
+    );
+    let udp = UdpPacket::new_checked(&reassembled[40..]).unwrap();
+    assert_eq!(udp.src_port(), 41000);
+    assert_eq!(udp.dst_port(), 5353);
+    assert_eq!(udp.payload(), b"fragmented-ipv6");
+}
+
+#[test]
+fn ipv6_fragment_reassembler_drops_overlap_and_expires_assemblies() {
+    let whole = ipv6_udp_packet(
+        Ipv6Addr::LOCALHOST,
+        Ipv6Addr::LOCALHOST,
+        41000,
+        5353,
+        b"overlap-check",
+    );
+    let first = ipv6_fragment(&whole, 0, true, 16, 0x0a0b_0c0d);
+    let overlap = ipv6_fragment(&whole, 8, false, whole.len() - 40 - 8, 0x0a0b_0c0d);
+    let later = StdInstant::now() + IPV6_FRAGMENT_TIMEOUT + StdDuration::from_secs(1);
+    let mut reassembler = Ipv6FragmentReassembler::default();
+    let now = StdInstant::now();
+
+    assert!(reassembler.push(&first, now).unwrap().is_none());
+    assert!(reassembler.push(&overlap, now).unwrap().is_none());
+    assert!(reassembler.assemblies.is_empty());
+    assert!(reassembler.push(&first, now).unwrap().is_none());
+    reassembler.expire(later);
+    assert!(reassembler.assemblies.is_empty());
+}
+
+fn ipv6_udp_packet(
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    source_port: u16,
+    destination_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut packet = vec![0; 40 + 8 + payload.len()];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(8u16 + payload.len() as u16).to_be_bytes());
+    packet[6] = 17;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&source.octets());
+    packet[24..40].copy_from_slice(&destination.octets());
+    packet[40..42].copy_from_slice(&source_port.to_be_bytes());
+    packet[42..44].copy_from_slice(&destination_port.to_be_bytes());
+    packet[44..46].copy_from_slice(&(8u16 + payload.len() as u16).to_be_bytes());
+    packet[46..48].copy_from_slice(&0u16.to_be_bytes());
+    packet[48..].copy_from_slice(payload);
+    packet
+}
+
+fn ipv6_fragment(
+    packet: &[u8],
+    payload_offset: usize,
+    more: bool,
+    payload_len: usize,
+    identification: u32,
+) -> Vec<u8> {
+    let mut fragment = vec![0; 48 + payload_len];
+    fragment[..40].copy_from_slice(&packet[..40]);
+    fragment[4..6].copy_from_slice(&(8u16 + payload_len as u16).to_be_bytes());
+    fragment[6] = 44;
+    fragment[40] = packet[6];
+    let offset_and_flags = ((payload_offset / 8) as u16) << 3 | u16::from(more);
+    fragment[42..44].copy_from_slice(&offset_and_flags.to_be_bytes());
+    fragment[44..48].copy_from_slice(&identification.to_be_bytes());
+    fragment[48..].copy_from_slice(&packet[40 + payload_offset..40 + payload_offset + payload_len]);
+    fragment
 }
 
 #[test]
