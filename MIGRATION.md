@@ -7,6 +7,8 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
+> 2026-08-10 TUN live connection metadata fixture：`tun-service-smoke` 增加可选的 `YUHAIIN_TUN_ASSERT_CONNECTIONS=1` 模式，并提供 `make tun-connection-metadata-smoke`。它在真实 TUN traffic 仍存活时读取同一 `ConnectionMonitor`，要求 `component=tun`、选中 node、非空 outbound endpoint、非空 localAddr，避免只用 payload echo 掩盖 connections 元数据丢失。当前 rootless Podman 运行现场只能看到 `runtime-tun-opened`，随后客户端无法建立回显流；容器内 `/proc/net/dev`/`/sys/class/net` 未出现稳定的 `yrtun0`，因此该 smoke 尚未作为通过证据，需 rootful 或干净网络 namespace 重跑。失败现场保留在 `~/.cache/yuhaiin-rust/integration/tun-*`，未使用 `/tmp`。
+
 > 2026-08-10 loopback outbound endpoint wiring：`AsyncStream` 现在可以携带可选的真实本地 `SocketAddr` 元数据；direct/fixed、blocking HTTP CONNECT、SOCKS5、RustCrypto TLS、HTTP/2 pool 以及 Yuubinsya TCP/UOT 均保留该元数据。`RuntimeProxySelector` 对选中的 proxy 统一包一层 stream/datagram lifetime guard，注册采用引用计数，连接释放或 datagram close 后自动移除；UOT reconnect 会更新当前底层 endpoint；新增 core/H2 metadata 单测。真实 TUN 自环现场验收和未暴露 socket 的内存 transport 仍按安全降级处理。
 
 > 2026-08-10 loopback route guard：对照 Go `pkg/route/loopback.go`，Rust 新增 runtime 级 `LoopbackDetector`，并在 `RuntimeProxySelector::route_context` 的统一入口执行入站监听地址自环检查、当前代理进程 path/PID 检查，以及出站本地端点引用计数注册。命中后设置 `RouteMode::Block` 与 `skip_route`，不会再被 trie 规则覆盖；普通未解析域名在没有 FakeIP/hosts 元数据时保留 Go 的例外。新增 detector 单测和真实 selector 拦截测试；`cfg(test)` 不注入测试可执行文件自身身份，避免同进程 fixture 被误判；剩余是真实 TUN 自环现场验收。

@@ -79,6 +79,11 @@ async fn run() -> Result<()> {
             "YUHAIIN_TUN_TRAFFIC_BYTES must be between 1 and 536870912",
         ));
     }
+    let connection_hold_ms = std::env::var("YUHAIIN_TUN_CONNECTION_HOLD_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    let assert_connections = std::env::var_os("YUHAIIN_TUN_ASSERT_CONNECTIONS").is_some();
     let chain_mode = std::env::var("YUHAIIN_TUN_CHAIN")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -207,11 +212,21 @@ async fn run() -> Result<()> {
     println!("runtime-tun-opened name={device_name}");
 
     if traffic {
-        let traffic_result =
-            tokio::task::spawn_blocking(move || run_tun_traffic_client(traffic_bytes))
-                .await
-                .map_err(join_error)?
-                .map_err(io_error);
+        let connection_assertion = if assert_connections {
+            Some(spawn_tun_connection_assertion(
+                controller.monitor(),
+                selected.clone(),
+                Duration::from_secs(10),
+            ))
+        } else {
+            None
+        };
+        let traffic_result = tokio::task::spawn_blocking(move || {
+            run_tun_traffic_client(traffic_bytes, connection_hold_ms)
+        })
+        .await
+        .map_err(join_error)?
+        .map_err(io_error);
         if let Err(error) = &traffic_result {
             eprintln!(
                 "runtime-tun-logs {:?}",
@@ -219,6 +234,9 @@ async fn run() -> Result<()> {
             );
             let _ = shutdown_tx.send(true);
             let _ = inbound_task.await;
+            if let Some(connection_assertion) = connection_assertion {
+                connection_assertion.abort();
+            }
             if let Some(target_task) = target_task {
                 target_task.abort();
                 let _ = target_task.await;
@@ -227,6 +245,36 @@ async fn run() -> Result<()> {
                 chain_fixture.abort();
             }
             return Err(error.clone());
+        }
+        if let Some(connection_assertion) = connection_assertion {
+            let connection = connection_assertion.await.map_err(join_error)??;
+            println!(
+                "runtime-tun-connection-ok id={} inbound={} node={} outbound={} local={} protocol={}",
+                connection
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+                connection
+                    .get("inboundName")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+                connection
+                    .get("nodeId")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+                connection
+                    .get("outbound")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+                connection
+                    .get("localAddr")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+                connection
+                    .pointer("/network/connType")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            );
         }
         println!("runtime-tun-traffic-ok bytes={traffic_bytes}");
     } else {
@@ -396,15 +444,67 @@ fn fill_traffic_chunk(buffer: &mut [u8], offset: usize) {
     }
 }
 
-fn run_tun_traffic_client(total_bytes: usize) -> std::io::Result<()> {
+fn spawn_tun_connection_assertion(
+    monitor: Arc<yuhaiin_runtime::ConnectionMonitor>,
+    selected_node: String,
+    timeout: Duration,
+) -> tokio::task::JoinHandle<Result<serde_json::Value>> {
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let connections = monitor
+                .connections_value()
+                .get("connections")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(connection) = connections.into_iter().find(|connection| {
+                connection
+                    .get("component")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("tun")
+                    && connection.get("nodeId").and_then(serde_json::Value::as_str)
+                        == Some(selected_node.as_str())
+                    && connection
+                        .get("outbound")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                    && connection
+                        .get("localAddr")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+            }) {
+                return Ok(connection);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::new(
+                    ErrorKind::Timeout,
+                    format!(
+                        "TUN connection metadata did not appear for selected node {selected_node}"
+                    ),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+}
+
+fn run_tun_traffic_client(total_bytes: usize, connection_hold_ms: u64) -> std::io::Result<()> {
     use std::io::{Read, Write};
 
     let address = "198.18.0.2:18080";
-    let mut stream =
-        TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_secs(10))?;
+    let mut stream = TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_secs(10))
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("connect TUN traffic target {address}: {error}"),
+            )
+        })?;
     stream.set_read_timeout(Some(Duration::from_secs(120)))?;
     stream.set_write_timeout(Some(Duration::from_secs(120)))?;
-    let mut writer_stream = stream.try_clone()?;
+    let mut writer_stream = stream.try_clone().map_err(|error| {
+        std::io::Error::new(error.kind(), format!("clone TUN traffic stream: {error}"))
+    })?;
     writer_stream.set_write_timeout(Some(Duration::from_secs(120)))?;
     let writer = std::thread::spawn(move || -> std::io::Result<()> {
         let mut payload = vec![0u8; 64 * 1024];
@@ -412,10 +512,27 @@ fn run_tun_traffic_client(total_bytes: usize) -> std::io::Result<()> {
         while sent < total_bytes {
             let length = (total_bytes - sent).min(payload.len());
             fill_traffic_chunk(&mut payload[..length], sent);
-            writer_stream.write_all(&payload[..length])?;
+            writer_stream
+                .write_all(&payload[..length])
+                .map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("write TUN traffic payload at byte {sent}: {error}"),
+                    )
+                })?;
             sent += length;
         }
-        writer_stream.shutdown(std::net::Shutdown::Write)
+        if connection_hold_ms != 0 {
+            std::thread::sleep(Duration::from_millis(connection_hold_ms));
+        }
+        writer_stream
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("shutdown TUN traffic writer: {error}"),
+                )
+            })
     });
     let mut echoed = vec![0u8; 64 * 1024];
     let mut received = 0usize;
@@ -446,7 +563,12 @@ fn run_tun_traffic_client(total_bytes: usize) -> std::io::Result<()> {
     let writer_result = writer
         .join()
         .map_err(|_| std::io::Error::other("runtime TUN traffic writer panicked"))?;
-    read_result?;
+    read_result.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("read TUN traffic echo after {received} bytes: {error}"),
+        )
+    })?;
     writer_result
 }
 

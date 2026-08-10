@@ -41,6 +41,14 @@ run_args=(
   -e YUHAIIN_TUN_HOLD_MS=750
   "${common_args[@]: -1}"
 )
+if [[ "${YUHAIIN_TUN_ASSERT_CONNECTIONS:-0}" == "1" ]]; then
+  run_args=(
+    "${run_args[@]:0:${#run_args[@]}-1}"
+    -e YUHAIIN_TUN_ASSERT_CONNECTIONS=1
+    -e YUHAIIN_TUN_CONNECTION_HOLD_MS="${YUHAIIN_TUN_CONNECTION_HOLD_MS:-250}"
+    "${run_args[@]: -1}"
+  )
+fi
 force_args=(
   "${common_args[@]:0:${#common_args[@]}-1}"
   -e YUHAIIN_TUN_TRAFFIC=1

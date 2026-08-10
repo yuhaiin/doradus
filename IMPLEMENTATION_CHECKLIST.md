@@ -205,6 +205,7 @@ flowchart LR
 ### 未完成与下一步
 
 - `[~]` 超过有界 fragment 重组上限的长流、更多 namespace teardown 矩阵。
+- `[~]` 新增 live connection metadata smoke：在 TUN flow 存活期间断言 `component/inbound/nodeId/outbound/localAddr`；当前 rootless Podman 现场没有稳定的 TUN netdev/route，需在干净或 rootful namespace 重跑后才能升级为现场证据。
 - `[~]` Android VpnService fd/权限/route/电量/RSS；macOS utun/权限/route。
 - 下一步：先补 Linux 超限 fragment 的进程级恢复证据，再做 Android/macOS 实机验收。
 
@@ -213,6 +214,7 @@ flowchart LR
 - `make tun-service-smoke`
 - `make tun-long-service-smoke`
 - `make tun-chain-service-smoke`
+- `make tun-connection-metadata-smoke`
 - `YUHAIIN_TUN_FORCE_STOP=1 make tun-chain-service-smoke`
 - `make tun-mtu-smoke`
 

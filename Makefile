@@ -42,7 +42,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-chain-service-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
+.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -60,6 +60,7 @@ help:
 		'make tun-service-smoke run the runtime-owned TUN lifecycle and echo smoke' \
 		'make tun-long-service-smoke run a 1 MiB content-checked runtime-owned TUN stream' \
 		'make tun-chain-service-smoke run TUN inbound -> TLS + HTTP/2 + Yuubinsya chain smoke' \
+		'make tun-connection-metadata-smoke verify live TUN connection metadata during a chain' \
 		'make tun-mtu-smoke run the runtime-owned TUN MTU boundary matrix' \
 		'make transparent-service-smoke run REDIRECT TCP smoke; rootless Podman records TPROXY skip' \
 		'make api-contract-smoke run the frontend management API process contract in Podman' \
@@ -128,6 +129,9 @@ tun-long-service-smoke:
 
 tun-chain-service-smoke:
 	./scripts/integration/tun-chain-service.sh
+
+tun-connection-metadata-smoke:
+	./scripts/integration/tun-connection-metadata.sh
 
 tun-mtu-smoke:
 	./scripts/integration/tun-mtu.sh
