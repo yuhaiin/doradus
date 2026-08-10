@@ -314,4 +314,100 @@ if [[ "${YUHAIIN_MUTATION_PARITY:-1}" == "1" ]]; then
   compare_mutation route-rule-delete route.rule.delete "$(jq -cn --arg name "${rule_id}" '{name:$name,index:0}')"
 fi
 
+# Go's typed CloseRequest decodes a missing/null ids field as an empty slice;
+# closing no connections is a successful no-op. Keep this explicit because it
+# is a request-shape edge case rather than a mutation of the fixture.
+compare_mutation connections-close-empty connections.close '{}'
+
+compare_error() {
+  local name="$1"
+  local operation="$2"
+  local body="$3"
+  local safe_name="${name//./-}"
+  local address service status raw normalized
+  for service in go rust; do
+    if [[ "${service}" == "go" ]]; then
+      address="${go_http}"
+    else
+      address="${rust_http}"
+    fi
+    raw="${scenario_dir}/error-${service}-${safe_name}.raw"
+    normalized="${scenario_dir}/error-${service}-${safe_name}.json"
+    status="$(curl -sS --max-time 30 -o "${raw}" -w '%{http_code}' \
+      "http://${address}/api/v2/rpc/${operation}" \
+      -H 'content-type: application/json' \
+      --data "${body}")"
+    if [[ "${status}" == 2* ]]; then
+      echo "[go-api-parity] expected error but got HTTP ${status}: ${operation} ${body}" >&2
+      return 1
+    fi
+    printf '%s\n' "${status}" >"${scenario_dir}/error-${service}-${safe_name}.status"
+    if jq -e . "${raw}" >/dev/null 2>&1; then
+      # Go's decoder includes its concrete request type in malformed JSON
+      # messages (for example `emptyRequest`); that implementation detail is
+      # not part of the frontend contract. Status and error code remain
+      # strict, while raw bodies above retain the original diagnostic.
+      jq -S 'if (.error.message? != null) then .error.message = "<validation-message>" else . end' \
+        "${raw}" >"${normalized}"
+    else
+      # Go's net/http ServeMux can answer an unknown method/path with a
+      # plain-text 404/405. Preserve that body instead of hiding it behind a
+      # JSON-only harness; known RPC errors remain strictly normalized JSON.
+      jq -Rs . "${raw}" >"${normalized}"
+    fi
+  done
+  if ! diff -u "${scenario_dir}/error-go-${safe_name}.status" \
+    "${scenario_dir}/error-rust-${safe_name}.status" \
+    >"${scenario_dir}/error-${safe_name}.status.diff"; then
+    echo "[go-api-parity] error status mismatch: ${operation}" >&2
+    sed -n '1,160p' "${scenario_dir}/error-${safe_name}.status.diff" >&2
+    return 1
+  fi
+  if ! diff -u "${scenario_dir}/error-go-${safe_name}.json" \
+    "${scenario_dir}/error-rust-${safe_name}.json" \
+    >"${scenario_dir}/error-${safe_name}.diff"; then
+    echo "[go-api-parity] error body mismatch: ${operation}" >&2
+    sed -n '1,160p' "${scenario_dir}/error-${safe_name}.diff" >&2
+    return 1
+  fi
+  echo "[go-api-parity] error identical: ${operation} (${name})"
+}
+
+# These requests must not mutate either service. Keep them alongside the
+# success/mutation matrix so a frontend replacement is checked for the same
+# HTTP status, rpc error code, and validation message as Go.
+declare -a error_operations=(
+  'non-object-body|info|[]'
+  'node-id-required|node.get|{}'
+  'node-not-found|node.get|{"id":"missing-error-node"}'
+  'inbound-id-required|inbound.get|{}'
+  'inbound-not-found|inbound.get|{"id":"missing-error-inbound"}'
+  'resolver-id-required|resolver.get|{}'
+  'resolver-not-found|resolver.get|{"id":"missing-error-resolver"}'
+  'route-list-id-required|route.list.get|{}'
+  'route-list-not-found|route.list.get|{"id":"missing-error-list"}'
+  'route-rule-name-required|route.rule.get|{"index":0}'
+  'route-rule-not-found|route.rule.get|{"name":"missing-error-rule","index":0}'
+  'connections-traffic-missing-from|connections.traffic|{"to":"2030-01-01T00:00:00Z"}'
+  'connections-traffic-invalid-from|connections.traffic|{"from":"not-rfc3339","to":"2030-01-01T00:00:00Z"}'
+  'connections-traffic-reversed|connections.traffic|{"from":"2030-01-02T00:00:00Z","to":"2030-01-01T00:00:00Z"}'
+  'connections-telemetry-limit|connections.telemetry|{"from":"2020-01-01T00:00:00Z","to":"2030-01-01T00:00:00Z","limit":51}'
+  'connections-close-id-invalid|connections.close|{"ids":["not-a-number"]}'
+  'connections-close-ids-type|connections.close|{"ids":123}'
+  'route-test-host-required|route.rules.test|{}'
+  'route-test-port-invalid|route.rules.test|{"host":"example.com:not-a-port"}'
+  'route-priority-source-required|route.rules.priority|{"target":{"name":"missing"}}'
+  'route-priority-operate-invalid|route.rules.priority|{"source":{"name":"missing"},"target":{"name":"missing"},"operate":"invalid"}'
+  'backup-restore-source-required|backup.restore|{}'
+  'subscriptions-deferred|subscriptions.update|{}'
+)
+
+for request_spec in "${error_operations[@]}"; do
+  error_name="${request_spec%%|*}"
+  remainder="${request_spec#*|}"
+  error_operation="${remainder%%|*}"
+  error_body="${remainder#*|}"
+  compare_error "${error_name}" "${error_operation}" "${error_body}"
+done
+
 echo "[go-api-parity] passed; logs=${scenario_dir}"

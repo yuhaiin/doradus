@@ -588,7 +588,10 @@ async fn rpc(
         "nodes.post" => save_node_value(&state, body, None).await,
         "nodes.selected" => selected_nodes_value(&state).await,
         "nodes.active" => active_nodes_value(&state).await,
-        "node.get" => get_node_value(&state, required_string(&body, "id")?).await,
+        // Go decodes these endpoints into typed request structs. A missing or
+        // null string field therefore becomes the zero value and reaches the
+        // store lookup, which returns 404; it is not rejected as a 400 here.
+        "node.get" => get_node_value(&state, go_request_string(&body, "id")?).await,
         "node.put" => save_node_value(&state, body, None).await,
         "node.delete" => delete_node_value(&state, required_string(&body, "id")?).await,
         "node.use" => select_node_value(&state, required_string(&body, "id")?).await,
@@ -598,12 +601,12 @@ async fn rpc(
         "inbounds.config.put" => inbounds_config_put_value(&state, body).await,
         "inbounds.get" => inbounds_get_value(&state, &body).await,
         "inbounds.post" => save_inbound_value(&state, body, None).await,
-        "inbound.get" => get_inbound_value(&state, required_string(&body, "id")?).await,
+        "inbound.get" => get_inbound_value(&state, go_request_string(&body, "id")?).await,
         "inbound.put" => save_inbound_value(&state, body, None).await,
         "inbound.delete" => delete_inbound_value(&state, required_string(&body, "id")?).await,
         "resolvers.get" => resolvers_get_value(&state, &body).await,
         "resolvers.post" => save_resolver_value(&state, body, None).await,
-        "resolver.get" => get_resolver_value(&state, required_string(&body, "id")?).await,
+        "resolver.get" => get_resolver_value(&state, go_request_string(&body, "id")?).await,
         "resolver.put" => save_resolver_value(&state, body, None).await,
         "resolver.delete" => delete_resolver_value(&state, required_string(&body, "id")?).await,
         "resolver.hosts.get" => hosts_get_value(&state).await,
@@ -623,7 +626,7 @@ async fn rpc(
         "publish.resolve" => publish_resolve_value(&state, &body).await,
         "users.get" => users_get_value(&state, &body).await,
         "users.post" => user_save_value(&state, body, None).await,
-        "user.get" => user_get_value(&state, required_string(&body, "id")?).await,
+        "user.get" => user_get_value(&state, go_request_string(&body, "id")?).await,
         "user.put" => {
             user_save_value(&state, body.clone(), Some(required_string(&body, "id")?)).await
         }
@@ -670,7 +673,7 @@ async fn rpc(
         "route.config.put" => route_config_put_value(&state, body).await,
         "route.lists.get" => route_lists_get_value(&state, &body).await,
         "route.lists.post" => save_route_list_value(&state, body, None).await,
-        "route.list.get" => get_route_list_value(&state, required_string(&body, "id")?).await,
+        "route.list.get" => get_route_list_value(&state, go_request_string(&body, "id")?).await,
         "route.list.put" => save_route_list_value(&state, body, None).await,
         "route.list.delete" => delete_route_list_value(&state, required_string(&body, "id")?).await,
         "route.lists.config.get" => route_lists_config_get_value(&state).await,
@@ -682,8 +685,8 @@ async fn rpc(
         "route.rule.get" => {
             get_route_rule_value(
                 &state,
-                required_string(&body, "name")?,
-                number(&body, "index")?,
+                go_request_string(&body, "name")?,
+                go_request_number(&body, "index")?,
             )
             .await
         }
@@ -942,20 +945,21 @@ async fn connections_close(State(state): State<ApiState>, Json(value): Json<Valu
 }
 
 async fn close_connections_value(state: &ApiState, value: Value) -> ApiResult {
-    let ids = value
-        .get("ids")
-        .and_then(Value::as_array)
-        .ok_or_else(|| ApiError::bad("connections close requires an ids array"))?
-        .iter()
-        .map(|value| {
-            let id = value
-                .as_str()
-                .ok_or_else(|| ApiError::bad("connection ids must be strings"))?;
-            id.parse::<u64>()
-                .map_err(|_| ApiError::bad(format!("invalid connection id {id:?}")))?;
-            Ok::<_, ApiError>(id.to_owned())
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let ids = match value.get("ids") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                let id = value
+                    .as_str()
+                    .ok_or_else(|| ApiError::bad("connection ids must be strings"))?;
+                id.parse::<u64>()
+                    .map_err(|_| ApiError::bad(format!("invalid connection id {id:?}")))?;
+                Ok::<_, ApiError>(id.to_owned())
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        Some(_) => return Err(ApiError::bad("connections close ids must be an array")),
+    };
     state.controller.monitor().request_close(&ids);
     empty()
 }
@@ -3709,6 +3713,13 @@ fn required_string(value: &Value, key: &str) -> std::result::Result<String, ApiE
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| ApiError::bad(format!("{key} is required")))
 }
+fn go_request_string(value: &Value, key: &str) -> std::result::Result<String, ApiError> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(ApiError::bad(format!("{key} must be a string"))),
+    }
+}
 fn string_or(value: &Value, key: &str, default: &str) -> String {
     string_or_opt(value, key).unwrap_or_else(|| default.to_owned())
 }
@@ -3734,6 +3745,18 @@ fn number(value: &Value, key: &str) -> std::result::Result<usize, ApiError> {
         .and_then(Value::as_u64)
         .map(|value| value as usize)
         .ok_or_else(|| ApiError::bad(format!("{key} must be a non-negative integer")))
+}
+fn go_request_number(value: &Value, key: &str) -> std::result::Result<usize, ApiError> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(0),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .map(|value| value as usize)
+            .ok_or_else(|| ApiError::bad(format!("{key} must be a non-negative integer"))),
+        Some(_) => Err(ApiError::bad(format!(
+            "{key} must be a non-negative integer"
+        ))),
+    }
 }
 fn set_string(value: &mut Value, key: &str, text: impl Into<String>) {
     if let Some(object) = value.as_object_mut() {
@@ -5581,6 +5604,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn go_typed_request_zero_values_preserve_missing_fields_but_reject_wrong_types() {
+        assert_eq!(go_request_string(&json!({}), "id").unwrap(), "");
+        assert_eq!(go_request_string(&json!({"id": null}), "id").unwrap(), "");
+        assert_eq!(
+            go_request_string(&json!({"id": "node-1"}), "id").unwrap(),
+            "node-1"
+        );
+        assert!(go_request_string(&json!({"id": 1}), "id").is_err());
+
+        assert_eq!(go_request_number(&json!({}), "index").unwrap(), 0);
+        assert_eq!(
+            go_request_number(&json!({"index": null}), "index").unwrap(),
+            0
+        );
+        assert_eq!(go_request_number(&json!({"index": 3}), "index").unwrap(), 3);
+        assert!(go_request_number(&json!({"index": -1}), "index").is_err());
+        assert!(go_request_number(&json!({"index": "0"}), "index").is_err());
+    }
+
     #[tokio::test]
     async fn rpc_router_accepts_the_real_frontend_request_shape() {
         let state = state().await;
@@ -5723,7 +5766,12 @@ mod tests {
                 .oneshot(
                     Request::post(format!("/api/v2/rpc/{operation}"))
                         .header("content-type", "application/json")
-                        .body(Body::from("{}"))
+                        // Use a non-object probe so registered handlers
+                        // stop at the shared request-shape check with
+                        // 400. `{}` would legitimately reach 404 for Go
+                        // typed detail requests whose zero-value ID is
+                        // not present in the store.
+                        .body(Body::from("[]"))
                         .unwrap(),
                 )
                 .await

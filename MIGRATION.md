@@ -2259,3 +2259,28 @@ DTO，也不改变现有前端 contract。
 `service_chain` 数据面测试，以及 Go/Rust 26 个只读响应和 mutation/config parity 全部通过。
 对照日志保存在 `~/.cache/yuhaiin-rust/integration/go-api-route-history-final11`，没有使用
 `/tmp`；复杂 matcher 的逐项 match history 仍单独列为后续工作。
+
+## 67. 2026-08-10 Go/Rust management error parity
+
+在 §65/§66 的成功响应和 mutation 对照上，`scripts/integration/go-api-parity.sh` 新增了非变更
+错误矩阵，并在 `~/.cache/yuhaiin-rust/integration/go-api-error-matrix-7` 使用停止的 Go
+schema-7 snapshot 完成 Go/Rust 双进程对照。矩阵严格比较 HTTP status 和 JSON RPC error code；
+Go 解码器会把具体 request type 写入校验消息，因此只对这类实现相关 message 做占位归一化，
+同时为每个 case 保留 raw body，避免把诊断信息隐藏掉。
+
+本轮先后修复了两个真实请求语义差异：`node.get`、`inbound.get`、`resolver.get`、
+`route.list.get`、`route.rule.get` 等 Go typed request 的缺失/`null` 字段要使用零值并让存储层
+返回 404，而不是由 Rust API 提前返回 400；`connections.close` 缺失或 `null` 的 `ids` 是
+空 slice，Go 将其作为成功空操作，Rust 现在保持相同语义，非法 ID 仍严格返回 400。新增单测
+覆盖字符串/数字字段的缺失、`null`、正确类型和错误类型。
+
+最终矩阵覆盖非对象请求、缺失/不存在资源、统计时间范围、telemetry limit、空/非法连接关闭、
+route test/priority、backup restore 和 deferred subscription update；同一运行还通过了此前的
+26 个只读响应、核心资源 mutation/config 闭环和 route rule test 对照。unknown RPC operation
+没有放进业务错误矩阵：Go 的 ServeMux 对动态未知路径返回 plain-text 405，而 Rust 的通用 RPC
+handler 返回 JSON 404，这是框架路径表面的差异，不是 generated frontend operation；已保留为
+后续专门的 HTTP surface 兼容项。
+
+本轮只使用 `~/.cache/yuhaiin-rust` 保存副本、日志和构建缓存，不使用 `/tmp`。管理 API 仍为
+`[~]`，剩余项是完整 response 字段、复杂 matcher history 和更多 production snapshot，不能
+因为错误矩阵通过就把整个 API 或 Rust 重写标成完成。
