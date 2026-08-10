@@ -158,6 +158,118 @@ async fn real_process_direct_node_latency_resolves_domain_before_connect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_rule_test_reports_nested_all_match_history() {
+    let root = integration_dir("api-route-nested-match-history");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+
+    for (name, value) in [
+        ("nested-parent-list", "example.com"),
+        ("nested-child-list", "blocked.example.com"),
+    ] {
+        expect_ok(
+            &service,
+            Method::POST,
+            "/api/v2/route/lists",
+            Some(json!({
+                "name": name,
+                "type": "host",
+                "source": {"type":"local","local":{"lists":[value]}}
+            })),
+        )
+        .await;
+    }
+
+    expect_ok(
+        &service,
+        Method::POST,
+        "/api/v2/route/rules",
+        Some(json!({
+            "name":"nested-all-rule",
+            "mode":"drop",
+            "tag":"nested-all",
+            "rules":[{"type":"all","all":[
+                {"type":"host","host":{"list":"nested-parent-list"}},
+                {"type":"host","host":{"list":"nested-child-list"}}
+            ]}]
+        })),
+    )
+    .await;
+
+    let mut matching = Value::Null;
+    for _ in 0..100 {
+        let (status, value) = request_json(
+            &service,
+            Method::POST,
+            "/api/v2/route/rules/test",
+            Some(json!({"host":"blocked.example.com:443"})),
+        )
+        .await;
+        if status.is_success() && value["mode"] == "drop" {
+            matching = value;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(matching["mode"], "drop", "nested route was not published");
+    assert!(
+        matching["lists"]
+            .as_array()
+            .is_some_and(|lists| lists.iter().any(|list| list == "nested-parent-list"))
+    );
+    assert!(
+        matching["lists"]
+            .as_array()
+            .is_some_and(|lists| lists.iter().any(|list| list == "nested-child-list"))
+    );
+    let history = matching["matchResult"]
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["ruleName"] == "nested-all-rule")
+        })
+        .unwrap_or_else(|| panic!("nested rule missing from match history: {matching}"));
+    assert!(history["history"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["listName"] == "List nested-parent-list" && item["matched"] == true)
+            && items
+                .iter()
+                .any(|item| item["listName"] == "List nested-child-list" && item["matched"] == true)
+    }));
+
+    let parent_only = expect_ok(
+        &service,
+        Method::POST,
+        "/api/v2/route/rules/test",
+        Some(json!({"host":"other.example.com:443"})),
+    )
+    .await;
+    assert_ne!(parent_only["mode"], "drop");
+    let rejected = parent_only["matchResult"]
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["ruleName"] == "nested-all-rule")
+        })
+        .unwrap_or_else(|| panic!("rejected nested rule missing from history: {parent_only}"));
+    assert!(rejected["history"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["listName"] == "List nested-parent-list" && item["matched"] == true)
+            && items.iter().any(|item| {
+                item["listName"] == "List nested-child-list" && item["matched"] == false
+            })
+    }));
+
+    service.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn management_api_round_trips_frontend_contracts_in_one_process() {
     let root = integration_dir("management-api-contract");
     std::fs::create_dir_all(&root).unwrap();

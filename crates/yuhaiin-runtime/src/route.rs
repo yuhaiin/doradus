@@ -774,7 +774,11 @@ pub fn expand_go_route_rule(
                 rule_name: record.name.clone(),
                 tag: record.tag.clone(),
                 list_names: variant.list_names,
-                pattern: variant.pattern.unwrap_or_default(),
+                pattern: variant.pattern.clone().unwrap_or_default(),
+                required_patterns: compile_required_patterns(
+                    variant.additional_patterns,
+                    record.id.as_str(),
+                )?,
                 always_false: variant.always_false,
                 action,
                 network: variant.network,
@@ -845,6 +849,7 @@ fn route_rule_from_root(record: &GoRouteRuleRecord, root: &Value) -> Result<Opti
         tag: record.tag.clone(),
         list_names: Vec::new(),
         pattern,
+        required_patterns: Vec::new(),
         always_false: false,
         action,
         network,
@@ -881,6 +886,8 @@ struct RuleVariant {
     /// `None` means the expression has no host/CIDR constraint and is a
     /// global rule whose remaining network/port/geo predicates still apply.
     pattern: Option<String>,
+    /// Positive patterns beyond `pattern`, produced by nested `all`.
+    additional_patterns: Vec<String>,
     network: Option<Network>,
     excluded_networks: Vec<Network>,
     port: Option<(u16, u16)>,
@@ -916,11 +923,12 @@ fn parse_rule_expression_inner(
         .unwrap_or_default()
         .to_ascii_lowercase();
     if kind == "all" || value.get("all").is_some() {
-        let children = value
+        let mut children = value
             .get("all")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        children.sort_by_key(route_expression_sort_key);
         if negated {
             let mut variants = Vec::new();
             for child in children {
@@ -1133,6 +1141,27 @@ fn parse_rule_expression_inner(
     }
 }
 
+/// Match Go's `sortRule` before evaluating nested `all` expressions.  The
+/// order is observable through short-circuit match history, not just an
+/// optimization: a failed process matcher must prevent later host-list
+/// history from being recorded.
+fn route_expression_sort_key(value: &Value) -> u8 {
+    match value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "port" | "network" => 1,
+        "process" => 2,
+        "inbound" => 3,
+        "geoip" => 4,
+        "host" => 5,
+        _ => u8::MAX,
+    }
+}
+
 fn combine_all(
     children: &[Value],
     lists: &RouteListSnapshot,
@@ -1145,12 +1174,6 @@ fn combine_all(
         let mut combined = Vec::new();
         for left in &variants {
             for right in &child_variants {
-                if left.pattern.is_some() && right.pattern.is_some() {
-                    return Err(unsupported_expression(
-                        id,
-                        "all expression with two host/CIDR predicates",
-                    ));
-                }
                 let network = match (left.network, right.network) {
                     (Some(left), Some(right)) if left != right => {
                         return Ok(Vec::new());
@@ -1187,6 +1210,13 @@ fn combine_all(
                 );
                 let mut excluded_patterns = left.excluded_patterns.clone();
                 excluded_patterns.extend(right.excluded_patterns.iter().cloned());
+                let mut additional_patterns = left.additional_patterns.clone();
+                if let Some(pattern) = right.pattern.clone() {
+                    if left.pattern.is_some() {
+                        additional_patterns.push(pattern);
+                    }
+                }
+                additional_patterns.extend(right.additional_patterns.iter().cloned());
                 let mut excluded_networks = left.excluded_networks.clone();
                 excluded_networks.extend(right.excluded_networks.iter().copied());
                 excluded_networks.sort_by_key(|network| *network as u8);
@@ -1200,11 +1230,14 @@ fn combine_all(
                 excluded_geo_countries.sort_unstable_by_key(|country| country.to_ascii_lowercase());
                 excluded_geo_countries.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
                 let mut list_names = left.list_names.clone();
-                list_names.extend(right.list_names.iter().cloned());
-                list_names.sort();
-                list_names.dedup();
+                for name in &right.list_names {
+                    if !list_names.iter().any(|existing| existing == name) {
+                        list_names.push(name.clone());
+                    }
+                }
                 combined.push(RuleVariant {
                     pattern: left.pattern.clone().or_else(|| right.pattern.clone()),
+                    additional_patterns,
                     network,
                     port,
                     geo_country,
@@ -1248,6 +1281,22 @@ fn compile_excluded_patterns(patterns: Vec<String>, id: &str) -> Result<Combined
         })?;
     }
     Ok(index)
+}
+
+fn compile_required_patterns(patterns: Vec<String>, id: &str) -> Result<Vec<CombinedTrie<()>>> {
+    patterns
+        .into_iter()
+        .map(|pattern| {
+            let mut index = CombinedTrie::new();
+            index.insert(&pattern, ()).map_err(|error| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("route rule {id} has invalid required pattern {pattern:?}: {error}"),
+                )
+            })?;
+            Ok(index)
+        })
+        .collect()
 }
 
 /// `Some(None)` means no constraint, `Some(Some(values))` means a constraint,
@@ -1638,6 +1687,70 @@ mod tests {
         context.inbound_name = Some("http-main".to_owned());
         assert_eq!(
             router.snapshot().decide_context(&context).mode,
+            yuhaiin_core::RouteMode::Direct
+        );
+    }
+
+    #[test]
+    fn all_matcher_requires_every_positive_host_constraint() {
+        let lists = load_route_lists(&[
+            GoRouteListRecord {
+                name: "parents".to_owned(),
+                list_type: "host".to_owned(),
+                source_type: "local".to_owned(),
+                updated_at: 0,
+                data_json: br#"{
+                    "type":"host",
+                    "source":{"type":"local","local":{"lists":["example.com"]}}
+                }"#
+                .to_vec(),
+            },
+            GoRouteListRecord {
+                name: "children".to_owned(),
+                list_type: "host".to_owned(),
+                source_type: "local".to_owned(),
+                updated_at: 0,
+                data_json: br#"{
+                    "type":"host",
+                    "source":{"type":"local","local":{"lists":["blocked.example.com"]}}
+                }"#
+                .to_vec(),
+            },
+        ]);
+        let router = compile_go_route_rules_with_lists(
+            &[record(
+                r#"{"mode":"proxy","rules":[{"type":"all","all":[
+                    {"type":"host","host":{"list":"parents"}},
+                    {"type":"host","host":{"list":"children"}}
+                ]}]}"#,
+                "proxy",
+                "all",
+            )],
+            &lists,
+            RouteDecision {
+                mode: yuhaiin_core::RouteMode::Direct,
+                resolver_policy: ResolverPolicy::default(),
+                priority: 100,
+            },
+            None,
+        )
+        .unwrap();
+        let matching = Endpoint::domain(
+            Network::Tcp,
+            yuhaiin_core::DomainName::new("blocked.example.com").unwrap(),
+            443,
+        );
+        let parent_only = Endpoint::domain(
+            Network::Tcp,
+            yuhaiin_core::DomainName::new("other.example.com").unwrap(),
+            443,
+        );
+        assert_eq!(
+            router.decide(&matching).mode,
+            yuhaiin_core::RouteMode::Proxy
+        );
+        assert_eq!(
+            router.decide(&parent_only).mode,
             yuhaiin_core::RouteMode::Direct
         );
     }

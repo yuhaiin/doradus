@@ -2369,3 +2369,18 @@ rule 保留其 `List ...: false` history。使用停止的 `tmp/v2/state.db` 独
 mutation 和错误矩阵，Go/Rust 全部逐响应通过；日志位于
 `~/.cache/yuhaiin-rust/integration/go-api-route-history-current3`。源库没有修改，也没有使用
 `/tmp`。
+
+## 71. 2026-08-10 nested route all matcher parity
+
+Go 的 route expression 支持在 `all` 中组合多个正向 host/CIDR matcher；此前 Rust
+compiler 只能保留一个 `pattern`，遇到两个正向域名/CIDR 条件会返回 unsupported，或者
+如果绕过校验会错误地把它们当成 OR。现在 `yuhaiin-trie::RouteRule` 保留一个主候选
+pattern，并为其余正向条件编译独立 `CombinedTrie`；候选必须同时命中所有 trie，仍由
+同一优先级和 immutable router snapshot 选择出口。不同列表的 expression 顺序也不再被
+字典序重排，因此 `route.rules.test` 的 `List ...` history 与 Go 的短路顺序一致。
+
+新增真实进程测试 `route_rule_test_reports_nested_all_match_history`：通过管理 API 写入
+两个本地 host list 和一个 `all(host-list, host-list)` drop rule，分别验证共同命中、父
+列表单独命中时的 fallback，以及 `matchResult` 中两个 list 的 true/false history。Rust
+route unit test 和 API contract test 均通过；功能仍保持 API `[~]`，剩余是更多
+process/inbound/negative matcher fixture、完整 response 字段和生产 snapshot parity。

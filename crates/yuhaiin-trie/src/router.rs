@@ -38,7 +38,11 @@ pub struct RouteRule {
     pub tag: String,
     /// Names of Go host/process lists contributing to this expanded rule.
     pub list_names: Vec<String>,
+    /// Primary domain/CIDR pattern used to find candidates in `Router::rules`.
     pub pattern: String,
+    /// Additional positive domain/CIDR constraints from a Go `all` matcher.
+    /// Every index must match the endpoint after the primary candidate lookup.
+    pub required_patterns: Vec<CombinedTrie<()>>,
     /// Preserve a rule whose Go list is not loaded yet, but keep it
     /// fail-closed until the list contents become available.
     pub always_false: bool,
@@ -86,6 +90,13 @@ impl RouteRule {
             return false;
         }
         if self.excluded_patterns.search(endpoint).is_some() {
+            return false;
+        }
+        if self
+            .required_patterns
+            .iter()
+            .any(|patterns| patterns.search(endpoint).is_none())
+        {
             return false;
         }
         if self
@@ -671,6 +682,7 @@ mod tests {
             tag: String::new(),
             list_names: Vec::new(),
             pattern: pattern.to_owned(),
+            required_patterns: Vec::new(),
             always_false: false,
             action,
             network: None,
