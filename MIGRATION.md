@@ -2613,10 +2613,12 @@ next-header 建立有界 assembly，支持乱序片段和前置 hop/routing/dest
 dispatcher。每个 assembly 最多 128 片、32 个并行 datagram、64 KiB 总包，并在 15 秒后过期；任何
 重叠、长度冲突或容量超限都 fail-closed 丢弃，不影响后续 TUN 流量。
 
-新增 `ipv6_fragment_reassembler_reassembles_out_of_order_udp` 与
-`ipv6_fragment_reassembler_drops_overlap_and_expires_assemblies`，覆盖 second fragment 先到、完整
-UDP payload、重叠冲突和确定性过期。IPv4 仍使用 smoltcp 自带的 bounded reassembly；超出各自上限的
-wire-fragment 长流、真实 namespace teardown，以及 Android/macOS 设备验收仍保持 checklist 的部分状态。
+新增 `ipv6_fragment_reassembler_reassembles_out_of_order_udp`、
+`ipv6_fragment_reassembler_drops_overlap_and_expires_assemblies` 与
+`ipv6_fragment_reassembler_drops_fragment_count_overflow_without_poisoning`，覆盖 second fragment 先到、完整
+UDP payload、重叠冲突、确定性过期、129 片 wire-fragment 上限，以及超限丢弃后同 key 后续 datagram
+仍可重组。IPv4 仍使用 smoltcp 自带的 bounded reassembly；真实 namespace teardown、超出有界重组上限的
+长流进程级证据，以及 Android/macOS 设备验收仍保持 checklist 的部分状态。
 
 ## 83. 2026-08-10 live connections SSE add/remove regression
 

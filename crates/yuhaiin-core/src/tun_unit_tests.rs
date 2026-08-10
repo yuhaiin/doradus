@@ -139,6 +139,42 @@ fn ipv6_fragment_reassembler_drops_overlap_and_expires_assemblies() {
     assert!(reassembler.assemblies.is_empty());
 }
 
+#[test]
+fn ipv6_fragment_reassembler_drops_fragment_count_overflow_without_poisoning() {
+    let whole = ipv6_udp_packet(
+        Ipv6Addr::LOCALHOST,
+        Ipv6Addr::LOCALHOST,
+        41000,
+        5353,
+        &[0xa5; 1024],
+    );
+    let now = StdInstant::now();
+    let mut reassembler = Ipv6FragmentReassembler::default();
+
+    // 128 eight-byte fragments reach the assembly limit; the next fragment
+    // must be dropped and must not leave a partial assembly behind.
+    for payload_offset in (0..1024).step_by(8) {
+        let fragment = ipv6_fragment(&whole, payload_offset, true, 8, 0x1112_1314);
+        assert!(reassembler.push(&fragment, now).unwrap().is_none());
+    }
+    let final_fragment = ipv6_fragment(&whole, 1024, false, 8, 0x1112_1314);
+    assert!(reassembler.push(&final_fragment, now).unwrap().is_none());
+    assert!(reassembler.assemblies.is_empty());
+
+    // A later datagram with the same flow key can still complete normally.
+    let recovered = ipv6_udp_packet(
+        Ipv6Addr::LOCALHOST,
+        Ipv6Addr::LOCALHOST,
+        41000,
+        5353,
+        b"after-fragment-limit",
+    );
+    let first = ipv6_fragment(&recovered, 0, true, 8, 0x1112_1314);
+    let second = ipv6_fragment(&recovered, 8, false, recovered.len() - 40 - 8, 0x1112_1314);
+    assert_eq!(reassembler.push(&first, now).unwrap(), None);
+    assert_eq!(reassembler.push(&second, now).unwrap(), Some(recovered));
+}
+
 fn ipv6_udp_packet(
     source: Ipv6Addr,
     destination: Ipv6Addr,
