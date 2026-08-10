@@ -276,6 +276,10 @@ impl IpSet {
 #[derive(Debug, Clone)]
 pub struct FlowContext {
     pub source: Option<Endpoint>,
+    /// The local endpoint of the inbound socket, when the flow came from a
+    /// socket-backed inbound.  It is kept separate from `source`: Go's
+    /// connection contract exposes both the peer and `LocalAddr()`.
+    pub local_addr: Option<Endpoint>,
     pub destination: Endpoint,
     /// The address selected by the runtime resolver for the final direct
     /// socket. Keep this separate from `destination`: protocol layers must
@@ -338,6 +342,7 @@ impl FlowContext {
         let network = destination.network();
         Self {
             source: None,
+            local_addr: None,
             destination,
             resolved_destination: None,
             network,

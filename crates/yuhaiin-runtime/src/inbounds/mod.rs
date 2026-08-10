@@ -853,6 +853,9 @@ impl InboundSpec {
     ) {
         context.inbound = Some(self.protocol.clone());
         context.inbound_name = Some(self.id.clone());
+        if context.local_addr.is_none() {
+            context.local_addr = Some(Endpoint::ip(context.network, self.listen));
+        }
         if !self.outbound_id.is_empty() {
             context.outbound = Some(self.outbound_id.clone());
         }
@@ -2587,6 +2590,13 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         assert_eq!(context.inbound.as_deref(), Some("http"));
         assert_eq!(context.inbound_name.as_deref(), Some("process-inbound"));
         assert_eq!(context.outbound.as_deref(), Some("direct"));
+        assert_eq!(
+            context.local_addr,
+            Some(Endpoint::ip(
+                Network::Tcp,
+                "127.0.0.1:18080".parse().unwrap()
+            ))
+        );
         assert_eq!(context.process.as_deref(), Some("/usr/bin/inbound-client"));
         assert_eq!(context.process_id, Some(4242));
         assert_eq!(context.user_id, Some(1000));

@@ -1220,6 +1220,17 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
     let destination = endpoint_string(&context.effective_destination());
     let original = endpoint_string(&flow.key.endpoint());
     let source = endpoint_string(&flow.key.source_endpoint());
+    let local_addr = context
+        .local_addr
+        .as_ref()
+        .and_then(Endpoint::addr)
+        .map(|address| address.to_string())
+        .unwrap_or_else(|| source.clone());
+    let underlying_type = context
+        .local_addr
+        .as_ref()
+        .map(|endpoint| endpoint.network().to_string())
+        .unwrap_or_default();
     let domain = context
         .original_domain
         .as_ref()
@@ -1243,13 +1254,13 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
     json!({
         "id": id,
         "addr": destination,
-        "network": {"connType": flow.key.network.to_string(), "underlyingType": ""},
+        "network": {"connType": flow.key.network.to_string(), "underlyingType": underlying_type},
         "source": source,
         "inbound": inbound,
         "inboundName": inbound_name,
         "interface": context.interface.as_deref().unwrap_or_default(),
         "outbound": outbound,
-        "localAddr": source,
+        "localAddr": local_addr,
         "destination": original,
         "fakeIp": context.fake_ip.as_deref().unwrap_or_default(),
         "hosts": context.hosts.as_deref().unwrap_or_default(),
@@ -1771,6 +1782,10 @@ mod tests {
     fn monitor_preserves_protocol_and_socket_metadata_in_connections() {
         let monitor = ConnectionMonitor::new();
         let (flow, mut context) = flow();
+        context.local_addr = Some(Endpoint::ip(
+            Network::Tcp,
+            "127.0.0.1:1080".parse().unwrap(),
+        ));
         context.hosts = Some("hosts".to_owned());
         context.tls_server_name = Some("example.com".to_owned());
         context.http_host = Some("example.com:443".to_owned());
@@ -1783,6 +1798,8 @@ mod tests {
         assert_eq!(connection["httpHost"], "example.com:443");
         assert_eq!(connection["interface"], "eth0");
         assert_eq!(connection["outboundGeo"], "US");
+        assert_eq!(connection["localAddr"], "127.0.0.1:1080");
+        assert_eq!(connection["network"]["underlyingType"], "tcp");
     }
 
     #[test]

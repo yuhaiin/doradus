@@ -254,6 +254,8 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
     assert_eq!(item["inbound"], "http");
     assert_eq!(item["outbound"], "http-out");
     assert_eq!(item["mode"], "proxy");
+    assert_eq!(item["localAddr"], inbound.to_string());
+    assert_eq!(item["network"]["underlyingType"], "tcp");
     assert!(item["matchHistory"].as_array().is_some_and(|history| {
         history
             .iter()
