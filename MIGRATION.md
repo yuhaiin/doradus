@@ -2163,7 +2163,7 @@ source。failure telemetry 复用同一维度构造，避免正常流量和失�
 telemetry 表，再给 Go/Rust 各自独立副本。这样不会修改源库，也不会把旧 Go v5 telemetry 表的
 缺失误报成 HTTP API 差异。
 
-本轮逐项通过了 25 个稳定管理面响应：info、settings、nodes、resolvers、inbounds、connections
+本轮逐项通过了 26 个稳定管理面响应：info、settings、nodes、resolvers、inbounds、connections
 及 total/traffic/telemetry/failed-history/history、hosts/FakeDNS/server、route activation/config/
 lists/rules/tags，以及 interfaces/licenses。对照中修复了几项真实兼容差异：
 
@@ -2216,3 +2216,24 @@ rule test 的 `afterAddr` 使用 Go 的 authority 形式（例如 `example.com:4
 `route.rules.test` 本身暂不纳入严格逐字节矩阵：它返回运行时 list-evaluation history，Go
 返回所有已配置规则的历史，Rust 当前返回选中规则的历史；这是可见的剩余兼容差异，不能用
 排序或删除字段掩盖。它仍由 Rust API 单测覆盖，后续应单独对齐 history 生成语义。
+
+## 65. 2026-08-10 Go/Rust frontend configuration mutation parity
+
+在 §64 的资源 CRUD mutation 矩阵上继续补齐前端配置写入边界。`scripts/integration/go-api-parity.sh`
+现在对 Go 与 Rust 的独立 SQLite 副本逐项执行 settings、backup config、inbound config、hosts、
+FakeDNS、resolver server、route config 和 route list config 的 put → get；请求体仍使用 React
+现有 contract 的 camelCase 字段，比较保留 Go 行为所需的响应字段，并在失败时保留原始 HTTP body。
+
+本轮 parity 实际发现并修复两个兼容 bug：
+
+- Go 的 `route_settings` 表是单行表，并有 `CHECK (id = 1)`；Rust API 原先写入 `id=0`，在接管
+  Go snapshot 后会得到 HTTP 500。现在统一写入 canonical row `id=1`，并新增 repository/API 单测。
+- Go `Lists.SaveContractConfig` 不接受客户端覆盖运行时维护的 `lastRefreshTime`，保存时清空顶层
+  error；只有 MaxMindDB 下载 URL 变化时才清空已有 GeoIP error。Rust 现在先读当前
+  `settings_kv.route_extra`，复用同样的保留/清理规则，并有同 URL、换 URL 的回归测试。
+
+最终对照使用真实停止的 Go schema-7 state snapshot，日志和两个运行副本位于
+`~/.cache/yuhaiin-rust/integration/go-api-config-debug3`，没有修改源库，也没有使用 `/tmp`；
+settings/backup/inbound config/hosts/FakeDNS/server/route config/list config 以及此前的核心资源
+mutation 全部通过。`route.rules.test` 的 Go 全量 history 与 Rust 选中 rule history 差异仍保持显式
+延期，不能因本轮配置 API 通过而标记为完成。

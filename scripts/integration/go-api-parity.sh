@@ -142,6 +142,8 @@ normalize() {
 declare -a operations=(
   'info|{}'
   'settings.get|{}'
+  'backup.config.get|{}'
+  'inbounds.config.get|{}'
   'nodes.get|{"page":1,"page_size":1000}'
   'resolvers.get|{"page":1,"page_size":1000}'
   'inbounds.get|{"page":1,"page_size":1000}'
@@ -263,6 +265,38 @@ if [[ "${YUHAIIN_MUTATION_PARITY:-1}" == "1" ]]; then
   compare_mutation resolver-put resolver.put "${resolver_put_body}"
   compare_mutation resolver-get-updated resolver.get "$(jq -cn --arg id "${resolver_id}" '{id:$id}')"
   compare_mutation resolver-delete resolver.delete "$(jq -cn --arg id "${resolver_id}" '{id:$id}')"
+
+  settings_body="$(jq '.pprof = false' "${scenario_dir}/go-settings-get.json")"
+  compare_mutation settings-put settings.put "${settings_body}"
+  compare_mutation settings-get-updated settings.get '{}'
+
+  backup_body='{"instanceName":"api-parity","interval":0,"lastBackupHash":"","s3":{"enabled":false,"accessKey":"","secretKey":"","bucket":"","region":"","endpointUrl":"","usePathStyle":false,"storageClass":""}}'
+  compare_mutation backup-put backup.config.put "${backup_body}"
+  compare_mutation backup-get-updated backup.config.get '{}'
+
+  inbound_config_body='{"hijackDns":true,"hijackDnsFakeIp":false,"sniff":true}'
+  compare_mutation inbound-config-put inbounds.config.put "${inbound_config_body}"
+  compare_mutation inbound-config-get-updated inbounds.config.get '{}'
+
+  hosts_body='{"hosts":{"api-parity.example":"127.0.0.1"}}'
+  compare_mutation hosts-put resolver.hosts.put "${hosts_body}"
+  compare_mutation hosts-get-updated resolver.hosts.get '{}'
+
+  fakedns_body='{"enabled":false,"ipv4Range":"198.18.0.0/15","ipv6Range":"fc00::/18","whitelist":["api-parity.example"],"skipCheckList":["skip.api-parity.example"]}'
+  compare_mutation fakedns-put resolver.fakedns.put "${fakedns_body}"
+  compare_mutation fakedns-get-updated resolver.fakedns.get '{}'
+
+  server_body='{"server":"127.0.0.1:5353"}'
+  compare_mutation resolver-server-put resolver.server.put "${server_body}"
+  compare_mutation resolver-server-get-updated resolver.server.get '{}'
+
+  route_config_body='{"directResolver":"bootstrap","proxyResolver":"proxy","resolveLocally":true,"udpProxyFqdnStrategy":"resolve"}'
+  compare_mutation route-config-put route.config.put "${route_config_body}"
+  compare_mutation route-config-get-updated route.config.get '{}'
+
+  route_list_config_body='{"refreshInterval":"3600","lastRefreshTime":"0","error":"","hostIndexDisk":false,"maxMindDbGeoIp":{"downloadUrl":"","error":""}}'
+  compare_mutation route-lists-config-put route.lists.config.put "${route_list_config_body}"
+  compare_mutation route-lists-config-get-updated route.lists.config.get '{}'
 
   list_body="$(jq -cn --arg name "${list_id}" '{name:$name,type:"host",source:{type:"local",local:{lists:["parity.example"]}}}')"
   compare_mutation route-list-post route.lists.post "${list_body}"

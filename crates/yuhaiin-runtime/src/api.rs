@@ -1911,7 +1911,10 @@ async fn route_config_get_value(state: &ApiState) -> ApiResult {
 
 async fn route_config_put_value(state: &ApiState, value: Value) -> ApiResult {
     let record = GoRouteSettingsRecord {
-        id: 0,
+        // Go's route_settings compatibility table is a single-row table with
+        // CHECK (id = 1). Keep the API mutation on that canonical row so a
+        // Go snapshot can be edited and later reopened by either runtime.
+        id: 1,
         direct_resolver: string_or_any(&value, &["directResolver", "direct_resolver"]),
         proxy_resolver: string_or_any(&value, &["proxyResolver", "proxy_resolver"]),
         resolve_locally: bool_or_any(&value, &["resolveLocally", "resolve_locally"], false),
@@ -3038,7 +3041,11 @@ async fn route_lists_config_put_value(state: &ApiState, value: Value) -> ApiResu
                 "refreshInterval must be an unsigned integer: {error}"
             ))
         })?;
-    let last_refresh_time = string_or(&value, "lastRefreshTime", "0")
+    // Go's SaveContractConfig updates the interval/disk/url settings but
+    // preserves runtime-owned lastRefreshTime. It also clears the top-level
+    // error and only clears the GeoIP error when the download URL changes.
+    let current = load_route_list_config_value(state).await?;
+    let last_refresh_time = string_or(&current, "lastRefreshTime", "0")
         .parse::<u64>()
         .unwrap_or(0);
     let geo = value
@@ -3046,14 +3053,26 @@ async fn route_lists_config_put_value(state: &ApiState, value: Value) -> ApiResu
         .filter(|value| value.is_object())
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let current_geo = current
+        .get("maxMindDbGeoIp")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let download_url = string_or(&geo, "downloadUrl", "");
+    let current_download_url = string_or(&current_geo, "downloadUrl", "");
+    let geo_error = if download_url == current_download_url {
+        string_or(&current_geo, "error", "")
+    } else {
+        String::new()
+    };
     let normalized = json!({
         "refreshInterval": refresh_interval.to_string(),
         "lastRefreshTime": last_refresh_time.to_string(),
-        "error": string_or(&value, "error", ""),
+        "error": "",
         "hostIndexDisk": bool_or(&value, "hostIndexDisk", false),
         "maxMindDbGeoIp": {
-            "downloadUrl": string_or(&geo, "downloadUrl", ""),
-            "error": string_or(&geo, "error", ""),
+            "downloadUrl": download_url,
+            "error": geo_error,
         },
     });
     let settings = route_list_config_settings(&normalized)?;
@@ -4882,6 +4901,25 @@ mod tests {
             "https://geo.example/Country.mmdb"
         );
 
+        state
+            .controller
+            .store()
+            .repository()
+            .put_go_settings_kv(&[
+                GoSettingsKvRecord {
+                    section: "route_extra".to_owned(),
+                    key: "refresh_config".to_owned(),
+                    value_json: r#"{"refresh_interval":3600,"last_refresh_time":42,"error":"old","host_index_disk":false}"#.to_owned(),
+                },
+                GoSettingsKvRecord {
+                    section: "route_extra".to_owned(),
+                    key: "maxminddb_geoip".to_owned(),
+                    value_json: r#"{"download_url":"https://geo.example/Country.mmdb","error":"geo-old"}"#.to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+
         let saved = route_lists_config_put_value(
             &state,
             json!({
@@ -4889,19 +4927,34 @@ mod tests {
                 "lastRefreshTime":"not-a-number",
                 "error":"",
                 "hostIndexDisk":true,
-                "maxMindDbGeoIp":{"downloadUrl":"https://geo.example/new.mmdb","error":""},
+                "maxMindDbGeoIp":{"downloadUrl":"https://geo.example/Country.mmdb","error":""},
                 "unknown":"discarded"
             }),
         )
         .await
         .unwrap();
         assert_eq!(saved.0["refreshInterval"], "7200");
-        assert_eq!(saved.0["lastRefreshTime"], "0");
+        assert_eq!(saved.0["lastRefreshTime"], "42");
+        assert_eq!(saved.0["error"], "");
+        assert_eq!(saved.0["maxMindDbGeoIp"]["error"], "geo-old");
         assert!(saved.0.get("unknown").is_none());
         assert_eq!(
             route_lists_config_get_value(&state).await.unwrap().0,
             saved.0
         );
+
+        let changed_url = route_lists_config_put_value(
+            &state,
+            json!({
+                "refreshInterval":"7200",
+                "hostIndexDisk":true,
+                "maxMindDbGeoIp":{"downloadUrl":"https://geo.example/new.mmdb","error":"client-error-is-discarded"}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed_url.0["lastRefreshTime"], "42");
+        assert_eq!(changed_url.0["maxMindDbGeoIp"]["error"], "");
     }
 
     #[tokio::test]
@@ -5312,6 +5365,15 @@ mod tests {
         let _ = route_config_put_value(&state, json!({"directResolver":"lan","proxyResolver":"lan","resolveLocally":true,"udpProxyFqdnStrategy":"resolve"})).await.unwrap();
         let route = route_config_get_value(&state).await.unwrap();
         assert_eq!(route.0["directResolver"], "lan");
+        let records = state
+            .controller
+            .store()
+            .repository()
+            .list_go_route_settings()
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, 1);
         assert_eq!(state.controller.handle().revision(), 2);
     }
 
