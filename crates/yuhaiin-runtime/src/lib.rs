@@ -220,7 +220,14 @@ impl RuntimeSnapshot {
     }
 
     pub fn apply_route(&self, context: &mut FlowContext) -> RouteDecision {
+        let matched_lists = self.route_lists.matching_names(context);
         let decision = self.router.apply_to_context(context);
+        // Go populates ConnOptions.lists from the host/process tries before
+        // evaluating route rules.  Do the same at the shared snapshot seam;
+        // Router metadata remains responsible for the selected rule, while
+        // this list is the complete flow-level membership used by API and
+        // connection statistics.
+        context.lists = matched_lists;
         context.resolver = self.route.as_ref().and_then(|route| {
             let id = match decision.mode {
                 RouteMode::Proxy => route.proxy_resolver.trim(),

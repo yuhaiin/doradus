@@ -2239,3 +2239,21 @@ FakeDNS、resolver server、route config 和 route list config 的 put → get�
 settings/backup/inbound config/hosts/FakeDNS/server/route config/list config 以及此前的核心资源
 mutation，以及 route rule test 全量 history 对照全部通过；复杂 matcher 的更多真实样本仍按
 上段列为后续验收项。
+
+## 66. 2026-08-10 Go route-list membership in live flow metadata
+
+Rust 之前在 `Router::apply_to_context` 中把 `FlowContext.lists` 设置为选中规则的
+`list_names`。这会让真实 connection metadata 丢失“命中了但没有选择该规则”的 host/process
+list；Go 则在 route matcher 运行前调用 host trie 和 process trie，把所有命中的 list 写入
+`ConnOptions.Lists()`，随后每个 route rule 只在自己的 match history 中记录诊断结果。
+
+现在 `RouteListSnapshot` 保存规范化 list kind、host/CIDR trie 和 process values，新增
+`matching_names(&FlowContext)`；`RuntimeSnapshot::apply_route` 在同一 immutable snapshot
+边界先计算全量 membership，再交给 router 选择 mode/tag/resolver。这样 TUN、socket inbound、
+`route.rules.test` 和 connections/telemetry 共用同一 list 结果，不新增 DTO，也不改变现有
+前端 contract。
+
+验证结果：route-list host/CIDR/process membership 单测、route API 单测、完整 8 条
+`service_chain` 数据面测试，以及 Go/Rust 26 个只读响应和 mutation/config parity 全部通过。
+对照日志保存在 `~/.cache/yuhaiin-rust/integration/go-api-route-lists-final7`，没有使用
+`/tmp`；复杂 matcher 的逐项 match history 仍单独列为后续工作。

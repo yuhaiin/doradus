@@ -34,6 +34,8 @@ use yuhaiin_trie::router::{RouteDecision, RouteRule, Router, RouterRuntime, Rule
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RouteListSnapshot {
     values: BTreeMap<String, Vec<String>>,
+    kinds: BTreeMap<String, String>,
+    host_indexes: BTreeMap<String, CombinedTrie<()>>,
     errors: BTreeMap<String, String>,
 }
 
@@ -52,6 +54,31 @@ impl RouteListSnapshot {
 
     pub fn error_names(&self) -> impl Iterator<Item = &str> {
         self.errors.keys().map(String::as_str)
+    }
+
+    /// Return the route lists that the Go host/process tries would report for
+    /// this flow before rule evaluation.  A rule may be selected from a list,
+    /// but Go's connection metadata still includes every independently
+    /// matched list, including lists used only by a later rule.
+    pub fn matching_names(&self, context: &FlowContext) -> Vec<String> {
+        let mut names = Vec::new();
+        for (name, values) in &self.values {
+            let kind = self.kinds.get(name).map(String::as_str).unwrap_or_default();
+            let matched = if kind == "process" || kind == "processes" {
+                context
+                    .process
+                    .as_deref()
+                    .is_some_and(|process| values.iter().any(|value| value == process))
+            } else {
+                self.host_indexes
+                    .get(name)
+                    .is_some_and(|index| index.search(&context.destination).is_some())
+            };
+            if matched {
+                names.push(name.clone());
+            }
+        }
+        names
     }
 }
 
@@ -93,6 +120,17 @@ pub fn load_route_lists(records: &[GoRouteListRecord]) -> RouteListSnapshot {
                         "route list has no usable entries".to_owned(),
                     );
                 } else {
+                    let normalized_kind = kind.replace('-', "_");
+                    if normalized_kind == "process" || normalized_kind == "processes" {
+                        snapshot.kinds.insert(record.name.clone(), normalized_kind);
+                    } else {
+                        let mut index = CombinedTrie::new();
+                        for value in &values {
+                            let _ = index.insert(value, ());
+                        }
+                        snapshot.kinds.insert(record.name.clone(), normalized_kind);
+                        snapshot.host_indexes.insert(record.name.clone(), index);
+                    }
                     snapshot.values.insert(record.name.clone(), values);
                 }
             }
@@ -1722,6 +1760,48 @@ mod tests {
                 .unwrap()
                 .contains(&"example.com".to_owned())
         );
+    }
+
+    #[test]
+    fn route_list_snapshot_reports_all_go_host_and_process_memberships() {
+        let lists = load_route_lists(&[
+            GoRouteListRecord {
+                name: "domains".to_owned(),
+                list_type: "host".to_owned(),
+                source_type: "local".to_owned(),
+                updated_at: 1,
+                data_json: br#"{
+                    "type":"host",
+                    "source":{"type":"local","local":{"lists":["example.com","192.0.2.0/24"]}}
+                }"#
+                .to_vec(),
+            },
+            GoRouteListRecord {
+                name: "apps".to_owned(),
+                list_type: "process".to_owned(),
+                source_type: "local".to_owned(),
+                updated_at: 1,
+                data_json: br#"{
+                    "type":"process",
+                    "source":{"type":"local","local":{"lists":["/usr/bin/example-app"]}}
+                }"#
+                .to_vec(),
+            },
+        ]);
+        let mut context = FlowContext::new(Endpoint::domain(
+            Network::Tcp,
+            DomainName::new("www.example.com").unwrap(),
+            443,
+        ));
+        context.process = Some("/usr/bin/example-app".to_owned());
+        assert_eq!(lists.matching_names(&context), vec!["apps", "domains"]);
+
+        context.destination = Endpoint::ip(Network::Udp, "192.0.2.10:53".parse().unwrap());
+        context.network = Network::Udp;
+        assert_eq!(lists.matching_names(&context), vec!["apps", "domains"]);
+
+        context.process = Some("/usr/bin/other-app".to_owned());
+        assert_eq!(lists.matching_names(&context), vec!["domains"]);
     }
 
     #[test]
