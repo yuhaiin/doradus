@@ -325,6 +325,65 @@ pub(super) fn typed_schema_sql() -> &'static str {
         updated_at INTEGER NOT NULL,
         data_json  TEXT NOT NULL CHECK (json_valid(data_json))
     );
+    CREATE TABLE IF NOT EXISTS users_v2 (
+        id                TEXT PRIMARY KEY,
+        name              TEXT NOT NULL DEFAULT '',
+        enabled           INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        origin            TEXT NOT NULL DEFAULT 'manual',
+        usage             TEXT NOT NULL CHECK (usage IN ('inbound', 'outbound', 'both')),
+        credential_type   TEXT NOT NULL CHECK (credential_type IN ('basic', 'uuid', 'token')),
+        updated_at        INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS users_v2_name_idx ON users_v2(name, id);
+    CREATE INDEX IF NOT EXISTS users_v2_enabled_type_usage_idx
+        ON users_v2(enabled, credential_type, usage);
+    CREATE TABLE IF NOT EXISTS user_basic_v2 (
+        user_id             TEXT PRIMARY KEY,
+        username            TEXT,
+        password            TEXT,
+        allow_any_username  INTEGER NOT NULL DEFAULT 0 CHECK (allow_any_username IN (0, 1)),
+        allow_any_password  INTEGER NOT NULL DEFAULT 0 CHECK (allow_any_password IN (0, 1)),
+        FOREIGN KEY (user_id) REFERENCES users_v2(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS user_basic_v2_username_idx ON user_basic_v2(username);
+    CREATE TABLE IF NOT EXISTS user_uuid_v2 (
+        user_id TEXT PRIMARY KEY,
+        uuid    TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users_v2(id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS user_uuid_v2_uuid_idx ON user_uuid_v2(uuid);
+    CREATE TABLE IF NOT EXISTS user_token_v2 (
+        user_id TEXT PRIMARY KEY,
+        token   TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users_v2(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS user_migration_state_v2 (
+        migration_name TEXT PRIMARY KEY,
+        status         TEXT NOT NULL CHECK (status IN ('running', 'completed')),
+        completed_at   INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS user_migration_sources_v2 (
+        migration_name TEXT NOT NULL,
+        source_kind    TEXT NOT NULL,
+        source_id      TEXT NOT NULL,
+        source_path    TEXT NOT NULL,
+        dedup_scope    TEXT NOT NULL,
+        dedup_key      BLOB NOT NULL,
+        user_id        TEXT NOT NULL,
+        migrated_at    INTEGER NOT NULL,
+        PRIMARY KEY (migration_name, source_kind, source_id, source_path),
+        FOREIGN KEY (user_id) REFERENCES users_v2(id) ON DELETE RESTRICT
+    );
+    CREATE INDEX IF NOT EXISTS user_migration_sources_user_idx
+        ON user_migration_sources_v2(user_id);
+    CREATE TABLE IF NOT EXISTS user_migration_dedup_v2 (
+        migration_name TEXT NOT NULL,
+        dedup_scope    TEXT NOT NULL,
+        dedup_key      BLOB NOT NULL,
+        user_id        TEXT NOT NULL,
+        PRIMARY KEY (migration_name, dedup_scope, dedup_key),
+        FOREIGN KEY (user_id) REFERENCES users_v2(id) ON DELETE RESTRICT
+    );
     CREATE TABLE IF NOT EXISTS traffic_dimension_daily (
         bucket_start_utc INTEGER NOT NULL,
         value_id          INTEGER NOT NULL,
@@ -526,6 +585,36 @@ pub(super) fn validate_typed_schema(connection: &Connection) -> Result<()> {
                 ("updated_at", "INTEGER", true, 0),
                 ("data_json", "TEXT", true, 0),
             ],
+        ),
+        (
+            "users_v2",
+            &[
+                ("id", "TEXT", false, 1),
+                ("name", "TEXT", true, 0),
+                ("enabled", "INTEGER", true, 0),
+                ("origin", "TEXT", true, 0),
+                ("usage", "TEXT", true, 0),
+                ("credential_type", "TEXT", true, 0),
+                ("updated_at", "INTEGER", true, 0),
+            ],
+        ),
+        (
+            "user_basic_v2",
+            &[
+                ("user_id", "TEXT", false, 1),
+                ("username", "TEXT", false, 0),
+                ("password", "TEXT", false, 0),
+                ("allow_any_username", "INTEGER", true, 0),
+                ("allow_any_password", "INTEGER", true, 0),
+            ],
+        ),
+        (
+            "user_uuid_v2",
+            &[("user_id", "TEXT", false, 1), ("uuid", "TEXT", true, 0)],
+        ),
+        (
+            "user_token_v2",
+            &[("user_id", "TEXT", false, 1), ("token", "TEXT", true, 0)],
         ),
     ];
     for (table, columns) in contracts {

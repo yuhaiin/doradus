@@ -432,6 +432,7 @@ pub struct MatchResult {
 pub enum ErrorKind {
     InvalidInput,
     NotFound,
+    Conflict,
     Unsupported,
     Io,
     Protocol,

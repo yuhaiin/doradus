@@ -24,6 +24,7 @@ mod schema;
 mod sqlite;
 mod statistics;
 mod status;
+mod users;
 use migration::{
     import_go_schema, recover_legacy_node_chains, require_go_table, table_exists,
     validate_go_compat_text, validate_go_texts, validate_go_timestamp,
@@ -52,6 +53,10 @@ pub use statistics::{
     GoTelemetryBucketRecord, GoTrafficBucketRecord,
 };
 pub use status::StorageStatus;
+pub use users::{
+    GoBasicCredential, GoCredential, GoCredentialView, GoTokenCredential, GoUserRecord, GoUserView,
+    GoUserWrite, GoUuidCredential,
+};
 
 const SCHEMA_VERSION: i64 = 3;
 // Go schema 7 is an additive user/subscription-link migration. Rust does not

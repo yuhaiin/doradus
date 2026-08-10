@@ -35,7 +35,7 @@ use yuhaiin_geo::{GeoDatabaseManager, GeoDownloadTransport, GeoRefreshRequest};
 use yuhaiin_store::{
     GoBackupSettingsRecord, GoInboundRecord, GoNodeRecord, GoPublishRecord, GoResolverRecord,
     GoRouteListRecord, GoRouteRuleRecord, GoRouteSettingsRecord, GoSettingsKvRecord,
-    GoSubscriptionLinkRecord, InboundSettings, MaxMindMetadataRecord,
+    GoSubscriptionLinkRecord, GoUserRecord, GoUserWrite, InboundSettings, MaxMindMetadataRecord,
 };
 
 use crate::update::UpdateService;
@@ -169,6 +169,14 @@ impl ApiError {
         }
     }
 
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "user_referenced",
+            message: message.into(),
+        }
+    }
+
     fn unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -213,6 +221,7 @@ impl From<yuhaiin_core::Error> for ApiError {
                 Self::bad(message)
             }
             yuhaiin_core::ErrorKind::NotFound => Self::not_found(message),
+            yuhaiin_core::ErrorKind::Conflict => Self::conflict(message),
             // A closed/timeout runtime owner is equivalent to Go's
             // unavailable service dependency.
             yuhaiin_core::ErrorKind::Closed | yuhaiin_core::ErrorKind::Timeout => {
@@ -2989,54 +2998,81 @@ fn decode_publish_contract(record: GoPublishRecord) -> Result<PublishContract, A
 }
 
 async fn users_get_value(state: &ApiState, input: &Value) -> ApiResult {
-    let users = config_items(state, "users.items")
-        .await?
-        .into_iter()
-        .map(user_view)
-        .collect::<Vec<_>>();
-    Ok(Json(page(users, input)))
+    let page = input
+        .get("page")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as usize;
+    let page_size = input
+        .get("page_size")
+        .or_else(|| input.get("pageSize"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let query = input.get("query").and_then(Value::as_str);
+    let (items, total) = state
+        .controller
+        .store()
+        .repository()
+        .list_go_user_views(query, page, page_size)
+        .await?;
+    json_value(json!({
+        "items": items,
+        "page": {"page": page, "pageSize": page_size, "total": total}
+    }))
 }
 
 async fn user_get_value(state: &ApiState, id: String) -> ApiResult {
-    config_items(state, "users.items")
-        .await?
-        .into_iter()
-        .find(|user| user.get("id").and_then(Value::as_str) == Some(id.as_str()))
-        .map(|user| Json(user_view(user)))
-        .ok_or_else(|| ApiError::not_found(format!("user {id:?} was not found")))
+    let user = state
+        .controller
+        .store()
+        .repository()
+        .get_go_user_view(&id)
+        .await?;
+    json_value(serde_json::to_value(user)?)
 }
 
-async fn user_save_value(state: &ApiState, mut value: Value, id: Option<String>) -> ApiResult {
-    let id = id
-        .or_else(|| string_or_opt(&value, "id"))
-        .unwrap_or_else(|| format!("rust-user-{}-{}", unix_seconds(), std::process::id()));
-    let mut items = config_items(state, "users.items").await?;
-    let previous = items
-        .iter()
-        .find(|user| user.get("id").and_then(Value::as_str) == Some(id.as_str()))
-        .cloned();
-    set_string(&mut value, "id", id.clone());
-    if value.get("credential").is_none() {
-        if let Some(previous) = previous.as_ref().and_then(|user| user.get("credential")) {
-            if let Some(object) = value.as_object_mut() {
-                object.insert("credential".to_owned(), previous.clone());
-            }
+#[derive(Debug, Deserialize)]
+struct GoUserPutRequest {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    usage: String,
+    #[serde(default)]
+    credential: Option<yuhaiin_store::GoCredential>,
+}
+
+async fn user_save_value(state: &ApiState, value: Value, id: Option<String>) -> ApiResult {
+    let repository = state.controller.store().repository();
+    let view = if let Some(id) = id {
+        let request: GoUserPutRequest = serde_json::from_value(value)
+            .map_err(|error| ApiError::bad(format!("invalid user update: {error}")))?;
+        let mut user: GoUserRecord = repository.get_go_user(&id).await?;
+        user.name = request.name;
+        user.enabled = request.enabled;
+        user.usage = request.usage;
+        if let Some(credential) = request.credential {
+            user.credential = credential;
         }
-    }
-    items.retain(|user| user.get("id").and_then(Value::as_str) != Some(id.as_str()));
-    items.push(value.clone());
-    let _ = write_config_json(state, "users.items", json!({"items": items})).await?;
-    json_value(user_view(value))
+        user.updated_at = unix_seconds();
+        repository.save_go_user(&user).await?;
+        repository.get_go_user_view(&id).await?
+    } else {
+        let write: GoUserWrite = serde_json::from_value(value)
+            .map_err(|error| ApiError::bad(format!("invalid user contract: {error}")))?;
+        repository.create_go_user(write).await?
+    };
+    json_value(serde_json::to_value(view)?)
 }
 
 async fn user_delete_value(state: &ApiState, id: String) -> ApiResult {
-    let mut items = config_items(state, "users.items").await?;
-    let before = items.len();
-    items.retain(|user| user.get("id").and_then(Value::as_str) != Some(id.as_str()));
-    if items.len() == before {
-        return Err(ApiError::not_found(format!("user {id:?} was not found")));
-    }
-    let _ = write_config_json(state, "users.items", json!({"items": items})).await?;
+    state
+        .controller
+        .store()
+        .repository()
+        .delete_go_user(&id)
+        .await?;
     empty()
 }
 
@@ -3050,58 +3086,6 @@ async fn config_items(state: &ApiState, key: &str) -> Result<Vec<Value>, ApiErro
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default())
-}
-
-fn user_view(mut value: Value) -> Value {
-    let credential = value
-        .get("credential")
-        .cloned()
-        .unwrap_or_else(|| json!({"type": "token", "token": ""}));
-    let mut view = json!({
-        "id": string_or(&value, "id", ""),
-        "name": string_or(&value, "name", ""),
-        "enabled": bool_or(&value, "enabled", true),
-        "origin": string_or(&value, "origin", "rust-api"),
-        "usage": string_or(&value, "usage", ""),
-        "credential": credential_view(&credential),
-    });
-    if let Some(reference_count) = value.get("outboundReferences") {
-        if let Some(object) = view.as_object_mut() {
-            object.insert("outboundReferences".to_owned(), reference_count.clone());
-        }
-    }
-    value = view;
-    value
-}
-
-fn credential_view(value: &Value) -> Value {
-    let kind = string_or(value, "type", "token");
-    let section = value.get(&kind).unwrap_or(value);
-    let username = string_or_opt(section, "username");
-    let password = string_or_opt(section, "password");
-    let uuid = string_or_opt(section, "uuid");
-    let token = string_or_opt(section, "token");
-    let secret = password.as_deref().or(uuid.as_deref()).or(token.as_deref());
-    let mut result = json!({
-        "type": kind,
-        "hasUsername": username.is_some(),
-        "hasSecret": secret.is_some_and(|secret| !secret.is_empty()),
-    });
-    if let Some(object) = result.as_object_mut() {
-        if let Some(username) = username {
-            object.insert("username".to_owned(), Value::String(username));
-        }
-        if let Some(password) = password {
-            object.insert("password".to_owned(), Value::String(password));
-        }
-        if let Some(uuid) = uuid {
-            object.insert("uuid".to_owned(), Value::String(uuid));
-        }
-        if let Some(token) = token {
-            object.insert("token".to_owned(), Value::String(token));
-        }
-    }
-    result
 }
 
 fn default_backup_config() -> Value {
@@ -5342,7 +5326,7 @@ mod tests {
             ("/api/v2/publishes/public", r#"{"points":["direct"]}"#),
             (
                 "/api/v2/users",
-                r#"{"name":"Alice","enabled":true,"credential":{"type":"token","token":"secret"}}"#,
+                r#"{"name":"Alice","enabled":true,"usage":"outbound","credential":{"type":"token","token":{"token":"secret"}}}"#,
             ),
         ] {
             let method = if uri == "/api/v2/users" {
@@ -5643,6 +5627,11 @@ mod tests {
                 yuhaiin_core::ErrorKind::NotFound,
                 StatusCode::NOT_FOUND,
                 "not_found",
+            ),
+            (
+                yuhaiin_core::ErrorKind::Conflict,
+                StatusCode::CONFLICT,
+                "user_referenced",
             ),
             (
                 yuhaiin_core::ErrorKind::Timeout,

@@ -332,8 +332,8 @@ impl ConfigRepository {
     }
 
     pub async fn list_go_proxy_runtime_configs(&self) -> Result<Vec<GoProxyRuntimeConfig>> {
-        self.list_go_nodes()
-            .await?
+        let nodes = self.list_go_nodes().await?;
+        self.resolve_go_node_runtime_records(&nodes)?
             .iter()
             .map(GoNodeRecord::to_proxy_runtime_config)
             .collect()

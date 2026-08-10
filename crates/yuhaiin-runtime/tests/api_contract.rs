@@ -504,32 +504,28 @@ async fn management_api_round_trips_frontend_contracts_in_one_process() {
             "name":"Contract user",
             "enabled":true,
             "origin":"manual",
-            "usage":"0",
+            "usage":"outbound",
             "credential":{"type":"token","token":{"token":"secret"}}
         })),
     )
     .await;
-    assert_eq!(user["id"], "contract-user");
+    let user_id = user["id"].as_str().unwrap().to_owned();
+    assert!(!user_id.is_empty());
     assert_eq!(user["credential"]["type"], "token");
     assert_eq!(user["credential"]["hasSecret"], true);
+    let user_path = format!("/api/v2/users/{user_id}");
     expect_ok(
         &service,
         Method::PUT,
-        "/api/v2/users/contract-user",
-        Some(json!({"name":"Contract user updated","enabled":false,"usage":"12"})),
+        &user_path,
+        Some(json!({"name":"Contract user updated","enabled":false,"usage":"outbound"})),
     )
     .await;
     assert_eq!(
-        expect_ok(&service, Method::GET, "/api/v2/users/contract-user", None).await["enabled"],
+        expect_ok(&service, Method::GET, &user_path, None).await["enabled"],
         false
     );
-    expect_empty(
-        &service,
-        Method::DELETE,
-        "/api/v2/users/contract-user",
-        None,
-    )
-    .await;
+    expect_empty(&service, Method::DELETE, &user_path, None).await;
 
     let publish = expect_ok(
         &service,

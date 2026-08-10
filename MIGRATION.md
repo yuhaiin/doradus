@@ -9,7 +9,9 @@
 
 > 当前实现快照：可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store`、`yuhaiin-geo`、`yuhaiin-protocol` 和 `yuhaiin-runtime` 七个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，MaxMindDB 位于独立的 `yuhaiin-geo`，协议 wire codec/可组合 transport 位于 `yuhaiin-protocol`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责应用层组装和原子 reload，`yuhaiin-runtime::api` 提供与现有 `yuhaiin-react` client 对齐的管理面和 Rust-native pprof endpoint，`yuhaiin-runtime::run_tun_device_until` 负责已创建设备的数据面生命周期，`yuhaiin-runtime::inbound::run_until` 统一拥有 TUN、TCP/HTTP/WebSocket 和 UDP inbound 的启动、reload、shutdown 及 accepted-flow 生命周期，`src/bin/yuhaiin.rs` 只负责桌面 host/API/DNS wiring。HTTP 层复用 Go compatibility records，不新增一套配置 DTO，也不把平台权限细节泄漏到上层。
 
-> 2026-08-10 Go/Rust publishes 与 update status parity：`publishes` 不再存于 Rust overlay，而是通过 `yuhaiin-store::ConfigRepository` 读写 Go 原生 `publishes(name, updated_at, data_json)` 表。API 只在 storage boundary 解码 Go Publish 的已知字段（`name/points/path/password/address/insecure`），未知 JSON 字段继续由存储层保留；resolve 与 Go 一致：不存在或 path/password 不匹配返回 `points: null`，匹配时返回空数组或现存节点列表，删除不存在的 publish 返回 404。`update.status` 初始 `stage` 也与 Go zero value 一致为空字符串。`go-api-parity.sh` 已加入 update.status 以及 publishes 的稳定读取和 put/resolve/delete 变更序列，三份停止的 Go 生产快照均已通过；日志位于 `~/.cache/yuhaiin-rust/production-parity`。React 当前生成的 `users.*` 在本地 Go main 分支找不到对应 handler/table contract，Rust 临时 users overlay 因此仍不宣称为 replacement parity。
+> 2026-08-10 Go/Rust publishes 与 update status parity：`publishes` 不再存于 Rust overlay，而是通过 `yuhaiin-store::ConfigRepository` 读写 Go 原生 `publishes(name, updated_at, data_json)` 表。API 只在 storage boundary 解码 Go Publish 的已知字段（`name/points/path/password/address/insecure`），未知 JSON 字段继续由存储层保留；resolve 与 Go 一致：不存在或 path/password 不匹配返回 `points: null`，匹配时返回空数组或现存节点列表，删除不存在的 publish 返回 404。`update.status` 初始 `stage` 也与 Go zero value 一致为空字符串。`go-api-parity.sh` 已加入 update.status 以及 publishes 的稳定读取和 put/resolve/delete 变更序列，三份停止的 Go 生产快照均已通过；日志位于 `~/.cache/yuhaiin-rust/production-parity`。
+
+> 2026-08-10 central users schema/runtime integration：React 当前生成的 `users.*` 契约来自 Go `refact-user` 分支（本地 Go `main` 尚未包含这组 handler），Rust 已按该分支的 schema-v6 原生表实现 `users_v2`、`user_basic_v2`、`user_uuid_v2`、`user_token_v2` 及 migration reference 表。`ConfigRepository` 提供 create/update/delete、query/pagination、credential view 和 node/migration reference conflict；API 不再使用 Rust overlay。运行时构建代理快照时，节点 JSON 中的出站 `userId` 会解析为临时 basic/UUID/token 字段，原始 `nodes_v2.data_json` 只保留 `userId`，不会回写 secret。覆盖了 basic、UUID、token、HTTP/SOCKS5/Yuubinsya/VMess/VLESS/Tailscale 字段映射、缺失用户和禁用/错误 usage 的 fail-closed 单测；剩余是 HTTP/SOCKS5/Yuubinsya inbound 的中心用户认证，以及以 refact-user Go handler 运行的逐响应 parity，不应把该项误报为已完成的 Go main parity。
 
 > 2026-08-10 inbound/proxy runtime 修复：`mixed`/`mix` 入站按 Go 语义继承 SOCKS5 UDP mode，不再因 `protocol_udp=false` 错误跳过 UDP listener；`DirectAsyncProxy` 的 TCP 与 UDP fallback，以及 TLS/HTTP2 等 blocking transport 使用的 `DirectConnector`，在直接收到域名 endpoint 时分别通过 Tokio/system resolver 解析，再连接/绑定 socket，避免 `direct async proxy requires an already-resolved IP endpoint`。现有测试覆盖低层 async/sync direct、真实 runtime direct node latency 和 mixed UDP supervisor。透明/SOCKS5/Yuubinsya/Trojan UDP flow 统一记录最后活动时间，按 Go 的 90 秒 `UDPIdleTimeout` 回收空闲 datagram，并有边界单测。`make transparent-service-smoke` 在 rootless Podman 中通过 REDIRECT TCP 并明确记录 TPROXY skip；强制 TPROXY gate 仍要求 rootful/宿主机 `CAP_NET_ADMIN`，不能把 rootless 下的规则命中误报成完整 UDP 验收。
 
@@ -2456,3 +2458,25 @@ runtime-tun-closed name=yrtun0
 因此当前 runtime-owned Linux TUN 的长流/代理链内容完整性已纳入替换 gate；这不等价于
 已经完成 wire fragment 重组、独立 namespace teardown 矩阵或 Android/macOS 实机验收，后三项
 继续保留在 checklist 的 `[~]`。
+
+## 74. 2026-08-10 central users runtime resolution and production parity
+
+本轮把 React generated `users.*` 对应的 Go `refact-user` schema-v6 契约接入 Rust 原生 store/API：
+`users_v2` 负责用户元数据，`user_basic_v2`、`user_uuid_v2`、`user_token_v2` 分别保存三种
+credential，migration source/dedup 表用于阻止删除仍被迁移映射引用的用户。API 层支持 Go
+形状的 create/update/delete、query/pagination、credential view 和 node/migration reference
+冲突；更新时省略 credential 会保留旧凭据。
+
+运行时不修改 API-facing 的 `nodes_v2.data_json`。构建代理 snapshot 前，store 在内存克隆中
+按 `userId` 注入 basic 的 `user/password`、VMess/VLESS 的 UUID、Yuubinsya/Shadowsocks/
+ShadowsocksR/Trojan/AEAD 的 password 和 Tailscale token。缺少用户、disabled 用户、usage
+不含 outbound 或 credential 类型不匹配都会 fail-closed。SSR 的 `protocol` 字段是内部认证
+算法而不是代理层类型；第一次生产启动暴露该优先级错误后，改为优先继承外层 chain `type`，
+并加入 SSR 回归，避免真实旧节点被错误判为 unsupported。
+
+验证结果：users/store 定向测试通过，workspace `cargo test --workspace --all-features --offline`
+通过；`make production-parity-smoke` 对 `tmp/v2/state.db`、`tmp/yuhaiin/state.db`、
+`tmp/aws/yuhaiin/state.db` 三份停止快照逐响应通过，日志在
+`~/.cache/yuhaiin-rust/production-parity`；`make build` 成功，产物在
+`~/.cache/yuhaiin-rust/cargo-target/debug/yuhaiin`。inbound HTTP/SOCKS5/Yuubinsya 的中心
+用户认证及 refact-user Go handler 的逐响应 parity 仍未完成，故本项继续保持部分完成。

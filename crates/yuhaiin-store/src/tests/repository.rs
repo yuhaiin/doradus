@@ -519,3 +519,143 @@ fn go_publish_rejects_invalid_contract_json() {
             .contains("decode publishes.data_json as JSON failed")
     );
 }
+
+#[test]
+fn go_users_round_trip_native_credentials_and_pagination() {
+    let store = block_on(ConfigStore::open_memory()).unwrap();
+    let repository = store.repository();
+    let view = block_on(repository.create_go_user(GoUserWrite {
+        name: "Alice".to_owned(),
+        enabled: true,
+        origin: String::new(),
+        usage: "outbound".to_owned(),
+        credential: GoCredential {
+            kind: "basic".to_owned(),
+            basic: Some(GoBasicCredential {
+                username: Some("alice".to_owned()),
+                password: Some("secret".to_owned()),
+                allow_any_username: false,
+                allow_any_password: false,
+            }),
+            uuid: None,
+            token: None,
+        },
+    }))
+    .unwrap();
+    assert!(view.id.len() == 36);
+    assert_eq!(view.origin, "manual");
+    assert_eq!(view.credential.password, "secret");
+    assert!(view.credential.has_secret);
+
+    let (items, total) = block_on(repository.list_go_user_views(Some("alice"), 1, 100)).unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(items[0].id, view.id);
+    let loaded = block_on(repository.get_go_user(&view.id)).unwrap();
+    assert_eq!(loaded.credential.kind, "basic");
+    assert_eq!(
+        loaded.credential.basic.unwrap().username.as_deref(),
+        Some("alice")
+    );
+
+    block_on(repository.delete_go_user(&view.id)).unwrap();
+    let error = block_on(repository.get_go_user(&view.id)).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::NotFound);
+}
+
+#[test]
+fn go_user_delete_reports_node_reference_as_conflict() {
+    let store = block_on(ConfigStore::open_memory()).unwrap();
+    let repository = store.repository();
+    let view = block_on(repository.create_go_user(GoUserWrite {
+        name: "Referenced".to_owned(),
+        enabled: true,
+        origin: String::new(),
+        usage: "outbound".to_owned(),
+        credential: GoCredential {
+            kind: "token".to_owned(),
+            basic: None,
+            uuid: None,
+            token: Some(GoTokenCredential {
+                token: "token".to_owned(),
+            }),
+        },
+    }))
+    .unwrap();
+    block_on(
+        repository.put_go_node(&GoNodeRecord {
+            id: "referencing-node".to_owned(),
+            name: "Referencing node".to_owned(),
+            group_name: String::new(),
+            origin: "manual".to_owned(),
+            enabled: true,
+            chain_types_json: br#"["http"]"#.to_vec(),
+            updated_at: 1,
+            data_json: format!(
+                r#"{{"chain":[{{"type":"http","http":{{"userId":"{}"}}}}]}}"#,
+                view.id
+            )
+            .into_bytes(),
+        }),
+    )
+    .unwrap();
+
+    let error = block_on(repository.delete_go_user(&view.id)).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert!(error.message.contains("referenced"));
+}
+
+#[test]
+fn go_node_runtime_resolves_central_credentials_without_persisting_secrets() {
+    let store = block_on(ConfigStore::open_memory()).unwrap();
+    let repository = store.repository();
+    let user = block_on(repository.create_go_user(GoUserWrite {
+        name: "Runtime user".to_owned(),
+        enabled: true,
+        origin: String::new(),
+        usage: "outbound".to_owned(),
+        credential: GoCredential {
+            kind: "basic".to_owned(),
+            basic: Some(GoBasicCredential {
+                username: Some("central-user".to_owned()),
+                password: Some("central-password".to_owned()),
+                allow_any_username: false,
+                allow_any_password: false,
+            }),
+            uuid: None,
+            token: None,
+        },
+    }))
+    .unwrap();
+    block_on(repository.put_go_node(&GoNodeRecord {
+        id: "runtime-http".to_owned(),
+        name: "Runtime HTTP".to_owned(),
+        group_name: String::new(),
+        origin: "manual".to_owned(),
+        enabled: true,
+        chain_types_json: br#"["http"]"#.to_vec(),
+        updated_at: 1,
+        data_json: format!(
+            r#"{{"chain":[{{"type":"http","http":{{"userId":"{}","user":"stale","password":"stale"}}}}]}}"#,
+            user.id
+        )
+        .into_bytes(),
+    }))
+    .unwrap();
+
+    let runtime = block_on(repository.list_go_proxy_runtime_configs()).unwrap();
+    let http = runtime
+        .iter()
+        .find(|node| node.id == "runtime-http")
+        .unwrap();
+    assert_eq!(http.layers[0].config["user"], "central-user");
+    assert_eq!(http.layers[0].config["password"], "central-password");
+
+    let persisted = block_on(repository.list_go_nodes()).unwrap();
+    let persisted = persisted
+        .iter()
+        .find(|node| node.id == "runtime-http")
+        .unwrap();
+    let persisted = String::from_utf8_lossy(&persisted.data_json);
+    assert!(persisted.contains("stale"));
+    assert!(!persisted.contains("central-password"));
+}
