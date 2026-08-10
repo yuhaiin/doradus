@@ -87,8 +87,14 @@ if [[ "${tproxy_enabled}" != 0 && "${tproxy_enabled}" != 1 ]]; then
   exit 1
 fi
 if [[ "${tproxy_enabled}" -eq 1 && "${podman_rootless}" == "true" ]]; then
-  echo "[transparent-service] rootless Podman: attempting the explicit TPROXY UDP gate"
-  echo "[transparent-service] if namespace capability setup fails, inspect ${scenario_dir}/container.log"
+  cat >&2 <<EOF
+[transparent-service] TPROXY UDP requires a rootful Podman namespace with
+CAP_NET_ADMIN and a kernel mangle/route namespace. The current Podman
+connection is rootless, so the explicit gate is not runnable here.
+[transparent-service] run this smoke with rootful Podman, or omit
+YUHAIIN_TPROXY_ENABLED=1 to record the deterministic capability skip.
+EOF
+  exit 77
 fi
 
 ipv6_env_args=()

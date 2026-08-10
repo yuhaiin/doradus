@@ -50,7 +50,7 @@
 | --- | --- | --- | --- |
 | SQLite / 生产库 | `[~]` | 增加更多生产版本快照；逐表核对 route/resolver projection；补异常关闭后的未建模表检查 | 默认 3 份真实快照已通过 `make production-parity-smoke`；Rust 启动现在按 Go 的 4 MiB 或 10% freelist 阈值 checkpoint/VACUUM；store fixture tests |
 | FakeIP | `[~]` | 增加真实生产 FakeIP 表快照，并验证双栈池容量/TTL/重启后的分配稳定性 | FakeIP store tests + Go state takeover |
-| Linux transparent inbound | `[~]` | 在具备 `CAP_NET_ADMIN` 的独立 namespace 中验证 TPROXY UDP；继续补多 flow 的异常关闭矩阵 | 默认 `make transparent-service-smoke` 已真实验证隔离 namespace REDIRECT IPv4 TCP：非 root client → Rust redir → `SO_ORIGINAL_DST` → direct outbound → 同一 listener 上两条 TCP flow → echo，并检查累计 upload/download counters、shutdown；`YUHAIIN_TRANSPARENT_IPV6=1 make transparent-service-smoke` 又验证 IPv4+IPv6 共四条 flow 和 `IP6T_SO_ORIGINAL_DST`。auto 模式仍明确 skip TPROXY；显式 rootless gate 已实际尝试并保留失败日志，不能替代 rootful/宿主机 `CAP_NET_ADMIN` 的 TPROXY UDP 与异常 teardown |
+| Linux transparent inbound | `[~]` | 在具备 `CAP_NET_ADMIN` 的独立 namespace 中验证 TPROXY UDP；继续补多 flow 的异常关闭矩阵 | 默认 `make transparent-service-smoke` 已真实验证隔离 namespace REDIRECT IPv4 TCP：非 root client → Rust redir → `SO_ORIGINAL_DST` → direct outbound → 同一 listener 上两条 TCP flow → echo，并检查累计 upload/download counters、shutdown；`YUHAIIN_TRANSPARENT_IPV6=1 make transparent-service-smoke` 又验证 IPv4+IPv6 共四条 flow 和 `IP6T_SO_ORIGINAL_DST`。auto 模式明确 skip TPROXY；rootless 下显式 gate 现在在启动容器前以 exit 77 明确拒绝，不能替代 rootful/宿主机 `CAP_NET_ADMIN` 的 TPROXY UDP 与异常 teardown |
 | TUN / NAT | `[~]` | Linux MTU 边界矩阵、1 MiB 内容校验长流、IPv4/IPv6 out-of-order fragment 重组和 TUN→TLS→HTTP/2→Yuubinsya 长流已通过；继续补 namespace teardown、超过有界重组上限的 wire-fragment 长流，以及 Android VpnService fd 和 macOS utun 实机验收 | `tun-long-service-smoke`、`tun-chain-service.sh`、`tun-mtu.sh`、`p0_tun`、`dispatcher_reassembles_out_of_order_ipv4_udp_fragments`、`ipv6_fragment_reassembler_reassembles_out_of_order_udp`、平台设备日志 |
 | API / reload | `[~]` | 已覆盖 node/user/inbound/resolver/route mutation 后新数据面切换、central basic user 的真实 HTTP inbound create/update/delete 认证 reload、latency、traffic/history 和同库重启读回；Go/Rust parity 已覆盖核心 node/inbound/resolver/route mutation，以及前端配置 API 的独立副本闭环；错误矩阵已严格对照 HTTP status/RPC code，Go typed request 的缺失字段零值和空 `connections.close` 也已对齐；`route.rules.test` 现在支持嵌套 `all` 的多个正向 host/CIDR 约束并保留 Go 短路 history；socket-backed inbound 的 `connections.localAddr`、`network.underlyingType`、应用层 `protocol` 和实际出站 `outbound` endpoint 已按 Go 语义输出，`nodeId/nodeName` 保留节点身份，未识别协议保持空值；SSE 现在同时覆盖初始快照和真实 live `connections_added`/`connections_removed`；这些均由 monitor/selector 单测及真实 HTTP/TLS/H2/Yuubinsya 集成测试断言；剩余是更多 process/inbound/negative matcher、users 边界和生产快照 | `api-reload-flow.sh`、`api-contract.sh`、`go-api-parity.sh`、`service-chain.sh` |
 | connections / statistics | `[~]` | 已补 Go daily telemetry bucket 的区间重叠语义：SQLite/checkpoint 保留 hourly/daily span，半天范围查询不再丢失前一天数据；继续增加 production telemetry 快照，并逐字段核对长时间范围与升级期间锁竞争 | `monitor_telemetry_includes_daily_buckets_that_overlap_a_partial_day`、store statistics tests、`stats-concurrency.sh`（并发读取、优雅重启、force-stop 后同库接管）、`go-rust-stats.sh` |
@@ -77,9 +77,10 @@ h2 分配发送窗口后提交固定大小 frame，并由独立发送 task 等�
 > 和 `tmp/aws/yuhaiin/state.db` 三份停止快照全部通过，日志位于
 > `~/.cache/yuhaiin-rust/production-parity-current`；`stats-concurrency.sh` 的并发读取/重启
 > 通过；`transparent-service.sh` 的 REDIRECT TCP 通过并明确记录 rootless 下 TPROXY UDP skip；
-> runtime-owned TUN、启动日志也通过。最新 release benchmark 为 HTTP CONNECT 135.01 MiB/s、peak RSS
-> 17,096 KiB；TLS/H2/Yuubinsya 为 10.10 MiB/s、peak RSS 72,912 KiB；TUN benchmark 为 36.87 MiB/s、
-> peak RSS 12,456 KiB；证据位于
+> runtime-owned TUN、启动日志也通过。上一轮 TUN benchmark 为 36.87 MiB/s、peak RSS 12,456 KiB；本轮
+> release HTTP benchmark 为 HTTP CONNECT 116.14 MiB/s、peak RSS 17,516 KiB；TLS/H2/Yuubinsya 为
+> 19.59 MiB/s、peak RSS 19,120 KiB。旧的 HTTP benchmark 数值仍保留在 MIGRATION 历史章节，不能混作当前基线；
+> TUN benchmark 为 36.87 MiB/s、peak RSS 12,456 KiB；证据位于
 > `~/.cache/yuhaiin-rust/benchmarks/{http-throughput-current,tun-throughput-current}`。随后
 > `tun-mtu.sh` 在 privileged Podman 中用独立设备和 SQLite 状态通过了 576、1280、1500、9000、
 > 9216 五个 MTU 用例，日志位于 `~/.cache/yuhaiin-rust/integration/tun-mtu-current`。
