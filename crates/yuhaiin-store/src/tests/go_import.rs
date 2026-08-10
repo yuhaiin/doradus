@@ -82,7 +82,10 @@ fn additive_go_schema_v7_is_opened_without_dropping_subscription_tables() {
             .unwrap();
         connection
             .execute_batch(
-                "UPDATE metadata SET value = '7' WHERE key = 'schema_version';
+                // Go v7 production snapshots can retain the plain-model
+                // metadata value 6 while the additive link migration is
+                // recorded in `migrate` as version 7.
+                "UPDATE metadata SET value = '6' WHERE key = 'schema_version';
                  INSERT INTO migrate (version, name, applied_at)
                      VALUES (7, 'subscription_node_user_links', 0);
                  CREATE TABLE subscription_nodes_v2 (

@@ -535,6 +535,20 @@ fn read_go_schema_version(connection: &Connection) -> Result<i64> {
     let migration_version = validate_go_schema_version(version)?;
     if let Some(metadata_version) = metadata_version {
         if metadata_version != migration_version {
+            // Some current Go production databases contain the additive
+            // subscription/user-link migration (version 7) while retaining
+            // metadata.schema_version = 6. Go treats `migrate` as the source
+            // of applied migrations and opens this shape successfully. Keep
+            // the compatibility exception narrow: only the known v7 tables
+            // may make a 6 -> 7 mismatch valid; arbitrary mismatches still
+            // fail closed below.
+            let known_additive_v7 = metadata_version == 6
+                && migration_version == 7
+                && (table_exists(connection, "subscription_nodes_v2")
+                    || table_exists(connection, "subscription_users_v2"));
+            if known_additive_v7 {
+                return Ok(migration_version);
+            }
             return Err(Error::new(
                 ErrorKind::Storage,
                 format!(

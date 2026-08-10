@@ -15,6 +15,8 @@
 
 > 2026-08-10 connections outbound endpoint：对照 Go `getConnection` 的 `getRemote(conn)`，`FlowContext` 新增 `outbound_addr`；selector 根据当前 route mode 记录实际出站 proxy socket endpoint，monitor 将 `connections.outbound` 输出为裸 `IP:port`，同时保留 `nodeId/nodeName` 作为配置节点身份。真实 direct、HTTP、SOCKS5、TLS/HTTP2/Yuubinsya、TCP/UDP service-chain 均新增 endpoint 断言，避免把节点 ID 与实际远端地址混用。
 
+> 2026-08-10 Go schema-7 production takeover：真实 Go v6/v7-shaped state 可能保留 `metadata.schema_version=6`，但在 `migrate` 中记录新增的 `subscription_node_user_links=7`；Go 会正常打开，Rust 原先却因强制要求两个版本相等而拒绝启动。`yuhaiin-store::read_go_schema_version` 现在仅在已知 `subscription_nodes_v2`/`subscription_users_v2` 表存在时放行该增量形态，未知版本和任意其他不一致仍 fail-closed。新增回归，并用三份停止的生产快照重新通过 Go/Rust API 读、写和错误矩阵 parity；测试状态和临时副本均位于 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+
 > 2026-08-10 TUN 组合链路验收：新增 `make tun-chain-service-smoke`，在 privileged、`--network=none` 的 Podman 容器中用同一个 `inbound::run_until` 和 SQLite 配置验证真实 kernel TUN → `fixed` → RustCrypto TLS → HTTP/2 → Yuubinsya TCP → loopback echo。测试客户端写入后立即半关闭，修复并回归 HTTP/2 relay 只关闭请求方向、仍持续转发响应方向的语义；同时让 H2 server 等待 response bridge 排空，避免已回写的数据在 `serve_connect` 返回时被 abort。状态与日志统一放在 `~/.cache/yuhaiin-rust/integration/tun-chain-service`，不使用 `/tmp`。Android/macOS TUN fd/route/lifecycle 和 UDP 版 runtime chain 仍是独立验收项。
 
 > 2026-08-10 多 inbound 组合验收：`service_chain.rs` 新增同一真实 runtime 进程中的 SOCKS5 inbound、Yuubinsya inbound → TLS → HTTP/2 → Yuubinsya outbound 测试。两条 inbound 都使用域名目标进入共享 router，验证 payload echo、`connections` 的 inbound/outbound/mode/matchHistory 和 node latency，避免只证明 HTTP inbound 能工作而遗漏其他实际入口。
