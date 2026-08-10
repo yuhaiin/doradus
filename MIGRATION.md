@@ -2192,3 +2192,27 @@ client、CONNECT 握手、payload echo 和 connections metadata 断言；
 service-chain 测试，状态、日志和构建产物继续放在 `~/.cache/yuhaiin-rust`，不使用
 `/tmp`。本次定向测试通过，TLS inbound 的功能条目不再只是静态代码存在，而有真实
 子进程数据面证据。
+
+## 64. 2026-08-10 Go/Rust management mutation parity
+
+在 §62 的生产只读 projection 对照上，`scripts/integration/go-api-parity.sh` 增加了基于前端
+RPC 边界的变更矩阵。Go 与 Rust 仍使用同一停止快照的两个独立副本；每次运行生成带
+`BASHPID` 后缀的临时节点、resolver、inbound、route list、route rule 和 tag，按
+create → get → update/use/apply → delete 顺序清理，不改源库。默认状态目录是
+`~/.cache/yuhaiin-rust/integration/go-api-parity`，不使用 `/tmp`。
+
+严格逐响应通过的变更包括：
+
+- node create/get/put/use/selected/close/delete；
+- inbound create/get/put/delete；
+- resolver create/get/put/delete；
+- route list 的 create/get/delete、route rule 的 create/get/delete、route tag 的 put/get/delete，以及 `route.apply`。
+
+本轮对照暴露并修复了三个契约边界：Go 手动节点允许空 `group`，Rust 不再把它公开改写成
+`default`；Go 的 route rule detail 不公开 Rust 路由编译使用的内部 `match` 字段；route
+rule test 的 `afterAddr` 使用 Go 的 authority 形式（例如 `example.com:443`），不带 Rust
+内部的 `tcp://` 前缀。对应的 API 单测和真实 Go/Rust 双进程 parity 均通过。
+
+`route.rules.test` 本身暂不纳入严格逐字节矩阵：它返回运行时 list-evaluation history，Go
+返回所有已配置规则的历史，Rust 当前返回选中规则的历史；这是可见的剩余兼容差异，不能用
+排序或删除字段掩盖。它仍由 Rust API 单测覆盖，后续应单独对齐 history 生成语义。

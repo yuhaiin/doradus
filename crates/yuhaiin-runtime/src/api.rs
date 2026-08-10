@@ -1562,7 +1562,10 @@ async fn save_node_value(state: &ApiState, value: Value, _index: Option<usize>) 
         return Err(ApiError::bad("node chain/protocol is empty"));
     }
     let group_name = match string_or_any(&value, &["group", "groupName", "group_name"]).as_str() {
-        "" => "default".to_owned(),
+        // Go's contract.node.Node has no default for group. Preserve an
+        // omitted/empty group in the public API; internal runtime-created
+        // nodes may still use the explicit "default" group where needed.
+        "" => String::new(),
         group => group.to_owned(),
     };
     // `nodes_v2.data_json` is also consumed directly by Go's plain-contract
@@ -2267,11 +2270,19 @@ async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
         "mode": mode,
         "tag": tag,
         "resolver": resolver,
-        "afterAddr": context.destination.to_string(),
+        "afterAddr": endpoint_authority(&context.destination),
         "lists": context.lists,
         "ips": [],
         "matchResult": match_result,
     }))
+}
+
+fn endpoint_authority(endpoint: &Endpoint) -> String {
+    match endpoint {
+        Endpoint::Ip { addr, .. } => addr.to_string(),
+        Endpoint::Domain { host, port, .. } if *port == 0 => host.to_string(),
+        Endpoint::Domain { host, port, .. } => format!("{host}:{port}"),
+    }
 }
 
 fn split_rule_test_target(value: &str) -> std::result::Result<(String, u16), ApiError> {
@@ -3317,10 +3328,17 @@ fn route_list_detail_json(record: GoRouteListRecord) -> Value {
 }
 
 fn route_rule_detail_json(record: GoRouteRuleRecord) -> Value {
-    normalize_route_rule_value(
+    let mut value = normalize_route_rule_value(
         &raw_json(&record.data_json, json!({"name": record.name})),
         &record.name,
-    )
+    );
+    // `match` is an internal compatibility projection used by the Rust
+    // route compiler. Go's public RouteRule contract exposes the equivalent
+    // expression through `rules` and omits this storage-only field.
+    if let Value::Object(object) = &mut value {
+        object.remove("match");
+    }
+    value
 }
 
 fn route_list_item_json(record: GoRouteListRecord) -> Value {
@@ -4024,6 +4042,7 @@ mod tests {
         let value = json!({"id":"direct","name":"Direct","group":"","enabled":true,"chain":[{"type":"direct","direct":{}}]});
         let saved = save_node_value(&state, value.clone(), None).await.unwrap();
         assert_eq!(saved.0["id"], "direct");
+        assert_eq!(saved.0["group"], "");
         assert_eq!(saved.0["origin"], "manual");
         let listed = nodes_get_value(&state, &json!({"page":1,"page_size":0}))
             .await
@@ -4523,6 +4542,7 @@ mod tests {
         let body = to_bytes(tested.into_body(), 1024 * 1024).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["mode"], "drop");
+        assert_eq!(value["afterAddr"], "example.com:443");
         assert!(value.get("matchResult").is_some());
 
         let _ = route_apply_value(&state).await.unwrap();
@@ -4732,6 +4752,7 @@ mod tests {
             .unwrap();
         assert_eq!(rule.0["name"], "normalized-rule");
         assert_eq!(rule.0["mode"], "bypass");
+        assert!(rule.0.get("match").is_none());
     }
 
     #[tokio::test]

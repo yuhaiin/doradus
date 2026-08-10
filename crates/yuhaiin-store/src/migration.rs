@@ -1001,7 +1001,7 @@ pub(super) fn validate_go_texts(values: &[(&str, &String)]) -> Result<()> {
     Ok(())
 }
 
-fn validate_go_compat_text(value: &str, field: &str) -> Result<()> {
+pub(super) fn validate_go_compat_text(value: &str, field: &str) -> Result<()> {
     if value.len() > 512 || value.chars().any(char::is_control) {
         return Err(Error::new(
             ErrorKind::Storage,

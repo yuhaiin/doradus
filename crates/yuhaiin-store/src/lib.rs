@@ -26,7 +26,7 @@ mod statistics;
 mod status;
 use migration::{
     import_go_schema, recover_legacy_node_chains, require_go_table, table_exists,
-    validate_go_texts, validate_go_timestamp,
+    validate_go_compat_text, validate_go_texts, validate_go_timestamp,
 };
 #[cfg(test)]
 use migration::{meta_flag, table_row_count};

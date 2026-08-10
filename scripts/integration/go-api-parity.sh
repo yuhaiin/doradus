@@ -181,4 +181,105 @@ for request_spec in "${operations[@]}"; do
   echo "[go-api-parity] identical: ${operation}"
 done
 
+compare_mutation() {
+  local name="$1"
+  local operation="$2"
+  local body="${3:-}"
+  if [[ -z "${body}" ]]; then
+    body='{}'
+  fi
+  request_mutation() {
+    local address="$1"
+    local request_body="$2"
+    local raw_output="$3"
+    local normalized_output="$4"
+    local status
+    if ! status="$(curl -sS --max-time 30 -o "${raw_output}" -w '%{http_code}' \
+      "http://${address}/api/v2/rpc/${operation}" \
+      -H 'content-type: application/json' \
+      --data "${request_body}")"; then
+      echo "[go-api-parity] curl failed: ${operation} address=${address}" >&2
+      return 1
+    fi
+    if [[ "${status}" != 2* ]]; then
+      echo "[go-api-parity] mutation HTTP ${status}: ${operation} address=${address}" >&2
+      sed -n '1,160p' "${raw_output}" >&2 || true
+      return 1
+    fi
+    jq -S . "${raw_output}" >"${normalized_output}"
+  }
+
+  request_mutation "${go_http}" "${body}" \
+    "${scenario_dir}/mutation-go-${name}.raw" \
+    "${scenario_dir}/mutation-go-${name}.json"
+  request_mutation "${rust_http}" "${body}" \
+    "${scenario_dir}/mutation-rust-${name}.raw" \
+    "${scenario_dir}/mutation-rust-${name}.json"
+  if ! diff -u "${scenario_dir}/mutation-go-${name}.json" \
+    "${scenario_dir}/mutation-rust-${name}.json" \
+    >"${scenario_dir}/mutation-${name}.diff"; then
+    echo "[go-api-parity] mutation response mismatch: ${operation}" >&2
+    sed -n '1,160p' "${scenario_dir}/mutation-${name}.diff" >&2
+    exit 1
+  fi
+  echo "[go-api-parity] mutation identical: ${operation}"
+}
+
+if [[ "${YUHAIIN_MUTATION_PARITY:-1}" == "1" ]]; then
+  # These IDs are deliberately unique per invocation so the mutation matrix
+  # can run against an unchanged production snapshot without deleting user
+  # configuration. Both services receive the same body and path sequence.
+  mutation_suffix="${YUHAIIN_MUTATION_SUFFIX:-${BASHPID}}"
+  node_id="rust-api-parity-node-${mutation_suffix}"
+  inbound_id="rust-api-parity-inbound-${mutation_suffix}"
+  resolver_id="rust-api-parity-resolver-${mutation_suffix}"
+  list_id="rust-api-parity-list-${mutation_suffix}"
+  rule_id="rust-api-parity-rule-${mutation_suffix}"
+  tag_id="rust-api-parity-tag-${mutation_suffix}"
+
+  node_body="$(jq -cn --arg id "${node_id}" '{id:$id,name:"API parity node",group:"parity",enabled:true,chain:[{type:"direct",direct:{}}]}')"
+  compare_mutation node-post nodes.post "${node_body}"
+  compare_mutation node-get node.get "$(jq -cn --arg id "${node_id}" '{id:$id}')"
+  node_put_body="$(jq -cn --arg id "${node_id}" '{id:$id,name:"API parity node updated",enabled:false,chain:[{type:"direct",direct:{}}]}')"
+  compare_mutation node-put node.put "${node_put_body}"
+  compare_mutation node-get-updated node.get "$(jq -cn --arg id "${node_id}" '{id:$id}')"
+  compare_mutation node-use node.use "$(jq -cn --arg id "${node_id}" '{id:$id}')"
+  compare_mutation nodes-selected nodes.selected '{}'
+  compare_mutation node-close node.close "$(jq -cn --arg id "${node_id}" '{id:$id}')"
+  compare_mutation node-delete node.delete "$(jq -cn --arg id "${node_id}" '{id:$id}')"
+
+  inbound_body="$(jq -cn --arg id "${inbound_id}" '{id:$id,name:"API parity inbound",enabled:false,network:{type:"empty",empty:{}},transports:[],protocol:{type:"none",none:{}}}')"
+  compare_mutation inbound-post inbounds.post "${inbound_body}"
+  compare_mutation inbound-get inbound.get "$(jq -cn --arg id "${inbound_id}" '{id:$id}')"
+  inbound_put_body="$(jq -cn --arg id "${inbound_id}" '{id:$id,name:"API parity inbound updated",enabled:false,network:{type:"empty",empty:{}},transports:[],protocol:{type:"none",none:{}}}')"
+  compare_mutation inbound-put inbound.put "${inbound_put_body}"
+  compare_mutation inbound-get-updated inbound.get "$(jq -cn --arg id "${inbound_id}" '{id:$id}')"
+  compare_mutation inbound-delete inbound.delete "$(jq -cn --arg id "${inbound_id}" '{id:$id}')"
+
+  resolver_body="$(jq -cn --arg id "${resolver_id}" '{id:$id,type:"udp",host:"127.0.0.1:53"}')"
+  compare_mutation resolver-post resolvers.post "${resolver_body}"
+  compare_mutation resolver-get resolver.get "$(jq -cn --arg id "${resolver_id}" '{id:$id}')"
+  resolver_put_body="$(jq -cn --arg id "${resolver_id}" '{id:$id,type:"udp",host:"127.0.0.1:5353"}')"
+  compare_mutation resolver-put resolver.put "${resolver_put_body}"
+  compare_mutation resolver-get-updated resolver.get "$(jq -cn --arg id "${resolver_id}" '{id:$id}')"
+  compare_mutation resolver-delete resolver.delete "$(jq -cn --arg id "${resolver_id}" '{id:$id}')"
+
+  list_body="$(jq -cn --arg name "${list_id}" '{name:$name,type:"host",source:{type:"local",local:{lists:["parity.example"]}}}')"
+  compare_mutation route-list-post route.lists.post "${list_body}"
+  compare_mutation route-list-get route.list.get "$(jq -cn --arg id "${list_id}" '{id:$id}')"
+
+  rule_body="$(jq -cn --arg name "${rule_id}" --arg list "${list_id}" '{name:$name,mode:"direct",tag:"parity",rules:[{type:"host",host:{list:$list}}]}')"
+  compare_mutation route-rule-post route.rules.post "${rule_body}"
+  compare_mutation route-rule-get route.rule.get "$(jq -cn --arg name "${rule_id}" '{name:$name,index:0}')"
+  # route.rules.test includes process-local list-evaluation history. Go
+  # reports every configured rule while Rust reports the selected rule; keep
+  # this runtime-diagnostic surface outside strict mutation parity.
+  compare_mutation route-apply route.apply '{}'
+  compare_mutation route-list-delete route.list.delete "$(jq -cn --arg id "${list_id}" '{id:$id}')"
+  compare_mutation route-tag-put route.tag.put "$(jq -cn --arg tag "${tag_id}" '{tag:$tag,type:"node",hash:""}')"
+  compare_mutation route-tag-get route.tags.get "$(jq -cn --arg query "${tag_id}" '{query:$query}')"
+  compare_mutation route-tag-delete route.tag.delete "$(jq -cn --arg tag "${tag_id}" '{tag:$tag}')"
+  compare_mutation route-rule-delete route.rule.delete "$(jq -cn --arg name "${rule_id}" '{name:$name,index:0}')"
+fi
+
 echo "[go-api-parity] passed; logs=${scenario_dir}"

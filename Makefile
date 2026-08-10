@@ -61,7 +61,7 @@ help:
 		'make transparent-service-smoke run REDIRECT TCP smoke; rootless Podman records TPROXY skip' \
 		'make api-contract-smoke run the frontend management API process contract in Podman' \
 		'make api-reload-flow-smoke verify mutation reloads the real data plane and survives restart' \
-		'make go-api-parity-smoke compare public API responses against a Go state snapshot' \
+		'make go-api-parity-smoke compare read and core mutation API responses against a Go state snapshot' \
 		'make production-parity-smoke compare several stopped production SQLite snapshots' \
 		'make go-rust-stats-smoke run concurrent Go/Rust SQLite statistics smoke in Podman' \
 		'make service-chain-smoke run inbound/router/outbound protocol chains in Podman' \

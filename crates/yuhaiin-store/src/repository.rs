@@ -917,9 +917,12 @@ impl ConfigRepository {
         validate_go_texts(&[
             ("node id", &record.id),
             ("node name", &record.name),
-            ("node group_name", &record.group_name),
             ("node origin", &record.origin),
         ])?;
+        // Go's node contract permits an empty group_name for manually saved
+        // nodes. It is still bounded and control-character-free, but unlike
+        // identifiers it is not required to contain one character.
+        validate_go_compat_text(&record.group_name, "node group_name")?;
         validate_go_timestamp(record.updated_at)?;
         validate_json_bytes(&record.chain_types_json, "nodes_v2.chain_types_json")?;
         validate_json_bytes(&record.data_json, "nodes_v2.data_json")?;
