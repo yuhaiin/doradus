@@ -10,6 +10,7 @@ pub mod http_obfs;
 pub mod shadowsocks;
 pub mod shadowsocksr;
 pub mod socks5;
+pub mod socks5_server;
 #[cfg(feature = "tls-rustcrypto")]
 pub mod tls;
 pub mod trojan;

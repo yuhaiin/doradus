@@ -42,7 +42,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
+.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke socks5-protocol-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -80,6 +80,7 @@ help:
 		'make dns-source-smoke   run UDP/TCP resolver source-bind smoke in Podman' \
 		'make doh-source-smoke   run DoH/DoT source-bind smoke in Podman' \
 		'make socks5-udp-associate-smoke run real SOCKS5 UDP chain smoke in Podman' \
+		'make socks5-protocol-smoke run SOCKS5 wire unit tests in Podman' \
 		'make node-latency-dns-smoke run API DNS latency chain smoke in Podman' \
 		'make stats-concurrency-smoke run concurrent statistics/restart smoke in Podman' \
 		'make startup-logs-smoke run foreground startup log smoke' \
@@ -204,6 +205,9 @@ doh-source-smoke:
 
 socks5-udp-associate-smoke:
 	./scripts/integration/socks5-udp-associate.sh
+
+socks5-protocol-smoke:
+	./scripts/integration/socks5-protocol.sh
 
 node-latency-dns-smoke:
 	./scripts/integration/node-latency-dns.sh

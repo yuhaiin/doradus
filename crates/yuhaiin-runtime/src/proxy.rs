@@ -176,8 +176,6 @@ pub(crate) mod http;
 pub(crate) mod reverse;
 #[path = "proxy/socks4a.rs"]
 pub(crate) mod socks4a;
-#[path = "proxy/socks5.rs"]
-pub(crate) mod socks5;
 #[cfg(target_os = "linux")]
 #[path = "proxy/transparent.rs"]
 pub(crate) mod transparent;

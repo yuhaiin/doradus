@@ -9,7 +9,7 @@
 
 > 2026-08-11 启动可诊断性与 checklist 重排：foreground binary 默认把启动、API bind、runtime ready、shutdown/stopped 写到 stderr；
 > `YUHAIIN_QUIET` 只有 `1/true/yes/on` 才会关闭这些 console notice，避免环境中设置 `YUHAIIN_QUIET=0` 时误以为没有日志。
-> `IMPLEMENTATION_CHECKLIST.md` 现在按 crate 模块树、协议矩阵、P0/P1/P2 缺口和验收命令组织；当前仍明确标记 rootful TUN/TPROXY、Android/macOS 和生产/发布现场为未完成，不能从单元测试覆盖率推导为完整替换。
+> `IMPLEMENTATION_CHECKLIST.md` 现在按 crate 模块树、协议矩阵、未完成项和验收命令组织；当前仍明确标记 rootful TUN/TPROXY、Android/macOS 和生产/发布现场为未完成，不能从单元测试覆盖率推导为完整替换。
 
 > 2026-08-11 Go/Rust live flow parity：新增
 > `scripts/integration/go-live-flow-parity.sh` 与 `make go-live-flow-parity-smoke`。测试会在
@@ -2871,3 +2871,27 @@ TUN reload fixture 在禁用持久化 inbound 后，除了等待 `/sys/class/net
 需要在 `CAP_NET_ADMIN` 的 Podman namespace 中执行 `make tun-reload-traffic-smoke` 后再更新
 checklist。源码编译、`make fmt-check`、`make check`、`make clippy` 以及容器中的 API/chain/
 startup/live parity 均已通过，所有运行状态仍写入 `~/.cache`，没有使用 `/tmp`。
+
+## 92. 2026-08-11 SOCKS5 server protocol boundary
+
+此前 SOCKS5 inbound 的握手、地址解析、reply 编码和 UDP framing 与 runtime 的 selector、
+`ConnectionMonitor`、UDP flow map 混在 `crates/yuhaiin-runtime/src/inbounds/socks5.rs` 中，
+导致 outbound 使用 `yuhaiin-protocol::socks5`，inbound 却有另一份 wire codec。现在新增
+`yuhaiin-protocol::socks5_server`：
+
+- `server_handshake` 统一处理 greeting、username/password、CONNECT、UDP ASSOCIATE；
+- `read_endpoint`、`parse_endpoint_bytes`、`encode_endpoint` 统一 IPv4/IPv6/domain 地址；
+- `parse_udp_packet`、`encode_udp_packet` 统一 RFC 1928 UDP header；
+- `write_reply`、`write_reply_endpoint` 统一 server response。
+
+runtime 仍保留 inbound-specific 的认证快照、route/selector、`AsyncDatagram`、UDP idle
+reap、连接观察和 AEAD socket adapter，但不再重复维护 SOCKS5 字节协议。这样后续新增
+其他 listener 或 transport 时可以复用同一个 server codec，而不让 protocol crate 依赖
+runtime 的配置和 monitor 类型。
+
+新增 `make socks5-protocol-smoke`：宿主机只编译 test binary，实际 6 个 protocol tests
+在 `debian:testing` Podman、`network=none` 容器内执行；随后重新执行
+`make socks5-udp-associate-smoke`（1/1）和 `make service-chain-smoke`（14/14），确认
+真实 SOCKS5 UDP chain 以及 HTTP/2/TLS/Yuubinsya 多层链路未回归。构建日志和测试结果位于
+`~/.cache/yuhaiin-rust/integration-reusable/`，没有使用 `/tmp`，也没有在宿主机启动
+runtime、proxy 或 TUN。

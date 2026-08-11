@@ -62,6 +62,7 @@ flowchart TD
 已完成：
 
 - `[x]` RustCrypto TLS，HTTP/2 prior knowledge/client pool/server，HTTP CONNECT、SOCKS5 wire codec。
+- `[x]` SOCKS5 server-side wire codec 已下沉到 `yuhaiin-protocol::socks5_server`；runtime 只保留 inbound policy、selector 和 UDP flow 生命周期，`make socks5-protocol-smoke` 在 Podman 中覆盖 greeting/auth/request、IPv4/IPv6/domain 和 UDP framing。
 - `[x]` Yuubinsya TCP、UDP、UOT/dup-over-TCP，AEAD transport。
 - `[x]` transport 组合通过统一 stream/datagram trait 接入 chain，不把协议状态散落到 runtime。
 
@@ -155,8 +156,8 @@ flowchart TD
 | --- | :---: | :---: | --- |
 | direct / drop / fixed | fixed listener | 是 | `[x]` unit + service chain |
 | HTTP proxy / CONNECT | 是 | 是 | `[x]` |
-| SOCKS5 TCP | 是 | 是 | `[x]` |
-| SOCKS5 UDP ASSOCIATE | 是 | 是 | `[x]` `socks5-udp-associate-smoke` |
+| SOCKS5 TCP | 是 | 是 | `[x]` protocol codec + service chain |
+| SOCKS5 UDP ASSOCIATE | 是 | 是 | `[x]` protocol codec + `socks5-udp-associate-smoke` |
 | mixed/mix UDP | 是 | 是 | `[x]` Go mode regression |
 | SOCKS4A | 是 | — | `[x]` |
 | TLS | 是 | 是 | `[x]` TLS chain |
@@ -201,6 +202,7 @@ git diff --check
 
 ```bash
 make service-chain-smoke
+make socks5-protocol-smoke
 make api-contract-smoke
 make api-reload-flow-smoke
 make go-api-parity-smoke

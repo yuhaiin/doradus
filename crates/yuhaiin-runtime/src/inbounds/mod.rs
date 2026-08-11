@@ -33,6 +33,10 @@ use crate::{ConnectionMonitor, RuntimeController, RuntimeProxySelector};
 mod auth;
 pub(crate) use auth::InboundAuth;
 
+// Outbound SOCKS5 lives in yuhaiin-protocol; this module owns inbound policy
+// and flow lifetime.
+mod socks5;
+
 #[cfg(feature = "doh-tls")]
 pub(crate) type InboundTlsAcceptor = tokio_rustls::TlsAcceptor;
 #[cfg(not(feature = "doh-tls"))]
@@ -738,24 +742,26 @@ async fn start_listeners(
                 };
                 let logs = monitor.logs();
                 if let Some(password) = spec.aead_password.clone() {
-                    let socket = crate::proxy::socks5::AeadUdpSocket::new(
+                    let socket = crate::inbound::socks5::AeadUdpSocket::new(
                         socket,
                         password,
                         spec.aead_method,
                     );
                     listeners.push(tokio::spawn(async move {
-                        if let Err(error) =
-                            crate::proxy::socks5::serve_udp_socket(socket, spec, selector, monitor)
-                                .await
+                        if let Err(error) = crate::inbound::socks5::serve_udp_socket(
+                            socket, spec, selector, monitor,
+                        )
+                        .await
                         {
                             logs.error(format!("AEAD SOCKS5 UDP listener stopped: {error}"));
                         }
                     }));
                 } else {
                     listeners.push(tokio::spawn(async move {
-                        if let Err(error) =
-                            crate::proxy::socks5::serve_udp_socket(socket, spec, selector, monitor)
-                                .await
+                        if let Err(error) = crate::inbound::socks5::serve_udp_socket(
+                            socket, spec, selector, monitor,
+                        )
+                        .await
                         {
                             logs.error(format!("SOCKS5 UDP listener stopped: {error}"));
                         }
@@ -1896,7 +1902,7 @@ where
 {
     match protocol.as_str() {
         "socks4a" => crate::proxy::socks4a::serve(stream, peer, spec, selector, monitor).await,
-        "socks5" => crate::proxy::socks5::serve(stream, peer, spec, selector, monitor).await,
+        "socks5" => crate::inbound::socks5::serve(stream, peer, spec, selector, monitor).await,
         "http" => crate::proxy::http::serve(stream, peer, spec, selector, monitor).await,
         "reverse_tcp" => {
             crate::proxy::reverse::serve_tcp(stream, peer, spec, selector, monitor).await
@@ -1953,7 +1959,7 @@ where
     if first[0] == 4 {
         crate::proxy::socks4a::serve(stream, peer, spec, selector, monitor).await
     } else if first[0] == 5 {
-        crate::proxy::socks5::serve(stream, peer, spec, selector, monitor).await
+        crate::inbound::socks5::serve(stream, peer, spec, selector, monitor).await
     } else {
         crate::proxy::http::serve(stream, peer, spec, selector, monitor).await
     }
@@ -3225,7 +3231,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             let server_address = server.local_addr().unwrap();
             let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let (selector, monitor) = direct_runtime().await;
-            let listener_task = tokio::spawn(crate::proxy::socks5::serve_socks5_udp_loop(
+            let listener_task = tokio::spawn(crate::inbound::socks5::serve_socks5_udp_loop(
                 server,
                 InboundSpec {
                     id: "socks-udp-close-inbound".to_owned(),
@@ -3251,11 +3257,11 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             let result = tokio::time::timeout(Duration::from_secs(2), async {
                 let target = Endpoint::ip(Network::Udp, target_address);
                 let packet =
-                    crate::proxy::socks5::encode_socks_udp_packet(&target, b"udp-close").unwrap();
+                    crate::inbound::socks5::encode_socks_udp_packet(&target, b"udp-close").unwrap();
                 client.send_to(&packet, server_address).await.unwrap();
                 let mut reply = [0u8; 2048];
                 let (length, _) = client.recv_from(&mut reply).await.unwrap();
-                let (_, payload) = crate::proxy::socks5::parse_socks_udp_packet(&reply[..length])
+                let (_, payload) = crate::inbound::socks5::parse_socks_udp_packet(&reply[..length])
                     .unwrap()
                     .unwrap();
                 assert_eq!(payload, b"udp-close");
@@ -3317,7 +3323,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             let listener_monitor = monitor.clone();
             let listener_task = tokio::spawn(async move {
                 let (stream, peer) = inbound_listener.accept().await.unwrap();
-                let _ = crate::proxy::socks5::serve(
+                let _ = crate::inbound::socks5::serve(
                     stream,
                     peer,
                     InboundSpec {
@@ -3370,7 +3376,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             let client = UdpSocket::bind("127.0.0.2:0").await.unwrap();
             let target = Endpoint::ip(Network::Udp, target_address);
             let packet =
-                crate::proxy::socks5::encode_socks_udp_packet(&target, b"udp-associate").unwrap();
+                crate::inbound::socks5::encode_socks_udp_packet(&target, b"udp-associate").unwrap();
             client.send_to(&packet, relay_address).await.unwrap();
             let mut reply = [0u8; 2048];
             let (length, _) =
@@ -3378,7 +3384,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     .await
                     .unwrap()
                     .unwrap();
-            let (_, payload) = crate::proxy::socks5::parse_socks_udp_packet(&reply[..length])
+            let (_, payload) = crate::inbound::socks5::parse_socks_udp_packet(&reply[..length])
                 .unwrap()
                 .unwrap();
             assert_eq!(payload, b"udp-associate");
