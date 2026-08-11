@@ -7,6 +7,10 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
+> 2026-08-11 启动可诊断性与 checklist 重排：foreground binary 默认把启动、API bind、runtime ready、shutdown/stopped 写到 stderr；
+> `YUHAIIN_QUIET` 只有 `1/true/yes/on` 才会关闭这些 console notice，避免环境中设置 `YUHAIIN_QUIET=0` 时误以为没有日志。
+> `IMPLEMENTATION_CHECKLIST.md` 现在按 crate 模块树、协议矩阵、P0/P1/P2 缺口和验收命令组织；当前仍明确标记 rootful TUN/TPROXY、Android/macOS 和生产/发布现场为未完成，不能从单元测试覆盖率推导为完整替换。
+
 > 2026-08-11 Go/Rust live flow parity：新增
 > `scripts/integration/go-live-flow-parity.sh` 与 `make go-live-flow-parity-smoke`。测试会在
 > `~/.cache/yuhaiin-rust/integration/go-live-flow-parity/<run>/` 下分别启动 Go/Rust 进程和

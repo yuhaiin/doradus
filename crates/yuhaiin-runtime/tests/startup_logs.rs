@@ -22,7 +22,9 @@ async fn foreground_service_emits_startup_progress_by_default() {
     let mut child = Command::new(runtime_binary)
         .env("YUHAIIN_DB", &database)
         .env("YUHAIIN_HTTP", address.to_string())
-        .env_remove("YUHAIIN_QUIET")
+        // A false-valued quiet switch must not hide the foreground startup
+        // diagnostics. This catches the common inherited-environment case.
+        .env("YUHAIIN_QUIET", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()

@@ -274,7 +274,16 @@ fn print_help() {
 }
 
 fn console_logs_enabled() -> bool {
-    std::env::var_os("YUHAIIN_QUIET").is_none()
+    !quiet_env_value_enabled(std::env::var("YUHAIIN_QUIET").ok().as_deref())
+}
+
+fn quiet_env_value_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn console_notice(message: impl std::fmt::Display) {
@@ -286,7 +295,7 @@ fn console_notice(message: impl std::fmt::Display) {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{RunOptions, parse_run_options};
+    use super::{RunOptions, parse_run_options, quiet_env_value_enabled};
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -331,6 +340,16 @@ mod tests {
     #[test]
     fn empty_arguments_mean_default_run() {
         assert_eq!(parse_run_options(&[]), Ok(RunOptions::default()));
+    }
+
+    #[test]
+    fn quiet_switch_requires_an_explicit_truthy_value() {
+        assert!(!quiet_env_value_enabled(None));
+        assert!(!quiet_env_value_enabled(Some("0")));
+        assert!(!quiet_env_value_enabled(Some("false")));
+        assert!(quiet_env_value_enabled(Some("1")));
+        assert!(quiet_env_value_enabled(Some(" TRUE ")));
+        assert!(quiet_env_value_enabled(Some("on")));
     }
 }
 
