@@ -177,6 +177,28 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     wait_for_listener_closed(inbound).await;
     connect_and_echo(moved_inbound, &second_authority, b"after-inbound-reload").await;
 
+    let mut disabled_inbound = updated_inbound.clone();
+    disabled_inbound["enabled"] = json!(false);
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::PUT,
+        "/api/v2/inbounds/http-chain-in",
+        Some(&disabled_inbound),
+    )
+    .await;
+    wait_for_listener_closed(moved_inbound).await;
+
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::PUT,
+        "/api/v2/inbounds/http-chain-in",
+        Some(&updated_inbound),
+    )
+    .await;
+    connect_and_echo(moved_inbound, &second_authority, b"after-inbound-reenable").await;
+
     let proxy_authority_count_before_direct_route = second
         .connect_authorities
         .lock()

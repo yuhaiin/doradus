@@ -195,18 +195,7 @@ async fn load_go_tun_config(
     store: &yuhaiin_store::ConfigStore,
 ) -> Result<Option<TunRuntimeConfig>> {
     let records = store.repository().list_go_inbounds().await?;
-    let mut tun_records = records.into_iter().filter(|record| {
-        record.protocol_type.eq_ignore_ascii_case("tun")
-            || serde_json::from_slice::<Value>(&record.data_json)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .pointer("/protocol/type")
-                        .and_then(Value::as_str)
-                        .map(|protocol| protocol.eq_ignore_ascii_case("tun"))
-                })
-                .unwrap_or(false)
-    });
+    let mut tun_records = records.into_iter().filter(is_tun_record);
     let Some(record) = tun_records.next() else {
         return Ok(None);
     };
@@ -216,6 +205,47 @@ async fn load_go_tun_config(
         ));
     }
     Ok(Some(parse_go_tun_config(&record)?))
+}
+
+#[cfg(feature = "tun")]
+fn is_tun_record(record: &GoInboundRecord) -> bool {
+    record.protocol_type.eq_ignore_ascii_case("tun")
+        || serde_json::from_slice::<Value>(&record.data_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/protocol/type")
+                    .and_then(Value::as_str)
+                    .map(|protocol| protocol.eq_ignore_ascii_case("tun"))
+            })
+            .unwrap_or(false)
+}
+
+/// Reload the TUN switch for an externally-owned device without accidentally
+/// disabling embedders that keep their TUN configuration outside SQLite.
+///
+/// Desktop service runs can always derive their device from the persisted Go
+/// inbound, while Android/iOS hosts may pass a `TunRuntimeConfig` created by
+/// the platform VPN API.  The latter uses the fallback until a persisted Go
+/// TUN record or Rust overlay exists.  Once either source exists, the store is
+/// authoritative, including `enabled = false`.
+#[cfg(feature = "tun")]
+pub(crate) async fn load_tun_config_for_supervisor(
+    store: &yuhaiin_store::ConfigStore,
+    fallback: TunRuntimeConfig,
+) -> Result<TunRuntimeConfig> {
+    let has_overlay = store.get_config("tun.runtime").await?.is_some();
+    let has_go_tun = store
+        .repository()
+        .list_go_inbounds()
+        .await?
+        .iter()
+        .any(is_tun_record);
+    if has_overlay || has_go_tun {
+        load_tun_config(store).await
+    } else {
+        Ok(fallback)
+    }
 }
 
 #[cfg(feature = "tun")]
@@ -547,6 +577,23 @@ mod tests {
     use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
     use yuhaiin_store::ConfigStore;
 
+    fn platform_tun_config(enabled: bool) -> TunRuntimeConfig {
+        TunRuntimeConfig {
+            enabled,
+            tun: yuhaiin_core::tun::TunConfig {
+                name: Some("platform-vpn".to_owned()),
+                ipv4: Some((Ipv4Addr::new(10, 42, 0, 1), 24)),
+                ..Default::default()
+            },
+            routes: Vec::new(),
+            direct_id: "direct".to_owned(),
+            proxy_id: Some("proxy".to_owned()),
+            bypass_id: String::new(),
+            drop_id: String::new(),
+            channel_capacity: 256,
+        }
+    }
+
     #[tokio::test]
     async fn injected_tun_host_can_load_shared_persisted_config_without_opening_device() {
         let store = ConfigStore::open_memory().await.unwrap();
@@ -639,6 +686,34 @@ mod tests {
         assert!(!config.enabled);
         assert!(config.tun.ipv4.is_none());
         assert!(config.tun.ipv6.is_empty());
+    }
+
+    #[tokio::test]
+    async fn injected_tun_supervisor_keeps_platform_config_without_persisted_tun() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let fallback = platform_tun_config(true);
+        let config = load_tun_config_for_supervisor(&store, fallback.clone())
+            .await
+            .unwrap();
+        assert_eq!(config.enabled, fallback.enabled);
+        assert_eq!(config.tun.name, fallback.tun.name);
+    }
+
+    #[tokio::test]
+    async fn injected_tun_supervisor_honors_persisted_disable_after_reload() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        store
+            .put_config(
+                "tun.runtime",
+                br#"{"enabled":false,"name":"platform-vpn","ipv4":"10.42.0.1/24"}"#,
+            )
+            .await
+            .unwrap();
+        let config = load_tun_config_for_supervisor(&store, platform_tun_config(true))
+            .await
+            .unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.tun.name.as_deref(), Some("platform-vpn"));
     }
 
     #[tokio::test]

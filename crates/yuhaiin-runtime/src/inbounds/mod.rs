@@ -149,32 +149,57 @@ pub async fn run_until_with_tun_runtime(
     mut tun: yuhaiin_core::tun::TunRuntime,
     config: crate::TunRuntimeConfig,
 ) -> Result<()> {
-    if !config.enabled {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            "injected TUN runtime is disabled",
-        ));
-    }
-
     let tun_controller = controller.clone();
     let tun_shutdown = shutdown.clone();
     let tun_monitor = controller.monitor();
     let tun_task = tokio::task::spawn_local(async move {
+        let mut config = config;
         loop {
-            match crate::run_tun_device_until_ref(
-                tun_controller.clone(),
-                &mut tun,
+            if config.enabled {
+                tun_monitor.info("TUN inbound started");
+                match crate::run_tun_device_until_ref(
+                    tun_controller.clone(),
+                    &mut tun,
+                    config.clone(),
+                    tun_shutdown.clone(),
+                )
+                .await
+                {
+                    Ok(()) if *tun_shutdown.borrow() => break,
+                    Ok(()) => {}
+                    Err(error) => {
+                        tun_monitor.error(format!("injected TUN inbound stopped: {error}"));
+                        break;
+                    }
+                }
+            } else {
+                tun_monitor.info("TUN inbound disabled");
+            }
+            if *tun_shutdown.borrow() {
+                break;
+            }
+
+            config = match crate::data_plane::load_tun_config_for_supervisor(
+                tun_controller.store(),
                 config.clone(),
-                tun_shutdown.clone(),
             )
             .await
             {
-                Ok(()) if *tun_shutdown.borrow() => break,
-                Ok(()) => continue,
+                Ok(config) => config,
                 Err(error) => {
-                    tun_monitor.error(format!("injected TUN inbound stopped: {error}"));
-                    break;
+                    tun_monitor.error(format!("reload TUN inbound config failed: {error}"));
+                    if crate::wait_for_shutdown_or_reload(&tun_controller, tun_shutdown.clone())
+                        .await
+                    {
+                        break;
+                    }
+                    continue;
                 }
+            };
+            if !config.enabled
+                && crate::wait_for_shutdown_or_reload(&tun_controller, tun_shutdown.clone()).await
+            {
+                break;
             }
         }
     });

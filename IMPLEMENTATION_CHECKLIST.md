@@ -1,6 +1,6 @@
 # yuhaiin Go → Rust 实现清单
 
-更新时间：2026-08-10
+更新时间：2026-08-11
 
 这份文件只回答四个问题：现在有什么、完成到哪里、还缺什么、下一步怎么验收。
 Go 源码映射、设计取舍和历史结果放在 [MIGRATION.md](MIGRATION.md)，不在这里重复堆长段落。
@@ -170,6 +170,7 @@ flowchart LR
 
 - `[~]` Linux `tproxy` UDP：实现已存在，但当前 rootless Podman 只允许明确 skip；需要 rootful/CAP_NET_ADMIN namespace 验收多 flow、异常 teardown。
 - `[~]` inbound listen socket 的平台专用绑定仍需 Android/macOS 验收。
+- `评估中` WireGuard：Go 使用自有 `wireguard-go` userspace tunnel；Rust 已确认 `boringtun 0.7.1` 可作为协议引擎候选，但还缺 `Wireguard` 配置/peer/allowed-IP 映射、UDP underlay、虚拟 TUN/channel、`AsyncProxy`/`AsyncDatagram` 适配和 Go↔Rust 互操作 fixture，当前没有放入半成品。
 - `延期` Shadowsocks/SSR、Tailscale、Reality、Mux、QUIC；不作为当前替换门槛。
 
 ### 证据
@@ -206,6 +207,7 @@ flowchart LR
 
 - `[~]` 超过有界 fragment 重组上限的长流、更多 namespace teardown 矩阵。
 - `[~]` 新增 live connection metadata smoke：在 TUN flow 存活期间断言 `component/inbound/nodeId/outbound/localAddr`；当前 rootless Podman 现场没有稳定的 TUN netdev/route，需在干净或 rootful namespace 重跑后才能升级为现场证据。
+- `[~]` 注入式 TUN supervisor reload 代码已重新读取持久化 `enabled`；关闭后停止 packet dispatcher，重新开启后恢复，外部平台未持久化 TUN 配置时保留 host 传入的 fallback config。当前已有 config/lifecycle 单测，真实 VpnService/utun dispatcher 仍待现场验收。
 - `[~]` Android VpnService fd/权限/route/电量/RSS；macOS utun/权限/route。
 - 下一步：先补 Linux 超限 fragment 的进程级恢复证据，再做 Android/macOS 实机验收。
 

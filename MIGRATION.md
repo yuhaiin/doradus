@@ -7,6 +7,10 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
+> 2026-08-11 inbound live switch 修复：普通 socket inbound 的 API reload 流程新增了 disable → listener closed → enable → traffic restored 的真实进程回归。此前注入式 TUN（Android/VpnService 等）路径只捕获初始 `TunRuntimeConfig`，reload 后即使持久化的 TUN inbound 已变成 `enabled=false`，仍会继续运行 dispatcher；现在 `run_until_with_tun_runtime` 在每次 reload 后重新读取 Go inbound/`tun.runtime`，关闭时停止 packet dispatcher，重新开启时复用外部 device 重建 proxy runtime。没有持久化 TUN 记录的宿主仍使用传入的 fallback config。新增 data-plane config tests；真实 VpnService/utun 现场仍待平台验收。
+
+> 2026-08-11 WireGuard 评估：Go 的 `pkg/net/proxy/wireguard` 不是普通 socket proxy，而是 `wireguard-go` userspace device + custom `NetTun`/`PacketConn`，需要把 peer/allowed IP、UDP underlay、虚拟 TUN packet channel 和连接式 `AsyncProxy` 边界全部接起来。Rust 已验证 [boringtun 0.7.1](https://crates.io/crates/boringtun) 的 `noise::Tunn` 可作为协议引擎候选，且不需要把 C TLS 引入 workspace；但它不会直接提供 yuhaiin 所需的 `AsyncProxy`/`AsyncDatagram` adapter。当前先不加入不可运行的配置分支，待主链路和 TUN 平台验收后，以 Go↔Rust handshake/transport fixture 为入口实现并单独做 benchmark。
+
 > 2026-08-10 TUN live connection metadata fixture：`tun-service-smoke` 增加可选的 `YUHAIIN_TUN_ASSERT_CONNECTIONS=1` 模式，并提供 `make tun-connection-metadata-smoke`。它在真实 TUN traffic 仍存活时读取同一 `ConnectionMonitor`，要求 `component=tun`、选中 node、非空 outbound endpoint、非空 localAddr，避免只用 payload echo 掩盖 connections 元数据丢失。当前 rootless Podman 运行现场只能看到 `runtime-tun-opened`，随后客户端无法建立回显流；容器内 `/proc/net/dev`/`/sys/class/net` 未出现稳定的 `yrtun0`，因此该 smoke 尚未作为通过证据，需 rootful 或干净网络 namespace 重跑。失败现场保留在 `~/.cache/yuhaiin-rust/integration/tun-*`，未使用 `/tmp`。
 
 > 2026-08-10 loopback outbound endpoint wiring：`AsyncStream` 现在可以携带可选的真实本地 `SocketAddr` 元数据；direct/fixed、blocking HTTP CONNECT、SOCKS5、RustCrypto TLS、HTTP/2 pool 以及 Yuubinsya TCP/UOT 均保留该元数据。`RuntimeProxySelector` 对选中的 proxy 统一包一层 stream/datagram lifetime guard，注册采用引用计数，连接释放或 datagram close 后自动移除；UOT reconnect 会更新当前底层 endpoint；新增 core/H2 metadata 单测。真实 TUN 自环现场验收和未暴露 socket 的内存 transport 仍按安全降级处理。
