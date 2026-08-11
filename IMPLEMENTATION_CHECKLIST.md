@@ -19,7 +19,7 @@ Go 源码映射、设计取舍和历史结果放在 [MIGRATION.md](MIGRATION.md)
 | 已完成 `[x]` | 55 项（83.3%） |
 | 主路径完成 `[~]` | 12 项（18.2%） |
 | 加权覆盖率 | **92.4%**（`(55 + 12 × 0.5) / 66`） |
-| 明确延期 | 订阅、DoQ/DoH3、Shadowsocks/SSR、Tailscale、Reality、Mux、QUIC 等复杂协议 |
+| 明确延期 | 订阅、DoQ/DoH3、Shadowsocks/SSR、WireGuard、Tailscale、Reality、Mux、QUIC 等复杂协议 |
 | 当前总体状态 | **未完成**：Linux 主链路已可运行，平台/生产/少数边界证据仍缺 |
 
 ### 主链路
@@ -172,7 +172,7 @@ flowchart LR
 
 - `[~]` Linux `tproxy` UDP：实现已存在，但当前 rootless Podman 只允许明确 skip；需要 rootful/CAP_NET_ADMIN namespace 验收多 flow、异常 teardown。
 - `[~]` inbound listen socket 的平台专用绑定仍需 Android/macOS 验收。
-- `评估中` WireGuard：Go 使用自有 `wireguard-go` userspace tunnel；Rust 已确认 `boringtun 0.7.1` 可作为协议引擎候选，但还缺 `Wireguard` 配置/peer/allowed-IP 映射、UDP underlay、虚拟 TUN/channel、`AsyncProxy`/`AsyncDatagram` 适配和 Go↔Rust 互操作 fixture，当前没有放入半成品。
+- `延期` WireGuard：Go 使用自有 `wireguard-go` userspace tunnel。已审计 `tokio-wireguard 0.1.3`、`onetun 0.3.10` 和 `wiretap-rs 0.3.0`：它们分别依赖旧 `boringtun 0.6`/`x25519-dalek 2.0.0-rc.3`，与当前 `rustls-rustcrypto` 的稳定版 `x25519-dalek 2.x` 冲突，或只提供 native/UAPI/独立 port-forwarder；不能直接作为 yuhaiin 的 `AsyncProxy`/`AsyncDatagram` backend。当前不加入不可构建半成品。若后续引入兼容 `boringtun 0.7.x` 的 userspace TCP/UDP stack，再按配置、peer/allowed-IP、PSK、UDP underlay、Go↔Rust fixture 和 benchmark 重新开启。
 - `延期` Shadowsocks/SSR、Tailscale、Reality、Mux、QUIC；不作为当前替换门槛。
 
 ### 证据
