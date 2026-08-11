@@ -116,7 +116,7 @@ flowchart TD
 
 - `[x]` `RuntimeSnapshot` + atomic reload；API mutation 会重新构建 live selector/listener。
 - `[x]` 普通 inbound 统一由 `inbound::run_until` 管理：SOCKS5、mixed、HTTP、Yuubinsya、reverse、UDP、TLS/HTTP2 transport。
-- `[~]` TUN 作为 inbound 生命周期的一部分；桌面设备和注入式 host FD 都有统一 shutdown/abort/reload 边界，但 Android/macOS 目前还没有宿主调用方和真实 fd/route 现场证据。
+- `[~]` TUN 作为 inbound 生命周期的一部分；桌面设备和注入式 host FD 都有统一 shutdown/abort/reload 边界，且已提取可复用的 `RuntimeService` 宿主编排，但 Android/macOS 目前还没有 JNI/AAR、宿主调用方和真实 fd/route 现场证据。
 - `[x]` connections、SSE、traffic、telemetry、history、failed history、node latency、pprof。
 - `[x]` Go/Rust API read/mutation/error parity、live flow parity、API reload flow、stats concurrency。
 - `[x]` 启动日志默认写 stderr：数据库、API bind/listen、runtime ready、shutdown/stopped；`YUHAIIN_QUIET` 只接受显式 truthy 值。

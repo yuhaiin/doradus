@@ -6,18 +6,9 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
 
-use tokio::sync::watch;
-
-use yuhaiin_core::dns_resolver_async::{AsyncIpResolver, SystemAsyncIpResolver};
 use yuhaiin_core::{Error, ErrorKind, Result};
-#[cfg(not(feature = "doh-tls"))]
-use yuhaiin_runtime::BuiltinResolverFactory;
-use yuhaiin_runtime::api::ApiState;
-use yuhaiin_runtime::{RuntimeBuilder, RuntimeController, inbound, run_dns_supervisor};
-use yuhaiin_store::{ConfigStore, restore_database};
+use yuhaiin_runtime::service::{RuntimeService, ServiceOptions};
 
 mod service;
 
@@ -99,41 +90,6 @@ async fn run(options: RunOptions) -> Result<()> {
     if let Some(parent) = database.parent() {
         std::fs::create_dir_all(parent).map_err(io_error)?;
     }
-    let store = ConfigStore::open(&database).await?;
-    console_notice("configuration database opened");
-
-    let upstream: Arc<dyn AsyncIpResolver> = Arc::new(SystemAsyncIpResolver);
-    let mut builder = RuntimeBuilder::new(store.clone(), upstream);
-    #[cfg(feature = "doh-tls")]
-    {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let config =
-            rustls::ClientConfig::builder_with_provider(Arc::new(rustls_rustcrypto::provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-                .map_err(|error| Error::new(ErrorKind::Protocol, format!("TLS provider: {error}")))?
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-        builder = builder.with_resolver_factory(Arc::new(
-            yuhaiin_runtime::RustCryptoResolverFactory::from_client_config(
-                Arc::new(config),
-                Duration::from_secs(5),
-                256,
-            ),
-        ));
-    }
-    #[cfg(not(feature = "doh-tls"))]
-    {
-        builder = builder.with_resolver_factory(Arc::new(BuiltinResolverFactory::new(
-            Duration::from_secs(5),
-            256,
-        )));
-    }
-    let controller = RuntimeController::from_builder(builder).await?;
-    let logs = controller.monitor().logs();
-    if console_logs_enabled() {
-        logs.enable_console();
-    }
     let listen = options
         .listen
         .or_else(|| std::env::var("YUHAIIN_HTTP").ok())
@@ -141,14 +97,6 @@ async fn run(options: RunOptions) -> Result<()> {
         .parse::<SocketAddr>()
         .map_err(|error| Error::invalid(format!("YUHAIIN_HTTP is invalid: {error}")))?;
     console_notice(format!("binding HTTP API on {listen}"));
-    let listener = tokio::net::TcpListener::bind(listen)
-        .await
-        .map_err(|error| Error::new(ErrorKind::Io, format!("bind HTTP API: {error}")))?;
-    let actual_listen = listener
-        .local_addr()
-        .map_err(|error| Error::new(ErrorKind::Io, format!("read HTTP API address: {error}")))?;
-    console_notice(format!("HTTP API listening on http://{actual_listen}"));
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let username = options
         .username
         .or_else(|| std::env::var("YUHAIIN_API_USERNAME").ok())
@@ -157,46 +105,28 @@ async fn run(options: RunOptions) -> Result<()> {
         .password
         .or_else(|| std::env::var("YUHAIIN_API_PASSWORD").ok())
         .unwrap_or_default();
-    let mut state = ApiState::new(controller.clone())
-        .with_shutdown(shutdown_tx.clone())
-        .with_optional_auth(username, password);
-    if let Some(external_web) = options.external_web {
-        state = state.with_external_web(external_web);
+    let mut service_options = ServiceOptions::new(database, listen);
+    service_options.username = username;
+    service_options.password = password;
+    service_options.external_web = options.external_web.map(PathBuf::from);
+    let service = RuntimeService::start(service_options).await?;
+    let logs = service.logs();
+    if console_logs_enabled() {
+        logs.enable_console();
     }
-    let signal_tx = shutdown_tx.clone();
+    console_notice("configuration database opened");
+    console_notice(format!(
+        "HTTP API listening on http://{}",
+        service.address()
+    ));
+    let signal_tx = service.shutdown_handle();
     tokio::spawn(async move {
         wait_for_process_shutdown().await;
+        console_notice("shutdown requested; stopping runtime tasks");
         let _ = signal_tx.send(true);
     });
-
-    let dns_task =
-        tokio::task::spawn_local(run_dns_supervisor(controller.clone(), shutdown_rx.clone()));
-    let inbound_task =
-        tokio::task::spawn_local(inbound::run_until(controller.clone(), shutdown_rx.clone()));
-
-    let api_task = tokio::spawn(yuhaiin_runtime::api::serve_until(
-        listener,
-        state,
-        wait_for_shutdown(shutdown_rx),
-    ));
     console_notice("runtime ready; DNS, inbound and HTTP API supervisors started");
-    let api_result = api_task
-        .await
-        .map_err(|error| Error::new(ErrorKind::Io, format!("HTTP API task: {error}")))?;
-    console_notice("shutdown requested; stopping runtime tasks");
-    let _ = shutdown_tx.send(true);
-
-    if let Err(error) = dns_task.await.map_err(join_error)? {
-        logs.error(format!("DNS task stopped: {error}"));
-    }
-    if let Err(error) = inbound_task.await.map_err(join_error)? {
-        logs.error(format!("inbound task stopped: {error}"));
-    }
-    controller.persist_monitor().await?;
-    if let Some(source) = controller.take_restore_request() {
-        restore_database(source, &database).await?;
-    }
-    let result = api_result.map_err(io_error);
+    let result = service.wait().await;
     if result.is_ok() {
         console_notice("stopped");
     }
@@ -353,13 +283,6 @@ mod tests {
     }
 }
 
-async fn wait_for_shutdown(mut receiver: watch::Receiver<bool>) {
-    if *receiver.borrow() {
-        return;
-    }
-    while receiver.changed().await.is_ok() && !*receiver.borrow() {}
-}
-
 async fn wait_for_process_shutdown() {
     #[cfg(unix)]
     {
@@ -384,7 +307,4 @@ async fn wait_for_process_shutdown() {
 
 fn io_error(error: impl std::fmt::Display) -> Error {
     Error::new(ErrorKind::Io, error.to_string())
-}
-fn join_error(error: tokio::task::JoinError) -> Error {
-    io_error(error)
 }

@@ -60,6 +60,8 @@
 
 > 2026-08-11 注入式 TUN supervisor：宿主传入的 fd 在 proxy snapshot 暂不可构建时不再永久退出；supervisor 会保留 fd 所属的 inbound 生命周期并等待下一次 API reload 后重试。当前 rootless Podman（宿主 `CapEff=0`）中，TUN smoke 在 reload 前后都停在 0 字节，属于缺少 `CAP_NET_ADMIN`/route 的环境证据，不能作为 Rust TUN 数据面通过。
 
+> 2026-08-11 RuntimeService host boundary：将 SQLite 打开、resolver/controller、API、DNS、普通 inbound、注入式 TUN 和 shutdown/persist 编排提取到 `yuhaiin_runtime::service::RuntimeService`；CLI 已使用该入口，未来 Android JNI/AAR 只需提供 `ServiceOptions` 与 host TUN fd，不再复制一套 runtime supervisor。JNI/AAR 本身仍未实现。
+
 > 2026-08-11 TCP/UDP selected node data-plane parity：Go `NodeRuntime.Get` 按网络分别读取 `selected_tcp_node_v2` 与 `selected_udp_node_v2`；Rust 原先在 inbound/TUN supervisor 中只读取 TCP selection，导致 UDP 也走 TCP 节点。现在 `RuntimeProxySelector` 同时维护 TCP/UDP routed slots，TCP flow、UDP flow、SOCKS5/Yuubinsya UDP 和 TUN UDP 按 `FlowContext.network` 选择对应节点；reload、`close_node`、active-node 汇总、outbound metadata 和旧单 selection API 均同步覆盖双路。新增 selector 单测；runtime 223 个单测、core 136 个单测和 `make service-chain-smoke` 13 条真实进程链全部通过。service-chain smoke 的共享等待窗口也从 2 秒扩大到 10 秒，避免并行 Podman/进程负载下 monitor 可见性偶发超时。
 
 > 2026-08-10 TUN live connection metadata fixture：`tun-service-smoke` 增加可选的 `YUHAIIN_TUN_ASSERT_CONNECTIONS=1` 模式，并提供 `make tun-connection-metadata-smoke`。它在真实 TUN traffic 仍存活时读取同一 `ConnectionMonitor`，要求 `component=tun`、选中 node、非空 outbound endpoint、非空 localAddr，避免只用 payload echo 掩盖 connections 元数据丢失。当前 rootless Podman 运行现场只能看到 `runtime-tun-opened`，随后客户端无法建立回显流；容器内 `/proc/net/dev`/`/sys/class/net` 未出现稳定的 `yrtun0`，因此该 smoke 尚未作为通过证据，需 rootful 或干净网络 namespace 重跑。失败现场保留在 `~/.cache/yuhaiin-rust/integration/tun-*`，未使用 `/tmp`。

@@ -26,6 +26,8 @@ mod resolver;
 mod route;
 #[cfg(feature = "doh-tls")]
 mod rustcrypto_resolver;
+#[cfg(feature = "http-api")]
+pub mod service;
 mod settings;
 #[cfg(feature = "update")]
 pub mod update;
