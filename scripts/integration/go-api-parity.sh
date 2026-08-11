@@ -238,6 +238,8 @@ if [[ "${YUHAIIN_MUTATION_PARITY:-1}" == "1" ]]; then
   inbound_id="rust-api-parity-inbound-${mutation_suffix}"
   resolver_id="rust-api-parity-resolver-${mutation_suffix}"
   list_id="rust-api-parity-list-${mutation_suffix}"
+  process_list_id="rust-api-parity-process-list-${mutation_suffix}"
+  inbound_list_id="rust-api-parity-inbound-list-${mutation_suffix}"
   rule_id="rust-api-parity-rule-${mutation_suffix}"
   tag_id="rust-api-parity-tag-${mutation_suffix}"
 
@@ -304,15 +306,24 @@ if [[ "${YUHAIIN_MUTATION_PARITY:-1}" == "1" ]]; then
   compare_mutation route-list-post route.lists.post "${list_body}"
   compare_mutation route-list-get route.list.get "$(jq -cn --arg id "${list_id}" '{id:$id}')"
 
+  process_list_body="$(jq -cn --arg name "${process_list_id}" '{name:$name,type:"process",source:{type:"local",local:{lists:["parity-process"]}}}')"
+  compare_mutation route-process-list-post route.lists.post "${process_list_body}"
+  compare_mutation route-process-list-get route.list.get "$(jq -cn --arg id "${process_list_id}" '{id:$id}')"
+  inbound_list_body="$(jq -cn --arg name "${inbound_list_id}" '{name:$name,type:"inbound",source:{type:"local",local:{lists:["parity-inbound"]}}}')"
+  compare_mutation route-inbound-list-post route.lists.post "${inbound_list_body}"
+  compare_mutation route-inbound-list-get route.list.get "$(jq -cn --arg id "${inbound_list_id}" '{id:$id}')"
+
   # Exercise a nested matcher rather than only a single host-list predicate:
   # parity.example is in the list but the requested port (443) is outside the
   # rule's 8443 range, so both services must expose the rejected rule history.
-  rule_body="$(jq -cn --arg name "${rule_id}" --arg list "${list_id}" '{name:$name,mode:"direct",tag:"parity",rules:[{type:"all",all:[{type:"host",host:{list:$list}},{type:"port",port:{ports:"8443"}}]}]}')"
+  rule_body="$(jq -cn --arg name "${rule_id}" --arg list "${list_id}" --arg process_list "${process_list_id}" '{name:$name,mode:"direct",tag:"parity",rules:[{type:"all",all:[{type:"host",host:{list:$list}},{type:"process",process:{list:$process_list}},{type:"inbound",inbound:{names:["parity-inbound"]}},{type:"port",port:{ports:"8443"}},{type:"not",not:{type:"port",port:{ports:"9443"}}}]}]}')"
   compare_mutation route-rule-post route.rules.post "${rule_body}"
   compare_mutation route-rule-get route.rule.get "$(jq -cn --arg name "${rule_id}" '{name:$name,index:0}')"
   compare_mutation route-apply route.apply '{}'
   compare_mutation route-rules-test route.rules.test '{"host":"parity.example:443"}'
   compare_mutation route-list-delete route.list.delete "$(jq -cn --arg id "${list_id}" '{id:$id}')"
+  compare_mutation route-process-list-delete route.list.delete "$(jq -cn --arg id "${process_list_id}" '{id:$id}')"
+  compare_mutation route-inbound-list-delete route.list.delete "$(jq -cn --arg id "${inbound_list_id}" '{id:$id}')"
   compare_mutation route-tag-put route.tag.put "$(jq -cn --arg tag "${tag_id}" '{tag:$tag,type:"node",hash:""}')"
   compare_mutation route-tag-get route.tags.get "$(jq -cn --arg query "${tag_id}" '{query:$query}')"
   compare_mutation route-tag-delete route.tag.delete "$(jq -cn --arg tag "${tag_id}" '{tag:$tag}')"

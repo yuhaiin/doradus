@@ -42,7 +42,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
+.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -67,6 +67,7 @@ help:
 		'make api-contract-smoke run the frontend management API process contract in Podman' \
 		'make api-reload-flow-smoke verify mutation reloads the real data plane and survives restart' \
 		'make go-api-parity-smoke compare read and core mutation API responses against a Go state snapshot' \
+		'make refact-user-parity-smoke compare users CRUD against the Go refact-user branch' \
 		'make production-parity-smoke compare several stopped production SQLite snapshots' \
 		'make legacy-v1-runtime-smoke build a runtime snapshot from a copied Go v1 state.db' \
 		'make go-rust-stats-smoke run concurrent Go/Rust SQLite statistics smoke in Podman' \
@@ -155,6 +156,9 @@ api-reload-flow-smoke:
 
 go-api-parity-smoke:
 	./scripts/integration/go-api-parity.sh
+
+refact-user-parity-smoke:
+	./scripts/integration/refact-user-parity.sh
 
 production-parity-smoke:
 	./scripts/integration/production-parity.sh

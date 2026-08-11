@@ -7,6 +7,26 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
+> 2026-08-11 refact-user CRUD 进程验收：从 Go 仓库的 `refact-user` 分支编译真实 Go
+> binary，与 Rust 分别打开同一份停止状态快照的副本，通过 `/api/v2/rpc/users.post`、
+> `user.put`、`user.get`、`users.get`、`user.delete` 完成 basic/UUID/token 创建、
+> 缺省 credential 更新、查询和删除；同时覆盖被节点引用时的 409 conflict，以及
+> missing-user 的 404 错误矩阵。两端返回的用户视图和归一化错误体一致。第一次试验
+> 发现 Go 的 list `query` 按用户名称匹配而不是 credential.username，修正测试后
+> 两端全部通过。日志保存在 `~/.cache/yuhaiin-rust/integration/refact-user-parity/`，
+> 没有使用 `/tmp`。
+> 可重复命令为 `YUHAIIN_SOURCE_DB=... make refact-user-parity-smoke`；Go 分支 worktree
+> 默认使用 `~/.cache/yuhaiin-rust/go-refact-user`。
+
+> 2026-08-11 process/inbound/negative route matcher API parity：扩展
+> `scripts/integration/go-api-parity.sh` 的 mutation fixture，加入 process list、inbound
+> list、嵌套 `all(host-list, process-list, inbound-names, port, not(port))`，并逐响应对照
+> Go/Rust 的创建、读取、apply、test、删除和错误矩阵。过程中发现测试 fixture 原先把 Go
+> `SourceRef` 错写成不支持的 `inbound.list`；Go typed decoder 会忽略该未知字段，Rust 则
+> 保留输入 JSON，造成假差异。改为合法的 `inbound.names` 后完整 parity 通过。日志和副本
+> 位于 `~/.cache/yuhaiin-rust/integration/go-api-parity/`，没有使用 `/tmp`。
+> 可重复命令：`YUHAIIN_SOURCE_DB=... YUHAIIN_PREPARE=1 make go-api-parity-smoke`。
+
 > 2026-08-11 TUN flow isolation and smoke hardening：rootless Podman 现场复测发现，单个 outbound task 在 TUN packet 到达前结束时，旧逻辑会把 `TUN proxy flow channel: channel closed` 当成 supervisor 级错误，关闭整个 TUN inbound。现在 `TunRuntime` 将 `Closed/NotFound` stale-flow 错误限制在对应 TCP/UDP flow，主动关闭该 kernel flow 后继续处理其他 flow；协议、IO、超时等真正的 dispatcher 错误仍会终止 runtime。新增错误分类单测。`scripts/integration/tun-service.sh` 同时增加默认 45 秒超时、命名容器和退出清理，rootless 缺少 netdev/route 时不会无限挂起。当前环境 `CapEff=0`，所以 rootful TUN/route 证据仍待具备 `CAP_NET_ADMIN` 的干净 namespace。
 
 > 2026-08-11 central inbound auth process chain：`InboundAuth` 的 immutable user snapshot 现在有完整的 SOCKS5/Yuubinsya 进程级覆盖。测试通过真实 API 添加 `usage=inbound` 的 basic user，在已有 inline credentials 的两个 listener 上等待 reload，确认错误 SOCKS5 basic credentials 和错误 Yuubinsya password 都被拒绝；随后用 central credentials 分别建立 TCP flow，验证 payload echo、同一 domain route rule、HTTP outbound 和 `connections` 的 inbound/protocol/mode/outbound/matchHistory。HTTP inbound 已覆盖同一用户的 add/update/delete reload；因此当前缺口仅是本地 Go main 没有 refact-user handler 时的逐响应 parity，不再是 Rust runtime central auth 主路径。并行 service-chain 测试还修复了 API 端口预留与子进程 bind 之间的测试竞态。

@@ -16,9 +16,9 @@ Go 源码映射、设计取舍和历史结果放在 [MIGRATION.md](MIGRATION.md)
 | 指标 | 当前值 |
 | --- | ---: |
 | 当前替换范围 | 66 项 |
-| 已完成 `[x]` | 55 项（83.3%） |
-| 主路径完成 `[~]` | 12 项（18.2%） |
-| 加权覆盖率 | **92.4%**（`(55 + 12 × 0.5) / 66`） |
+| 已完成 `[x]` | 57 项（86.4%） |
+| 主路径完成 `[~]` | 10 项（15.2%） |
+| 加权覆盖率 | **93.9%**（`(57 + 10 × 0.5) / 66`） |
 | 明确延期 | 订阅、DoQ/DoH3、Shadowsocks/SSR、WireGuard、Tailscale、Reality、Mux、QUIC 等复杂协议 |
 | 当前总体状态 | **未完成**：Linux 主链路已可运行，平台/生产/少数边界证据仍缺 |
 
@@ -237,20 +237,22 @@ flowchart LR
 - `[x]` central basic user snapshot 已覆盖 HTTP、SOCKS5、Yuubinsya inbound：API 添加用户后 reload，旧凭据拒绝、新凭据通过，并继续走 router/outbound。
 - `[x]` connections 建立、更新、关闭、数字 ID close、SSE added/removed、local/outbound/protocol/process/route metadata。
 - `[x]` traffic、telemetry、failed history、history、checkpoint、Go projection、跨进程 SQLite 接管。
+- `[x]` users：Go `refact-user` 分支与 Rust 的 basic/UUID/token CRUD、缺省 credential 保留、节点引用冲突和 missing-user 错误矩阵已通过真实 HTTP/RPC 对照。
 - `[x]` fresh state、三份生产快照、核心错误矩阵、API reload flow 已逐响应对照 Go。
 
 ### 未完成与下一步
 
-- `[~]` users：当前 Go main 没有 refact-user handler；Rust 已按 refact-user schema-v6 实现，central inbound auth 已完成，但逐响应 Go handler parity 仍缺。
-- `[~]` process/inbound/negative matcher、完整 response 字段和更多 history/telemetry 生产样本。
+- `[x]` process/inbound/negative matcher：runtime 单测、真实 service-chain 和 Go/Rust route rule API mutation parity 均已覆盖。
+- `[~]` 完整 response 字段和更多 history/telemetry 生产样本。
 - `[~]` 升级期间 SQLite 表锁竞争与更长时间范围逐字段对照。
-- 下一步：优先补 refact-user 可运行 Go fixture；然后增加长时间 telemetry/history snapshot 和 lock contention。
+- 下一步：增加长时间 telemetry/history snapshot、SQLite lock contention 和 rootful TUN/TPROXY 现场验收。
 
 ### 证据
 
 - `make api-contract-smoke`
 - `make api-reload-flow-smoke`
 - `make go-api-parity-smoke`
+- `YUHAIIN_SOURCE_DB=... make refact-user-parity-smoke`（Go `refact-user` 分支 users 全矩阵）
 - `make production-parity-smoke`
 - `make go-rust-stats-smoke`
 - `make stats-concurrency-smoke`
