@@ -7,6 +7,8 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
+> 2026-08-11 TUN flow isolation and smoke hardening：rootless Podman 现场复测发现，单个 outbound task 在 TUN packet 到达前结束时，旧逻辑会把 `TUN proxy flow channel: channel closed` 当成 supervisor 级错误，关闭整个 TUN inbound。现在 `TunRuntime` 将 `Closed/NotFound` stale-flow 错误限制在对应 TCP/UDP flow，主动关闭该 kernel flow 后继续处理其他 flow；协议、IO、超时等真正的 dispatcher 错误仍会终止 runtime。新增错误分类单测。`scripts/integration/tun-service.sh` 同时增加默认 45 秒超时、命名容器和退出清理，rootless 缺少 netdev/route 时不会无限挂起。当前环境 `CapEff=0`，所以 rootful TUN/route 证据仍待具备 `CAP_NET_ADMIN` 的干净 namespace。
+
 > 2026-08-11 inbound live switch 修复：普通 socket inbound 的 API reload 流程新增了 disable → listener closed → enable → traffic restored 的真实进程回归。此前注入式 TUN（Android/VpnService 等）路径只捕获初始 `TunRuntimeConfig`，reload 后即使持久化的 TUN inbound 已变成 `enabled=false`，仍会继续运行 dispatcher；现在 `run_until_with_tun_runtime` 在每次 reload 后重新读取 Go inbound/`tun.runtime`，关闭时停止 packet dispatcher，重新开启时复用外部 device 重建 proxy runtime。没有持久化 TUN 记录的宿主仍使用传入的 fallback config。新增 data-plane config tests；真实 VpnService/utun 现场仍待平台验收。
 
 > 2026-08-11 WireGuard 评估：Go 的 `pkg/net/proxy/wireguard` 不是普通 socket proxy，而是 `wireguard-go` userspace device + custom `NetTun`/`PacketConn`，需要把 peer/allowed IP、UDP underlay、虚拟 TUN packet channel 和连接式 `AsyncProxy` 边界全部接起来。Rust 已验证 [boringtun 0.7.1](https://crates.io/crates/boringtun) 的 `noise::Tunn` 可作为协议引擎候选，且不需要把 C TLS 引入 workspace；但它不会直接提供 yuhaiin 所需的 `AsyncProxy`/`AsyncDatagram` adapter。当前先不加入不可运行的配置分支，待主链路和 TUN 平台验收后，以 Go↔Rust handshake/transport fixture 为入口实现并单独做 benchmark。

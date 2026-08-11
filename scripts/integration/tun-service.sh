@@ -9,6 +9,18 @@ database_dir="${cache_dir}/state"
 log_path="${cache_dir}/podman.log"
 tun_name="yrtun0"
 chain_mode="${YUHAIIN_TUN_CHAIN:-}"
+container_name="yuhaiin-tun-service-$$"
+timeout_seconds="${YUHAIIN_TUN_SMOKE_TIMEOUT_SEC:-45}"
+
+cleanup() {
+  podman rm -f "${container_name}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+if ! [[ "${timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "YUHAIIN_TUN_SMOKE_TIMEOUT_SEC must be a positive integer" >&2
+  exit 2
+fi
 
 chain_env=()
 if [[ -n "${chain_mode}" ]]; then
@@ -87,8 +99,12 @@ if [[ "${YUHAIIN_TUN_FORCE_STOP:-0}" == "1" ]]; then
   echo "runtime-tun-force-stop-ok name=${tun_name}"
 fi
 
-if ! podman run --rm "${run_args[@]}" >"${log_path}" 2>&1; then
+if ! timeout --foreground "${timeout_seconds}s" podman run --name "${container_name}" "${run_args[@]}" >"${log_path}" 2>&1; then
   cat "${log_path}"
+  if grep -Fq "runtime-tun-opened name=${tun_name}" "${log_path}" \
+    && ! grep -Fq "runtime-tun-traffic-ok" "${log_path}"; then
+    echo "TUN smoke timed out after ${timeout_seconds}s; this usually means the namespace lacks a route/CAP_NET_ADMIN or the flow chain did not complete" >&2
+  fi
   exit 1
 fi
 output="$(<"${log_path}")"

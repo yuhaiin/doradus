@@ -210,6 +210,8 @@ flowchart LR
 - `[~]` 超过有界 fragment 重组上限的长流、更多 namespace teardown 矩阵。
 - `[~]` 新增 live connection metadata smoke：在 TUN flow 存活期间断言 `component/inbound/nodeId/outbound/localAddr`；当前 rootless Podman 现场没有稳定的 TUN netdev/route，需在干净或 rootful namespace 重跑后才能升级为现场证据。
 - `[~]` 注入式 TUN supervisor reload 代码已重新读取持久化 `enabled`；关闭后停止 packet dispatcher，重新开启后恢复，外部平台未持久化 TUN 配置时保留 host 传入的 fallback config。当前已有 config/lifecycle 单测，真实 VpnService/utun dispatcher 仍待现场验收。
+- `[~]` 单个 TUN flow 的 outbound task 提前结束时已隔离为 flow 级关闭，不再让 stale command channel 关闭整个 TUN supervisor；仍需 rootful namespace 验证真实 TCP reset、重连和多 flow 并发。
+- `[~]` TUN Podman smoke 已增加超时和容器清理；当前 rootless 环境实测能打开 fd 但没有稳定的 netdev/route，超时会明确报告能力缺口，不再无限挂起。
 - `[~]` Android VpnService fd/权限/route/电量/RSS；macOS utun/权限/route。
 - 下一步：先补 Linux 超限 fragment 的进程级恢复证据，再做 Android/macOS 实机验收。
 
@@ -271,9 +273,9 @@ flowchart LR
 按影响整体替换能力排序，不按提交数量排序：
 
 1. **Router loopback 现场验收**：补 TUN→proxy 自环进程验收，并确认 endpoint guard 在真实 TUN flow 结束后回收。
-2. **生产与统计边界**：更多 schema/telemetry/history 样本，补升级期间 SQLite lock contention。
-3. **Linux transparent TPROXY**：rootful/CAP_NET_ADMIN namespace 的 UDP、多 flow、异常 teardown。
-4. **TUN Linux 收尾**：超限 fragment 长流恢复和 namespace teardown matrix。
+2. **Linux TUN rootful 收尾**：在 CAP_NET_ADMIN namespace 验证 flow 级失败隔离、TCP reset/重连、多 flow、超限 fragment 和 namespace teardown matrix。
+3. **生产与统计边界**：更多 schema/telemetry/history 样本，补升级期间 SQLite lock contention。
+4. **Linux transparent TPROXY**：rootful/CAP_NET_ADMIN namespace 的 UDP、多 flow、异常 teardown。
 5. **Android/macOS**：fd、route、权限、设备生命周期、RSS/电量。
 6. **发布替换现场**：systemd/launchd 真实替换、回滚、备份恢复和健康检查。
 7. **仅按实际需要评估延期协议**：订阅、DoQ/DoH3、Shadowsocks/SSR、Tailscale、Reality、Mux、QUIC。

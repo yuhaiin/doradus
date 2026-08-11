@@ -2,6 +2,36 @@ use super::tun_test_support::*;
 use super::*;
 
 #[test]
+fn stale_proxy_flow_errors_are_recoverable_but_backpressure_is_not() {
+    assert!(is_recoverable_proxy_flow_error(&Error::new(
+        ErrorKind::Closed,
+        "flow command channel closed",
+    )));
+    assert!(is_recoverable_proxy_flow_error(&Error::new(
+        ErrorKind::NotFound,
+        "flow no longer exists",
+    )));
+    assert!(!is_recoverable_proxy_flow_error(&Error::new(
+        ErrorKind::Timeout,
+        "flow command queue full",
+    )));
+    assert_eq!(
+        event_flow_key(&TunEvent::TcpData {
+            flow: TunFlow {
+                key: TunFlowKey {
+                    network: Network::Tcp,
+                    source: "192.0.2.1:1234".parse().unwrap(),
+                    destination: "198.51.100.1:443".parse().unwrap(),
+                },
+            },
+            payload: Vec::new(),
+        })
+        .network,
+        Network::Tcp
+    );
+}
+
+#[test]
 fn validates_and_classifies_ip_packets() {
     let ipv4 = [
         0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 8, 8, 8, 8,

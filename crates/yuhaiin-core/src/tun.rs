@@ -459,6 +459,20 @@ pub enum TunEvent {
     UdpDatagram { flow: TunFlow, payload: Vec<u8> },
 }
 
+fn event_flow_key(event: &TunEvent) -> TunFlowKey {
+    match event {
+        TunEvent::TcpOpened { flow }
+        | TunEvent::TcpData { flow, .. }
+        | TunEvent::TcpHalfClosed { flow }
+        | TunEvent::TcpClosed { flow }
+        | TunEvent::UdpDatagram { flow, .. } => flow.key,
+    }
+}
+
+fn is_recoverable_proxy_flow_error(error: &Error) -> bool {
+    matches!(error.kind, ErrorKind::Closed | ErrorKind::NotFound)
+}
+
 #[derive(Debug)]
 struct TcpFlowState {
     key: Option<TunFlowKey>,
@@ -3006,7 +3020,31 @@ impl TunRuntime {
                 return Err(io::Error::other(error.to_string()));
             }
             for event in dispatcher.events().collect::<Vec<_>>() {
+                let flow = event_flow_key(&event);
                 if let Err(error) = proxy_runtime.handle_event_async(event).await {
+                    // A transport can finish between smoltcp emitting a
+                    // packet and the next command being delivered to its
+                    // bounded flow queue.  That is a per-flow failure, not a
+                    // reason to tear down the TUN supervisor and all other
+                    // flows.  Close the kernel flow here and continue with
+                    // the next packet; protocol/IO/timeout errors still fail
+                    // the dispatcher as before.
+                    if is_recoverable_proxy_flow_error(&error) {
+                        tun_debug(format!(
+                            "TUN proxy flow ended before event {:?}: {error}",
+                            flow
+                        ));
+                        match flow.network {
+                            Network::Tcp => {
+                                let _ = dispatcher.abort_tcp(flow);
+                            }
+                            Network::Udp => {
+                                let _ = dispatcher.close_udp(flow);
+                            }
+                            Network::Icmp | Network::Any => {}
+                        }
+                        continue;
+                    }
                     proxy_runtime.close();
                     return Err(io::Error::other(error.to_string()));
                 }
