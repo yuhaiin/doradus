@@ -17,10 +17,12 @@ declare -a candidates=()
 if [[ -n "${YUHAIIN_SOURCE_DB:-}" ]]; then
   IFS=: read -r -a candidates <<<"${YUHAIIN_SOURCE_DB}"
 else
-  # Keep the default set to snapshots that Go can reopen after its own
-  # migration.  The older catch-all tmp/state.db is still testable by
-  # setting YUHAIIN_SOURCE_DB explicitly, but currently fails inside Go's
-  # duplicate fakeip_entries migration before any API comparison is possible.
+  # The default path prepares each snapshot with Rust first, because these
+  # stopped production snapshots can carry a migration ledger from a newer Go
+  # checkout while still using the older dimension/value telemetry tables.
+  # YUHAIIN_PREPARE=0 remains a useful raw-source diagnostic, but it is not a
+  # valid Go/Rust parity fixture when the current Go checkout cannot migrate
+  # that future ledger and its telemetry API returns HTTP 500.
   candidates=(
     "${go_root}/tmp/v2/state.db"
     "${go_root}/tmp/yuhaiin/state.db"

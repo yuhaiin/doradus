@@ -23,6 +23,8 @@
 | `make service-chain-smoke` | Podman `--network=host` | 14/14 通过，覆盖 HTTP、SOCKS5、Yuubinsya inbound 及 direct/HTTP/SOCKS5/TLS+HTTP/2+Yuubinsya outbound |
 | `make api-reload-flow-smoke` | Podman `--network=host` | 2/2 通过；普通 inbound reload，以及通过 `/api/v2/inbounds/{id}` 的 TUN enabled toggle、重启持久化 |
 | `make go-live-flow-parity-smoke` | Podman | Go/Rust inbound→router→outbound live flow、connections 和 statistics 对照通过 |
+| `make production-parity-smoke` | Podman：3 份停止态 Go SQLite 快照，Rust takeover-prepared path | 3/3 通过；read/mutation/error API、routes/resolvers/FakeDNS、connections/statistics/history/telemetry 和 deferred subscriptions 返回与 Go 一致 |
+| `YUHAIIN_PREPARE=0 make production-parity-smoke` | Podman：原始停止态 Go SQLite 快照 | 2/3 原始快照（schema 4）通过；`tmp/v2/state.db` 未通过：Go 侧 `connections.telemetry` 返回 HTTP 500（响应为 `no such table: failure_dimension_daily`，启动日志还显示 `telemetry_dimension_values` 缺失），Rust 侧能正常返回，判定为当前 Go checkout 无法迁移该 future migration ledger 的样本限制，不把 Rust 有效响应伪装成 parity 通过 |
 | `make stats-concurrency-smoke` | Podman 隔离容器 | 2/2 通过；8 路并发统计读取、实时流量写入、正常重启恢复，以及强停后重新打开同一 SQLite 数据库 |
 | `make transparent-service-smoke` | Podman `--privileged` 隔离 namespace | REDIRECT TCP 2 flows / 68 bytes 通过；rootless 能力门禁正确跳过 TPROXY UDP，不计为 TPROXY 通过 |
 | `make workspace-tests` | Podman：隔离、stats 专用、host-network 三类容器 | 40 个 workspace harness、0 个失败；rootful TUN/TPROXY 相关用例因当前 rootless 能力按设计 ignored |

@@ -120,9 +120,28 @@ request() {
   local address="$1"
   local operation="$2"
   local body="$3"
-  curl -fsS "http://${address}/api/v2/rpc/${operation}" \
+  local service="rust"
+  [[ "${address}" == "${go_http}" ]] && service="go"
+  local safe_name="${operation//./-}"
+  local raw_output="${scenario_dir}/request-${service}-${safe_name}.raw"
+  local status
+  if ! status="$(curl -sS --max-time 30 -o "${raw_output}" -w '%{http_code}' \
+    "http://${address}/api/v2/rpc/${operation}" \
     -H 'content-type: application/json' \
-    --data "${body}"
+    --data "${body}")"; then
+    echo "[go-api-parity] curl failed: ${service} ${operation}" >&2
+    return 1
+  fi
+  if [[ "${status}" != 2* ]]; then
+    echo "[go-api-parity] unexpected HTTP ${status}: ${service} ${operation}" >&2
+    if jq -e . "${raw_output}" >/dev/null 2>&1; then
+      jq -S . "${raw_output}" >&2
+    else
+      sed -n '1,160p' "${raw_output}" >&2 || true
+    fi
+    return 1
+  fi
+  cat "${raw_output}"
 }
 
 normalize() {

@@ -7,11 +7,13 @@ use std::time::Instant;
 use rusqlite::{Connection, OptionalExtension};
 
 fn main() {
-    let (source, destination) = match parse_args() {
+    let (source, destination, print_schema) = match parse_args() {
         Ok(paths) => paths,
         Err(message) => {
             eprintln!("sqlite-backend-probe: {message}");
-            eprintln!("usage: sqlite_backend_probe --source FILE --destination FILE");
+            eprintln!(
+                "usage: sqlite_backend_probe --source FILE --destination FILE [--print-schema]"
+            );
             std::process::exit(2);
         }
     };
@@ -66,6 +68,9 @@ fn main() {
     let nodes: i64 = connection
         .query_row("SELECT COUNT(*) FROM nodes_v2", [], |row| row.get(0))
         .unwrap_or_else(|error| fail(format!("count node rows: {error}")));
+    if print_schema {
+        print_schema_summary(&connection);
+    }
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS yuhaiin_probe_meta (
@@ -92,22 +97,59 @@ fn main() {
     );
 }
 
-fn parse_args() -> Result<(PathBuf, PathBuf), String> {
+fn parse_args() -> Result<(PathBuf, PathBuf, bool), String> {
     let mut source = None;
     let mut destination = None;
+    let mut print_schema = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(argument) = args.next() {
         match argument.to_str() {
             Some("--source") => source = args.next().map(PathBuf::from),
             Some("--destination") => destination = args.next().map(PathBuf::from),
+            Some("--print-schema") => print_schema = true,
             Some(value) => return Err(format!("unknown argument {value}")),
             None => return Err("argument is not valid UTF-8".to_owned()),
         }
     }
     match (source, destination) {
-        (Some(source), Some(destination)) => Ok((source, destination)),
+        (Some(source), Some(destination)) => Ok((source, destination, print_schema)),
         _ => Err("both --source and --destination are required".to_owned()),
     }
+}
+
+fn print_schema_summary(connection: &Connection) {
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name
+             FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%'
+             ORDER BY type, name",
+        )
+        .unwrap_or_else(|error| fail(format!("prepare schema query: {error}")));
+    let objects = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap_or_else(|error| fail(format!("query schema objects: {error}")))
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap_or_else(|error| fail(format!("read schema objects: {error}")));
+    let migrations = connection
+        .prepare("SELECT version, name FROM migrate ORDER BY version")
+        .ok()
+        .and_then(|mut statement| {
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .ok()?;
+            Some(
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap_or_else(|error| fail(format!("read migrations: {error}"))),
+            )
+        })
+        .unwrap_or_default();
+    println!("schema-objects={objects:?}");
+    println!("migrations={migrations:?}");
 }
 
 fn memory_summary() -> String {
