@@ -2730,3 +2730,23 @@ HTTP inbound 发送 CONNECT，process list 使用当前测试进程路径，inbo
 `make service-chain-smoke` 的 13 个真实 inbound/router/outbound 场景全部通过。这个入口复用
 `~/.cache/yuhaiin-rust/integration-reusable`，不是 Podman；TUN、透明代理和统计等需要
 namespace 的测试继续由各自 Podman 脚本负责，所有临时状态均不使用 `/tmp`。
+
+## 87. 2026-08-11 TUN bounded-fragment verification boundary
+
+本轮重新核对 TUN 分片边界后，没有重复增加一个等价的重组器测试：当前实现已经在 ingress
+层对 IPv6 assembly 限制并发数量、单个 datagram 的片数和总字节数，所有恶意/资源耗尽分支都会
+删除当前 assembly；`recv_from_tun` 对等待后续片段和主动丢弃的 datagram 都返回已成功读取的长度，
+不会因为一个坏分片关闭整个 TUN supervisor。
+
+现有 `yuhaiin-core` 证据实际通过：IPv6 的乱序 UDP、重叠/过期、128 片上限和超限后同 key
+恢复共 4 个测试，另外 `dispatcher_reassembles_out_of_order_ipv4_udp_fragments` 验证 IPv4
+dispatcher 的乱序重组；本轮定向运行结果为 4/4 和 1/1。这里的“完成”只表示代码和单元测试边界，
+不等同于真实内核 TUN 进程证据。
+
+因此 checklist 保持 `[~]` 而不是虚构现场通过：剩余项必须在拥有 `CAP_NET_ADMIN` 的干净
+Linux namespace 中，让真实 TUN 长流注入超过上限的 IPv6 wire fragments，并同时观察另一条
+flow 是否继续、TCP reset/重连、容器/namespace teardown 以及同名设备二次接管。当前 rootless
+Podman 的能力不足以完成这些断言，所有临时数据库和日志继续放在 `~/.cache/yuhaiin-rust`。
+本轮实际运行 `make tun-chain-service-smoke` 的容器能输出 `runtime-tun-opened`，但真实流量在
+`0 bytes` 处收到 `Connection reset by peer`，随后按 45 秒上限退出并清理容器；这证明 smoke
+脚本的超时/清理路径生效，也保留了真实 route/CAP_NET_ADMIN 缺口的可复现记录。
