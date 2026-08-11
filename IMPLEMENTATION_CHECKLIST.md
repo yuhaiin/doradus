@@ -23,6 +23,7 @@
 | `make service-chain-smoke` | Podman `--network=host` | 14/14 通过，覆盖 HTTP、SOCKS5、Yuubinsya inbound 及 direct/HTTP/SOCKS5/TLS+HTTP/2+Yuubinsya outbound |
 | `make api-reload-flow-smoke` | Podman `--network=host` | 2/2 通过；普通 inbound reload，以及通过 `/api/v2/inbounds/{id}` 的 TUN enabled toggle、重启持久化 |
 | `make go-live-flow-parity-smoke` | Podman | Go/Rust inbound→router→outbound live flow、connections 和 statistics 对照通过 |
+| `make stats-concurrency-smoke` | Podman 隔离容器 | 2/2 通过；8 路并发统计读取、实时流量写入、正常重启恢复，以及强停后重新打开同一 SQLite 数据库 |
 | `make benchmark-throughput`：HTTP CONNECT | Podman `--network=host`，release runtime | 64 MiB，109.89 MiB/s，peak RSS 17,864 KiB |
 | `make benchmark-throughput`：TLS+HTTP/2+Yuubinsya | Podman `--network=host`，release runtime | 64 MiB，29.57 MiB/s，peak RSS 19,432 KiB |
 | TUN packet / TPROXY | 当前 rootless Podman | 按能力门禁跳过；必须在 rootful `CAP_NET_ADMIN` namespace 验收，不计为通过 |
