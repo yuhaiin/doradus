@@ -124,7 +124,7 @@ flowchart TD
 未完成：
 
 - `[~]` 完整 response 字段和更多生产 history/telemetry 样本。
-- `[~]` rootful TUN/TPROXY、Android/macOS host binding 和平台 route lifecycle。
+- `[~]` rootful TUN/TPROXY 和 Linux 桌面 route lifecycle；Android/macOS host binding 不计入本轮。
 - `[~]` 真实服务替换、回滚、backup/health-check 演练。
 
 ### `crates/yuhaiin-platform`：平台边界
@@ -163,8 +163,8 @@ flowchart TD
 
 ### P1：替换前建议完成
 
-- `[ ]` 更多 production SQLite schema/未知表/FakeIP/history/telemetry 快照 diff。
-- `[ ]` SQLite lock contention、长时间 stats 投影、升级和强停组合测试。
+- `[~]` 更多 production SQLite schema/未知表/FakeIP/history/telemetry 快照 diff；3 份真实生产形态快照的 Go/Rust API parity 已通过，仍需逐表 schema/异常快照 diff。
+- `[~]` SQLite lock contention、长时间 stats 投影、升级和强停组合测试；并发 stats reader/writer 与 force-stop recovery 已通过，升级组合仍待补。
 - `[ ]` 至少一个真实 Linux systemd 环境的替换、回滚、备份恢复和 health-check。
 - `[ ]` TUN loopback guard 真实 endpoint/PID/path 证据。
 
