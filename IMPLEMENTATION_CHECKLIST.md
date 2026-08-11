@@ -8,10 +8,11 @@
 
 | 指标 | 当前值 |
 | --- | ---: |
-| 当前替换范围 | 66 项 |
-| 已完成 `[x]` | 57 项（86.4%） |
-| 主路径完成 `[~]` | 10 项（15.2%） |
-| 加权覆盖率 | **93.9%**（`(57 + 10 × 0.5) / 66`） |
+| 当前清单条目 | 50 项（延期项不计入分母；复合能力按一条统计） |
+| 已完成 `[x]` | 29 项（58.0%） |
+| 主路径完成 `[~]` | 14 项（28.0%） |
+| 仍未完成 `[ ]` | 7 项（14.0%） |
+| 加权覆盖率 | **72.0%**（`(29 + 14 × 0.5) / 50`） |
 | 可运行范围 | Linux desktop/container：SQLite、API、DNS、普通 inbound、TUN、router、主要 proxy chain |
 | 当前结论 | **未完成**：Android/macOS、rootful TUN/TPROXY、更多生产兼容样本和发布替换仍需验收 |
 
@@ -115,7 +116,7 @@ flowchart TD
 
 - `[x]` `RuntimeSnapshot` + atomic reload；API mutation 会重新构建 live selector/listener。
 - `[x]` 普通 inbound 统一由 `inbound::run_until` 管理：SOCKS5、mixed、HTTP、Yuubinsya、reverse、UDP、TLS/HTTP2 transport。
-- `[x]` TUN 作为 inbound 生命周期的一部分；桌面设备和注入式 host FD 都有统一 shutdown/abort/reload 边界。
+- `[~]` TUN 作为 inbound 生命周期的一部分；桌面设备和注入式 host FD 都有统一 shutdown/abort/reload 边界，但 Android/macOS 目前还没有宿主调用方和真实 fd/route 现场证据。
 - `[x]` connections、SSE、traffic、telemetry、history、failed history、node latency、pprof。
 - `[x]` Go/Rust API read/mutation/error parity、live flow parity、API reload flow、stats concurrency。
 - `[x]` 启动日志默认写 stderr：数据库、API bind/listen、runtime ready、shutdown/stopped；`YUHAIIN_QUIET` 只接受显式 truthy 值。
@@ -201,6 +202,7 @@ TUN/透明/性能：
 ```bash
 make tun-service-smoke
 make tun-reload-smoke
+make tun-reload-traffic-smoke
 make tun-chain-service-smoke
 make tun-mtu-smoke
 make transparent-service-smoke

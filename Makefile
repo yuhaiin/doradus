@@ -42,7 +42,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
+.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -62,6 +62,7 @@ help:
 		'make tun-chain-service-smoke run TUN inbound -> TLS + HTTP/2 + Yuubinsya chain smoke' \
 		'make tun-connection-metadata-smoke verify live TUN connection metadata during a chain' \
 		'make tun-reload-smoke verify persisted TUN disable/enable and same-device recreation' \
+		'make tun-reload-traffic-smoke verify TUN traffic after disable/enable reload' \
 		'make tun-mtu-smoke run the runtime-owned TUN MTU boundary matrix' \
 		'make transparent-service-smoke run REDIRECT TCP smoke; rootless Podman records TPROXY skip' \
 		'make api-contract-smoke run the frontend management API process contract in Podman' \
@@ -138,6 +139,9 @@ tun-connection-metadata-smoke:
 
 tun-reload-smoke:
 	YUHAIIN_TUN_RELOAD=1 YUHAIIN_TUN_RELOAD_ONLY=1 ./scripts/integration/tun-service.sh
+
+tun-reload-traffic-smoke:
+	YUHAIIN_TUN_RELOAD=1 ./scripts/integration/tun-service.sh
 
 tun-mtu-smoke:
 	./scripts/integration/tun-mtu.sh

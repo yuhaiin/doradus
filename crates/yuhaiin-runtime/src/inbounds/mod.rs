@@ -168,8 +168,20 @@ pub async fn run_until_with_tun_runtime(
                     Ok(()) if *tun_shutdown.borrow() => break,
                     Ok(()) => {}
                     Err(error) => {
-                        tun_monitor.error(format!("injected TUN inbound stopped: {error}"));
-                        break;
+                        // A mobile host can start the supervisor before the
+                        // first usable proxy snapshot is available.  Keep
+                        // the inbound owner alive in that case: the next
+                        // API mutation/reload can make the runtime buildable
+                        // without requiring VpnService to recreate its fd.
+                        tun_monitor.error(format!(
+                            "injected TUN inbound stopped; waiting for reload: {error}"
+                        ));
+                        if crate::wait_for_shutdown_or_reload(&tun_controller, tun_shutdown.clone())
+                            .await
+                        {
+                            break;
+                        }
+                        continue;
                     }
                 }
             } else {
