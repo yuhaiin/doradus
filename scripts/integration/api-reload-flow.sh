@@ -48,7 +48,7 @@ podman run --rm \
   "${image}" \
   -ec '
     set -eu
-    /usr/local/bin/yuhaiin-api-reload-flow --nocapture
+    /usr/local/bin/yuhaiin-api-reload-flow --nocapture --test-threads=1
   ' \
   | tee "${scenario_dir}/podman.log"
 

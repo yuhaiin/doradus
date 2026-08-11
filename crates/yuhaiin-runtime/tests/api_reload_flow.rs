@@ -344,3 +344,94 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     first.shutdown().await;
     second.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_tun_inbound_toggle_reloads_and_persists() {
+    let root = integration_dir("api-tun-toggle");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+
+    let service = ServiceProcess::start(&database).await;
+    let tun_id = "tun-api-toggle";
+    let tun_name = format!("yrtun-api-toggle-{}", std::process::id());
+    let mut config = json!({
+        "name":"TUN API toggle",
+        "enabled":false,
+        "network":{"type":"empty","empty":{}},
+        "transports":[],
+        "protocol":{
+            "type":"tun",
+            "tun":{
+                "name":tun_name,
+                "mtu":1500,
+                "portal":"10.42.0.1/24",
+                "portalV6":"fd42::1/64",
+                "routes":[],
+                "excludes":[]
+            }
+        }
+    });
+
+    let path = format!("/api/v2/inbounds/{tun_id}");
+    let saved = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::PUT,
+        &path,
+        Some(&config),
+    )
+    .await;
+    assert_eq!(saved["id"], tun_id);
+    assert_eq!(saved["enabled"], false);
+    assert_eq!(saved["protocol"]["type"], "tun");
+
+    config["enabled"] = json!(true);
+    let enabled = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::PUT,
+        &path,
+        Some(&config),
+    )
+    .await;
+    assert_eq!(enabled["enabled"], true);
+    // Give the desktop TUN owner a chance to consume the reload. Rootless
+    // Podman will fail closed at device creation; rootful Podman exercises the
+    // same owner against a real namespace device.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let _ = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::GET,
+        "/api/v2/info",
+        None,
+    )
+    .await;
+
+    config["enabled"] = json!(false);
+    let disabled = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::PUT,
+        &path,
+        Some(&config),
+    )
+    .await;
+    assert_eq!(disabled["enabled"], false);
+
+    service.shutdown().await;
+    let restarted = ServiceProcess::start(&database).await;
+    let persisted = api_json(
+        &restarted.client,
+        &restarted.base_url,
+        reqwest::Method::GET,
+        &path,
+        None,
+    )
+    .await;
+    assert_eq!(persisted["id"], tun_id);
+    assert_eq!(persisted["enabled"], false);
+    assert_eq!(persisted["protocol"]["tun"]["name"], tun_name);
+    restarted.shutdown().await;
+}

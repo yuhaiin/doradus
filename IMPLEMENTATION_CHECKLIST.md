@@ -1,6 +1,6 @@
 # yuhaiin Go → Rust 实现清单
 
-更新时间：2026-08-11
+更新时间：2026-08-12
 
 这份清单按“模块 → 子模块 → 证据 → 缺口”组织，不再使用跨模块的优先级列表。它不把“代码存在”当成“替换完成”：`[x]` 必须有单测或真实进程证据，`[~]` 表示 Linux 主路径可用但仍有权限、生产样本或现场证据缺口，`[ ]` 表示仍有实际缺口，`延期` 表示按当前范围主动不阻塞替换。宿主机只编译；运行时、服务、代理链和 TUN 测试均在 Podman 中执行。
 
@@ -21,6 +21,8 @@
 | 场景 | 执行位置 | 结果 |
 | --- | --- | --- |
 | `make service-chain-smoke` | Podman `--network=host` | 14/14 通过，覆盖 HTTP、SOCKS5、Yuubinsya inbound 及 direct/HTTP/SOCKS5/TLS+HTTP/2+Yuubinsya outbound |
+| `make api-reload-flow-smoke` | Podman `--network=host` | 2/2 通过；普通 inbound reload，以及通过 `/api/v2/inbounds/{id}` 的 TUN enabled toggle、重启持久化 |
+| `make go-live-flow-parity-smoke` | Podman | Go/Rust inbound→router→outbound live flow、connections 和 statistics 对照通过 |
 | `make benchmark-throughput`：HTTP CONNECT | Podman `--network=host`，release runtime | 64 MiB，109.89 MiB/s，peak RSS 17,864 KiB |
 | `make benchmark-throughput`：TLS+HTTP/2+Yuubinsya | Podman `--network=host`，release runtime | 64 MiB，29.57 MiB/s，peak RSS 19,432 KiB |
 | TUN packet / TPROXY | 当前 rootless Podman | 按能力门禁跳过；必须在 rootful `CAP_NET_ADMIN` namespace 验收，不计为通过 |
