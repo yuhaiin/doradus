@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Compare public management responses from a stopped, consistent Go database
 # snapshot. Go and Rust always receive separate copies; neither process may
-# write the source fixture or share a live state.db.
+# write the source fixture or share a live state.db. The host only builds the
+# binaries and drives curl; both services run in disposable Podman containers.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 go_root="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
@@ -19,8 +20,15 @@ prepare_enabled="${YUHAIIN_PREPARE:-1}"
 command -v curl >/dev/null
 command -v jq >/dev/null
 command -v go >/dev/null
+command -v podman >/dev/null
 test -f "${source_db}"
 mkdir -p "${scenario_dir}/go" "${scenario_dir}/rust" "${scenario_dir}/prepared"
+
+image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+run_id="${BASHPID}-$(date +%s)"
+go_container="yuhaiin-go-api-parity-${run_id}"
+rust_container="yuhaiin-rust-api-parity-${run_id}"
+prepare_container="yuhaiin-rust-api-parity-prepare-${run_id}"
 
 echo "[go-api-parity] building Go and Rust services"
 go_binary="${scenario_dir}/yuhaiin-go"
@@ -49,16 +57,12 @@ wait_ready() {
   return 1
 }
 
-go_pid=""
-rust_pid=""
-prepare_pid=""
 cleanup() {
-  for pid in "${prepare_pid}" "${go_pid}" "${rust_pid}"; do
-    if [[ -n "${pid}" ]]; then
-      kill -TERM "${pid}" 2>/dev/null || true
-      wait "${pid}" 2>/dev/null || true
-    fi
-  done
+  podman logs "${prepare_container}" >"${scenario_dir}/prepare-container.log" 2>&1 || true
+  podman logs "${go_container}" >"${scenario_dir}/go-container.log" 2>&1 || true
+  podman logs "${rust_container}" >"${scenario_dir}/rust-container.log" 2>&1 || true
+  podman rm -f --ignore "${prepare_container}" "${go_container}" "${rust_container}" \
+    >"${scenario_dir}/container-cleanup.log" 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -67,15 +71,20 @@ if [[ "${prepare_enabled}" == "1" ]]; then
   # Let the current Rust takeover path create/migrate them on a disposable
   # copy first, then give the prepared snapshot to two independent services.
   cp --reflink=auto "${source_db}" "${scenario_dir}/prepared/state.sqlite"
-  echo "[go-api-parity] preparing a disposable Rust takeover snapshot"
-  YUHAIIN_DB="${scenario_dir}/prepared/state.sqlite" \
-  YUHAIIN_HTTP="${prepare_http}" \
-    "${rust_binary}" >"${scenario_dir}/prepare.log" 2>&1 &
-  prepare_pid=$!
+  echo "[go-api-parity] preparing a disposable Rust takeover snapshot in Podman"
+  podman run -d \
+    --name "${prepare_container}" \
+    -p "${prepare_http}:50051" \
+    -v "${scenario_dir}/prepared:/data:Z" \
+    -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
+    -e YUHAIIN_DB=/data/state.sqlite \
+    -e YUHAIIN_HTTP=0.0.0.0:50051 \
+    --entrypoint /usr/local/bin/yuhaiin \
+    "${image}" \
+    >"${scenario_dir}/prepare-container-id"
   wait_ready "${prepare_http}"
-  kill -TERM "${prepare_pid}" 2>/dev/null || true
-  wait "${prepare_pid}" 2>/dev/null || true
-  prepare_pid=""
+  podman stop "${prepare_container}" >"${scenario_dir}/prepare-stop.log"
+  podman rm -f "${prepare_container}" >"${scenario_dir}/prepare-rm.log"
   cp --reflink=auto "${scenario_dir}/prepared/state.sqlite" "${scenario_dir}/go/state.db"
   cp --reflink=auto "${scenario_dir}/prepared/state.sqlite" "${scenario_dir}/rust/state.sqlite"
 else
@@ -83,12 +92,26 @@ else
   cp --reflink=auto "${source_db}" "${scenario_dir}/rust/state.sqlite"
 fi
 
-"${go_binary}" -host "${go_http}" -path "${scenario_dir}/go" >"${scenario_dir}/go.log" 2>&1 &
-go_pid=$!
-YUHAIIN_DB="${scenario_dir}/rust/state.sqlite" \
-YUHAIIN_HTTP="${rust_http}" \
-  "${rust_binary}" >"${scenario_dir}/rust.log" 2>&1 &
-rust_pid=$!
+echo "[go-api-parity] starting Go and Rust services in Podman"
+podman run -d \
+  --name "${go_container}" \
+  -p "${go_http}:50051" \
+  -v "${scenario_dir}/go:/data:Z" \
+  -v "${go_binary}:/usr/local/bin/yuhaiin:ro" \
+  --entrypoint /usr/local/bin/yuhaiin \
+  "${image}" \
+  -host 0.0.0.0:50051 -path /data \
+  >"${scenario_dir}/go-container-id"
+podman run -d \
+  --name "${rust_container}" \
+  -p "${rust_http}:50051" \
+  -v "${scenario_dir}/rust:/data:Z" \
+  -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
+  -e YUHAIIN_DB=/data/state.sqlite \
+  -e YUHAIIN_HTTP=0.0.0.0:50051 \
+  --entrypoint /usr/local/bin/yuhaiin \
+  "${image}" \
+  >"${scenario_dir}/rust-container-id"
 
 wait_ready "${go_http}"
 wait_ready "${rust_http}"
@@ -123,9 +146,11 @@ normalize() {
       jq -S '.items |= map(if .source == "remote" then del(.itemCount, .errorCount, .preview) else . end)'
       ;;
     tools.interfaces)
-      # Interface enumeration order is provided by the host kernel and is
-      # not a management contract.
-      jq -S '.interfaces |= (map(.addresses |= sort) | sort_by(.name))'
+      # Interface enumeration order is provided by the kernel, and IPv6
+      # link-local addresses are derived from each container's veth/MAC. Keep
+      # the stable interface/address projection strict while ignoring that
+      # namespace-specific link-local value.
+      jq -S '.interfaces |= (map((.addresses |= (map(select(test("^fe80::") | not)) | sort))) | sort_by(.name))'
       ;;
     tools.licenses|tools.logs)
       # Dependency manifests and startup logs are implementation-specific;

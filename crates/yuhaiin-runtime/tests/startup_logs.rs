@@ -9,6 +9,11 @@ use std::time::Duration;
 
 use support::{integration_dir, reserve_loopback, seed_empty_database};
 
+#[cfg(target_os = "linux")]
+use nix::sys::signal::{Signal, kill};
+#[cfg(target_os = "linux")]
+use nix::unistd::Pid;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn foreground_service_emits_startup_progress_by_default() {
     let root = integration_dir("startup-logs");
@@ -68,9 +73,16 @@ async fn foreground_service_emits_startup_progress_by_default() {
 
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
-            .args(["-TERM", &child.id().to_string()])
-            .status();
+        #[cfg(target_os = "linux")]
+        {
+            kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).unwrap();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status();
+        }
     }
     #[cfg(not(unix))]
     child.kill().unwrap();

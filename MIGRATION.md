@@ -2895,3 +2895,46 @@ runtime 的配置和 monitor 类型。
 真实 SOCKS5 UDP chain 以及 HTTP/2/TLS/Yuubinsya 多层链路未回归。构建日志和测试结果位于
 `~/.cache/yuhaiin-rust/integration-reusable/`，没有使用 `/tmp`，也没有在宿主机启动
 runtime、proxy 或 TUN。
+
+## 93. 2026-08-11 workspace tests container boundary and parity runners
+
+本轮把“不要在本机测试”落实到默认 workspace 入口，而不只约束若干 smoke script。`Makefile`
+新增 `workspace-tests` 目标，`make test` 现在只在宿主机执行两类编译动作：构建 runtime binary
+以及 `cargo test --workspace --all-features --no-run` 生成测试 harness。所有生成的 harness
+随后通过 `scripts/integration/workspace-tests.sh` 在 Podman 执行；runtime 子进程、SQLite
+副本、临时目录、XDG cache、integration 日志都映射到 `~/.cache/yuhaiin-rust` 下的 state
+目录，不使用 `/tmp`。
+
+workspace harness 按网络需求拆成两个 disposable container：
+
+- 普通 39 个 harness 使用 `--network=none --privileged`，覆盖 core、chain、protocol、store、
+  trie、geo、API、DNS/DoH、FakeIP、NAT、模拟 TUN、stats、跨进程 SQLite 和启动日志；
+- `service_chain` 的 14 个真实 inbound/router/outbound 进程场景单独使用 Podman
+  `--network=host` 并强制单线程。这仍然是容器内运行，目的是复用专用 `service-chain-smoke`
+  的 loopback 语义；rootless `network=none` 在 HTTP/2 多层 fixture 上会产生无关的 response
+  reset。startup harness 的 TERM 信号在 Linux 测试中使用纯 Rust `nix` 直接发送，不依赖
+  Debian 精简镜像中可能不存在的外部 `kill` 可执行文件。
+
+本轮最终 workspace 入口报告 40 个 harness；`startup_logs` 在容器中 0.09 秒通过，
+`service_chain` 的 14/14 条真实链路通过，其余 harness 也无失败。ignored 项仍按测试自身声明
+保留，不被包装脚本误判为通过。这个入口不把 rootful 能力伪装成普通测试：TUN 真实 packet/route、TPROXY ancillary
+和 loopback guard 仍需拥有 `CAP_NET_ADMIN` 的独立 Podman namespace，rootless 环境只记录
+生命周期/权限 skip。
+
+另外，`go-api-parity.sh` 的 Go 和 Rust 管理服务、Rust takeover preparation 已全部移入
+独立 Podman 容器；宿主机只编译 binary、驱动 curl 和收集日志。`tools.interfaces` 比较保留
+稳定的 interface/address contract，并忽略每个容器 veth/MAC 派生的 IPv6 link-local 地址，避免
+把 network namespace 的实现细节当成 API 差异。`legacy-v1-runtime-smoke` 也改为在 Podman
+中加载复制后的 v1 `state.db`，不会让 legacy fixture 触碰宿主运行时。
+
+本轮静态检查通过：`bash -n`、`git diff --check`、`make fmt-check`、`make check` 和
+`make clippy`。可重复入口为：
+
+```bash
+make workspace-tests
+make test
+make go-api-parity-smoke
+make go-live-flow-parity-smoke
+make legacy-v1-runtime-smoke \
+  YUHAIIN_GO_LEGACY_PRODUCTION_DB=~/.cache/yuhaiin-rust/fixtures/go-v1/state.db
+```

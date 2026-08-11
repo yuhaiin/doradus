@@ -42,7 +42,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke socks5-protocol-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
+.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke socks5-protocol-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke workspace-tests \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -84,6 +84,7 @@ help:
 		'make node-latency-dns-smoke run API DNS latency chain smoke in Podman' \
 		'make stats-concurrency-smoke run concurrent statistics/restart smoke in Podman' \
 		'make startup-logs-smoke run foreground startup log smoke' \
+		'make workspace-tests   compile harnesses on host and run all workspace tests in Podman' \
 		'make run ARGS="..."    run the runtime binary with arguments' \
 		'make version            run the binary version command' \
 		'make check              cargo check for the whole workspace' \
@@ -182,8 +183,7 @@ legacy-v1-runtime-smoke:
 		exit 1; \
 	}
 	YUHAIIN_GO_LEGACY_PRODUCTION_DB="$${YUHAIIN_GO_LEGACY_PRODUCTION_DB}" \
-		$(CARGO) test $(CARGO_COMMON_ARGS) -p $(RUNTIME_PACKAGE) --all-features --offline \
-			--test legacy_v1_runtime -- --ignored --nocapture
+		./scripts/integration/legacy-v1-runtime.sh
 
 go-rust-stats-smoke:
 	./scripts/integration/go-rust-stats.sh
@@ -231,8 +231,10 @@ version: build-debug
 check:
 	$(CARGO) check $(CARGO_COMMON_ARGS) --workspace --all-features
 
-test:
-	$(CARGO) test $(CARGO_COMMON_ARGS) --workspace --all-features
+workspace-tests:
+	./scripts/integration/workspace-tests.sh
+
+test: workspace-tests
 
 fmt:
 	$(CARGO) fmt --all

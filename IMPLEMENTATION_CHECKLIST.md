@@ -16,6 +16,12 @@
 | 可运行范围 | Linux desktop/container：SQLite、API、DNS、普通 inbound、TUN、router、主要 proxy chain |
 | 当前结论 | **未完成**：rootful TUN/TPROXY、更多生产兼容样本和 TUN loopback 现场证据仍需验收；Android/macOS 独立应用暂不计入本轮 |
 
+### 测试边界
+
+- `make test` / `make workspace-tests` 只在宿主机执行 `cargo build`、`cargo test --no-run`；测试 harness、runtime 子进程、SQLite 临时副本和网络 flow 全部在 Podman 中运行。
+- 普通 workspace harness 使用 `--network=none`；`service_chain` 单独使用 Podman `--network=host`，与专用 `service-chain-smoke` 保持一致，规避 rootless net-none 对 HTTP/2 loopback fixture 的影响。两者都不在宿主机启动 Rust/Go runtime、proxy 或 TUN。
+- 当前 workspace 编译出的 40 个 harness 已有容器执行入口；rootful TUN/TPROXY 的能力不足仍按 `[ ]`/`[~]` 记录，不因模拟 TUN 单测或 rootless 生命周期 smoke 改变状态。
+
 ```mermaid
 flowchart TD
     CORE[yuhaiin-core\nFlowContext / Endpoint / proxy traits] --> CHAIN[yuhaiin-chain\nselector / router / inbound flow]
@@ -194,7 +200,8 @@ flowchart TD
 ```bash
 make fmt-check
 make check
-make test
+make test                 # host compile only; all harnesses run in Podman
+make workspace-tests      # same container-only workspace test entrypoint
 git diff --check
 ```
 
