@@ -1197,16 +1197,26 @@ impl AsyncDatagram for TokioDatagram {
             if target.network() != Network::Udp {
                 return Err(Error::invalid("UDP datagram target has wrong network"));
             }
-            let address = target.addr().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unsupported,
-                    "direct UDP datagram requires an IP endpoint",
-                )
-            })?;
-            self.socket
-                .send_to(payload, address)
-                .await
-                .map_err(|error| Error::new(ErrorKind::Io, format!("UDP send: {error}")))
+            let preferred_ipv4 = self
+                .socket
+                .local_addr()
+                .ok()
+                .map(|address| address.is_ipv4());
+            let addresses = resolve_direct_addresses(&target, preferred_ipv4).await?;
+            let mut last_error = None;
+            for address in addresses {
+                match self.socket.send_to(payload, address).await {
+                    Ok(length) => return Ok(length),
+                    Err(error) => {
+                        last_error = Some(Error::new(
+                            ErrorKind::Io,
+                            format!("UDP send to {address}: {error}"),
+                        ));
+                    }
+                }
+            }
+            Err(last_error
+                .unwrap_or_else(|| Error::invalid("direct UDP destination has no address")))
         })
     }
 
@@ -1700,6 +1710,45 @@ mod tests {
         let mut stream = proxy.connect(&context).await.unwrap();
         stream.write_all(b"direct-domain").await.unwrap();
         assert_eq!(server.await.unwrap(), *b"direct-domain");
+    }
+
+    #[cfg(feature = "async-proxy")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_async_datagram_resolves_domain_targets_on_send() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut payload = [0u8; 64];
+            let (length, peer) = server.recv_from(&mut payload).await.unwrap();
+            server.send_to(&payload[..length], peer).await.unwrap();
+            payload[..length].to_vec()
+        });
+
+        let mut context = FlowContext::new(Endpoint::domain(
+            Network::Udp,
+            DomainName::new("localhost").unwrap(),
+            address.port(),
+        ));
+        context
+            .local_bind_addresses
+            .push("127.0.0.1".parse().unwrap());
+        let proxy = DirectAsyncProxy {
+            timeout: Duration::from_secs(1),
+        };
+        let datagram = proxy.open_datagram(&context).await.unwrap();
+        let target = Endpoint::domain(
+            Network::Udp,
+            DomainName::new("localhost").unwrap(),
+            address.port(),
+        );
+        datagram
+            .send_to(b"direct-udp-domain", target)
+            .await
+            .unwrap();
+        let mut response = [0u8; 64];
+        let (length, _) = datagram.recv_from(&mut response).await.unwrap();
+        assert_eq!(&response[..length], b"direct-udp-domain");
+        assert_eq!(server_task.await.unwrap(), b"direct-udp-domain");
     }
 
     #[test]
