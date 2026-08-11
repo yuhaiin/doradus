@@ -24,6 +24,8 @@
 | `make api-reload-flow-smoke` | Podman `--network=host` | 2/2 通过；普通 inbound reload，以及通过 `/api/v2/inbounds/{id}` 的 TUN enabled toggle、重启持久化 |
 | `make go-live-flow-parity-smoke` | Podman | Go/Rust inbound→router→outbound live flow、connections 和 statistics 对照通过 |
 | `make stats-concurrency-smoke` | Podman 隔离容器 | 2/2 通过；8 路并发统计读取、实时流量写入、正常重启恢复，以及强停后重新打开同一 SQLite 数据库 |
+| `make transparent-service-smoke` | Podman `--privileged` 隔离 namespace | REDIRECT TCP 2 flows / 68 bytes 通过；rootless 能力门禁正确跳过 TPROXY UDP，不计为 TPROXY 通过 |
+| `make workspace-tests` | Podman：隔离、stats 专用、host-network 三类容器 | 40 个 workspace harness、0 个失败；rootful TUN/TPROXY 相关用例因当前 rootless 能力按设计 ignored |
 | `make benchmark-throughput`：HTTP CONNECT | Podman `--network=host`，release runtime | 64 MiB，109.89 MiB/s，peak RSS 17,864 KiB |
 | `make benchmark-throughput`：TLS+HTTP/2+Yuubinsya | Podman `--network=host`，release runtime | 64 MiB，29.57 MiB/s，peak RSS 19,432 KiB |
 | TUN packet / TPROXY | 当前 rootless Podman | 按能力门禁跳过；必须在 rootful `CAP_NET_ADMIN` namespace 验收，不计为通过 |
@@ -67,6 +69,7 @@ flowchart TD
 未完成：
 
 - `[~]` TUN flow 级异常隔离已有单测和 rootless 回归，但真实 TCP reset、多 flow 重连、超限 fragment 仍需 rootful namespace。
+- `[~]` loopback guard 已用真实本地 endpoint、当前测试进程 PID 和 executable path 验证；TUN 真实设备上的 endpoint/PID/path 组合仍需 rootful namespace 现场证据。
 - `延期` WireGuard userspace adapter；本轮完成了依赖审计：`boringtun 0.7.1` 的协议核心可复用但依赖 `ring`（含 `cc` build dependency）及 `libc/nix`，`wireguard 0.2.0` 同样依赖 `ring/libc` 且是较旧的参考实现；两者都不符合当前“纯 Rust、可直接接入现有 TCP/UDP data-plane”的约束，暂不引入。
 
 下一步：

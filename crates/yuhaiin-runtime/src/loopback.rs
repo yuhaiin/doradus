@@ -230,6 +230,20 @@ mod tests {
     }
 
     #[test]
+    fn real_process_identity_blocks_a_real_local_endpoint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let path = std::env::current_exe().unwrap();
+        let process_id = std::process::id();
+        let detector = LoopbackDetector::with_process(path.clone(), process_id);
+        let mut context = context(&endpoint.to_string());
+        context.process = Some(path.to_string_lossy().into_owned());
+        context.process_id = Some(process_id);
+
+        assert_eq!(detector.reason(&context), Some("loopback process"));
+    }
+
+    #[test]
     fn tracked_outbound_endpoint_is_reference_counted() {
         let detector = LoopbackDetector::new();
         let local = "127.0.0.1:24567".parse().unwrap();
