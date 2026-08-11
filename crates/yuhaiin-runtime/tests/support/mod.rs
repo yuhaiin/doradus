@@ -1012,6 +1012,15 @@ pub async fn api_json(
         .unwrap_or_else(|error| panic!("{path} returned invalid JSON: {error}: {text}"))
 }
 
+/// Management mutations publish the snapshot before the inbound owner has
+/// finished rebinding its listener set. Process-level flow fixtures wait for
+/// that short latest-wins reload window before opening a protocol connection,
+/// so a test does not connect to a socket that is about to be retired by an
+/// already-acknowledged mutation.
+async fn settle_runtime_reload() {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
 pub struct ServiceProcess {
     child: Child,
     pub client: reqwest::Client,
@@ -1223,6 +1232,7 @@ pub async fn configure_http_chain(
         Some(&rule),
     )
     .await;
+    settle_runtime_reload().await;
 }
 
 /// Configure an HTTP inbound whose route is selected only when the runtime
@@ -1310,6 +1320,7 @@ pub async fn configure_http_process_inbound_chain(
         Some(&rule),
     )
     .await;
+    settle_runtime_reload().await;
 }
 
 /// Configure the smallest real TLS-termination inbound: TLS transport,
@@ -1367,6 +1378,7 @@ pub async fn configure_tls_http_inbound(service: &ServiceProcess, inbound: Socke
         Some(&inbound),
     )
     .await;
+    settle_runtime_reload().await;
 }
 
 /// Configure a prior-knowledge HTTP/2 inbound over the same runtime owner as
@@ -1436,6 +1448,7 @@ pub async fn configure_h2_http_inbound(
         Some(&rule),
     )
     .await;
+    settle_runtime_reload().await;
 }
 
 /// Configure TLS termination followed by HTTP/2 prior-knowledge framing.
@@ -1515,6 +1528,7 @@ pub async fn configure_tls_h2_http_inbound(
         Some(&rule),
     )
     .await;
+    settle_runtime_reload().await;
 }
 
 pub async fn configure_socks5_chain(
@@ -1580,6 +1594,7 @@ pub async fn configure_socks5_chain(
         Some(&rule),
     )
     .await;
+    settle_runtime_reload().await;
 }
 
 pub async fn configure_h2_http_chain(
@@ -1597,6 +1612,7 @@ pub async fn configure_h2_http_chain(
         json!({"type":"http","http":{"user":"user","password":"pass"}}),
     )
     .await;
+    settle_runtime_reload().await;
 }
 
 pub async fn configure_h2_socks5_chain(
@@ -1617,6 +1633,7 @@ pub async fn configure_h2_socks5_chain(
         }),
     )
     .await;
+    settle_runtime_reload().await;
 }
 
 async fn configure_h2_protocol_chain(
@@ -1687,6 +1704,7 @@ async fn configure_h2_protocol_chain(
         Some(&rule),
     )
     .await;
+    settle_runtime_reload().await;
 }
 
 pub async fn configure_tls_h2_yuubinsya_chain(
@@ -1768,6 +1786,7 @@ pub async fn configure_tls_h2_yuubinsya_chain(
         Some(&rule),
     )
     .await;
+    settle_runtime_reload().await;
 }
 
 pub async fn add_mixed_udp_inbound(service: &ServiceProcess, id: &str, listen: SocketAddr) {
@@ -1787,6 +1806,7 @@ pub async fn add_mixed_udp_inbound(service: &ServiceProcess, id: &str, listen: S
         Some(&inbound),
     )
     .await;
+    settle_runtime_reload().await;
 }
 
 pub async fn add_socks5_inbound(
@@ -1812,6 +1832,7 @@ pub async fn add_socks5_inbound(
         Some(&inbound),
     )
     .await;
+    settle_runtime_reload().await;
 }
 
 pub async fn add_yuubinsya_inbound(service: &ServiceProcess, id: &str, listen: SocketAddr) {
@@ -1831,4 +1852,5 @@ pub async fn add_yuubinsya_inbound(service: &ServiceProcess, id: &str, listen: S
         Some(&inbound),
     )
     .await;
+    settle_runtime_reload().await;
 }

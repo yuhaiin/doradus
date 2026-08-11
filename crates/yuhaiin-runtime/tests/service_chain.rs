@@ -168,7 +168,23 @@ async fn http2_inbound_routes_through_http_outbound() {
         .body(())
         .unwrap();
     let (response, mut request_body) = client.send_request(request, false).unwrap();
-    let response = response.await.unwrap();
+    let response = match response.await {
+        Ok(response) => response,
+        Err(error) => {
+            let logs = api_json(
+                &service.client,
+                &service.base_url,
+                reqwest::Method::POST,
+                "/api/v2/rpc/tools.logs",
+                Some(&json!({})),
+            )
+            .await;
+            panic!(
+                "HTTP/2 inbound response failed: {error}; logs={logs}; stderr={}",
+                service.diagnostics()
+            );
+        }
+    };
     assert_eq!(response.status(), http::StatusCode::OK);
 
     let authority = format!("example.test:{}", fixture.target.port());

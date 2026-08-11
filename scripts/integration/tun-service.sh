@@ -45,6 +45,9 @@ fi
 if [[ -n "${YUHAIIN_TUN_RELOAD:-}" ]]; then
   chain_env+=( -e "YUHAIIN_TUN_RELOAD=${YUHAIIN_TUN_RELOAD}" )
 fi
+if [[ -n "${YUHAIIN_TUN_RELOAD_CYCLES:-}" ]]; then
+  chain_env+=( -e "YUHAIIN_TUN_RELOAD_CYCLES=${YUHAIIN_TUN_RELOAD_CYCLES}" )
+fi
 if [[ -n "${YUHAIIN_TUN_DEBUG:-}" ]]; then
   chain_env+=( -e "YUHAIIN_TUN_DEBUG=${YUHAIIN_TUN_DEBUG}" )
 fi

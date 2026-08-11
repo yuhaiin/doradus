@@ -2905,10 +2905,13 @@ runtime、proxy 或 TUN。
 副本、临时目录、XDG cache、integration 日志都映射到 `~/.cache/yuhaiin-rust` 下的 state
 目录，不使用 `/tmp`。
 
-workspace harness 按网络需求拆成两个 disposable container：
+workspace harness 按网络和进程隔离需求拆成三个 disposable container：
 
-- 普通 39 个 harness 使用 `--network=none --privileged`，覆盖 core、chain、protocol、store、
-  trie、geo、API、DNS/DoH、FakeIP、NAT、模拟 TUN、stats、跨进程 SQLite 和启动日志；
+- 普通 harness 使用 `--network=none --privileged`，覆盖 core、chain、protocol、store、trie、
+  geo、API、DNS/DoH、FakeIP、NAT、模拟 TUN、跨进程 SQLite 和启动日志；
+- `stats_concurrency` 单独使用 `--network=none --privileged`，避免它的 force-stop 子进程和
+  其他 harness 共享 namespace；它仍通过 `/state/tmp`、`/state/cache` 和 `~/.cache` 映射运行，
+  不使用 `/tmp`；
 - `service_chain` 的 14 个真实 inbound/router/outbound 进程场景单独使用 Podman
   `--network=host` 并强制单线程。这仍然是容器内运行，目的是复用专用 `service-chain-smoke`
   的 loopback 语义；rootless `network=none` 在 HTTP/2 多层 fixture 上会产生无关的 response
@@ -2938,3 +2941,26 @@ make go-live-flow-parity-smoke
 make legacy-v1-runtime-smoke \
   YUHAIIN_GO_LEGACY_PRODUCTION_DB=~/.cache/yuhaiin-rust/fixtures/go-v1/state.db
 ```
+
+## 94. 2026-08-11 desktop TUN supervisor lifecycle boundary
+
+此前桌面 `inbound::run_until` 把 TUN task 放进普通 TCP/UDP listener 的
+`abort_listeners` 集合。任意配置 reload 都会先 abort 整个 listener set，再立即重新打开 TUN；
+这会把设备 fd、Linux route lease 和新的 dispatcher 绑定在一次无序 task abort/re-open 中，尤其
+容易在快速切换 TUN enabled 或其他 inbound 配置时产生同名设备/路由 teardown 竞态。
+
+现在桌面 TUN 由独立的 `run_desktop_tun_supervisor` 持有。普通 socket listener 仍按 reload
+重建；listener supervisor 会合并尚未处理的 pending reload，只按最新 snapshot 重建一次，避免
+客户端连上刚 bind 的 socket 后又被同一批旧通知立即 abort。TUN supervisor 会等待当前 dispatcher
+通过 shared shutdown/reload future 返回，确保
+`TunRuntime` 和它的 route lease 在下一次 `load_tun_config` 前析构；打开失败或 dispatcher 初始化
+失败会等待下一次 reload，不会对同一份坏配置忙循环。注入式 Android/host FD 路径继续使用已有
+`run_until_with_tun_runtime`，不打开第二个桌面设备，也不改变 FD 的复用边界。
+
+`make tun-reload-smoke` 现在在 Podman 中连续执行四轮 `disable -> device disappears ->
+enable -> same device returns`，最近一次输出包含每轮的 `cycle=1..4`，最终正常打印
+`runtime-tun-closed`。这证明了 reload 的 owner 顺序和重复切换边界；rootless Podman 仍不具备
+真实 route、代理 packet flow、TPROXY 和 loopback guard 所需的 `CAP_NET_ADMIN`，因此这些
+rootful 现场项继续留在 checklist 的 `[ ]`/`[~]`，没有被生命周期 smoke 冒充完成。宿主机只
+执行 Cargo 编译和静态检查，smoke binary、SQLite 和日志均由 Podman 运行并落在
+`~/.cache/yuhaiin-rust`。

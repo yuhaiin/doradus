@@ -127,15 +127,31 @@ impl UdpMode {
     }
 }
 
-/// Run all enabled inbounds and restart their listener set after a successful
-/// configuration reload. TUN, TCP and UDP are owned from this boundary so
-/// `RuntimeController` only publishes immutable snapshots while this module
-/// controls device, socket and accepted-flow lifetimes.
+/// Run all enabled inbounds and restart their socket listener set after a
+/// successful configuration reload. Desktop TUN has its own persistent
+/// supervisor so a socket reload cannot race device teardown and re-open.
 pub async fn run_until(
     controller: RuntimeController,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    run_until_inner(controller, shutdown, true).await
+    #[cfg(feature = "tun")]
+    {
+        let tun_controller = controller.clone();
+        let tun_shutdown = shutdown.clone();
+        let tun_task = tokio::task::spawn_local(async move {
+            run_desktop_tun_supervisor(tun_controller, tun_shutdown).await;
+        });
+
+        let result = run_until_inner(controller, shutdown).await;
+        if !tun_task.is_finished() {
+            tun_task.abort();
+        }
+        let _ = tun_task.await;
+        result
+    }
+
+    #[cfg(not(feature = "tun"))]
+    run_until_inner(controller, shutdown).await
 }
 
 /// Run normal inbounds together with a TUN device created by the platform
@@ -220,7 +236,7 @@ pub async fn run_until_with_tun_runtime(
         }
     });
 
-    let result = run_until_inner(controller, shutdown, false).await;
+    let result = run_until_inner(controller, shutdown).await;
     if !tun_task.is_finished() {
         tun_task.abort();
     }
@@ -248,17 +264,95 @@ pub async fn run_until_with_tun_fd(
     run_until_with_tun_runtime(controller, shutdown, tun, config).await
 }
 
+/// Own the desktop TUN device independently from TCP/UDP listener reloads.
+///
+/// A successful proxy-runtime run returns when the controller publishes a
+/// reload. The device is then dropped before the next configuration is
+/// loaded, which gives route/device cleanup a deterministic boundary. Failed
+/// opens and failed dispatcher starts wait for a future reload instead of
+/// repeatedly retrying the same broken configuration.
+#[cfg(feature = "tun")]
+async fn run_desktop_tun_supervisor(
+    controller: RuntimeController,
+    shutdown: watch::Receiver<bool>,
+) {
+    let monitor = controller.monitor();
+    let mut config = loop {
+        match crate::load_tun_config(controller.store()).await {
+            Ok(config) => break config,
+            Err(error) => {
+                monitor.error(format!("load TUN inbound config failed: {error}"));
+                if crate::wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+                    return;
+                }
+            }
+        }
+    };
+
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+
+        if !config.enabled {
+            monitor.info("TUN inbound disabled");
+            if crate::wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+                break;
+            }
+        } else {
+            monitor.info("TUN inbound started");
+            match crate::data_plane::open_tun(&config) {
+                Ok(tun) => {
+                    if let Err(error) = crate::run_tun_device_until(
+                        controller.clone(),
+                        tun,
+                        config.clone(),
+                        shutdown.clone(),
+                    )
+                    .await
+                    {
+                        monitor.error(format!("TUN inbound stopped: {error}"));
+                        if crate::wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    monitor.error(format!("TUN inbound open failed: {error}"));
+                    if crate::wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if *shutdown.borrow() {
+            break;
+        }
+        config = loop {
+            match crate::load_tun_config(controller.store()).await {
+                Ok(config) => break config,
+                Err(error) => {
+                    monitor.error(format!("reload TUN inbound config failed: {error}"));
+                    if crate::wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+                        return;
+                    }
+                }
+            }
+        };
+    }
+}
+
 async fn run_until_inner(
     controller: RuntimeController,
     mut shutdown: watch::Receiver<bool>,
-    open_tun: bool,
 ) -> Result<()> {
     let mut reload = controller.subscribe_reload();
     let mut listeners = Vec::new();
     let result = async {
         loop {
             abort_listeners(&mut listeners).await;
-            listeners = start_listeners(&controller, shutdown.clone(), open_tun).await?;
+            listeners = start_listeners(&controller).await?;
             if *shutdown.borrow() {
                 break;
             }
@@ -272,6 +366,14 @@ async fn run_until_inner(
                     if changed.is_err() {
                         break;
                     }
+                    // A single API operation can publish several compatible
+                    // reloads while listeners are still binding. The store
+                    // and snapshot are already latest-wins, so discard the
+                    // queued intermediate notifications before restarting;
+                    // otherwise a client can connect to a freshly-bound
+                    // socket only to have the next stale notification abort
+                    // it immediately.
+                    while reload.try_recv().is_ok() {}
                 }
             }
         }
@@ -285,8 +387,6 @@ async fn run_until_inner(
 
 async fn start_listeners(
     controller: &RuntimeController,
-    shutdown: watch::Receiver<bool>,
-    open_tun: bool,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
     let records = controller.store().repository().list_go_inbounds().await?;
     let inbound_auth = Arc::new(InboundAuth::from_users(
@@ -309,40 +409,6 @@ async fn start_listeners(
         .await?;
     let monitor = controller.monitor();
     let mut listeners = Vec::new();
-    #[cfg(not(feature = "tun"))]
-    let _ = (&shutdown, open_tun);
-
-    // A Go TUN record is an inbound, even though it owns a device instead of
-    // a TCP/UDP socket. Keep its task in this same owner collection so reload,
-    // shutdown and abort use exactly the same lifecycle as SOCKS5/HTTP and
-    // Yuubinsya listeners.
-    #[cfg(feature = "tun")]
-    {
-        let tun_config = crate::load_tun_config(controller.store()).await?;
-        if open_tun && tun_config.enabled {
-            let task_controller = controller.clone();
-            let task_monitor = monitor.clone();
-            let task_shutdown = shutdown.clone();
-            listeners.push(tokio::task::spawn_local(async move {
-                task_monitor.info("TUN inbound started");
-                match crate::data_plane::open_tun(&tun_config) {
-                    Ok(tun) => {
-                        if let Err(error) = crate::run_tun_device_until(
-                            task_controller,
-                            tun,
-                            tun_config,
-                            task_shutdown,
-                        )
-                        .await
-                        {
-                            task_monitor.error(format!("TUN inbound stopped: {error}"));
-                        }
-                    }
-                    Err(error) => task_monitor.error(format!("TUN inbound open failed: {error}")),
-                }
-            }));
-        }
-    }
 
     async fn bind_tcp_listener(
         listen: SocketAddr,

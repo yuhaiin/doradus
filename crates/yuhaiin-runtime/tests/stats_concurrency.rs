@@ -11,18 +11,43 @@ use support::{
     integration_dir, reserve_loopback, seed_empty_database,
 };
 
-async fn read_headers(stream: &mut TcpStream) -> Vec<u8> {
+async fn read_headers(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut headers = Vec::new();
     let mut byte = [0u8; 1];
     while !headers.ends_with(b"\r\n\r\n") {
-        stream.read_exact(&mut byte).await.unwrap();
+        stream.read_exact(&mut byte).await?;
         headers.push(byte[0]);
-        assert!(
-            headers.len() <= 64 * 1024,
-            "HTTP headers exceeded the limit"
-        );
+        if headers.len() > 64 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP headers exceeded the limit",
+            ));
+        }
     }
-    headers
+    Ok(headers)
+}
+
+async fn connect_http_tunnel(
+    service: &support::ServiceProcess,
+    inbound: std::net::SocketAddr,
+    target: std::net::SocketAddr,
+) -> TcpStream {
+    let request = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n", target, target);
+    for _ in 0..20 {
+        let mut client = connect_loopback(inbound).await;
+        if client.write_all(request.as_bytes()).await.is_ok()
+            && let Ok(Ok(headers)) =
+                tokio::time::timeout(Duration::from_secs(1), read_headers(&mut client)).await
+            && String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 200")
+        {
+            return client;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "HTTP inbound did not complete CONNECT after reload: {}",
+        service.diagnostics()
+    );
 }
 
 async fn assert_json_success(client: &reqwest::Client, url: &str) -> Result<(), String> {
@@ -55,19 +80,7 @@ async fn concurrent_stats_readers_survive_flow_updates_and_restart() {
 
     let service = ServiceProcess::start(&database).await;
     configure_http_chain(&service, inbound, fixture.outbound).await;
-    let mut client = connect_loopback(inbound).await;
-    client
-        .write_all(
-            format!(
-                "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
-                fixture.target, fixture.target
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-    let headers = read_headers(&mut client).await;
-    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 200"));
+    let mut client = connect_http_tunnel(&service, inbound, fixture.target).await;
 
     let range_end = OffsetDateTime::now_utc();
     let range_start = (range_end - time::Duration::hours(1))
@@ -156,19 +169,7 @@ async fn force_stop_during_stats_reads_reopens_same_database() {
 
     let service = ServiceProcess::start(&database).await;
     configure_http_chain(&service, inbound, fixture.outbound).await;
-    let mut client = connect_loopback(inbound).await;
-    client
-        .write_all(
-            format!(
-                "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
-                fixture.target, fixture.target
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-    let headers = read_headers(&mut client).await;
-    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 200"));
+    let mut client = connect_http_tunnel(&service, inbound, fixture.target).await;
 
     let base_url = service.base_url.clone();
     let reader = tokio::spawn(async move {

@@ -141,7 +141,7 @@ tun-connection-metadata-smoke:
 	./scripts/integration/tun-connection-metadata.sh
 
 tun-reload-smoke:
-	YUHAIIN_TUN_RELOAD=1 YUHAIIN_TUN_RELOAD_ONLY=1 ./scripts/integration/tun-service.sh
+	YUHAIIN_TUN_RELOAD=1 YUHAIIN_TUN_RELOAD_CYCLES=$${YUHAIIN_TUN_RELOAD_CYCLES:-4} YUHAIIN_TUN_RELOAD_ONLY=1 ./scripts/integration/tun-service.sh
 
 tun-reload-traffic-smoke:
 	YUHAIIN_TUN_RELOAD=1 ./scripts/integration/tun-service.sh

@@ -47,9 +47,11 @@ fi
 
 declare -a isolated_binaries=()
 declare -a host_network_binaries=()
+declare -a stats_binaries=()
 for test_binary in "${test_binaries[@]}"; do
   case "${test_binary##*/}" in
     service_chain-*) host_network_binaries+=("${test_binary}") ;;
+    stats_concurrency-*) stats_binaries+=("${test_binary}") ;;
     *) isolated_binaries+=("${test_binary}") ;;
   esac
 done
@@ -95,9 +97,11 @@ run_in_podman() {
 }
 
 # Rootless `--network=none` has a known loopback/HTTP2 discrepancy in this
-# environment. Keep the normal workspace tests isolated, and run the one
-# process-chain harness in the same Podman host-network mode as its dedicated
-# smoke test. Both paths still execute only inside containers.
+# environment. Keep ordinary harnesses isolated, give the process-level stats
+# harness its own disposable namespace because it force-stops child services,
+# and run the process-chain harness in the same Podman host-network mode as
+# its dedicated smoke test. Every path still executes only inside containers.
 run_in_podman none "${scenario_dir}/podman-isolated.log" "${isolated_binaries[@]}"
+run_in_podman none "${scenario_dir}/podman-stats.log" "${stats_binaries[@]}"
 run_in_podman host "${scenario_dir}/podman-service-chain.log" "${host_network_binaries[@]}"
 echo "[workspace-tests] passed; logs=${scenario_dir}"

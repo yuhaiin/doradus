@@ -85,6 +85,22 @@ async fn run() -> Result<()> {
         .unwrap_or_default();
     let assert_connections = std::env::var_os("YUHAIIN_TUN_ASSERT_CONNECTIONS").is_some();
     let reload_inbound = std::env::var_os("YUHAIIN_TUN_RELOAD").is_some();
+    let reload_cycles = std::env::var("YUHAIIN_TUN_RELOAD_CYCLES")
+        .ok()
+        .map(|value| {
+            value.parse::<usize>().map_err(|_| {
+                Error::invalid(format!(
+                    "YUHAIIN_TUN_RELOAD_CYCLES must be a positive integer, got {value:?}"
+                ))
+            })
+        })
+        .transpose()?
+        .unwrap_or(1);
+    if reload_cycles == 0 || reload_cycles > 32 {
+        return Err(Error::invalid(
+            "YUHAIIN_TUN_RELOAD_CYCLES must be between 1 and 32",
+        ));
+    }
     let chain_mode = std::env::var("YUHAIIN_TUN_CHAIN")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -213,14 +229,16 @@ async fn run() -> Result<()> {
     println!("runtime-tun-opened name={device_name}");
 
     if reload_inbound {
-        toggle_persisted_tun(&controller, &device_path, false).await?;
-        println!("runtime-tun-disabled name={device_name}");
-        if traffic {
-            assert_tun_target_unreachable(Duration::from_millis(750)).map_err(io_error)?;
-            println!("runtime-tun-disabled-no-route-ok name={device_name}");
+        for cycle in 1..=reload_cycles {
+            toggle_persisted_tun(&controller, &device_path, false).await?;
+            println!("runtime-tun-disabled name={device_name} cycle={cycle}");
+            if traffic {
+                assert_tun_target_unreachable(Duration::from_millis(750)).map_err(io_error)?;
+                println!("runtime-tun-disabled-no-route-ok name={device_name} cycle={cycle}");
+            }
+            toggle_persisted_tun(&controller, &device_path, true).await?;
+            println!("runtime-tun-reload-ok name={device_name} cycle={cycle}");
         }
-        toggle_persisted_tun(&controller, &device_path, true).await?;
-        println!("runtime-tun-reload-ok name={device_name}");
     }
 
     if traffic {

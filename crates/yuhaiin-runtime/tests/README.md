@@ -62,7 +62,8 @@ The current scenarios cover:
 - `make tun-reload-smoke` runs the same fixture with
   `YUHAIIN_TUN_RELOAD=1`: it changes the persisted Go inbound `enabled` field,
   waits for the real device to disappear, enables it again, waits for the same
-  device name to return, and then shuts down. Set
+  device name to return, and repeats that disable/enable boundary (four cycles
+  by default) before shutting down. Set
   `YUHAIIN_TUN_RELOAD_ONLY=1` (the Make target does this) to test lifecycle
   switching without requiring a working namespace route or proxy traffic.
 - `scripts/integration/tun-chain-service.sh` runs the same real kernel TUN

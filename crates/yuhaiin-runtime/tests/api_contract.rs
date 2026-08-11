@@ -49,6 +49,22 @@ async fn expect_empty(service: &ServiceProcess, method: Method, path: &str, body
     );
 }
 
+async fn wait_for_get(service: &ServiceProcess, path: &str) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..100 {
+        let (status, value) = request_json(service, Method::GET, path, None).await;
+        if status.is_success() {
+            return value;
+        }
+        last = value;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!(
+        "GET {path} did not become ready: last={last}; stderr={}",
+        service.diagnostics()
+    );
+}
+
 async fn expect_sse(service: &ServiceProcess, path: &str) {
     let response = service
         .client
@@ -451,7 +467,7 @@ async fn management_api_round_trips_frontend_contracts_in_one_process() {
     .await;
     assert_eq!(node["origin"], "manual");
     assert_eq!(
-        expect_ok(&service, Method::GET, "/api/v2/nodes/contract-direct", None).await["id"],
+        wait_for_get(&service, "/api/v2/nodes/contract-direct").await["id"],
         "contract-direct"
     );
     let nodes = expect_ok(

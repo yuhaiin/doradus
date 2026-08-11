@@ -19,7 +19,7 @@
 ### 测试边界
 
 - `make test` / `make workspace-tests` 只在宿主机执行 `cargo build`、`cargo test --no-run`；测试 harness、runtime 子进程、SQLite 临时副本和网络 flow 全部在 Podman 中运行。
-- 普通 workspace harness 使用 `--network=none`；`service_chain` 单独使用 Podman `--network=host`，与专用 `service-chain-smoke` 保持一致，规避 rootless net-none 对 HTTP/2 loopback fixture 的影响。两者都不在宿主机启动 Rust/Go runtime、proxy 或 TUN。
+- 普通 workspace harness 使用 `--network=none`；`stats_concurrency` 单独使用一个同样隔离的 Podman 容器，`service_chain` 单独使用 Podman `--network=host`，与专用 smoke 保持一致，规避 rootless net-none 对 HTTP/2 loopback fixture 的影响。所有路径都不在宿主机启动 Rust/Go runtime、proxy 或 TUN。
 - 当前 workspace 编译出的 40 个 harness 已有容器执行入口；rootful TUN/TPROXY 的能力不足仍按 `[ ]`/`[~]` 记录，不因模拟 TUN 单测或 rootless 生命周期 smoke 改变状态。
 
 ```mermaid
@@ -137,7 +137,7 @@ flowchart TD
 
 - `[x]` `RuntimeSnapshot` + atomic reload；API mutation 会重新构建 live selector/listener。
 - `[x]` 普通 inbound 统一由 `inbound::run_until` 管理：SOCKS5、mixed、HTTP、Yuubinsya、reverse、UDP、TLS/HTTP2 transport。
-- `[~]` TUN 作为 inbound 生命周期的一部分；Linux 桌面设备和注入式 host FD 都有统一 shutdown/abort/reload 边界，且已提取可复用的 `RuntimeService` 宿主编排；rootful 数据面证据仍待补齐。
+- `[~]` TUN 作为独立 inbound supervisor；Linux 桌面设备不再跟普通 TCP/UDP listener 一起被 abort/rebind，reload 时先完成设备/路由 teardown 再按新配置打开；注入式 host FD 仍复用同一套 supervisor。rootful 数据面证据仍待补齐。
 - `[x]` connections、SSE、traffic、telemetry、history、failed history、node latency、pprof。
 - `[x]` Go/Rust API read/mutation/error parity、Podman live flow parity、API reload flow、stats concurrency。
 - `[x]` 启动日志默认写 stderr：数据库、API bind/listen、runtime ready、shutdown/stopped；`YUHAIIN_QUIET` 只接受显式 truthy 值。
