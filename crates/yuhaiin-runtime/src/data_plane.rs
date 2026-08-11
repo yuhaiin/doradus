@@ -414,17 +414,18 @@ pub async fn run_tun_device_until_ref(
             "TUN runtime is disabled",
         ));
     }
-    let proxy_id = match config.proxy_id.clone() {
-        Some(proxy_id) if !proxy_id.trim().is_empty() => proxy_id,
-        _ => crate::inbound::selected_proxy_id(&controller).await?,
+    let (tcp_proxy_id, udp_proxy_id) = match config.proxy_id.clone() {
+        Some(proxy_id) if !proxy_id.trim().is_empty() => (proxy_id.clone(), proxy_id),
+        _ => crate::inbound::selected_proxy_ids(&controller).await?,
     };
     let snapshot = controller.handle().load();
     let async_dns_handler = inbound_dns_handler(&snapshot)
         .map(|handler| handler as Arc<dyn yuhaiin_core::dns::AsyncDnsHandler>);
     let mut proxy_runtime = controller
-        .build_tun_proxy_runtime_with_dns(
+        .build_tun_proxy_runtime_with_dns_and_udp(
             &config.direct_id,
-            &proxy_id,
+            &tcp_proxy_id,
+            &udp_proxy_id,
             &config.bypass_id,
             &config.drop_id,
             Duration::from_secs(30),

@@ -280,9 +280,16 @@ async fn start_listeners(
             .list_go_user_records_for_runtime()
             .await?,
     ));
-    let proxy_id = selected_proxy_id(controller).await?;
+    let (tcp_proxy_id, udp_proxy_id) = selected_proxy_ids(controller).await?;
     let selector = controller
-        .build_proxy_selector("", &proxy_id, "", "", Duration::from_secs(30))
+        .build_proxy_selector_with_udp(
+            "",
+            &tcp_proxy_id,
+            &udp_proxy_id,
+            "",
+            "",
+            Duration::from_secs(30),
+        )
         .await?;
     let monitor = controller.monitor();
     let mut listeners = Vec::new();
@@ -346,7 +353,7 @@ async fn start_listeners(
                 continue;
             }
         };
-        spec.outbound_id = proxy_id.clone();
+        spec.outbound_id = tcp_proxy_id.clone();
         if inbound_auth.has_basic_users() || !inbound_auth.inbound_passwords().is_empty() {
             spec.username.clear();
             if inbound_auth.has_basic_users() {
@@ -753,11 +760,11 @@ async fn start_listeners(
     Ok(listeners)
 }
 
-pub async fn selected_proxy_id(controller: &RuntimeController) -> Result<String> {
+pub async fn selected_proxy_ids(controller: &RuntimeController) -> Result<(String, String)> {
     let nodes = controller.store().repository().list_go_nodes().await?;
-    let selected = controller
+    let legacy_selected = controller
         .store()
-        .get_config("selected_tcp_node_v2")
+        .get_config("selected.node")
         .await?
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|value| {
@@ -766,11 +773,16 @@ pub async fn selected_proxy_id(controller: &RuntimeController) -> Result<String>
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         });
-    let selected = match selected {
-        Some(selected) => Some(selected),
-        None => controller
+
+    async fn selected_id(
+        controller: &RuntimeController,
+        key: &str,
+        nodes: &[yuhaiin_store::GoNodeRecord],
+        legacy_selected: Option<&String>,
+    ) -> Result<String> {
+        let selected = controller
             .store()
-            .get_config("selected.node")
+            .get_config(key)
             .await?
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
             .and_then(|value| {
@@ -778,19 +790,38 @@ pub async fn selected_proxy_id(controller: &RuntimeController) -> Result<String>
                     .get("id")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
-            }),
-    };
-    Ok(selected
-        .filter(|id| nodes.iter().any(|node| node.enabled && node.id == *id))
-        .or_else(|| {
-            nodes
-                .into_iter()
-                .find(|node| node.enabled)
-                .map(|node| node.id)
-        })
-        // The string is an internal selector sentinel only; unlike the old
-        // startup helper it is not persisted as a nodes_v2 row.
-        .unwrap_or_else(|| "direct".to_owned()))
+            })
+            .or_else(|| legacy_selected.cloned());
+        Ok(selected
+            .filter(|id| nodes.iter().any(|node| node.enabled && node.id == *id))
+            .or_else(|| {
+                nodes
+                    .iter()
+                    .find(|node| node.enabled)
+                    .map(|node| node.id.clone())
+            })
+            .unwrap_or_else(|| "direct".to_owned()))
+    }
+
+    let tcp = selected_id(
+        controller,
+        "selected_tcp_node_v2",
+        &nodes,
+        legacy_selected.as_ref(),
+    )
+    .await?;
+    let udp = selected_id(
+        controller,
+        "selected_udp_node_v2",
+        &nodes,
+        legacy_selected.as_ref(),
+    )
+    .await?;
+    Ok((tcp, udp))
+}
+
+pub async fn selected_proxy_id(controller: &RuntimeController) -> Result<String> {
+    Ok(selected_proxy_ids(controller).await?.0)
 }
 
 async fn abort_listeners(listeners: &mut Vec<tokio::task::JoinHandle<()>>) {

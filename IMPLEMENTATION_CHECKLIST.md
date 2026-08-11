@@ -164,6 +164,7 @@ flowchart LR
 - `[x]` HTTP/SOCKS5/SOCKS4A/Trojan/VLESS/Yuubinsya/TUN → router → outbound 共用 `FlowContext`。
 - `[x]` 域名先按同一 resolver snapshot 解析 socket endpoint，同时保留 domain 给 TLS/H2/Yuubinsya framing。
 - `[x]` HTTP、TLS、HTTP/2、SOCKS5、mixed、Yuubinsya 的 TCP/UDP 真实进程链路已通过。
+- `[x]` TCP/UDP 出站 selection 已分流：`selected_tcp_node_v2` 只服务 TCP，`selected_udp_node_v2` 服务 UDP/TUN UDP；reload、连接 outbound metadata 和旧单 selection fallback 均保持一致。
 - `[x]` HTTP/2 bounded backpressure、半关闭、GOAWAY/drain、Yuubinsya UOT/native UDP 生命周期已验证。
 
 ### 6.3 未完成与下一步
@@ -176,6 +177,7 @@ flowchart LR
 ### 证据
 
 - `make service-chain-smoke`
+- `cargo test -p yuhaiin-runtime --lib --all-features --offline`
 - `make socks5-udp-associate-smoke`
 - `make transparent-service-smoke`
 - `make benchmark-throughput`

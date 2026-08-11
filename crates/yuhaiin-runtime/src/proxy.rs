@@ -543,8 +543,35 @@ impl RuntimeSnapshot {
         drop_id: &str,
         timeout: Duration,
     ) -> Result<RuntimeProxySelector> {
-        RuntimeProxySelector::from_snapshot(self, direct_id, proxy_id, bypass_id, drop_id, timeout)
-            .await
+        self.build_proxy_selector_with_udp(
+            direct_id, proxy_id, proxy_id, bypass_id, drop_id, timeout,
+        )
+        .await
+    }
+
+    /// Build a selector with Go-compatible independent TCP and UDP selected
+    /// nodes. Existing callers that only provide one node intentionally use
+    /// [`Self::build_proxy_selector`] and retain the same node for both
+    /// networks.
+    pub async fn build_proxy_selector_with_udp(
+        &self,
+        direct_id: &str,
+        tcp_proxy_id: &str,
+        udp_proxy_id: &str,
+        bypass_id: &str,
+        drop_id: &str,
+        timeout: Duration,
+    ) -> Result<RuntimeProxySelector> {
+        RuntimeProxySelector::from_snapshot(
+            self,
+            direct_id,
+            tcp_proxy_id,
+            udp_proxy_id,
+            bypass_id,
+            drop_id,
+            timeout,
+        )
+        .await
     }
 
     async fn build_routed_proxy_selector(
@@ -761,8 +788,10 @@ async fn build_aead_proxy(
 /// by the old slot; new flows observe the new snapshot after `replace`.
 pub struct RuntimeProxySelector {
     current: RwLock<RuntimeRoutedProxySelector>,
+    udp_current: RwLock<RuntimeRoutedProxySelector>,
     direct_id: String,
     proxy_id: String,
+    udp_proxy_id: String,
     bypass_id: String,
     drop_id: String,
     timeout: Duration,
@@ -789,6 +818,7 @@ impl RuntimeProxySelector {
         [
             self.direct_id.as_str(),
             self.proxy_id.as_str(),
+            self.udp_proxy_id.as_str(),
             self.bypass_id.as_str(),
             self.drop_id.as_str(),
         ]
@@ -801,26 +831,38 @@ impl RuntimeProxySelector {
     async fn from_snapshot(
         snapshot: &RuntimeSnapshot,
         direct_id: &str,
-        proxy_id: &str,
+        tcp_proxy_id: &str,
+        udp_proxy_id: &str,
         bypass_id: &str,
         drop_id: &str,
         timeout: Duration,
     ) -> Result<Self> {
         let loopback = LoopbackDetector::new();
         let current = snapshot
-            .build_routed_proxy_selector(direct_id, proxy_id, bypass_id, drop_id, timeout)
+            .build_routed_proxy_selector(direct_id, tcp_proxy_id, bypass_id, drop_id, timeout)
+            .await?;
+        let udp_current = snapshot
+            .build_routed_proxy_selector(direct_id, udp_proxy_id, bypass_id, drop_id, timeout)
             .await?;
         Ok(Self {
             current: RwLock::new(track_selector(current, &loopback)),
+            udp_current: RwLock::new(track_selector(udp_current, &loopback)),
             direct_id: direct_id.to_owned(),
-            proxy_id: proxy_id.to_owned(),
+            proxy_id: tcp_proxy_id.to_owned(),
+            udp_proxy_id: udp_proxy_id.to_owned(),
             bypass_id: bypass_id.to_owned(),
             drop_id: drop_id.to_owned(),
             timeout,
             closed_nodes: RwLock::new(BTreeSet::new()),
             metadata: RwLock::new(
                 snapshot
-                    .proxy_context_metadata(direct_id, proxy_id, bypass_id, drop_id)
+                    .proxy_context_metadata(
+                        direct_id,
+                        tcp_proxy_id,
+                        udp_proxy_id,
+                        bypass_id,
+                        drop_id,
+                    )
                     .await?,
             ),
             settings: RwLock::new(snapshot.settings.clone()),
@@ -845,10 +887,23 @@ impl RuntimeProxySelector {
                     .await?,
                 &self.loopback,
             ),
+            udp_selector: track_selector(
+                snapshot
+                    .build_routed_proxy_selector(
+                        &self.direct_id,
+                        &self.udp_proxy_id,
+                        &self.bypass_id,
+                        &self.drop_id,
+                        self.timeout,
+                    )
+                    .await?,
+                &self.loopback,
+            ),
             metadata: snapshot
                 .proxy_context_metadata(
                     &self.direct_id,
                     &self.proxy_id,
+                    &self.udp_proxy_id,
                     &self.bypass_id,
                     &self.drop_id,
                 )
@@ -863,6 +918,10 @@ impl RuntimeProxySelector {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *current = next.selector;
+        *self
+            .udp_current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.udp_selector;
         self.closed_nodes
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -905,6 +964,14 @@ impl RuntimeProxySelector {
             close_slot!(&self.proxy_id, &mut current.proxy);
             close_slot!(&self.bypass_id, &mut current.bypass);
             close_slot!(&self.drop_id, &mut current.drop);
+            let mut udp_current = self
+                .udp_current
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            close_slot!(&self.direct_id, &mut udp_current.direct);
+            close_slot!(&self.udp_proxy_id, &mut udp_current.proxy);
+            close_slot!(&self.bypass_id, &mut udp_current.bypass);
+            close_slot!(&self.drop_id, &mut udp_current.drop);
             if !old_proxies.is_empty() {
                 closed_nodes.insert(id.to_owned());
             }
@@ -939,6 +1006,7 @@ impl RuntimeProxySelector {
 
 pub(crate) struct PreparedProxySelector {
     pub(crate) selector: RuntimeRoutedProxySelector,
+    pub(crate) udp_selector: RuntimeRoutedProxySelector,
     metadata: ProxyContextMetadata,
     settings: crate::RuntimeSettings,
 }
@@ -973,15 +1041,21 @@ impl AsyncProxySelector for RuntimeProxySelector {
             &metadata,
             &self.direct_id,
             &self.proxy_id,
+            &self.udp_proxy_id,
             &self.bypass_id,
         );
     }
 
     fn select(&self, context: &FlowContext) -> Arc<dyn AsyncProxy> {
-        let current = self
-            .current
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = if context.network == yuhaiin_core::Network::Udp {
+            self.udp_current
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        } else {
+            self.current
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
         current.select(context)
     }
 }
@@ -991,11 +1065,12 @@ impl RuntimeSnapshot {
         &self,
         direct_id: &str,
         proxy_id: &str,
+        udp_proxy_id: &str,
         bypass_id: &str,
         drop_id: &str,
     ) -> Result<ProxyContextMetadata> {
         let mut endpoints = BTreeMap::new();
-        for id in [direct_id, proxy_id, bypass_id, drop_id]
+        for id in [direct_id, proxy_id, udp_proxy_id, bypass_id, drop_id]
             .into_iter()
             .filter(|id| !id.trim().is_empty())
         {
@@ -1021,6 +1096,7 @@ fn annotate_connection_metadata(
     metadata: &ProxyContextMetadata,
     direct_id: &str,
     proxy_id: &str,
+    udp_proxy_id: &str,
     bypass_id: &str,
 ) {
     if context.hosts.is_none() {
@@ -1041,12 +1117,20 @@ fn annotate_connection_metadata(
         }
     }
 
+    let selected_proxy_id = if context.network == yuhaiin_core::Network::Udp {
+        udp_proxy_id
+    } else {
+        proxy_id
+    };
     let selected_id = match context.route_mode {
         yuhaiin_core::RouteMode::Direct => direct_id,
-        yuhaiin_core::RouteMode::Proxy => proxy_id,
+        yuhaiin_core::RouteMode::Proxy => selected_proxy_id,
         yuhaiin_core::RouteMode::Bypass => bypass_id,
         yuhaiin_core::RouteMode::Block => return,
     };
+    if context.route_mode == yuhaiin_core::RouteMode::Proxy && !selected_id.is_empty() {
+        context.outbound = Some(selected_id.to_owned());
+    }
     let endpoint = metadata
         .endpoints
         .get(selected_id)
@@ -1521,6 +1605,51 @@ mod tests {
         context.route_mode = RouteMode::Direct;
         let direct = selector.select(&context);
         assert!(!Arc::ptr_eq(&selected, &direct));
+    }
+
+    #[test]
+    fn proxy_selector_uses_independent_tcp_and_udp_selected_nodes() {
+        let make_direct = |id: &str| GoProxyRuntimeConfig {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            group_name: String::new(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["direct".to_owned()],
+            layers: Vec::new(),
+            transport: GoProxyTransport::Direct,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        };
+        let mut snapshot = snapshot(make_direct("tcp-node"));
+        snapshot.proxies.push(make_direct("udp-node"));
+        let selector = block_on(snapshot.build_proxy_selector_with_udp(
+            "",
+            "tcp-node",
+            "udp-node",
+            "",
+            "",
+            Duration::from_secs(1),
+        ))
+        .unwrap();
+
+        let mut tcp = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        tcp.route_mode = RouteMode::Proxy;
+        let mut udp = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Udp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        udp.route_mode = RouteMode::Proxy;
+        udp.skip_route = true;
+
+        let tcp_proxy = selector.select(&tcp);
+        let udp_proxy = selector.select(&udp);
+        assert!(!Arc::ptr_eq(&tcp_proxy, &udp_proxy));
+        assert!(selector.active_node_ids().contains(&"udp-node".to_owned()));
+        selector.route_context(&mut udp);
+        assert_eq!(udp.outbound.as_deref(), Some("udp-node"));
     }
 
     #[test]

@@ -652,7 +652,7 @@ impl AsyncProxy for ChainProxy {
                                 &context.local_bind_addresses,
                             )
                             .await?;
-                        let local_addr = stream_local_addr(&*session.transport());
+                        let local_addr = stream_local_addr(session.transport());
                         Ok(with_stream_local_addr(
                             Box::new(session) as BoxAsyncStream,
                             local_addr,
@@ -688,7 +688,7 @@ impl AsyncProxy for ChainProxy {
                         .await?;
                     let migrate = session.migrate_id;
                     let udp_coalesce = session.udp_coalesce;
-                    let local_addr = stream_local_addr(&*session.transport());
+                    let local_addr = stream_local_addr(session.transport());
                     let (reader, writer) = split(session.into_inner());
                     migrate_id.store(migrate, Ordering::Release);
                     Ok(Box::new(ChainDatagram {
@@ -1163,7 +1163,7 @@ impl ChainDatagram {
             .await?;
         let replacement_id = replacement.migrate_id;
         let udp_coalesce = replacement.udp_coalesce;
-        let local_addr = stream_local_addr(&*replacement.transport());
+        let local_addr = stream_local_addr(replacement.transport());
         let (reader, writer) = split(replacement.into_inner());
         let replacement = ChainUotSession::new(reader, writer, udp_coalesce);
         let retry = self.retry.lock().await.snapshot();

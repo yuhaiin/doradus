@@ -120,11 +120,35 @@ impl RuntimeController {
         drop_id: &str,
         timeout: std::time::Duration,
     ) -> Result<Arc<RuntimeProxySelector>> {
+        self.build_proxy_selector_with_udp(
+            direct_id, proxy_id, proxy_id, bypass_id, drop_id, timeout,
+        )
+        .await
+    }
+
+    /// Build a live selector with independent TCP and UDP proxy nodes, as
+    /// persisted by Go's `selected_tcp_node_v2` and `selected_udp_node_v2`.
+    pub async fn build_proxy_selector_with_udp(
+        &self,
+        direct_id: &str,
+        tcp_proxy_id: &str,
+        udp_proxy_id: &str,
+        bypass_id: &str,
+        drop_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Arc<RuntimeProxySelector>> {
         let _guard = self.reload_lock.lock().await;
         let selector = Arc::new(
             self.handle
                 .load()
-                .build_proxy_selector(direct_id, proxy_id, bypass_id, drop_id, timeout)
+                .build_proxy_selector_with_udp(
+                    direct_id,
+                    tcp_proxy_id,
+                    udp_proxy_id,
+                    bypass_id,
+                    drop_id,
+                    timeout,
+                )
                 .await?,
         );
         self.register_selector(&selector);
@@ -187,11 +211,45 @@ impl RuntimeController {
         channel_capacity: usize,
         async_dns_handler: Option<Arc<dyn yuhaiin_core::dns::AsyncDnsHandler>>,
     ) -> Result<yuhaiin_core::tun::TunProxyRuntime> {
+        self.build_tun_proxy_runtime_with_dns_and_udp(
+            direct_id,
+            proxy_id,
+            proxy_id,
+            bypass_id,
+            drop_id,
+            proxy_timeout,
+            channel_capacity,
+            async_dns_handler,
+        )
+        .await
+    }
+
+    /// TUN variant with separate TCP and UDP selected outbound nodes.
+    #[cfg(feature = "tun")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn build_tun_proxy_runtime_with_dns_and_udp(
+        &self,
+        direct_id: &str,
+        tcp_proxy_id: &str,
+        udp_proxy_id: &str,
+        bypass_id: &str,
+        drop_id: &str,
+        proxy_timeout: std::time::Duration,
+        channel_capacity: usize,
+        async_dns_handler: Option<Arc<dyn yuhaiin_core::dns::AsyncDnsHandler>>,
+    ) -> Result<yuhaiin_core::tun::TunProxyRuntime> {
         let _guard = self.reload_lock.lock().await;
         let snapshot = self.handle.load();
         let selector = Arc::new(
             snapshot
-                .build_proxy_selector(direct_id, proxy_id, bypass_id, drop_id, proxy_timeout)
+                .build_proxy_selector_with_udp(
+                    direct_id,
+                    tcp_proxy_id,
+                    udp_proxy_id,
+                    bypass_id,
+                    drop_id,
+                    proxy_timeout,
+                )
                 .await?,
         );
         let (nat, idle_timeout) = snapshot.new_full_cone_nat()?;

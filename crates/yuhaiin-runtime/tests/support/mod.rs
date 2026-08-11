@@ -1127,7 +1127,11 @@ impl Drop for ServiceProcess {
 }
 
 pub async fn wait_for_connection(client: &reqwest::Client, base_url: &str) -> Value {
-    for _ in 0..100 {
+    // The reusable Podman smoke runs many real service processes in parallel;
+    // under load the flow can be established before the monitor checkpoint
+    // is visible, so keep the observation window independent of the normal
+    // listener startup retry budget.
+    for _ in 0..500 {
         let value = api_json(
             client,
             base_url,
