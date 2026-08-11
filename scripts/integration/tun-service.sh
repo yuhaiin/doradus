@@ -26,6 +26,9 @@ chain_env=()
 if [[ -n "${chain_mode}" ]]; then
   chain_env=(-e "YUHAIIN_TUN_CHAIN=${chain_mode}")
 fi
+if [[ -n "${YUHAIIN_TUN_RELOAD:-}" ]]; then
+  chain_env+=( -e "YUHAIIN_TUN_RELOAD=${YUHAIIN_TUN_RELOAD}" )
+fi
 if [[ -n "${YUHAIIN_TUN_DEBUG:-}" ]]; then
   chain_env+=( -e "YUHAIIN_TUN_DEBUG=${YUHAIIN_TUN_DEBUG}" )
 fi
@@ -48,11 +51,17 @@ common_args=(
 )
 run_args=(
   "${common_args[@]:0:${#common_args[@]}-1}"
-  -e YUHAIIN_TUN_TRAFFIC=1
-  -e YUHAIIN_TUN_TRAFFIC_BYTES="${YUHAIIN_TUN_TRAFFIC_BYTES:-32}"
   -e YUHAIIN_TUN_HOLD_MS=750
   "${common_args[@]: -1}"
 )
+if [[ "${YUHAIIN_TUN_RELOAD_ONLY:-0}" != "1" ]]; then
+  run_args=(
+    "${run_args[@]:0:${#run_args[@]}-1}"
+    -e YUHAIIN_TUN_TRAFFIC=1
+    -e YUHAIIN_TUN_TRAFFIC_BYTES="${YUHAIIN_TUN_TRAFFIC_BYTES:-32}"
+    "${run_args[@]: -1}"
+  )
+fi
 if [[ "${YUHAIIN_TUN_ASSERT_CONNECTIONS:-0}" == "1" ]]; then
   run_args=(
     "${run_args[@]:0:${#run_args[@]}-1}"
@@ -110,7 +119,12 @@ fi
 output="$(<"${log_path}")"
 printf '%s\n' "${output}"
 grep -Fq "runtime-tun-opened name=${tun_name}" <<<"${output}"
-grep -Fq "runtime-tun-traffic-ok" <<<"${output}"
+if [[ -n "${YUHAIIN_TUN_RELOAD:-}" ]]; then
+  grep -Fq "runtime-tun-reload-ok name=${tun_name}" <<<"${output}"
+fi
+if [[ "${YUHAIIN_TUN_RELOAD_ONLY:-0}" != "1" ]]; then
+  grep -Fq "runtime-tun-traffic-ok" <<<"${output}"
+fi
 grep -Fq "runtime-tun-closed name=${tun_name}" <<<"${output}"
 if [[ -n "${chain_mode}" ]]; then
   grep -Fq "runtime-tun-chain-ready mode=${chain_mode}" <<<"${output}"

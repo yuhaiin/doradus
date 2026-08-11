@@ -84,6 +84,7 @@ async fn run() -> Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or_default();
     let assert_connections = std::env::var_os("YUHAIIN_TUN_ASSERT_CONNECTIONS").is_some();
+    let reload_inbound = std::env::var_os("YUHAIIN_TUN_RELOAD").is_some();
     let chain_mode = std::env::var("YUHAIIN_TUN_CHAIN")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -211,6 +212,13 @@ async fn run() -> Result<()> {
     }
     println!("runtime-tun-opened name={device_name}");
 
+    if reload_inbound {
+        toggle_persisted_tun(&controller, &device_path, false).await?;
+        println!("runtime-tun-disabled name={device_name}");
+        toggle_persisted_tun(&controller, &device_path, true).await?;
+        println!("runtime-tun-reload-ok name={device_name}");
+    }
+
     if traffic {
         let connection_assertion = if assert_connections {
             Some(spawn_tun_connection_assertion(
@@ -312,6 +320,48 @@ async fn run() -> Result<()> {
     }
     println!("runtime-tun-closed name={device_name}");
     Ok(())
+}
+
+async fn toggle_persisted_tun(
+    controller: &RuntimeController,
+    device_path: &Path,
+    enabled: bool,
+) -> Result<()> {
+    let mut record = controller
+        .store()
+        .repository()
+        .list_go_inbounds()
+        .await?
+        .into_iter()
+        .find(|record| record.id == "tun-service-smoke")
+        .ok_or_else(|| Error::invalid("TUN reload fixture record disappeared"))?;
+    record.enabled = enabled;
+    let mut data: serde_json::Value = serde_json::from_slice(&record.data_json)
+        .map_err(|error| Error::invalid(format!("TUN reload fixture JSON: {error}")))?;
+    data["enabled"] = serde_json::Value::Bool(enabled);
+    record.data_json = serde_json::to_vec(&data).map_err(io_error)?;
+    controller
+        .mutate_and_reload(
+            move |store| async move { store.repository().put_go_inbound(&record).await },
+        )
+        .await?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if device_path.exists() == enabled {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::new(
+                ErrorKind::Timeout,
+                format!(
+                    "TUN reload did not reach enabled={enabled} for {}",
+                    device_path.display()
+                ),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn seed_runtime_fixture(

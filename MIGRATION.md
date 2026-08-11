@@ -2750,3 +2750,24 @@ Podman 的能力不足以完成这些断言，所有临时数据库和日志继�
 本轮实际运行 `make tun-chain-service-smoke` 的容器能输出 `runtime-tun-opened`，但真实流量在
 `0 bytes` 处收到 `Connection reset by peer`，随后按 45 秒上限退出并清理容器；这证明 smoke
 脚本的超时/清理路径生效，也保留了真实 route/CAP_NET_ADMIN 缺口的可复现记录。
+
+## 88. 2026-08-11 TUN inbound live enable/disable smoke
+
+此前 TUN 的 `enabled` reload 主要由配置解析和 supervisor 单测覆盖，缺少真实设备生命周期
+断言。本轮扩展已有 `tun-service-smoke`，不改变 TUN 的 inbound 归属：进程启动同一个
+`inbound::run_until` owner 后，通过 `RuntimeController::mutate_and_reload` 修改 SQLite 中
+Go-shaped TUN inbound 的 `enabled` 字段。
+
+`make tun-reload-smoke` 实际通过，输出顺序为：
+
+```text
+runtime-tun-opened name=yrtun0
+runtime-tun-disabled name=yrtun0
+runtime-tun-reload-ok name=yrtun0
+runtime-tun-closed name=yrtun0
+```
+
+测试在关闭和重新开启之间分别等待 `/sys/class/net/yrtun0` 消失/出现，证明不是只观察
+snapshot 或日志。数据库和 Podman 日志复用 `~/.cache/yuhaiin-rust/integration/tun-service`；
+该 smoke 只验证开关生命周期，不把 rootless namespace 的 route/代理流量能力误算成通过。
+Android `VpnService`/macOS `utun` 的外部 fd 仍需对应平台实机验收。
