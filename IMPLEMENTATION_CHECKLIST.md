@@ -8,13 +8,13 @@
 
 | 指标 | 当前值 |
 | --- | ---: |
-| 当前清单条目 | 50 项（延期项不计入分母；复合能力按一条统计） |
-| 已完成 `[x]` | 29 项（58.0%） |
-| 主路径完成 `[~]` | 14 项（28.0%） |
-| 仍未完成 `[ ]` | 7 项（14.0%） |
-| 加权覆盖率 | **72.0%**（`(29 + 14 × 0.5) / 50`） |
+| 当前清单条目 | Linux 纯桌面范围（延期项不计入分母；复合能力按一条统计） |
+| 已完成 `[x]` | 28 项 |
+| 主路径完成 `[~]` | 12 项 |
+| 仍未完成 `[ ]` | 6 项 |
+| 加权覆盖率 | **74.0%**（`(28 + 12 × 0.5) / (28 + 12 + 6)`） |
 | 可运行范围 | Linux desktop/container：SQLite、API、DNS、普通 inbound、TUN、router、主要 proxy chain |
-| 当前结论 | **未完成**：Android/macOS、rootful TUN/TPROXY、更多生产兼容样本和发布替换仍需验收 |
+| 当前结论 | **未完成**：rootful TUN/TPROXY、更多生产兼容样本和 Linux 服务替换仍需验收；Android/macOS 独立应用暂不计入本轮 |
 
 ```mermaid
 flowchart TD
@@ -116,7 +116,7 @@ flowchart TD
 
 - `[x]` `RuntimeSnapshot` + atomic reload；API mutation 会重新构建 live selector/listener。
 - `[x]` 普通 inbound 统一由 `inbound::run_until` 管理：SOCKS5、mixed、HTTP、Yuubinsya、reverse、UDP、TLS/HTTP2 transport。
-- `[~]` TUN 作为 inbound 生命周期的一部分；桌面设备和注入式 host FD 都有统一 shutdown/abort/reload 边界，且已提取可复用的 `RuntimeService` 宿主编排，但 Android/macOS 目前还没有 JNI/AAR、宿主调用方和真实 fd/route 现场证据。
+- `[~]` TUN 作为 inbound 生命周期的一部分；Linux 桌面设备和注入式 host FD 都有统一 shutdown/abort/reload 边界，且已提取可复用的 `RuntimeService` 宿主编排；rootful 数据面证据仍待补齐。
 - `[x]` connections、SSE、traffic、telemetry、history、failed history、node latency、pprof。
 - `[x]` Go/Rust API read/mutation/error parity、live flow parity、API reload flow、stats concurrency。
 - `[x]` 启动日志默认写 stderr：数据库、API bind/listen、runtime ready、shutdown/stopped；`YUHAIIN_QUIET` 只接受显式 truthy 值。
@@ -129,10 +129,9 @@ flowchart TD
 
 ### `crates/yuhaiin-platform`：平台边界
 
-- `[x]` Unix owned FD 接管、权限/服务配置边界、Linux systemd/macOS launchd 配置生成。
-- `[x]` Android target/build 入口默认使用 `/opt/android-ndk`，`aarch64-linux-android` 可做 target check/build。
-- `[~]` Android VpnService 真实 fd/权限/route/生命周期/电量/RSS。
-- `[~]` macOS utun/权限/route/SDK/LaunchDaemon 现场。
+- `[x]` Unix owned FD 接管、权限/服务配置边界、Linux systemd 配置生成。
+- `延期` Android target、VpnService、AAR/JNI 和移动端生命周期。
+- `延期` macOS 独立应用、utun/SDK/LaunchDaemon 现场。
 
 ## 协议与 inbound/outbound 矩阵
 
@@ -161,18 +160,17 @@ flowchart TD
 
 - `[ ]` rootful/CAP_NET_ADMIN TUN：真实 route、TCP reset/reconnect、多 flow、fragment overflow、namespace teardown。
 - `[ ]` rootful TPROXY UDP：ancillary destination、多个 flow、回包/rebind、idle reap、异常关闭。
-- `[ ]` Android VpnService 和 macOS utun 的真实 fd、route、权限和生命周期。
 
 ### P1：替换前建议完成
 
 - `[ ]` 更多 production SQLite schema/未知表/FakeIP/history/telemetry 快照 diff。
 - `[ ]` SQLite lock contention、长时间 stats 投影、升级和强停组合测试。
-- `[ ]` 至少一个真实 systemd 与一个 launchd 环境的替换、回滚、备份恢复和 health-check。
+- `[ ]` 至少一个真实 Linux systemd 环境的替换、回滚、备份恢复和 health-check。
 - `[ ]` TUN loopback guard 真实 endpoint/PID/path 证据。
 
 ### P2：按使用量开启
 
-- `延期` DoQ/DoH3、Shadowsocks/SSR、Tailscale、Reality、Mux、QUIC、订阅、WireGuard。
+- `延期` DoQ/DoH3、Shadowsocks/SSR、Tailscale、Reality、Mux、QUIC、订阅、WireGuard、Android/macOS 独立应用。
 
 ## 验收命令
 
