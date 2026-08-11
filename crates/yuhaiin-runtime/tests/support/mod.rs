@@ -10,7 +10,7 @@ use std::io::{Cursor, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -21,7 +21,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, ServerConfig};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use yuhaiin_chain::{YuubinsyaH2Server, YuubinsyaServerProxy};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, DirectAsyncProxy};
@@ -1019,8 +1019,17 @@ pub struct ServiceProcess {
     diagnostics: Arc<Mutex<String>>,
 }
 
+// `reserve_loopback` closes its temporary listener before the child binds.
+// Serialize that small hand-off so parallel integration tests cannot choose
+// the same port between the probe and the runtime's real bind.
+static API_START_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+
 impl ServiceProcess {
     pub async fn start(db: &Path) -> Self {
+        let _api_start_guard = API_START_LOCK
+            .get_or_init(|| AsyncMutex::new(()))
+            .lock()
+            .await;
         let api_address = reserve_loopback().await;
         let diagnostics = Arc::new(Mutex::new(String::new()));
         let runtime_binary = std::env::var_os("YUHAIIN_RUNTIME_BIN")

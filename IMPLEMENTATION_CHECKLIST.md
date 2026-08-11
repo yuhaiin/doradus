@@ -16,9 +16,9 @@ Go 源码映射、设计取舍和历史结果放在 [MIGRATION.md](MIGRATION.md)
 | 指标 | 当前值 |
 | --- | ---: |
 | 当前替换范围 | 66 项 |
-| 已完成 `[x]` | 54 项（81.8%） |
+| 已完成 `[x]` | 55 项（83.3%） |
 | 主路径完成 `[~]` | 12 项（18.2%） |
-| 加权覆盖率 | **90.9%**（`(54 + 12 × 0.5) / 66`） |
+| 加权覆盖率 | **92.4%**（`(55 + 12 × 0.5) / 66`） |
 | 明确延期 | 订阅、DoQ/DoH3、Shadowsocks/SSR、Tailscale、Reality、Mux、QUIC 等复杂协议 |
 | 当前总体状态 | **未完成**：Linux 主链路已可运行，平台/生产/少数边界证据仍缺 |
 
@@ -164,6 +164,7 @@ flowchart LR
 - `[x]` HTTP/SOCKS5/SOCKS4A/Trojan/VLESS/Yuubinsya/TUN → router → outbound 共用 `FlowContext`。
 - `[x]` 域名先按同一 resolver snapshot 解析 socket endpoint，同时保留 domain 给 TLS/H2/Yuubinsya framing。
 - `[x]` HTTP、TLS、HTTP/2、SOCKS5、mixed、Yuubinsya 的 TCP/UDP 真实进程链路已通过。
+- `[x]` central basic user reload 已在同一 runtime 进程中覆盖 SOCKS5/Yuubinsya 两类 inbound，并验证错误凭据、正确凭据、route history 和 outbound metadata。
 - `[x]` TCP/UDP 出站 selection 已分流：`selected_tcp_node_v2` 只服务 TCP，`selected_udp_node_v2` 服务 UDP/TUN UDP；reload、连接 outbound metadata 和旧单 selection fallback 均保持一致。
 - `[x]` HTTP/2 bounded backpressure、半关闭、GOAWAY/drain、Yuubinsya UOT/native UDP 生命周期已验证。
 
@@ -231,13 +232,14 @@ flowchart LR
 - `[x]` 前端 generated client 的 operation 已有自动路由覆盖；`connections.events`、`tools.logs` 的直接 SSE 路由单独验证。
 - `[x]` settings、nodes、inbounds、resolvers、DNS、hosts/FakeDNS、routes/lists/tags、NAT、users、publishes 共用 store/runtime struct。
 - `[x]` API mutation → atomic reload → 新数据面生效；旧 snapshot/旧 flow 不被破坏。
+- `[x]` central basic user snapshot 已覆盖 HTTP、SOCKS5、Yuubinsya inbound：API 添加用户后 reload，旧凭据拒绝、新凭据通过，并继续走 router/outbound。
 - `[x]` connections 建立、更新、关闭、数字 ID close、SSE added/removed、local/outbound/protocol/process/route metadata。
 - `[x]` traffic、telemetry、failed history、history、checkpoint、Go projection、跨进程 SQLite 接管。
 - `[x]` fresh state、三份生产快照、核心错误矩阵、API reload flow 已逐响应对照 Go。
 
 ### 未完成与下一步
 
-- `[~]` users：当前 Go main 没有 refact-user handler；Rust 已按 refact-user schema-v6 实现，但逐响应 Go handler parity 仍缺。
+- `[~]` users：当前 Go main 没有 refact-user handler；Rust 已按 refact-user schema-v6 实现，central inbound auth 已完成，但逐响应 Go handler parity 仍缺。
 - `[~]` process/inbound/negative matcher、完整 response 字段和更多 history/telemetry 生产样本。
 - `[~]` 升级期间 SQLite 表锁竞争与更长时间范围逐字段对照。
 - 下一步：优先补 refact-user 可运行 Go fixture；然后增加长时间 telemetry/history snapshot 和 lock contention。
@@ -250,6 +252,7 @@ flowchart LR
 - `make production-parity-smoke`
 - `make go-rust-stats-smoke`
 - `make stats-concurrency-smoke`
+- `cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture`（14/14）
 
 ## 10. 平台、更新与发布
 

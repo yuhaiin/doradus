@@ -53,6 +53,95 @@ async fn http_connect_with_auth(
     Ok((stream, String::from_utf8_lossy(&headers).into_owned()))
 }
 
+async fn socks5_auth_probe(
+    address: SocketAddr,
+    username: &str,
+    password: &str,
+) -> std::io::Result<[u8; 2]> {
+    let mut stream = connect_loopback(address).await;
+    stream.write_all(&[5, 1, 2]).await?;
+    let mut method = [0u8; 2];
+    stream.read_exact(&mut method).await?;
+    if method != [5, 2] {
+        return Ok(method);
+    }
+    let username = username.as_bytes();
+    let password = password.as_bytes();
+    let mut request = vec![1, username.len() as u8];
+    request.extend_from_slice(username);
+    request.push(password.len() as u8);
+    request.extend_from_slice(password);
+    stream.write_all(&request).await?;
+    let mut reply = [0u8; 2];
+    stream.read_exact(&mut reply).await?;
+    let _ = stream.shutdown().await;
+    Ok(reply)
+}
+
+async fn connect_socks5_with_auth(
+    address: SocketAddr,
+    username: &str,
+    password: &str,
+    host: &str,
+    port: u16,
+) -> TcpStream {
+    let mut stream = connect_loopback(address).await;
+    stream.write_all(&[5, 1, 2]).await.unwrap();
+    let mut method = [0u8; 2];
+    stream.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [5, 2]);
+    let username = username.as_bytes();
+    let password = password.as_bytes();
+    let mut auth = vec![1, username.len() as u8];
+    auth.extend_from_slice(username);
+    auth.push(password.len() as u8);
+    auth.extend_from_slice(password);
+    stream.write_all(&auth).await.unwrap();
+    let mut auth_reply = [0u8; 2];
+    stream.read_exact(&mut auth_reply).await.unwrap();
+    assert_eq!(auth_reply, [1, 0]);
+    let host = host.as_bytes();
+    let mut request = vec![5, 1, 0, 3, host.len() as u8];
+    request.extend_from_slice(host);
+    request.extend_from_slice(&port.to_be_bytes());
+    stream.write_all(&request).await.unwrap();
+    read_socks5_reply(&mut stream).await;
+    stream
+}
+
+async fn yuubinsya_auth_is_rejected(
+    address: SocketAddr,
+    password: &str,
+    host: &str,
+    port: u16,
+) -> bool {
+    let stream = connect_loopback(address).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        AsyncYuubinsyaTcpSession::connect(
+            stream,
+            yuhaiin_core::yuubinsya::derive_salt(password.as_bytes()),
+            Endpoint::domain(Network::Tcp, DomainName::new(host).unwrap(), port),
+        ),
+    )
+    .await;
+    match result {
+        Ok(Ok(mut session)) => {
+            let payload = b"yuubinsya-auth-probe";
+            if session.write_all(payload).await.is_err() {
+                return true;
+            }
+            let mut echoed = vec![0u8; payload.len()];
+            !matches!(
+                tokio::time::timeout(Duration::from_secs(1), session.read_exact(&mut echoed))
+                    .await,
+                Ok(Ok(())) if echoed == payload
+            )
+        }
+        Ok(Err(_)) | Err(_) => true,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http2_inbound_routes_through_http_outbound() {
     let fixture = ConnectFixture::start().await;
@@ -792,6 +881,177 @@ async fn central_basic_user_authenticates_http_inbound_chain() {
     }
     assert!(deleted, "deleted central user auth did not reload");
 
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn central_basic_user_authenticates_socks5_and_yuubinsya_inbounds() {
+    let fixture = ConnectFixture::start().await;
+    let _default_mixed_blocker = tokio::net::TcpListener::bind("127.0.0.1:1080").await.ok();
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_inbound = http_listener.local_addr().unwrap();
+    drop(http_listener);
+    let socks5_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks5_inbound = socks5_listener.local_addr().unwrap();
+    drop(socks5_listener);
+    let yuubinsya_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yuubinsya_inbound = yuubinsya_listener.local_addr().unwrap();
+    drop(yuubinsya_listener);
+
+    let root = integration_dir("service-central-required-inbound-auth");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_http_chain(&service, http_inbound, fixture.outbound).await;
+    add_socks5_inbound(
+        &service,
+        "central-auth-socks5-in",
+        socks5_inbound,
+        "inline-user",
+        "inline-password",
+    )
+    .await;
+    add_yuubinsya_inbound(&service, "central-auth-yuubinsya-in", yuubinsya_inbound).await;
+
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/users",
+        Some(&json!({
+            "id":"central-required-user",
+            "name":"Central required inbound user",
+            "enabled":true,
+            "origin":"manual",
+            "usage":"inbound",
+            "credential":{
+                "type":"basic",
+                "basic":{
+                    "username":"central-user",
+                    "password":"central-password"
+                }
+            }
+        })),
+    )
+    .await;
+
+    let mut socks5_auth_ready = false;
+    for _ in 0..100 {
+        if socks5_auth_probe(socks5_inbound, "central-user", "wrong-password")
+            .await
+            .is_ok_and(|reply| reply == [1, 1])
+        {
+            socks5_auth_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        socks5_auth_ready,
+        "central SOCKS5 auth snapshot did not reload; logs={}",
+        service.diagnostics()
+    );
+
+    let mut yuubinsya_auth_ready = false;
+    for _ in 0..100 {
+        if yuubinsya_auth_is_rejected(
+            yuubinsya_inbound,
+            YUUBINSYA_PASSWORD,
+            "example.test",
+            fixture.target.port(),
+        )
+        .await
+        {
+            yuubinsya_auth_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        yuubinsya_auth_ready,
+        "central Yuubinsya auth snapshot did not reload; logs={}",
+        service.diagnostics()
+    );
+
+    let mut socks5 = connect_socks5_with_auth(
+        socks5_inbound,
+        "central-user",
+        "central-password",
+        "example.test",
+        fixture.target.port(),
+    )
+    .await;
+    let socks5_payload = b"central-socks5-auth-payload";
+    socks5.write_all(socks5_payload).await.unwrap();
+    let mut socks5_echo = vec![0u8; socks5_payload.len()];
+    socks5.read_exact(&mut socks5_echo).await.unwrap();
+    assert_eq!(&socks5_echo, socks5_payload);
+
+    let yuubinsya_stream = connect_loopback(yuubinsya_inbound).await;
+    let mut yuubinsya = AsyncYuubinsyaTcpSession::connect(
+        yuubinsya_stream,
+        yuhaiin_core::yuubinsya::derive_salt(b"central-password"),
+        Endpoint::domain(
+            Network::Tcp,
+            DomainName::new("example.test").unwrap(),
+            fixture.target.port(),
+        ),
+    )
+    .await
+    .unwrap();
+    let yuubinsya_payload = b"central-yuubinsya-auth-payload";
+    yuubinsya.write_all(yuubinsya_payload).await.unwrap();
+    let mut yuubinsya_echo = vec![0u8; yuubinsya_payload.len()];
+    yuubinsya.read_exact(&mut yuubinsya_echo).await.unwrap();
+    assert_eq!(&yuubinsya_echo, yuubinsya_payload);
+
+    let mut connections = None;
+    for _ in 0..100 {
+        let current = api_json(
+            &service.client,
+            &service.base_url,
+            reqwest::Method::GET,
+            "/api/v2/connections",
+            None,
+        )
+        .await;
+        let items = current["connections"].as_array().unwrap();
+        if items
+            .iter()
+            .any(|item| item["inboundName"] == "central-auth-socks5-in")
+            && items
+                .iter()
+                .any(|item| item["inboundName"] == "central-auth-yuubinsya-in")
+        {
+            connections = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let connections = connections.expect("both centrally authenticated inbounds must be visible");
+    let items = connections["connections"].as_array().unwrap();
+    for (inbound, protocol) in [
+        ("central-auth-socks5-in", "socks5"),
+        ("central-auth-yuubinsya-in", "yuubinsya"),
+    ] {
+        let item = items
+            .iter()
+            .find(|item| item["inboundName"] == inbound)
+            .unwrap_or_else(|| panic!("connection for {inbound} is missing"));
+        assert_eq!(item["inbound"], protocol);
+        assert_eq!(item["outbound"], fixture.outbound.to_string());
+        assert_eq!(item["mode"], "proxy");
+        assert!(item["matchHistory"].as_array().is_some_and(|history| {
+            history
+                .iter()
+                .any(|entry| entry["ruleName"] == "proxy-example-test")
+        }));
+    }
+
+    yuubinsya.shutdown().await.unwrap();
+    socks5.shutdown().await.unwrap();
     service.shutdown().await;
     fixture.shutdown().await;
 }
