@@ -1261,7 +1261,16 @@ impl TunFlowObserver for ConnectionMonitor {
 
 fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
     let destination = endpoint_string(&context.effective_destination());
-    let original = endpoint_string(&flow.key.endpoint());
+    // Socket-backed HTTP inbounds keep a placeholder packet tuple while the
+    // parsed CONNECT authority lives in `original_domain`.  Report that
+    // authority as Go does; otherwise the API leaks `0.0.0.0:0` even though
+    // routing and the proxy handshake used the real host and port.
+    let original =
+        if context.original_domain.is_some() && flow.key.destination.ip().is_unspecified() {
+            destination.clone()
+        } else {
+            flow.key.endpoint().to_string()
+        };
     let source = endpoint_string(&flow.key.source_endpoint());
     let local_addr = context
         .local_addr
@@ -1485,7 +1494,10 @@ fn is_decimal(value: &str) -> bool {
 }
 
 fn endpoint_string(endpoint: &Endpoint) -> String {
-    endpoint.to_string()
+    match endpoint {
+        Endpoint::Ip { addr, .. } => addr.to_string(),
+        Endpoint::Domain { host, port, .. } => format!("{host}:{port}"),
+    }
 }
 
 fn traffic_bucket_start(interval: &str, timestamp: i64) -> i64 {
@@ -2169,6 +2181,25 @@ mod tests {
         assert_eq!(value["items"][0]["host"], "blocked.example");
         assert_eq!(value["items"][0]["blockCount"], "2");
         assert_eq!(value["dumpProcessEnabled"], false);
+    }
+
+    #[test]
+    fn monitor_connection_uses_http_authority_for_placeholder_socket_tuple() {
+        let monitor = ConnectionMonitor::new();
+        let key = TunFlowKey {
+            network: Network::Tcp,
+            source: "127.0.0.1:40000".parse().unwrap(),
+            destination: "0.0.0.0:0".parse().unwrap(),
+        };
+        let flow = TunFlow { key };
+        let mut context =
+            FlowContext::new(Endpoint::ip(Network::Tcp, "127.0.0.1:443".parse().unwrap()));
+        context.original_domain = Some(yuhaiin_core::DomainName::new("example.test").unwrap());
+        monitor.opened(flow, context);
+
+        let connection = &monitor.connections_value()["connections"][0];
+        assert_eq!(connection["addr"], "example.test:443");
+        assert_eq!(connection["destination"], "example.test:443");
     }
 
     #[test]

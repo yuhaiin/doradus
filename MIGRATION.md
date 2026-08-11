@@ -7,6 +7,21 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
+> 2026-08-11 Go/Rust live flow parity：新增
+> `scripts/integration/go-live-flow-parity.sh` 与 `make go-live-flow-parity-smoke`。测试会在
+> `~/.cache/yuhaiin-rust/integration/go-live-flow-parity/<run>/` 下分别启动 Go/Rust 进程和
+> SQLite 状态，配置 HTTP inbound、host list route、fixed + HTTP CONNECT outbound，接入
+> 本地 Python CONNECT fixture 并实际回显 payload；随后逐端校验 live connections、累计
+> upload/download、traffic、telemetry、node latency 和 history。当前 smoke 已通过。脚本
+> 不使用 `/tmp`；Go 的显示型 inbound name、node ID 前缀和部分 protocol 字段会在比较层
+> 做语义归一化，不把两个实现的展示差异误判为数据面失败。
+
+> 同一 live flow 还暴露了 Rust monitor 的兼容性边界：HTTP CONNECT inbound 使用占位
+> packet tuple 时，`flow.key.endpoint()` 可能是 `0.0.0.0:0`，但原始 authority 已在
+> `FlowContext::original_domain`。`connections.addr/destination` 现在优先输出该 authority，
+> 并按 Go `net.Addr.String()` 输出裸 `host:port`，新增
+> `monitor_connection_uses_http_authority_for_placeholder_socket_tuple` 回归测试。
+
 > 2026-08-11 refact-user CRUD 进程验收：从 Go 仓库的 `refact-user` 分支编译真实 Go
 > binary，与 Rust 分别打开同一份停止状态快照的副本，通过 `/api/v2/rpc/users.post`、
 > `user.put`、`user.get`、`users.get`、`user.delete` 完成 basic/UUID/token 创建、

@@ -236,7 +236,7 @@ flowchart LR
 - `[x]` API mutation → atomic reload → 新数据面生效；旧 snapshot/旧 flow 不被破坏。
 - `[x]` central basic user snapshot 已覆盖 HTTP、SOCKS5、Yuubinsya inbound：API 添加用户后 reload，旧凭据拒绝、新凭据通过，并继续走 router/outbound。
 - `[x]` connections 建立、更新、关闭、数字 ID close、SSE added/removed、local/outbound/protocol/process/route metadata。
-- `[x]` traffic、telemetry、failed history、history、checkpoint、Go projection、跨进程 SQLite 接管。
+- `[x]` traffic、telemetry、failed history、history、checkpoint、Go projection、跨进程 SQLite 接管；新增真实 Go/Rust 双进程 `HTTP inbound → host route → HTTP outbound` flow parity，覆盖 connections、payload、traffic、telemetry、latency 和 history。
 - `[x]` users：Go `refact-user` 分支与 Rust 的 basic/UUID/token CRUD、缺省 credential 保留、节点引用冲突和 missing-user 错误矩阵已通过真实 HTTP/RPC 对照。
 - `[x]` fresh state、三份生产快照、核心错误矩阵、API reload flow 已逐响应对照 Go。
 
