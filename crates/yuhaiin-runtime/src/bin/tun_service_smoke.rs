@@ -215,6 +215,10 @@ async fn run() -> Result<()> {
     if reload_inbound {
         toggle_persisted_tun(&controller, &device_path, false).await?;
         println!("runtime-tun-disabled name={device_name}");
+        if traffic {
+            assert_tun_target_unreachable(Duration::from_millis(750)).map_err(io_error)?;
+            println!("runtime-tun-disabled-no-route-ok name={device_name}");
+        }
         toggle_persisted_tun(&controller, &device_path, true).await?;
         println!("runtime-tun-reload-ok name={device_name}");
     }
@@ -479,6 +483,19 @@ async fn seed_runtime_fixture(
             .await?;
     }
     Ok(())
+}
+
+fn assert_tun_target_unreachable(timeout: Duration) -> std::io::Result<()> {
+    let address = "198.18.0.2:18080";
+    match TcpStream::connect_timeout(&address.parse().unwrap(), timeout) {
+        Ok(stream) => {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            Err(std::io::Error::other(format!(
+                "TUN target {address} remained reachable while the inbound was disabled"
+            )))
+        }
+        Err(_) => Ok(()),
+    }
 }
 
 fn traffic_byte(offset: usize) -> u8 {

@@ -212,7 +212,7 @@ stats-concurrency-smoke:
 	./scripts/integration/stats-concurrency.sh
 
 startup-logs-smoke:
-	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) test $(CARGO_COMMON_ARGS) -p $(RUNTIME_PACKAGE) --all-features --offline --test startup_logs -- --nocapture
+	./scripts/integration/startup-logs.sh
 
 build-chain-smoke:
 	$(CARGO) build $(CARGO_COMMON_ARGS) -p yuhaiin-chain --bin chain-smoke

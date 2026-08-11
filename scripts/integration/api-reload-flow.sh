@@ -38,7 +38,7 @@ test -x "${runtime_binary}"
 
 echo "[api-reload-flow] running persistent mutation/reload flow in Podman host network"
 podman run --rm \
-  --network=host \
+  --network=none \
   -v "${test_binary}:/usr/local/bin/yuhaiin-api-reload-flow:ro" \
   -v "${runtime_binary}:/usr/local/bin/yuhaiin:ro" \
   -v "${scenario_dir}:/state" \

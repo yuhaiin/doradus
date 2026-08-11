@@ -2841,6 +2841,33 @@ router host-list rule → HTTP outbound → echo proxy 的真实 flow，并验�
   均可读且满足断言。
 
 最近一次结果保留在
-`~/.cache/yuhaiin-rust/integration/go-live-flow-parity/20260811215135-127811`。这补齐了
+`~/.cache/yuhaiin-rust/integration/go-live-flow-parity/20260811220616-142194`。这补齐了
 Linux 普通 inbound/router/outbound 的容器化替换证据，但不改变 rootful TUN、TPROXY、长时间
 production telemetry 和 TUN loopback guard 仍待完成的 checklist 状态。
+
+## 90. 2026-08-11 container-only runtime smoke boundary
+
+当前验收边界明确为“宿主机只编译，运行时和集成测试在 Podman”。`startup-logs-smoke` 已从
+直接在宿主机 spawn runtime 改为 `network=none` 容器内的 foreground harness：它启动当前
+`yuhaiin` binary，检查 database/API bind、HTTP API listening、runtime ready，然后发送 TERM
+并检查 shutdown/stopped 日志。实际通过日志保存在
+`~/.cache/yuhaiin-rust/integration/startup-logs/podman.log`。
+
+`service-chain-smoke` 也改成宿主机只 build test binary/runtime binary，由 Debian testing
+Podman 容器执行完整的 14 条 inbound/router/outbound 场景；容器内测试改为单线程，避免多个
+并行 runtime 争用默认 `127.0.0.1:1080` 造成偶发 central-auth fixture 失败。当前连续执行通过
+14/14；API contract（3/3）、API reload（1/1）和 Go/Rust live flow parity 也均在 Podman
+通过。service-chain 暂保留 Podman 的 host network mode，因为 HTTP/2/TLS/Yuubinsya 多层
+fixture 在 `network=none`/pasta namespace 中会在 H2 response 前 reset；这仍是容器内测试，
+宿主机未启动 Rust/Go runtime、proxy 或 TUN。API、DNS、DoH、SOCKS5 UDP、stats 和 startup
+smoke 已使用 `network=none`，不会接触宿主监听端口。
+
+## 91. 2026-08-11 TUN disabled data-plane assertion
+
+TUN reload fixture 在禁用持久化 inbound 后，除了等待 `/sys/class/net/yrtun0` 消失，现在还在
+启用流量模式下尝试访问 `198.18.0.2:18080`，要求该地址在禁用窗口不可达，再重新启用并执行
+原有 echo flow。成功时会输出 `runtime-tun-disabled-no-route-ok`。rootless Podman 只能执行
+设备生命周期 smoke，流量路径按脚本返回 77；因此本轮没有把这条 rootful-only 断言标记为通过，
+需要在 `CAP_NET_ADMIN` 的 Podman namespace 中执行 `make tun-reload-traffic-smoke` 后再更新
+checklist。源码编译、`make fmt-check`、`make check`、`make clippy` 以及容器中的 API/chain/
+startup/live parity 均已通过，所有运行状态仍写入 `~/.cache`，没有使用 `/tmp`。

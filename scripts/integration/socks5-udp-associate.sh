@@ -28,7 +28,7 @@ test -n "${test_binary}"
 
 echo "[socks5-udp-associate] running real SOCKS5 UDP chain in Podman"
 podman run --rm \
-  --network=host \
+  --network=none \
   -v "${test_binary}:/usr/local/bin/yuhaiin-runtime-test:ro" \
   --entrypoint /bin/sh \
   "${image}" \

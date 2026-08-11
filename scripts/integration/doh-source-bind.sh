@@ -28,7 +28,7 @@ test -n "${test_binary}"
 
 echo "[doh-source-bind] running DoH/DoT source-address check in Podman"
 podman run --rm \
-  --network=host \
+  --network=none \
   -v "${test_binary}:/usr/local/bin/yuhaiin-doh-test:ro" \
   --entrypoint /bin/sh \
   "${image}" \

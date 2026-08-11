@@ -38,7 +38,7 @@ test -x "${runtime_binary}"
 
 echo "[api-contract] running process contract in Podman host network"
 podman run --rm \
-  --network=host \
+  --network=none \
   -v "${test_binary}:/usr/local/bin/yuhaiin-api-contract:ro" \
   -v "${runtime_binary}:/usr/local/bin/yuhaiin:ro" \
   -e YUHAIIN_RUNTIME_BIN=/usr/local/bin/yuhaiin \

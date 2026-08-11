@@ -38,7 +38,7 @@ test -x "${runtime_binary}"
 
 echo "[stats-concurrency] running concurrent statistics process smoke in Podman"
 podman run --rm \
-  --network=host \
+  --network=none \
   -v "${test_binary}:/usr/local/bin/yuhaiin-stats-test:ro" \
   -v "${runtime_binary}:/usr/local/bin/yuhaiin:ro" \
   -e YUHAIIN_RUNTIME_BIN=/usr/local/bin/yuhaiin \

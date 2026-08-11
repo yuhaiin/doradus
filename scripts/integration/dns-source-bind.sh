@@ -28,7 +28,7 @@ test -n "${test_binary}"
 
 echo "[dns-source-bind] running UDP/TCP source-address checks in Podman"
 podman run --rm \
-  --network=host \
+  --network=none \
   -v "${test_binary}:/usr/local/bin/yuhaiin-core-test:ro" \
   --entrypoint /bin/sh \
   "${image}" \

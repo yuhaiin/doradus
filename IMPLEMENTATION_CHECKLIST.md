@@ -2,13 +2,13 @@
 
 更新时间：2026-08-11
 
-这份清单按“模块树 → 已完成 → 未完成 → 下一步验收”组织。它不把“代码存在”当成“替换完成”：`[x]` 必须有单测或真实进程证据，`[~]` 表示 Linux 主路径可用但仍有平台、权限、生产样本或现场证据缺口，`[ ]` 表示未实现，`延期` 表示按当前范围主动不阻塞替换。
+这份清单按“模块 → 子模块 → 证据 → 缺口”组织，不再使用跨模块的优先级列表。它不把“代码存在”当成“替换完成”：`[x]` 必须有单测或真实进程证据，`[~]` 表示 Linux 主路径可用但仍有权限、生产样本或现场证据缺口，`[ ]` 表示仍有实际缺口，`延期` 表示按当前范围主动不阻塞替换。宿主机只编译；运行时、服务、代理链和 TUN 测试均在 Podman 中执行。
 
 ## 总体状态
 
 | 指标 | 当前值 |
 | --- | ---: |
-| 当前清单条目 | Linux 纯桌面模块验收项 + P0/P1 gates（延期项、协议矩阵重复项不计入） |
+| 当前清单条目 | Linux 纯桌面模块/子模块验收项（延期项、协议矩阵重复项不计入） |
 | 已完成 `[x]` | 30 项 |
 | 主路径完成 `[~]` | 13 项 |
 | 仍未完成 `[ ]` | 3 项 |
@@ -36,6 +36,8 @@ flowchart TD
 
 ### `crates/yuhaiin-core`：公共数据面基础
 
+子模块：数据合同、基础代理、DNS/NAT 边界、Yuubinsya、TUN device/dispatcher、loopback/process guard。
+
 已完成：
 
 - `[x]` `Endpoint`、`FlowContext`、`AsyncProxy`、`AsyncDatagram`、错误、超时和 socket metadata。
@@ -55,6 +57,8 @@ flowchart TD
 
 ### `crates/yuhaiin-protocol`：可组合协议与 transport
 
+子模块：TLS、HTTP/2、HTTP/SOCKS5 codec、Yuubinsya/AEAD、DNS transport、Linux transparent ancillary。
+
 已完成：
 
 - `[x]` RustCrypto TLS，HTTP/2 prior knowledge/client pool/server，HTTP CONNECT、SOCKS5 wire codec。
@@ -68,6 +72,8 @@ flowchart TD
 - `[~]` TPROXY ancillary data 代码存在，但尚无 rootful UDP 现场证据。
 
 ### `crates/yuhaiin-chain`：router 与 proxy chain
+
+子模块：snapshot/selector、route matcher、TCP chain、UDP chain、出站资源边界、TUN/transparent flow。
 
 已完成：
 
@@ -83,17 +89,23 @@ flowchart TD
 
 ### `crates/yuhaiin-trie`：域名/CIDR 索引
 
+子模块：domain trie、CIDR trie。
+
 - `[x]` domain parent/wildcard/normalize/priority、网络和端口约束。
 - `[x]` IPv4/IPv6 longest-prefix lookup、随机对照和边界测试。
 - 下一步：补更多生产规则快照；当前无 Linux 主路径缺口。
 
 ### `crates/yuhaiin-geo`：MaxMindDB
 
+子模块：纯 Rust reader、生产数据库投影样本。
+
 - `[x]` 纯 Rust MaxMind reader、坏库 fail-closed、SHA-256 校验、atomic refresh、IPv4-mapped IPv6。
 - `[x]` fixture 存放在 `~/.cache/yuhaiin-rust-maxmind/`，不进入仓库。
 - `[~]` 更多真实生产数据库版本和 country/ASN projection 样本。
 
 ### `crates/yuhaiin-store`：SQLite 配置、FakeIP、统计
+
+子模块：生产 SQLite、Go schema、typed repository、FakeIP pool、statistics、生产 schema、长时统计、容量样本、升级恢复。
 
 已完成：
 
@@ -112,6 +124,8 @@ flowchart TD
 
 ### `crates/yuhaiin-runtime`：运行时、inbound owner、管理面
 
+子模块：runtime snapshot、普通 inbound owner、管理 API、观察面、兼容证据、启动/关闭、Linux service lifecycle、response parity、TUN supervisor、route lifecycle。
+
 已完成：
 
 - `[x]` `RuntimeSnapshot` + atomic reload；API mutation 会重新构建 live selector/listener。
@@ -128,6 +142,8 @@ flowchart TD
 - `[x]` Linux systemd 服务安装、失败自动回滚、持久化 backup、显式 rollback 和 `/health` 检查；`make systemd-service-smoke` 已在 disposable systemd Podman 环境通过。
 
 ### `crates/yuhaiin-platform`：平台边界
+
+子模块：Unix owned FD、权限/服务配置；移动平台单独应用明确延期。
 
 - `[x]` Unix owned FD 接管、权限/服务配置边界、Linux systemd 配置生成。
 - `延期` Android target、VpnService、AAR/JNI 和移动端生命周期。
@@ -154,23 +170,21 @@ flowchart TD
 | DoQ/DoH3 | resolver | client | `延期` |
 | WireGuard | — | — | `延期` library audit: `boringtun`/`wireguard` 依赖 native crypto/runtime 边界，暂不引入 |
 
-## 当前阻塞项与优先级
+## 仍需完成的工作
 
-### P0：必须继续收尾
+以下三项是 Linux 桌面替换前的实际缺口：
 
-- `[ ]` rootful/CAP_NET_ADMIN TUN：真实 route、TCP reset/reconnect、多 flow、fragment overflow、namespace teardown。
-- `[ ]` rootful TPROXY UDP：ancillary destination、多个 flow、回包/rebind、idle reap、异常关闭。
+- `[ ]` rootful/CAP_NET_ADMIN TUN：真实 route、禁用期间不可达、重新启用、多 flow、TCP reset/reconnect、fragment overflow 和 namespace teardown。
+- `[ ]` rootful TPROXY UDP：ancillary destination、多个 flow、回包/rebind、idle reap 和异常关闭。
+- `[ ]` TUN loopback guard 的真实 endpoint/PID/path 组合证据。
 
-### P1：替换前建议完成
+建议继续补的兼容性证据：
 
-- `[~]` 更多 production SQLite schema/未知表/FakeIP/history/telemetry 快照 diff；3 份真实生产形态快照的 Go/Rust API parity 已通过，仍需逐表 schema/异常快照 diff。
+- `[~]` 更多 production SQLite schema/未知表/FakeIP/history/telemetry 快照 diff；已有 3 份真实生产形态快照的 Go/Rust API parity，仍需逐表 schema/异常快照 diff。
 - `[~]` SQLite lock contention、长时间 stats 投影、升级和强停组合测试；并发 stats reader/writer 与 force-stop recovery 已通过，升级组合仍待补。
-- `[x]` 真实 Linux systemd 环境的替换、回滚、备份恢复和 health-check：`make systemd-service-smoke`。
-- `[ ]` TUN loopback guard 真实 endpoint/PID/path 证据。
+- `[~]` 完整 response 字段、生产 route/resolver projection、MaxMind country/ASN 以及 TUN loopback 的更多样本。
 
-### P2：按使用量开启
-
-- `延期` DoQ/DoH3、Shadowsocks/SSR、Tailscale、Reality、Mux、QUIC、订阅、WireGuard、Android/macOS 独立应用。
+主动延期：DoQ/DoH3、Shadowsocks/SSR、Tailscale、Reality、Mux、QUIC、订阅、WireGuard、Android/macOS 独立应用。
 
 ## 验收命令
 
