@@ -2816,3 +2816,31 @@ runtime-tun-closed name=yrtun0
 snapshot 或日志。数据库和 Podman 日志复用 `~/.cache/yuhaiin-rust/integration/tun-service`；
 该 smoke 只验证开关生命周期，不把 rootless namespace 的 route/代理流量能力误算成通过。
 Android `VpnService`/macOS `utun` 的外部 fd 仍需对应平台实机验收。
+
+## 89. 2026-08-11 containerized Go/Rust live flow parity
+
+此前 `go-live-flow-parity.sh` 的对照服务曾直接在宿主机启动；这不符合当前验收边界，也会让
+Go/Rust 的默认 mixed/DNS listener 互相争抢端口。现在脚本只在宿主机编译 Go/Rust binary，
+运行时全部放进 Podman：Go 和 Rust 各自使用独立的 `debian:testing` 容器、独立 SQLite，
+通过 pasta 网络和宿主随机映射端口提供 API/inbound；每个服务的纯 Python HTTP CONNECT echo
+proxy 作为 `--network=container:<service>` sidecar 启动。宿主机只负责启动/清理容器、调用管理
+API 和连接已发布端口的测试 client，不启动 proxy/runtime，不创建 TUN，不修改路由。
+
+容器 inbound 使用 wildcard `0.0.0.0:18080`，避免 Podman 端口转发无法到达容器内 loopback；
+sidecar 地址由容器实际网络地址发现，避免把宿主 `127.0.0.1` 错当成容器服务。清理时先删除
+sidecar 再删除服务容器，避免共享 network namespace 依赖导致容器残留。测试运行中的所有
+二进制、SQLite、日志和结果都位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
+`make go-live-flow-parity-smoke` 已在 Podman 中连续通过。两套实现均完成 HTTP inbound →
+router host-list rule → HTTP outbound → echo proxy 的真实 flow，并验证：
+
+- Go/Rust live connection 归一化结果完全一致，`connections.diff` 为空；
+- CONNECT 200 response、双向 payload echo、Go/Rust proxy CONNECT 和 HTTP latency 请求均有
+  sidecar 日志证据；
+- `connections.total` 的 upload/download、traffic、telemetry、node latency 和 history
+  均可读且满足断言。
+
+最近一次结果保留在
+`~/.cache/yuhaiin-rust/integration/go-live-flow-parity/20260811215135-127811`。这补齐了
+Linux 普通 inbound/router/outbound 的容器化替换证据，但不改变 rootful TUN、TPROXY、长时间
+production telemetry 和 TUN loopback guard 仍待完成的 checklist 状态。

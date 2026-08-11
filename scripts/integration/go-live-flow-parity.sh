@@ -4,7 +4,8 @@ set -euo pipefail
 # Start one Go service and one Rust service with independent SQLite state,
 # configure the same HTTP inbound -> router -> HTTP outbound chain, then
 # compare the live connection contract and validate traffic/history/latency
-# on both implementations. All generated state and logs stay in the cache.
+# on both implementations. Go, Rust, and the echo proxy run in Podman;
+# generated state, binaries, and logs stay in the cache.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${repo_root}/scripts/lib/cache.sh"
@@ -17,6 +18,7 @@ keep_runs="${YUHAIIN_KEEP_RUNS:-3}"
 command -v curl >/dev/null
 command -v go >/dev/null
 command -v jq >/dev/null
+command -v podman >/dev/null
 command -v python3 >/dev/null
 test -d "${go_root}"
 [[ "${keep_runs}" =~ ^[1-9][0-9]*$ ]]
@@ -38,20 +40,37 @@ rust_inbound="$(reserve_port)"
 proxy_port="$(reserve_port)"
 go_address="127.0.0.1:${go_api}"
 rust_address="127.0.0.1:${rust_api}"
+container_api="0.0.0.0:50051"
+container_inbound="0.0.0.0:18080"
 
 go_binary="${run_dir}/yuhaiin-go"
 rust_binary="${target_dir}/debug/yuhaiin"
-go_pid=""
-rust_pid=""
-proxy_pid=""
+image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+proxy_image="${YUHAIIN_PROXY_IMAGE:-localhost/yuhaiin-nettools-python:testing}"
+go_container="yuhaiin-go-live-${run_id}"
+rust_container="yuhaiin-rust-live-${run_id}"
+go_proxy_container="yuhaiin-go-live-proxy-${run_id}"
+rust_proxy_container="yuhaiin-rust-live-proxy-${run_id}"
+go_flow_pid=""
+rust_flow_pid=""
 
 cleanup() {
-  for pid in "${proxy_pid}" "${go_pid}" "${rust_pid}"; do
+  for pid in "${go_flow_pid}" "${rust_flow_pid}"; do
     if [[ -n "${pid}" ]]; then
       kill -TERM "${pid}" 2>/dev/null || true
       wait "${pid}" 2>/dev/null || true
     fi
   done
+  podman logs "${go_container}" >"${run_dir}/go-container.log" 2>&1 || true
+  podman logs "${rust_container}" >"${run_dir}/rust-container.log" 2>&1 || true
+  podman logs "${go_proxy_container}" >"${run_dir}/go-proxy.log" 2>&1 || true
+  podman logs "${rust_proxy_container}" >"${run_dir}/rust-proxy.log" 2>&1 || true
+  # A network-sharing sidecar depends on its service container. Remove the
+  # sidecars first so Podman does not leave the service containers behind.
+  podman rm -f --ignore "${go_proxy_container}" "${rust_proxy_container}" \
+    >/dev/null 2>&1 || true
+  podman rm -f --ignore "${go_container}" "${rust_container}" \
+    >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -67,60 +86,30 @@ cargo build \
   >"${run_dir}/rust-build.log"
 test -x "${rust_binary}"
 
-# The fixed parent of the configured HTTP outbound points here. It accepts
-# CONNECT, returns a successful proxy response, then serves HTTP probes and
-# raw payloads. This keeps the test independent of external network access.
-python3 -u - "${proxy_port}" >"${run_dir}/proxy.log" 2>&1 <<'PY' &
-import socket
-import sys
-import threading
-
-port = int(sys.argv[1])
-listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-listener.bind(("127.0.0.1", port))
-listener.listen(32)
-
-def serve(client):
-    try:
-        request = b""
-        while b"\r\n\r\n" not in request and len(request) < 16384:
-            chunk = client.recv(4096)
-            if not chunk:
-                return
-            request += chunk
-        print(f"request={request!r}", flush=True)
-        if not request.startswith(b"CONNECT "):
-            return
-        client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        while True:
-            chunk = client.recv(65536)
-            if not chunk:
-                return
-            print(f"payload={chunk!r}", flush=True)
-            if chunk.startswith((b"GET ", b"HEAD ")):
-                client.sendall(
-                    b"HTTP/1.1 204 No Content\r\n"
-                    b"Content-Length: 0\r\nConnection: close\r\n\r\n"
-                )
-            else:
-                client.sendall(chunk)
-            print("echoed", flush=True)
-    finally:
-        client.close()
-
-while True:
-    client, _ = listener.accept()
-    threading.Thread(target=serve, args=(client,), daemon=True).start()
-PY
-proxy_pid=$!
-
 wait_tcp() {
   local port="$1"
   for _ in $(seq 1 100); do
     if python3 - "${port}" <<'PY' >/dev/null 2>&1
 import socket
 import sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=0.5)
+s.close()
+PY
+    then
+      return 0
+    fi
+    sleep 0.05
+  done
+  return 1
+}
+
+wait_proxy() {
+  local container="$1"
+  for _ in $(seq 1 100); do
+    if podman exec "${container}" python3 - "${proxy_port}" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=0.5)
 s.close()
 PY
@@ -145,16 +134,60 @@ wait_ready() {
   return 1
 }
 
-wait_tcp "${proxy_port}"
-
-"${go_binary}" -host "${go_address}" -path "${run_dir}/go" \
-  >"${run_dir}/go.log" 2>&1 &
-go_pid=$!
-YUHAIIN_DB="${run_dir}/rust/state.sqlite" YUHAIIN_HTTP="${rust_address}" \
-  "${rust_binary}" >"${run_dir}/rust.log" 2>&1 &
-rust_pid=$!
+echo "[go-live-flow-parity] starting proxy, Go, and Rust services in Podman"
+podman run -d \
+  --name "${go_container}" \
+  --network=pasta \
+  -p "127.0.0.1:${go_api}:50051" \
+  -p "127.0.0.1:${go_inbound}:18080" \
+  --userns=keep-id \
+  -v "${run_dir}:/data" \
+  -v "${go_binary}:/usr/local/bin/yuhaiin:ro" \
+  --entrypoint /usr/local/bin/yuhaiin \
+  "${image}" \
+  -host "${container_api}" -path /data/go \
+  >"${run_dir}/go-container-id"
+podman run -d \
+  --name "${rust_container}" \
+  --network=pasta \
+  -p "127.0.0.1:${rust_api}:50051" \
+  -p "127.0.0.1:${rust_inbound}:18080" \
+  --userns=keep-id \
+  -v "${run_dir}:/data" \
+  -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
+  -e "YUHAIIN_DB=/data/rust/state.sqlite" \
+  -e "YUHAIIN_HTTP=${container_api}" \
+  --entrypoint /usr/local/bin/yuhaiin \
+  "${image}" \
+  >"${run_dir}/rust-container-id"
 wait_ready "${go_address}"
 wait_ready "${rust_address}"
+go_proxy_host="$(podman exec "${go_container}" hostname -I | awk '{print $1}')"
+rust_proxy_host="$(podman exec "${rust_container}" hostname -I | awk '{print $1}')"
+test -n "${go_proxy_host}"
+test -n "${rust_proxy_host}"
+
+podman run -d \
+  --name "${go_proxy_container}" \
+  --network "container:${go_container}" \
+  --userns=keep-id \
+  -v "${repo_root}/scripts/integration/http-connect-echo.py:/usr/local/bin/http-connect-echo.py:ro" \
+  --entrypoint python3 \
+  "${proxy_image}" \
+  -u /usr/local/bin/http-connect-echo.py "${proxy_port}" \
+  >"${run_dir}/go-proxy-container-id"
+podman run -d \
+  --name "${rust_proxy_container}" \
+  --network "container:${rust_container}" \
+  --userns=keep-id \
+  -v "${repo_root}/scripts/integration/http-connect-echo.py:/usr/local/bin/http-connect-echo.py:ro" \
+  --entrypoint python3 \
+  "${proxy_image}" \
+  -u /usr/local/bin/http-connect-echo.py "${proxy_port}" \
+  >"${run_dir}/rust-proxy-container-id"
+wait_proxy "${go_proxy_container}"
+wait_proxy "${rust_proxy_container}"
+echo "[go-live-flow-parity] sidecar proxy addresses=${go_proxy_host}:${proxy_port},${rust_proxy_host}:${proxy_port}"
 
 rpc() {
   local address="$1"
@@ -169,18 +202,19 @@ rpc() {
 
 configure_service() {
   local address="$1"
-  local inbound_port="$2"
+  local _inbound_port="$2"
   local prefix="$3"
+  local proxy_host="$4"
   local node_id="${prefix}-http-out"
   local inbound_id="${prefix}-http-in"
   local list_id="${prefix}-host-list"
   local rule_name="${prefix}-route"
   local node_body inbound_body list_body rule_body
 
-  node_body="$(jq -cn --arg id "${node_id}" --arg port "${proxy_port}" \
-    '{id:$id,name:"live HTTP outbound",group:"live",enabled:true,chain:[{type:"fixed",fixed:{host:"127.0.0.1",port:($port|tonumber)}},{type:"http",http:{user:"",password:""}}]}')"
-  inbound_body="$(jq -cn --arg id "${inbound_id}" --arg port "${inbound_port}" \
-    '{id:$id,name:"live HTTP inbound",enabled:true,network:{type:"tcp_udp",tcp_udp:{host:("127.0.0.1:" + $port),udp:"disabled"}},transports:[{type:"normal",normal:{}}],protocol:{type:"http",http:{username:"",password:""}}}')"
+  node_body="$(jq -cn --arg id "${node_id}" --arg host "${proxy_host}" --arg port "${proxy_port}" \
+    '{id:$id,name:"live HTTP outbound",group:"live",enabled:true,chain:[{type:"fixed",fixed:{host:$host,port:($port|tonumber)}},{type:"http",http:{user:"",password:""}}]}')"
+  inbound_body="$(jq -cn --arg id "${inbound_id}" --arg host "${container_inbound}" \
+    '{id:$id,name:"live HTTP inbound",enabled:true,network:{type:"tcp_udp",tcp_udp:{host:$host,udp:"disabled"}},transports:[{type:"normal",normal:{}}],protocol:{type:"http",http:{username:"",password:""}}}')"
   list_body="$(jq -cn --arg name "${list_id}" \
     '{name:$name,type:"host",source:{type:"local",local:{lists:["example.test"]}}}')"
   rule_body="$(jq -cn --arg name "${rule_name}" --arg list "${list_id}" \
@@ -194,8 +228,8 @@ configure_service() {
   rpc "${address}" route.apply '{}' >/dev/null
 }
 
-configure_service "${go_address}" "${go_inbound}" go
-configure_service "${rust_address}" "${rust_inbound}" rust
+configure_service "${go_address}" "${go_inbound}" go "${go_proxy_host}"
+configure_service "${rust_address}" "${rust_inbound}" rust "${rust_proxy_host}"
 wait_tcp "${go_inbound}"
 wait_tcp "${rust_inbound}"
 
@@ -254,15 +288,17 @@ wait_connection() {
 if ! wait_connection "${go_address}" go-http-in "${run_dir}/go-connections.json"; then
   echo "[go-live-flow-parity] Go live connection did not appear" >&2
   cat "${run_dir}/go-flow.log" >&2 || true
-  tail -100 "${run_dir}/go.log" >&2 || true
-  tail -100 "${run_dir}/proxy.log" >&2 || true
+  podman logs "${go_container}" >&2 || true
+  rpc "${go_address}" connections.failed_history '{}' >"${run_dir}/go-failed-history.json" || true
+  podman logs "${go_proxy_container}" >&2 || true
   exit 1
 fi
 if ! wait_connection "${rust_address}" rust-http-in "${run_dir}/rust-connections.json"; then
   echo "[go-live-flow-parity] Rust live connection did not appear" >&2
   cat "${run_dir}/rust-flow.log" >&2 || true
-  tail -100 "${run_dir}/rust.log" >&2 || true
-  tail -100 "${run_dir}/proxy.log" >&2 || true
+  podman logs "${rust_container}" >&2 || true
+  rpc "${rust_address}" connections.failed_history '{}' >"${run_dir}/rust-failed-history.json" || true
+  podman logs "${rust_proxy_container}" >&2 || true
   exit 1
 fi
 wait "${go_flow_pid}"
