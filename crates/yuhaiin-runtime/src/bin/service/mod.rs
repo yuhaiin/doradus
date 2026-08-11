@@ -6,12 +6,16 @@
 //! command-line managers and share the same option parser.
 
 use std::ffi::OsString;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::fs;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 
 use yuhaiin_core::{Error, ErrorKind, Result};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServiceOptions {
     host: String,
@@ -19,6 +23,7 @@ struct ServiceOptions {
     nfs_mode: bool,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Default for ServiceOptions {
     fn default() -> Self {
         Self {
@@ -29,14 +34,14 @@ impl Default for ServiceOptions {
     }
 }
 
-pub fn run(action: &str, args: &[OsString]) -> Result<()> {
+pub fn run(action: &str, _args: &[OsString]) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        return linux::run(action, args);
+        return linux::run(action, _args);
     }
     #[cfg(target_os = "macos")]
     {
-        return macos::run(action, args);
+        return macos::run(action, _args);
     }
     #[allow(unreachable_code)]
     Err(Error::new(
@@ -45,6 +50,7 @@ pub fn run(action: &str, args: &[OsString]) -> Result<()> {
     ))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn parse_options(args: &[OsString]) -> Result<ServiceOptions> {
     let mut options = ServiceOptions::default();
     let mut index = 0;
@@ -78,6 +84,7 @@ fn parse_options(args: &[OsString]) -> Result<ServiceOptions> {
     Ok(options)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn required_value(args: &[OsString], index: &mut usize, flag: &str) -> Result<String> {
     *index += 1;
     args.get(*index)
@@ -85,6 +92,7 @@ fn required_value(args: &[OsString], index: &mut usize, flag: &str) -> Result<St
         .ok_or_else(|| Error::invalid(format!("service option {flag} requires a value")))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn default_service_path() -> PathBuf {
     if cfg!(target_os = "macos") {
         PathBuf::from("/Library/Application Support/yuhaiin")
@@ -93,10 +101,12 @@ fn default_service_path() -> PathBuf {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn service_error(message: impl std::fmt::Display) -> Error {
     Error::new(ErrorKind::Io, message.to_string())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn command_output(program: &str, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new(program)
         .args(args)
@@ -114,6 +124,7 @@ fn command_output(program: &str, args: &[&str]) -> Result<Vec<u8>> {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn require_root(action: &str) -> Result<()> {
     #[cfg(unix)]
     {
@@ -131,16 +142,19 @@ fn require_root(action: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn current_executable() -> Result<PathBuf> {
     std::env::current_exe().map_err(service_error)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_symlink(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn same_file(left: &Path, right: &Path) -> bool {
     let Some(left) = fs::canonicalize(left).ok() else {
         return false;
@@ -151,6 +165,7 @@ fn same_file(left: &Path, right: &Path) -> bool {
     left == right
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn copy_binary(source: &Path, destination: &Path) -> Result<()> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(service_error)?;
@@ -172,6 +187,7 @@ fn copy_binary(source: &Path, destination: &Path) -> Result<()> {
     result
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(service_error)?;
@@ -193,7 +209,7 @@ fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::{ServiceOptions, parse_options};
     use std::ffi::OsString;
