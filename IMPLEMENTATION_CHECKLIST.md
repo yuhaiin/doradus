@@ -16,9 +16,18 @@
 | 可运行范围 | Linux desktop/container：SQLite、API、DNS、普通 inbound、TUN、router、主要 proxy chain |
 | 当前结论 | **未完成**：rootful TUN/TPROXY、更多生产兼容样本和 TUN loopback 现场证据仍需验收；Android/macOS 独立应用暂不计入本轮 |
 
+### 最近一次容器证据
+
+| 场景 | 执行位置 | 结果 |
+| --- | --- | --- |
+| `make service-chain-smoke` | Podman `--network=host` | 14/14 通过，覆盖 HTTP、SOCKS5、Yuubinsya inbound 及 direct/HTTP/SOCKS5/TLS+HTTP/2+Yuubinsya outbound |
+| `make benchmark-throughput`：HTTP CONNECT | Podman `--network=host`，release runtime | 64 MiB，109.89 MiB/s，peak RSS 17,864 KiB |
+| `make benchmark-throughput`：TLS+HTTP/2+Yuubinsya | Podman `--network=host`，release runtime | 64 MiB，29.57 MiB/s，peak RSS 19,432 KiB |
+| TUN packet / TPROXY | 当前 rootless Podman | 按能力门禁跳过；必须在 rootful `CAP_NET_ADMIN` namespace 验收，不计为通过 |
+
 ### 测试边界
 
-- `make test` / `make workspace-tests` 只在宿主机执行 `cargo build`、`cargo test --no-run`；测试 harness、runtime 子进程、SQLite 临时副本和网络 flow 全部在 Podman 中运行。
+- `make test` / `make workspace-tests` 在宿主机只执行依赖和测试 harness 的编译准备（`cargo build`、`cargo test --no-run`），绝不执行测试函数、runtime、代理链或 TUN；测试 harness、runtime 子进程、SQLite 临时副本和网络 flow 全部在 Podman 中运行。若要把编译准备也放入容器，可通过独立 builder 镜像迁移，但不能改变运行阶段的容器门禁。
 - 普通 workspace harness 使用 `--network=none`；`stats_concurrency` 单独使用一个同样隔离的 Podman 容器，`service_chain` 单独使用 Podman `--network=host`，与专用 smoke 保持一致，规避 rootless net-none 对 HTTP/2 loopback fixture 的影响。所有路径都不在宿主机启动 Rust/Go runtime、proxy 或 TUN。
 - 当前 workspace 编译出的 40 个 harness 已有容器执行入口；rootful TUN/TPROXY 的能力不足仍按 `[ ]`/`[~]` 记录，不因模拟 TUN 单测或 rootless 生命周期 smoke 改变状态。
 
