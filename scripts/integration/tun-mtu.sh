@@ -5,6 +5,16 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cache_dir="${YUHAIIN_TUN_MTU_DIR:-${HOME}/.cache/yuhaiin-rust/integration/tun-mtu}"
 target_dir="${CARGO_TARGET_DIR:-${HOME}/.cache/yuhaiin-rust/cargo-target}"
 binary="${target_dir}/debug/tun-service-smoke"
+podman_rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || echo true)"
+
+if [[ "${podman_rootless}" == "true" ]]; then
+  cat >&2 <<EOF
+[tun-mtu] packet traffic requires a rootful Podman namespace with
+CAP_NET_ADMIN. The current Podman connection is rootless, so the MTU matrix
+is skipped with exit 77.
+EOF
+  exit 77
+fi
 
 mkdir -p "${cache_dir}"
 cd "${repo_dir}"

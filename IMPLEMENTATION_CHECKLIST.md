@@ -8,13 +8,13 @@
 
 | 指标 | 当前值 |
 | --- | ---: |
-| 当前清单条目 | Linux 纯桌面范围（延期项不计入分母；复合能力按一条统计） |
-| 已完成 `[x]` | 28 项 |
-| 主路径完成 `[~]` | 12 项 |
-| 仍未完成 `[ ]` | 6 项 |
-| 加权覆盖率 | **74.0%**（`(28 + 12 × 0.5) / (28 + 12 + 6)`） |
+| 当前清单条目 | Linux 纯桌面模块验收项 + P0/P1 gates（延期项、协议矩阵重复项不计入） |
+| 已完成 `[x]` | 30 项 |
+| 主路径完成 `[~]` | 13 项 |
+| 仍未完成 `[ ]` | 3 项 |
+| 加权覆盖率 | **79.3%**（`(30 + 13 × 0.5) / (30 + 13 + 3)`） |
 | 可运行范围 | Linux desktop/container：SQLite、API、DNS、普通 inbound、TUN、router、主要 proxy chain |
-| 当前结论 | **未完成**：rootful TUN/TPROXY、更多生产兼容样本和 Linux 服务替换仍需验收；Android/macOS 独立应用暂不计入本轮 |
+| 当前结论 | **未完成**：rootful TUN/TPROXY、更多生产兼容样本和 TUN loopback 现场证据仍需验收；Android/macOS 独立应用暂不计入本轮 |
 
 ```mermaid
 flowchart TD
@@ -47,7 +47,7 @@ flowchart TD
 未完成：
 
 - `[~]` TUN flow 级异常隔离已有单测和 rootless 回归，但真实 TCP reset、多 flow 重连、超限 fragment 仍需 rootful namespace。
-- `延期` WireGuard userspace adapter；现有纯 Rust 候选不能直接提供需要的 TCP/UDP socket stack。
+- `延期` WireGuard userspace adapter；本轮完成了依赖审计：`boringtun 0.7.1` 的协议核心可复用但依赖 `ring`（含 `cc` build dependency）及 `libc/nix`，`wireguard 0.2.0` 同样依赖 `ring/libc` 且是较旧的参考实现；两者都不符合当前“纯 Rust、可直接接入现有 TCP/UDP data-plane”的约束，暂不引入。
 
 下一步：
 
@@ -125,7 +125,7 @@ flowchart TD
 
 - `[~]` 完整 response 字段和更多生产 history/telemetry 样本。
 - `[~]` rootful TUN/TPROXY 和 Linux 桌面 route lifecycle；Android/macOS host binding 不计入本轮。
-- `[~]` 真实服务替换、回滚、backup/health-check 演练。
+- `[x]` Linux systemd 服务安装、失败自动回滚、持久化 backup、显式 rollback 和 `/health` 检查；`make systemd-service-smoke` 已在 disposable systemd Podman 环境通过。
 
 ### `crates/yuhaiin-platform`：平台边界
 
@@ -152,7 +152,7 @@ flowchart TD
 | redir TCP / tproxy UDP | 是 | — | `[~]` rootful TPROXY pending |
 | DoH/DoT | resolver | client | `[x]` |
 | DoQ/DoH3 | resolver | client | `延期` |
-| WireGuard | — | — | `延期` after library audit |
+| WireGuard | — | — | `延期` library audit: `boringtun`/`wireguard` 依赖 native crypto/runtime 边界，暂不引入 |
 
 ## 当前阻塞项与优先级
 
@@ -165,7 +165,7 @@ flowchart TD
 
 - `[~]` 更多 production SQLite schema/未知表/FakeIP/history/telemetry 快照 diff；3 份真实生产形态快照的 Go/Rust API parity 已通过，仍需逐表 schema/异常快照 diff。
 - `[~]` SQLite lock contention、长时间 stats 投影、升级和强停组合测试；并发 stats reader/writer 与 force-stop recovery 已通过，升级组合仍待补。
-- `[ ]` 至少一个真实 Linux systemd 环境的替换、回滚、备份恢复和 health-check。
+- `[x]` 真实 Linux systemd 环境的替换、回滚、备份恢复和 health-check：`make systemd-service-smoke`。
 - `[ ]` TUN loopback guard 真实 endpoint/PID/path 证据。
 
 ### P2：按使用量开启
@@ -193,6 +193,7 @@ make go-api-parity-smoke
 make go-live-flow-parity-smoke
 make production-parity-smoke
 make stats-concurrency-smoke
+make systemd-service-smoke
 ```
 
 TUN/透明/性能：

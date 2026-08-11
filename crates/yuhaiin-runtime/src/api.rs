@@ -255,6 +255,7 @@ pub fn router(state: ApiState) -> Router {
     let auth = state.auth.clone();
     let web_root = state.web_root.clone();
     let router = Router::new()
+        .route("/health", get(health))
         .route("/api/v2/info", get(info))
         .route("/api/v2/update/check", post(update_check))
         .route("/api/v2/update/apply", post(update_apply))
@@ -397,6 +398,9 @@ pub fn router(state: ApiState) -> Router {
 }
 
 async fn authenticate(auth: Option<ApiAuth>, request: Request<Body>, next: Next) -> Response {
+    if request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
     let Some(auth) = auth else {
         return next.run(request).await;
     };
@@ -419,6 +423,16 @@ async fn authenticate(auth: Option<ApiAuth>, request: Request<Body>, next: Next)
     } else {
         (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
     }
+}
+
+/// Lightweight process health endpoint for systemd/container supervisors.
+///
+/// It deliberately has no dependency on the persisted configuration and is
+/// reachable even when management API credentials are enabled.  A 204 means
+/// the HTTP server and runtime task owner are alive; data-plane readiness is
+/// still validated by the service manager's regular integration smoke.
+async fn health() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -4113,6 +4127,16 @@ mod tests {
                 .unwrap();
         assert_eq!(persisted["instanceName"], "rust-instance");
         assert_eq!(persisted["s3"]["bucket"], "bucket");
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_is_public_even_when_management_api_is_authenticated() {
+        let app = router(state().await.with_auth("alice", "secret"));
+        let response = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     async fn state() -> ApiState {

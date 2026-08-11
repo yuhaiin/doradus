@@ -42,7 +42,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
+.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -65,6 +65,7 @@ help:
 		'make tun-reload-traffic-smoke verify TUN traffic after disable/enable reload' \
 		'make tun-mtu-smoke run the runtime-owned TUN MTU boundary matrix' \
 		'make transparent-service-smoke run REDIRECT TCP smoke; rootless Podman records TPROXY skip' \
+		'make systemd-service-smoke run install/rollback/health smoke in disposable systemd Podman' \
 		'make api-contract-smoke run the frontend management API process contract in Podman' \
 		'make api-reload-flow-smoke verify mutation reloads the real data plane and survives restart' \
 		'make go-api-parity-smoke compare read and core mutation API responses against a Go state snapshot' \
@@ -152,6 +153,9 @@ build-transparent-service-smoke:
 
 transparent-service-smoke:
 	./scripts/integration/transparent-service.sh
+
+systemd-service-smoke:
+	./scripts/integration/systemd-service.sh
 
 api-contract-smoke:
 	./scripts/integration/api-contract.sh

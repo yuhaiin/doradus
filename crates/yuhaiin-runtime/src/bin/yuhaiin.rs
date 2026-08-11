@@ -71,7 +71,7 @@ async fn main_result() -> Result<()> {
     if let Some(action) = args.first().and_then(|arg| arg.to_str())
         && matches!(
             action,
-            "install" | "uninstall" | "start" | "stop" | "restart"
+            "install" | "uninstall" | "rollback" | "health" | "start" | "stop" | "restart"
         )
     {
         service::run(action, &args[1..])?;
@@ -199,7 +199,7 @@ fn required_option_value(
 
 fn print_help() {
     println!(
-        "Usage: yuhaiin-rust [action] [options]\n\nActions:\n  install     install the native Linux systemd/macOS launchd service\n  uninstall   uninstall the native service\n  start       start the native service\n  stop        stop the native service\n  restart     restart the native service\n  run         run the service (default)\n\nNo command is equivalent to run and starts the service.\nConsole logs are enabled by default; set YUHAIIN_QUIET=1 to disable them.\n\nRun options:\n  -host, --host ADDR       HTTP listen address (default 0.0.0.0:50051)\n  -path, --path DIR        Go-compatible data directory (DIR/state.db)\n  -u, --username NAME      HTTP Basic Auth username\n  -p, --password PASSWORD  HTTP Basic Auth password\n  -eweb, --external-web DIR  Accepted for Go service-command compatibility\n  -nfs-mode                Accepted for Go service-command compatibility\n\nInstall options:\n  -host, --host ADDR       HTTP listen address (default 0.0.0.0:50051)\n  -path, --path DIR        service data directory\n  -nfs-mode                preserve Go service compatibility\n\nOther:\n  version                  print version\n  update-helper TARGET STAGED  apply a staged update"
+        "Usage: yuhaiin-rust [action] [options]\n\nActions:\n  install     install the native Linux systemd/macOS launchd service\n  uninstall   uninstall the native service\n  rollback    restore the latest automatic service backup\n  health      check systemd state and the unauthenticated /health endpoint\n  start       start the native service\n  stop        stop the native service\n  restart     restart the native service\n  run         run the service (default)\n\nNo command is equivalent to run and starts the service.\nConsole logs are enabled by default; set YUHAIIN_QUIET=1 to disable them.\n\nRun options:\n  -host, --host ADDR       HTTP listen address (default 0.0.0.0:50051)\n  -path, --path DIR        Go-compatible data directory (DIR/state.db)\n  -u, --username NAME      HTTP Basic Auth username\n  -p, --password PASSWORD  HTTP Basic Auth password\n  -eweb, --external-web DIR  Accepted for Go service-command compatibility\n  -nfs-mode                Accepted for Go service-command compatibility\n\nInstall options:\n  -host, --host ADDR       HTTP listen address (default 0.0.0.0:50051)\n  -path, --path DIR        service data directory\n  -nfs-mode                preserve Go service compatibility\n\nRollback/health options:\n  -host, --host ADDR       health endpoint address (0.0.0.0 is probed as 127.0.0.1)\n  -path, --path DIR        service data directory containing service-backups\n\nOther:\n  version                  print version\n  update-helper TARGET STAGED  apply a staged update"
     );
 }
 

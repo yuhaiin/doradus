@@ -11,6 +11,7 @@ tun_name="yrtun0"
 chain_mode="${YUHAIIN_TUN_CHAIN:-}"
 container_name="yuhaiin-tun-service-$$"
 timeout_seconds="${YUHAIIN_TUN_SMOKE_TIMEOUT_SEC:-45}"
+podman_rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || echo true)"
 
 cleanup() {
   podman rm -f "${container_name}" >/dev/null 2>&1 || true
@@ -20,6 +21,21 @@ trap cleanup EXIT INT TERM
 if ! [[ "${timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
   echo "YUHAIIN_TUN_SMOKE_TIMEOUT_SEC must be a positive integer" >&2
   exit 2
+fi
+
+# Opening a TUN fd can be exercised by the lifecycle-only smoke, but actual
+# packet traffic needs CAP_NET_ADMIN in the container's network namespace.
+# Rootless Podman cannot provide that capability even with --privileged, so
+# report an explicit environment skip instead of a misleading traffic timeout.
+if [[ "${YUHAIIN_TUN_RELOAD_ONLY:-0}" != "1" && "${podman_rootless}" == "true" ]]; then
+  cat >&2 <<EOF
+[tun-service] traffic smoke requires a rootful Podman namespace with
+CAP_NET_ADMIN. The current Podman connection is rootless, so the packet
+traffic/chain/force-stop path is skipped with exit 77.
+[tun-service] run this smoke with rootful Podman; lifecycle-only reload smoke
+remains available via YUHAIIN_TUN_RELOAD_ONLY=1.
+EOF
+  exit 77
 fi
 
 chain_env=()
