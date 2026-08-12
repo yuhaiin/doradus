@@ -548,6 +548,13 @@ impl RuntimeSnapshot {
                 )
                 .await?,
             ) as Arc<dyn AsyncProxy>
+        } else if config.transport == yuhaiin_store::GoProxyTransport::HttpMock {
+            let base = config
+                .to_base_proxy_config_with_resolver(timeout, self.resolver.clone())
+                .await?;
+            Arc::new(yuhaiin_protocol::http_mock::HttpMockProxy::new(
+                base.build()?,
+            )) as Arc<dyn AsyncProxy>
         } else if is_chain_config(&config) {
             let json = std::str::from_utf8(&config.data_json).map_err(|error| {
                 Error::new(
@@ -2141,6 +2148,67 @@ mod tests {
             kind: BaseProxyKind::Direct,
             timeout: Duration::from_secs(1),
         };
+    }
+
+    #[tokio::test]
+    async fn runtime_builds_go_http_mock_around_a_fixed_parent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let expected =
+                b"GET / HTTP/1.1\r\nHost: www.speedtest.cn\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n";
+            let mut request = vec![0u8; expected.len()];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, expected);
+            let mut payload = [0u8; 4];
+            stream.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let config = GoProxyRuntimeConfig {
+            id: "http-mock".to_owned(),
+            name: "HTTP mock".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned(), "http_mock".to_owned()],
+            layers: vec![
+                GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({
+                        "addresses": [{
+                            "host": address.ip().to_string(),
+                            "port": address.port()
+                        }]
+                    }),
+                },
+                GoProxyLayer {
+                    kind: "http_mock".to_owned(),
+                    config: serde_json::json!({"data": []}),
+                },
+            ],
+            transport: GoProxyTransport::HttpMock,
+            data_json: Vec::new(),
+        };
+        let proxy = snapshot(config)
+            .build_proxy("http-mock", Duration::from_secs(1))
+            .await
+            .unwrap()
+            .proxy;
+        let context = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        let mut stream = proxy.connect(&context).await.unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
+        server.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

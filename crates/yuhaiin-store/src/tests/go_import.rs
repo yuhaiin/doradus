@@ -393,6 +393,7 @@ fn go_node_runtime_preserves_proxy_layers_and_selects_supported_base() {
         ("direct", GoProxyTransport::Direct),
         ("drop", GoProxyTransport::Drop),
         ("fixed", GoProxyTransport::Fixed),
+        ("http_mock", GoProxyTransport::HttpMock),
         ("http", GoProxyTransport::HttpProxy),
         ("http_proxy", GoProxyTransport::HttpProxy),
         ("socks5", GoProxyTransport::Socks5),

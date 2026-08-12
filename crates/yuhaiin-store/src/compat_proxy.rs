@@ -38,6 +38,7 @@ pub enum GoProxyTransport {
     Direct,
     Drop,
     Fixed,
+    HttpMock,
     HttpProxy,
     Socks5,
     Shadowsocks,
@@ -220,6 +221,7 @@ fn parse_proxy_transport(value: &str) -> GoProxyTransport {
         "direct" => GoProxyTransport::Direct,
         "drop" | "block" => GoProxyTransport::Drop,
         "fixed" | "simple" | "fixedv2" => GoProxyTransport::Fixed,
+        "http_mock" | "httpmock" => GoProxyTransport::HttpMock,
         "http" | "http_proxy" => GoProxyTransport::HttpProxy,
         "socks5" => GoProxyTransport::Socks5,
         "shadowsocks" => GoProxyTransport::Shadowsocks,
@@ -247,6 +249,7 @@ fn select_proxy_transport(chain_types: &[String], layers: &[GoProxyLayer]) -> Go
     // The outer protocol is the effective runtime proxy: HTTP/SOCKS5 wraps a
     // fixed dialer, and Yuubinsya wraps the full fixed/TLS/HTTP2 chain.
     for preferred in [
+        "http_mock",
         "yuubinsya",
         "wireguard",
         "aead",

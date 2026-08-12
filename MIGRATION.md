@@ -4242,3 +4242,24 @@ Yuubinsya、mixed UDP、VLESS/VMess/Trojan、reverse 和 connections/traffic 链
 单测在 Podman 通过 1/1。容器镜像未安装 rustfmt component，所以本轮没有把宿主或容器外的 fmt
 工具链问题冒充为源码失败；运行时、编译和测试仍全部在 Podman，临时状态继续位于
 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+
+## 157. 2026-08-12 Go `http_mock` outbound contract
+
+对照 Go `pkg/net/proxy/mock/http.go` 后确认，`http_mock` 不是 HTTP CONNECT proxy，也不是
+`obfs_http`：Go `NewClient` 只包住父 proxy，TCP `Conn` 建立成功后写入固定请求：
+`GET / HTTP/1.1`、`Host: www.speedtest.cn`、`User-Agent: Mozilla/5.0`、`Accept: */*`、
+`Connection: keep-alive`；随后原样返回父连接。由于 client 结构直接嵌入父 proxy，UDP
+`PacketConn` 也应保持透传。
+
+Rust 新增 `crates/yuhaiin-protocol/src/http_mock.rs::HttpMockProxy`，严格保持这个边界：
+`connect` 只写一次固定请求，`open_datagram` 和 `close` 委托给 upstream；没有把它误实现成
+HTTP response stripping 或另一个 HTTP obfs framing。`GoProxyTransport` 现在识别
+`http_mock/httpmock`，`fixedv2 -> http_mock` 节点会在 `RuntimeSnapshot::build_proxy` 中先构造
+fixed parent，再包上 mock wrapper，原始 Go layer JSON 仍保留用于兼容写回。
+
+新增覆盖：protocol crate 固定字节和真实 TCP parent 单测、store Go node transport parser、
+runtime `RuntimeSnapshot` 的 Go-shaped `fixedv2 + http_mock` 真实 socket echo。Podman 结果为
+protocol 38 passed/2 ignored、store 131 passed/5 ignored、runtime 264 passed/0 ignored，新增
+runtime focused test 1/1；`rustfmt` 未执行是因为 Podman 的 Rust 1.97.1 toolchain 缺少组件，
+宿主仅做只读 `rustfmt --check` 和 `git diff --check`，没有在宿主编译或运行测试。所有测试状态
+仍位于 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。

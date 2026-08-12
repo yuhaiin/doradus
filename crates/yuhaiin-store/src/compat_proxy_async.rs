@@ -123,6 +123,7 @@ impl GoProxyRuntimeConfig {
     fn fixed_endpoints(&self) -> Result<Vec<ProxyEndpoint>> {
         match &self.transport {
             GoProxyTransport::Fixed
+            | GoProxyTransport::HttpMock
             | GoProxyTransport::HttpProxy
             | GoProxyTransport::Socks5
             | GoProxyTransport::Shadowsocks
@@ -145,6 +146,10 @@ impl GoProxyRuntimeConfig {
             GoProxyTransport::Direct => BaseProxyKind::Direct,
             GoProxyTransport::Drop => BaseProxyKind::Drop,
             GoProxyTransport::Fixed => match single_address() {
+                Some(address) => BaseProxyKind::Fixed { address },
+                None => BaseProxyKind::FixedMany { endpoints },
+            },
+            GoProxyTransport::HttpMock => match single_address() {
                 Some(address) => BaseProxyKind::Fixed { address },
                 None => BaseProxyKind::FixedMany { endpoints },
             },
@@ -240,6 +245,7 @@ fn transport_name(transport: &GoProxyTransport) -> &str {
         GoProxyTransport::Direct => "direct",
         GoProxyTransport::Drop => "drop",
         GoProxyTransport::Fixed => "fixed",
+        GoProxyTransport::HttpMock => "http_mock",
         GoProxyTransport::HttpProxy => "http",
         GoProxyTransport::Socks5 => "socks5",
         GoProxyTransport::Shadowsocks => "shadowsocks",
