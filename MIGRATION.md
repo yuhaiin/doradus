@@ -3939,3 +3939,30 @@ runtime 257、store 131（5 个 ignored），0 失败），随后在 privileged�
 `network_interface` 回归，direct TCP 和 fixed UDP 均为 2/2，WireGuard underlay 的 Linux `lo`
 绑定为 1/1，runtime wrapper 传递测试和 Clippy 也通过。该证据只覆盖 Linux 权限可用的接口绑定和本地 loopback，不把它外推为 macOS/Windows
 原生接口索引行为或第三方/WARP 网络现场；后者继续由 checklist 的外部验收项跟踪。
+
+## 141. 2026-08-12 Go `fixedv2` 多地址与接口策略兼容
+
+继续对照 Go `pkg/net/proxy/fixed` 的 `Fixedv2` 行为后，补上普通 base proxy 只使用第一个
+地址的兼容缺口。Rust store 现在从 `fixed`/`simple`/`fixedv2` 的 `host`、`alternateHost`
+和 `addresses` 读取完整的有序 endpoint 列表；域名 endpoint 会在同一个共享 resolver 下展开为
+多个 IP，保留配置顺序，并且每个地址自己的 `network_interface` 优先于节点级字段。
+
+`yuhaiin-core::proxy_factory` 新增内部 `BaseProxyEndpoint` 和 `*Many` 构造分支。每个 endpoint
+先建立既有的 Fixed、HTTP CONNECT、SOCKS5 或 Yuubinsya proxy，再由共享的
+`FallbackAsyncProxy` 按顺序执行完整 connect/handshake，失败后尝试下一个地址；
+`BindInterfaceProxy` 在每次尝试前把该 endpoint 的接口策略写入 `FlowContext`，因此 TLS、协议
+framing 和 socket 都不会丢失 per-address 绑定。只有一个无接口地址时继续使用原来的单地址
+variant，保持现有 API/调用方兼容。Direct、Drop、HTTP/2 chain 和 WireGuard 的既有边界没有
+被改成另一套配置模型。
+
+新增回归覆盖两层：core 用第一个不可用、第二个可用的 TCP endpoint 验证真实 fallback payload；
+store 用两个 `fixedv2` 地址验证 alternate 顺序和节点级接口继承。Rust 1.97.1 Podman 中的
+Clippy（`-D warnings`）和完整 workspace tests 均通过；完整测试还覆盖 SQLite、FakeIP、NAT、
+TUN、DNS、router、协议、service-chain 和 BoringTun WireGuard。UDP endpoint 的 socket 打开
+失败会按同一列表回退；已经打开的 UDP socket 不会在每个数据包失败时隐式切换，以避免改变 Go
+`PacketConn` 的连接语义。
+
+这次只闭合了 Go fixed/fixedv2 的本地多地址兼容边界，不把顺序 fallback 外推为 Go 的
+Happy-Eyeballs 时序实现，也不把 loopback/interface 单测外推为真实多网卡生产路由；后者继续由
+Linux 权限和第三方网络现场 checklist 跟踪。所有测试和缓存仍使用 `~/.cache/yuhaiin-rust`，
+没有使用 `/tmp`。
