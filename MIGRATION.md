@@ -4439,10 +4439,10 @@ parity 一起执行，仍保持源库只读。审计运行在 Podman 的 Python 
 
 ## 166. 2026-08-13 统计长压与强停复测
 
-在不改变统计实现的前提下，重新执行真实前台 runtime 的统计长压：16 个并发 reader，每个 400 轮，
-800 次 16 KiB live flow 写入，同时查询 connections、total、traffic、telemetry、history 和
+在不改变统计实现的前提下，重新执行真实前台 runtime 的统计长压：32 个并发 reader，每个 1200 轮，
+3000 次 16 KiB live flow 写入，同时查询 connections、total、traffic、telemetry、history 和
 failed-history；随后执行 force-stop，再用同一个 SQLite 重启并读取 totals/history。Podman 结果为
-`2 passed`，耗时 38.31 秒。此前更高压力的 24 readers×1000 rounds、2000 writes 结果仍保留在清单中。
+`2 passed`，耗时 132.56 秒。此前 16×400/800 和 24×1000/2000 writes 结果仍保留在清单中。
 
 这确认的是运行期 checkpoint、Go statistics projection、并发读取和异常重启恢复；更长 production
 projection 时段仍保留为 `[~]`，没有把一次长压误报为完整长期现场验收。
@@ -4465,3 +4465,28 @@ projection 时段仍保留为 `[~]`，没有把一次长压误报为完整长期
 Podman 中运行 `cross_process` harness 的结果为 `6 passed, 0 failed, 1 ignored`；本轮编译、运行和
 测试状态均位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。这闭合了本地跨进程锁语义的回归证据，
 更长生产 projection、真实升级工具/服务重启编排和跨平台文件锁现场仍按清单保留为未完成样本。
+
+## 168. 2026-08-13 TUN inbound 开关与前台启动可见性复测
+
+重新执行 `make tun-api-process-smoke` 以及
+`YUHAIIN_TUN_USER_NAMESPACE=0 make tun-api-process-smoke`。两次都在 Podman 中完成，分别覆盖
+disposable user/network namespace 和 rootful `/dev/net/tun` 路径；默认禁用、新增单个 TUN、两个
+同时 enabled 的 TUN、disable→enable→disable，以及真实设备销毁均为 `1/1` 通过。
+
+同时执行 `make startup-logs-smoke`，前台进程会在 stderr 输出 database、HTTP bind、数据库打开、
+HTTP API listening、runtime ready、shutdown requested 和 stopped 等阶段日志；因此直接运行
+二进制时不是无输出卡死。所有状态和日志继续位于 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+
+## 169. 2026-08-13 Cloudflare BoringTun WireGuard 复测
+
+WireGuard 继续按已确定的边界实现：Rust 只维护配置兼容、BoringTun adapter、smoltcp
+userspace TCP/UDP 和 runtime proxy 集成，不再引入第二份纯 Rust WireGuard protocol 实现。
+本轮在 Podman 中重跑 `make wireguard-smoke` 和 `make wireguard-chain-smoke`：协议层
+11 passed、1 个显式 benchmark ignored；runtime 层 HTTP/TCP 与 SOCKS5/UDP 两条
+`inbound → CIDR router → WireGuard outbound → peer` 链路 2 passed。
+
+随后运行 `make benchmark-wireguard-throughput`，默认 64 MiB release packet benchmark
+得到 `595.8930899268966 MiB/s`、peak RSS `3504 KiB`。结果仅作为同机回归基线，日志和
+JSON 保存在 `~/.cache/yuhaiin-rust/benchmarks/wireguard/`，本轮没有使用 `/tmp`。
+真实第三方/WARP peer、公网 keepalive、NAT roaming 和 source-interface policy 仍保留
+为外部验证项，没有由本地 userspace 双 peer 结果外推完成。

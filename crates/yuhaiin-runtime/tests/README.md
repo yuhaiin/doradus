@@ -192,8 +192,8 @@ uses one real `tun-rs + smoltcp + fixed proxy + loopback echo` stream and
 defaults to a stable 4 MiB transfer; increase `YUHAIIN_TUN_BENCH_BYTES` only
 when investigating long-stream behavior. The Cloudflare BoringTun userspace
 adapter has its own Podman packet benchmark (`make benchmark-wireguard-throughput`)
-and is kept separate from this runtime relay benchmark; the current 16 MiB
-same-host baseline is about 554.65 MiB/s with 3,348 KiB peak RSS.
+and is kept separate from this runtime relay benchmark; the current 64 MiB
+same-host baseline is 595.89 MiB/s with 3,504 KiB peak RSS.
 
 The 2026-08-10 Linux verification completed the lifecycle smoke and the
 default 4 MiB benchmark. The Podman run created and removed `yrtun0`, relayed
