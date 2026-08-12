@@ -4321,3 +4321,20 @@ HTTP/HTTP2 listener 和 router 复用同一条入站路径。
 的 inbound/outbound/protocol metadata、upload/download counters 和 HTTP outbound 的真实
 authority。Podman focused test 结果为 `1 passed, 0 failed`；编译、runtime、SQLite 和测试
 状态均位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
+## 160. 2026-08-12 透明 TCP inbound 支持 TLS transport
+
+重新对照 Go `contract_listener.go` 的组合顺序后确认，`redir`/`tproxy` 的协议 handler 位于
+transport listener 之后；因此透明 TCP 也必须先完成 TLS 解包，再读取原始目的地址并进入共享
+router/outbound relay。Rust 之前在 `start_listeners` 看到 TLS acceptor 时直接跳过整个透明 inbound，
+这会让配置看似成功保存但没有可用 listener。
+
+本轮让透明 TCP owner 复用 `inbound::prepare_inbound_stream`，在原始 socket 上先保存
+`SO_ORIGINAL_DST`/TPROXY local destination，再执行 TLS handshake，随后把解包后的 stream
+交给原有 transparent relay；UDP 仍保持不经过 TLS wrapper 的 Go 语义。新增
+`transparent_tls_transport_is_unwrapped_before_relay`，使用真实 RustCrypto TLS、direct selector
+和 echo socket 验证 TLS→透明 relay→outbound；Podman focused test `1/1` 通过。
+
+同时重新执行 `make transparent-service-smoke`，Podman REDIRECT TCP `2 flows`、流量统计和关闭
+流程通过；当前 rootless capability policy 仍明确跳过 TPROXY UDP，rootful firewall matrix 的
+`[~]` 状态不变。

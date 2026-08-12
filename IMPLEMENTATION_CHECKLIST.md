@@ -92,7 +92,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `pkg/net/proxy/aead/*` | `crates/yuhaiin-protocol/src/aead.rs`、`crates/yuhaiin-runtime/src/inbounds/mod.rs` | `[x]` | TCP/UDP wire and Go interop；入站 AEAD→HTTP/2、AEAD→WebSocket 共享 transport 解包，声明顺序逆置时仍按 Go listener wrapper 顺序解包；TLS→AEAD→HTTP/2 也由真实进程链验证；Podman focused/runtime tests 通过 | — |
 | `pkg/net/proxy/websocket/*`、HTTP obfs | `crates/yuhaiin-protocol/src/websocket.rs`、`http_obfs.rs`、`crates/yuhaiin-runtime/src/proxy/websocket.rs` | `[x]` | Go WebSocket→HTTP/2 interop、fragmented headers、early data | — |
 | `pkg/net/proxy/vless/*`、`vmess/*`、`trojan/*` | `crates/yuhaiin-protocol/src/{vless,vmess,trojan}.rs`、runtime counterparts | `[~]` | parser/runtime/unit coverage；`make service-chain-smoke` 在 Podman 中通过 API→HTTP inbound→domain router→普通 VLESS/VMess/Trojan outbound 的 TCP 3/3 payload echo，并新增 VLESS/VMess/Trojan 的普通、TLS+WebSocket TCP 7/7 payload echo，以及 VLESS/VMess 普通、TLS+WebSocket UDP 5/5 framing、connections、selected node、match history；Rust runtime builder 现在也覆盖 Go-compatible VLESS/VMess/Trojan TLS/WebSocket transport layer，且共享 stream transport builder；`make go-protocol-interop-smoke` 当前在 Podman 通过 14/14 个真实 Go listener/client wire test，覆盖 VLESS 双向普通/TLS/TLS+WebSocket、VLESS UDP、VMess 普通/TLS+WebSocket、Trojan 普通/TLS+WebSocket | 更广的 runtime listener/outbound、HTTP2、地址族和远端 UDP/真实远端组合矩阵 |
-| `pkg/net/proxy/tproxy/*`、`redir/*` | `crates/yuhaiin-runtime/src/proxy/transparent.rs` | `[~]` | REDIRECT TCP、IPv4/IPv6 ancillary decoder unit tests；rootful iptables 与 native nft TPROXY UDP 均已完成 2 flow、original destination、reply/rebind、monitor 统计、socket readback、加速 idle reap；iptables/nft service SIGKILL 也已通过；Debian VM 现场再次通过 iptables、native nft 和 IPv6 REDIRECT | 真实生产 firewall/nftables 组合 matrix |
+| `pkg/net/proxy/tproxy/*`、`redir/*` | `crates/yuhaiin-runtime/src/proxy/transparent.rs` | `[~]` | REDIRECT TCP、IPv4/IPv6 ancillary decoder unit tests；透明 TCP 现在复用普通 inbound transport 解包，TLS→透明 relay 已由 Podman unit test 验证；rootful iptables 与 native nft TPROXY UDP 均已完成 2 flow、original destination、reply/rebind、monitor 统计、socket readback、加速 idle reap；iptables/nft service SIGKILL 也已通过；Debian VM 现场再次通过 iptables、native nft 和 IPv6 REDIRECT | 真实生产 firewall/nftables 组合 matrix |
 | `pkg/net/proxy/shadowsocks/*`、`shadowsocksr/*` | Rust protocol modules remain compatibility code | `延期` | 当前迁移范围不以 SS/SSR 为门槛 | 后续若 Go 未废弃再决定是否保留 |
 | `pkg/net/proxy/quic/*`、`reality/*`、`mux/*`、`tailscale/*` | — | `延期` | 用户明确暂不实现 | 不阻塞 Linux desktop replacement |
 
@@ -149,7 +149,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | Yuubinsya UOT / dup-over-TCP | 是 | 是 | `[x]` |
 | reverse TCP / reverse HTTP | 是 | — | `[x]`：真实前台进程分别验证 raw relay、HTTP path/Host rewrite、direct outbound 和 connections metadata |
 | TUN | 是 | — | `[~]`：真实 user/rootful data-plane、每个 enabled inbound 独立设备、3-route lease、reload、reset/reconnect、teardown、IPv4 五档和 IPv6 合法 MTU 四档 fragmentation 通过；扩展头布局单测通过，更广泛 firewall/真实 extension-header 现场仍补 |
-| redir TCP / TPROXY UDP | 是 | — | `[~]`：rootful iptables/nft 2-flow delivery、original destination、回包/rebind、idle reap、force-stop 通过；真实生产 firewall matrix 仍补充 |
+| redir TCP / TPROXY UDP | 是 | — | `[~]`：TLS transport 可在透明 TCP listener 上先解包再 relay；rootful iptables/nft 2-flow delivery、original destination、回包/rebind、idle reap、force-stop 通过；真实生产 firewall matrix 仍补充 |
 | DNS UDP / TCP / DoH / DoT | server/client | resolver/client | `[x]` |
 | WireGuard | — | 是 | `[~]`：BoringTun userspace adapter 已通过本地双 peer |
 | Cloudflare WARP MASQUE | — | — | `延期`：Go 侧依赖 QUIC/HTTP3；当前范围明确延期 QUIC/DoH3，不把它误报成 WireGuard 缺口 |
@@ -168,7 +168,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` IPv6 ingress/egress fragmentation 已在 Debian VM rootful Podman 通过合法 MTU 1280/1500/9000/9216 四档；每档均回环最大合法 IPv6 UDP payload 65507 字节，覆盖 kernel ingress 分片、Rust ingress 重组、proxy echo、TUN boundary egress 分片和 kernel egress 重组。IPv6 MTU 576 按协议最低 MTU 约束 fail-closed，不作为合法档位。
 - `[x]` 在同一 rootful namespace 执行 TPROXY UDP：默认 iptables 与 native nft backend 均通过 transparent socket readback、original destination `10.254.1.2:18082`、local listener `0.0.0.0:18083`、两个 source flow、回包、rebind 和 upload/download monitor 统计。
 - `[x]` TPROXY UDP 在 rootful VM 用测试专用 1 秒 timeout 验证了 2 个 flow 的 idle reap；iptables 与 native nft 均通过 service SIGKILL 后的进程级观测，生产默认仍保持 90 秒 `UDP_IDLE_TIMEOUT`。
-- `[~]` 真实生产 firewall/nftables 组合 matrix 仍待补；公共 `UDP_IDLE_TIMEOUT`/reap/close 单测、容器 namespace teardown 和 Debian VM 的 iptables/native nft/IPv6 REDIRECT 现场已覆盖基础生命周期。
+- `[~]` 真实生产 firewall/nftables 组合 matrix 仍待补；透明 TCP 的 TLS wrapper 已复用 `prepare_inbound_stream` 并有 Podman unit 覆盖，公共 `UDP_IDLE_TIMEOUT`/reap/close 单测、容器 namespace teardown 和 Debian VM 的 iptables/native nft/IPv6 REDIRECT 现场已覆盖基础生命周期。
 - `[~]` 将当前 user+network namespace TUN smoke 保持为 CI 默认路径；它证明真实 kernel TUN packet path，但 rootful route takeover 另由 `tun-route-matrix-smoke` 验证。
 - `[x]` IPv6 出方向扩展头分片布局已在 Podman `network=none` 中通过：Hop-by-Hop、Routing、Routing 后 Destination Options、分片重组和重复分片拒绝均有断言；真实内核对该组合的端到端现场仍待补。
 - `[x]` rootful TUN connection metadata 已在 rootful fixture 中逐字段固定 endpoint/localAddr、selected node、process、PID 和 UID；本轮现场为 `/usr/local/bin/tun-service-smoke`、pid `7`、uid `0`。
@@ -212,6 +212,8 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 | 命令 | Podman 场景 | 结果 |
 | --- | --- | --- |
+| `cargo test -p yuhaiin-runtime --all-features --offline --lib transparent_tls_transport_is_unwrapped_before_relay -- --nocapture --test-threads=1`（2026-08-12 当前轮） | Rust 1.97.1 Podman、host network；编译/运行和状态均位于 `~/.cache/yuhaiin-rust` | `1 passed, 0 failed`；真实 RustCrypto TLS handshake → transparent relay → direct outbound → TCP echo |
+| `make transparent-service-smoke`（2026-08-12 当前轮） | privileged Podman transparent namespace；运行日志位于 `~/.cache/yuhaiin-rust/integration/transparent-service` | REDIRECT TCP 2 flows、upload/download、关闭流程通过；rootless capability policy 下 TPROXY UDP 明确 skipped |
 | `cargo test -p yuhaiin-runtime --all-features --offline --test service_chain tls_aead_http2_inbound_routes_through_http_outbound -- --nocapture --test-threads=1`（2026-08-12 当前轮） | Rust 1.97.1 Podman、host network；编译/运行和状态均位于 `~/.cache/yuhaiin-rust` | `1 passed, 0 failed`；真实 `TLS → AEAD → HTTP/2 → HTTP outbound` 进程链，覆盖 TLS ALPN、XChaCha20 解包、H2 CONNECT、router、SQLite connections/traffic 和 HTTP authority |
 | `make service-chain-smoke`（2026-08-12 当前轮） | service-chain harness/runtime 均在 Podman host-network，日志位于 `~/.cache/yuhaiin-rust/integration-reusable` | `20 passed, 0 failed`；保留既有 19 条矩阵并新增 TLS→AEAD→HTTP/2 组合 |
 | `cargo test -p yuhaiin-runtime --all-features --offline --lib`（2026-08-12 当前轮） | Rust 1.97.1 Podman、host network；编译/运行在容器，状态和临时目录位于 `~/.cache/yuhaiin-rust` | 276/276 通过；包含 AEAD→HTTP/2、AEAD→WebSocket 真实 TCP flow，以及 TLS/AEAD wrapper 声明顺序单测。一个历史 route-list HTTPS fixture 测试访问外部地址，未作为本轮功能依赖 |

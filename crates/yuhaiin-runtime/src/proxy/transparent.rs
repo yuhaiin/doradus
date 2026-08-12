@@ -25,7 +25,7 @@ use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
     FlowObserver as TunFlowObserver, FlowObserverGuard,
 };
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector, BoxAsyncStream};
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 use super::common::{
@@ -33,7 +33,7 @@ use super::common::{
     reap_expired_udp_flows_with_timeout, record_outbound_datagram, record_outbound_stream,
     relay_counted_with_buffer, shutdown_udp_flow, udp_flow_key, udp_idle_timeout,
 };
-use crate::inbound::InboundSpec;
+use crate::inbound::{InboundSpec, InboundTlsAcceptor, prepare_inbound_stream};
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
 const BACKLOG: i32 = 256;
@@ -44,6 +44,7 @@ pub(crate) async fn serve_listener(
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
+    tls_acceptor: Option<InboundTlsAcceptor>,
 ) -> Result<()> {
     let listener = bind_listener(listen, protocol.eq_ignore_ascii_case("tproxy"))?;
     let mut connections = JoinSet::new();
@@ -56,8 +57,18 @@ pub(crate) async fn serve_listener(
                     let spec = spec.clone();
                     let selector = selector.clone();
                     let monitor = monitor.clone();
+                    let tls_acceptor = tls_acceptor.clone();
                     connections.spawn(async move {
-                        handle_connection(stream, peer, &protocol, spec, selector, monitor).await
+                        handle_connection(
+                            stream,
+                            peer,
+                            &protocol,
+                            spec,
+                            selector,
+                            monitor,
+                            tls_acceptor,
+                        )
+                        .await
                     });
                 }
                 Some(result) = connections.join_next(), if !connections.is_empty() => {
@@ -431,6 +442,7 @@ async fn handle_connection(
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
+    tls_acceptor: Option<InboundTlsAcceptor>,
 ) -> Result<()> {
     let destination = if protocol.eq_ignore_ascii_case("tproxy") {
         stream.local_addr().map_err(io_error)?
@@ -443,6 +455,19 @@ async fn handle_connection(
             format!("{protocol} did not provide a usable original destination"),
         ));
     }
+    let stream = prepare_inbound_stream(stream, &spec, tls_acceptor, false).await?;
+    handle_transparent_stream(stream, peer, protocol, spec, selector, monitor, destination).await
+}
+
+async fn handle_transparent_stream(
+    stream: BoxAsyncStream,
+    peer: SocketAddr,
+    protocol: &str,
+    spec: InboundSpec,
+    selector: Arc<RuntimeProxySelector>,
+    monitor: Arc<ConnectionMonitor>,
+    destination: SocketAddr,
+) -> Result<()> {
     let endpoint = Endpoint::ip(Network::Tcp, destination);
     let mut context = FlowContext::new(endpoint.clone());
     context.source = Some(Endpoint::ip(Network::Tcp, peer));
@@ -518,6 +543,189 @@ fn capability_error(option: &str, error: std::io::Error) -> Error {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[cfg(feature = "doh-tls")]
+    use std::io::Cursor;
+
+    #[cfg(feature = "doh-tls")]
+    use rustls::pki_types::{CertificateDer, ServerName};
+    #[cfg(feature = "doh-tls")]
+    use rustls::{ClientConfig, RootCertStore, ServerConfig};
+    #[cfg(feature = "doh-tls")]
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(feature = "doh-tls")]
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+    #[cfg(feature = "doh-tls")]
+    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    #[cfg(feature = "doh-tls")]
+    use yuhaiin_store::{ConfigStore, GoNodeRecord};
+
+    #[cfg(feature = "doh-tls")]
+    const CA_CERTIFICATE_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
+MIIBlTCCATugAwIBAgIUbS/bRRel4PtBGY4lbCYyc2lxKngwCgYIKoZIzj0EAwIw
+GDEWMBQGA1UEAwwNeXVoYWlpbi1wMC1jYTAeFw0yNjA4MDYxODIwMzRaFw0zNjA4
+MDMxODIwMzRaMBgxFjAUBgNVBAMMDXl1aGFpaW4tcDAtY2EwWTATBgcqhkjOPQIB
+BggqhkjOPQMBBwNCAATBHNZR0dSTLNKfYwheVmhyGdCeMBSibhHEGBzXtZ6v0nIA
+DhHIIK38v1qnoiTWN9Fof8HXKfhvl1LxSY0rSqe0o2MwYTAdBgNVHQ4EFgQUhaYk
+OXheQ1JzLpIKK4I2FEcRMyMwHwYDVR0jBBgwFoAUhaYkOXheQ1JzLpIKK4I2FEcR
+MyMwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwCgYIKoZIzj0EAwID
+SAAwRQIhAOzmDAm07/ezq+5WBQhYYOi/F1onvS4skssoRtRq8w8XAiBH0LCIlJk5
+QX0jqAZz0309NRht+WWJtz28CPHvuhGXNg==
+-----END CERTIFICATE-----
+"#;
+
+    #[cfg(feature = "doh-tls")]
+    const LEAF_CERTIFICATE_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
+MIIBmzCCAUGgAwIBAgIUA6T+/U88N9aMPipK+MdNsAFRUAUwCgYIKoZIzj0EAwIw
+GDEWMBQGA1UEAwwNeXVoYWlpbi1wMC1jYTAeFw0yNjA4MDYxODIwNDlaFw0zNjA4
+MDMxODIwNDlaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEGCCqG
+SM49AwEHA0IABLPnwlYFERi1MgbJNuBHZV/eSpTGdJCQIOyxBt8LlR1ZTEG06pWy
+FnJVIzUS4oPuuHc0RcDEltGb/WolyQlM75SjbTBrMBQGA1UdEQQNMAuCCWxvY2Fs
+aG9zdDATBgNVHSUEDDAKBggrBgEFBQcDATAdBgNVHQ4EFgQUZoMmXETR998IsWt1
+UTBOVMIs7jMwHwYDVR0jBBgwFoAUhaYkOXheQ1JzLpIKK4I2FEcRMyMwCgYIKoZI
+zj0EAwIDSAAwRQIgGEU+sldusbLVAE/kxzZYXaMpIt6l+CZ0cC2jm7lQBqoCIQCw
+M5PhuwMhCCb+dUnK6ueJUMHwyK3l2pIAJTMp9+cwqw==
+-----END CERTIFICATE-----
+"#;
+
+    #[cfg(feature = "doh-tls")]
+    const PRIVATE_KEY_PEM: &[u8] = br#"-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIFqkH6SeIb9vVEJ6WecsMk5Pn/a8sQ+vdNS/ZSkl3KwfoAoGCCqGSM49
+AwEHoUQDQgAEs+fCVgURGLUyBsk24EdlX95KlMZ0kJAg7LEG3wuVHVlMQbTqlbIW
+clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
+-----END EC PRIVATE KEY-----
+"#;
+
+    #[cfg(feature = "doh-tls")]
+    fn transparent_tls_acceptor() -> TlsAcceptor {
+        let certificate = rustls_pemfile::certs(&mut Cursor::new(LEAF_CERTIFICATE_PEM))
+            .next()
+            .unwrap()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut Cursor::new(PRIVATE_KEY_PEM))
+            .unwrap()
+            .unwrap();
+        let provider = Arc::new(rustls_rustcrypto::provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![CertificateDer::from(certificate)], key)
+            .unwrap();
+        TlsAcceptor::from(Arc::new(config))
+    }
+
+    #[cfg(feature = "doh-tls")]
+    fn transparent_tls_connector() -> TlsConnector {
+        let mut roots = RootCertStore::empty();
+        let certificate = rustls_pemfile::certs(&mut Cursor::new(CA_CERTIFICATE_PEM))
+            .next()
+            .unwrap()
+            .unwrap();
+        roots.add(certificate).unwrap();
+        let provider = Arc::new(rustls_rustcrypto::provider());
+        let config = ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        TlsConnector::from(Arc::new(config))
+    }
+
+    #[cfg(feature = "doh-tls")]
+    async fn direct_test_runtime() -> (Arc<RuntimeProxySelector>, Arc<ConnectionMonitor>) {
+        use crate::{RuntimeBuilder, RuntimeController};
+
+        let store = ConfigStore::open_memory().await.unwrap();
+        let controller = RuntimeController::from_builder(RuntimeBuilder::new(
+            store,
+            Arc::new(SystemAsyncIpResolver),
+        ))
+        .await
+        .unwrap();
+        controller
+            .store()
+            .repository()
+            .put_go_node(&GoNodeRecord {
+                id: "direct".to_owned(),
+                name: "Direct".to_owned(),
+                group_name: "default".to_owned(),
+                origin: "transparent-test".to_owned(),
+                enabled: true,
+                chain_types_json: br#"["direct"]"#.to_vec(),
+                updated_at: 1,
+                data_json: br#"{"protocol":"direct"}"#.to_vec(),
+            })
+            .await
+            .unwrap();
+        controller.reload().await.unwrap();
+        let selector = controller
+            .build_proxy_selector("", "direct", "", "", Duration::from_secs(2))
+            .await
+            .unwrap();
+        (selector, controller.monitor())
+    }
+
+    #[cfg(feature = "doh-tls")]
+    #[tokio::test]
+    async fn transparent_tls_transport_is_unwrapped_before_relay() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = target_listener.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let mut payload = Vec::new();
+            stream.read_to_end(&mut payload).await.unwrap();
+            stream.write_all(&payload).await.unwrap();
+        });
+
+        let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let inbound = inbound_listener.local_addr().unwrap();
+        let (selector, monitor) = direct_test_runtime().await;
+        let acceptor = transparent_tls_acceptor();
+        let server_task = tokio::spawn(async move {
+            let (stream, peer) = inbound_listener.accept().await.unwrap();
+            let spec = InboundSpec {
+                id: "transparent-tls".to_owned(),
+                name: "transparent-tls".to_owned(),
+                protocol: "redir".to_owned(),
+                listen: inbound,
+                username: String::new(),
+                password: String::new(),
+                auth: None,
+                udp_mode: crate::inbound::UdpMode::Disabled,
+                protocol_udp: false,
+                transports: vec!["tls".to_owned()],
+                aead_password: None,
+                aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
+                outbound_id: "direct".to_owned(),
+                reverse_target: None,
+                reverse_http: None,
+            };
+            let stream = prepare_inbound_stream(stream, &spec, Some(acceptor), false)
+                .await
+                .unwrap();
+            handle_transparent_stream(stream, peer, "redir", spec, selector, monitor, target)
+                .await
+                .unwrap();
+        });
+
+        let connector = transparent_tls_connector();
+        let mut client = connector
+            .connect(
+                ServerName::try_from("localhost".to_owned()).unwrap(),
+                TcpStream::connect(inbound).await.unwrap(),
+            )
+            .await
+            .unwrap();
+        client.write_all(b"transparent-tls-payload").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        client.read_to_end(&mut echoed).await.unwrap();
+        assert_eq!(echoed, b"transparent-tls-payload");
+
+        server_task.await.unwrap();
+        target_task.await.unwrap();
+    }
 
     #[tokio::test]
     async fn redir_listener_binds_an_ephemeral_tcp_port_without_transparent_capability() {

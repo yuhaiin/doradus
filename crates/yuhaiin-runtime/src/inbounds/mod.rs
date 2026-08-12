@@ -567,13 +567,6 @@ async fn start_listeners(
                     spec.id
                 ));
             }
-            if tls_acceptor.is_some() {
-                monitor.warn(format!(
-                    "skip inbound {}: transparent TLS transport is not implemented yet",
-                    spec.id
-                ));
-                continue;
-            }
             if spec.transports.iter().any(|transport| {
                 !transport.eq_ignore_ascii_case("normal") && !transport.eq_ignore_ascii_case("tls")
             }) {
@@ -592,6 +585,7 @@ async fn start_listeners(
                 let listener_spec = spec;
                 let listener_selector = selector.clone();
                 let listener_monitor = monitor.clone();
+                let listener_tls_acceptor = tls_acceptor.clone();
                 let logs = listener_monitor.logs();
                 listeners.push(tokio::spawn(async move {
                     if let Err(error) = crate::proxy::transparent::serve_listener(
@@ -600,6 +594,7 @@ async fn start_listeners(
                         listener_spec,
                         listener_selector,
                         listener_monitor,
+                        listener_tls_acceptor,
                     )
                     .await
                     {
@@ -1263,7 +1258,7 @@ async fn apply_inbound_aead(stream: BoxAsyncStream, spec: &InboundSpec) -> Resul
     }
 }
 
-async fn prepare_inbound_stream<S>(
+pub(crate) async fn prepare_inbound_stream<S>(
     stream: S,
     spec: &InboundSpec,
     tls_acceptor: Option<InboundTlsAcceptor>,
