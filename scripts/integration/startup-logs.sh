@@ -26,9 +26,8 @@ podman run --rm \
   --network=none \
   -v "${runtime_binary}:/usr/local/bin/yuhaiin:ro" \
   -v "${scenario_dir}:/state" \
-  -e YUHAIIN_DB=/state/state.sqlite \
-  -e YUHAIIN_HTTP=127.0.0.1:50051 \
-  -e YUHAIIN_QUIET=0 \
+  -e HOME=/state/home \
+  -e XDG_CONFIG_HOME=/state/config \
   --entrypoint /bin/sh \
   "${image}" \
   -ec '
@@ -54,7 +53,7 @@ podman run --rm \
       wait "$pid" 2>/dev/null || true
       exit 1
     fi
-    grep -Fq "starting; database=/state/state.sqlite" /state/stderr.log
+    grep -Fq "starting; database=/state/config/yuhaiin/state.db" /state/stderr.log
     grep -Fq "HTTP API listening on" /state/stderr.log
     kill -TERM "$pid"
     wait "$pid"

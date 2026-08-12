@@ -50,6 +50,25 @@
 > `.update-backup`，以及 restart 失败时恢复旧 binary、删除临时 backup、保留 staged 供重试；真实
 > macOS launchd/Windows SCM 权限和服务管理器现场仍是独立验收项。
 
+> 2026-08-12 runtime observability/cache boundary：SSE endpoint 显式补齐 Go 的
+> `Cache-Control: no-cache` 与 `Connection: keep-alive` 响应头，避免前端 EventSource 在
+> 代理/浏览器缓存层被误处理；`connections.events` 的首屏 snapshot、added/removed event 和
+> tools log stream 仍共用 axum 的 bounded broadcast。新增 `make cache-prune`，只清理缓存中超过
+> 1 天的 integration/parity/benchmark 场景目录，默认保留 `cargo-target` 与 `fixtures`，所有
+> 路径仍位于 `~/.cache/yuhaiin-rust`，不使用 `/tmp`。
+
+> 2026-08-12 no-argument startup log closure：前台二进制默认启动路径现在由
+> `make startup-logs-smoke` 按用户实际方式验证：Podman 只提供隔离的 `HOME`/`XDG_CONFIG_HOME`，
+> 不传命令、不设置 `YUHAIIN_DB`、`YUHAIIN_HTTP` 或 `YUHAIIN_QUIET`，直接运行 `./yuhaiin`。
+> 默认 stderr 会输出 database、API bind、runtime ready、shutdown/stopped；只有显式设置
+> `YUHAIIN_QUIET=1` 才关闭这些前台进度日志。
+
+> 2026-08-12 replacement parity recheck：当前提交在 Podman 重新通过停止态 Go 快照的
+> API read/mutation/error matrix（单快照和 3 份 production parity）、Go/Rust live-flow
+> statistics、Go protocol interop 6/6，以及 4 次连续 `api-reload-flow-smoke`。本轮没有发现
+> 新的 API、统计、协议或 inbound reload 回归；剩余 `[~]` 主要是第三方 WARP、真实跨平台权限、
+> 远程 Actions 和更广生产现场矩阵。
+
 > 2026-08-12 TUN Podman data-plane recheck：当前 rootless Podman 连接在显式传入宿主
 > `/dev/net/tun`、`--privileged`、`--network=none` 后，已实际通过 runtime-owned TUN
 > device lifecycle、普通 `fixed` TCP packet echo、disable/enable reload 后 packet echo 和

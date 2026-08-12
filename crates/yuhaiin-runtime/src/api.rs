@@ -1113,9 +1113,7 @@ async fn close_connections_value(state: &ApiState, value: Value) -> ApiResult {
     empty()
 }
 
-async fn connections_events(
-    State(state): State<ApiState>,
-) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
+async fn connections_events(State(state): State<ApiState>) -> Response {
     let monitor = state.controller.monitor();
     let (initial, receiver) = monitor.initial_event_and_subscribe();
     let updates = BroadcastStream::new(receiver).filter_map(|event| {
@@ -1133,18 +1131,14 @@ async fn connections_events(
             .unwrap_or_else(|_| SseEvent::default()),
     )])
     .chain(updates.map(Ok));
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    sse_response(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-async fn tools_logs(
-    State(state): State<ApiState>,
-) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
+async fn tools_logs(State(state): State<ApiState>) -> Response {
     tools_logs_v2(State(state)).await
 }
 
-async fn tools_logs_v2(
-    State(state): State<ApiState>,
-) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
+async fn tools_logs_v2(State(state): State<ApiState>) -> Response {
     let (snapshot, receiver) = state.controller.monitor().logs().snapshot_and_subscribe();
     let initial = SseEvent::default()
         .event("log")
@@ -1160,7 +1154,24 @@ async fn tools_logs_v2(
     });
     let stream =
         tokio_stream::iter(vec![Ok::<SseEvent, Infallible>(initial)]).chain(updates.map(Ok));
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    sse_response(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+fn sse_response<T>(sse: Sse<T>) -> Response
+where
+    T: futures_util::Stream<Item = Result<SseEvent, Infallible>> + Send + 'static,
+{
+    let mut response = sse.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+        header::CONNECTION,
+        header::HeaderValue::from_static("keep-alive"),
+    );
+    response
 }
 
 async fn tools_interfaces() -> ApiResult {
@@ -6499,6 +6510,8 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "SSE route {path}");
             assert_eq!(response.headers()["content-type"], expected_content_type);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+            assert_eq!(response.headers()[header::CONNECTION], "keep-alive");
         }
     }
 

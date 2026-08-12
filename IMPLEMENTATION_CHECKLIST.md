@@ -6,6 +6,11 @@
 
 运行约定：宿主机只负责 Rust/Go harness 编译；测试函数、runtime、代理链、SQLite 副本和网络命名空间均在 Podman 中运行。构建缓存和测试状态只放在 `~/.cache/yuhaiin-rust`，不使用 `/tmp`。
 
+缓存维护：`make cache-usage` 查看分层占用；`make cache-prune` 只清理超过
+`YUHAIIN_CACHE_RETENTION_DAYS`（默认 1 天）的 integration/parity/benchmark 场景目录，保留
+`cargo-target` 和 `fixtures`。需要预览时设置 `YUHAIIN_CACHE_DRY_RUN=1`；不会自动删除可复用
+构建产物。
+
 ## 总体状态
 
 | 指标 | 当前值 |
@@ -197,9 +202,11 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | --- | --- | --- |
 | `make workspace-tests` | 46 个 harness；isolated/stats/host-network 分组 | 0 失败；预计 ignored 项保持 ignored |
 | `make workspace-tests`（2026-08-12 update helper） | Podman；宿主机只编译 harness | `run_update_helper` 成功替换、保留 `.update-backup`、重启失败恢复旧 binary 和保留 staged retry 两项单测通过 |
-| `make production-parity-smoke` | 3 份停止态 Go `state.db`，每份 Go/Rust 均在 Podman 中运行 | 3/3：read、core mutation、error matrix identical；日志存 `~/.cache/yuhaiin-rust/production-parity/` |
+| `YUHAIIN_SOURCE_DB=... make go-api-parity-smoke`（2026-08-12 当前轮） | 既有停止态 Go 快照复制到 Podman；Go/Rust 独立数据库副本 | info/settings/nodes/inbounds/resolvers/routes/publishes/connections、全部 mutation 和错误矩阵 identical |
+| `make production-parity-smoke`（2026-08-12 当前轮） | 3 份停止态 Go v5/v6/AWS-shaped snapshot；每份在 Podman 独立运行 Go/Rust | 3/3 API read、core mutation、error matrix identical |
+| `make go-live-flow-parity-smoke` + `make go-rust-stats-smoke`（2026-08-12 当前轮） | Podman Go/Rust live mixed inbound，共享 SQLite 统计接管 | Go/Rust 真实流量、connections/total/traffic/history 和 reload 后统计均通过 |
+| `make go-protocol-interop-smoke`（2026-08-12 当前轮） | Podman host network；真实 Go checkout/client/server | 6/6：Yuubinsya TCP/UOT/native UDP/Ping、WebSocket→H2、H2 v1、VLESS、VMess、Trojan |
 | `make service-chain-smoke` | host-network | 15/15：多个 inbound→router→outbound chain，含普通 VLESS/VMess/Trojan outbound |
-| `make go-protocol-interop-smoke` | 挂载 Go checkout、GOROOT、module cache；所有 Go scratch 位于 `~/.cache` | 6/6：Go Yuubinsya TCP/UOT/native UDP/Ping、Go WS→H2、Go H2 v1、VLESS、VMess、Trojan |
 | `make tun-reload-traffic-smoke` | rootless Podman + `unshare -Urn` + `/dev/net/tun` | 3 cycle：disable、不可达、reopen、traffic、close 通过 |
 | `make tun-reset-reconnect-smoke` / Debian VM rootful `tun-service.sh` | `/dev/net/tun`、`YUHAIIN_TUN_USER_NAMESPACE=0` | RST flow 被 target 接受并关闭；随后正常 reconnect echo、device close 通过 |
 | `make tun-mtu-smoke` | 同上 | IPv4 MTU 576/1280/1500/9000/9216 全部通过；默认最大合法 IPv4 UDP payload 65507 字节 |
@@ -228,7 +235,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `make workspace-tests`（2026-08-12 当前轮） | Podman；宿主机只编译 harness | 46 个 harness；core 145、runtime 252、store 128、WireGuard 7、service-chain 15 全部通过；新增 TUN DNS hot-reload 和 WireGuard runtime UDP chain 回归通过；外部 WireGuard harness 的 2 个公网测试显式 ignored；另有 Debian VM rootful TUN/TPROXY 现场复核 |
 | `make tun-api-process-smoke`（2026-08-12 当前轮） | Podman disposable user/network namespace、前台 runtime、`/dev/net/tun` | 1/1 通过；真实设备按 disabled→enabled→disabled→enabled→disabled 出现/消失，排除“API 已保存但 TUN supervisor 未切换” |
 | `make build MUSL=1`（2026-08-12 当前轮） | 宿主只做 target 编译，产物留在 `~/.cache/yuhaiin-rust` | `x86_64-unknown-linux-musl` debug runtime 构建通过；未把宿主编译当作容器运行时证据 |
-| `make startup-logs-smoke` | foreground Podman | 默认 stderr 输出 database、API bind、runtime ready、shutdown/stopped |
+| `make startup-logs-smoke` | foreground Podman；不传命令、不传 `YUHAIIN_DB/YUHAIIN_HTTP/YUHAIIN_QUIET`，只隔离 HOME/config | 真实 `./yuhaiin` 默认启动会在 stderr 输出 database、API bind、runtime ready、shutdown/stopped；因此不是静默卡死；`YUHAIIN_QUIET=1` 仍可显式关闭 |
 
 ## 常用命令
 
