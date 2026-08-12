@@ -57,7 +57,7 @@ pub use crate::flow::{FlowDirection as TunFlowDirection, FlowObserver as TunFlow
 use crate::dns::{AsyncDnsHandler, DnsHandler, answer_query};
 
 #[cfg(feature = "async-proxy")]
-use crate::proxy::{AsyncProxy, AsyncProxySelector};
+use crate::proxy::{AsyncProxy, AsyncProxySelector, stream_local_addr};
 
 fn tun_debug(message: impl std::fmt::Display) {
     if std::env::var_os("YUHAIIN_TUN_DEBUG").is_some() {
@@ -1223,8 +1223,9 @@ impl TunProxyRuntime {
                 let output = self.output_tx.clone();
                 let key = flow.key;
                 let timeouts = self.timeouts;
+                let observer = self.observer.clone();
                 let join = tokio::spawn(async move {
-                    run_tcp_proxy(proxy, context, key, commands, output, timeouts).await;
+                    run_tcp_proxy(proxy, context, key, commands, output, timeouts, observer).await;
                 });
                 self.tasks.insert(key, ProxyTask { command, join });
             }
@@ -1274,8 +1275,12 @@ impl TunProxyRuntime {
                     let (command, commands) = mpsc::channel(self.channel_capacity);
                     let output = self.output_tx.clone();
                     let timeouts = self.timeouts;
+                    let observer = self.observer.clone();
                     let join = tokio::spawn(async move {
-                        run_udp_proxy(proxy, context, flow.key, commands, output, timeouts).await;
+                        run_udp_proxy(
+                            proxy, context, flow.key, commands, output, timeouts, observer,
+                        )
+                        .await;
                     });
                     self.udp_tasks.insert(
                         source,
@@ -1806,11 +1811,12 @@ fn udp_source_key(flow: TunFlowKey) -> UdpSourceKey {
 #[cfg(feature = "async-proxy")]
 async fn run_tcp_proxy(
     proxy: Arc<dyn AsyncProxy>,
-    context: crate::FlowContext,
+    mut context: crate::FlowContext,
     flow: TunFlowKey,
     mut commands: mpsc::Receiver<ProxyCommand>,
     output: mpsc::Sender<ProxyOutput>,
     timeouts: ProxyTimeouts,
+    observer: Option<Arc<dyn TunFlowObserver>>,
 ) {
     let stream = match tokio::time::timeout(timeouts.connect, proxy.connect(&context)).await {
         Ok(Ok(stream)) => stream,
@@ -1825,6 +1831,16 @@ async fn run_tcp_proxy(
             return;
         }
     };
+    if let Some(local_addr) = stream_local_addr(&*stream) {
+        context.outbound_local_addr = Some(Endpoint::ip(context.network, local_addr));
+    }
+    if let Some(observer) = observer {
+        // TUN opens are published before the async connect so the management
+        // plane can show a pending flow. Publish the same flow once more after
+        // connect so the monitor can merge socket metadata without allocating
+        // a second connection ID.
+        observer.opened(TunFlow { key: flow }, context.clone());
+    }
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut buffer = vec![0u8; 16 * 1024];
     let mut write_closed = false;
@@ -1904,11 +1920,12 @@ async fn run_tcp_proxy(
 #[cfg(feature = "async-proxy")]
 async fn run_udp_proxy(
     proxy: Arc<dyn AsyncProxy>,
-    context: crate::FlowContext,
+    mut context: crate::FlowContext,
     initial_flow: TunFlowKey,
     mut commands: mpsc::Receiver<UdpProxyCommand>,
     output: mpsc::Sender<ProxyOutput>,
     timeouts: ProxyTimeouts,
+    observer: Option<Arc<dyn TunFlowObserver>>,
 ) {
     let datagram = match tokio::time::timeout(timeouts.connect, proxy.open_datagram(&context)).await
     {
@@ -1936,6 +1953,14 @@ async fn run_udp_proxy(
             return;
         }
     };
+    if let Ok(endpoint) = datagram.local_addr()
+        && endpoint.addr().is_some()
+    {
+        context.outbound_local_addr = Some(endpoint);
+    }
+    if let Some(observer) = observer {
+        observer.opened(TunFlow { key: initial_flow }, context.clone());
+    }
     if let Ok(Endpoint::Ip {
         network: Network::Udp,
         addr: translated,

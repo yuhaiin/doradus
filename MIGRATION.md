@@ -59,6 +59,15 @@
 > `YUHAIIN_CACHE_PRUNE_DEBUG=1 make cache-prune` 还可以释放 `cargo-target/debug` 的依赖中间产物，
 > 但会保留已生成的 debug 二进制。
 
+> 2026-08-12 TUN connection metadata closure：TUN 为了让管理面尽早看到 pending flow，仍在
+> 异步出站连接前先发布一次 `connections_added`；TCP stream 或 UDP datagram 成功打开后，
+> `yuhaiin-core::TunProxyRuntime` 再用同一个 flow 反馈实际 outbound local endpoint。monitor
+> 现在对同一 flow 做非空字段 merge，不分配新的 connection ID，并复用 Go/React 已有的
+> `connections_added` 按 ID 覆盖语义，因此 `localAddr`、`network.underlyingType` 和 sniffed
+> `protocol` 不会永久缺失。新增 monitor 单测；Podman 中 core TUN runtime 14/14、service-chain
+> 18/18、Go/Rust stats parity 和 workspace 48 harness 均通过。整个过程只使用
+> `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
 > 2026-08-12 no-argument startup log closure：前台二进制默认启动路径现在由
 > `make startup-logs-smoke` 按用户实际方式验证：Podman 只提供隔离的 `HOME`/`XDG_CONFIG_HOME`，
 > 不传命令、不设置 `YUHAIIN_DB`、`YUHAIIN_HTTP` 或 `YUHAIIN_QUIET`，直接运行 `./yuhaiin`。

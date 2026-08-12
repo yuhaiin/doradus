@@ -796,7 +796,19 @@ impl ConnectionMonitor {
 
     fn open(&self, flow: TunFlow, context: FlowContext) {
         let mut state = self.lock();
-        if state.connections.contains_key(&flow.key) {
+        if let Some(entry) = state.connections.get_mut(&flow.key) {
+            let update = connection_value(&entry.id, flow, &context);
+            let changed = merge_connection_metadata(&mut entry.value, update);
+            let value = entry.value.clone();
+            drop(state);
+            if changed {
+                self.mark_dirty();
+                // The React contract keys connections by id, so reusing the
+                // existing `connections_added` event updates metadata in
+                // place while remaining compatible with Go's two-event SSE
+                // surface (`connections_added`/`connections_removed`).
+                self.emit("connections_added", json!({"connections": [value]}));
+            }
             return;
         }
         state.next_id = state.next_id.saturating_add(1);
@@ -1400,6 +1412,51 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
     })
 }
 
+/// Merge metadata discovered after a flow was first published. TUN can expose
+/// a flow to the management plane before its asynchronous outbound socket has
+/// finished connecting, while Go creates the public record after that dial.
+/// Empty values from the early snapshot must not erase route/process metadata
+/// when the later snapshot only contains socket fields.
+fn merge_connection_metadata(target: &mut Value, update: Value) -> bool {
+    fn merge_value(target: &mut Value, update: Value) -> bool {
+        match (target, update) {
+            (Value::Object(target), Value::Object(update)) => {
+                let mut changed = false;
+                for (key, value) in update {
+                    if key == "id" || value_is_empty(&value) {
+                        continue;
+                    }
+                    match target.get_mut(&key) {
+                        Some(existing) => changed |= merge_value(existing, value),
+                        None => {
+                            target.insert(key, value);
+                            changed = true;
+                        }
+                    }
+                }
+                changed
+            }
+            (target, update) if *target != update => {
+                *target = update;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn value_is_empty(value: &Value) -> bool {
+        match value {
+            Value::Null => true,
+            Value::String(value) => value.is_empty(),
+            Value::Array(value) => value.is_empty(),
+            Value::Object(value) => value.is_empty(),
+            Value::Bool(_) | Value::Number(_) => false,
+        }
+    }
+
+    merge_value(target, update)
+}
+
 /// Build the same telemetry dimensions as Go's `statistics.dimensionsForConnection`.
 ///
 /// This is intentionally derived from the public connection contract instead of
@@ -1948,6 +2005,35 @@ mod tests {
         assert_eq!(connection["localAddr"], "");
         assert_eq!(connection["network"]["underlyingType"], "");
         assert_eq!(connection["udpMigrateId"], "");
+    }
+
+    #[test]
+    fn monitor_merges_late_socket_metadata_without_allocating_a_new_connection() {
+        let monitor = ConnectionMonitor::new();
+        let (flow, mut initial) = flow();
+        initial.inbound = Some("tun".to_owned());
+        initial.inbound_name = Some("TUN".to_owned());
+        initial.process = Some("/usr/bin/browser".to_owned());
+        monitor.opened(flow, initial);
+        let mut late = FlowContext::new(Endpoint::ip(flow.key.network, flow.key.destination));
+        late.outbound_local_addr = Some(Endpoint::ip(
+            Network::Tcp,
+            "192.0.2.20:52000".parse().unwrap(),
+        ));
+        late.protocol = Some("tls".to_owned());
+        monitor.opened(flow, late);
+
+        let connections = monitor.connections_value()["connections"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0]["id"], "1");
+        assert_eq!(connections[0]["inbound"], "tun");
+        assert_eq!(connections[0]["process"], "/usr/bin/browser");
+        assert_eq!(connections[0]["localAddr"], "192.0.2.20:52000");
+        assert_eq!(connections[0]["network"]["underlyingType"], "tcp");
+        assert_eq!(connections[0]["protocol"], "tls");
     }
 
     #[test]
