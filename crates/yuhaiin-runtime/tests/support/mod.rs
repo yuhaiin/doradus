@@ -1525,6 +1525,78 @@ pub async fn configure_h2_http_inbound(
     settle_runtime_reload().await;
 }
 
+/// Configure an AEAD-wrapped prior-knowledge HTTP/2 inbound. The AEAD layer
+/// is intentionally outside the H2 handshake, matching the Go transport
+/// composition used by legacy inbound configurations.
+pub async fn configure_aead_h2_http_inbound(
+    service: &ServiceProcess,
+    inbound: SocketAddr,
+    outbound: SocketAddr,
+) {
+    let node = json!({
+        "id":"aead-h2-inbound-http-out",
+        "name":"AEAD HTTP/2 inbound HTTP outbound",
+        "group":"integration",
+        "enabled":true,
+        "chain":[
+            {"type":"fixed","fixed":{"host":"127.0.0.1","port":outbound.port()}},
+            {"type":"http","http":{"user":"","password":""}}
+        ]
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes",
+        Some(&node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes/aead-h2-inbound-http-out/use",
+        None,
+    )
+    .await;
+
+    let inbound = json!({
+        "id":"aead-h2-http-in",
+        "name":"AEAD HTTP/2 inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
+        "transports":[
+            {"type":"aead","aead":{"password":"runtime-aead-password","cryptoMethod":"XChacha20Poly1305"}},
+            {"type":"http2","http2":{}}
+        ],
+        "protocol":{"type":"http","http":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+
+    let rule = json!({
+        "name":"proxy-example-test-over-aead-h2-inbound",
+        "mode":"proxy",
+        "match":{"domain":"example.test"},
+        "tag":"integration"
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/route/rules",
+        Some(&rule),
+    )
+    .await;
+    settle_runtime_reload().await;
+}
+
 /// Configure TLS termination followed by HTTP/2 prior-knowledge framing.
 /// The selected outbound is fixed → HTTP CONNECT so this fixture exercises
 /// TLS ALPN negotiation, H2 stream handling, router selection, and proxy-side

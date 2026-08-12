@@ -546,16 +546,6 @@ async fn start_listeners(
             ));
             continue;
         }
-        if spec.aead_password.is_some()
-            && (has_transport(&spec.transports, "websocket")
-                || has_transport(&spec.transports, "http2"))
-        {
-            monitor.warn(format!(
-                "skip inbound {}: AEAD transport composition with WebSocket/HTTP2 is not implemented",
-                spec.id
-            ));
-            continue;
-        }
         let tls_acceptor = match build_inbound_tls_acceptor(&record.data_json, &spec.transports) {
             Ok(acceptor) => acceptor,
             Err(error) => {
@@ -1234,6 +1224,92 @@ fn parse_aead_transport(
     Ok((Some(password), method))
 }
 
+/// Apply the stream transports which precede an application listener.
+///
+/// Go composes contract transports in declaration order. In the supported
+/// desktop combinations TLS and AEAD are stream wrappers, while HTTP/2 and
+/// WebSocket consume the resulting stream as their application transport.
+/// Keeping this boundary shared is important: AEAD must be removed before
+/// both the HTTP/2 and WebSocket handshakes, not only before the plain TCP
+/// protocol path.
+fn transport_index(transports: &[String], kind: &str) -> Option<usize> {
+    transports
+        .iter()
+        .position(|transport| transport.eq_ignore_ascii_case(kind))
+}
+
+fn aead_before_tls(transports: &[String]) -> bool {
+    transport_index(transports, "aead")
+        .zip(transports.iter().position(|transport| {
+            transport.eq_ignore_ascii_case("tls") || transport.eq_ignore_ascii_case("tls_auto")
+        }))
+        .is_some_and(|(aead, tls)| aead < tls)
+}
+
+async fn apply_inbound_aead(stream: BoxAsyncStream, spec: &InboundSpec) -> Result<BoxAsyncStream> {
+    let Some(password) = spec.aead_password.as_deref() else {
+        return Ok(stream);
+    };
+    if let Some(auth) = spec.auth.as_ref() {
+        let passwords = auth.inbound_passwords();
+        if passwords.is_empty() {
+            yuhaiin_protocol::aead::server(stream, password.as_bytes(), spec.aead_method).await
+        } else {
+            yuhaiin_protocol::aead::server_with_passwords(stream, &passwords, spec.aead_method)
+                .await
+        }
+    } else {
+        yuhaiin_protocol::aead::server(stream, password.as_bytes(), spec.aead_method).await
+    }
+}
+
+async fn prepare_inbound_stream<S>(
+    stream: S,
+    spec: &InboundSpec,
+    tls_acceptor: Option<InboundTlsAcceptor>,
+    require_h2_alpn: bool,
+) -> Result<BoxAsyncStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let aead_is_before_tls = aead_before_tls(&spec.transports);
+    let mut stream: BoxAsyncStream = Box::new(stream);
+
+    // Go wraps the listener in declaration order, so Accept unwraps the
+    // outermost transport first. Usually TLS is declared before AEAD, but
+    // preserve the inverse order too for configs that intentionally put TLS
+    // outside AEAD.
+    if aead_is_before_tls {
+        stream = apply_inbound_aead(stream, spec).await?;
+    }
+
+    #[cfg(feature = "doh-tls")]
+    if let Some(acceptor) = tls_acceptor {
+        let tls_stream = acceptor.accept(stream).await.map_err(|error| {
+            Error::new(
+                ErrorKind::Protocol,
+                format!("inbound TLS handshake: {error}"),
+            )
+        })?;
+        if require_h2_alpn && tls_stream.get_ref().1.alpn_protocol() != Some(b"h2") {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "inbound HTTP/2 TLS did not negotiate ALPN h2",
+            ));
+        }
+        stream = Box::new(tls_stream);
+    }
+    #[cfg(not(feature = "doh-tls"))]
+    {
+        let _ = (tls_acceptor, require_h2_alpn);
+    }
+
+    if !aead_is_before_tls {
+        stream = apply_inbound_aead(stream, spec).await?;
+    }
+    Ok(stream)
+}
+
 fn parse_listen_addr(value: &str) -> Result<SocketAddr> {
     let value = value.trim();
     let value = if value.starts_with(':') {
@@ -1485,39 +1561,9 @@ async fn serve_h2_listener(
                     let yuubinsya_server = yuubinsya_server.clone();
                     let logs = monitor.logs();
                     connections.spawn(async move {
-                        let result: Result<()> = if let Some(acceptor) = tls_acceptor {
-                            #[cfg(feature = "doh-tls")]
-                            {
-                                match acceptor.accept(stream).await {
-                                    Ok(stream) if stream.get_ref().1.alpn_protocol() == Some(b"h2") => {
-                                        serve_h2_connection(
-                                            stream,
-                                            peer,
-                                            spec,
-                                            selector,
-                                            monitor,
-                                            yuubinsya_server,
-                                        ).await
-                                    }
-                                    Ok(_) => Err(Error::new(
-                                        ErrorKind::Protocol,
-                                        "inbound HTTP/2 TLS did not negotiate ALPN h2",
-                                    )),
-                                    Err(error) => Err(Error::new(
-                                        ErrorKind::Protocol,
-                                        format!("inbound HTTP/2 TLS handshake: {error}"),
-                                    )),
-                                }
-                            }
-                            #[cfg(not(feature = "doh-tls"))]
-                            {
-                                let _ = (acceptor, stream, peer, spec, selector, monitor, yuubinsya_server);
-                                Err(Error::new(
-                                    ErrorKind::Unsupported,
-                                    "inbound HTTP/2 TLS requires the doh-tls feature",
-                                ))
-                            }
-                        } else {
+                        let result: Result<()> = async {
+                            let stream =
+                                prepare_inbound_stream(stream, &spec, tls_acceptor, true).await?;
                             serve_h2_connection(
                                 stream,
                                 peer,
@@ -1525,8 +1571,10 @@ async fn serve_h2_listener(
                                 selector,
                                 monitor,
                                 yuubinsya_server,
-                            ).await
-                        };
+                            )
+                            .await
+                        }
+                        .await;
                         if let Err(error) = result {
                             logs.error(format!("HTTP/2 inbound connection error: {error}"));
                         }
@@ -1539,7 +1587,8 @@ async fn serve_h2_listener(
                 }
             }
         }
-    }.await;
+    }
+    .await;
     connections.abort_all();
     while connections.join_next().await.is_some() {}
     if let Some(server) = yuubinsya_server {
@@ -1742,51 +1791,8 @@ async fn serve_listener(
                     let logs = monitor.logs();
                     connections.spawn(async move {
                         let result = async {
-                            #[cfg(feature = "doh-tls")]
-                            let stream: BoxAsyncStream = if let Some(acceptor) = tls_acceptor {
-                                Box::new(acceptor.accept(stream).await.map_err(|error| {
-                                    Error::new(
-                                        ErrorKind::Protocol,
-                                        format!("inbound TLS handshake: {error}"),
-                                    )
-                                })?)
-                            } else {
-                                Box::new(stream)
-                            };
-                            #[cfg(not(feature = "doh-tls"))]
-                            let stream: BoxAsyncStream = {
-                                let _ = tls_acceptor;
-                                Box::new(stream)
-                            };
-                            let stream = if let Some(password) = spec.aead_password.as_deref() {
-                                if let Some(auth) = spec.auth.as_ref() {
-                                    let passwords = auth.inbound_passwords();
-                                    if passwords.is_empty() {
-                                        yuhaiin_protocol::aead::server(
-                                            stream,
-                                            password.as_bytes(),
-                                            spec.aead_method,
-                                        )
-                                        .await?
-                                    } else {
-                                        yuhaiin_protocol::aead::server_with_passwords(
-                                            stream,
-                                            &passwords,
-                                            spec.aead_method,
-                                        )
-                                        .await?
-                                    }
-                                } else {
-                                    yuhaiin_protocol::aead::server(
-                                        stream,
-                                        password.as_bytes(),
-                                        spec.aead_method,
-                                    )
-                                    .await?
-                                }
-                            } else {
-                                stream
-                            };
+                            let stream =
+                                prepare_inbound_stream(stream, &spec, tls_acceptor, false).await?;
                             serve_connection(
                                 stream,
                                 peer,
@@ -1849,22 +1855,9 @@ async fn serve_websocket_listener(
                     let yuubinsya_server = yuubinsya_server.clone();
                     let logs = monitor.logs();
                     connections.spawn(async move {
-                        #[cfg(feature = "doh-tls")]
-                        let result = if let Some(acceptor) = tls_acceptor {
-                            match acceptor.accept(stream).await {
-                                Ok(stream) => {
-                                    serve_websocket_stream(
-                                        stream, peer, protocol, spec, selector, monitor,
-                                        yuubinsya_server,
-                                    )
-                                    .await
-                                }
-                                Err(error) => Err(Error::new(
-                                    ErrorKind::Protocol,
-                                    format!("inbound TLS handshake: {error}"),
-                                )),
-                            }
-                        } else {
+                        let result: Result<()> = async {
+                            let stream =
+                                prepare_inbound_stream(stream, &spec, tls_acceptor, false).await?;
                             serve_websocket_stream(
                                 stream,
                                 peer,
@@ -1875,21 +1868,8 @@ async fn serve_websocket_listener(
                                 yuubinsya_server,
                             )
                             .await
-                        };
-                        #[cfg(not(feature = "doh-tls"))]
-                        let result = {
-                            let _ = tls_acceptor;
-                            serve_websocket_stream(
-                                stream,
-                                peer,
-                                protocol,
-                                spec,
-                                selector,
-                                monitor,
-                                yuubinsya_server,
-                            )
-                            .await
-                        };
+                        }
+                        .await;
                         if let Err(error) = result {
                             logs.error(format!("WebSocket inbound connection error: {error}"));
                         }
@@ -1986,22 +1966,8 @@ async fn serve_websocket_h2_listener(
                     let logs = monitor.logs();
                     connections.spawn(async move {
                         let result = async {
-                            #[cfg(feature = "doh-tls")]
-                            let stream: BoxAsyncStream = if let Some(acceptor) = tls_acceptor {
-                                Box::new(acceptor.accept(stream).await.map_err(|error| {
-                                    Error::new(
-                                        ErrorKind::Protocol,
-                                        format!("inbound WebSocket TLS handshake: {error}"),
-                                    )
-                                })?)
-                            } else {
-                                Box::new(stream)
-                            };
-                            #[cfg(not(feature = "doh-tls"))]
-                            let stream = {
-                                let _ = tls_acceptor;
-                                stream
-                            };
+                            let stream =
+                                prepare_inbound_stream(stream, &spec, tls_acceptor, false).await?;
                             let (stream, early_data) = accept_websocket_stream(stream).await?;
                             let stream = PrefixedIo::new(early_data, stream);
                             serve_h2_connection(
@@ -2288,6 +2254,20 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             );
         }
         assert!(is_supported_inbound_transport("tls_auto"));
+    }
+
+    #[test]
+    fn inbound_stream_wrappers_unwrap_in_go_accept_order() {
+        let names = |values: &[&str]| -> Vec<String> {
+            values.iter().map(|value| (*value).to_owned()).collect()
+        };
+
+        // Go wraps listeners in declaration order, therefore Accept unwraps
+        // the first declared stream wrapper before the later one.
+        assert!(!aead_before_tls(&names(&["tls", "aead", "http2"])));
+        assert!(aead_before_tls(&names(&["aead", "tls", "http2"])));
+        assert!(aead_before_tls(&names(&["aead", "tls_auto", "websocket"])));
+        assert!(!aead_before_tls(&names(&["websocket", "aead"])));
     }
 
     async fn direct_runtime() -> (Arc<RuntimeProxySelector>, Arc<ConnectionMonitor>) {
@@ -4028,6 +4008,185 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 assert!(received.ends_with(b"websocket-http2"));
                 connection_task.abort();
                 let _ = connection_task.await;
+            })
+            .await;
+
+            listener_task.abort();
+            let _ = listener_task.await;
+            echo_task.abort();
+            let _ = echo_task.await;
+            result.unwrap();
+        });
+    }
+
+    #[cfg(feature = "http2")]
+    #[test]
+    fn aead_http2_transport_bridges_http_inbound_and_routes_a_real_tcp_flow() {
+        block_on(async {
+            use bytes::Bytes;
+            use http::Request;
+
+            let (echo_address, echo_task) = echo_server().await;
+            let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let inbound_address = inbound_listener.local_addr().unwrap();
+            let (selector, monitor) = direct_runtime().await;
+            let listener_task = tokio::spawn(serve_h2_listener(
+                inbound_listener,
+                InboundSpec {
+                    id: "aead-http2-inbound".to_owned(),
+                    name: "aead-http2-inbound".to_owned(),
+                    protocol: "http".to_owned(),
+                    listen: inbound_address,
+                    username: String::new(),
+                    password: String::new(),
+                    auth: None,
+                    udp_mode: UdpMode::Disabled,
+                    protocol_udp: false,
+                    transports: vec!["aead".to_owned(), "http2".to_owned()],
+                    aead_password: Some("secret".to_owned()),
+                    aead_method: yuhaiin_protocol::aead::CryptoMethod::XChacha20Poly1305,
+                    outbound_id: "direct".to_owned(),
+                    reverse_target: None,
+                    reverse_http: None,
+                },
+                selector,
+                monitor,
+                None,
+            ));
+
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let transport = TcpStream::connect(inbound_address).await.unwrap();
+                let transport = yuhaiin_protocol::aead::client(
+                    Box::new(transport),
+                    b"secret",
+                    yuhaiin_protocol::aead::CryptoMethod::XChacha20Poly1305,
+                )
+                .await
+                .unwrap();
+                let (mut client, connection) = h2::client::handshake(transport).await.unwrap();
+                let connection_task = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                let request = Request::builder()
+                    .method(http::Method::CONNECT)
+                    .uri("http://localhost")
+                    .body(())
+                    .unwrap();
+                let (response, mut request_body) = client.send_request(request, false).unwrap();
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), http::StatusCode::OK);
+                let request_headers = format!(
+                    "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+                    echo_address, echo_address
+                );
+                request_body
+                    .send_data(Bytes::from(request_headers), false)
+                    .unwrap();
+                request_body
+                    .send_data(Bytes::from_static(b"aead-http2"), true)
+                    .unwrap();
+                let mut body = response.into_body();
+                let mut received = Vec::new();
+                while let Some(data) = body.data().await {
+                    let data = data.unwrap();
+                    body.flow_control().release_capacity(data.len()).unwrap();
+                    received.extend_from_slice(&data);
+                    if received.ends_with(b"aead-http2") {
+                        break;
+                    }
+                }
+                assert!(received.starts_with(b"HTTP/1.1 200 Connection Established\r\n\r\n"));
+                assert!(received.ends_with(b"aead-http2"));
+                connection_task.abort();
+                let _ = connection_task.await;
+            })
+            .await;
+
+            listener_task.abort();
+            let _ = listener_task.await;
+            echo_task.abort();
+            let _ = echo_task.await;
+            result.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn aead_websocket_transport_wraps_http_inbound_and_routes_a_real_tcp_flow() {
+        block_on(async {
+            use futures_util::{SinkExt, StreamExt};
+            use tokio_tungstenite::tungstenite::Message;
+
+            let (echo_address, echo_task) = echo_server().await;
+            let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let inbound_address = inbound_listener.local_addr().unwrap();
+            let (selector, monitor) = direct_runtime().await;
+            let listener_task = tokio::spawn(serve_websocket_listener(
+                inbound_listener,
+                InboundSpec {
+                    id: "aead-websocket-inbound".to_owned(),
+                    name: "aead-websocket-inbound".to_owned(),
+                    protocol: "http".to_owned(),
+                    listen: inbound_address,
+                    username: String::new(),
+                    password: String::new(),
+                    auth: None,
+                    udp_mode: UdpMode::Disabled,
+                    protocol_udp: false,
+                    transports: vec!["aead".to_owned(), "websocket".to_owned()],
+                    aead_password: Some("secret".to_owned()),
+                    aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
+                    outbound_id: "direct".to_owned(),
+                    reverse_target: None,
+                    reverse_http: None,
+                },
+                selector,
+                monitor,
+                None,
+            ));
+
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let transport = TcpStream::connect(inbound_address).await.unwrap();
+                let transport = yuhaiin_protocol::aead::client(
+                    Box::new(transport),
+                    b"secret",
+                    yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
+                )
+                .await
+                .unwrap();
+                let (mut websocket, _) =
+                    tokio_tungstenite::client_async("ws://localhost/ws", transport)
+                        .await
+                        .unwrap();
+                websocket
+                    .send(Message::binary(
+                        format!(
+                            "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+                            echo_address, echo_address
+                        )
+                        .into_bytes(),
+                    ))
+                    .await
+                    .unwrap();
+                let response = websocket.next().await.unwrap().unwrap();
+                let response = match response {
+                    Message::Binary(data) => data.to_vec(),
+                    Message::Text(data) => data.as_bytes().to_vec(),
+                    other => panic!("unexpected WebSocket response: {other:?}"),
+                };
+                assert!(response.starts_with(b"HTTP/1.1 200"));
+                websocket
+                    .send(Message::binary(b"aead-websocket".to_vec()))
+                    .await
+                    .unwrap();
+                let echoed = websocket.next().await.unwrap().unwrap();
+                let echoed = match echoed {
+                    Message::Binary(data) => data.to_vec(),
+                    Message::Text(data) => data.as_bytes().to_vec(),
+                    other => panic!("unexpected WebSocket echo: {other:?}"),
+                };
+                assert_eq!(echoed, b"aead-websocket");
+                websocket.close(None).await.unwrap();
             })
             .await;
 

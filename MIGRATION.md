@@ -11,6 +11,16 @@
 > `YUHAIIN_QUIET` 只有 `1/true/yes/on` 才会关闭这些 console notice，避免环境中设置 `YUHAIIN_QUIET=0` 时误以为没有日志。
 > `IMPLEMENTATION_CHECKLIST.md` 现在按 crate 模块树、协议矩阵、未完成项和验收命令组织；rootful TUN route lease、RST/reconnect 与 TPROXY UDP delivery/idle/force-stop 已有独立 VM 现场证据，但 TUN kernel fragment、Android/macOS 和生产/发布现场仍保留为 `[~]`，不能从单元测试覆盖率推导为完整替换。
 
+> 2026-08-12 inbound AEAD transport composition：Go 的 `listenContract` 会按
+> `config.Transports` 顺序逐层包裹 listener，Rust 入站现在通过统一的
+> `prepare_inbound_stream` 复现这一边界：TLS、AEAD 先完成 stream handshake，再交给
+> HTTP/2、WebSocket 或普通协议 listener；如果声明顺序把 AEAD 放在 TLS 前，也按 Go 的
+> accept 顺序先解 AEAD 再做 TLS。这样 `AEAD→HTTP/2` 与 `AEAD→WebSocket` 不会再被
+> supervisor 静默跳过，也不会在 WebSocket+HTTP/2 场景错误强制 TLS ALPN `h2`。新增两条
+> runtime 真实 TCP flow 单测、声明顺序回归和一个 SQLite/API/runtime 进程级
+> `AEAD→HTTP/2→HTTP outbound` chain；Podman focused runtime 276/276、service-chain
+> 19/19 和 workspace harness 回归通过。
+
 > 2026-08-12 inbound reload boundary：对照 Go `Inbound.SaveContract`，Rust 不再让所有配置变更
 > 中断全部 socket listeners。普通 node/route/resolver/backup/settings reload 只构建并原子替换已注册
 > `RuntimeProxySelector`；inbound、中心用户、selected-node 和全量 apply 变更才发布专用 inbound
