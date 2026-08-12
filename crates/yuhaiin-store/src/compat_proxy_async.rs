@@ -391,6 +391,48 @@ mod tests {
     }
 
     #[test]
+    fn extracts_node_interface_from_fixedv2_and_alternate_address() {
+        let config = GoProxyRuntimeConfig {
+            id: "fixed".to_owned(),
+            name: "fixed".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "local".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned()],
+            layers: vec![GoProxyLayer {
+                kind: "fixedv2".to_owned(),
+                config: serde_json::json!({
+                    "addresses": [
+                        { "host": "proxy.example", "port": 443, "network_interface": "eth-proxy" }
+                    ]
+                }),
+            }],
+            transport: GoProxyTransport::Fixed,
+            data_json: Vec::new(),
+        };
+        assert_eq!(config.network_interface().as_deref(), Some("eth-proxy"));
+    }
+
+    #[test]
+    fn extracts_camel_case_interface_from_preserved_legacy_payload() {
+        let config = GoProxyRuntimeConfig {
+            id: "direct".to_owned(),
+            name: "direct".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "local".to_owned(),
+            enabled: true,
+            chain_types: vec!["direct".to_owned()],
+            layers: Vec::new(),
+            transport: GoProxyTransport::Direct,
+            data_json: serde_json::to_vec(&serde_json::json!({
+                "networkInterface": "wan0"
+            }))
+            .unwrap(),
+        };
+        assert_eq!(config.network_interface().as_deref(), Some("wan0"));
+    }
+
+    #[test]
     fn injected_resolver_builds_domain_fixed_proxy_without_system_dns() {
         let config = GoProxyRuntimeConfig {
             id: "fixed".to_owned(),

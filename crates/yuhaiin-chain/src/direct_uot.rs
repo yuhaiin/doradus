@@ -15,7 +15,9 @@ use serde_json::Value;
 use tokio::io::split;
 use tokio::sync::Mutex;
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, connect_tokio_tcp};
+use yuhaiin_core::proxy::{
+    AsyncDatagram, AsyncProxy, BoxAsyncStream, connect_tokio_tcp_with_interface,
+};
 use yuhaiin_core::yuubinsya::derive_salt;
 use yuhaiin_core::{BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, Result};
 
@@ -210,6 +212,7 @@ impl AsyncProxy for DirectUotProxy {
         ));
         let context_migrate_id = Arc::clone(&context.udp_migrate_id);
         let local_bind_addresses = Arc::new(context.local_bind_addresses.clone());
+        let bind_interface = context.bind_interface.clone();
         Box::pin(async move {
             if proxy.closed.load(Ordering::Acquire) {
                 return Err(closed_error());
@@ -218,6 +221,7 @@ impl AsyncProxy for DirectUotProxy {
                 .connect_session(
                     migrate_id.load(Ordering::Acquire),
                     local_bind_addresses.as_slice(),
+                    bind_interface.as_deref(),
                 )
                 .await?;
             migrate_id.store(assigned_id, Ordering::Release);
@@ -227,6 +231,7 @@ impl AsyncProxy for DirectUotProxy {
                 migrate_id,
                 session,
                 local_bind_addresses,
+                bind_interface,
             ));
             if let Err(error) = proxy.register_datagram(&datagram).await {
                 let _ = datagram.close().await;
@@ -273,6 +278,7 @@ impl DirectUotProxy {
         &self,
         migrate_id: u64,
         local_bind_addresses: &[std::net::IpAddr],
+        bind_interface: Option<&str>,
     ) -> Result<(Arc<DirectUotSession>, u64)> {
         let addresses = resolve_endpoints(&self.endpoints, self.resolver.as_ref()).await?;
         let mut last_error = None;
@@ -282,7 +288,14 @@ impl DirectUotProxy {
                 .copied()
                 .find(|ip| ip.is_ipv4() == address.ip().is_ipv4())
                 .map(|ip| SocketAddr::new(ip, 0));
-            let stream = match connect_tokio_tcp(address, local_bind, CONNECT_TIMEOUT).await {
+            let stream = match connect_tokio_tcp_with_interface(
+                address,
+                local_bind,
+                bind_interface,
+                CONNECT_TIMEOUT,
+            )
+            .await
+            {
                 Ok(stream) => stream,
                 Err(error) => {
                     last_error = Some(error);
@@ -337,6 +350,7 @@ struct DirectUotDatagram {
     proxy: DirectUotProxy,
     migrate_id: Arc<AtomicU64>,
     local_bind_addresses: Arc<Vec<std::net::IpAddr>>,
+    bind_interface: Option<String>,
     session: Mutex<Option<Arc<DirectUotSession>>>,
     reconnect_lock: Mutex<()>,
     closed: AtomicBool,
@@ -370,11 +384,13 @@ impl DirectUotDatagram {
         migrate_id: Arc<AtomicU64>,
         session: Arc<DirectUotSession>,
         local_bind_addresses: Arc<Vec<std::net::IpAddr>>,
+        bind_interface: Option<String>,
     ) -> Self {
         Self {
             proxy,
             migrate_id,
             local_bind_addresses,
+            bind_interface,
             session: Mutex::new(Some(session)),
             reconnect_lock: Mutex::new(()),
             closed: AtomicBool::new(false),
@@ -404,6 +420,7 @@ impl DirectUotDatagram {
             .connect_session(
                 self.migrate_id.load(Ordering::Acquire),
                 self.local_bind_addresses.as_slice(),
+                self.bind_interface.as_deref(),
             )
             .await?;
         self.migrate_id.store(assigned_id, Ordering::Release);

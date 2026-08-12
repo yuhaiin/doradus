@@ -524,6 +524,7 @@ impl RuntimeSnapshot {
             inner: Arc::new(SocketPolicyProxy {
                 inner: proxy,
                 bind_addresses: self.socket_bind_addresses.clone(),
+                bind_interface: config.network_interface(),
             }),
             semaphore: self.connect_semaphore.clone(),
         }) as Arc<dyn AsyncProxy>;
@@ -653,6 +654,7 @@ impl RuntimeSnapshot {
                 inner: Arc::new(SocketPolicyProxy {
                     inner: proxy,
                     bind_addresses: self.socket_bind_addresses.clone(),
+                    bind_interface: None,
                 }),
                 semaphore: self.connect_semaphore.clone(),
             }) as Arc<dyn AsyncProxy>;
@@ -672,6 +674,7 @@ impl RuntimeSnapshot {
 struct SocketPolicyProxy {
     inner: Arc<dyn AsyncProxy>,
     bind_addresses: Arc<[std::net::IpAddr]>,
+    bind_interface: Option<String>,
 }
 
 impl AsyncProxy for SocketPolicyProxy {
@@ -681,6 +684,9 @@ impl AsyncProxy for SocketPolicyProxy {
     ) -> yuhaiin_core::BoxFuture<'a, Result<yuhaiin_core::proxy::BoxAsyncStream>> {
         let mut context = context.clone();
         context.local_bind_addresses = self.bind_addresses.to_vec();
+        if self.bind_interface.is_some() {
+            context.bind_interface = self.bind_interface.clone();
+        }
         let inner = Arc::clone(&self.inner);
         Box::pin(async move { inner.connect(&context).await })
     }
@@ -691,6 +697,9 @@ impl AsyncProxy for SocketPolicyProxy {
     ) -> yuhaiin_core::BoxFuture<'a, Result<Box<dyn yuhaiin_core::proxy::AsyncDatagram>>> {
         let mut context = context.clone();
         context.local_bind_addresses = self.bind_addresses.to_vec();
+        if self.bind_interface.is_some() {
+            context.bind_interface = self.bind_interface.clone();
+        }
         let inner = Arc::clone(&self.inner);
         Box::pin(async move { inner.open_datagram(&context).await })
     }
@@ -701,6 +710,9 @@ impl AsyncProxy for SocketPolicyProxy {
     ) -> yuhaiin_core::BoxFuture<'a, Result<Duration>> {
         let mut context = context.clone();
         context.local_bind_addresses = self.bind_addresses.to_vec();
+        if self.bind_interface.is_some() {
+            context.bind_interface = self.bind_interface.clone();
+        }
         let inner = Arc::clone(&self.inner);
         Box::pin(async move { inner.ping(&context).await })
     }
@@ -1699,6 +1711,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(server.await.unwrap(), *b"standalone-resolve");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_proxy_carries_node_network_interface_into_direct_socket() {
+        let config = GoProxyRuntimeConfig {
+            id: "direct-interface".to_owned(),
+            name: "Direct interface".to_owned(),
+            group_name: String::new(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["direct".to_owned()],
+            layers: vec![GoProxyLayer {
+                kind: "direct".to_owned(),
+                config: serde_json::json!({ "network_interface": "lo" }),
+            }],
+            transport: GoProxyTransport::Direct,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        };
+        let built = snapshot(config)
+            .build_proxy("direct-interface", Duration::from_secs(1))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let context = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            address,
+        ));
+        let mut stream = built.proxy.connect(&context).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"interface")
+            .await
+            .unwrap();
+        let mut accepted = server.await.unwrap();
+        let mut payload = [0u8; 9];
+        tokio::io::AsyncReadExt::read_exact(&mut accepted, &mut payload)
+            .await
+            .unwrap();
+        assert_eq!(&payload, b"interface");
     }
 
     #[test]

@@ -40,6 +40,25 @@ pub trait StreamConnector: Send + Sync {
         self.connect(destination)
     }
 
+    /// Connect while applying a node-level operating-system interface.
+    /// Implementations that do not create the socket themselves retain the
+    /// safe default and reject a non-empty interface rather than silently
+    /// dropping the setting.
+    fn connect_with_options(
+        &self,
+        destination: &Endpoint,
+        local_bind: Option<SocketAddr>,
+        bind_interface: Option<&str>,
+    ) -> Result<TcpStream> {
+        if bind_interface.is_some_and(|interface| !interface.trim().is_empty()) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "stream connector does not support a network interface",
+            ));
+        }
+        self.connect_with_local(destination, local_bind)
+    }
+
     fn connect_target(&self) -> Option<SocketAddr> {
         None
     }
@@ -50,9 +69,35 @@ fn connect_std_tcp(
     local_bind: Option<SocketAddr>,
     timeout: Duration,
 ) -> Result<TcpStream> {
+    connect_std_tcp_with_interface(address, local_bind, None, timeout)
+}
+
+fn connect_std_tcp_with_interface(
+    address: SocketAddr,
+    local_bind: Option<SocketAddr>,
+    bind_interface: Option<&str>,
+    timeout: Duration,
+) -> Result<TcpStream> {
     let Some(local_bind) = local_bind else {
-        return TcpStream::connect_timeout(&address, timeout)
-            .map_err(|error| Error::new(ErrorKind::Io, error.to_string()));
+        if bind_interface.is_none_or(|interface| interface.trim().is_empty()) {
+            return TcpStream::connect_timeout(&address, timeout)
+                .map_err(|error| Error::new(ErrorKind::Io, error.to_string()));
+        }
+        let socket = Socket::new(
+            if address.is_ipv4() {
+                Domain::IPV4
+            } else {
+                Domain::IPV6
+            },
+            Type::STREAM,
+            Some(Protocol::TCP),
+        )
+        .map_err(|error| Error::new(ErrorKind::Io, format!("create TCP socket: {error}")))?;
+        bind_socket_to_interface(&socket, bind_interface)?;
+        socket
+            .connect_timeout(&address.into(), timeout)
+            .map_err(|error| Error::new(ErrorKind::Io, format!("connect TCP socket: {error}")))?;
+        return Ok(socket.into());
     };
     if local_bind.is_ipv4() != address.is_ipv4() {
         return Err(Error::new(
@@ -70,6 +115,7 @@ fn connect_std_tcp(
         Some(Protocol::TCP),
     )
     .map_err(|error| Error::new(ErrorKind::Io, format!("create TCP socket: {error}")))?;
+    bind_socket_to_interface(&socket, bind_interface)?;
     socket
         .bind(&local_bind.into())
         .map_err(|error| Error::new(ErrorKind::Io, format!("bind TCP socket: {error}")))?;
@@ -112,6 +158,15 @@ fn connect_direct_tcp(
     local_bind: Option<SocketAddr>,
     timeout: Duration,
 ) -> Result<TcpStream> {
+    connect_direct_tcp_with_interface(destination, local_bind, None, timeout)
+}
+
+fn connect_direct_tcp_with_interface(
+    destination: &Endpoint,
+    local_bind: Option<SocketAddr>,
+    bind_interface: Option<&str>,
+    timeout: Duration,
+) -> Result<TcpStream> {
     let addresses = resolve_std_tcp_addresses(destination)?;
     let mut last_error = None;
     let mut family_mismatch = false;
@@ -120,7 +175,7 @@ fn connect_direct_tcp(
             family_mismatch = true;
             continue;
         }
-        match connect_std_tcp(address, local_bind, timeout) {
+        match connect_std_tcp_with_interface(address, local_bind, bind_interface, timeout) {
             Ok(stream) => return Ok(stream),
             Err(error) => last_error = Some(error),
         }
@@ -143,6 +198,16 @@ pub async fn connect_tokio_tcp(
     local_bind: Option<SocketAddr>,
     timeout: Duration,
 ) -> Result<tokio::net::TcpStream> {
+    connect_tokio_tcp_with_interface(address, local_bind, None, timeout).await
+}
+
+#[cfg(feature = "async-proxy")]
+pub async fn connect_tokio_tcp_with_interface(
+    address: SocketAddr,
+    local_bind: Option<SocketAddr>,
+    bind_interface: Option<&str>,
+    timeout: Duration,
+) -> Result<tokio::net::TcpStream> {
     if local_bind.is_some_and(|local| local.is_ipv4() != address.is_ipv4()) {
         return Err(Error::new(
             ErrorKind::InvalidInput,
@@ -155,6 +220,7 @@ pub async fn connect_tokio_tcp(
         tokio::net::TcpSocket::new_v6()
     }
     .map_err(|error| Error::new(ErrorKind::Io, format!("create TCP socket: {error}")))?;
+    bind_tokio_tcp_socket_to_interface(&socket, bind_interface)?;
     if let Some(local_bind) = local_bind {
         socket
             .bind(local_bind)
@@ -164,6 +230,129 @@ pub async fn connect_tokio_tcp(
         .await
         .map_err(|_| Error::new(ErrorKind::Timeout, "TCP connect timed out"))?
         .map_err(|error| Error::new(ErrorKind::Io, format!("TCP connect: {error}")))
+}
+
+fn bind_socket_to_interface(socket: &Socket, bind_interface: Option<&str>) -> Result<()> {
+    let Some(interface) = bind_interface
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    bind_socket_to_interface_platform(socket, interface)
+}
+
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+fn bind_socket_to_interface_platform(socket: &Socket, interface: &str) -> Result<()> {
+    socket
+        .bind_device(Some(interface.as_bytes()))
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("bind socket to interface {interface:?}: {error}"),
+            )
+        })
+}
+
+#[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+fn bind_socket_to_interface_platform(_socket: &Socket, _interface: &str) -> Result<()> {
+    // macOS and Windows use the source-address fallback supplied by the
+    // runtime interface snapshot. Their native interface-index APIs are
+    // platform-specific and are intentionally kept out of this shared core.
+    Ok(())
+}
+
+#[cfg(feature = "async-proxy")]
+fn bind_tokio_tcp_socket_to_interface(
+    socket: &tokio::net::TcpSocket,
+    bind_interface: Option<&str>,
+) -> Result<()> {
+    let Some(interface) = bind_interface
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    bind_tokio_tcp_socket_to_interface_platform(socket, interface)
+}
+
+#[cfg(all(
+    feature = "async-proxy",
+    any(target_os = "android", target_os = "fuchsia", target_os = "linux")
+))]
+fn bind_tokio_tcp_socket_to_interface_platform(
+    socket: &tokio::net::TcpSocket,
+    interface: &str,
+) -> Result<()> {
+    socket
+        .bind_device(Some(interface.as_bytes()))
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("bind TCP socket to interface {interface:?}: {error}"),
+            )
+        })
+}
+
+#[cfg(all(
+    feature = "async-proxy",
+    not(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))
+))]
+fn bind_tokio_tcp_socket_to_interface_platform(
+    _socket: &tokio::net::TcpSocket,
+    _interface: &str,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(feature = "async-proxy")]
+async fn bind_tokio_udp_socket(
+    bind_address: SocketAddr,
+    bind_interface: Option<&str>,
+    label: &str,
+) -> Result<tokio::net::UdpSocket> {
+    let socket = tokio::net::UdpSocket::bind(bind_address)
+        .await
+        .map_err(|error| Error::new(ErrorKind::Io, format!("{label} UDP bind: {error}")))?;
+    let Some(interface) = bind_interface
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(socket);
+    };
+    bind_tokio_udp_socket_to_interface(&socket, interface, label)?;
+    Ok(socket)
+}
+
+#[cfg(all(
+    feature = "async-proxy",
+    any(target_os = "android", target_os = "fuchsia", target_os = "linux")
+))]
+fn bind_tokio_udp_socket_to_interface(
+    socket: &tokio::net::UdpSocket,
+    interface: &str,
+    label: &str,
+) -> Result<()> {
+    socket
+        .bind_device(Some(interface.as_bytes()))
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("{label} UDP interface {interface:?}: {error}"),
+            )
+        })
+}
+
+#[cfg(all(
+    feature = "async-proxy",
+    not(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))
+))]
+fn bind_tokio_udp_socket_to_interface(
+    _socket: &tokio::net::UdpSocket,
+    _interface: &str,
+    _label: &str,
+) -> Result<()> {
+    Ok(())
 }
 pub trait SecureStream: Read + Write + Send {}
 impl<T: Read + Write + Send> SecureStream for T {}
@@ -211,6 +400,15 @@ impl StreamConnector for DirectConnector {
     ) -> Result<TcpStream> {
         connect_direct_tcp(destination, local_bind, self.timeout)
     }
+
+    fn connect_with_options(
+        &self,
+        destination: &Endpoint,
+        local_bind: Option<SocketAddr>,
+        bind_interface: Option<&str>,
+    ) -> Result<TcpStream> {
+        connect_direct_tcp_with_interface(destination, local_bind, bind_interface, self.timeout)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -244,6 +442,15 @@ impl StreamConnector for FixedConnector {
         connect_std_tcp(self.address, local_bind, self.timeout)
     }
 
+    fn connect_with_options(
+        &self,
+        _destination: &Endpoint,
+        local_bind: Option<SocketAddr>,
+        bind_interface: Option<&str>,
+    ) -> Result<TcpStream> {
+        connect_std_tcp_with_interface(self.address, local_bind, bind_interface, self.timeout)
+    }
+
     fn connect_target(&self) -> Option<SocketAddr> {
         Some(self.address)
     }
@@ -266,7 +473,17 @@ impl StreamConnector for HttpProxyConnector {
         destination: &Endpoint,
         local_bind: Option<SocketAddr>,
     ) -> Result<TcpStream> {
-        let mut stream = connect_std_tcp(self.proxy, local_bind, self.timeout)?;
+        self.connect_with_options(destination, local_bind, None)
+    }
+
+    fn connect_with_options(
+        &self,
+        destination: &Endpoint,
+        local_bind: Option<SocketAddr>,
+        bind_interface: Option<&str>,
+    ) -> Result<TcpStream> {
+        let mut stream =
+            connect_std_tcp_with_interface(self.proxy, local_bind, bind_interface, self.timeout)?;
         stream
             .set_read_timeout(Some(self.timeout))
             .and_then(|_| stream.set_write_timeout(Some(self.timeout)))
@@ -321,7 +538,17 @@ impl StreamConnector for Socks5Connector {
         destination: &Endpoint,
         local_bind: Option<SocketAddr>,
     ) -> Result<TcpStream> {
-        let mut stream = connect_std_tcp(self.proxy, local_bind, self.timeout)?;
+        self.connect_with_options(destination, local_bind, None)
+    }
+
+    fn connect_with_options(
+        &self,
+        destination: &Endpoint,
+        local_bind: Option<SocketAddr>,
+        bind_interface: Option<&str>,
+    ) -> Result<TcpStream> {
+        let mut stream =
+            connect_std_tcp_with_interface(self.proxy, local_bind, bind_interface, self.timeout)?;
         stream
             .set_read_timeout(Some(self.timeout))
             .and_then(|_| stream.set_write_timeout(Some(self.timeout)))
@@ -428,6 +655,16 @@ impl StreamConnector for FixedProxy {
         local_bind: Option<SocketAddr>,
     ) -> Result<TcpStream> {
         self.inner.connect_with_local(destination, local_bind)
+    }
+
+    fn connect_with_options(
+        &self,
+        destination: &Endpoint,
+        local_bind: Option<SocketAddr>,
+        bind_interface: Option<&str>,
+    ) -> Result<TcpStream> {
+        self.inner
+            .connect_with_options(destination, local_bind, bind_interface)
     }
 
     fn connect_target(&self) -> Option<SocketAddr> {
@@ -595,12 +832,18 @@ impl AsyncProxy for DirectAsyncProxy {
             .local_bind_addresses
             .first()
             .map(|address| address.is_ipv4());
+        let bind_interface = context.bind_interface.clone();
         Box::pin(async move {
             let addresses = resolve_direct_addresses(&destination, preferred_ipv4).await?;
             let mut last_error = None;
             for address in addresses {
-                match connect_tokio_tcp(address, context.local_bind_for(address), self.timeout)
-                    .await
+                match connect_tokio_tcp_with_interface(
+                    address,
+                    context.local_bind_for(address),
+                    bind_interface.as_deref(),
+                    self.timeout,
+                )
+                .await
                 {
                     Ok(stream) => {
                         let local_addr = stream.local_addr().ok();
@@ -625,6 +868,7 @@ impl AsyncProxy for DirectAsyncProxy {
             .local_bind_addresses
             .first()
             .map(|address| address.is_ipv4());
+        let bind_interface = context.bind_interface.clone();
         Box::pin(async move {
             let address = resolve_direct_addresses(&destination, preferred_ipv4)
                 .await?
@@ -636,9 +880,8 @@ impl AsyncProxy for DirectAsyncProxy {
                 std::net::SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
             };
             let bind_address = context.local_bind_for(address).unwrap_or(bind_address);
-            let socket = tokio::net::UdpSocket::bind(bind_address)
-                .await
-                .map_err(|error| Error::new(ErrorKind::Io, format!("direct UDP bind: {error}")))?;
+            let socket =
+                bind_tokio_udp_socket(bind_address, bind_interface.as_deref(), "direct").await?;
             Ok(Box::new(TokioDatagram { socket }) as Box<dyn AsyncDatagram>)
         })
     }
@@ -735,8 +978,15 @@ pub struct FixedAsyncProxy {
 impl AsyncProxy for FixedAsyncProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         let local_bind = context.local_bind_for(self.address);
+        let bind_interface = context.bind_interface.clone();
         Box::pin(async move {
-            let stream = connect_tokio_tcp(self.address, local_bind, self.timeout).await?;
+            let stream = connect_tokio_tcp_with_interface(
+                self.address,
+                local_bind,
+                bind_interface.as_deref(),
+                self.timeout,
+            )
+            .await?;
             let local_addr = stream.local_addr().ok();
             Ok(with_stream_local_addr(
                 Box::new(stream) as BoxAsyncStream,
@@ -756,10 +1006,10 @@ impl AsyncProxy for FixedAsyncProxy {
             "[::]:0".parse().expect("valid IPv6 wildcard")
         };
         let bind_address = context.local_bind_for(target).unwrap_or(fallback);
+        let bind_interface = context.bind_interface.clone();
         Box::pin(async move {
-            let socket = tokio::net::UdpSocket::bind(bind_address)
-                .await
-                .map_err(|error| Error::new(ErrorKind::Io, format!("fixed UDP bind: {error}")))?;
+            let socket =
+                bind_tokio_udp_socket(bind_address, bind_interface.as_deref(), "fixed").await?;
             Ok(Box::new(FixedDatagram { socket, target }) as Box<dyn AsyncDatagram>)
         })
     }
@@ -786,9 +1036,10 @@ impl AsyncProxy for BlockingStreamProxy {
         let local_bind = connector
             .connect_target()
             .and_then(|address| context.local_bind_for(address));
+        let bind_interface = context.bind_interface.clone();
         Box::pin(async move {
             let stream = tokio::task::spawn_blocking(move || {
-                connector.connect_with_local(&destination, local_bind)
+                connector.connect_with_options(&destination, local_bind, bind_interface.as_deref())
             })
             .await
             .map_err(|error| Error::new(ErrorKind::Closed, format!("proxy task: {error}")))??;
@@ -843,10 +1094,17 @@ impl AsyncProxy for Socks5AsyncProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         let destination = context.effective_destination();
         let local_bind = context.local_bind_for(self.proxy);
+        let bind_interface = context.bind_interface.clone();
         let proxy = self.clone();
         Box::pin(async move {
             let result = tokio::time::timeout(proxy.timeout, async move {
-                let mut stream = connect_tokio_tcp(proxy.proxy, local_bind, proxy.timeout).await?;
+                let mut stream = connect_tokio_tcp_with_interface(
+                    proxy.proxy,
+                    local_bind,
+                    bind_interface.as_deref(),
+                    proxy.timeout,
+                )
+                .await?;
                 socks5_authenticate(
                     &mut stream,
                     proxy.username.as_deref(),
@@ -878,10 +1136,16 @@ impl AsyncProxy for Socks5AsyncProxy {
                 "[::]:0".parse().expect("valid IPv6 wildcard")
             }
         });
+        let bind_interface = context.bind_interface.clone();
         Box::pin(async move {
             let result = tokio::time::timeout(proxy.timeout, async move {
-                let mut control =
-                    connect_tokio_tcp(proxy.proxy, Some(local_bind), proxy.timeout).await?;
+                let mut control = connect_tokio_tcp_with_interface(
+                    proxy.proxy,
+                    Some(local_bind),
+                    bind_interface.as_deref(),
+                    proxy.timeout,
+                )
+                .await?;
                 socks5_authenticate(
                     &mut control,
                     proxy.username.as_deref(),
@@ -907,11 +1171,8 @@ impl AsyncProxy for Socks5AsyncProxy {
                         "SOCKS5 UDP relay and local bind use different address families",
                     ));
                 }
-                let socket = tokio::net::UdpSocket::bind(local_bind)
-                    .await
-                    .map_err(|error| {
-                        Error::new(ErrorKind::Io, format!("bind SOCKS5 UDP socket: {error}"))
-                    })?;
+                let socket =
+                    bind_tokio_udp_socket(local_bind, bind_interface.as_deref(), "SOCKS5").await?;
                 Ok::<_, Error>(Socks5UdpDatagram {
                     socket,
                     relay,
@@ -1343,13 +1604,15 @@ impl AsyncProxy for YuubinsyaUdpProxy {
             SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
         };
         let bind_address = context.local_bind_for(server).unwrap_or(fallback);
+        let bind_interface = context.bind_interface.clone();
         Box::pin(async move {
             Ok(Box::new(
-                YuubinsyaUdpDatagram::bind(
+                YuubinsyaUdpDatagram::bind_with_interface(
                     bind_address,
                     password_hash,
                     Endpoint::ip(Network::Udp, server),
                     socks5_prefix,
+                    bind_interface.as_deref(),
                 )
                 .await?,
             ) as Box<dyn AsyncDatagram>)
@@ -1493,11 +1756,17 @@ impl YuubinsyaUdpDatagram {
         server: Endpoint,
         socks5_prefix: bool,
     ) -> Result<Self> {
-        let socket = tokio::net::UdpSocket::bind(address)
-            .await
-            .map_err(|error| {
-                Error::new(ErrorKind::Io, format!("bind Yuubinsya UDP client: {error}"))
-            })?;
+        Self::bind_with_interface(address, password_hash, server, socks5_prefix, None).await
+    }
+
+    pub async fn bind_with_interface(
+        address: SocketAddr,
+        password_hash: [u8; 32],
+        server: Endpoint,
+        socks5_prefix: bool,
+        bind_interface: Option<&str>,
+    ) -> Result<Self> {
+        let socket = bind_tokio_udp_socket(address, bind_interface, "Yuubinsya client").await?;
         Self::new(
             Box::new(TokioDatagram { socket }),
             password_hash,
@@ -1715,6 +1984,47 @@ mod tests {
                 .unwrap();
         assert_eq!(&buffer[..length], b"fixed-reply");
         assert_eq!(source, Endpoint::ip(Network::Udp, fixed));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_connector_applies_linux_network_interface() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || listener.accept().unwrap().0.peer_addr().unwrap());
+        let connector = DirectConnector {
+            timeout: Duration::from_secs(1),
+        };
+        let stream = connector
+            .connect_with_options(&Endpoint::ip(Network::Tcp, address), None, Some("lo"))
+            .unwrap();
+        assert_eq!(handle.join().unwrap(), stream.local_addr().unwrap());
+    }
+
+    #[cfg(all(feature = "async-proxy", target_os = "linux"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixed_async_proxy_applies_linux_network_interface_to_udp() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fixed = server.local_addr().unwrap();
+        let proxy = FixedAsyncProxy {
+            address: fixed,
+            timeout: Duration::from_secs(1),
+        };
+        let mut context = FlowContext::new(Endpoint::ip(Network::Udp, fixed));
+        context.bind_interface = Some("lo".to_owned());
+        let datagram = proxy.open_datagram(&context).await.unwrap();
+        datagram
+            .send_to(b"interface-udp", Endpoint::ip(Network::Udp, fixed))
+            .await
+            .unwrap();
+
+        let mut buffer = [0u8; 64];
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buffer[..length], b"interface-udp");
     }
 
     #[test]

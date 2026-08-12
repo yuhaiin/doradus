@@ -46,7 +46,7 @@ use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use yuhaiin_core::dns_resolver_async::{AsyncIpResolver, SystemAsyncIpResolver};
 use yuhaiin_core::proxy::{
-    AsyncDatagram, AsyncProxy, BoxAsyncStream, connect_tokio_tcp, stream_local_addr,
+    AsyncDatagram, AsyncProxy, BoxAsyncStream, connect_tokio_tcp_with_interface, stream_local_addr,
     with_stream_local_addr,
 };
 use yuhaiin_core::{
@@ -263,6 +263,16 @@ impl ChainClient {
         destination: Endpoint,
         local_bind_addresses: &[std::net::IpAddr],
     ) -> Result<Duration> {
+        self.ping_with_bind_and_interface(destination, local_bind_addresses, None)
+            .await
+    }
+
+    pub async fn ping_with_bind_and_interface(
+        &self,
+        destination: Endpoint,
+        local_bind_addresses: &[std::net::IpAddr],
+        bind_interface: Option<&str>,
+    ) -> Result<Duration> {
         self.ensure_open()?;
         if destination.network() != Network::Tcp {
             return Err(Error::invalid("Yuubinsya ping target must use tcp network"));
@@ -318,14 +328,18 @@ impl ChainClient {
 
         let Some(yuubinsya) = self.chain.yuubinsya.as_ref() else {
             let started = Instant::now();
-            let mut stream = self.open_h2_stream(local_bind_addresses).await?;
+            let mut stream = self
+                .open_h2_stream(local_bind_addresses, bind_interface)
+                .await?;
             stream
                 .shutdown()
                 .await
                 .map_err(|error| Error::new(ErrorKind::Closed, error.to_string()))?;
             return Ok(started.elapsed());
         };
-        let stream = self.open_h2_stream(local_bind_addresses).await?;
+        let stream = self
+            .open_h2_stream(local_bind_addresses, bind_interface)
+            .await?;
         let (session, elapsed) = tokio::time::timeout(
             Duration::from_secs(10),
             AsyncYuubinsyaPingSession::connect(
@@ -359,6 +373,16 @@ impl ChainClient {
         destination: Endpoint,
         local_bind_addresses: &[std::net::IpAddr],
     ) -> Result<AsyncYuubinsyaTcpSession<BoxAsyncStream>> {
+        self.connect_tcp_with_bind_and_interface(destination, local_bind_addresses, None)
+            .await
+    }
+
+    pub async fn connect_tcp_with_bind_and_interface(
+        &self,
+        destination: Endpoint,
+        local_bind_addresses: &[std::net::IpAddr],
+        bind_interface: Option<&str>,
+    ) -> Result<AsyncYuubinsyaTcpSession<BoxAsyncStream>> {
         self.ensure_open()?;
         if destination.network() != Network::Tcp {
             return Err(Error::invalid(
@@ -371,7 +395,9 @@ impl ChainClient {
                 "standalone HTTP/2 transport has no destination protocol",
             )
         })?;
-        let stream = self.open_h2_stream(local_bind_addresses).await?;
+        let stream = self
+            .open_h2_stream(local_bind_addresses, bind_interface)
+            .await?;
         AsyncYuubinsyaTcpSession::connect(
             stream,
             derive_salt(yuubinsya.password.as_bytes()),
@@ -388,13 +414,23 @@ impl ChainClient {
         &self,
         local_bind_addresses: &[std::net::IpAddr],
     ) -> Result<BoxAsyncStream> {
+        self.connect_raw_with_bind_and_interface(local_bind_addresses, None)
+            .await
+    }
+
+    pub async fn connect_raw_with_bind_and_interface(
+        &self,
+        local_bind_addresses: &[std::net::IpAddr],
+        bind_interface: Option<&str>,
+    ) -> Result<BoxAsyncStream> {
         if self.chain.yuubinsya.is_some() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "raw HTTP/2 transport requested from a Yuubinsya chain",
             ));
         }
-        self.open_h2_stream(local_bind_addresses).await
+        self.open_h2_stream(local_bind_addresses, bind_interface)
+            .await
     }
 
     /// Open a Yuubinsya UDP-over-TCP session. The first frame is the migrate
@@ -412,6 +448,16 @@ impl ChainClient {
         migrate_id: u64,
         local_bind_addresses: &[std::net::IpAddr],
     ) -> Result<AsyncYuubinsyaUotSession<BoxAsyncStream>> {
+        self.connect_uot_with_bind_and_interface(migrate_id, local_bind_addresses, None)
+            .await
+    }
+
+    pub async fn connect_uot_with_bind_and_interface(
+        &self,
+        migrate_id: u64,
+        local_bind_addresses: &[std::net::IpAddr],
+        bind_interface: Option<&str>,
+    ) -> Result<AsyncYuubinsyaUotSession<BoxAsyncStream>> {
         self.ensure_open()?;
         let yuubinsya = self.chain.yuubinsya.as_ref().ok_or_else(|| {
             Error::new(
@@ -425,7 +471,9 @@ impl ChainClient {
                 "chain does not enable yuubinsya udp_over_stream",
             ));
         }
-        let stream = self.open_h2_stream(local_bind_addresses).await?;
+        let stream = self
+            .open_h2_stream(local_bind_addresses, bind_interface)
+            .await?;
         AsyncYuubinsyaUotSession::connect(
             stream,
             derive_salt(yuubinsya.password.as_bytes()),
@@ -438,6 +486,7 @@ impl ChainClient {
     async fn open_h2_stream(
         &self,
         local_bind_addresses: &[std::net::IpAddr],
+        bind_interface: Option<&str>,
     ) -> Result<BoxAsyncStream> {
         self.ensure_open()?;
         let tls_identity = self.transport_identity();
@@ -448,7 +497,7 @@ impl ChainClient {
                 &addresses,
                 &tls_identity,
                 self.chain.http2.concurrency,
-                |address| self.open_h2_connection(address, local_bind_addresses),
+                |address| self.open_h2_connection(address, local_bind_addresses, bind_interface),
             )
             .await?;
         let (stream, local_addr) = stream;
@@ -510,13 +559,20 @@ impl ChainClient {
         &self,
         address: SocketAddr,
         local_bind_addresses: &[std::net::IpAddr],
+        bind_interface: Option<&str>,
     ) -> Result<Arc<H2Connection>> {
         let local_bind = local_bind_addresses
             .iter()
             .copied()
             .find(|ip| ip.is_ipv4() == address.ip().is_ipv4())
             .map(|ip| SocketAddr::new(ip, 0));
-        let stream = connect_tokio_tcp(address, local_bind, Duration::from_secs(15)).await?;
+        let stream = connect_tokio_tcp_with_interface(
+            address,
+            local_bind,
+            bind_interface,
+            Duration::from_secs(15),
+        )
+        .await?;
         let local_addr = stream.local_addr().ok();
         let mut stream: BoxAsyncStream = if self.chain.tls.servernames.is_empty() {
             Box::new(stream)
@@ -647,9 +703,10 @@ impl AsyncProxy for ChainProxy {
                 Box::pin(async move {
                     if client.chain.yuubinsya.is_some() {
                         let session = client
-                            .connect_tcp_with_bind(
+                            .connect_tcp_with_bind_and_interface(
                                 context.effective_destination(),
                                 &context.local_bind_addresses,
+                                context.bind_interface.as_deref(),
                             )
                             .await?;
                         let local_addr = stream_local_addr(session.transport());
@@ -659,7 +716,10 @@ impl AsyncProxy for ChainProxy {
                         ))
                     } else {
                         let stream = client
-                            .connect_raw_with_bind(&context.local_bind_addresses)
+                            .connect_raw_with_bind_and_interface(
+                                &context.local_bind_addresses,
+                                context.bind_interface.as_deref(),
+                            )
                             .await?;
                         Ok(stream)
                     }
@@ -679,11 +739,13 @@ impl AsyncProxy for ChainProxy {
                 let client = client.clone();
                 let migrate_id = Arc::clone(&context.udp_migrate_id);
                 let local_bind_addresses = Arc::new(context.local_bind_addresses.clone());
+                let bind_interface = context.bind_interface.clone();
                 Box::pin(async move {
                     let session = client
-                        .connect_uot_with_bind(
+                        .connect_uot_with_bind_and_interface(
                             migrate_id.load(Ordering::Acquire),
                             local_bind_addresses.as_slice(),
+                            bind_interface.as_deref(),
                         )
                         .await?;
                     let migrate = session.migrate_id;
@@ -706,6 +768,7 @@ impl AsyncProxy for ChainProxy {
                         next_retry_id: std::sync::atomic::AtomicU64::new(1),
                         retry: Mutex::new(RetryQueue::new()),
                         local_bind_addresses,
+                        bind_interface,
                         local_addr: StdMutex::new(local_addr),
                     }) as Box<dyn AsyncDatagram>)
                 })
@@ -735,9 +798,14 @@ impl AsyncProxy for ChainProxy {
                 let client = client.clone();
                 let destination = context.effective_destination();
                 let local_bind_addresses = context.local_bind_addresses.clone();
+                let bind_interface = context.bind_interface.clone();
                 Box::pin(async move {
                     client
-                        .ping_with_bind(destination, &local_bind_addresses)
+                        .ping_with_bind_and_interface(
+                            destination,
+                            &local_bind_addresses,
+                            bind_interface.as_deref(),
+                        )
                         .await
                 })
             }
@@ -758,6 +826,7 @@ struct ChainDatagram {
     next_retry_id: std::sync::atomic::AtomicU64,
     retry: Mutex<RetryQueue>,
     local_bind_addresses: Arc<Vec<std::net::IpAddr>>,
+    bind_interface: Option<String>,
     local_addr: StdMutex<Option<SocketAddr>>,
 }
 
@@ -1159,7 +1228,11 @@ impl ChainDatagram {
         // prevents a dead H2 stream from permanently wedging the flow.
         let replacement = self
             .client
-            .connect_uot_with_bind(migrate_id, self.local_bind_addresses.as_slice())
+            .connect_uot_with_bind_and_interface(
+                migrate_id,
+                self.local_bind_addresses.as_slice(),
+                self.bind_interface.as_deref(),
+            )
             .await?;
         let replacement_id = replacement.migrate_id;
         let udp_coalesce = replacement.udp_coalesce;

@@ -311,6 +311,11 @@ pub struct FlowContext {
     /// Keeping all addresses allows a dual-stack interface to select the
     /// family matching the actual upstream socket.
     pub local_bind_addresses: Vec<IpAddr>,
+    /// Optional operating-system interface to which outbound sockets should
+    /// be bound.  Source addresses remain useful as a portable fallback, but
+    /// Go's node-level `network_interface` is stronger than selecting an
+    /// address: on Linux it also constrains routing through `SO_BINDTODEVICE`.
+    pub bind_interface: Option<String>,
     /// Management-plane identity of the component that accepted the flow.
     /// These fields are optional so packet-only callers do not need a second
     /// DTO or synthetic values.
@@ -366,6 +371,7 @@ impl FlowContext {
             hosts: None,
             fake_ip: None,
             local_bind_addresses: Vec::new(),
+            bind_interface: None,
             component: None,
             inbound: None,
             inbound_name: None,

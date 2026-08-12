@@ -71,6 +71,29 @@ pub struct GoProxyRuntimeConfig {
     pub data_json: Vec<u8>,
 }
 
+impl GoProxyRuntimeConfig {
+    /// Return the node-level interface requested by Go's Direct/Fixed
+    /// contracts.  It is intentionally derived from the preserved layer JSON
+    /// instead of being added to the HTTP-facing runtime struct: unknown Go
+    /// fields remain lossless and the existing API shape stays unchanged.
+    pub fn network_interface(&self) -> Option<String> {
+        self.layers
+            .iter()
+            .filter(|layer| {
+                matches!(
+                    layer.kind.to_ascii_lowercase().as_str(),
+                    "direct" | "fixed" | "simple" | "fixedv2"
+                )
+            })
+            .find_map(|layer| network_interface_from_value(&layer.config))
+            .or_else(|| {
+                serde_json::from_slice::<Value>(&self.data_json)
+                    .ok()
+                    .and_then(|value| network_interface_from_value(&value))
+            })
+    }
+}
+
 impl GoNodeRecord {
     pub fn to_proxy_runtime_config(&self) -> Result<GoProxyRuntimeConfig> {
         let chain_types: Vec<String> =
@@ -165,6 +188,24 @@ fn redact_config(value: &Value) -> Value {
         Value::Array(values) => Value::Array(values.iter().map(redact_config).collect()),
         value => value.clone(),
     }
+}
+
+fn network_interface_from_value(value: &Value) -> Option<String> {
+    for key in ["network_interface", "networkInterface"] {
+        if let Some(interface) = value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|interface| !interface.is_empty())
+        {
+            return Some(interface.to_owned());
+        }
+    }
+
+    value
+        .get("addresses")
+        .and_then(Value::as_array)
+        .and_then(|addresses| addresses.iter().find_map(network_interface_from_value))
 }
 
 fn parse_proxy_transport(value: &str) -> GoProxyTransport {
