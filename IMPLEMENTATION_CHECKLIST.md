@@ -234,6 +234,14 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `make benchmark-tun-throughput` | release harness、privileged Podman、真实 kernel TUN、4 MiB 单流 | TUN→fixed→loopback 31.23 MiB/s、peak RSS 13,236 KiB；原始日志存 `~/.cache/yuhaiin-rust/benchmarks/tun-throughput` |
 | `make benchmark-wireguard-throughput` | release harness、`--network=none` | 64 MiB BoringTun packet baseline 588.64 MiB/s、peak RSS 3,460 KiB（单次同机趋势，不外推公网），结果存 `~/.cache/yuhaiin-rust/benchmarks/wireguard` |
 | `make api-reload-flow-smoke` | disposable Podman service | 普通 inbound/node/route reload、route reload 期间同一 HTTP CONNECT 隧道持续 echo，以及 TUN 配置持久化通过；TUN API 子用例不冒充 rootful device evidence |
+| `make api-reload-flow-smoke`（2026-08-12 当前轮） | `network=none` Podman、真实前台 runtime、复用 state 目录 | 普通 API mutation/reload 与 TUN inbound enable/disable/restart persistence 2/2 通过 |
+| `make api-contract-smoke`（2026-08-12 当前轮） | `network=none` Podman、真实前台 runtime | direct node latency 解析、嵌套路由 match history、前端管理 API round-trip 3/3 通过 |
+| `make node-latency-dns-smoke`（2026-08-12 当前轮） | `network=none` Podman、runtime API test binary | 选中 proxy datagram 的 domain latency/DNS probe 1/1 通过 |
+| `make go-live-flow-parity-smoke`（2026-08-12 当前轮） | Go/Rust 两个真实服务、HTTP inbound→router→HTTP outbound、Podman sidecar echo | Go/Rust live connections、total、traffic、history、telemetry 和 reload 后统计均通过 |
+| `make service-chain-smoke`（2026-08-12 当前轮） | Podman host-network、复用 runtime binary | 16/16 通过；另对 mixed UDP protocol outbound 做 5 次连续重复验证，5/5 通过 |
+| `make benchmark-throughput`（2026-08-12 当前轮，16 MiB） | release harness、Podman host network、单流 loopback | HTTP CONNECT 157.12 MiB/s、peak RSS 18,428 KiB；TLS/H2/Yuubinsya 51.66 MiB/s、peak RSS 20,232 KiB |
+| `make benchmark-tun-throughput`（2026-08-12 当前轮，4 MiB） | privileged Podman、真实 kernel TUN | TUN→fixed→loopback 30.98 MiB/s、peak RSS 13,192 KiB |
+| `make benchmark-wireguard-throughput`（2026-08-12 当前轮，16 MiB） | `--network=none` Podman、BoringTun userspace | BoringTun packet baseline 359.94 MiB/s、peak RSS 3,748 KiB；仅作为同机趋势基线 |
 | `make tun-api-process-smoke` | disposable Podman user/network namespace、真实 `/dev/net/tun`、前台 binary | API TUN disable/enable 后真实设备 visibility 通过；覆盖默认禁用 TUN 与新增启用 TUN 并存 |
 | `make maxmind-smoke` | 缓存真实 `Country-without-asn.mmdb`、Podman `--network=none` | 固定 SHA-256；IPv4 与 IPv4-mapped IPv6 查询通过 |
 | `make tun-ipv6-extension-smoke` | Podman `--network=none`、core test harness | Hop-by-Hop/Routing/后置 Destination Options 分片重组通过；已有 Fragment Header fail-closed |

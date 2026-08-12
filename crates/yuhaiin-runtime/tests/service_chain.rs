@@ -722,6 +722,10 @@ async fn run_protocol_outbound_chain(kind: ProtocolOutboundKind) {
 }
 
 async fn run_protocol_udp_outbound_chain(kind: ProtocolOutboundKind) {
+    eprintln!(
+        "starting protocol UDP outbound integration: {}",
+        kind.name()
+    );
     let expected_payload: &'static [u8] = match kind {
         ProtocolOutboundKind::Vless => b"runtime-vless-udp-outbound",
         ProtocolOutboundKind::VlessTlsWebsocket => b"runtime-vless-tls-websocket-udp-outbound",
@@ -755,20 +759,31 @@ async fn run_protocol_udp_outbound_chain(kind: ProtocolOutboundKind) {
     packet.extend_from_slice(expected_payload);
 
     let mut response = [0u8; 2048];
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    // The UDP listener and the first protocol session are both created after
+    // the API reload notification.  GitHub's shared runners can delay that
+    // reload, or the TLS/HTTP2 handshake, well beyond the local happy path.
+    // Keep retransmits bounded so a slow runner does not turn one flow into a
+    // burst of concurrent outbound sessions, while leaving enough time for
+    // the real end-to-end path to settle.
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    let mut next_send = std::time::Instant::now();
     let mut received = None;
     while std::time::Instant::now() < deadline {
-        client.send_to(&packet, inbound).await.unwrap();
-        if let Ok(Ok(result)) =
-            tokio::time::timeout(Duration::from_millis(50), client.recv_from(&mut response)).await
-        {
+        if std::time::Instant::now() >= next_send {
+            client.send_to(&packet, inbound).await.unwrap();
+            next_send = std::time::Instant::now() + Duration::from_millis(250);
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let wait = remaining.min(Duration::from_millis(250));
+        if let Ok(Ok(result)) = tokio::time::timeout(wait, client.recv_from(&mut response)).await {
             received = Some(result);
             break;
         }
     }
     let (length, _) = received.unwrap_or_else(|| {
         panic!(
-            "protocol UDP inbound timed out; diagnostics={}",
+            "protocol UDP inbound timed out for {}; inbound={inbound}; outbound={protocol_server}; diagnostics={}",
+            kind.name(),
             service.diagnostics()
         )
     });

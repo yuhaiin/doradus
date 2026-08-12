@@ -4002,3 +4002,33 @@ cargo build --locked --offline --release --target <target> -p yuhaiin-runtime --
 仍由 workflow 对应的 macOS/Windows runner 负责最终原生链接，Linux 容器不把 GNU 交叉检查冒充为
 MSVC 或 Apple SDK 验证。构建缓存和下载的 toolchain 均位于 `~/.cache/yuhaiin-rust`，验证后删除了
 本轮专用的 `ci-crosscheck` target，避免长期占用磁盘。
+
+## 144. 2026-08-12 控制面/数据面端到端回归与吞吐基线
+
+本轮重新使用可复用的 Podman fixture 验证替换目标，而不是只运行 crate 单元测试：
+
+- `make service-chain-smoke` 通过 16/16，覆盖 SOCKS5、HTTP、TLS/HTTP2、Yuubinsya inbound，
+  以及 HTTP、SOCKS5、TLS/HTTP2/Yuubinsya、VLESS、VMess、Trojan outbound；另对 mixed UDP
+  protocol chain 连续运行 5 次，5/5 通过。
+- `make go-live-flow-parity-smoke` 通过 Go/Rust 两个真实服务的 HTTP inbound → router → HTTP
+  outbound 流程，并比较 live connections、total、traffic、history、telemetry；共享的 SQLite
+  reload 后统计也通过。`make api-contract-smoke` 通过 3/3，`make api-reload-flow-smoke`
+  通过 2/2，`make node-latency-dns-smoke` 通过 1/1。
+
+本轮 release harness 的单流 loopback 基线（运行在 Podman，不能外推为公网性能）如下：
+
+| 场景 | 数据量 | 吞吐 | 峰值 RSS |
+| --- | ---: | ---: | ---: |
+| HTTP inbound → HTTP CONNECT outbound | 16 MiB | 157.12 MiB/s | 18,428 KiB |
+| HTTP inbound → TLS → HTTP/2 → Yuubinsya | 16 MiB | 51.66 MiB/s | 20,232 KiB |
+| TUN inbound → fixed outbound → loopback | 4 MiB | 30.98 MiB/s | 13,192 KiB |
+| BoringTun userspace packet baseline | 16 MiB | 359.94 MiB/s | 3,748 KiB |
+
+为了避免慢 runner 上 UDP 首包丢失时创建并发 session，`service_chain` 的真实 UDP outbound
+回归改为有界的 12 秒窗口、250ms 重传节奏，并把协议名和 endpoint 写入超时诊断；它仍然验证
+真实 listener/router/outbound，而不是放宽错误断言。所有结果和日志位于
+`~/.cache/yuhaiin-rust`。
+
+本轮构建并发结束后运行仓库自带 `cache-prune`，清理 0 个过期 integration 目录和可重建的
+`cargo-target/debug` 依赖目录，保留 debug binary、release 产物、Cargo registry 和可复用
+fixture；缓存从约 23G 降至约 16G，没有使用 `/tmp`。
