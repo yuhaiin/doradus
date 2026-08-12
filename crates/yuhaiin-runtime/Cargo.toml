@@ -56,6 +56,8 @@ yuhaiin-geo = { path = "../yuhaiin-geo" }
 yuhaiin-protocol = { path = "../yuhaiin-protocol" }
 yuhaiin-store = { path = "../yuhaiin-store", features = ["async-dns"] }
 yuhaiin-trie = { path = "../yuhaiin-trie", features = ["async-proxy"] }
+yuhaiin-wireguard = { path = "../yuhaiin-wireguard" }
+yuhaiin-platform = { path = "../yuhaiin-platform" }
 
 [lints]
 workspace = true

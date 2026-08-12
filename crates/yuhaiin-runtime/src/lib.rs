@@ -48,9 +48,9 @@ use yuhaiin_core::{
 use yuhaiin_geo::{GeoDatabaseManager, GeoMetadata};
 use yuhaiin_store::fakeip::{FakeIpPool, FakeIpPoolOptions, FakeIpV6Pool};
 use yuhaiin_store::{
-    ConfigStore, FakeIpPools, FakeIpResolver, GoProxyRuntimeConfig, GoResolverRuntimeConfig,
-    GoRouteRuleRecord, GoRouteRuntimeConfig, InboundSettings, MaxMindMetadataRecord,
-    NatConfigRecord,
+    ConfigRepository, ConfigStore, FakeIpPolicy, FakeIpPools, FakeIpResolver, GoProxyRuntimeConfig,
+    GoResolverRuntimeConfig, GoRouteRuleRecord, GoRouteRuntimeConfig, InboundSettings,
+    MaxMindMetadataRecord, NatConfigRecord,
 };
 use yuhaiin_trie::router::{RouteDecision, RouterRuntime};
 
@@ -335,10 +335,15 @@ impl RuntimeBuilder {
             .transpose()?
             .map(|database| database as Arc<dyn GeoLookup>);
 
-        let fakeip_config = match repository.load_go_fakeip_runtime_config().await? {
+        // A Rust/API overlay is authoritative when present. This matters
+        // for a Go database: the compatibility `dns_settings` row remains
+        // readable, but a frontend FakeDNS update is persisted under
+        // `resolver.fakedns` and must take effect after reload.
+        let fakeip_config = match load_fakeip_config(&self.store).await? {
             Some(config) => Some(config),
-            None => load_fakeip_config(&self.store).await?,
+            None => repository.load_go_fakeip_runtime_config().await?,
         };
+        let fakeip_policy = load_fakeip_policy(&self.store, &repository).await?;
         let fakeip = match fakeip_config {
             Some(config) if config.enabled => {
                 let options = self.options.fakeip_options;
@@ -367,6 +372,7 @@ impl RuntimeBuilder {
             &hosts,
             fakeip.as_ref(),
             self.options.fakeip_skip_check_upstream,
+            &fakeip_policy,
             settings.ipv6,
         );
         let dns_resolver = wrap_resolver(
@@ -374,6 +380,7 @@ impl RuntimeBuilder {
             &hosts,
             None,
             self.options.fakeip_skip_check_upstream,
+            &fakeip_policy,
             settings.ipv6,
         );
         let mut resolver_by_id = BTreeMap::new();
@@ -388,6 +395,7 @@ impl RuntimeBuilder {
                             &hosts,
                             fakeip.as_ref(),
                             self.options.fakeip_skip_check_upstream,
+                            &fakeip_policy,
                             settings.ipv6,
                         );
                         let wrapped = if self.options.resolver_query_fallback {
@@ -448,13 +456,15 @@ fn wrap_resolver(
     hosts: &HostsTable,
     fakeip: Option<&FakeIpPools>,
     skip_check_upstream: bool,
+    fakeip_policy: &FakeIpPolicy,
     ipv6_enabled: bool,
 ) -> Arc<dyn AsyncIpResolver> {
     let upstream = match fakeip {
-        Some(pools) => Arc::new(FakeIpResolver::new(
+        Some(pools) => Arc::new(FakeIpResolver::new_with_policy(
             upstream,
             pools.clone(),
             skip_check_upstream,
+            fakeip_policy.clone(),
         )) as Arc<dyn AsyncIpResolver>,
         None => upstream,
     };
@@ -581,6 +591,68 @@ async fn load_fakeip_config(
     record.to_fakeip_runtime_config().map(Some)
 }
 
+async fn load_fakeip_policy(
+    store: &ConfigStore,
+    repository: &ConfigRepository,
+) -> Result<FakeIpPolicy> {
+    if let Some(bytes) = store.get_config("resolver.fakedns").await? {
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("resolver.fakedns is invalid JSON: {error}"),
+            )
+        })?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| Error::invalid("resolver.fakedns must be a JSON object"))?;
+        let whitelist = parse_fakeip_list(object, &["whitelist"], "whitelist")?;
+        let skip_check = parse_fakeip_list(
+            object,
+            &["skipCheckList", "skip_check_list"],
+            "skipCheckList",
+        )?;
+        if whitelist.is_some() || skip_check.is_some() {
+            return FakeIpPolicy::from_lists(
+                whitelist.as_deref().unwrap_or_default(),
+                skip_check.as_deref().unwrap_or_default(),
+            );
+        }
+    }
+
+    let mut whitelist = Vec::new();
+    let mut skip_check = Vec::new();
+    for record in repository.list_go_dns_fakedns_lists().await? {
+        match record.kind.as_str() {
+            "whitelist" => whitelist.push(record.value),
+            "skip_check" => skip_check.push(record.value),
+            _ => {}
+        }
+    }
+    FakeIpPolicy::from_lists(&whitelist, &skip_check)
+}
+
+fn parse_fakeip_list(
+    object: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+    field: &str,
+) -> Result<Option<Vec<String>>> {
+    let Some(value) = keys.iter().find_map(|key| object.get(*key)) else {
+        return Ok(None);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| Error::invalid(format!("resolver.fakedns.{field} must be an array")))?;
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                Error::invalid(format!("resolver.fakedns.{field} entries must be strings"))
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,6 +687,48 @@ mod tests {
         assert_eq!(entries[0].1, DomainName::new("example.test").unwrap());
         assert_eq!(entries[1].1, DomainName::new("alias.example.test").unwrap());
         assert_eq!(entries[2].0, "2001:db8::10".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn fakeip_policy_loads_json_lists_with_go_field_names() {
+        let store = block_on(ConfigStore::open_memory()).unwrap();
+        block_on(store.put_config(
+            "resolver.fakedns",
+            br#"{"enabled":true,"whitelist":["example.com"],"skipCheckList":["*.skip.example.com"]}"#,
+        ))
+        .unwrap();
+
+        let policy = block_on(load_fakeip_policy(&store, &store.repository())).unwrap();
+        assert!(policy.is_whitelisted(&DomainName::new("api.example.com").unwrap()));
+        assert!(policy.is_skip_check(&DomainName::new("one.skip.example.com").unwrap()));
+        assert!(!policy.is_skip_check(&DomainName::new("deep.two.skip.example.com").unwrap()));
+    }
+
+    #[test]
+    fn fakeip_json_overlay_controls_runtime_enablement_over_legacy_settings() {
+        let store = block_on(ConfigStore::open_memory()).unwrap();
+        block_on(store.put_config(
+            "resolver.fakedns",
+            br#"{"enabled":true,"ipv4Range":"198.18.10.0/30","ipv6Range":"fc00:10::/126","whitelist":[],"skipCheckList":[]}"#,
+        ))
+        .unwrap();
+
+        let snapshot = block_on(
+            RuntimeBuilder::new(
+                store,
+                Arc::new(StaticResolver {
+                    address: Ipv4Addr::new(192, 0, 2, 55),
+                }),
+            )
+            .build(),
+        )
+        .unwrap();
+        let resolved = block_on(snapshot.resolver.resolve(
+            &DomainName::new("overlay.example.com").unwrap(),
+            ResolveStrategy::OnlyIpv4,
+        ))
+        .unwrap();
+        assert_eq!(resolved.v4, vec![Ipv4Addr::new(198, 18, 10, 0)]);
     }
 
     #[test]

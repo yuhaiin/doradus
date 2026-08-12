@@ -6,6 +6,9 @@ cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/stats-concurrency}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+reader_count="${YUHAIIN_STATS_READER_COUNT:-8}"
+reader_rounds="${YUHAIIN_STATS_READER_ROUNDS:-40}"
+write_rounds="${YUHAIIN_STATS_WRITE_ROUNDS:-64}"
 
 mkdir -p "${scenario_dir}"
 
@@ -42,6 +45,9 @@ podman run --rm \
   -v "${test_binary}:/usr/local/bin/yuhaiin-stats-test:ro" \
   -v "${runtime_binary}:/usr/local/bin/yuhaiin:ro" \
   -e YUHAIIN_RUNTIME_BIN=/usr/local/bin/yuhaiin \
+  -e YUHAIIN_STATS_READER_COUNT="${reader_count}" \
+  -e YUHAIIN_STATS_READER_ROUNDS="${reader_rounds}" \
+  -e YUHAIIN_STATS_WRITE_ROUNDS="${write_rounds}" \
   --entrypoint /bin/sh \
   "${image}" \
   -ec '
@@ -52,4 +58,5 @@ podman run --rm \
   | tee "${scenario_dir}/podman.log"
 
 grep -q 'test result: ok' "${scenario_dir}/podman.log"
+echo "[stats-concurrency] pressure: readers=${reader_count}, reader-rounds=${reader_rounds}, write-rounds=${write_rounds}"
 echo "[stats-concurrency] passed; logs=${scenario_dir}"

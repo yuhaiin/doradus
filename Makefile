@@ -42,7 +42,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-mtu-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke socks5-protocol-smoke node-latency-dns-smoke stats-concurrency-smoke startup-logs-smoke workspace-tests \
+.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-udp-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-reset-reconnect-smoke tun-mtu-smoke tun-ipv6-extension-smoke tun-route-matrix-smoke tun-api-process-smoke wireguard-smoke maxmind-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke go-protocol-interop-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput benchmark-wireguard-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke socks5-protocol-smoke node-latency-dns-smoke stats-concurrency-smoke stats-soak-smoke startup-logs-smoke workspace-tests \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -59,24 +59,34 @@ help:
 		'make build-tun-service-smoke build the runtime-owned TUN smoke binary' \
 		'make tun-service-smoke run the runtime-owned TUN lifecycle and echo smoke' \
 		'make tun-long-service-smoke run a 1 MiB content-checked runtime-owned TUN stream' \
+		'make tun-udp-service-smoke run direct fixed UDP traffic through the runtime-owned TUN' \
 		'make tun-chain-service-smoke run TUN inbound -> TLS + HTTP/2 + Yuubinsya chain smoke' \
 		'make tun-connection-metadata-smoke verify live TUN connection metadata during a chain' \
 		'make tun-reload-smoke verify persisted TUN disable/enable and same-device recreation' \
 		'make tun-reload-traffic-smoke verify TUN traffic after disable/enable reload' \
+		'make tun-reset-reconnect-smoke verify TUN TCP RST cleanup and reconnect traffic' \
 		'make tun-mtu-smoke run the runtime-owned TUN MTU boundary matrix' \
+		'make tun-ipv6-extension-smoke run IPv6 extension-header fragmentation tests in Podman' \
+		'make tun-route-matrix-smoke run rootful TUN multi-route and force-stop lease smoke' \
+		'make tun-api-process-smoke verify the foreground binary TUN API toggle against /dev/net/tun' \
+		'make wireguard-smoke run BoringTun userspace two-peer smoke in Podman' \
+		'make maxmind-smoke    download/cache and query the real Country-without-asn.mmdb in Podman' \
 		'make transparent-service-smoke run REDIRECT TCP smoke; rootless Podman records TPROXY skip' \
 		'make systemd-service-smoke run install/rollback/health smoke in disposable systemd Podman' \
 		'make api-contract-smoke run the frontend management API process contract in Podman' \
 		'make api-reload-flow-smoke verify mutation reloads the real data plane and survives restart' \
 		'make go-api-parity-smoke compare read and core mutation API responses against a Go state snapshot' \
 		'make go-live-flow-parity-smoke compare Go/Rust live inbound-router-outbound connections and statistics' \
+		'make go-protocol-interop-smoke run Go Yuubinsya/WS-H2/H2/VLESS/VMess/Trojan interop in Podman' \
 		'make refact-user-parity-smoke compare users CRUD against the Go refact-user branch' \
 		'make production-parity-smoke compare several stopped production SQLite snapshots' \
 		'make legacy-v1-runtime-smoke build a runtime snapshot from a copied Go v1 state.db' \
 		'make go-rust-stats-smoke run concurrent Go/Rust SQLite statistics smoke in Podman' \
+		'make stats-soak-smoke run extended connections/traffic/history lock-pressure smoke in Podman' \
 		'make service-chain-smoke run inbound/router/outbound protocol chains in Podman' \
 		'make benchmark-throughput run the release inbound/router/outbound throughput benchmark in Podman' \
 		'make benchmark-tun-throughput run the privileged TUN packet throughput benchmark in Podman' \
+		'make benchmark-wireguard-throughput run the BoringTun packet benchmark in Podman' \
 		'make dns-source-smoke   run UDP/TCP resolver source-bind smoke in Podman' \
 		'make doh-source-smoke   run DoH/DoT source-bind smoke in Podman' \
 		'make socks5-udp-associate-smoke run real SOCKS5 UDP chain smoke in Podman' \
@@ -134,6 +144,9 @@ tun-service-smoke:
 tun-long-service-smoke:
 	YUHAIIN_TUN_TRAFFIC_BYTES=$${YUHAIIN_TUN_TRAFFIC_BYTES:-1048576} ./scripts/integration/tun-service.sh
 
+tun-udp-service-smoke:
+	YUHAIIN_TUN_UDP_TRAFFIC=1 YUHAIIN_TUN_TRAFFIC=1 ./scripts/integration/tun-service.sh
+
 tun-chain-service-smoke:
 	./scripts/integration/tun-chain-service.sh
 
@@ -146,8 +159,26 @@ tun-reload-smoke:
 tun-reload-traffic-smoke:
 	YUHAIIN_TUN_RELOAD=1 ./scripts/integration/tun-service.sh
 
+tun-reset-reconnect-smoke:
+	YUHAIIN_TUN_RESET_RECONNECT=1 ./scripts/integration/tun-service.sh
+
 tun-mtu-smoke:
 	./scripts/integration/tun-mtu.sh
+
+tun-ipv6-extension-smoke:
+	./scripts/integration/tun-ipv6-extension.sh
+
+tun-route-matrix-smoke:
+	./scripts/integration/tun-route-matrix.sh
+
+tun-api-process-smoke:
+	./scripts/integration/tun-api-process.sh
+
+wireguard-smoke:
+	./scripts/integration/wireguard.sh
+
+maxmind-smoke:
+	./scripts/integration/maxmind.sh
 
 build-transparent-service-smoke:
 	$(CARGO) build $(CARGO_COMMON_ARGS) -p $(RUNTIME_PACKAGE) --bin transparent-service-smoke --all-features
@@ -170,6 +201,9 @@ go-api-parity-smoke:
 
 go-live-flow-parity-smoke:
 	./scripts/integration/go-live-flow-parity.sh
+
+go-protocol-interop-smoke:
+	./scripts/integration/go-protocol-interop.sh
 
 refact-user-parity-smoke:
 	./scripts/integration/refact-user-parity.sh
@@ -197,6 +231,9 @@ benchmark-throughput:
 benchmark-tun-throughput:
 	./scripts/benchmark/tun-throughput.sh
 
+benchmark-wireguard-throughput:
+	./scripts/benchmark/wireguard.sh
+
 dns-source-smoke:
 	./scripts/integration/dns-source-bind.sh
 
@@ -213,6 +250,12 @@ node-latency-dns-smoke:
 	./scripts/integration/node-latency-dns.sh
 
 stats-concurrency-smoke:
+	./scripts/integration/stats-concurrency.sh
+
+stats-soak-smoke:
+	YUHAIIN_STATS_READER_COUNT=$${YUHAIIN_STATS_READER_COUNT:-12} \
+	YUHAIIN_STATS_READER_ROUNDS=$${YUHAIIN_STATS_READER_ROUNDS:-160} \
+	YUHAIIN_STATS_WRITE_ROUNDS=$${YUHAIIN_STATS_WRITE_ROUNDS:-256} \
 	./scripts/integration/stats-concurrency.sh
 
 startup-logs-smoke:

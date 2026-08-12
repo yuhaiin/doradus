@@ -73,11 +73,17 @@ where
         context.protocol = Some("http".to_owned());
         spec.annotate_context(&mut context);
         selector.route_context(&mut context);
+        let process = context.process.clone();
         let proxy = selector.select(&context);
         let outbound = match proxy.connect(&context).await {
             Ok(outbound) => outbound,
             Err(error) => {
-                monitor.record_failure("http", &destination.to_string(), &error.to_string());
+                monitor.record_failure_with_process(
+                    "http",
+                    &destination.to_string(),
+                    &error.to_string(),
+                    process.as_deref(),
+                );
                 return Err(error);
             }
         };
@@ -111,10 +117,16 @@ where
     context.http_host = yuhaiin_core::sniff::http_host(headers.as_bytes());
     spec.annotate_context(&mut context);
     selector.route_context(&mut context);
+    let process = context.process.clone();
     let outbound = match selector.select(&context).connect(&context).await {
         Ok(outbound) => outbound,
         Err(error) => {
-            monitor.record_failure("http", &destination.to_string(), &error.to_string());
+            monitor.record_failure_with_process(
+                "http",
+                &destination.to_string(),
+                &error.to_string(),
+                process.as_deref(),
+            );
             return Err(error);
         }
     };

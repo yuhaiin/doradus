@@ -90,6 +90,21 @@ impl RuntimeController {
         Ok(())
     }
 
+    /// Prepare every live selector for deletion of a node. The selected node
+    /// is closed immediately, then its selector roles are changed to the
+    /// built-in fallbacks so the following store mutation can reload the
+    /// runtime without referring to a row that no longer exists.
+    pub async fn retarget_node_to_direct(&self, id: &str) -> Result<()> {
+        if id.trim().is_empty() {
+            return Ok(());
+        }
+        let _guard = self.reload_lock.lock().await;
+        for selector in self.live_selectors() {
+            selector.retarget_node_to_direct(id).await;
+        }
+        Ok(())
+    }
+
     pub fn subscribe_reload(&self) -> tokio::sync::broadcast::Receiver<()> {
         self.reload_events.subscribe()
     }

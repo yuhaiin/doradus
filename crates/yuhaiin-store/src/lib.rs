@@ -47,7 +47,7 @@ pub use compat_runtime::{
     GoUdpProxyFqdnStrategy,
 };
 #[cfg(feature = "async-dns")]
-pub use resolver::{FakeIpPools, FakeIpResolver};
+pub use resolver::{FakeIpPolicy, FakeIpPools, FakeIpResolver};
 pub use statistics::{
     GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsSnapshot,
     GoTelemetryBucketRecord, GoTrafficBucketRecord, TELEMETRY_DAILY_BUCKET_SECONDS,

@@ -147,6 +147,21 @@ fn ipv6_fragment_reassembler_reassembles_out_of_order_udp() {
 }
 
 #[test]
+fn reassembled_ipv6_datagram_may_exceed_the_wire_mtu() {
+    let packet = ipv6_udp_packet(
+        Ipv6Addr::LOCALHOST,
+        Ipv6Addr::LOCALHOST,
+        41000,
+        5353,
+        &[0xa5; 2000],
+    );
+    let device = SmoltcpTunDevice::new(1280, 2).unwrap();
+    assert!(packet.len() > device.mtu());
+    assert!(device.enqueue_rx_reassembled(packet).unwrap());
+    assert_eq!(device.queued_rx().unwrap(), 1);
+}
+
+#[test]
 fn ipv6_fragment_reassembler_drops_overlap_and_expires_assemblies() {
     let whole = ipv6_udp_packet(
         Ipv6Addr::LOCALHOST,
@@ -227,6 +242,30 @@ fn ipv6_udp_packet(
     packet
 }
 
+fn ipv6_udp_packet_with_hbh_routing_and_destination(payload: &[u8]) -> Vec<u8> {
+    let mut packet = vec![0; 40 + 8 + 8 + 8 + 8 + payload.len()];
+    packet[0] = 0x60;
+    let payload_len = (packet.len() - 40) as u16;
+    packet[4..6].copy_from_slice(&payload_len.to_be_bytes());
+    packet[6] = 0; // Hop-by-Hop Options
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+    packet[24..40].copy_from_slice(&"2001:db8::2".parse::<Ipv6Addr>().unwrap().octets());
+
+    packet[40] = 43; // Hop-by-Hop -> Routing
+    packet[41] = 0; // eight bytes
+    packet[48] = 60; // Routing -> Destination Options
+    packet[49] = 0; // eight bytes
+    packet[56] = 17; // Destination Options -> UDP
+    packet[57] = 0; // eight bytes
+    packet[64..66].copy_from_slice(&41000u16.to_be_bytes());
+    packet[66..68].copy_from_slice(&5353u16.to_be_bytes());
+    packet[68..70].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    packet[70..72].copy_from_slice(&0u16.to_be_bytes());
+    packet[72..].copy_from_slice(payload);
+    packet
+}
+
 fn ipv6_fragment(
     packet: &[u8],
     payload_offset: usize,
@@ -247,11 +286,11 @@ fn ipv6_fragment(
 }
 
 #[test]
-fn tx_token_drops_packets_larger_than_mtu() {
+fn tx_token_accepts_a_complete_datagram_before_tun_fragmentation() {
     let mut device = SmoltcpTunDevice::new(576, 2).unwrap();
     let token = phy::Device::transmit(&mut device, Instant::from_millis(0)).unwrap();
     phy::TxToken::consume(token, 577, |_| ());
-    assert_eq!(device.queued_tx().unwrap(), 0);
+    assert_eq!(device.queued_tx().unwrap(), 1);
 }
 
 #[test]
@@ -264,6 +303,17 @@ fn config_rejects_invalid_mtu_and_queue() {
     config.mtu = DEFAULT_MTU;
     config.queue_capacity = 0;
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn config_rejects_an_ipv6_mtu_below_the_protocol_minimum() {
+    let config = TunConfig {
+        mtu: 576,
+        ipv6: vec![(Ipv6Addr::LOCALHOST, 128)],
+        ..TunConfig::default()
+    };
+    let error = config.validate().unwrap_err();
+    assert!(error.message.contains("at least 1280"));
 }
 
 #[cfg(unix)]
@@ -486,6 +536,158 @@ fn udp_socket_round_trips_through_smoltcp_ip_device() {
 }
 
 #[test]
+fn udp_socket_fragments_a_large_datagram_to_the_tun_mtu() {
+    let local = Ipv4Address::new(198, 18, 0, 1);
+    let remote = Ipv4Address::new(198, 18, 0, 2);
+    let mut device = SmoltcpTunDevice::new(576, 64).unwrap();
+    let mut interface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(IpAddress::Ipv4(local), 15))
+            .unwrap();
+    });
+
+    let rx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 1], vec![0; 1]);
+    let tx_buffer =
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 2], vec![0; 8 * 1024 + 64]);
+    let mut sockets = SocketSet::new(vec![]);
+    let handle = sockets.add(udp::Socket::new(rx_buffer, tx_buffer));
+    sockets.get_mut::<udp::Socket>(handle).bind(18080).unwrap();
+
+    let payload: Vec<u8> = (0..8192).map(|offset| (offset % 251) as u8).collect();
+    sockets
+        .get_mut::<udp::Socket>(handle)
+        .send_slice(&payload, IpEndpoint::new(IpAddress::Ipv4(remote), 41000))
+        .unwrap();
+
+    interface.poll(Instant::from_millis(1), &mut device, &mut sockets);
+    let whole = device
+        .take_tx()
+        .unwrap()
+        .expect("smoltcp emitted a datagram");
+    assert!(whole.len() > 576);
+    let packets = fragment_ip_packet(&whole, 576, 0x1234).unwrap();
+    assert!(packets.len() > 2, "large datagram was not fragmented");
+    let mut reassembled = vec![0u8; 8 + payload.len()];
+    let mut identification = None;
+    for packet in &packets {
+        assert!(packet.len() <= 576);
+        let ip = Ipv4Packet::new_checked(packet).unwrap();
+        assert_eq!(ip.src_addr(), local);
+        assert_eq!(ip.dst_addr(), remote);
+        assert_eq!(ip.next_header(), IpProtocol::Udp);
+        identification.get_or_insert(ip.ident());
+        assert_eq!(identification, Some(ip.ident()));
+        let offset = ip.frag_offset() as usize;
+        reassembled[offset..offset + ip.payload().len()].copy_from_slice(ip.payload());
+    }
+    assert_eq!(&reassembled[8..], payload.as_slice());
+}
+
+#[test]
+fn ipv6_large_datagram_is_fragmented_at_the_tun_boundary() {
+    let payload: Vec<u8> = (0..8192).map(|offset| (offset % 251) as u8).collect();
+    let whole = ipv6_udp_packet(
+        Ipv6Addr::LOCALHOST,
+        "2001:db8::2".parse().unwrap(),
+        41000,
+        5353,
+        &payload,
+    );
+    let packets = fragment_ip_packet(&whole, 576, 0x0102_0304).unwrap();
+    assert!(packets.len() > 2);
+
+    let mut reassembled = vec![0u8; whole.len() - 40];
+    let mut identification = None;
+    for packet in &packets {
+        assert!(packet.len() <= 576);
+        let ip = Ipv6Packet::new_checked(packet).unwrap();
+        assert_eq!(ip.next_header(), IpProtocol::Ipv6Frag);
+        assert_eq!(packet[40], 17);
+        let fragment_id = u32::from_be_bytes(packet[44..48].try_into().unwrap());
+        identification.get_or_insert(fragment_id);
+        assert_eq!(identification, Some(0x0102_0304));
+        let offset_and_flags = u16::from_be_bytes([packet[42], packet[43]]);
+        let offset = usize::from(offset_and_flags >> 3) * 8;
+        let fragment_payload = &packet[48..];
+        reassembled[offset..offset + fragment_payload.len()].copy_from_slice(fragment_payload);
+        if offset + fragment_payload.len() == reassembled.len() {
+            assert_eq!(offset_and_flags & 1, 0);
+        } else {
+            assert_ne!(offset_and_flags & 1, 0);
+        }
+    }
+
+    let mut restored = whole[..40].to_vec();
+    restored[4..6].copy_from_slice(&((whole.len() - 40) as u16).to_be_bytes());
+    restored[6] = 17;
+    restored.extend_from_slice(&reassembled);
+    assert_eq!(restored, whole);
+}
+
+#[test]
+fn ipv6_extension_headers_are_split_at_the_wire_boundary() {
+    let payload: Vec<u8> = (0..8192).map(|offset| (offset % 251) as u8).collect();
+    let whole = ipv6_udp_packet_with_hbh_routing_and_destination(&payload);
+    let packets = fragment_ip_packet(&whole, 576, 0x0a0b_0c0d).unwrap();
+    assert!(packets.len() > 2);
+
+    // IPv6 + Hop-by-Hop + Routing are unfragmentable and occur in every
+    // fragment. The Destination Options header after Routing is the first
+    // byte of the fragmentable part and is therefore reconstructed with it.
+    let prefix_len = 40 + 8 + 8;
+    let fragmentable_len = whole.len() - prefix_len;
+    let mut reassembled = vec![0u8; fragmentable_len];
+    let mut saw_first = false;
+    for packet in &packets {
+        assert!(packet.len() <= 576);
+        assert_eq!(packet[6], 0); // Hop-by-Hop
+        assert_eq!(packet[40], 43); // Routing
+        assert_eq!(packet[48], 44); // Fragment Header
+        assert_eq!(packet[56], 60); // Destination Options follows Fragment
+        let fragment_id = u32::from_be_bytes(packet[60..64].try_into().unwrap());
+        assert_eq!(fragment_id, 0x0a0b_0c0d);
+
+        let offset_and_flags = u16::from_be_bytes([packet[58], packet[59]]);
+        let offset = usize::from(offset_and_flags >> 3) * 8;
+        let fragment_payload = &packet[64..];
+        if offset == 0 {
+            saw_first = true;
+        }
+        reassembled[offset..offset + fragment_payload.len()].copy_from_slice(fragment_payload);
+        if offset + fragment_payload.len() == reassembled.len() {
+            assert_eq!(offset_and_flags & 1, 0);
+        } else {
+            assert_ne!(offset_and_flags & 1, 0);
+        }
+    }
+    assert!(saw_first);
+
+    let mut restored = whole[..prefix_len].to_vec();
+    restored[48] = 60;
+    restored.extend_from_slice(&reassembled);
+    assert_eq!(restored, whole);
+}
+
+#[test]
+fn ipv6_output_fragmentation_rejects_an_existing_fragment_header() {
+    let whole = ipv6_udp_packet(
+        Ipv6Addr::LOCALHOST,
+        "2001:db8::2".parse().unwrap(),
+        41000,
+        5353,
+        &[0xa5; 1024],
+    );
+    let existing = ipv6_fragment(&whole, 0, true, 1024, 0x0102_0304);
+    let error = fragment_ip_packet(&existing, 576, 0x0506_0708).unwrap_err();
+    assert!(error.to_string().contains("already-fragmented"));
+}
+
+#[test]
 fn tcp_listener_accepts_syn_and_emits_syn_ack() {
     let local = Ipv4Address::new(10, 0, 0, 1);
     let remote = Ipv4Address::new(10, 0, 0, 2);
@@ -662,6 +864,61 @@ fn dispatcher_emits_udp_flow_and_writes_response_back_to_tun() {
     let ip = Ipv4Packet::new_checked(&response).unwrap();
     let udp = UdpPacket::new_checked(ip.payload()).unwrap();
     assert_eq!(udp.src_port(), 5353);
+    assert_eq!(udp.dst_port(), 41000);
+    assert_eq!(udp.payload(), b"reply");
+}
+
+#[test]
+fn dispatcher_udp_routed_destination_preserves_virtual_source_address() {
+    let portal = Ipv4Address::new(198, 18, 0, 1);
+    let virtual_destination = Ipv4Address::new(198, 18, 0, 2);
+    let remote = Ipv4Address::new(198, 18, 0, 3);
+    let mut device = SmoltcpTunDevice::new(1500, 8).unwrap();
+    let mut interface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    interface.set_any_ip(true);
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(IpAddress::Ipv4(virtual_destination), 15))
+            .unwrap();
+        addresses
+            .push(IpCidr::new(IpAddress::Ipv4(portal), 15))
+            .unwrap();
+    });
+    let mut dispatcher = TunDispatcher::new(2048, 2048, 4).unwrap();
+    device
+        .enqueue_rx(udp_packet(
+            remote,
+            virtual_destination,
+            41000,
+            18080,
+            b"virtual-destination",
+        ))
+        .unwrap();
+
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(1))
+        .unwrap();
+    let events: Vec<_> = dispatcher.events().collect();
+    let [TunEvent::UdpDatagram { flow, payload }] = events.as_slice() else {
+        panic!("expected one routed UDP datagram event");
+    };
+    assert_eq!(payload, b"virtual-destination");
+    assert_eq!(flow.key.destination.ip(), IpAddr::V4(virtual_destination));
+    dispatcher.write_udp(flow.key, b"reply").unwrap();
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(2))
+        .unwrap();
+
+    let response = device.take_tx().unwrap().unwrap();
+    let ip = Ipv4Packet::new_checked(&response).unwrap();
+    let udp = UdpPacket::new_checked(ip.payload()).unwrap();
+    assert_eq!(ip.src_addr(), virtual_destination);
+    assert_eq!(ip.dst_addr(), remote);
+    assert_eq!(udp.src_port(), 18080);
     assert_eq!(udp.dst_port(), 41000);
     assert_eq!(udp.payload(), b"reply");
 }

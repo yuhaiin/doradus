@@ -2,10 +2,12 @@
 
 use std::sync::Arc;
 
+use yuhaiin_core::dns::{DnsRecordType, DnsResponse, DnsServiceParam};
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::{BoxFuture, DomainName, IpSet, ResolveStrategy, Result};
+use yuhaiin_trie::DomainTrie;
 
-use crate::fakeip::{FakeIpPool, FakeIpV6Pool, FakeIpView, FakeIpViewStore};
+use crate::fakeip::{FakeIpPool, FakeIpV6Pool, FakeIpView, FakeIpViewStore, reverse_name_to_ip};
 
 /// The two persistent pools used by one resolver snapshot.
 #[derive(Clone)]
@@ -13,6 +15,55 @@ pub struct FakeIpPools {
     pub ipv4: Arc<FakeIpPool>,
     pub ipv6: Arc<FakeIpV6Pool>,
     view: FakeIpViewStore,
+}
+
+/// Domain policy loaded from Go's `dns_fakedns_lists` table or the
+/// `resolver.fakedns` JSON overlay.
+///
+/// Whitelist has precedence over skip-check, matching Go's resolver: a
+/// whitelisted name always uses the upstream resolver, while skip-check only
+/// suppresses the upstream A/AAAA lookup before allocating a FakeIP.
+#[derive(Clone, Default)]
+pub struct FakeIpPolicy {
+    whitelist: DomainTrie<()>,
+    skip_check: DomainTrie<()>,
+}
+
+impl FakeIpPolicy {
+    pub fn from_lists(whitelist: &[String], skip_check: &[String]) -> Result<Self> {
+        let mut policy = Self::default();
+        for pattern in whitelist {
+            policy.whitelist.insert(pattern, ()).map_err(|error| {
+                yuhaiin_core::Error::invalid(format!(
+                    "invalid FakeIP whitelist entry {pattern:?}: {error}"
+                ))
+            })?;
+        }
+        for pattern in skip_check {
+            policy.skip_check.insert(pattern, ()).map_err(|error| {
+                yuhaiin_core::Error::invalid(format!(
+                    "invalid FakeIP skip-check entry {pattern:?}: {error}"
+                ))
+            })?;
+        }
+        Ok(policy)
+    }
+
+    pub fn is_whitelisted(&self, domain: &DomainName) -> bool {
+        self.whitelist
+            .search(domain.as_str())
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    pub fn is_skip_check(&self, domain: &DomainName) -> bool {
+        self.skip_check
+            .search(domain.as_str())
+            .ok()
+            .flatten()
+            .is_some()
+    }
 }
 
 impl FakeIpPools {
@@ -40,6 +91,16 @@ impl FakeIpPools {
     pub fn view_store(&self) -> FakeIpViewStore {
         self.view.clone()
     }
+
+    /// Resolve an `in-addr.arpa` or `ip6.arpa` name from the current
+    /// persistent FakeIP reverse maps.  Refreshing the immutable view here
+    /// also makes preloaded mappings visible to socket DNS before the first
+    /// new A/AAAA allocation happens after startup.
+    pub async fn lookup_ptr_domain(&self, domain: &DomainName) -> Option<DomainName> {
+        let address = reverse_name_to_ip(domain)?;
+        let view = self.snapshot().await;
+        view.lookup_domain_ip(address)
+    }
 }
 
 /// Resolve through the normal upstream and replace successful A/AAAA results
@@ -50,6 +111,7 @@ pub struct FakeIpResolver {
     pub upstream: Arc<dyn AsyncIpResolver>,
     pub pools: FakeIpPools,
     pub skip_check_upstream: bool,
+    pub policy: FakeIpPolicy,
 }
 
 impl FakeIpResolver {
@@ -58,10 +120,25 @@ impl FakeIpResolver {
         pools: FakeIpPools,
         skip_check_upstream: bool,
     ) -> Self {
+        Self::new_with_policy(
+            upstream,
+            pools,
+            skip_check_upstream,
+            FakeIpPolicy::default(),
+        )
+    }
+
+    pub fn new_with_policy(
+        upstream: Arc<dyn AsyncIpResolver>,
+        pools: FakeIpPools,
+        skip_check_upstream: bool,
+        policy: FakeIpPolicy,
+    ) -> Self {
         Self {
             upstream,
             pools,
             skip_check_upstream,
+            policy,
         }
     }
 }
@@ -73,24 +150,130 @@ impl AsyncIpResolver for FakeIpResolver {
         strategy: ResolveStrategy,
     ) -> BoxFuture<'a, Result<IpSet>> {
         Box::pin(async move {
-            let upstream = if self.skip_check_upstream {
+            if self.policy.is_whitelisted(domain) {
+                return self.upstream.resolve(domain, strategy).await;
+            }
+            let skip_check = self.skip_check_upstream || self.policy.is_skip_check(domain);
+            let upstream = if skip_check {
                 IpSet::default()
             } else {
                 self.upstream.resolve(domain, strategy).await?
             };
             let mut result = filter_strategy(upstream.clone(), strategy);
 
-            if should_resolve_v4(strategy) && (self.skip_check_upstream || !upstream.v4.is_empty())
-            {
+            if should_resolve_v4(strategy) && (skip_check || !upstream.v4.is_empty()) {
                 result.v4 = vec![self.pools.ipv4.allocate(domain.clone()).await?];
             }
-            if should_resolve_v6(strategy) && (self.skip_check_upstream || !upstream.v6.is_empty())
-            {
+            if should_resolve_v6(strategy) && (skip_check || !upstream.v6.is_empty()) {
                 result.v6 = vec![self.pools.ipv6.allocate(domain.clone()).await?];
             }
             self.pools.snapshot().await;
             Ok(result)
         })
+    }
+
+    fn query<'a>(
+        &'a self,
+        domain: &'a DomainName,
+        record_type: DnsRecordType,
+    ) -> BoxFuture<'a, Result<DnsResponse>> {
+        Box::pin(async move {
+            if self.policy.is_whitelisted(domain) {
+                return self.upstream.query(domain, record_type).await;
+            }
+
+            if record_type == DnsRecordType::Ptr {
+                if let Some(mapped) = self.pools.lookup_ptr_domain(domain).await {
+                    return Ok(DnsResponse {
+                        addresses: IpSet::default(),
+                        ptr_names: vec![mapped],
+                        service_bindings: Vec::new(),
+                        minimum_ttl: Some(60),
+                    });
+                }
+                return self.upstream.query(domain, record_type).await;
+            }
+
+            let skip_check = self.skip_check_upstream || self.policy.is_skip_check(domain);
+            let mut response =
+                if skip_check && matches!(record_type, DnsRecordType::A | DnsRecordType::Aaaa) {
+                    empty_dns_response()
+                } else {
+                    self.upstream.query(domain, record_type).await?
+                };
+            match record_type {
+                DnsRecordType::A if skip_check || !response.addresses.v4.is_empty() => {
+                    let address = self.pools.ipv4.allocate(domain.clone()).await?;
+                    response.addresses = IpSet {
+                        v4: vec![address],
+                        v6: Vec::new(),
+                    };
+                    self.pools.snapshot().await;
+                }
+                DnsRecordType::Aaaa if skip_check || !response.addresses.v6.is_empty() => {
+                    let address = self.pools.ipv6.allocate(domain.clone()).await?;
+                    response.addresses = IpSet {
+                        v4: Vec::new(),
+                        v6: vec![address],
+                    };
+                    self.pools.snapshot().await;
+                }
+                DnsRecordType::Https | DnsRecordType::Svcb => {
+                    let wants_v4 = response.service_bindings.iter().any(|binding| {
+                        binding.params.iter().any(|param| {
+                            matches!(param, DnsServiceParam::Ipv4Hint(values) if !values.is_empty())
+                        })
+                    });
+                    let wants_v6 = response.service_bindings.iter().any(|binding| {
+                        binding.params.iter().any(|param| {
+                            matches!(param, DnsServiceParam::Ipv6Hint(values) if !values.is_empty())
+                        })
+                    });
+                    let ipv4 = if wants_v4 {
+                        Some(self.pools.ipv4.allocate(domain.clone()).await?)
+                    } else {
+                        None
+                    };
+                    let ipv6 = if wants_v6 {
+                        Some(self.pools.ipv6.allocate(domain.clone()).await?)
+                    } else {
+                        None
+                    };
+                    if ipv4.is_some() || ipv6.is_some() {
+                        for binding in &mut response.service_bindings {
+                            for param in &mut binding.params {
+                                match param {
+                                    DnsServiceParam::Ipv4Hint(values) if ipv4.is_some() => {
+                                        if let Some(address) = ipv4 {
+                                            *values = vec![address];
+                                        }
+                                    }
+                                    DnsServiceParam::Ipv6Hint(values) if ipv6.is_some() => {
+                                        if let Some(address) = ipv6 {
+                                            *values = vec![address];
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        self.pools.snapshot().await;
+                    }
+                }
+                DnsRecordType::Ptr => unreachable!("PTR handled before the response query"),
+                DnsRecordType::A | DnsRecordType::Aaaa => {}
+            }
+            Ok(response)
+        })
+    }
+}
+
+fn empty_dns_response() -> DnsResponse {
+    DnsResponse {
+        addresses: IpSet::default(),
+        ptr_names: Vec::new(),
+        service_bindings: Vec::new(),
+        minimum_ttl: Some(0),
     }
 }
 
@@ -266,5 +449,72 @@ mod tests {
         .unwrap();
         assert_eq!(result.v4, vec![Ipv4Addr::new(198, 18, 1, 1)]);
         assert_eq!(result.v6, vec!["fc00:1::1".parse::<Ipv6Addr>().unwrap()]);
+    }
+
+    #[test]
+    fn fakeip_policy_whitelist_precedes_skip_check_and_matches_subdomains() {
+        let store = block_on(crate::ConfigStore::open_memory()).unwrap();
+        let ipv4 = Arc::new(
+            block_on(FakeIpPool::open(
+                store.clone(),
+                crate::fakeip::FakeIpConfig::new(
+                    Ipv4Addr::new(198, 18, 3, 1),
+                    Ipv4Addr::new(198, 18, 3, 8),
+                )
+                .unwrap(),
+            ))
+            .unwrap(),
+        );
+        let ipv6 = Arc::new(
+            block_on(FakeIpV6Pool::open(
+                store,
+                crate::fakeip::FakeIpV6Config::new(
+                    "fc00:3::1".parse().unwrap(),
+                    "fc00:3::8".parse().unwrap(),
+                )
+                .unwrap(),
+            ))
+            .unwrap(),
+        );
+        let whitelist = vec!["example.com".to_owned()];
+        let skip_check = vec!["*.skip.other.test".to_owned()];
+        let policy = FakeIpPolicy::from_lists(&whitelist, &skip_check).unwrap();
+        assert!(policy.is_skip_check(&DomainName::new("api.skip.other.test").unwrap()));
+        let resolver = FakeIpResolver::new_with_policy(
+            Arc::new(StaticResolver),
+            FakeIpPools::new(ipv4, ipv6),
+            false,
+            policy,
+        );
+
+        let whitelisted = block_on(resolver.resolve(
+            &DomainName::new("api.example.com").unwrap(),
+            ResolveStrategy::Default,
+        ))
+        .unwrap();
+        assert_eq!(whitelisted.v4, vec![Ipv4Addr::new(203, 0, 113, 7)]);
+        assert_eq!(whitelisted.v6, vec![Ipv6Addr::LOCALHOST]);
+
+        let skipped = block_on(resolver.resolve(
+            &DomainName::new("api.skip.other.test").unwrap(),
+            ResolveStrategy::Default,
+        ))
+        .unwrap();
+        assert_eq!(skipped.v4, vec![Ipv4Addr::new(198, 18, 3, 1)]);
+        assert_eq!(skipped.v6, vec!["fc00:3::1".parse::<Ipv6Addr>().unwrap()]);
+
+        let skipped_query = block_on(resolver.query(
+            &DomainName::new("api.skip.other.test").unwrap(),
+            DnsRecordType::A,
+        ))
+        .unwrap();
+        assert_eq!(skipped_query.addresses.v4, skipped.v4);
+
+        let whitelisted_query = block_on(resolver.query(
+            &DomainName::new("api.example.com").unwrap(),
+            DnsRecordType::A,
+        ))
+        .unwrap();
+        assert_eq!(whitelisted_query.addresses.v4, whitelisted.v4);
     }
 }

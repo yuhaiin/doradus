@@ -168,6 +168,12 @@ impl GoProxyRuntimeConfig {
                         .unwrap_or(false),
                 }
             }
+            GoProxyTransport::Wireguard => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "WireGuard is a stateful userspace tunnel and must be built by yuhaiin-runtime",
+                ));
+            }
             GoProxyTransport::Tls | GoProxyTransport::Http2 | GoProxyTransport::Unknown { .. } => {
                 return Err(Error::new(
                     ErrorKind::Unsupported,
@@ -194,6 +200,7 @@ fn transport_name(transport: &GoProxyTransport) -> &str {
         GoProxyTransport::Vless => "vless",
         GoProxyTransport::Vmess => "vmess",
         GoProxyTransport::Yuubinsya => "yuubinsya",
+        GoProxyTransport::Wireguard => "wireguard",
         GoProxyTransport::Aead => "aead",
         GoProxyTransport::Tls => "tls",
         GoProxyTransport::Http2 => "http2",

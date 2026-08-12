@@ -32,6 +32,45 @@ use yuhaiin_store::{ConfigStore, GoInboundRecord, GoNodeRecord};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--traffic-client") {
+        let total_bytes = match std::env::var("YUHAIIN_TUN_TRAFFIC_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            Some(value) => value,
+            None => {
+                eprintln!("tun-service-smoke: traffic client has invalid byte count");
+                std::process::exit(2);
+            }
+        };
+        let connection_hold_ms = std::env::var("YUHAIIN_TUN_CONNECTION_HOLD_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
+        if let Err(error) = run_tun_traffic_client(total_bytes, connection_hold_ms) {
+            eprintln!("tun-service-smoke: traffic client: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--udp-traffic-client") {
+        let total_bytes = std::env::var("YUHAIIN_TUN_UDP_TRAFFIC_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(32);
+        if let Err(error) = run_tun_udp_traffic_client(total_bytes) {
+            eprintln!("tun-service-smoke: UDP traffic client: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--reset-client") {
+        if let Err(error) = run_tun_reset_client() {
+            eprintln!("tun-service-smoke: reset client: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let result = tokio::task::LocalSet::new().run_until(run()).await;
     if let Err(error) = result {
         eprintln!("tun-service-smoke: {error}");
@@ -63,6 +102,18 @@ async fn run() -> Result<()> {
         )));
     }
     let traffic = std::env::var_os("YUHAIIN_TUN_TRAFFIC").is_some();
+    let udp_traffic = std::env::var_os("YUHAIIN_TUN_UDP_TRAFFIC").is_some();
+    let udp_first = udp_traffic && std::env::var_os("YUHAIIN_TUN_UDP_FIRST").is_some();
+    if udp_traffic && !traffic {
+        return Err(Error::invalid(
+            "YUHAIIN_TUN_UDP_TRAFFIC requires YUHAIIN_TUN_TRAFFIC",
+        ));
+    }
+    if udp_traffic && chain_mode_is_set() {
+        return Err(Error::invalid(
+            "YUHAIIN_TUN_UDP_TRAFFIC is currently supported by the direct TUN fixture only",
+        ));
+    }
     let traffic_bytes = std::env::var("YUHAIIN_TUN_TRAFFIC_BYTES")
         .ok()
         .map(|value| {
@@ -79,11 +130,28 @@ async fn run() -> Result<()> {
             "YUHAIIN_TUN_TRAFFIC_BYTES must be between 1 and 536870912",
         ));
     }
+    let udp_traffic_bytes = std::env::var("YUHAIIN_TUN_UDP_TRAFFIC_BYTES")
+        .ok()
+        .map(|value| {
+            value.parse::<usize>().map_err(|_| {
+                Error::invalid(format!(
+                    "YUHAIIN_TUN_UDP_TRAFFIC_BYTES must be a positive integer, got {value:?}"
+                ))
+            })
+        })
+        .transpose()?
+        .unwrap_or(8192);
+    if udp_traffic_bytes == 0 || udp_traffic_bytes > 65_507 {
+        return Err(Error::invalid(
+            "YUHAIIN_TUN_UDP_TRAFFIC_BYTES must be between 1 and 65507",
+        ));
+    }
     let connection_hold_ms = std::env::var("YUHAIIN_TUN_CONNECTION_HOLD_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or_default();
     let assert_connections = std::env::var_os("YUHAIIN_TUN_ASSERT_CONNECTIONS").is_some();
+    let assert_process = std::env::var_os("YUHAIIN_TUN_ASSERT_PROCESS").is_some();
     let reload_inbound = std::env::var_os("YUHAIIN_TUN_RELOAD").is_some();
     let reload_cycles = std::env::var("YUHAIIN_TUN_RELOAD_CYCLES")
         .ok()
@@ -104,38 +172,87 @@ async fn run() -> Result<()> {
     let chain_mode = std::env::var("YUHAIIN_TUN_CHAIN")
         .ok()
         .filter(|value| !value.trim().is_empty());
+    let reset_reconnect = std::env::var_os("YUHAIIN_TUN_RESET_RECONNECT").is_some();
+    if reset_reconnect && chain_mode.is_some() {
+        return Err(Error::invalid(
+            "YUHAIIN_TUN_RESET_RECONNECT is only supported by the direct TUN fixture",
+        ));
+    }
 
-    let (target_address, target_task, chain_fixture) = if chain_mode.is_some() {
+    // `--network=none` creates the loopback device in a down state.  The
+    // fixture's fixed outbound intentionally targets a local echo listener,
+    // so bring only this disposable namespace's loopback interface up before
+    // opening the TUN.  Production does not need this test-only setup.
+    if traffic {
+        yuhaiin_platform::enable_loopback().map_err(io_error)?;
+    }
+
+    let (target_address, target_task, udp_target_task, chain_fixture) = if chain_mode.is_some() {
         if !traffic {
             return Err(Error::invalid(
                 "YUHAIIN_TUN_CHAIN requires YUHAIIN_TUN_TRAFFIC",
             ));
         }
         let fixture = ChainFixture::start().await?;
-        (Some(fixture.target), None, Some(fixture))
+        (Some(fixture.target), None, None, Some(fixture))
     } else if traffic {
         let target = TcpListener::bind("127.0.0.1:0").await.map_err(io_error)?;
         let address = target.local_addr().map_err(io_error)?;
-        let task = tokio::spawn(async move {
-            let (mut stream, _) = target.accept().await.map_err(io_error)?;
-            let mut buffer = vec![0u8; 16 * 1024];
-            let mut received = 0usize;
-            loop {
-                let length = stream.read(&mut buffer).await.map_err(io_error)?;
-                if length == 0 {
-                    break;
-                }
-                stream
-                    .write_all(&buffer[..length])
+        let udp_target = if udp_traffic {
+            Some(
+                tokio::net::UdpSocket::bind(SocketAddr::new(address.ip(), address.port()))
+                    .await
+                    .map_err(io_error)?,
+            )
+        } else {
+            None
+        };
+        let udp_target_task = udp_target.map(|target| {
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 65_507];
+                let (length, peer) = target.recv_from(&mut buffer).await.map_err(io_error)?;
+                println!("runtime-tun-udp-target-received bytes={length}");
+                target
+                    .send_to(&buffer[..length], peer)
                     .await
                     .map_err(io_error)?;
-                received = received.saturating_add(length);
+                Ok::<usize, Error>(length)
+            })
+        });
+        let task = tokio::spawn(async move {
+            let mut buffer = vec![0u8; 16 * 1024];
+            let mut received = 0usize;
+            let expected_connections = 1 + usize::from(reset_reconnect);
+            for connection_index in 0..expected_connections {
+                let (mut stream, _) = target.accept().await.map_err(io_error)?;
+                loop {
+                    let length = match stream.read(&mut buffer).await {
+                        Ok(length) => length,
+                        Err(error)
+                            if reset_reconnect
+                                && error.kind() == std::io::ErrorKind::ConnectionReset =>
+                        {
+                            break;
+                        }
+                        Err(error) => return Err(io_error(error)),
+                    };
+                    if length == 0 {
+                        break;
+                    }
+                    stream
+                        .write_all(&buffer[..length])
+                        .await
+                        .map_err(io_error)?;
+                    if !(reset_reconnect && connection_index == 0) {
+                        received = received.saturating_add(length);
+                    }
+                }
             }
             Ok::<usize, Error>(received)
         });
-        (Some(address), Some(task), None)
+        (Some(address), Some(task), udp_target_task, None)
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
     if let Some(parent) = database.parent() {
@@ -172,9 +289,7 @@ async fn run() -> Result<()> {
     println!("runtime-tun-selected-node id={selected} chain={chain_types}");
     let mut route_probe = FlowContext::new(Endpoint::ip(
         Network::Tcp,
-        "198.18.0.2:18080"
-            .parse()
-            .expect("valid TUN smoke endpoint"),
+        configured_tun_target().map_err(io_error)?,
     ));
     let route_mode = controller
         .handle()
@@ -194,8 +309,6 @@ async fn run() -> Result<()> {
         .name
         .clone()
         .ok_or_else(|| Error::invalid("TUN fixture has no device name"))?;
-    let device_path = Path::new("/sys/class/net").join(&device_name);
-
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let inbound_task =
         tokio::task::spawn_local(inbound::run_until(controller.clone(), shutdown_rx));
@@ -205,7 +318,7 @@ async fn run() -> Result<()> {
     );
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !device_path.exists() {
+    while !device_is_present(&device_name) {
         if inbound_task.is_finished() {
             let result = inbound_task.await.map_err(join_error)?;
             return Err(result
@@ -228,15 +341,21 @@ async fn run() -> Result<()> {
     }
     println!("runtime-tun-opened name={device_name}");
 
+    if udp_first {
+        eprintln!("runtime-tun-udp-client-start bytes={udp_traffic_bytes}");
+        run_tun_udp_traffic_child(udp_traffic_bytes).await?;
+        println!("runtime-tun-udp-traffic-ok bytes={udp_traffic_bytes}");
+    }
+
     if reload_inbound {
         for cycle in 1..=reload_cycles {
-            toggle_persisted_tun(&controller, &device_path, false).await?;
+            toggle_persisted_tun(&controller, &device_name, false).await?;
             println!("runtime-tun-disabled name={device_name} cycle={cycle}");
             if traffic {
                 assert_tun_target_unreachable(Duration::from_millis(750)).map_err(io_error)?;
                 println!("runtime-tun-disabled-no-route-ok name={device_name} cycle={cycle}");
             }
-            toggle_persisted_tun(&controller, &device_path, true).await?;
+            toggle_persisted_tun(&controller, &device_name, true).await?;
             println!("runtime-tun-reload-ok name={device_name} cycle={cycle}");
         }
     }
@@ -247,16 +366,55 @@ async fn run() -> Result<()> {
                 controller.monitor(),
                 selected.clone(),
                 Duration::from_secs(10),
+                assert_process,
             ))
         } else {
             None
         };
-        let traffic_result = tokio::task::spawn_blocking(move || {
-            run_tun_traffic_client(traffic_bytes, connection_hold_ms)
-        })
-        .await
-        .map_err(join_error)?
-        .map_err(io_error);
+        // Keep the TUN client in a separate process. The runtime deliberately
+        // blocks flows originating from its own resolved process path to avoid
+        // routing its listener/control connections back through itself. A
+        // child process is the same shape as a real application using the TUN
+        // device and lets this smoke exercise that guard without disabling it.
+        let executable = std::env::current_exe().map_err(io_error)?;
+        if reset_reconnect {
+            let mut reset_client = std::process::Command::new(&executable)
+                .arg("--reset-client")
+                .spawn()
+                .map_err(io_error)?;
+            let reset_status = tokio::task::spawn_blocking(move || reset_client.wait())
+                .await
+                .map_err(join_error)?
+                .map_err(io_error)?;
+            if !reset_status.success() {
+                return Err(io_error(std::io::Error::other(format!(
+                    "TUN reset client exited with {reset_status}"
+                ))));
+            }
+            println!("runtime-tun-reset-ok");
+        }
+        let mut traffic_client = std::process::Command::new(executable)
+            .arg("--traffic-client")
+            .env("YUHAIIN_TUN_TRAFFIC_BYTES", traffic_bytes.to_string())
+            .env(
+                "YUHAIIN_TUN_CONNECTION_HOLD_MS",
+                connection_hold_ms.to_string(),
+            )
+            .spawn()
+            .map_err(io_error)?;
+        let traffic_result = tokio::task::spawn_blocking(move || traffic_client.wait())
+            .await
+            .map_err(join_error)?
+            .map_err(io_error)
+            .and_then(|status| {
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(io_error(std::io::Error::other(format!(
+                        "TUN traffic client exited with {status}"
+                    ))))
+                }
+            });
         if let Err(error) = &traffic_result {
             eprintln!(
                 "runtime-tun-logs {:?}",
@@ -271,10 +429,25 @@ async fn run() -> Result<()> {
                 target_task.abort();
                 let _ = target_task.await;
             }
+            if let Some(udp_target_task) = udp_target_task {
+                udp_target_task.abort();
+                let _ = udp_target_task.await;
+            }
             if let Some(chain_fixture) = chain_fixture {
                 chain_fixture.abort();
             }
             return Err(error.clone());
+        }
+        if udp_traffic && !udp_first {
+            eprintln!("runtime-tun-udp-client-start bytes={udp_traffic_bytes}");
+            if let Err(error) = run_tun_udp_traffic_child(udp_traffic_bytes).await {
+                eprintln!(
+                    "runtime-tun-logs {:?}",
+                    controller.monitor().logs().snapshot()
+                );
+                return Err(error);
+            }
+            println!("runtime-tun-udp-traffic-ok bytes={udp_traffic_bytes}");
         }
         if let Some(connection_assertion) = connection_assertion {
             let connection = connection_assertion.await.map_err(join_error)??;
@@ -305,8 +478,33 @@ async fn run() -> Result<()> {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default(),
             );
+            if assert_process {
+                let process = connection
+                    .get("process")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| Error::new(ErrorKind::Io, "TUN process metadata is empty"))?;
+                let pid = connection
+                    .get("pid")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        Error::new(ErrorKind::Io, "TUN process PID metadata is empty")
+                    })?;
+                let uid = connection
+                    .get("uid")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        Error::new(ErrorKind::Io, "TUN process UID metadata is empty")
+                    })?;
+                println!("runtime-tun-process-ok process={process} pid={pid} uid={uid}");
+            }
         }
         println!("runtime-tun-traffic-ok bytes={traffic_bytes}");
+        if reset_reconnect {
+            println!("runtime-tun-reconnect-ok");
+        }
     } else {
         tokio::time::sleep(Duration::from_millis(hold_ms)).await;
     }
@@ -323,6 +521,15 @@ async fn run() -> Result<()> {
             ));
         }
     }
+    if let Some(udp_target_task) = udp_target_task {
+        let received = udp_target_task.await.map_err(join_error)??;
+        if received != udp_traffic_bytes {
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!("runtime TUN UDP target received {received} of {udp_traffic_bytes} bytes"),
+            ));
+        }
+    }
     if let Some(chain_fixture) = chain_fixture {
         let received = chain_fixture.shutdown().await?;
         if received != traffic_bytes {
@@ -334,7 +541,7 @@ async fn run() -> Result<()> {
     }
     controller.persist_monitor().await?;
 
-    if device_path.exists() {
+    if device_is_present(&device_name) {
         return Err(Error::new(
             ErrorKind::Io,
             format!("runtime TUN device remained after shutdown: {device_name}"),
@@ -344,9 +551,15 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+fn chain_mode_is_set() -> bool {
+    std::env::var("YUHAIIN_TUN_CHAIN")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
 async fn toggle_persisted_tun(
     controller: &RuntimeController,
-    device_path: &Path,
+    device_name: &str,
     enabled: bool,
 ) -> Result<()> {
     let mut record = controller
@@ -370,7 +583,7 @@ async fn toggle_persisted_tun(
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if device_path.exists() == enabled {
+        if device_is_present(device_name) == enabled {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -378,12 +591,31 @@ async fn toggle_persisted_tun(
                 ErrorKind::Timeout,
                 format!(
                     "TUN reload did not reach enabled={enabled} for {}",
-                    device_path.display()
+                    device_name
                 ),
             ));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// `/sys/class/net` is not guaranteed to expose the current network
+/// namespace after entering an unshared user/network namespace.  `/proc/net/dev`
+/// is namespace-aware and is the primary probe; sysfs remains a fallback for
+/// normal containers and desktop hosts.
+fn device_is_present(name: &str) -> bool {
+    if std::fs::read_to_string("/proc/net/dev")
+        .ok()
+        .is_some_and(|contents| {
+            contents.lines().any(|line| {
+                line.split_once(':')
+                    .is_some_and(|(interface, _)| interface.trim() == name)
+            })
+        })
+    {
+        return true;
+    }
+    Path::new("/sys/class/net").join(name).exists()
 }
 
 async fn seed_runtime_fixture(
@@ -421,8 +653,9 @@ async fn seed_runtime_fixture(
             "tun": {
                 "name": format!("tun://{name}"),
                 "mtu": mtu,
-                "portal": "198.18.0.1/15",
-                "routes": ["198.18.0.2/32"],
+                "portal": configured_tun_portal(),
+                "portalV6": configured_tun_portal_v6(),
+                "routes": configured_tun_routes(),
                 "excludes": []
             }
         }
@@ -492,10 +725,22 @@ async fn seed_runtime_fixture(
                 &serde_json::to_vec(&json!({"id":node_id})).map_err(io_error)?,
             )
             .await?;
+        store
+            .put_config(
+                "selected_udp_node_v2",
+                &serde_json::to_vec(&json!({"id":node_id})).map_err(io_error)?,
+            )
+            .await?;
     } else {
         store
             .put_config(
                 "selected_tcp_node_v2",
+                &serde_json::to_vec(&json!({"id":"direct"})).map_err(io_error)?,
+            )
+            .await?;
+        store
+            .put_config(
+                "selected_udp_node_v2",
                 &serde_json::to_vec(&json!({"id":"direct"})).map_err(io_error)?,
             )
             .await?;
@@ -504,8 +749,8 @@ async fn seed_runtime_fixture(
 }
 
 fn assert_tun_target_unreachable(timeout: Duration) -> std::io::Result<()> {
-    let address = "198.18.0.2:18080";
-    match TcpStream::connect_timeout(&address.parse().unwrap(), timeout) {
+    let address = configured_tun_target()?;
+    match TcpStream::connect_timeout(&address, timeout) {
         Ok(stream) => {
             let _ = stream.shutdown(std::net::Shutdown::Both);
             Err(std::io::Error::other(format!(
@@ -533,6 +778,7 @@ fn spawn_tun_connection_assertion(
     monitor: Arc<yuhaiin_runtime::ConnectionMonitor>,
     selected_node: String,
     timeout: Duration,
+    assert_process: bool,
 ) -> tokio::task::JoinHandle<Result<serde_json::Value>> {
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -558,6 +804,19 @@ fn spawn_tun_connection_assertion(
                         .get("localAddr")
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|value| !value.is_empty())
+                    && (!assert_process
+                        || (connection
+                            .get("process")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|value| !value.is_empty())
+                            && connection
+                                .get("pid")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|value| !value.is_empty())
+                            && connection
+                                .get("uid")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|value| !value.is_empty())))
             }) {
                 return Ok(connection);
             }
@@ -577,9 +836,9 @@ fn spawn_tun_connection_assertion(
 fn run_tun_traffic_client(total_bytes: usize, connection_hold_ms: u64) -> std::io::Result<()> {
     use std::io::{Read, Write};
 
-    let address = "198.18.0.2:18080";
-    let mut stream = TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_secs(10))
-        .map_err(|error| {
+    let address = configured_tun_target()?;
+    let mut stream =
+        TcpStream::connect_timeout(&address, Duration::from_secs(10)).map_err(|error| {
             std::io::Error::new(
                 error.kind(),
                 format!("connect TUN traffic target {address}: {error}"),
@@ -655,6 +914,139 @@ fn run_tun_traffic_client(total_bytes: usize, connection_hold_ms: u64) -> std::i
         )
     })?;
     writer_result
+}
+
+fn run_tun_udp_traffic_client(total_bytes: usize) -> std::io::Result<()> {
+    let source = configured_tun_source()?;
+    let socket = std::net::UdpSocket::bind(SocketAddr::new(source, 0))?;
+    socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let destination = configured_tun_udp_target()?;
+    eprintln!(
+        "runtime-tun-udp-client local={} destination={destination}",
+        socket.local_addr()?
+    );
+    let mut payload = vec![0u8; total_bytes];
+    fill_traffic_chunk(&mut payload, 0);
+    let sent = socket.send_to(&payload, destination).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("write TUN UDP traffic payload to {destination}: {error}"),
+        )
+    })?;
+    eprintln!("runtime-tun-udp-client-sent bytes={sent}");
+    let mut echoed = vec![0u8; 65_507];
+    let (length, _) = socket.recv_from(&mut echoed).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("read TUN UDP traffic echo from {destination}: {error}"),
+        )
+    })?;
+    if length != total_bytes || echoed[..length] != payload {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("runtime TUN UDP echo mismatch: received {length} of {total_bytes} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+async fn run_tun_udp_traffic_child(total_bytes: usize) -> Result<()> {
+    let executable = std::env::current_exe().map_err(io_error)?;
+    let mut child = std::process::Command::new(executable)
+        .arg("--udp-traffic-client")
+        .env("YUHAIIN_TUN_UDP_TRAFFIC_BYTES", total_bytes.to_string())
+        .spawn()
+        .map_err(io_error)?;
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .map_err(join_error)?
+        .map_err(io_error)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io_error(std::io::Error::other(format!(
+            "TUN UDP traffic client exited with {status}"
+        ))))
+    }
+}
+
+fn run_tun_reset_client() -> std::io::Result<()> {
+    use std::io::Write;
+
+    let address = configured_tun_target()?;
+    let stream =
+        TcpStream::connect_timeout(&address, Duration::from_secs(10)).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("connect TUN reset target {address}: {error}"),
+            )
+        })?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let socket = socket2::SockRef::from(&stream);
+    socket.set_linger(Some(Duration::ZERO))?;
+    let mut stream = stream;
+    stream.write_all(b"tun-reset-before-reconnect")?;
+    // SO_LINGER=0 makes the close send RST, exercising the inbound's
+    // connection-task cleanup before the normal reconnect below.
+    drop(stream);
+    Ok(())
+}
+
+fn configured_tun_portal() -> String {
+    std::env::var("YUHAIIN_TUN_PORTAL").unwrap_or_else(|_| "198.18.0.1/15".to_owned())
+}
+
+fn configured_tun_portal_v6() -> Option<String> {
+    std::env::var("YUHAIIN_TUN_PORTAL_V6")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn configured_tun_routes() -> Vec<String> {
+    match std::env::var("YUHAIIN_TUN_ROUTE") {
+        Ok(value) if value.eq_ignore_ascii_case("none") || value.trim().is_empty() => Vec::new(),
+        Ok(value) => vec![value],
+        Err(_) => vec!["198.18.0.2/32".to_owned()],
+    }
+}
+
+fn configured_tun_source() -> std::io::Result<std::net::IpAddr> {
+    std::env::var("YUHAIIN_TUN_SOURCE")
+        .unwrap_or_else(|_| "198.18.0.1".to_owned())
+        .parse()
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid YUHAIIN_TUN_SOURCE: {error}"),
+            )
+        })
+}
+
+fn configured_tun_target() -> std::io::Result<SocketAddr> {
+    std::env::var("YUHAIIN_TUN_TARGET")
+        .unwrap_or_else(|_| "198.18.0.2:18080".to_owned())
+        .parse()
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid YUHAIIN_TUN_TARGET: {error}"),
+            )
+        })
+}
+
+fn configured_tun_udp_target() -> std::io::Result<SocketAddr> {
+    std::env::var("YUHAIIN_TUN_UDP_TARGET").map_or_else(
+        |_| configured_tun_target(),
+        |value| {
+            value.parse().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid YUHAIIN_TUN_UDP_TARGET: {error}"),
+                )
+            })
+        },
+    )
 }
 
 const YUUBINSYA_PASSWORD: &str = "runtime-tun-smoke-yuubinsya";

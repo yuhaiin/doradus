@@ -4,14 +4,21 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cache_dir="${YUHAIIN_INTEGRATION_DIR:-${HOME}/.cache/yuhaiin-rust/integration/tun-service}"
 target_dir="${CARGO_TARGET_DIR:-${HOME}/.cache/yuhaiin-rust/cargo-target}"
-binary="${target_dir}/debug/tun-service-smoke"
+binary="${YUHAIIN_TUN_BINARY:-${target_dir}/debug/tun-service-smoke}"
 database_dir="${cache_dir}/state"
 log_path="${cache_dir}/podman.log"
 tun_name="yrtun0"
 chain_mode="${YUHAIIN_TUN_CHAIN:-}"
 container_name="yuhaiin-tun-service-$$"
 timeout_seconds="${YUHAIIN_TUN_SMOKE_TIMEOUT_SEC:-45}"
-podman_rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || echo true)"
+tun_device_args=()
+if [[ -c /dev/net/tun ]]; then
+  tun_device_args=(--device=/dev/net/tun)
+fi
+
+source "${repo_dir}/scripts/integration/tun-container-common.sh"
+configure_tun_container_namespace tun-service
+
 
 cleanup() {
   podman rm -f "${container_name}" >/dev/null 2>&1 || true
@@ -23,17 +30,14 @@ if ! [[ "${timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
-# Opening a TUN fd can be exercised by the lifecycle-only smoke, but actual
-# packet traffic needs CAP_NET_ADMIN in the container's network namespace.
-# Rootless Podman cannot provide that capability even with --privileged, so
-# report an explicit environment skip instead of a misleading traffic timeout.
-if [[ "${YUHAIIN_TUN_RELOAD_ONLY:-0}" != "1" && "${podman_rootless}" == "true" ]]; then
+# The real device is required for both lifecycle and packet traffic. Some
+# rootless Podman installations can pass it together with --privileged; probe
+# that capability instead of classifying every rootless connection as a skip.
+if [[ "${#tun_device_args[@]}" == "0" ]]; then
   cat >&2 <<EOF
-[tun-service] traffic smoke requires a rootful Podman namespace with
-CAP_NET_ADMIN. The current Podman connection is rootless, so the packet
-traffic/chain/force-stop path is skipped with exit 77.
-[tun-service] run this smoke with rootful Podman; lifecycle-only reload smoke
-remains available via YUHAIIN_TUN_RELOAD_ONLY=1.
+[tun-service] smoke needs /dev/net/tun to be passed into the container.
+The host does not expose that character device, so this run is skipped with
+exit 77.
 EOF
   exit 77
 fi
@@ -51,21 +55,33 @@ fi
 if [[ -n "${YUHAIIN_TUN_DEBUG:-}" ]]; then
   chain_env+=( -e "YUHAIIN_TUN_DEBUG=${YUHAIIN_TUN_DEBUG}" )
 fi
+for tun_fixture_env in YUHAIIN_TUN_PORTAL YUHAIIN_TUN_PORTAL_V6 YUHAIIN_TUN_ROUTE YUHAIIN_TUN_SOURCE YUHAIIN_TUN_TARGET YUHAIIN_TUN_UDP_TARGET YUHAIIN_TUN_UDP_FIRST; do
+  if [[ -n "${!tun_fixture_env:-}" ]]; then
+    chain_env+=( -e "${tun_fixture_env}=${!tun_fixture_env}" )
+  fi
+done
+if [[ "${YUHAIIN_TUN_RESET_RECONNECT:-0}" == "1" ]]; then
+  chain_env+=( -e YUHAIIN_TUN_RESET_RECONNECT=1 )
+fi
 
 mkdir -p "${database_dir}"
-cd "${repo_dir}"
-cargo build --target-dir "${target_dir}" -p yuhaiin-runtime --bin tun-service-smoke --all-features --offline
+if [[ "${YUHAIIN_SKIP_BUILD:-0}" != "1" ]]; then
+  cd "${repo_dir}"
+  cargo build --target-dir "${target_dir}" -p yuhaiin-runtime --bin tun-service-smoke --all-features --offline
+fi
+test -x "${binary}"
 
 common_args=(
   --privileged
   --network=none
+  "${tun_device_args[@]}"
   -e YUHAIIN_DB=/state/state.sqlite
   -e YUHAIIN_TUN_NAME="${tun_name}"
   -e YUHAIIN_TUN_MTU="${YUHAIIN_TUN_MTU:-1500}"
   "${chain_env[@]}"
   -v "${binary}:/usr/local/bin/tun-service-smoke:ro"
   -v "${database_dir}:/state:Z"
-  --entrypoint /usr/local/bin/tun-service-smoke
+  --entrypoint "${TUN_CONTAINER_ENTRYPOINT}"
   docker.io/library/debian:testing
 )
 run_args=(
@@ -89,6 +105,21 @@ if [[ "${YUHAIIN_TUN_ASSERT_CONNECTIONS:-0}" == "1" ]]; then
     "${run_args[@]: -1}"
   )
 fi
+if [[ "${YUHAIIN_TUN_ASSERT_PROCESS:-0}" == "1" ]]; then
+  run_args=(
+    "${run_args[@]:0:${#run_args[@]}-1}"
+    -e YUHAIIN_TUN_ASSERT_PROCESS=1
+    "${run_args[@]: -1}"
+  )
+fi
+if [[ "${YUHAIIN_TUN_UDP_TRAFFIC:-0}" == "1" ]]; then
+  run_args=(
+    "${run_args[@]:0:${#run_args[@]}-1}"
+    -e YUHAIIN_TUN_UDP_TRAFFIC=1
+    -e YUHAIIN_TUN_UDP_TRAFFIC_BYTES="${YUHAIIN_TUN_UDP_TRAFFIC_BYTES:-8192}"
+    "${run_args[@]: -1}"
+  )
+fi
 force_args=(
   "${common_args[@]:0:${#common_args[@]}-1}"
   -e YUHAIIN_TUN_TRAFFIC=1
@@ -102,7 +133,7 @@ if [[ "${YUHAIIN_TUN_FORCE_STOP:-0}" == "1" ]]; then
   force_log="${cache_dir}/force-stop.log"
   : >"${force_log}"
   podman rm -f "${force_name}" >/dev/null 2>&1 || true
-  podman run -d --name "${force_name}" "${force_args[@]}" >"${cache_dir}/force-stop-container-id"
+  podman run -d --name "${force_name}" "${force_args[@]}" "${TUN_CONTAINER_COMMAND_ARGS[@]}" >"${cache_dir}/force-stop-container-id"
   opened=0
   for _ in $(seq 1 150); do
     podman logs "${force_name}" >"${force_log}" 2>&1 || true
@@ -127,7 +158,7 @@ if [[ "${YUHAIIN_TUN_FORCE_STOP:-0}" == "1" ]]; then
   echo "runtime-tun-force-stop-ok name=${tun_name}"
 fi
 
-if ! timeout --foreground "${timeout_seconds}s" podman run --name "${container_name}" "${run_args[@]}" >"${log_path}" 2>&1; then
+if ! timeout --foreground "${timeout_seconds}s" podman run --name "${container_name}" "${run_args[@]}" "${TUN_CONTAINER_COMMAND_ARGS[@]}" >"${log_path}" 2>&1; then
   cat "${log_path}"
   if grep -Fq "runtime-tun-opened name=${tun_name}" "${log_path}" \
     && ! grep -Fq "runtime-tun-traffic-ok" "${log_path}"; then
@@ -143,6 +174,16 @@ if [[ -n "${YUHAIIN_TUN_RELOAD:-}" ]]; then
 fi
 if [[ "${YUHAIIN_TUN_RELOAD_ONLY:-0}" != "1" ]]; then
   grep -Fq "runtime-tun-traffic-ok" <<<"${output}"
+fi
+if [[ "${YUHAIIN_TUN_RESET_RECONNECT:-0}" == "1" ]]; then
+  grep -Fq "runtime-tun-reset-ok" <<<"${output}"
+  grep -Fq "runtime-tun-reconnect-ok" <<<"${output}"
+fi
+if [[ "${YUHAIIN_TUN_ASSERT_PROCESS:-0}" == "1" ]]; then
+  grep -Fq "runtime-tun-process-ok" <<<"${output}"
+fi
+if [[ "${YUHAIIN_TUN_UDP_TRAFFIC:-0}" == "1" ]]; then
+  grep -Fq "runtime-tun-udp-traffic-ok" <<<"${output}"
 fi
 grep -Fq "runtime-tun-closed name=${tun_name}" <<<"${output}"
 if [[ -n "${chain_mode}" ]]; then

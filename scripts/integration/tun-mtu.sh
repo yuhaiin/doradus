@@ -4,22 +4,35 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cache_dir="${YUHAIIN_TUN_MTU_DIR:-${HOME}/.cache/yuhaiin-rust/integration/tun-mtu}"
 target_dir="${CARGO_TARGET_DIR:-${HOME}/.cache/yuhaiin-rust/cargo-target}"
-binary="${target_dir}/debug/tun-service-smoke"
-podman_rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || echo true)"
-
-if [[ "${podman_rootless}" == "true" ]]; then
+binary="${YUHAIIN_TUN_BINARY:-${target_dir}/debug/tun-service-smoke}"
+tun_device_args=()
+if [[ -c /dev/net/tun ]]; then
+  tun_device_args=(--device=/dev/net/tun)
+else
   cat >&2 <<EOF
-[tun-mtu] packet traffic requires a rootful Podman namespace with
-CAP_NET_ADMIN. The current Podman connection is rootless, so the MTU matrix
-is skipped with exit 77.
+[tun-mtu] MTU packet smoke needs /dev/net/tun to be passed into the
+container. The host does not expose that character device, so this matrix is
+skipped with exit 77.
 EOF
   exit 77
 fi
+source "${repo_dir}/scripts/integration/tun-container-common.sh"
+configure_tun_container_namespace tun-mtu
+
+fixture_env=()
+for tun_fixture_env in YUHAIIN_TUN_PORTAL YUHAIIN_TUN_PORTAL_V6 YUHAIIN_TUN_ROUTE YUHAIIN_TUN_SOURCE YUHAIIN_TUN_TARGET YUHAIIN_TUN_UDP_TARGET YUHAIIN_TUN_UDP_FIRST; do
+  if [[ -n "${!tun_fixture_env:-}" ]]; then
+    fixture_env+=( -e "${tun_fixture_env}=${!tun_fixture_env}" )
+  fi
+done
 
 mkdir -p "${cache_dir}"
-cd "${repo_dir}"
-cargo build --target-dir "${target_dir}" -p yuhaiin-runtime --bin tun-service-smoke --all-features --offline \
-  >"${cache_dir}/build.log" 2>&1
+if [[ "${YUHAIIN_SKIP_BUILD:-0}" != "1" ]]; then
+  cd "${repo_dir}"
+  cargo build --target-dir "${target_dir}" -p yuhaiin-runtime --bin tun-service-smoke --all-features --offline \
+    >"${cache_dir}/build.log" 2>&1
+fi
+test -x "${binary}"
 
 for mtu in 576 1280 1500 9000 9216; do
   case_dir="${cache_dir}/mtu-${mtu}"
@@ -28,16 +41,23 @@ for mtu in 576 1280 1500 9000 9216; do
   tun_name="yrtun-mtu-${mtu}"
   mkdir -p "${database_dir}"
 
-  if ! podman run --rm --privileged --network=none \
+  # Exercise the largest legal IPv4 UDP payload by default. Callers can lower
+  # it for a faster smoke, but the default catches both smoltcp
+  # fragmentation-buffer regressions and kernel reassembly regressions.
+  if ! podman run --rm --privileged --network=none "${tun_device_args[@]}" \
       -e YUHAIIN_DB=/state/state.sqlite \
       -e YUHAIIN_TUN_NAME="${tun_name}" \
       -e YUHAIIN_TUN_MTU="${mtu}" \
       -e YUHAIIN_TUN_TRAFFIC=1 \
+      -e YUHAIIN_TUN_UDP_TRAFFIC=1 \
+      -e YUHAIIN_TUN_UDP_TRAFFIC_BYTES="${YUHAIIN_TUN_UDP_TRAFFIC_BYTES:-65507}" \
       -e YUHAIIN_TUN_HOLD_MS=750 \
+      "${fixture_env[@]}" \
       -v "${binary}:/usr/local/bin/tun-service-smoke:ro" \
       -v "${database_dir}:/state:Z" \
-      --entrypoint /usr/local/bin/tun-service-smoke \
-      docker.io/library/debian:testing >"${log_path}" 2>&1; then
+      --entrypoint "${TUN_CONTAINER_ENTRYPOINT}" \
+      docker.io/library/debian:testing \
+      "${TUN_CONTAINER_COMMAND_ARGS[@]}" >"${log_path}" 2>&1; then
     cat "${log_path}"
     exit 1
   fi
@@ -46,6 +66,7 @@ for mtu in 576 1280 1500 9000 9216; do
   printf '%s\n' "${output}"
   grep -Fq "runtime-tun-opened name=${tun_name}" <<<"${output}"
   grep -Fq "runtime-tun-traffic-ok" <<<"${output}"
+  grep -Fq "runtime-tun-udp-traffic-ok" <<<"${output}"
   grep -Fq "runtime-tun-closed name=${tun_name}" <<<"${output}"
   printf 'tun-mtu-case-passed mtu=%s\n' "${mtu}"
 done

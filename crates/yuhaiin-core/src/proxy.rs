@@ -747,13 +747,20 @@ impl AsyncProxy for FixedAsyncProxy {
 
     fn open_datagram<'a>(
         &'a self,
-        _context: &'a FlowContext,
+        context: &'a FlowContext,
     ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
-        Box::pin(async {
-            Err(Error::new(
-                ErrorKind::Unsupported,
-                "fixed async proxy has no datagram transport",
-            ))
+        let target = self.address;
+        let fallback = if target.is_ipv4() {
+            "0.0.0.0:0".parse().expect("valid IPv4 wildcard")
+        } else {
+            "[::]:0".parse().expect("valid IPv6 wildcard")
+        };
+        let bind_address = context.local_bind_for(target).unwrap_or(fallback);
+        Box::pin(async move {
+            let socket = tokio::net::UdpSocket::bind(bind_address)
+                .await
+                .map_err(|error| Error::new(ErrorKind::Io, format!("fixed UDP bind: {error}")))?;
+            Ok(Box::new(FixedDatagram { socket, target }) as Box<dyn AsyncDatagram>)
         })
     }
 
@@ -1191,6 +1198,12 @@ struct TokioDatagram {
 }
 
 #[cfg(feature = "async-proxy")]
+struct FixedDatagram {
+    socket: tokio::net::UdpSocket,
+    target: SocketAddr,
+}
+
+#[cfg(feature = "async-proxy")]
 impl AsyncDatagram for TokioDatagram {
     fn send_to<'a>(&'a self, payload: &'a [u8], target: Endpoint) -> BoxFuture<'a, Result<usize>> {
         Box::pin(async move {
@@ -1236,6 +1249,46 @@ impl AsyncDatagram for TokioDatagram {
             .local_addr()
             .map(|address| Endpoint::ip(Network::Udp, address))
             .map_err(|error| Error::new(ErrorKind::Io, format!("UDP local address: {error}")))
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[cfg(feature = "async-proxy")]
+impl AsyncDatagram for FixedDatagram {
+    fn send_to<'a>(&'a self, payload: &'a [u8], target: Endpoint) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            if target.network() != Network::Udp {
+                return Err(Error::invalid("UDP datagram target has wrong network"));
+            }
+            self.socket
+                .send_to(payload, self.target)
+                .await
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::Io,
+                        format!("fixed UDP send to {}: {error}", self.target),
+                    )
+                })
+        })
+    }
+
+    fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
+        Box::pin(async move {
+            let (length, _) = self.socket.recv_from(buffer).await.map_err(|error| {
+                Error::new(ErrorKind::Io, format!("fixed UDP receive: {error}"))
+            })?;
+            Ok((length, Endpoint::ip(Network::Udp, self.target)))
+        })
+    }
+
+    fn local_addr(&self) -> Result<Endpoint> {
+        self.socket
+            .local_addr()
+            .map(|address| Endpoint::ip(Network::Udp, address))
+            .map_err(|error| Error::new(ErrorKind::Io, format!("fixed UDP local address: {error}")))
     }
 
     fn close(&self) -> BoxFuture<'_, Result<()>> {
@@ -1625,6 +1678,43 @@ mod tests {
         let mut buffer = [0; 4];
         stream.read_exact(&mut buffer).await.unwrap();
         assert_eq!(&buffer, b"ping");
+    }
+
+    #[cfg(feature = "async-proxy")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixed_async_proxy_routes_datagrams_to_fixed_endpoint() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fixed = server.local_addr().unwrap();
+        let proxy = FixedAsyncProxy {
+            address: fixed,
+            timeout: Duration::from_secs(1),
+        };
+        let logical_target = Endpoint::ip(Network::Udp, "127.0.0.1:9".parse().unwrap());
+        let context = FlowContext::new(logical_target.clone());
+        let datagram = proxy.open_datagram(&context).await.unwrap();
+
+        let payload = b"fixed-udp";
+        assert_eq!(
+            datagram.send_to(payload, logical_target).await.unwrap(),
+            payload.len()
+        );
+
+        let mut buffer = [0u8; 64];
+        let (length, peer) =
+            tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buffer[..length], payload);
+        server.send_to(b"fixed-reply", peer).await.unwrap();
+
+        let (length, source) =
+            tokio::time::timeout(Duration::from_secs(1), datagram.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buffer[..length], b"fixed-reply");
+        assert_eq!(source, Endpoint::ip(Network::Udp, fixed));
     }
 
     #[test]

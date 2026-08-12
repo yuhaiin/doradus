@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, watch};
 
 use yuhaiin_core::flow::{
@@ -633,7 +633,10 @@ impl ConnectionMonitor {
                 .and_then(Value::as_str)
                 .cmp(&left.get("time").and_then(Value::as_str))
         });
-        json!({"items": items, "dumpProcessEnabled": false})
+        json!({
+            "items": items,
+            "dumpProcessEnabled": state.block_history.values().any(|entry| !entry.process.is_empty()),
+        })
     }
 
     pub fn initial_event(&self) -> MonitorEvent {
@@ -715,27 +718,45 @@ impl ConnectionMonitor {
     }
 
     pub fn record_failure(&self, protocol: &str, host: &str, error: &str) {
+        self.record_failure_with_process(protocol, host, error, None);
+    }
+
+    /// Record a failed dial with the same process dimension as Go's
+    /// `failed_connection_history` table.  The short compatibility wrapper
+    /// above is kept for failures that happen before an inbound context has
+    /// been built (for example malformed protocol input).
+    pub fn record_failure_with_process(
+        &self,
+        protocol: &str,
+        host: &str,
+        error: &str,
+        process: Option<&str>,
+    ) {
         let mut state = self.lock();
-        let key = (protocol.to_owned(), host.to_owned(), String::new());
-        let entry = state
-            .failed_history
-            .entry(key)
-            .or_insert_with(|| FailedEntry {
-                protocol: protocol.to_owned(),
-                host: host.to_owned(),
-                process: String::new(),
-                error: error.to_owned(),
-                time: unix_seconds(),
-                count: 0,
-            });
-        entry.count = entry.count.saturating_add(1);
-        entry.error = error.to_owned();
-        entry.time = unix_seconds();
-        let bucket = entry.time.div_euclid(3600) * 3600;
+        let process = process.unwrap_or_default().to_owned();
+        let key = (protocol.to_owned(), host.to_owned(), process.clone());
+        let bucket = {
+            let entry = state
+                .failed_history
+                .entry(key)
+                .or_insert_with(|| FailedEntry {
+                    protocol: protocol.to_owned(),
+                    host: host.to_owned(),
+                    process: process.clone(),
+                    error: error.to_owned(),
+                    time: unix_seconds(),
+                    count: 0,
+                });
+            entry.count = entry.count.saturating_add(1);
+            entry.error = error.to_owned();
+            entry.time = unix_seconds();
+            entry.time.div_euclid(3600) * 3600
+        };
         let connection = json!({
             "network": {"connType": protocol},
             "addr": host,
             "destination": host,
+            "process": process,
         });
         for (dimension, value) in telemetry_dimensions(&connection) {
             let item = state
@@ -927,15 +948,28 @@ impl ConnectionMonitor {
                 .unwrap_or_default()
                 .to_owned();
             let key = (protocol.clone(), host.clone(), process.clone());
-            let blocked = state.block_history.entry(key).or_insert(BlockEntry {
-                protocol,
-                host,
-                process,
-                time: unix_seconds(),
-                count: 0,
-            });
-            blocked.time = unix_seconds();
-            blocked.count = blocked.count.saturating_add(1);
+            {
+                let blocked = state.block_history.entry(key).or_insert(BlockEntry {
+                    protocol,
+                    host,
+                    process,
+                    time: unix_seconds(),
+                    count: 0,
+                });
+                blocked.time = unix_seconds();
+                blocked.count = blocked.count.saturating_add(1);
+            }
+            while state.block_history.len() > GO_HISTORY_SIZE {
+                let Some(key) = state
+                    .block_history
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.time)
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                state.block_history.remove(&key);
+            }
         }
         state.ids.remove(&entry.id);
         state.close_requests.retain(|pending| *pending != flow);
@@ -1019,6 +1053,17 @@ impl ConnectionMonitor {
                 )
             })
             .collect();
+        while state.block_history.len() > GO_HISTORY_SIZE {
+            let Some(key) = state
+                .block_history
+                .iter()
+                .min_by_key(|(_, entry)| entry.time)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            state.block_history.remove(&key);
+        }
         state.telemetry = persisted
             .telemetry
             .into_iter()
@@ -1541,13 +1586,9 @@ fn unix_seconds() -> i64 {
 }
 
 fn format_time(seconds: i64) -> String {
-    OffsetDateTime::from_unix_timestamp(seconds)
-        .ok()
-        .and_then(|time| {
-            let offset = UtcOffset::local_offset_at(time).unwrap_or(UtcOffset::UTC);
-            time.to_offset(offset).format(&Rfc3339).ok()
-        })
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
+    // Go's `time.Unix` JSON representation is emitted in UTC by the service
+    // contract. Do not let the host timezone leak into frontend responses.
+    format_time_utc(seconds)
 }
 
 fn format_time_utc(seconds: i64) -> String {
@@ -1601,7 +1642,7 @@ fn history_count(item: &Value) -> u64 {
 /// the API or writing the projection back.
 fn coalesce_history(items: Vec<Value>) -> Vec<Value> {
     let mut merged = BTreeMap::<(String, String, String), Value>::new();
-    for item in items {
+    for item in items.into_iter().map(normalize_history_time) {
         let key = history_key(&item);
         if let Some(existing) = merged.get_mut(&key) {
             let count = history_count(existing).saturating_add(history_count(&item));
@@ -1620,6 +1661,17 @@ fn coalesce_history(items: Vec<Value>) -> Vec<Value> {
             .then_with(|| history_key(left).cmp(&history_key(right)))
     });
     items
+}
+
+fn normalize_history_time(mut item: Value) -> Value {
+    let timestamp = item
+        .get("time")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_time(Some(value)));
+    if let Some(timestamp) = timestamp {
+        item["time"] = Value::String(format_time(timestamp));
+    }
+    item
 }
 
 fn history_time(item: &Value) -> i64 {
@@ -1720,6 +1772,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             GO_TELEMETRY_DIMENSIONS.to_vec()
         );
+    }
+
+    #[test]
+    fn history_times_are_serialized_in_utc() {
+        assert_eq!(format_time(1_752_883_200), "2025-07-19T00:00:00Z");
     }
 
     #[test]
@@ -2092,6 +2149,39 @@ mod tests {
                 .iter()
                 .any(|item| item["value"] == "http" && item["failures"] == "1")
         );
+        let failure_process = failures["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|group| group["dimension"] == "process")
+            .unwrap();
+        assert!(
+            failure_process["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["failures"] == "0")
+        );
+        monitor.record_failure_with_process(
+            "http",
+            "example.com:443",
+            "timeout",
+            Some("/usr/bin/browser"),
+        );
+        let failures = monitor.telemetry_value_range(now - 3_600, now + 3_600, 10);
+        let failure_process = failures["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|group| group["dimension"] == "process")
+            .unwrap();
+        assert!(
+            failure_process["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["value"] == "/usr/bin/browser" && item["failures"] == "1" })
+        );
     }
 
     #[test]
@@ -2165,12 +2255,14 @@ mod tests {
         let (flow, mut context) = flow();
         context.route_mode = RouteMode::Block;
         context.original_domain = Some(yuhaiin_core::DomainName::new("blocked.example").unwrap());
+        context.process = Some("/usr/bin/browser".to_owned());
         monitor.opened(flow, context);
         monitor.closed(flow.key);
 
         let mut second = FlowContext::new(Endpoint::ip(flow.key.network, flow.key.destination));
         second.route_mode = RouteMode::Block;
         second.original_domain = Some(yuhaiin_core::DomainName::new("blocked.example").unwrap());
+        second.process = Some("/usr/bin/browser".to_owned());
         monitor.opened(flow, second);
         monitor.closed(flow.key);
 
@@ -2180,7 +2272,49 @@ mod tests {
         assert_eq!(value["items"][0]["protocol"], "");
         assert_eq!(value["items"][0]["host"], "blocked.example");
         assert_eq!(value["items"][0]["blockCount"], "2");
-        assert_eq!(value["dumpProcessEnabled"], false);
+        assert_eq!(value["dumpProcessEnabled"], true);
+    }
+
+    #[test]
+    fn monitor_keeps_failed_history_processes_separate_and_exposes_the_flag() {
+        let monitor = ConnectionMonitor::new();
+        monitor.record_failure_with_process(
+            "http",
+            "example.com:443",
+            "timeout",
+            Some("/usr/bin/browser"),
+        );
+        monitor.record_failure("http", "example.com:443", "connection refused");
+
+        let value = monitor.failed_history_value();
+        assert_eq!(value["items"].as_array().unwrap().len(), 2);
+        assert_eq!(value["dumpProcessEnabled"], true);
+        assert!(
+            value["items"].as_array().unwrap().iter().any(|item| {
+                item["process"] == "/usr/bin/browser" && item["failedCount"] == "1"
+            })
+        );
+    }
+
+    #[test]
+    fn monitor_bounds_block_history_to_the_go_public_window() {
+        let monitor = ConnectionMonitor::new();
+        for index in 0..=GO_HISTORY_SIZE {
+            let (flow, mut context) = flow();
+            context.route_mode = RouteMode::Block;
+            context.original_domain =
+                Some(yuhaiin_core::DomainName::new(&format!("blocked-{index}.example")).unwrap());
+            context.process = Some(format!("process-{index}"));
+            monitor.opened(flow, context);
+            monitor.closed(flow.key);
+        }
+        assert_eq!(
+            monitor.block_history_value()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            GO_HISTORY_SIZE
+        );
     }
 
     #[test]

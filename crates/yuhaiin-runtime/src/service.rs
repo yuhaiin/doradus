@@ -93,15 +93,22 @@ impl RuntimeService {
         let injected_tun = options.injected_tun;
         let task_controller = controller.clone();
         let task_shutdown = shutdown.clone();
+        let route_refresh_state = state.clone();
         let task = tokio::task::spawn_local(async move {
             let logs = task_controller.monitor().logs();
             let dns_shutdown = shutdown_rx.clone();
             let inbound_shutdown = shutdown_rx.clone();
             let api_shutdown = shutdown_rx.clone();
+            let route_refresh_shutdown = shutdown_rx.clone();
             let dns_task = tokio::task::spawn_local(crate::run_dns_supervisor(
                 task_controller.clone(),
                 dns_shutdown,
             ));
+            let route_refresh_task =
+                tokio::task::spawn_local(crate::api::run_route_list_refresh_loop(
+                    route_refresh_state,
+                    route_refresh_shutdown,
+                ));
             let inbound_controller = task_controller.clone();
             let inbound_task = tokio::task::spawn_local(async move {
                 #[cfg(all(feature = "tun", unix))]
@@ -132,6 +139,7 @@ impl RuntimeService {
             if let Err(error) = inbound_task.await.map_err(join_error)? {
                 logs.error(format!("inbound task stopped: {error}"));
             }
+            route_refresh_task.await.map_err(join_error)?;
             task_controller.persist_monitor().await?;
             if let Some(source) = task_controller.take_restore_request() {
                 restore_database(source, &database).await?;

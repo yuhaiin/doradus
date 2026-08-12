@@ -654,7 +654,7 @@ impl FakeIpPtrTransform {
     }
 }
 
-fn reverse_name_to_ip(domain: &DomainName) -> Option<IpAddr> {
+pub(crate) fn reverse_name_to_ip(domain: &DomainName) -> Option<IpAddr> {
     let labels: Vec<_> = domain.labels().collect();
     if labels.len() == 6
         && labels[4] == "in-addr"

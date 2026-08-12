@@ -39,6 +39,7 @@ where
     context.original_domain = destination.host().cloned();
     spec.annotate_context(&mut context);
     selector.route_context(&mut context);
+    let process = context.process.clone();
     match request.command {
         Command::Tcp => {
             let flow = TunFlowKey {
@@ -51,7 +52,12 @@ where
             let outbound = match selector.select(&context).connect(&context).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    monitor.record_failure("vless", &destination.to_string(), &error.to_string());
+                    monitor.record_failure_with_process(
+                        "vless",
+                        &destination.to_string(),
+                        &error.to_string(),
+                        process.as_deref(),
+                    );
                     return Err(error);
                 }
             };

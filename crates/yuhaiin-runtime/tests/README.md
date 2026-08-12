@@ -26,6 +26,12 @@ The current scenarios cover:
   after a process restart. Run the reusable Podman entry point with
   `make api-reload-flow-smoke`; logs are kept under
   `~/.cache/yuhaiin-rust/integration/api-reload-flow`.
+- `tun_api_process.rs` starts the real foreground binary, writes a user TUN
+  inbound through `/api/v2/inbounds/{id}`, and observes the actual interface
+  in `/proc/net/dev` while toggling disabled/enabled across reloads. It is
+  ignored in the normal workspace run because it needs `/dev/net/tun` and
+  `CAP_NET_ADMIN`; run `make tun-api-process-smoke` so the process and test
+  execute in the disposable Podman namespace under `~/.cache`.
 - HTTP inbound → domain route rule → fixed + HTTP CONNECT outbound, including
   live connection metadata, traffic counters, route testing, and node latency.
 - HTTP inbound + mixed UDP inbound → TLS + HTTP/2 + Yuubinsya UDP-over-TCP
@@ -65,7 +71,11 @@ The current scenarios cover:
   device name to return, and repeats that disable/enable boundary (four cycles
   by default) before shutting down. Set
   `YUHAIIN_TUN_RELOAD_ONLY=1` (the Make target does this) to test lifecycle
-  switching without requiring a working namespace route or proxy traffic.
+  switching without requiring a working namespace route or proxy traffic. The
+  script passes `/dev/net/tun` explicitly when the host exposes it, so a
+  rootless Podman connection can still exercise the real device lifecycle and,
+  when `--privileged` permits the device, the packet smoke as well. The
+  separate transparent/TProxy path still requires a rootful namespace.
 - `scripts/integration/tun-chain-service.sh` runs the same real kernel TUN
   inbound with a SQLite-selected `fixed -> TLS -> HTTP/2 -> Yuubinsya` TCP
   outbound and a loopback echo target. It deliberately half-closes the client
@@ -109,6 +119,16 @@ The current scenarios cover:
   visible on stderr, and then checks a clean SIGTERM shutdown. This protects
   the foreground behavior that makes a manually launched binary distinguishable
   from a hung process.
+- `make go-protocol-interop-smoke` compiles the ignored cross-language
+  harnesses on the host and runs them in Podman: Go Yuubinsya, WebSocket→H2,
+  H2 v1, VLESS, VMess, and Trojan. The Go checkout and all scratch state are
+  mounted from `~/.cache/yuhaiin-rust`; the normal workspace test run does not
+  start external Go processes.
+- `make service-chain-smoke` includes a process-level 3-case protocol matrix:
+  the API writes a Go-shaped fixed+VLESS/VMess/Trojan node, an HTTP inbound
+  routes `example.test` through it, and the Podman test checks payload echo,
+  connection metadata, match history, traffic totals, and the node latency
+  probe through each protocol outbound.
 - `service_chain.rs` also creates a schema-v6 central basic user through the
   real API after the HTTP inbound is already running. It waits for the inbound
   owner to reload, proves invalid credentials are rejected, then sends an
@@ -130,6 +150,9 @@ The current scenarios cover:
   in the sibling Go checkout (or uses `YUHAIIN_SOURCE_DB`), then runs the full
   Go/Rust management parity smoke for each one. Copies and logs live under
   `~/.cache/yuhaiin-rust/production-parity`.
+- `make maxmind-smoke` downloads the selected `Country-without-asn.mmdb` into
+  `~/.cache/yuhaiin-rust/fixtures` with a pinned SHA-256, then runs the ignored
+  real-database IPv4/IPv4-mapped-IPv6 query test in Podman.
 - standalone Go HTTP/2 transport wire compatibility is covered separately in
   `crates/yuhaiin-chain/tests/standalone_http2.rs`: fixed endpoint resolution,
   plaintext prior-knowledge H2, `CONNECT http://localhost`, raw bidirectional
@@ -167,9 +190,10 @@ Podman packet benchmark (`make benchmark-tun-throughput`) in addition to the
 device/lifecycle smoke (`scripts/integration/tun-service.sh`). The TUN runner
 uses one real `tun-rs + smoltcp + fixed proxy + loopback echo` stream and
 defaults to a stable 4 MiB transfer; increase `YUHAIIN_TUN_BENCH_BYTES` only
-when investigating long-stream behavior. WireGuard is intentionally not
-implemented in the current scope, so no WireGuard performance number is
-reported.
+when investigating long-stream behavior. The Cloudflare BoringTun userspace
+adapter has its own Podman packet benchmark (`make benchmark-wireguard-throughput`)
+and is kept separate from this runtime relay benchmark; the current 16 MiB
+same-host baseline is about 554.65 MiB/s with 3,348 KiB peak RSS.
 
 The 2026-08-10 Linux verification completed the lifecycle smoke and the
 default 4 MiB benchmark. The Podman run created and removed `yrtun0`, relayed

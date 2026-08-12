@@ -9,9 +9,10 @@ use http::Request;
 use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use yuhaiin_chain::AsyncYuubinsyaTcpSession;
 use yuhaiin_core::{DomainName, Endpoint, Network};
+use yuhaiin_protocol::{trojan, vless, vmess};
 
 use support::{
     ConnectFixture, H2FinalProtocol, H2ProtocolFixture, H2YuubinsyaFixture, ServiceProcess,
@@ -107,6 +108,365 @@ async fn connect_socks5_with_auth(
     stream.write_all(&request).await.unwrap();
     read_socks5_reply(&mut stream).await;
     stream
+}
+
+#[derive(Clone, Copy)]
+enum ProtocolOutboundKind {
+    Vless,
+    Vmess,
+    Trojan,
+}
+
+impl ProtocolOutboundKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Vless => "vless",
+            Self::Vmess => "vmess",
+            Self::Trojan => "trojan",
+        }
+    }
+
+    fn node_id(self) -> String {
+        format!("{}-runtime-out", self.name())
+    }
+
+    fn inbound_id(self) -> String {
+        format!("{}-runtime-in", self.name())
+    }
+
+    fn rule_name(self) -> String {
+        format!("proxy-example-test-over-{}", self.name())
+    }
+}
+
+async fn protocol_outbound_server(
+    kind: ProtocolOutboundKind,
+    listener: TcpListener,
+    expected_payload: &'static [u8],
+) {
+    for connection in 0..2 {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let destination = Endpoint::domain(
+            Network::Tcp,
+            DomainName::new("example.test").unwrap(),
+            if connection == 0 { 443 } else { 80 },
+        );
+        match kind {
+            ProtocolOutboundKind::Vless => {
+                let uuid = vless::parse_uuid("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+                let request = vless::read_request(&mut stream, &uuid).await.unwrap();
+                assert_eq!(request.command, vless::Command::Tcp);
+                assert_eq!(request.destination, destination);
+                vless::write_response(&mut stream, &[]).await.unwrap();
+                if connection == 0 {
+                    let mut payload = vec![0u8; expected_payload.len()];
+                    stream.read_exact(&mut payload).await.unwrap();
+                    assert_eq!(payload, expected_payload);
+                    stream.write_all(expected_payload).await.unwrap();
+                } else {
+                    let request = read_http_headers(&mut stream).await;
+                    assert!(request.starts_with(b"GET /health HTTP/1.1\r\n"));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            ProtocolOutboundKind::Trojan => {
+                let hash = trojan::password_hash(b"runtime-protocol-password");
+                let request = trojan::read_request(&mut stream, &hash).await.unwrap();
+                assert_eq!(request.command, trojan::Command::Connect);
+                assert_eq!(request.destination, destination);
+                if connection == 0 {
+                    let mut payload = vec![0u8; expected_payload.len()];
+                    stream.read_exact(&mut payload).await.unwrap();
+                    assert_eq!(payload, expected_payload);
+                    stream.write_all(expected_payload).await.unwrap();
+                } else {
+                    let request = read_http_headers(&mut stream).await;
+                    assert!(request.starts_with(b"GET /health HTTP/1.1\r\n"));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            ProtocolOutboundKind::Vmess => {
+                const UUID: [u8; 16] = [
+                    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+                    0xdd, 0xee, 0xff,
+                ];
+                let request = vmess::read_request(&mut stream, &UUID).await.unwrap();
+                assert_eq!(request.destination, destination);
+                let response_key = sha256_key(&request.body_key);
+                let response_iv = sha256_key(&request.body_iv);
+                stream
+                    .write_all(
+                        &vmess::encode_response_header(
+                            request.response_v,
+                            &response_key,
+                            &response_iv,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let payload = vmess::read_body_frame(
+                    &mut stream,
+                    &request.body_key,
+                    &request.body_iv,
+                    request.security,
+                    0,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                if connection == 0 {
+                    assert_eq!(payload, expected_payload);
+                    vmess::write_body_frame(
+                        &mut stream,
+                        &response_key,
+                        &response_iv,
+                        request.security,
+                        0,
+                        expected_payload,
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    assert!(payload.starts_with(b"GET /health HTTP/1.1\r\n"));
+                    vmess::write_body_frame(
+                        &mut stream,
+                        &response_key,
+                        &response_iv,
+                        request.security,
+                        0,
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+    }
+}
+
+async fn read_http_headers(stream: &mut TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    let mut byte = [0u8; 1];
+    while !request.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await.unwrap();
+        request.push(byte[0]);
+        assert!(
+            request.len() <= 16 * 1024,
+            "HTTP latency request exceeded header limit"
+        );
+    }
+    request
+}
+
+fn sha256_key(input: &[u8; 16]) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(input)[..16].try_into().unwrap()
+}
+
+async fn configure_protocol_outbound_chain(
+    service: &ServiceProcess,
+    kind: ProtocolOutboundKind,
+    inbound: SocketAddr,
+    server: SocketAddr,
+) {
+    let node_id = kind.node_id();
+    let inbound_id = kind.inbound_id();
+    let rule_name = kind.rule_name();
+    let protocol_layer = match kind {
+        ProtocolOutboundKind::Vless => json!({
+            "type":"vless",
+            "vless":{"uuid":"00112233-4455-6677-8899-aabbccddeeff"}
+        }),
+        ProtocolOutboundKind::Vmess => json!({
+            "type":"vmess",
+            "vmess":{
+                "id":"00112233-4455-6677-8899-aabbccddeeff",
+                "aid":"0",
+                "security":"aes-128-gcm"
+            }
+        }),
+        ProtocolOutboundKind::Trojan => json!({
+            "type":"trojan",
+            "trojan":{"password":"runtime-protocol-password"}
+        }),
+    };
+    let node = json!({
+        "id":node_id,
+        "name":format!("{} runtime protocol outbound", kind.name()),
+        "group":"integration",
+        "enabled":true,
+        "chain":[
+            {"type":"fixed","fixed":{"host":"127.0.0.1","port":server.port()}},
+            protocol_layer
+        ]
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes",
+        Some(&node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        &format!("/api/v2/nodes/{node_id}/use"),
+        None,
+    )
+    .await;
+
+    let inbound = json!({
+        "id":inbound_id,
+        "name":format!("{} runtime protocol inbound", kind.name()),
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":{"type":"http","http":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+
+    let rule = json!({
+        "name":rule_name,
+        "mode":"proxy",
+        "match":{"domain":"example.test"},
+        "tag":"protocol-integration"
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/route/rules",
+        Some(&rule),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+}
+
+async fn run_protocol_outbound_chain(kind: ProtocolOutboundKind) {
+    let expected_payload: &'static [u8] = match kind {
+        ProtocolOutboundKind::Vless => b"runtime-vless-outbound",
+        ProtocolOutboundKind::Vmess => b"runtime-vmess-outbound",
+        ProtocolOutboundKind::Trojan => b"runtime-trojan-outbound",
+    };
+    let protocol_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let protocol_server = protocol_listener.local_addr().unwrap();
+    let server_task = tokio::spawn(protocol_outbound_server(
+        kind,
+        protocol_listener,
+        expected_payload,
+    ));
+
+    let _default_mixed_blocker = TcpListener::bind("127.0.0.1:1080").await.ok();
+    let inbound = support::reserve_loopback().await;
+    let root = integration_dir(&format!("service-{}-runtime-outbound", kind.name()));
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_protocol_outbound_chain(&service, kind, inbound, protocol_server).await;
+
+    let mut client = connect_loopback(inbound).await;
+    let authority = "example.test:443";
+    client
+        .write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut headers = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while !headers.windows(4).any(|window| window == b"\r\n\r\n") {
+        let length = client.read(&mut buffer).await.unwrap();
+        assert!(length > 0, "HTTP inbound closed before protocol response");
+        headers.extend_from_slice(&buffer[..length]);
+    }
+    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 200"));
+
+    client.write_all(expected_payload).await.unwrap();
+    let mut echoed = vec![0u8; expected_payload.len()];
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, expected_payload);
+
+    let connections = wait_for_connection(&service.client, &service.base_url).await;
+    let inbound_id = kind.inbound_id();
+    let node_id = kind.node_id();
+    let item = connections["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inboundName"] == inbound_id)
+        .expect("runtime protocol outbound connection must be visible");
+    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["outbound"], protocol_server.to_string());
+    assert_eq!(item["nodeId"], node_id);
+    assert_eq!(item["mode"], "proxy");
+    assert!(item["matchHistory"].as_array().is_some_and(|history| {
+        history
+            .iter()
+            .any(|entry| entry["ruleName"] == kind.rule_name())
+    }));
+
+    let total = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::GET,
+        "/api/v2/connections/total",
+        None,
+    )
+    .await;
+    assert!(total["upload"].as_str().unwrap().parse::<u64>().unwrap() > 0);
+    assert!(total["download"].as_str().unwrap().parse::<u64>().unwrap() > 0);
+
+    let latency = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        &format!("/api/v2/nodes/{node_id}/latency"),
+        Some(&json!({
+            "id": node_id,
+            "type": "http",
+            "url": "http://example.test/health",
+            "timeoutMs": 5_000
+        })),
+    )
+    .await;
+    assert_eq!(
+        latency["ok"], true,
+        "protocol node latency failed: {latency}"
+    );
+
+    client.shutdown().await.unwrap();
+    service.shutdown().await;
+    server_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_protocol_outbounds_round_trip_through_http_router() {
+    for kind in [
+        ProtocolOutboundKind::Vless,
+        ProtocolOutboundKind::Vmess,
+        ProtocolOutboundKind::Trojan,
+    ] {
+        run_protocol_outbound_chain(kind).await;
+    }
 }
 
 async fn yuubinsya_auth_is_rejected(

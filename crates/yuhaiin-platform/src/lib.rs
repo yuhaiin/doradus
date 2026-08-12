@@ -28,3 +28,75 @@ pub fn async_device_from_owned_fd(fd: OwnedFd) -> std::io::Result<AsyncDevice> {
     // unique ownership exactly once to tun-rs::AsyncDevice.
     unsafe { AsyncDevice::from_fd(raw_fd) }
 }
+
+/// Bring the namespace-local loopback interface up.
+///
+/// This is used by disposable Linux smoke namespaces whose `--network=none`
+/// loopback starts down. It is also a small safe platform boundary that can be
+/// reused by future Linux integration fixtures without duplicating netlink
+/// message construction in individual binaries.
+#[cfg(target_os = "linux")]
+pub fn enable_loopback() -> std::io::Result<()> {
+    use netlink_packet_core::{
+        NLM_F_ACK, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage, NetlinkPayload,
+    };
+    use netlink_packet_route::{
+        AddressFamily, RouteNetlinkMessage,
+        link::{LinkFlags, LinkMessage},
+    };
+    use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_ROUTE};
+
+    let index = nix::net::if_::if_nametoindex("lo")
+        .map_err(|error| std::io::Error::other(format!("find loopback interface: {error}")))?;
+    let mut link = LinkMessage::default();
+    link.header.interface_family = AddressFamily::Unspec;
+    link.header.index = index;
+    link.header.flags = LinkFlags::Up;
+    link.header.change_mask = LinkFlags::Up;
+    let mut packet = NetlinkMessage::new(
+        NetlinkHeader::default(),
+        NetlinkPayload::from(RouteNetlinkMessage::SetLink(link)),
+    );
+    packet.header.flags = NLM_F_REQUEST | NLM_F_ACK;
+    packet.header.sequence_number = 1;
+    packet.finalize();
+    let mut request = vec![0; packet.header.length as usize];
+    packet.serialize(&mut request);
+
+    let mut socket = Socket::new(NETLINK_ROUTE)?;
+    socket.bind_auto()?;
+    socket.connect(&SocketAddr::new(0, 0))?;
+    socket.send(&request, 0)?;
+
+    let mut response = vec![0; 4096];
+    loop {
+        let size = socket.recv(&mut &mut response[..], 0)?;
+        let mut offset = 0;
+        while offset < size {
+            let message =
+                NetlinkMessage::<RouteNetlinkMessage>::deserialize(&response[offset..size])
+                    .map_err(|error| {
+                        std::io::Error::other(format!("parse loopback response: {error}"))
+                    })?;
+            let length = message.header.length as usize;
+            if length == 0 || offset.saturating_add(length) > size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid loopback netlink response length",
+                ));
+            }
+            offset += length;
+            if let NetlinkPayload::Error(error) = message.payload {
+                return match error.code {
+                    None => Ok(()),
+                    Some(_) => Err(error.into()),
+                };
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn enable_loopback() -> std::io::Result<()> {
+    Ok(())
+}

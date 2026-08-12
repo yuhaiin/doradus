@@ -18,8 +18,9 @@ use yuhaiin_core::{Endpoint, FlowContext, Network, Result};
 
 use crate::inbound::InboundSpec;
 use crate::proxy::common::{
-    UDP_IDLE_TIMEOUT, UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows,
-    io_error, reap_expired_udp_flows, relay_counted_with_buffer, shutdown_udp_flow, udp_flow_key,
+    UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows, io_error,
+    reap_expired_udp_flows_with_timeout, relay_counted_with_buffer, shutdown_udp_flow,
+    udp_flow_key, udp_idle_timeout,
 };
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -78,12 +79,18 @@ where
     context.original_domain = destination.host().cloned();
     spec.annotate_context(&mut context);
     selector.route_context(&mut context);
+    let process = context.process.clone();
     let proxy = selector.select(&context);
     let outbound = match proxy.connect(&context).await {
         Ok(outbound) => outbound,
         Err(error) => {
             yuhaiin_protocol::socks5_server::write_reply(&mut stream, 5).await?;
-            monitor.record_failure("socks5", &destination.to_string(), &error.to_string());
+            monitor.record_failure_with_process(
+                "socks5",
+                &destination.to_string(),
+                &error.to_string(),
+                process.as_deref(),
+            );
             return Err(error);
         }
     };
@@ -127,7 +134,8 @@ pub(crate) async fn serve_socks5_udp_loop(
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
     let mut flows = HashMap::<UdpFlowId, UdpFlowState>::new();
     let mut close_events = monitor.subscribe_close_requests();
-    let mut idle_tick = tokio::time::interval(UDP_IDLE_TIMEOUT);
+    let idle_timeout = udp_idle_timeout();
+    let mut idle_tick = tokio::time::interval(idle_timeout);
     let mut client = None;
     let mut packet = vec![0u8; udp_buffer_size];
     loop {
@@ -225,7 +233,7 @@ pub(crate) async fn serve_socks5_udp_loop(
                 }
             }
             _ = idle_tick.tick() => {
-                reap_expired_udp_flows(&mut flows).await;
+                reap_expired_udp_flows_with_timeout(&mut flows, idle_timeout).await;
             }
             else => break,
         }

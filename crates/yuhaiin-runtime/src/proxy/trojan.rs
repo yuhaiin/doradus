@@ -16,8 +16,8 @@ use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 use yuhaiin_protocol::trojan::{self, Command};
 
 use super::common::{
-    UDP_IDLE_TIMEOUT, answer_dns_packet, relay_counted_with_buffer, relay_counted_with_prefix,
-    udp_flow_expired,
+    answer_dns_packet, relay_counted_with_buffer, relay_counted_with_prefix, udp_flow_expired,
+    udp_idle_timeout,
 };
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -59,6 +59,7 @@ where
     context.original_domain = destination.host().cloned();
     spec.annotate_context(&mut context);
     selector.route_context(&mut context);
+    let process = context.process.clone();
     let flow = TunFlowKey {
         network: Network::Tcp,
         source: peer,
@@ -69,7 +70,12 @@ where
     let outbound = match selector.select(&context).connect(&context).await {
         Ok(stream) => stream,
         Err(error) => {
-            monitor.record_failure("trojan", &destination.to_string(), &error.to_string());
+            monitor.record_failure_with_process(
+                "trojan",
+                &destination.to_string(),
+                &error.to_string(),
+                process.as_deref(),
+            );
             return Err(error);
         }
     };
@@ -126,7 +132,8 @@ where
     let udp_ringbuffer_size = selector.udp_ringbuffer_size().max(1);
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
     let mut flows = HashMap::<Endpoint, UdpFlowState>::new();
-    let mut idle_tick = tokio::time::interval(UDP_IDLE_TIMEOUT);
+    let idle_timeout = udp_idle_timeout();
+    let mut idle_tick = tokio::time::interval(idle_timeout);
     let mut packet = vec![0u8; udp_buffer_size];
     loop {
         tokio::select! {
@@ -209,7 +216,7 @@ where
                 let now = std::time::Instant::now();
                 let expired = flows
                     .iter()
-                    .filter(|(_, state)| udp_flow_expired(state.last_seen, now, UDP_IDLE_TIMEOUT))
+                    .filter(|(_, state)| udp_flow_expired(state.last_seen, now, idle_timeout))
                     .map(|(id, _)| id.clone())
                     .collect::<Vec<_>>();
                 for id in expired {

@@ -5,6 +5,7 @@
 //! stack.
 
 use std::env;
+use std::net::Ipv6Addr;
 use std::thread;
 use std::time::Duration;
 
@@ -24,30 +25,85 @@ fn main() -> std::io::Result<()> {
     let read_once = env::var_os("YUHAIIN_TUN_READ_ONCE").is_some();
     let echo = env::var_os("YUHAIIN_TUN_ECHO").is_some();
     let proxy_echo = env::var_os("YUHAIIN_TUN_PROXY_ECHO").is_some();
+    let udp_proxy_echo = env::var_os("YUHAIIN_TUN_UDP_PROXY_ECHO").is_some();
     let proxy_throughput = env::var_os("YUHAIIN_TUN_PROXY_THROUGHPUT").is_some();
     let dns_echo = env::var_os("YUHAIIN_TUN_DNS_ECHO").is_some();
     let route_smoke = env::var_os("YUHAIIN_TUN_ROUTE_SMOKE").is_some();
+    let ipv6 = env::var("YUHAIIN_TUN_IPV6")
+        .ok()
+        .map(|value| {
+            let (address, prefix) = value
+                .split_once('/')
+                .ok_or_else(|| std::io::Error::other("YUHAIIN_TUN_IPV6 needs address/prefix"))?;
+            let address: Ipv6Addr = address
+                .parse()
+                .map_err(|error| std::io::Error::other(format!("invalid IPv6 address: {error}")))?;
+            let prefix: u8 = prefix
+                .parse()
+                .map_err(|error| std::io::Error::other(format!("invalid IPv6 prefix: {error}")))?;
+            if prefix > 128 {
+                return Err(std::io::Error::other("IPv6 prefix is greater than 128"));
+            }
+            Ok((address, prefix))
+        })
+        .transpose()?;
+    let queue_capacity = env::var("YUHAIIN_TUN_QUEUE_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8);
     let mut runtime = TunRuntime::open(TunConfig {
         name,
-        ipv4: Some(("10.0.0.1".parse().expect("literal IPv4"), 24)),
-        ipv6: Vec::new(),
+        ipv4: ipv6
+            .is_none()
+            .then(|| ("10.0.0.1".parse().expect("literal IPv4"), 24)),
+        ipv6: ipv6.iter().copied().collect(),
         mtu: 1500,
-        queue_capacity: 8,
+        queue_capacity,
     })?;
     if route_smoke {
         #[cfg(all(feature = "tun-routes", target_os = "linux"))]
         {
             use yuhaiin_core::tun::TunRoute;
 
-            let route = TunRoute::new(
-                "198.18.0.0"
+            // Keep the route smoke independent from the service fixture's
+            // single /32 route.  Multiple disjoint prefixes exercise the
+            // same netlink lease with both the normal and metric-bearing
+            // route forms, and let the container assert that every owned
+            // route disappears when the process exits.
+            let mut metered = TunRoute::new(
+                "203.0.113.0"
                     .parse()
                     .expect("literal route destination IPv4"),
-                15,
+                24,
             )
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-            runtime.install_linux_routes(&[route])?;
-            println!("tun-route-installed");
+            metered.metric = Some(42_424);
+            let mut routes = vec![
+                TunRoute::new(
+                    "198.18.0.0"
+                        .parse()
+                        .expect("literal route destination IPv4"),
+                    15,
+                )
+                .map_err(|error| std::io::Error::other(error.to_string()))?,
+                metered,
+                TunRoute::new(
+                    "192.0.2.0".parse().expect("literal route destination IPv4"),
+                    24,
+                )
+                .map_err(|error| std::io::Error::other(error.to_string()))?,
+            ];
+            if udp_proxy_echo {
+                routes.push(
+                    TunRoute::new(
+                        "10.0.0.2".parse().expect("literal UDP proxy route IPv4"),
+                        32,
+                    )
+                    .map_err(|error| std::io::Error::other(error.to_string()))?,
+                );
+            }
+            runtime.install_linux_routes(&routes)?;
+            println!("tun-route-installed count={}", routes.len());
         }
         #[cfg(not(all(feature = "tun-routes", target_os = "linux")))]
         {
@@ -60,8 +116,10 @@ fn main() -> std::io::Result<()> {
     // Keep 10.0.0.1 as the Linux-facing address and put 10.0.0.2 first in the
     // smoltcp address list. A namespace ping to .2 therefore enters the TUN,
     // while smoltcp emits the echo reply with .2 as its source address.
-    runtime
-        .replace_ip_addresses(&[
+    let test_addresses = if let Some((address, prefix)) = ipv6 {
+        vec![IpCidr::new(IpAddress::Ipv6(address), prefix)]
+    } else {
+        vec![
             IpCidr::new(
                 IpAddress::Ipv4("10.0.0.2".parse().expect("literal IPv4")),
                 24,
@@ -70,8 +128,18 @@ fn main() -> std::io::Result<()> {
                 IpAddress::Ipv4("10.0.0.1".parse().expect("literal IPv4")),
                 24,
             ),
-        ])
+        ]
+    };
+    runtime
+        .replace_ip_addresses(&test_addresses)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
+    // `--network=none` leaves the namespace-local loopback interface down.
+    // The proxy benchmark and echo fixture deliberately connect to a local
+    // target, so enable only this disposable test namespace; production TUN
+    // setup does not use this helper.
+    if proxy_throughput || proxy_echo || udp_proxy_echo {
+        yuhaiin_platform::enable_loopback()?;
+    }
     if proxy_throughput {
         #[cfg(feature = "async-proxy")]
         {
@@ -95,6 +163,19 @@ fn main() -> std::io::Result<()> {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "YUHAIIN_TUN_PROXY_ECHO requires the async-proxy feature",
+            ));
+        }
+    }
+    if udp_proxy_echo {
+        #[cfg(feature = "async-proxy")]
+        {
+            return run_udp_proxy_echo(runtime);
+        }
+        #[cfg(not(feature = "async-proxy"))]
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "YUHAIIN_TUN_UDP_PROXY_ECHO requires the async-proxy feature",
             ));
         }
     }
@@ -569,8 +650,100 @@ fn run_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
 }
 
 #[cfg(feature = "async-proxy")]
-fn run_dns_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
+fn run_udp_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
     use std::net::UdpSocket;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use yuhaiin_core::proxy::{AsyncProxy, DropAsyncProxy, FixedAsyncProxy, StaticProxySelector};
+    use yuhaiin_core::tun::{TunDispatcher, TunProxyRuntime};
+
+    let async_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    async_runtime.block_on(async move {
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let target_address = target.local_addr()?;
+        let target_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 256];
+            let (length, peer) = target.recv_from(&mut buffer).await?;
+            target.send_to(&buffer[..length], peer).await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let client = std::thread::spawn(move || -> std::io::Result<()> {
+            let result = (|| -> std::io::Result<()> {
+                let socket = UdpSocket::bind("0.0.0.0:0")?;
+                socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+                socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+                let payload = b"tun-udp-proxy";
+                socket.send_to(payload, "10.0.0.2:18080")?;
+                let mut response = [0u8; 256];
+                let (length, _) = socket.recv_from(&mut response)?;
+                if response[..length] != *payload {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "TUN UDP proxy echo payload mismatch",
+                    ));
+                }
+                Ok(())
+            })();
+            let signal = result.as_ref().map(|_| ()).map_err(ToString::to_string);
+            let _ = done_tx.send(signal);
+            result
+        });
+
+        let proxy: Arc<dyn AsyncProxy> = Arc::new(FixedAsyncProxy {
+            address: target_address,
+            timeout: Duration::from_secs(2),
+        });
+        let drop_proxy: Arc<dyn AsyncProxy> = Arc::new(DropAsyncProxy);
+        let selector = Arc::new(StaticProxySelector {
+            direct: Arc::clone(&drop_proxy),
+            proxy,
+            bypass: Arc::clone(&drop_proxy),
+            drop: Arc::clone(&drop_proxy),
+        });
+        let mut proxy_runtime = TunProxyRuntime::new(selector, 32)
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+            .with_io_timeout(Duration::from_secs(5))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut dispatcher = TunDispatcher::new(2048, 2048, 16)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        runtime
+            .run_dispatcher_until(
+                &mut dispatcher,
+                &mut proxy_runtime,
+                Duration::from_millis(1),
+                async move {
+                    let result = done_rx.await.unwrap_or_else(|_| Err("shutdown".into()));
+                    let _ = result_tx.send(result);
+                },
+            )
+            .await?;
+        proxy_runtime.close();
+        if let Err(message) = result_rx
+            .await
+            .map_err(|_| std::io::Error::other("TUN UDP proxy result channel closed"))?
+        {
+            let _ = client.join();
+            return Err(std::io::Error::other(message));
+        }
+        client
+            .join()
+            .map_err(|_| std::io::Error::other("TUN UDP proxy client thread panicked"))??;
+        target_task
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))??;
+        println!("tun-udp-proxy-echo-ok");
+        Ok(())
+    })
+}
+
+#[cfg(feature = "async-proxy")]
+fn run_dns_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
+    use std::net::{SocketAddr, UdpSocket};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -610,8 +783,12 @@ fn run_dns_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
         .enable_all()
         .build()?;
     async_runtime.block_on(async move {
+        let dns_port = env::var("YUHAIIN_TUN_DNS_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(53);
         let query = encode_query(
-            53,
+            dns_port,
             &DomainName::new("example.com").map_err(|error| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
             })?,
@@ -624,10 +801,13 @@ fn run_dns_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
             let result = (|| -> std::io::Result<()> {
                 let socket = UdpSocket::bind("0.0.0.0:0")?;
                 socket.set_read_timeout(Some(Duration::from_secs(5)))?;
-                socket.send_to(&query, "10.0.0.2:53")?;
+                socket.send_to(
+                    &query,
+                    SocketAddr::new("10.0.0.2".parse().unwrap(), dns_port),
+                )?;
                 let mut response = [0u8; 4096];
                 let (length, _) = socket.recv_from(&mut response)?;
-                let response = decode_response(&response[..length], 53, DnsRecordType::A)
+                let response = decode_response(&response[..length], dns_port, DnsRecordType::A)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
                 if response.addresses.v4
                     != vec!["192.0.2.53".parse::<std::net::Ipv4Addr>().unwrap()]

@@ -104,12 +104,15 @@ async fn concurrent_stats_readers_survive_flow_updates_and_restart() {
         format!("{}/api/v2/connections/failed-history", service.base_url),
     ];
 
+    let reader_count = env_usize("YUHAIIN_STATS_READER_COUNT", 8);
+    let reader_rounds = env_usize("YUHAIIN_STATS_READER_ROUNDS", 40);
+    let write_rounds = env_usize("YUHAIIN_STATS_WRITE_ROUNDS", 64);
     let mut readers = Vec::new();
-    for reader_id in 0..8 {
+    for reader_id in 0..reader_count {
         let urls = urls.clone();
         readers.push(tokio::spawn(async move {
             let http = reqwest::Client::new();
-            for round in 0..40 {
+            for round in 0..reader_rounds {
                 let url = &urls[(reader_id + round) % urls.len()];
                 assert_json_success(&http, url).await?;
             }
@@ -118,7 +121,7 @@ async fn concurrent_stats_readers_survive_flow_updates_and_restart() {
     }
 
     let payload = vec![b's'; 16 * 1024];
-    for _ in 0..64 {
+    for _ in 0..write_rounds {
         client.write_all(&payload).await.unwrap();
         let mut echoed = vec![0u8; payload.len()];
         client.read_exact(&mut echoed).await.unwrap();
@@ -156,6 +159,14 @@ async fn concurrent_stats_readers_survive_flow_updates_and_restart() {
     );
     restarted.shutdown().await;
     fixture.shutdown().await;
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

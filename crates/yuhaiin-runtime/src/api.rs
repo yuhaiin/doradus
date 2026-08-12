@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::watch;
@@ -60,6 +61,7 @@ pub struct ApiState {
     shutdown: Option<watch::Sender<bool>>,
     auth: Option<ApiAuth>,
     web_root: Option<PathBuf>,
+    route_list_refreshing: Arc<AtomicBool>,
 }
 
 /// Optional management API credentials. The stored values are SHA-256
@@ -107,6 +109,7 @@ impl ApiState {
             shutdown: None,
             auth: None,
             web_root: None,
+            route_list_refreshing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -566,6 +569,97 @@ fn hex(value: u8) -> Option<u8> {
 
 pub async fn serve(listener: tokio::net::TcpListener, state: ApiState) -> std::io::Result<()> {
     serve_until(listener, state, std::future::pending::<()>()).await
+}
+
+/// Keep remote route-list caches fresh while the runtime is alive.
+///
+/// Go stores this value as minutes and arms a timer whenever the route-list
+/// contract is created or reloaded.  The Rust service owns the equivalent
+/// task so API handlers, embedded hosts and the desktop binary all share the
+/// same lifecycle.  A reload wakes the loop and re-reads the setting, while a
+/// refresh-generated reload is drained before the next timer is armed to
+/// avoid a self-triggered busy loop.
+pub(crate) async fn run_route_list_refresh_loop(state: ApiState, shutdown: watch::Receiver<bool>) {
+    run_route_list_refresh_loop_inner(state, shutdown, None).await;
+}
+
+async fn run_route_list_refresh_loop_inner(
+    state: ApiState,
+    mut shutdown: watch::Receiver<bool>,
+    _test_interval: Option<Duration>,
+) {
+    let mut reloads = state.controller.subscribe_reload();
+    loop {
+        let interval = match load_route_list_config_value(&state).await {
+            Ok(value) => {
+                let interval = route_list_refresh_duration(&value);
+                #[cfg(test)]
+                let interval = match (interval, _test_interval) {
+                    (Some(_), Some(test_interval)) => Some(test_interval),
+                    (interval, None) => interval,
+                    (None, Some(_)) => None,
+                };
+                interval
+            }
+            Err(error) => {
+                state
+                    .controller
+                    .monitor()
+                    .logs()
+                    .error(format!("load route-list refresh interval: {error}"));
+                None
+            }
+        };
+
+        let Some(interval) = interval else {
+            tokio::select! {
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+                result = reloads.recv() => match result {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+            }
+            continue;
+        };
+
+        let sleep = tokio::time::sleep(interval);
+        tokio::pin!(sleep);
+        tokio::select! {
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+            result = reloads.recv() => match result {
+                Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+            _ = &mut sleep => {
+                if *shutdown.borrow() {
+                    return;
+                }
+                if let Err(error) = route_lists_refresh_value(&state).await {
+                    state
+                        .controller
+                        .monitor()
+                        .logs()
+                        .error(format!(
+                            "scheduled route-list refresh failed: {}",
+                            error.message
+                        ));
+                }
+                // A successful refresh publishes a reload event itself. Do
+                // not let that event immediately arm another zero-delay
+                // iteration; the next refresh is due after the configured
+                // interval, just like Go's resetRefreshInterval.
+                while reloads.try_recv().is_ok() {}
+            }
+        }
+    }
 }
 
 pub async fn serve_until<S>(
@@ -1248,6 +1342,32 @@ struct RouteGeoDownloadTransport {
     timeout: Duration,
 }
 
+struct RouteListRefreshGuard {
+    refreshing: Arc<AtomicBool>,
+}
+
+impl RouteListRefreshGuard {
+    fn acquire(refreshing: &Arc<AtomicBool>) -> std::result::Result<Self, ApiError> {
+        if refreshing
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            // RefreshContract returns a plain `refreshing` error. It is not a
+            // user validation failure, so retain Go's generic RPC 500 shape.
+            return Err(ApiError::internal("refreshing"));
+        }
+        Ok(Self {
+            refreshing: Arc::clone(refreshing),
+        })
+    }
+}
+
+impl Drop for RouteListRefreshGuard {
+    fn drop(&mut self) {
+        self.refreshing.store(false, Ordering::Release);
+    }
+}
+
 impl GeoDownloadTransport for RouteGeoDownloadTransport {
     fn download<'a>(&'a self, url: &'a str) -> BoxFuture<'a, yuhaiin_core::Result<Vec<u8>>> {
         let route = Arc::clone(&self.route);
@@ -1341,6 +1461,7 @@ async fn route_lists_activation(State(state): State<ApiState>) -> ApiResult {
 }
 
 async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
+    let _refresh_guard = RouteListRefreshGuard::acquire(&state.route_list_refreshing)?;
     let records = state
         .controller
         .store()
@@ -1377,7 +1498,24 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
         Ok(metadata) => (metadata, None),
         Err(error) => (None, Some(error.to_string())),
     };
+    // Go writes the result of every remote download back into the route-list
+    // contract: successful refresh clears stale `errorMsgs`, while failed
+    // URLs remain visible through both route.lists and route.list.get.  Keep
+    // this update in the same reload transaction as the cache/config change
+    // so a force-stop cannot expose a half-updated management snapshot.
+    let refreshed_route_lists = records
+        .iter()
+        .filter_map(|record| {
+            let errors = report
+                .errors
+                .get(&record.name)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            route_list_record_with_refresh_errors(record, errors)
+        })
+        .collect::<Vec<_>>();
     let refreshed_at = unix_millis();
+    let last_refresh_time = unix_seconds();
     let host_index_refresh_at = refreshed_at.saturating_add(60_000);
     let activation = json!({
         "hostIndexRefreshAt": host_index_refresh_at,
@@ -1390,7 +1528,10 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
     if let Some(object) = list_config.as_object_mut() {
         object.insert(
             "lastRefreshTime".to_owned(),
-            Value::String(refreshed_at.to_string()),
+            // Go's persisted RouteListSettings.LastRefreshTime is Unix
+            // seconds (`time.Now().Unix()`), while activation timestamps are
+            // Unix milliseconds for the UI's pending-apply countdown.
+            Value::String(last_refresh_time.to_string()),
         );
         if let Some(geo) = object
             .entry("maxMindDbGeoIp".to_owned())
@@ -1410,6 +1551,9 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
         .mutate_and_reload(move |store| async move {
             if let Some(metadata) = geo_metadata {
                 store.repository().put_maxmind_metadata(&metadata).await?;
+            }
+            for record in &refreshed_route_lists {
+                store.repository().put_go_route_list(record).await?;
             }
             store
                 .put_config("route.lists.config", &list_config_bytes)
@@ -1631,9 +1775,40 @@ async fn save_node_value(state: &ApiState, value: Value, _index: Option<usize>) 
 }
 
 async fn delete_node_value(state: &ApiState, id: String) -> ApiResult {
+    if !state
+        .controller
+        .store()
+        .repository()
+        .list_go_nodes()
+        .await?
+        .iter()
+        .any(|node| node.id == id)
+    {
+        return Err(ApiError::not_found(format!("node {id:?} was not found")));
+    }
+    state
+        .controller
+        .retarget_node_to_direct(&id)
+        .await
+        .map_err(ApiError::from)?;
     let removed = state
         .controller
         .mutate_and_reload(move |store| async move {
+            let selected_fallback = br##"{"id":"direct"}"##.to_vec();
+            for key in [
+                SELECTED_TCP_NODE_KEY,
+                SELECTED_UDP_NODE_KEY,
+                LEGACY_SELECTED_NODE_KEY,
+            ] {
+                let selected = store
+                    .get_config(key)
+                    .await?
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned));
+                if selected.as_deref() == Some(id.as_str()) {
+                    store.put_config(key, &selected_fallback).await?;
+                }
+            }
             if store.repository().delete_go_node(&id).await? {
                 Ok(())
             } else {
@@ -3463,6 +3638,25 @@ fn route_list_detail_json(record: GoRouteListRecord) -> Value {
     )
 }
 
+fn route_list_record_with_refresh_errors(
+    record: &GoRouteListRecord,
+    errors: &[String],
+) -> Option<GoRouteListRecord> {
+    let mut value = serde_json::from_slice::<Value>(&record.data_json).ok()?;
+    let source = value.get("source").cloned().unwrap_or_default();
+    let source_type = string_or(&source, "type", &record.source_type).to_ascii_lowercase();
+    if source_type != "remote" {
+        return None;
+    }
+    value
+        .as_object_mut()?
+        .insert("errorMsgs".to_owned(), json!(errors));
+    Some(GoRouteListRecord {
+        data_json: serde_json::to_vec(&value).ok()?,
+        ..record.clone()
+    })
+}
+
 fn route_rule_detail_json(record: GoRouteRuleRecord) -> Value {
     let mut value = normalize_route_rule_value(
         &raw_json(&record.data_json, json!({"name": record.name})),
@@ -4001,6 +4195,19 @@ fn log_level_from_json(value: &Value) -> String {
 }
 fn default_route_list_config() -> Value {
     json!({"refreshInterval":"0","lastRefreshTime":"0","error":"","hostIndexDisk":false,"maxMindDbGeoIp":{"downloadUrl":"","error":""}})
+}
+
+/// Go's route-extra contract expresses refresh intervals in minutes. Zero
+/// disables the timer; malformed or overflowing legacy values are treated as
+/// disabled until the user saves a valid configuration.
+fn route_list_refresh_duration(value: &Value) -> Option<Duration> {
+    let minutes = match value.get("refreshInterval") {
+        Some(Value::String(value)) => value.parse::<u64>().ok(),
+        Some(Value::Number(value)) => value.as_u64(),
+        _ => None,
+    };
+    let minutes = minutes.filter(|minutes| *minutes != 0)?;
+    Some(Duration::from_secs(minutes.checked_mul(60)?))
 }
 fn default_fakedns() -> Value {
     json!({"enabled":false,"ipv4Range":"198.18.0.0/15","ipv6Range":"fc00::/18","whitelist":[],"skipCheckList":[]})
@@ -4889,6 +5096,83 @@ mod tests {
         assert!(local["preview"].as_str().unwrap().contains("example.test"));
     }
 
+    #[test]
+    fn route_list_refresh_interval_matches_go_minutes_and_zero_disables() {
+        assert_eq!(
+            route_list_refresh_duration(&json!({"refreshInterval":"3600"})),
+            Some(Duration::from_secs(3600 * 60))
+        );
+        assert_eq!(
+            route_list_refresh_duration(&json!({"refreshInterval":0})),
+            None
+        );
+        assert_eq!(
+            route_list_refresh_duration(&json!({"refreshInterval":"not-a-number"})),
+            None
+        );
+    }
+
+    #[test]
+    fn route_list_refresh_guard_matches_go_single_flight_error_and_release() {
+        let refreshing = Arc::new(AtomicBool::new(false));
+        let guard = RouteListRefreshGuard::acquire(&refreshing).unwrap();
+        let error = match RouteListRefreshGuard::acquire(&refreshing) {
+            Ok(_) => panic!("a second route-list refresh must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.code, "internal_error");
+        assert_eq!(error.message, "refreshing");
+        drop(guard);
+        assert!(RouteListRefreshGuard::acquire(&refreshing).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduled_route_list_refresh_reloads_and_stops_with_service() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let state = state().await;
+                let _ = route_lists_config_put_value(
+                    &state,
+                    json!({
+                        "refreshInterval":"1",
+                        "hostIndexDisk":false,
+                        "maxMindDbGeoIp":{"downloadUrl":""}
+                    }),
+                )
+                .await
+                .unwrap();
+                let (shutdown, receiver) = watch::channel(false);
+                let task = tokio::task::spawn_local(run_route_list_refresh_loop_inner(
+                    state.clone(),
+                    receiver,
+                    Some(Duration::from_millis(1)),
+                ));
+
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let config = state
+                    .controller
+                    .store()
+                    .get_config("route.lists.config")
+                    .await
+                    .unwrap()
+                    .map(|bytes| raw_json(&bytes, Value::Null))
+                    .unwrap();
+                let last_refresh_time = config["lastRefreshTime"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap();
+                let now = unix_seconds();
+                assert!(last_refresh_time >= now.saturating_sub(2));
+                assert!(last_refresh_time <= now.saturating_add(2));
+
+                shutdown.send(true).unwrap();
+                task.await.unwrap();
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn route_detail_gets_return_go_store_normalized_contracts() {
         let state = state().await;
@@ -4921,6 +5205,48 @@ mod tests {
         assert_eq!(rule.0["name"], "normalized-rule");
         assert_eq!(rule.0["mode"], "bypass");
         assert!(rule.0.get("match").is_none());
+    }
+
+    #[test]
+    fn route_list_refresh_errors_are_persisted_only_for_remote_lists() {
+        let remote = GoRouteListRecord {
+            name: "remote".to_owned(),
+            list_type: "host".to_owned(),
+            source_type: "remote".to_owned(),
+            updated_at: 7,
+            data_json: serde_json::to_vec(&json!({
+                "name":"remote",
+                "type":"host",
+                "source":{"type":"remote","remote":{"urls":["https://rules.example/list"]}},
+                "errorMsgs":["stale"]
+            }))
+            .unwrap(),
+        };
+        let local = GoRouteListRecord {
+            name: "local".to_owned(),
+            list_type: "host".to_owned(),
+            source_type: "local".to_owned(),
+            updated_at: 8,
+            data_json: serde_json::to_vec(&json!({
+                "name":"local",
+                "type":"host",
+                "source":{"type":"local","local":{"lists":["local.example"]}}
+            }))
+            .unwrap(),
+        };
+
+        let updated = route_list_record_with_refresh_errors(
+            &remote,
+            &["https://rules.example/list: timeout".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(updated.name, remote.name);
+        assert_eq!(updated.updated_at, remote.updated_at);
+        assert_eq!(
+            raw_json(&updated.data_json, Value::Null)["errorMsgs"][0],
+            "https://rules.example/list: timeout"
+        );
+        assert!(route_list_record_with_refresh_errors(&local, &[]).is_none());
     }
 
     #[tokio::test]

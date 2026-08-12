@@ -18,7 +18,7 @@ use yuhaiin_core::dns::{
 };
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::dns_tcp_async::AsyncTcpDnsServer;
-use yuhaiin_core::{BoxFuture, LocalBoxFuture, ResolveStrategy, Result};
+use yuhaiin_core::{BoxFuture, LocalBoxFuture, Result};
 #[cfg(feature = "tun")]
 use yuhaiin_core::{Error, ErrorKind};
 #[cfg(feature = "tun")]
@@ -50,29 +50,25 @@ impl RuntimeDnsHandler {
             Ok(question) => question,
             Err(error) => return Err(error),
         };
-        let addresses = self
-            .resolver
-            .resolve(
-                &question.domain,
-                match question.record_type {
-                    DnsRecordType::A => ResolveStrategy::OnlyIpv4,
-                    DnsRecordType::Aaaa => ResolveStrategy::OnlyIpv6,
-                    _ => ResolveStrategy::Default,
+        if question.record_type == DnsRecordType::Ptr
+            && let Some(fakeip) = &self.fakeip
+            && let Some(domain) = fakeip.lookup_ptr_domain(&question.domain).await
+        {
+            return encode_response(
+                packet,
+                &DnsResponse {
+                    addresses: yuhaiin_core::IpSet::default(),
+                    ptr_names: vec![domain],
+                    service_bindings: Vec::new(),
+                    minimum_ttl: Some(60),
                 },
-            )
-            .await?;
-        if let Some(fakeip) = &self.fakeip {
-            fakeip.snapshot().await;
+            );
         }
-        encode_response(
-            packet,
-            &DnsResponse {
-                addresses,
-                ptr_names: Vec::new(),
-                service_bindings: Vec::new(),
-                minimum_ttl: Some(30),
-            },
-        )
+        let response = self
+            .resolver
+            .query(&question.domain, question.record_type)
+            .await?;
+        encode_response(packet, &response)
     }
 }
 
@@ -195,16 +191,36 @@ async fn load_go_tun_config(
     store: &yuhaiin_store::ConfigStore,
 ) -> Result<Option<TunRuntimeConfig>> {
     let records = store.repository().list_go_inbounds().await?;
-    let mut tun_records = records.into_iter().filter(is_tun_record);
-    let Some(record) = tun_records.next() else {
+    let Some(record) = select_go_tun_record(records)? else {
         return Ok(None);
     };
-    if tun_records.next().is_some() {
+    Ok(Some(parse_go_tun_config(&record)?))
+}
+
+/// Select the one TUN device that the desktop runtime can own.
+///
+/// Go stores disabled inbound definitions alongside the active ones. In
+/// particular, a fresh database contains a disabled `tun` default, so an API
+/// client adding its own enabled TUN must not be rejected merely because that
+/// compatibility row exists. Multiple enabled TUNs remain invalid because a
+/// desktop process has one device supervisor; when all TUNs are disabled we
+/// keep the newest definition so editing a disabled inbound is reflected on
+/// the next enable.
+#[cfg(feature = "tun")]
+fn select_go_tun_record(records: Vec<GoInboundRecord>) -> Result<Option<GoInboundRecord>> {
+    let tun_records: Vec<_> = records.into_iter().filter(is_tun_record).collect();
+    let enabled_count = tun_records.iter().filter(|record| record.enabled).count();
+    if enabled_count > 1 {
         return Err(Error::invalid(
-            "multiple enabled/defined TUN inbounds are not supported by the single-device runtime",
+            "multiple enabled TUN inbounds are not supported by the single-device runtime",
         ));
     }
-    Ok(Some(parse_go_tun_config(&record)?))
+    Ok(tun_records.into_iter().max_by(|left, right| {
+        left.enabled
+            .cmp(&right.enabled)
+            .then_with(|| left.updated_at.cmp(&right.updated_at))
+            .then_with(|| left.id.cmp(&right.id))
+    }))
 }
 
 #[cfg(feature = "tun")]
@@ -358,14 +374,31 @@ fn parse_tun_routes(routes: &[String]) -> Result<Vec<yuhaiin_core::tun::TunRoute
 
 #[cfg(feature = "tun")]
 pub(crate) fn open_tun(config: &TunRuntimeConfig) -> Result<yuhaiin_core::tun::TunRuntime> {
-    let tun = yuhaiin_core::tun::TunRuntime::open(config.tun.clone()).map_err(io_error)?;
+    let mut tun = yuhaiin_core::tun::TunRuntime::open(config.tun.clone()).map_err(io_error)?;
     if config.routes.is_empty() {
         return Ok(tun);
     }
     #[cfg(all(feature = "tun-routes", target_os = "linux"))]
     {
-        let mut tun = tun;
         let routes = parse_tun_routes(&config.routes)?;
+        for route in &routes {
+            match route.destination {
+                IpAddr::V4(address) => {
+                    let prefix = config.tun.ipv4.map(|(_, prefix)| prefix).unwrap_or(32);
+                    tun.prepend_ipv4_address(address, prefix)?;
+                }
+                IpAddr::V6(address) => {
+                    let prefix = config
+                        .tun
+                        .ipv6
+                        .iter()
+                        .find(|(_, configured_prefix)| *configured_prefix <= route.prefix)
+                        .map(|(_, prefix)| *prefix)
+                        .unwrap_or(route.prefix);
+                    tun.prepend_ipv6_address(address, prefix)?;
+                }
+            }
+        }
         tun.install_linux_routes(&routes).map_err(io_error)?;
         Ok(tun)
     }
@@ -433,6 +466,7 @@ pub async fn run_tun_device_until_ref(
             async_dns_handler,
         )
         .await?;
+    controller.monitor().info("TUN inbound ready");
     let mut dispatcher = yuhaiin_core::tun::TunDispatcher::new(64 * 1024, 64 * 1024, 2048)?;
     tun.run_dispatcher_until(
         &mut dispatcher,
@@ -575,8 +609,14 @@ mod tests {
     use super::*;
     use crate::RuntimeBuilder;
     use std::sync::Arc;
-    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
-    use yuhaiin_store::ConfigStore;
+    use yuhaiin_core::dns::{
+        AsyncDnsHandler, DnsRecordType, DnsResponse, DnsServiceBinding, DnsServiceParam,
+        decode_response, encode_query,
+    };
+    use yuhaiin_core::dns_resolver_async::{AsyncIpResolver, SystemAsyncIpResolver};
+    use yuhaiin_core::{BoxFuture, DomainName, IpSet, ResolveStrategy};
+    use yuhaiin_store::fakeip::{FakeIpConfig, FakeIpPool, FakeIpV6Config, FakeIpV6Pool};
+    use yuhaiin_store::{ConfigStore, FakeIpPools};
 
     fn platform_tun_config(enabled: bool) -> TunRuntimeConfig {
         TunRuntimeConfig {
@@ -592,6 +632,99 @@ mod tests {
             bypass_id: String::new(),
             drop_id: String::new(),
             channel_capacity: 256,
+        }
+    }
+
+    fn go_tun_record(id: &str, enabled: bool, updated_at: i64) -> GoInboundRecord {
+        let data = serde_json::json!({
+            "id": id,
+            "name": id,
+            "enabled": enabled,
+            "network": {"type": "empty", "empty": {}},
+            "transports": [],
+            "protocol": {
+                "type": "tun",
+                "tun": {
+                    "name": format!("tun://{id}"),
+                    "portal": "10.42.0.1/24"
+                }
+            }
+        });
+        GoInboundRecord {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            enabled,
+            network_type: "empty".to_owned(),
+            protocol_type: "tun".to_owned(),
+            transport_types_json: br"[]".to_vec(),
+            updated_at,
+            data_json: serde_json::to_vec(&data).unwrap(),
+        }
+    }
+
+    #[test]
+    fn go_tun_selection_ignores_disabled_default_when_custom_tun_is_enabled() {
+        let selected = select_go_tun_record(vec![
+            go_tun_record("tun", false, 0),
+            go_tun_record("custom", true, 1),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.id, "custom");
+    }
+
+    #[test]
+    fn go_tun_selection_rejects_multiple_enabled_devices() {
+        let error = select_go_tun_record(vec![
+            go_tun_record("first", true, 1),
+            go_tun_record("second", true, 2),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("multiple enabled TUN"));
+    }
+
+    #[test]
+    fn go_tun_selection_keeps_newest_disabled_definition() {
+        let selected = select_go_tun_record(vec![
+            go_tun_record("older", false, 1),
+            go_tun_record("newer", false, 2),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.id, "newer");
+    }
+
+    struct ServiceBindingResolver;
+
+    impl AsyncIpResolver for ServiceBindingResolver {
+        fn resolve<'a>(
+            &'a self,
+            _domain: &'a DomainName,
+            _strategy: ResolveStrategy,
+        ) -> BoxFuture<'a, Result<IpSet>> {
+            Box::pin(async { Ok(IpSet::default()) })
+        }
+
+        fn query<'a>(
+            &'a self,
+            _domain: &'a DomainName,
+            _record_type: DnsRecordType,
+        ) -> BoxFuture<'a, Result<DnsResponse>> {
+            Box::pin(async {
+                Ok(DnsResponse {
+                    addresses: IpSet::default(),
+                    ptr_names: Vec::new(),
+                    service_bindings: vec![DnsServiceBinding {
+                        priority: 1,
+                        target: Some(DomainName::new("origin.example.test").unwrap()),
+                        params: vec![
+                            DnsServiceParam::Alpn(vec!["h2".to_owned()]),
+                            DnsServiceParam::Port(8443),
+                        ],
+                    }],
+                    minimum_ttl: Some(42),
+                })
+            })
         }
     }
 
@@ -757,6 +890,77 @@ mod tests {
             .unwrap();
         assert_eq!(udp.local_addr().unwrap(), address);
         assert_eq!(tcp.local_addr().unwrap(), address);
+    }
+
+    #[tokio::test]
+    async fn runtime_dns_preserves_https_service_bindings() {
+        let domain = DomainName::new("service.example.test").unwrap();
+        let packet = encode_query(0x5151, &domain, DnsRecordType::Https).unwrap();
+        let handler = RuntimeDnsHandler {
+            resolver: Arc::new(ServiceBindingResolver),
+            fakeip: None,
+        };
+
+        let response = handler.answer(&packet).await.unwrap();
+        let decoded = decode_response(&response, 0x5151, DnsRecordType::Https).unwrap();
+        assert_eq!(decoded.minimum_ttl, Some(42));
+        assert_eq!(decoded.service_bindings.len(), 1);
+        assert_eq!(
+            decoded.service_bindings[0].target,
+            Some(DomainName::new("origin.example.test").unwrap())
+        );
+        assert!(
+            decoded.service_bindings[0]
+                .params
+                .contains(&DnsServiceParam::Alpn(vec!["h2".to_owned()]))
+        );
+        assert!(
+            decoded.service_bindings[0]
+                .params
+                .contains(&DnsServiceParam::Port(8443))
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_dns_returns_preloaded_fakeip_ptr_mapping() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let pool = Arc::new(
+            FakeIpPool::open(
+                store.clone(),
+                FakeIpConfig::new("198.18.0.1".parse().unwrap(), "198.18.0.8".parse().unwrap())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let ipv6 = Arc::new(
+            FakeIpV6Pool::open(
+                store,
+                FakeIpV6Config::new("fc00::1".parse().unwrap(), "fc00::8".parse().unwrap())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let pools = FakeIpPools::new(pool, ipv6);
+        let original = DomainName::new("ptr.example.test").unwrap();
+        let address = pools.ipv4.allocate(original.clone()).await.unwrap();
+        let octets = address.octets();
+        let reverse_name = format!(
+            "{}.{}.{}.{}.in-addr.arpa",
+            octets[3], octets[2], octets[1], octets[0]
+        );
+        let reverse = DomainName::new(&reverse_name).unwrap();
+        let packet = encode_query(0x4242, &reverse, DnsRecordType::Ptr).unwrap();
+        let handler = RuntimeDnsHandler {
+            resolver: Arc::new(SystemAsyncIpResolver),
+            fakeip: Some(pools),
+        };
+
+        let response = handler.answer(&packet).await.unwrap();
+        let decoded = decode_response(&response, 0x4242, DnsRecordType::Ptr).unwrap();
+        assert_eq!(decoded.ptr_names, vec![original]);
+        assert_eq!(decoded.minimum_ttl, Some(60));
     }
 
     #[tokio::test]

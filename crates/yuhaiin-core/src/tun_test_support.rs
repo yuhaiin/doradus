@@ -3,7 +3,7 @@ pub(super) use smoltcp::phy::{ChecksumCapabilities, Device, Medium, TxToken};
 pub(super) use smoltcp::socket::{icmp, tcp, udp};
 pub(super) use smoltcp::wire::{
     HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpProtocol, Ipv4Address, Ipv4Packet,
-    Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+    Ipv4Repr, Ipv6Packet, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
 };
 
 pub(super) fn udp_packet(

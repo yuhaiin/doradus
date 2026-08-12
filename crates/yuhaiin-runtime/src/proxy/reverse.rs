@@ -100,12 +100,18 @@ where
     let mut context = new_context(&destination, peer, &spec);
     context.http_host = request_host(headers);
     selector.route_context(&mut context);
+    let process = context.process.clone();
     let outbound = selector
         .select(&context)
         .connect(&context)
         .await
         .inspect_err(|error| {
-            monitor.record_failure("reverse_http", &destination.to_string(), &error.to_string());
+            monitor.record_failure_with_process(
+                "reverse_http",
+                &destination.to_string(),
+                &error.to_string(),
+                process.as_deref(),
+            );
         })?;
     let outbound = wrap_https_if_needed(outbound, &config).await?;
     let flow = flow_key(peer, &destination);
@@ -138,12 +144,18 @@ where
 {
     let mut context = new_context(&target, peer, &spec);
     selector.route_context(&mut context);
+    let process = context.process.clone();
     let outbound = selector
         .select(&context)
         .connect(&context)
         .await
         .inspect_err(|error| {
-            monitor.record_failure(protocol, &target.to_string(), &error.to_string());
+            monitor.record_failure_with_process(
+                protocol,
+                &target.to_string(),
+                &error.to_string(),
+                process.as_deref(),
+            );
         })?;
     let flow = flow_key(peer, &target);
     relay_counted_with_prefix_and_buffer(

@@ -14,7 +14,11 @@ use yuhaiin_protocol::vless::VlessProxy;
 #[tokio::test]
 #[ignore = "requires the sibling Go checkout and Go toolchain"]
 async fn rust_vless_client_round_trips_against_go_server() {
-    let go_root = "/home/asutorufa/Documents/Programming/yuhaiin";
+    let go_root = std::env::var_os("YUHAIIN_GO_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from("/home/asutorufa/Documents/Programming/yuhaiin")
+        });
     let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/interop/vless_go_server.go");
     let cache_root = std::env::var_os("XDG_CACHE_HOME")
@@ -29,7 +33,7 @@ async fn rust_vless_client_round_trips_against_go_server() {
     let mut child = Command::new("go")
         .arg("run")
         .arg(helper)
-        .current_dir(go_root)
+        .current_dir(&go_root)
         .env("GOEXPERIMENT", "jsonv2,greenteagc")
         .env("GOTMPDIR", &cache_root)
         .env("VLESS_LISTEN", address)

@@ -54,13 +54,19 @@ where
     context.original_domain = destination.host().cloned();
     spec.annotate_context(&mut context);
     selector.route_context(&mut context);
+    let process = context.process.clone();
 
     let proxy = selector.select(&context);
     let outbound = match proxy.connect(&context).await {
         Ok(outbound) => outbound,
         Err(error) => {
             let _ = write_reply(&mut stream, 91, request.address, request.port).await;
-            monitor.record_failure("socks4a", &destination.to_string(), &error.to_string());
+            monitor.record_failure_with_process(
+                "socks4a",
+                &destination.to_string(),
+                &error.to_string(),
+                process.as_deref(),
+            );
             return Err(error);
         }
     };

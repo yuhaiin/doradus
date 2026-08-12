@@ -12,7 +12,7 @@ use std::time::Duration;
 #[cfg(feature = "http2")]
 use std::marker::PhantomData;
 
-use yuhaiin_core::dns::DnsCache;
+use yuhaiin_core::dns::{DnsCache, DnsResponse};
 use yuhaiin_core::dns_resolver_async::{AsyncDnsResolver, AsyncIpResolver, SystemAsyncIpResolver};
 use yuhaiin_core::dns_tcp_async::AsyncTcpDnsClient;
 use yuhaiin_core::dns_udp_async::AsyncUdpDnsClient;
@@ -86,6 +86,18 @@ impl AsyncIpResolver for TimeoutResolver {
                 .map_err(|_| Error::new(ErrorKind::Timeout, "DNS resolver query timed out"))?
         })
     }
+
+    fn query<'a>(
+        &'a self,
+        domain: &'a DomainName,
+        record_type: yuhaiin_core::dns::DnsRecordType,
+    ) -> BoxFuture<'a, Result<DnsResponse>> {
+        Box::pin(async move {
+            tokio::time::timeout(self.timeout, self.inner.query(domain, record_type))
+                .await
+                .map_err(|_| Error::new(ErrorKind::Timeout, "DNS resolver query timed out"))?
+        })
+    }
 }
 
 impl FallbackResolver {
@@ -119,6 +131,37 @@ impl AsyncIpResolver for FallbackResolver {
             }
         })
     }
+
+    fn query<'a>(
+        &'a self,
+        domain: &'a DomainName,
+        record_type: yuhaiin_core::dns::DnsRecordType,
+    ) -> BoxFuture<'a, Result<DnsResponse>> {
+        Box::pin(async move {
+            match self.primary.query(domain, record_type).await {
+                Ok(response) if !dns_response_empty(&response) => Ok(response),
+                Ok(_) => self.fallback.query(domain, record_type).await,
+                Err(primary_error) => self
+                    .fallback
+                    .query(domain, record_type)
+                    .await
+                    .map_err(|fallback_error| {
+                        Error::new(
+                            ErrorKind::Io,
+                            format!(
+                                "resolver primary failed: {primary_error}; fallback failed: {fallback_error}"
+                            ),
+                        )
+                    }),
+            }
+        })
+    }
+}
+
+fn dns_response_empty(response: &DnsResponse) -> bool {
+    response.addresses.is_empty()
+        && response.ptr_names.is_empty()
+        && response.service_bindings.is_empty()
 }
 
 #[derive(Debug, Clone, Copy)]

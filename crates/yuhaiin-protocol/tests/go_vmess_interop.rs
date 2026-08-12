@@ -60,7 +60,11 @@ async fn go_vmess_client_round_trips_against_rust_wire_server() {
         .unwrap();
     });
 
-    let go_root = "/home/asutorufa/Documents/Programming/yuhaiin";
+    let go_root = std::env::var_os("YUHAIIN_GO_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from("/home/asutorufa/Documents/Programming/yuhaiin")
+        });
     let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/interop/vmess_go_client.go");
     let cache_root = std::env::var_os("XDG_CACHE_HOME")
@@ -73,7 +77,7 @@ async fn go_vmess_client_round_trips_against_rust_wire_server() {
         Command::new("go")
             .arg("run")
             .arg(helper)
-            .current_dir(go_root)
+            .current_dir(&go_root)
             .env("GOEXPERIMENT", "jsonv2,greenteagc")
             .env("GOTMPDIR", &cache_root)
             .env("VMESS_LISTEN", listen)

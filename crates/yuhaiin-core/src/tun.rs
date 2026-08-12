@@ -22,6 +22,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::OwnedFd;
 #[cfg(all(feature = "tun-routes", target_os = "linux"))]
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "async-proxy")]
 use std::time::Duration;
@@ -58,7 +59,6 @@ use crate::dns::{AsyncDnsHandler, DnsHandler, answer_query};
 #[cfg(feature = "async-proxy")]
 use crate::proxy::{AsyncProxy, AsyncProxySelector};
 
-#[cfg(feature = "async-proxy")]
 fn tun_debug(message: impl std::fmt::Display) {
     if std::env::var_os("YUHAIIN_TUN_DEBUG").is_some() {
         eprintln!("yuhaiin-rust: tun-debug: {message}");
@@ -70,8 +70,13 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
 const MAX_TCP_EVENT_BYTES_PER_POLL: usize = 64 * 1024;
 const IPV6_FRAGMENT_MAX_ENTRIES: usize = 32;
 const IPV6_FRAGMENT_MAX_FRAGMENTS: usize = 128;
-const IPV6_FRAGMENT_MAX_PACKET: usize = 64 * 1024;
+const IPV6_FRAGMENT_MAX_PACKET: usize = MAX_SMOLTCP_PACKET_SIZE;
 const IPV6_FRAGMENT_TIMEOUT: StdDuration = StdDuration::from_secs(15);
+// The smoltcp device is allowed to produce one complete IP datagram.  The
+// real wire MTU is applied by `fragment_ip_packet` immediately before the
+// datagram crosses the OS TUN boundary.  IPv6's payload-length field permits
+// 40 + 65535 bytes, while IPv4's total-length field is limited to 65535.
+const MAX_SMOLTCP_PACKET_SIZE: usize = 40 + u16::MAX as usize;
 
 #[cfg(feature = "async-proxy")]
 const DEFAULT_GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -100,6 +105,11 @@ impl TunConfig {
     pub fn validate(&self) -> Result<()> {
         if !(576..=9216).contains(&self.mtu) {
             return Err(Error::invalid("TUN MTU must be between 576 and 9216"));
+        }
+        if !self.ipv6.is_empty() && self.mtu < 1280 {
+            return Err(Error::invalid(
+                "TUN MTU must be at least 1280 when IPv6 is configured",
+            ));
         }
         if self.queue_capacity == 0 {
             return Err(Error::invalid("TUN queue capacity must be non-zero"));
@@ -564,6 +574,7 @@ impl TunDispatcher {
         let Some(packet) = device.peek_rx_packet()? else {
             return Ok(());
         };
+        tun_debug(format!("TUN prepare RX packet length={}", packet.len()));
         // smoltcp performs IPv4 reassembly after this hook. A non-initial
         // fragment has no transport header at its payload offset, so trying
         // to parse it here would turn a valid datagram into a malformed-packet
@@ -574,8 +585,10 @@ impl TunDispatcher {
             return Ok(());
         }
         let Some(tuple) = parse_dispatch_transport_tuple(&packet)? else {
+            tun_debug("TUN prepare RX packet has no transport tuple");
             return Ok(());
         };
+        tun_debug(format!("TUN prepare RX tuple={tuple:?}"));
         match tuple.protocol {
             IpProtocol::Tcp if tuple.tcp_syn => self.ensure_tcp_listener(tuple),
             IpProtocol::Udp => self.ensure_udp_socket(tuple.destination),
@@ -690,6 +703,7 @@ impl TunDispatcher {
         if self.udp_by_local.contains_key(&local) {
             return Ok(());
         }
+        tun_debug(format!("TUN UDP socket prepare local={local}"));
         let mut socket = udp::Socket::new(
             udp::PacketBuffer::new(
                 vec![udp::PacketMetadata::EMPTY; self.udp_packet_capacity],
@@ -804,6 +818,11 @@ impl TunDispatcher {
                         destination: local,
                     },
                 };
+                tun_debug(format!(
+                    "TUN UDP datagram flow={:?} bytes={}",
+                    flow.key,
+                    payload.len()
+                ));
                 self.events.push_back(TunEvent::UdpDatagram {
                     flow,
                     payload: payload.to_vec(),
@@ -1385,9 +1404,19 @@ impl TunProxyRuntime {
                     if let Some(observer) = &self.observer {
                         observer.bytes(flow, TunFlowDirection::Download, payload.len());
                     }
-                    if dispatcher.write_udp(flow, &payload).is_err() {
-                        self.remove_flow_task(&flow);
-                        self.untrack_flow(&flow)?;
+                    match dispatcher.write_udp(flow, &payload) {
+                        Ok(()) => tun_debug(format!(
+                            "TUN UDP output queued flow={flow:?} bytes={}",
+                            payload.len()
+                        )),
+                        Err(error) => {
+                            tun_debug(format!(
+                                "TUN UDP output dropped flow={flow:?} bytes={} error={error}",
+                                payload.len()
+                            ));
+                            self.remove_flow_task(&flow);
+                            self.untrack_flow(&flow)?;
+                        }
                     }
                 }
                 ProxyOutput::UdpClosed { flow } => {
@@ -1884,7 +1913,10 @@ async fn run_udp_proxy(
     let datagram = match tokio::time::timeout(timeouts.connect, proxy.open_datagram(&context)).await
     {
         Ok(Ok(datagram)) => datagram,
-        Ok(Err(_)) => {
+        Ok(Err(error)) => {
+            tun_debug(format!(
+                "UDP proxy open failed flow={initial_flow:?}: {error}"
+            ));
             let _ = emit_output(
                 &output,
                 ProxyOutput::UdpClosed { flow: initial_flow },
@@ -1894,6 +1926,7 @@ async fn run_udp_proxy(
             return;
         }
         Err(_) => {
+            tun_debug(format!("UDP proxy open timed out flow={initial_flow:?}"));
             let _ = emit_output(
                 &output,
                 ProxyOutput::UdpClosed { flow: initial_flow },
@@ -1938,10 +1971,13 @@ async fn run_udp_proxy(
                         last_flow = Some(flow);
                         let send = tokio::time::timeout(
                             timeouts.write,
-                            datagram.send_to(&payload, destination),
+                            datagram.send_to(&payload, destination.clone()),
                         )
                         .await;
                         if !matches!(send, Ok(Ok(_))) {
+                            tun_debug(format!(
+                                "UDP proxy send failed flow={flow:?} target={destination:?} result={send:?}"
+                            ));
                             let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
                             for flow in routes.values().copied().collect::<HashSet<_>>() {
                                 let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
@@ -1972,6 +2008,7 @@ async fn run_udp_proxy(
             }
             result = tokio::time::timeout(timeouts.read, datagram.recv_from(&mut buffer)) => {
                 let Ok(Ok((length, source))) = result else {
+                    tun_debug(format!("UDP proxy receive ended flow={initial_flow:?} result={result:?}"));
                     let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
                     for flow in routes.values().copied().collect::<HashSet<_>>() {
                         let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
@@ -2150,6 +2187,257 @@ pub fn inspect_ip_packet_with_mtu(packet: &[u8], mtu: usize) -> Result<PacketInf
         return Err(Error::invalid("TUN packet exceeds configured MTU"));
     }
     Ok(info)
+}
+
+fn ipv4_header_checksum(header: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in header.chunks(2) {
+        let word = u16::from_be_bytes([chunk[0], *chunk.get(1).unwrap_or(&0)]) as u32;
+        sum += word;
+    }
+    while sum > u16::MAX as u32 {
+        sum = (sum & u16::MAX as u32) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Fragment one complete IP datagram into packets accepted by the real TUN
+/// MTU.
+///
+/// smoltcp 0.13 has IPv4 fragmentation support but drops oversized IPv6
+/// output. Keeping the stack's output as one complete datagram and applying
+/// the wire-format operation here gives both families the same behavior.
+/// IPv6 extension headers that belong to the unfragmentable part are copied
+/// into every fragment; a destination-options header after a routing header is
+/// left in the fragmentable part as required by the wire format.
+#[derive(Debug, Clone, Copy)]
+struct Ipv6FragmentLayout<'a> {
+    unfragmentable_prefix: &'a [u8],
+    previous_next_header_offset: usize,
+    next_header: u8,
+    fragmentable_part: &'a [u8],
+}
+
+fn ipv6_fragment_layout(packet: &[u8], total_len: usize) -> Result<Ipv6FragmentLayout<'_>> {
+    let mut next_header = packet[6];
+    let mut previous_next_header_offset = 6usize;
+    let mut offset = 40usize;
+    let mut saw_routing_header = false;
+
+    // IPv6 permits a bounded extension-header chain in practice. Do not walk
+    // an attacker-controlled chain indefinitely while preparing a packet for
+    // the TUN device.
+    for _ in 0..16 {
+        match next_header {
+            44 => {
+                return Err(Error::invalid(
+                    "cannot re-fragment an already-fragmented IPv6 packet",
+                ));
+            }
+            0 => {
+                if offset != 40 {
+                    return Err(Error::invalid(
+                        "IPv6 hop-by-hop header is not the first extension header",
+                    ));
+                }
+                if offset + 2 > total_len {
+                    return Err(Error::invalid("truncated IPv6 extension header"));
+                }
+                let header_len = (packet[offset + 1] as usize + 1) * 8;
+                if header_len < 8 || offset + header_len > total_len {
+                    return Err(Error::invalid("invalid IPv6 extension header length"));
+                }
+                previous_next_header_offset = offset;
+                next_header = packet[offset];
+                offset += header_len;
+            }
+            43 => {
+                if offset + 2 > total_len {
+                    return Err(Error::invalid("truncated IPv6 routing header"));
+                }
+                let header_len = (packet[offset + 1] as usize + 1) * 8;
+                if header_len < 8 || offset + header_len > total_len {
+                    return Err(Error::invalid("invalid IPv6 routing header length"));
+                }
+                saw_routing_header = true;
+                previous_next_header_offset = offset;
+                next_header = packet[offset];
+                offset += header_len;
+            }
+            60 => {
+                if saw_routing_header {
+                    // Destination options after Routing are part of the
+                    // fragmentable portion. They occur only in the first
+                    // fragment and are reconstructed with the rest of the
+                    // datagram by the receiver.
+                    return Ok(Ipv6FragmentLayout {
+                        unfragmentable_prefix: &packet[..offset],
+                        previous_next_header_offset,
+                        next_header,
+                        fragmentable_part: &packet[offset..total_len],
+                    });
+                }
+                if offset + 2 > total_len {
+                    return Err(Error::invalid("truncated IPv6 destination header"));
+                }
+                let header_len = (packet[offset + 1] as usize + 1) * 8;
+                if header_len < 8 || offset + header_len > total_len {
+                    return Err(Error::invalid("invalid IPv6 destination header length"));
+                }
+                previous_next_header_offset = offset;
+                next_header = packet[offset];
+                offset += header_len;
+            }
+            // AH and ESP must follow the Fragment header in a fragmented
+            // packet. Treat them as the beginning of the fragmentable part;
+            // their bytes are never guessed or rewritten here.
+            50 | 51 => {
+                return Ok(Ipv6FragmentLayout {
+                    unfragmentable_prefix: &packet[..offset],
+                    previous_next_header_offset,
+                    next_header,
+                    fragmentable_part: &packet[offset..total_len],
+                });
+            }
+            // Mobility, HIP, Shim6 and an upper-layer protocol are not
+            // headers that this boundary needs to parse. Keeping them in the
+            // fragmentable part preserves their bytes and avoids claiming a
+            // layout we cannot validate.
+            _ => {
+                return Ok(Ipv6FragmentLayout {
+                    unfragmentable_prefix: &packet[..offset],
+                    previous_next_header_offset,
+                    next_header,
+                    fragmentable_part: &packet[offset..total_len],
+                });
+            }
+        }
+    }
+    Err(Error::invalid("IPv6 extension header chain is too long"))
+}
+
+fn fragment_ip_packet(packet: &[u8], mtu: usize, identification: u32) -> Result<Vec<Vec<u8>>> {
+    if !(576..=9216).contains(&mtu) {
+        return Err(Error::invalid("TUN MTU must be between 576 and 9216"));
+    }
+    if packet.is_empty() {
+        return Err(Error::invalid("cannot fragment an empty IP packet"));
+    }
+
+    match packet[0] >> 4 {
+        4 => {
+            if packet.len() < 20 {
+                return Err(Error::invalid("malformed IPv4 packet"));
+            }
+            let header_len = usize::from(packet[0] & 0x0f) * 4;
+            if header_len < 20 || header_len > packet.len() {
+                return Err(Error::invalid("malformed IPv4 header length"));
+            }
+            let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+            if total_len < header_len || total_len > packet.len() {
+                return Err(Error::invalid("malformed IPv4 total length"));
+            }
+            if total_len <= mtu {
+                return Ok(vec![packet[..total_len].to_vec()]);
+            }
+
+            let flags_and_offset = u16::from_be_bytes([packet[6], packet[7]]);
+            if flags_and_offset & 0x3fff != 0 {
+                return Err(Error::invalid(
+                    "cannot re-fragment an already-fragmented IPv4 packet",
+                ));
+            }
+            let max_payload = ((mtu - header_len) / 8) * 8;
+            if max_payload == 0 {
+                return Err(Error::invalid("TUN MTU cannot carry an IPv4 fragment"));
+            }
+            let payload = &packet[header_len..total_len];
+            let mut fragments = Vec::new();
+            let mut offset = 0usize;
+            while offset < payload.len() {
+                let remaining = payload.len() - offset;
+                let chunk_len = remaining.min(max_payload);
+                let more_fragments = offset + chunk_len < payload.len();
+                if offset / 8 > 0x1fff {
+                    return Err(Error::invalid("IPv4 fragment offset exceeds wire format"));
+                }
+                let fragment_len = header_len + chunk_len;
+                let mut fragment = vec![0u8; fragment_len];
+                fragment[..header_len].copy_from_slice(&packet[..header_len]);
+                fragment[header_len..].copy_from_slice(&payload[offset..offset + chunk_len]);
+                fragment[2..4].copy_from_slice(&(fragment_len as u16).to_be_bytes());
+                fragment[4..6].copy_from_slice(&(identification as u16).to_be_bytes());
+                let reserved = flags_and_offset & 0x8000;
+                // smoltcp's IPv4 Repr emits DF by default.  This function is
+                // only called for packets freshly produced by that stack, so
+                // the TUN boundary owns the final fragmentation decision and
+                // deliberately clears DF here.
+                let flags =
+                    reserved | if more_fragments { 0x2000 } else { 0 } | (offset as u16 / 8);
+                fragment[6..8].copy_from_slice(&flags.to_be_bytes());
+                fragment[10..12].fill(0);
+                let checksum = ipv4_header_checksum(&fragment[..header_len]);
+                fragment[10..12].copy_from_slice(&checksum.to_be_bytes());
+                fragments.push(fragment);
+                offset += chunk_len;
+            }
+            Ok(fragments)
+        }
+        6 => {
+            if packet.len() < 40 {
+                return Err(Error::invalid("malformed IPv6 packet"));
+            }
+            let total_len = 40 + usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+            if total_len < 40 || total_len > packet.len() {
+                return Err(Error::invalid("malformed IPv6 payload length"));
+            }
+            if total_len <= mtu {
+                return Ok(vec![packet[..total_len].to_vec()]);
+            }
+            let layout = ipv6_fragment_layout(&packet[..total_len], total_len)?;
+            let fragment_header_offset = layout.unfragmentable_prefix.len();
+            let fragment_overhead = fragment_header_offset
+                .checked_add(8)
+                .ok_or_else(|| Error::invalid("IPv6 fragment length overflow"))?;
+            let max_payload = if fragment_overhead >= mtu {
+                0
+            } else {
+                ((mtu - fragment_overhead) / 8) * 8
+            };
+            if max_payload == 0 {
+                return Err(Error::invalid("TUN MTU cannot carry an IPv6 fragment"));
+            }
+            let payload = layout.fragmentable_part;
+            let mut fragments = Vec::new();
+            let mut offset = 0usize;
+            while offset < payload.len() {
+                let remaining = payload.len() - offset;
+                let chunk_len = remaining.min(max_payload);
+                let more_fragments = offset + chunk_len < payload.len();
+                if offset / 8 > 0x1fff {
+                    return Err(Error::invalid("IPv6 fragment offset exceeds wire format"));
+                }
+                let fragment_len = fragment_header_offset + 8 + chunk_len;
+                let mut fragment = vec![0u8; fragment_len];
+                fragment[..fragment_header_offset].copy_from_slice(layout.unfragmentable_prefix);
+                fragment[layout.previous_next_header_offset] = 44; // Fragment Header
+                fragment[4..6].copy_from_slice(&((fragment_len - 40) as u16).to_be_bytes());
+                let fragment_header = fragment_header_offset;
+                fragment[fragment_header] = layout.next_header;
+                let offset_and_flags = ((offset as u16 / 8) << 3) | u16::from(more_fragments);
+                fragment[fragment_header + 2..fragment_header + 4]
+                    .copy_from_slice(&offset_and_flags.to_be_bytes());
+                fragment[fragment_header + 4..fragment_header + 8]
+                    .copy_from_slice(&identification.to_be_bytes());
+                fragment[fragment_header + 8..]
+                    .copy_from_slice(&payload[offset..offset + chunk_len]);
+                fragments.push(fragment);
+                offset += chunk_len;
+            }
+            Ok(fragments)
+        }
+        _ => Err(Error::invalid("packet is not IPv4 or IPv6")),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2503,7 +2791,7 @@ impl phy::RxToken for QueueRxToken {
 pub struct QueueTxToken {
     queue: Arc<Mutex<PacketQueue>>,
     timestamp: Instant,
-    mtu: usize,
+    max_packet_size: usize,
 }
 
 impl phy::TxToken for QueueTxToken {
@@ -2513,7 +2801,7 @@ impl phy::TxToken for QueueTxToken {
     {
         let mut packet = vec![0u8; len];
         let result = f(&mut packet);
-        if len <= self.mtu
+        if len <= self.max_packet_size
             && let Ok(mut queue) = self.queue.lock()
             && queue.tx.len() < queue.capacity
         {
@@ -2546,8 +2834,31 @@ impl SmoltcpTunDevice {
         })
     }
 
+    pub fn mtu(&self) -> usize {
+        self.mtu
+    }
+
     pub fn enqueue_rx(&self, packet: Vec<u8>) -> Result<bool> {
         inspect_ip_packet_with_mtu(&packet, self.mtu)?;
+        self.enqueue_rx_validated(packet)
+    }
+
+    /// Enqueue a packet reassembled from IPv6 wire fragments.
+    ///
+    /// A reassembled datagram is allowed to be larger than the interface MTU;
+    /// only each individual packet crossing the TUN boundary must fit that
+    /// MTU.  Keep this path separate from [`Self::enqueue_rx`] so a caller
+    /// cannot accidentally bypass the wire-packet validation for ordinary
+    /// TUN input.
+    fn enqueue_rx_reassembled(&self, packet: Vec<u8>) -> Result<bool> {
+        inspect_ip_packet(&packet)?;
+        if packet.len() > MAX_SMOLTCP_PACKET_SIZE {
+            return Err(Error::invalid("reassembled TUN packet is too large"));
+        }
+        self.enqueue_rx_validated(packet)
+    }
+
+    fn enqueue_rx_validated(&self, packet: Vec<u8>) -> Result<bool> {
         self.queue
             .lock()
             .map(|mut queue| queue.push_rx(packet))
@@ -2614,7 +2925,11 @@ impl phy::Device for SmoltcpTunDevice {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut capabilities = DeviceCapabilities::default();
-        capabilities.max_transmission_unit = self.mtu;
+        // Do not advertise the OS wire MTU here.  smoltcp 0.13 drops an
+        // oversized IPv6 packet instead of fragmenting it.  We keep the
+        // complete datagram in this bounded queue and fragment both IP
+        // versions at the asynchronous TUN boundary below.
+        capabilities.max_transmission_unit = MAX_SMOLTCP_PACKET_SIZE;
         capabilities.medium = Medium::Ip;
         capabilities.checksum = ChecksumCapabilities::default();
         capabilities
@@ -2627,7 +2942,7 @@ impl phy::Device for SmoltcpTunDevice {
             QueueTxToken {
                 queue: Arc::clone(&self.queue),
                 timestamp,
-                mtu: self.mtu,
+                max_packet_size: MAX_SMOLTCP_PACKET_SIZE,
             },
         ))
     }
@@ -2641,7 +2956,7 @@ impl phy::Device for SmoltcpTunDevice {
         Some(QueueTxToken {
             queue: Arc::clone(&self.queue),
             timestamp,
-            mtu: self.mtu,
+            max_packet_size: MAX_SMOLTCP_PACKET_SIZE,
         })
     }
 }
@@ -2654,6 +2969,7 @@ pub struct TunRuntime {
     interface: Interface,
     buffer: Vec<u8>,
     ipv6_fragments: Ipv6FragmentReassembler,
+    fragment_identification: AtomicU32,
     #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
     configured_name: Option<String>,
 }
@@ -2701,6 +3017,7 @@ impl TunRuntime {
             interface,
             buffer: vec![0; config.mtu.max(65535)],
             ipv6_fragments: Ipv6FragmentReassembler::default(),
+            fragment_identification: AtomicU32::new(0),
             #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
             configured_name,
         })
@@ -2881,6 +3198,40 @@ impl TunRuntime {
         result.map_err(|_| Error::invalid("smoltcp IP address capacity is exhausted"))
     }
 
+    fn prepend_address(&mut self, address: IpAddress, prefix: u8) -> Result<()> {
+        if (matches!(address, IpAddress::Ipv4(_)) && prefix > 32)
+            || (matches!(address, IpAddress::Ipv6(_)) && prefix > 128)
+        {
+            return Err(Error::invalid("TUN address prefix is out of range"));
+        }
+        if self
+            .interface
+            .ip_addrs()
+            .iter()
+            .any(|cidr| cidr.address() == address)
+        {
+            return Ok(());
+        }
+        let mut addresses = Vec::with_capacity(self.interface.ip_addrs().len() + 1);
+        addresses.push(IpCidr::new(address, prefix));
+        addresses.extend_from_slice(self.interface.ip_addrs());
+        self.replace_ip_addresses(&addresses)
+    }
+
+    /// Put an IPv4 routed endpoint first so wildcard UDP sockets use it as
+    /// their source address when returning a packet through the TUN gateway.
+    pub fn prepend_ipv4_address(&mut self, address: Ipv4Addr, prefix: u8) -> Result<()> {
+        self.prepend_address(IpAddress::Ipv4(address), prefix)
+    }
+
+    /// Put an IPv6 routed endpoint first for the same gateway/source-address
+    /// contract as [`Self::prepend_ipv4_address`].  Without this, Linux can
+    /// install an IPv6 route successfully while smoltcp still has no virtual
+    /// address from which to emit the reply packet.
+    pub fn prepend_ipv6_address(&mut self, address: Ipv6Addr, prefix: u8) -> Result<()> {
+        self.prepend_address(IpAddress::Ipv6(address), prefix)
+    }
+
     /// Replace the smoltcp interface address order without changing the OS
     /// address already applied to the TUN device.
     pub fn replace_ip_addresses(&mut self, addresses: &[IpCidr]) -> Result<()> {
@@ -2899,6 +3250,11 @@ impl TunRuntime {
 
     pub async fn recv_from_tun(&mut self) -> io::Result<usize> {
         let length = self.device.recv(&mut self.buffer).await?;
+        tun_debug(format!(
+            "TUN packet received length={} prefix={:02x?}",
+            length,
+            &self.buffer[..length.min(32)]
+        ));
         let packet = self
             .ipv6_fragments
             .push(&self.buffer[..length], StdInstant::now())
@@ -2912,7 +3268,7 @@ impl TunRuntime {
         };
         let accepted = self
             .smoltcp_device
-            .enqueue_rx(packet)
+            .enqueue_rx_reassembled(packet)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         if !accepted {
             return Err(io::Error::new(
@@ -2936,7 +3292,23 @@ impl TunRuntime {
         else {
             return Ok(None);
         };
-        Ok(Some(self.device.send(&packet).await?))
+        let fragments = fragment_ip_packet(
+            &packet,
+            self.smoltcp_device.mtu(),
+            self.fragment_identification
+                .fetch_add(1, AtomicOrdering::Relaxed),
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let mut sent = 0;
+        for fragment in fragments {
+            tun_debug(format!(
+                "TUN packet sending length={} prefix={:02x?}",
+                fragment.len(),
+                &fragment[..fragment.len().min(32)]
+            ));
+            sent += self.device.send(&fragment).await?;
+        }
+        Ok(Some(sent))
     }
 
     pub fn poll_smoltcp(

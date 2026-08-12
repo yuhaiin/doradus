@@ -51,7 +51,11 @@ async fn expect_empty(service: &ServiceProcess, method: Method, path: &str, body
 
 async fn wait_for_get(service: &ServiceProcess, path: &str) -> Value {
     let mut last = Value::Null;
-    for _ in 0..100 {
+    // A workspace Podman run can start several runtime children while this
+    // process is already under load. Give the management reload worker a
+    // bounded but realistic window instead of making a successful mutation
+    // look like a missing resource after only two seconds.
+    for _ in 0..500 {
         let (status, value) = request_json(service, Method::GET, path, None).await;
         if status.is_success() {
             return value;
@@ -85,7 +89,7 @@ async fn expect_sse(service: &ServiceProcess, path: &str) {
 
 async fn wait_for_active_node(service: &ServiceProcess, id: &str) -> Value {
     let mut last = Value::Null;
-    for _ in 0..100 {
+    for _ in 0..500 {
         let active = expect_ok(service, Method::GET, "/api/v2/nodes/active", None).await;
         last = active.clone();
         if active["items"]

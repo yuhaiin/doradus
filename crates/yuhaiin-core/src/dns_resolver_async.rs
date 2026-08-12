@@ -22,6 +22,32 @@ pub trait AsyncIpResolver: Send + Sync {
         domain: &'a DomainName,
         strategy: ResolveStrategy,
     ) -> BoxFuture<'a, Result<IpSet>>;
+
+    /// Resolve one DNS record while retaining non-address data such as PTR
+    /// names and HTTPS/SVCB service bindings.  Address-only consumers keep
+    /// using [`Self::resolve`]; packet-facing DNS servers use this method so
+    /// the runtime does not erase records at a trait-object boundary.
+    fn query<'a>(
+        &'a self,
+        domain: &'a DomainName,
+        record_type: DnsRecordType,
+    ) -> BoxFuture<'a, Result<DnsResponse>> {
+        Box::pin(async move {
+            let strategy = match record_type {
+                DnsRecordType::A => ResolveStrategy::OnlyIpv4,
+                DnsRecordType::Aaaa => ResolveStrategy::OnlyIpv6,
+                DnsRecordType::Ptr | DnsRecordType::Https | DnsRecordType::Svcb => {
+                    ResolveStrategy::Default
+                }
+            };
+            Ok(DnsResponse {
+                addresses: self.resolve(domain, strategy).await?,
+                ptr_names: Vec::new(),
+                service_bindings: Vec::new(),
+                minimum_ttl: Some(30),
+            })
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -290,6 +316,14 @@ impl<Q: SendAsyncDnsQuery> AsyncIpResolver for AsyncDnsResolver<Q> {
         strategy: ResolveStrategy,
     ) -> BoxFuture<'a, Result<IpSet>> {
         self.resolve_send(domain, strategy)
+    }
+
+    fn query<'a>(
+        &'a self,
+        domain: &'a DomainName,
+        record_type: DnsRecordType,
+    ) -> BoxFuture<'a, Result<DnsResponse>> {
+        self.query_send(domain, record_type)
     }
 }
 

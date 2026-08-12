@@ -15,8 +15,8 @@ use yuhaiin_core::yuubinsya::derive_salt;
 use yuhaiin_core::{BoxFuture, Error, FlowContext, Result};
 
 use super::common::{
-    RoutedProxy, UDP_IDLE_TIMEOUT, UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet,
-    close_udp_flows, reap_expired_udp_flows, shutdown_udp_flow, udp_flow_key,
+    RoutedProxy, UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows,
+    reap_expired_udp_flows_with_timeout, shutdown_udp_flow, udp_flow_key, udp_idle_timeout,
 };
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -113,7 +113,8 @@ pub(crate) async fn serve_udp(
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
     let mut flows = HashMap::<UdpFlowId, UdpFlowState>::new();
     let mut close_events = monitor.subscribe_close_requests();
-    let mut idle_tick = tokio::time::interval(UDP_IDLE_TIMEOUT);
+    let idle_timeout = udp_idle_timeout();
+    let mut idle_tick = tokio::time::interval(idle_timeout);
     let mut packet = vec![0u8; udp_buffer_size];
     loop {
         tokio::select! {
@@ -209,7 +210,7 @@ pub(crate) async fn serve_udp(
                 }
             }
             _ = idle_tick.tick() => {
-                reap_expired_udp_flows(&mut flows).await;
+                reap_expired_udp_flows_with_timeout(&mut flows, idle_timeout).await;
             }
             else => break,
         }

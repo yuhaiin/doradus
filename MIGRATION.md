@@ -9,7 +9,68 @@
 
 > 2026-08-11 启动可诊断性与 checklist 重排：foreground binary 默认把启动、API bind、runtime ready、shutdown/stopped 写到 stderr；
 > `YUHAIIN_QUIET` 只有 `1/true/yes/on` 才会关闭这些 console notice，避免环境中设置 `YUHAIIN_QUIET=0` 时误以为没有日志。
-> `IMPLEMENTATION_CHECKLIST.md` 现在按 crate 模块树、协议矩阵、未完成项和验收命令组织；当前仍明确标记 rootful TUN/TPROXY、Android/macOS 和生产/发布现场为未完成，不能从单元测试覆盖率推导为完整替换。
+> `IMPLEMENTATION_CHECKLIST.md` 现在按 crate 模块树、协议矩阵、未完成项和验收命令组织；rootful TUN route lease、RST/reconnect 与 TPROXY UDP delivery/idle/force-stop 已有独立 VM 现场证据，但 TUN kernel fragment、Android/macOS 和生产/发布现场仍保留为 `[~]`，不能从单元测试覆盖率推导为完整替换。
+
+> 2026-08-12 TUN Podman data-plane recheck：当前 rootless Podman 连接在显式传入宿主
+> `/dev/net/tun`、`--privileged`、`--network=none` 后，已实际通过 runtime-owned TUN
+> device lifecycle、普通 `fixed` TCP packet echo、disable/enable reload 后 packet echo 和
+> connection metadata、`fixed -> TLS -> HTTP/2 -> Yuubinsya` packet chain，以及 MTU
+> `576/1280/1500/9000/9216` 五档矩阵。smoke 的 traffic client 改为同容器内独立子进程，
+> 避免被 runtime 自身的 loopback process guard 当成代理自环；生产 loopback guard 没有关闭。
+> `scripts/integration/tun-service.sh`、`tun-mtu.sh` 和 `scripts/benchmark/tun-throughput.sh` 现在
+> 按实际 `/dev/net/tun` 能力探测，不再因为 rootless 标志本身跳过；透明 TPROXY/内核路由
+> takeover 仍需 rootful `CAP_NET_ADMIN` namespace，不能由上述 TUN packet 证据替代；独立 rootful 证据见下方验收记录。
+> 当前 16 MiB release TUN benchmark sample 为 51.75 MiB/s、peak RSS 12,756 KiB，原始日志位于
+> `~/.cache/yuhaiin-rust/benchmarks/tun-throughput/`。
+
+> 2026-08-12 MaxMind real-fixture smoke：新增 `make maxmind-smoke`，按用户指定的
+> `Country-without-asn.mmdb` URL 下载到 `~/.cache/yuhaiin-rust/fixtures`，先校验固定
+> SHA-256 `1d900f73aa4644d255793548319410ff559ef9294a662ec1a0354f106c794155`，再把真实
+> 数据库和 Rust test harness 挂载到无网络 Podman 中，执行 IPv4 与 IPv4-mapped IPv6
+> country lookup。下载采用 cache-backed partial 文件和 rename，不使用 `/tmp`。
+
+> 2026-08-12 TUN API process switch regression：真实前台 `yuhaiin` 进程现在在 Podman
+> disposable user/network namespace 中通过 `/api/v2/inbounds/{id}` 处理 TUN inbound 的
+> disable/enable 生命周期。fresh store 的 Go 兼容默认 `tun` 记录是禁用的，Rust 之前把它
+> 与 API 新增的启用 TUN 一起判定为“multiple enabled/defined”，导致 supervisor 永远不
+> 会打开用户配置；现在选择逻辑只拒绝多个 enabled TUN，启用项优先，全部禁用时取最新编辑
+> 定义。`make tun-api-process-smoke` 已通过真实 `/dev/net/tun` 和 `/proc/net/dev` 的
+> disabled → enabled → disabled → enabled → disabled visibility 检查；Linux 接口名也按
+> IFNAMSIZ 限制保持在 15 字节以内。该证据不替代 rootful route/firewall matrix。
+
+> 2026-08-12 TUN disposable namespace validation：为让 rootless Podman 的验收条件可复现，
+> TUN integration/benchmark 脚本现在会根据宿主 `CAP_NET_ADMIN` 自动在容器内进入
+> `unshare -Urn` 的 disposable user/network namespace；这不是 fake queue，而是通过传入的
+> `/dev/net/tun` 创建真实 kernel TUN，并用 `/proc/net/dev` 检查当前 network namespace 的
+> device。traffic smoke 只在测试 namespace 内通过 safe netlink 把 `lo` 置为 up，生产代码的
+> loopback guard 没有关闭。当前已重新通过 `make tun-reload-traffic-smoke`（3 个 disable/
+> enable cycle、不可达检查、reopen、traffic、close）、`make tun-mtu-smoke`（576/1280/
+> 1500/9000/9216）、`make tun-chain-service-smoke`（TUN→fixed→TLS→HTTP/2→Yuubinsya）和
+> `make tun-connection-metadata-smoke`（component/node/outbound/localAddr）。这组证据仍不
+> 覆盖 rootful 宿主 route takeover 或 TPROXY UDP；`YUHAIIN_TUN_USER_NAMESPACE=0` 用于显式
+> 验证具备真实宿主权限的场景。
+
+> 2026-08-12 Debian VM rootful TUN/TPROXY 验收：使用用户提供的 `root@192.168.122.2` Debian
+> VM，内核 6.5、Podman 5.8.3、`rootless=false`、`/dev/net/tun` 和 `CAP_NET_ADMIN` 均可用；
+> 二进制从宿主已编译产物同步到 VM 的 `~/.cache/yuhaiin-rust-vm`，VM 只负责 Podman 运行。
+> rootful `tun-service-smoke` 已通过普通 256B packet echo、3 次 disable/enable reload、
+> MTU `576/1280/1500/9000/9216`、`TLS -> HTTP/2 -> Yuubinsya` chain 和 force-stop 后的
+> reopen/traffic/close。启用 `tun-routes` 的 `tun-smoke` 另外确认 `198.18.0.0/15` 在 TUN
+> 设备存活期间存在，进程正常结束后已移除；后续 3-route graceful/SIGKILL matrix 见文末最新记录。
+>
+> 同一 VM 的 rootful TPROXY UDP 首次试验未闭环：Rust runtime 的 transparent socket probe、
+> `iptables` TPROXY rule（计数增长到 49）以及 `fwmark -> table 100 -> local lo` 都成功，
+> 但 client netns 的 UDP packet 没有到达 transparent socket；独立 Python `recvmsg` kernel
+> probe 得到相同结果。该历史失败后来定位为测试入口 veth 的 Linux `accept_local` 策略；修正后的
+> iptables/nft 结果记录在本文末尾。保留这段记录用于防止把第一次 kernel 行为误判成 Rust
+> ancillary bug。透明测试脚本已支持
+> `YUHAIIN_SKIP_BUILD=1`、预编译 binary 覆盖、Debian multiarch xtables module 探测和可选
+> `YUHAIIN_TPROXY_MODE=redirect` 对照；所有状态仍在 `~/.cache`，没有使用 `/tmp`。
+
+> 同日 release packet benchmark：Cloudflare BoringTun userspace adapter 在 16 MiB 双 peer
+> 加解密回归中为 554.65 MiB/s、peak RSS 3,348 KiB；这是 `--network=none` 的同机 packet
+> baseline，不代表公网/WARP 链路吞吐。原始日志位于
+> `~/.cache/yuhaiin-rust/benchmarks/wireguard/`。
 
 > 2026-08-11 Go/Rust live flow parity：新增
 > `scripts/integration/go-live-flow-parity.sh` 与 `make go-live-flow-parity-smoke`。测试会在
@@ -52,7 +113,11 @@
 
 > 2026-08-11 inbound live switch 修复：普通 socket inbound 的 API reload 流程新增了 disable → listener closed → enable → traffic restored 的真实进程回归。此前注入式 TUN（Android/VpnService 等）路径只捕获初始 `TunRuntimeConfig`，reload 后即使持久化的 TUN inbound 已变成 `enabled=false`，仍会继续运行 dispatcher；现在 `run_until_with_tun_runtime` 在每次 reload 后重新读取 Go inbound/`tun.runtime`，关闭时停止 packet dispatcher，重新开启时复用外部 device 重建 proxy runtime。没有持久化 TUN 记录的宿主仍使用传入的 fallback config。新增 data-plane config tests；真实 VpnService/utun 现场仍待平台验收。
 
-> 2026-08-11 WireGuard 评估与依赖审计：Go 的 `pkg/net/proxy/wireguard` 不是普通 socket proxy，而是 `wireguard-go` userspace device + custom `NetTun`/`PacketConn`，需要把 peer/allowed IP、PSK、UDP underlay、虚拟 TUN packet channel 和连接式 `AsyncProxy` 边界全部接起来。`boringtun 0.7.1` 的 `noise::Tunn` 可以作为纯 Rust 协议引擎，但不会直接提供 yuhaiin 所需的 socket stack；已检查的 `tokio-wireguard 0.1.3`、`onetun 0.3.10`、`wiretap-rs 0.3.0` 均依赖旧 `boringtun 0.6`/`x25519-dalek 2.0.0-rc.3`，与当前 `rustls-rustcrypto` 的稳定版 `x25519-dalek 2.x` 无法共同解析，`wiretun` 则是 native/UAPI 方向。按“没有方便库就暂不加”的范围，WireGuard 现在明确延期，不加入不可构建分支；未来只有在兼容 userspace TCP/UDP stack 出现或完成独立 adapter 后，才进入配置接入、Go↔Rust handshake/transport fixture 和 benchmark。
+> 2026-08-11 WireGuard 评估与依赖审计（历史记录）：Go 的 `pkg/net/proxy/wireguard` 不是普通 socket proxy，而是 `wireguard-go` userspace device + custom `NetTun`/`PacketConn`；`boringtun` 只提供协议核心，不直接提供 yuhaiin 所需的 socket stack。该审计结论保留作为边界说明，后续已采用独立 `yuhaiin-wireguard` adapter 补上 userspace stack。
+
+> 2026-08-12 WireGuard userspace adapter：新增 `crates/yuhaiin-wireguard`。配置层兼容 Go 的 `secretKey`、`endpoint`、`peers`、PSK、keepAlive、AllowedIPs、MTU 和 Cloudflare WARP `reserved`（JSON base64）；Cloudflare `boringtun 0.7.1` 负责 Noise/WireGuard handshake、session、timer 和 packet crypto，smoltcp 负责虚拟 IP/TCP/UDP socket，UDP underlay 与 runtime `AsyncProxy` 在同一 adapter 内管理。`GoProxyTransport::Wireguard` 只在 runtime 分支构造这个有状态 proxy，不会误走普通 fixed builder，也不会给 inbound 再增加第二套 OS TUN。`make wireguard-smoke` 在 Podman `--network=none` 中通过两端 userspace peer、handshake/data、TCP SYN/RST、reserved 字节、JSON 配置和 5 个单测；`make benchmark-wireguard-throughput` 已补上 release packet 加解密回归基线。真实第三方 peer、NAT roaming、source-interface policy 和真实链路性能仍待外部验收。
+
+> 2026-08-12 Go protocol interoperability：扩展 `make go-protocol-interop-smoke`，宿主只编译 ignored harness，Podman `--network=host` 挂载 Go checkout、GOROOT 和 module cache 后执行：真实 Go Yuubinsya client 覆盖 TCP/UOT/native UDP/Ping，Go WebSocket→HTTP/2 client，Go HTTP/2 v1 client，以及 VLESS、VMess、Trojan 各一条 Go/Rust wire round-trip；当前 6/6 通过。workspace 默认仍将这些测试标为 ignored，避免普通无 Go 环境运行时启动外部进程；Go checkout 通过 `YUHAIIN_GO_ROOT` 注入，专用入口的 Go scratch、日志和缓存均位于 `~/.cache/yuhaiin-rust/integration/go-protocol-interop/`，不使用 `/tmp`。更广的 runtime listener/outbound、TLS/WebSocket/UDP 组合仍保留在 checklist 的 `[~]`。
 
 > 2026-08-11 direct UDP 域名目标修复：TCP direct 的旧错误只会出现在 `0bae7c1` 之前的 binary；当前 release 已不再包含 `direct async proxy requires an already-resolved IP endpoint`。另外补齐了 direct UDP datagram 的第二层边界：`open_datagram` 解析初始目标后，后续 `send_to` 收到 SOCKS5 UDP 域名目标时也会按本地 socket 的 IPv4/IPv6 family 解析并逐个尝试发送，不再在第一包处要求预先转换成 IP。新增 TCP direct、UDP domain send 单测；mixed UDP 的 Go 兼容判定回归仍通过。请使用最新 `make build-release` 产物，不要复用 2026-08-09 以前的旧 binary。
 
@@ -182,7 +247,7 @@
 > 2026-08-09 管理面补齐 `tools.interfaces` 的替换契约：Go 返回所有非 loopback 接口及其 `net.Interface.Addrs()` CIDR 字符串；Rust 现在在 Linux 通过纯 Rust netlink packet API 读取 RTM_GETADDR，同时使用 sysfs 的接口索引映射名称，覆盖 IPv4/IPv6、无地址接口和 loopback 过滤。实现位于 `yuhaiin-runtime::interfaces`，API 继续直接序列化共享 `InterfaceInfo`，没有新增 HTTP DTO；netlink 不可用时回退到无 loopback 的 sysfs/IPv6 发现。`cargo test -p yuhaiin-runtime --all-features --offline` 已通过 117 个 runtime 单测及 7 个 DoH 集成测试，最小 `http-api` library 构建也已验证。
 
 > 2026-08-09 inbound 生命周期收口：TUN 不再由 binary 单独启动；`yuhaiin-runtime::inbound::run_until` 与 SOCKS5、HTTP、Yuubinsya、WebSocket、HTTP/2 listener 共享同一个 inbound owner。普通 TCP/WebSocket accepted task 由 `JoinSet` 归属 listener，reload/shutdown/abort 会回收子任务；`yuhaiin-core::flow::FlowObserverGuard` 让正常结束、管理面 close 和强制取消都能完成 monitor close、history/SSE/traffic 收敛。Yuubinsya server 也提升到 listener 级，HTTP/2 多 stream 可共享 migrate ID 的 UDP session，listener 结束时显式 close 上游 session。runtime 新增 listener abort 后 live connection 清理回归；`yuhaiin-runtime` 117 个单测、`yuhaiin-chain` 42 个单测和 `yuhaiin-core` 116 个单测均通过。Podman 特权无网络容器中 `tun-smoke` 的真实 TUN 创建/关闭和 route smoke 也通过。
-> 2026-08-09 TUN 配置边界收口：Go 的 `inbounds_v2` 中 `network.type=empty`、`protocol.type=tun` 现在是 Rust TUN supervisor 的主配置源，按 Go `TunProtocol` 读取 `tun://` 名称、`portal`/`portalV6`、`routes`/`excludes`；旧 `tun.runtime` 仅作为没有 Go TUN inbound 时的兼容回退。普通 TCP/UDP listener 会跳过 TUN record，单设备 runtime 遇到多个 TUN record fail-closed。新增 Go inbound 配置解析回归，runtime 全部 118 个单测和 7 个 DoH 集成测试通过；此前 Podman 特权无网络容器中的真实 TUN 创建/关闭及 route smoke 仍通过。
+> 2026-08-09 TUN 配置边界收口：Go 的 `inbounds_v2` 中 `network.type=empty`、`protocol.type=tun` 现在是 Rust TUN supervisor 的主配置源，按 Go `TunProtocol` 读取 `tun://` 名称、`portal`/`portalV6`、`routes`/`excludes`；旧 `tun.runtime` 仅作为没有 Go TUN inbound 时的兼容回退。普通 TCP/UDP listener 会跳过 TUN record，单设备 runtime 只对多个 enabled TUN fail-closed，禁用的默认/历史 TUN 定义不会阻塞唯一启用项。新增 Go inbound 配置解析回归，runtime 全部 118 个单测和 7 个 DoH 集成测试通过；此前 Podman 特权无网络容器中的真实 TUN 创建/关闭及 route smoke 仍通过。
 > 2026-08-09 Podman runtime smoke：用 `cargo build -p yuhaiin-runtime --bin yuhaiin --all-features --offline` 构建 binary，在 Debian testing `--network=host` 容器中通过 API 创建 HTTP inbound；宿主机经 `127.0.0.1:18083` 访问本地 HTTP server，验证 API reload、HTTP inbound→direct outbound、history/traffic 统计。停止并重启同一容器后，`inbounds.get` 和 `connections.history` 均从 SQLite 读回。容器状态目录使用 `~/.cache/yuhaiin-rust-podman.*`，不使用 `/tmp`。
 > 2026-08-09 Podman live management smoke：在 Debian testing `--network=host` 容器中让 HTTP upstream 延迟响应，真实验证 `/api/v2/connections` 返回 live connection、非法 close ID 返回 `400`、合法 `connections/close` 返回 `200` 并使 relay 退出，随后 `/connections` 为空且 `/connections/history` 使用 Go 兼容的 `items` 形状；EventSource 收到初始 `connections_added`、建立连接的 `connections_added` 和关闭后的 `connections_removed`。另通过 `/api/v2/inbounds/{id}` PUT reload 验证旧 inbound 端口变为 `000`、新端口返回 `200`。测试临时目录均在 `~/.cache/yuhaiin-rust-*`。
 > 2026-08-09 统计持久化生命周期收口：`ConnectionMonitor` 现在拥有 SQLite persistence worker，并提供显式 `shutdown()`；inbound/DNS owner 收敛后，binary 会先执行 final flush、等待 writer 退出，再处理 backup restore，避免短连接/低流量统计丢失或与恢复竞态。新增回归不等待 2 秒周期即可重启读回最后一条 history/traffic；Podman Debian testing host-network smoke 已验证服务立即 SIGINT 退出后同一 SQLite 直接读回 history 和 total。
@@ -2152,7 +2217,7 @@ echo，并在 runtime 子进程上采样 Linux `VmRSS` 与 `/proc/<pid>/stat` CP
 | HTTP inbound → router → HTTP CONNECT outbound | 已有可执行基准 | `make benchmark-throughput`；默认 64 MiB、单流、loopback |
 | HTTP inbound → router → TLS → HTTP/2 → Yuubinsya TCP-over-stream outbound | 已有可执行基准 | 同一命令运行协议矩阵；真实 SQLite/API 配置、TLS、H2 和 Yuubinsya loopback echo |
 | TUN inbound | 已有可执行 packet 基准 | `make benchmark-tun-throughput`；默认 4 MiB、单流、privileged Podman、TUN → smoltcp → fixed proxy → loopback echo；16/64/256 MiB 长流已通过 |
-| WireGuard | 未实现/不报告性能 | 当前范围没有 WireGuard backend，不用虚构结果 |
+| WireGuard | 已有可执行协议/adapter smoke 和 packet benchmark | `make wireguard-smoke`、`make benchmark-wireguard-throughput`；当前只记录两端 userspace peer 与本地 packet path，不把 5/5 单测或约 575 MiB/s 基线伪装成第三方 peer 或公网带宽结论 |
 
 benchmark 数值只能用于同机、同 profile、同 payload 和同 namespace 的回归比较，不能
 直接解释为 Go 与 Rust 的跨机器性能结论。
@@ -2958,9 +3023,392 @@ make legacy-v1-runtime-smoke \
 `run_until_with_tun_runtime`，不打开第二个桌面设备，也不改变 FD 的复用边界。
 
 `make tun-reload-smoke` 现在在 Podman 中连续执行四轮 `disable -> device disappears ->
-enable -> same device returns`，最近一次输出包含每轮的 `cycle=1..4`，最终正常打印
+ enable -> same device returns`，最近一次输出包含每轮的 `cycle=1..4`，最终正常打印
 `runtime-tun-closed`。这证明了 reload 的 owner 顺序和重复切换边界；rootless Podman 仍不具备
-真实 route、代理 packet flow、TPROXY 和 loopback guard 所需的 `CAP_NET_ADMIN`，因此这些
+真实 route、代理 packet flow、TPROXY 和 loopback guard 所需的 `CAP_NET_ADMIN`；当时这些
 rootful 现场项继续留在 checklist 的 `[ ]`/`[~]`，没有被生命周期 smoke 冒充完成。宿主机只
 执行 Cargo 编译和静态检查，smoke binary、SQLite 和日志均由 Podman 运行并落在
 `~/.cache/yuhaiin-rust`。
+
+## 95. 2026-08-12 rootful TPROXY 与 TUN route matrix 收口
+
+在 Debian VM `root@192.168.122.2` 上使用 rootful Podman（`rootless=false`、Podman 5.8.3、
+`CAP_NET_ADMIN`、`/dev/net/tun`）重跑了新的独立现场夹具。宿主只负责构建和同步 binary，
+VM 内的 Podman 承担所有 TUN、netlink、iptables/nftables 和 proxy 数据面运行；状态与日志
+都位于 `~/.cache/yuhaiin-rust-vm`，没有使用 `/tmp`。
+
+TUN route matrix 由 `scripts/integration/tun-route-matrix.sh` / `make tun-route-matrix-smoke`
+驱动 `tun-smoke --features tun-routes`，实际安装并检查以下 3 条 IPv4 route：
+
+```text
+198.18.0.0/15 proto static
+192.0.2.0/24 proto static
+203.0.113.0/24 proto static metric 42424
+```
+
+结果：3 条 route 在 TUN owner 存活期间可见；owner graceful exit 后全部消失；另一个 owner
+被 SIGKILL 后全部消失。该 matrix 证明了 `TunRouteLease` 的多路由 netlink ownership 和异常
+teardown，不代表 TCP reset/reconnect 或真实 kernel IPv4/IPv6 fragmentation 已经完成；后两项
+仍由 checklist 的 `[~]` 保留。fragment overlap、expiry、count/size overflow 和恢复路径已有
+纯 Rust dispatcher 单测与模拟 packet 覆盖。
+
+TPROXY UDP 现在在同一 rootful VM 通过两种内核入口：
+
+- `YUHAIIN_TPROXY_BACKEND=iptables`：mangle `TPROXY` + `fwmark 1 -> table 100 -> local lo`；
+- `YUHAIIN_TPROXY_BACKEND=nft`：native nft `tproxy` rule，使用同一 policy route。
+
+两种 backend 都通过 transparent socket `IP_TRANSPARENT` readback、2 个不同 UDP source
+flow、original destination `10.254.1.2:18082`、local listener `0.0.0.0:18083`、UDP 回包、
+source-port rebind 和 monitor upload/download 统计。Rust 的 `recvmsg` ancillary decoder 现在
+不需要为这次现场失败增加特殊分支。夹具为 client ingress veth 设置了
+`/proc/sys/net/ipv4/conf/service-client/accept_local=1`；这是该隔离拓扑的 Linux martian/local
+source 流量前提，不是 runtime 对宿主机的全局副作用。Linux TPROXY 的必要组成仍是
+`IP_TRANSPARENT` socket 与 policy routing，可对照 [Linux kernel TPROXY 文档](https://cdn.kernel.org/doc/html/latest/networking/tproxy.html)。
+
+TPROXY 仍保留 `[~]` 的部分是公共 90 秒 idle reap 的 rootful 长时间现场、进程级 SIGKILL
+期间的 flow close 观测，以及真实生产 firewall/nftables 组合；公共 flow expiration/close 单测
+和 namespace teardown 已通过。WireGuard 同样继续使用 Cloudflare BoringTun userspace adapter，
+本地双 peer/Go interop 已通过，第三方/WARP endpoint roaming 仍需外部 peer。
+
+## 96. 2026-08-12 rootful reset/reconnect、TPROXY idle 和 force-stop 收口
+
+继续使用 Debian VM `root@192.168.122.2` 的 rootful Podman，宿主机只编译并同步
+binary；所有 TUN、UDP、netlink 和 firewall 数据面仍在 VM 内的 Podman namespace 中运行，
+状态与日志位于 `~/.cache/yuhaiin-rust-vm`。
+
+TUN 新增了 `make tun-reset-reconnect-smoke`：direct TUN fixture 先通过
+`SO_LINGER=0` 主动制造 TCP RST，target 端接受并清理该连接，随后第二个正常连接完成
+echo；rootful 输出包含 `runtime-tun-reset-ok`、`runtime-tun-reconnect-ok` 和
+`runtime-tun-closed`。该证据只关闭了 reset/reconnect 缺口，真实 kernel IPv4/IPv6 fragment
+matrix 仍未被 userspace packet fixture 冒充完成。
+
+UDP 生命周期 smoke 对生产默认 90 秒保持不变，只在进程级测试中使用
+`YUHAIIN_TEST_UDP_IDLE_TIMEOUT_MS=1000`，并等待 2500ms 检查 monitor 从两个 UDP flow 回收
+到零。rootful iptables 和 native nft backend 均通过；两种 backend 另以
+`YUHAIIN_TPROXY_FORCE_STOP=1` 在两个 UDP flow 已建立后对 runtime service 进程发送 SIGKILL，
+均观测到 `status=137`，shell/firewall/namespace cleanup 完成。剩余 TPROXY `[~]` 仅是实际生产
+firewall/nftables 组合 matrix，不把隔离 fixture 当作所有发行版规则的证明。
+
+同一轮 rootful TUN metadata smoke 通过了 `component=tun`、`node=tun-fixed`、
+`outbound=127.0.0.1:*` 和 `local=198.18.0.1:*`；PID/executable path 仍单独留在 checklist，
+因为当前 fixture 的固定断言尚未把这两个字段锁定为非空。
+
+完整 workspace 回归重新在 Podman 中通过：41 个 harness，所有非 ignored 测试通过；本轮还修复
+了 `close -> delete selected node` 的 API 边界——删除被选中的节点时，Rust 先把三份 selected
+metadata 回退到内置 `direct`，避免旧 selected id 让 runtime reload 访问已删除的 proxy config。
+
+## 97. 2026-08-12 rootful TUN connection metadata 逐字段收口
+
+在同一 Debian VM rootful Podman 环境中重跑 `tun-connection-metadata.sh`，并启用
+`YUHAIIN_TUN_ASSERT_PROCESS=1`。fixture 不再只检查 `component=tun`、selected node、outbound
+endpoint 和 localAddr，而是在 connection monitor 中要求 `process`、`pid`、`uid` 均为非空，随后
+输出固定断言结果：`process=/usr/local/bin/tun-service-smoke`、`pid=7`、`uid=0`。本次现场退出码为
+0，真实 TUN traffic 仍完成 1 MiB echo，device 正常关闭。
+
+这项证据关闭的是 loopback/process metadata 的现场缺口，不等同于关闭 TUN 的真实 IPv4/IPv6
+kernel fragmentation matrix；后者仍保留在 checklist 的 `[~]` 项中。
+
+## 98. 2026-08-12 rootful runtime TUN UDP path 收口
+
+在 Debian VM `root@192.168.122.2` 的 rootful Podman 中补跑了 runtime-owned TUN UDP
+traffic。fixture 使用 `198.18.0.1/15` portal、`198.18.0.2/32` route 和 fixed outbound；同一
+个服务先后执行 TCP 与 UDP echo，UDP target 收到 32 字节，UDP-first 顺序也通过，最后设备和
+route lease 正常关闭。宿主机只编译并同步 binary，TUN、路由、SQLite 和网络数据面仍在 VM 的
+Podman namespace 中运行，日志位于 `~/.cache/yuhaiin-rust-vm`。
+
+这次现场还固定了两个容易误判的问题：smoke 的阻塞式 UDP client 不能直接运行在
+current-thread Tokio 主协程中，否则会阻塞 TUN dispatcher；另外 runtime 的 loopback/process
+guard 会拒绝同一进程产生的回环 UDP，故测试 client 与已有 TCP fixture 一样改为独立子进程。
+这两个调整只影响测试夹具，不放宽生产 loopback guard。生产 TUN 在打开显式 route 时会先把
+route destination 加入 smoltcp 的虚拟地址列表，并保持 UDP socket 的精确本地 destination
+绑定，确保 routed virtual endpoint 的回包源地址正确。
+
+## 99. 2026-08-12 rootful TUN IPv4 kernel fragmentation matrix 收口
+
+上一轮只验证了小 UDP payload，继续把 runtime-owned TUN 的 rootful Debian VM 测试扩展到
+最大合法 IPv4 UDP payload `65507` 字节，并在 MTU `576/1280/1500/9000/9216` 五档分别运行
+独立的 privileged、`network=none` Podman 容器。五档均通过：Linux kernel 将 ingress datagram
+分片，smoltcp 完成 ingress 重组和 proxy echo，再按 TUN MTU 做 IPv4 出方向分片，Linux kernel
+重新组装后 UDP client 收到逐字节一致的 `65507` 字节响应；TCP 32 字节 smoke 和 device/route
+lease graceful close 也同时通过。VM 日志位于
+`/root/.cache/yuhaiin-rust-vm/integration/tun-mtu-full/`，宿主机只编译并同步 binary，未使用
+`/tmp`。
+
+这次现场失败过一次并已定位：smoltcp 0.13 的默认 `FRAGMENTATION_BUFFER_SIZE` 是 1500，
+超过该值的 IPv4 出方向 datagram 会被 fragmenter 丢弃，即使每个最终 fragment 都能小于设备
+MTU。新增 workspace `.cargo/config.toml` 将它设置为 `65535`，覆盖最大 UDP datagram 加
+IPv4/UDP header 的完整缓冲边界；同时新增 `udp_socket_fragments_a_large_datagram_to_the_tun_mtu`
+单测，直接校验 8192 字节 datagram 的 fragment 长度、地址、identification 和重组内容。
+
+IPv6 的 ingress fragment reassembly、IPv6 route virtual address 和普通 MTU 路径仍保留；但
+smoltcp 0.13 的 `dispatch_ip` 明确没有 IPv6 出方向 fragmentation，低 MTU 下的 IPv6 大 UDP
+因此继续在 checklist 标为 `[~]`，没有把 IPv4 现场结果外推成 IPv6 完整支持。
+
+## 100. 2026-08-12 TUN 双栈 wire fragmentation 收口
+
+上一节记录的 IPv4-only 限制已经由 TUN 边界重构解决。本轮没有再引入 tun2socket 或第二套
+userspace stack，而是让 smoltcp 的 queue device 接受一个完整 IP datagram，再在唯一的
+`TunRuntime::send_to_tun` OS 边界按实际 wire MTU 分片：
+
+- IPv4 复制原始 options/header，重新设置 total length、identification、MF/offset 和 header
+  checksum；smoltcp 的 IPv4 `Repr::emit` 默认设置 DF，最终分片边界会清除这个默认标志；已经是
+  中间分片的包不会被重复分片。
+- IPv6 为 smoltcp 生成的 base-header + transport payload 插入 Fragment Header，保留 next
+  header、offset、M flag 和 32-bit identification。smoltcp 当前不会产生 extension header；若
+  未来新增这类输出，当前 helper 会 fail-closed，必须先扩展 unfragmentable-header 解析。
+- ingress 的 IPv6 wire fragments 先在边界重组；重组后的完整 datagram 可以大于 TUN MTU，但仍
+  经过独立的 IP 合法性和最大包长度检查，不能绕过普通 wire packet 的 MTU 校验。
+- `TunConfig` 对配置 IPv6 时的 MTU `<1280` 提前返回 InvalidInput；IPv4-only TUN 仍支持已有
+  576 档测试。最大重组/生成包上限统一到 IPv6 payload-length 能表达的 `65575` 字节。
+
+对应单测新增/调整了 IPv4 8192-byte fragment/reassembly、IPv6 8192-byte Fragment Header
+生成与重组、完整 IPv6 datagram 大于 wire MTU 的入队，以及 IPv6 minimum-MTU validation。
+Podman workspace 回归为 41 个 harness，`yuhaiin-core` 142 passed、`yuhaiin-runtime` 229
+passed、service-chain 14 passed、WireGuard 5 passed（1 个显式 benchmark ignored）。
+
+真实双栈现场仍全部在 Debian VM 的 rootful Podman `--network=none` 中运行；容器内部显式开启
+IPv6 sysctl，没有改 VM 宿主网络。IPv4 65507-byte UDP 在 MTU `576/1280/1500/9000/9216`
+五档通过；IPv6 65507-byte UDP 在合法 MTU `1280/1500/9000/9216` 四档通过，均验证了 kernel
+ingress 分片、Rust ingress 重组、proxy echo、TUN boundary egress 分片和 kernel egress 重组。
+IPv6 MTU 576 的 `EINVAL` 是内核协议最低 MTU 约束，已由配置校验提前 fail-closed。现场日志位于
+`/root/.cache/yuhaiin-rust-vm/integration/tun-ipv6-mtu-*`，宿主机只编译/同步 binary，未使用
+`/tmp`。
+
+## 101. 2026-08-12 Runtime DNS FakeIP PTR 反向查询收口
+
+审计运行时 DNS handler 时发现，FakeIP allocation/reverse 的 store 单测虽然完整，但
+`RuntimeDnsHandler` 只把所有查询转换为 `AsyncIpResolver::resolve` 的 A/AAAA 地址结果。这样
+预加载的 FakeIP 映射在 socket DNS、DNS hijack 和 TUN DNS 查询 `in-addr.arpa` 或 `ip6.arpa` 时会
+被静默丢掉，前端/代理链无法得到 Go server 的本地反向答案。
+
+现在 `FakeIpPools::lookup_ptr_domain` 在一次异步快照后从双栈 reverse view 查找反向名称，
+`RuntimeDnsHandler` 在调用上游前优先返回 TTL 60 的 PTR response；未知映射继续走原有 resolver
+边界，不伪造答案。新增 runtime 单测先写入持久 FakeIP mapping，再通过真实 DNS wire query 校验
+transaction id、PTR name 和 TTL。
+
+Podman workspace 回归重新通过 41 个 harness：`yuhaiin-core` 143 passed、`yuhaiin-runtime`
+230 passed、service-chain 14 passed、WireGuard 5 passed（1 个显式 benchmark ignored）。本次
+修复没有改变 TUN、协议链或 SQLite schema；所有临时状态继续位于
+`~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+
+## 102. 2026-08-12 Go/Rust API history UTC parity
+
+使用缓存中的停止态 Go `state.db`（只读源副本）运行 `make go-api-parity-smoke` 时，除
+`connections.history` 外的 read、core mutation 和 error contract 都已经一致；唯一差异是
+Rust 旧 checkpoint 中的历史时间按宿主 `+08:00` 输出，而 Go contract 输出 UTC `Z`。
+
+修复分为两层：新建/更新 history 一律使用 UTC RFC3339；加载旧 Rust persistence 或 Go projection
+时，`coalesce_history` 将可解析的旧时间规范化为 UTC。因此不会要求用户清空已有 SQLite 或统计
+数据，也不会因为宿主机时区不同而让前端看到不同的历史时间。
+
+新增 `history_times_are_serialized_in_utc` 单测，并在 Podman 中重新通过完整 API parity：
+`connections.history`、节点/入站/解析器/设置/路由/发布/备份等所有 read 与 core mutation
+均 identical；错误矩阵也 identical，订阅更新保持明确的 deferred contract。现场日志位于
+`~/.cache/yuhaiin-rust/integration/go-api-parity/`，源库没有被写入。
+
+## 103. 2026-08-12 FakeDNS whitelist/skipCheckList runtime parity
+
+继续对照 Go `pkg/resolver/fakeip.go` 后确认，FakeDNS 不是简单的“始终把上游地址替换成
+FakeIP”：whitelist 命中时必须完整绕过 FakeIP；skip-check 只对 A/AAAA 查询跳过上游检查并
+直接分配 FakeIP，且 whitelist 优先级高于 skip-check。此前 Rust 只有一个全局
+`fakeip_skip_check_upstream` 开关，已经能分配地址，但没有接入 Go 的两个域名列表。
+
+Rust 现在新增 `FakeIpPolicy`，复用 `yuhaiin-trie::DomainTrie` 做父域、规范化和单标签 wildcard
+匹配。运行时同时支持两种来源：
+
+- `resolver.fakedns` JSON 的 `whitelist` / `skipCheckList`（以及 snake_case overlay）；
+- 旧 Go SQLite 的 `dns_fakedns_lists(kind, value)`，保持 rowid 顺序读取并忽略未知 kind。
+
+当 Go 数据库仍有 `dns_settings` 兼容行时，前端刚写入的 `resolver.fakedns` overlay 现在优先于
+旧行的 enabled/range 值，避免 API 返回新配置但 reload 继续使用旧 FakeIP 开关。PTR、HTTPS/SVCB
+仍走上游或本地 reverse/service binding 路径，不会被 A/AAAA skip-check 错误屏蔽。
+
+新增 store policy precedence/query 单测，以及 runtime JSON list 和 overlay enablement 单测。随后
+使用 Podman 重跑完整 `make workspace-tests`：41 个 harness 全部通过，其中 core 143、runtime
+233、store 128（5 个显式 ignored）、WireGuard 5（1 个 benchmark ignored）、service-chain 14；
+定向 policy test 也在 `network=none` 容器中通过。所有构建缓存和测试状态继续位于
+`~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+
+## 104. 2026-08-12 普通 VLESS/VMess/Trojan outbound service-chain
+
+此前 VLESS、VMess、Trojan 已有 protocol parser、runtime builder 和 Go wire interop，但缺少从
+管理 API 写入节点开始，经过真实 inbound、router 再到协议 outbound 的进程级覆盖。本轮把三种
+普通 outbound 加入 `service_chain.rs` 同一套可复用 harness：每个用例都在 API 中创建 Go 形状的
+`fixed + protocol` chain，启动 HTTP inbound，写入 `example.test` domain rule，然后由 Podman
+内的客户端发送 CONNECT 和 payload 到独立的协议 server。三种协议均完成 200 response、payload
+echo、connection metadata、match history 和 upload/download totals 断言。
+
+`make service-chain-smoke` 现为 15/15 通过，其中新增协议矩阵为 3/3；已有的
+`make go-protocol-interop-smoke` 仍为 6/6。测试构建产物、SQLite fixture 和日志全部位于
+`~/.cache/yuhaiin-rust`，宿主机只负责编译，未启动 runtime/proxy，也未使用 `/tmp`。这补齐了
+普通 API→inbound→router→VLESS/VMess/Trojan outbound 的主链路证据，但更广的 TLS/WebSocket/UDP
+组合和生产协议样本仍保持 checklist 的 `[~]`。
+
+## 105. 2026-08-12 协议 outbound latency probe
+
+在普通 VLESS/VMess/Trojan 的进程链路已经能够 payload echo 后，又把 Go 兼容的
+`POST /api/v2/nodes/{id}/latency` 加入同一个 service-chain 测试。fixture 接受第二条协议
+连接：第一条使用 `example.test:443` 验证业务 payload，第二条使用 latency 的默认
+`http://example.test/health`（端口 80）返回 HTTP 204。这样测试不仅验证出口能传数据，也验证
+管理面可以通过对应协议建立延迟探测。
+
+Podman 中 `make service-chain-smoke` 仍为 15/15，VLESS、VMess、Trojan latency 均为成功；
+期间曾由 fixture 误把 latency 端口当作 443 导致 connection reset，已修正并保留端口差异断言。
+构建和日志仍位于 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+
+## 106. 2026-08-12 statistics extended Podman soak
+
+统计并发测试原本固定为 8 个 readers、每个 40 轮 API 查询和 64 轮 payload 写入，能够覆盖
+基本并发与重启，但不足以作为较长 lock-pressure 证据。本轮将规模改为环境变量可调，普通
+`make stats-concurrency-smoke` 保持原默认值，新增 `make stats-soak-smoke` 使用 12 个 readers、
+每个 160 轮查询和 256 轮写入。
+
+本次在 `--network=none` Podman 中通过 2/2：并发查询 connections、total、traffic、telemetry、
+history、failed-history 期间持续 TCP 流量；随后关闭并重启同一 SQLite，确认 totals/history
+仍可读；另一个测试覆盖 force-stop 期间的统计读取。结果日志在
+`~/.cache/yuhaiin-rust/integration/stats-concurrency/`，未使用 `/tmp`。这加强了统计模块的
+现场证据，但生产升级期间的真实长期 projection/锁竞争仍保留 `[~]`。
+
+## 107. 2026-08-12 TUN IPv6 extension-header fragmentation
+
+此前 TUN 出方向分片只支持 smoltcp 实际产生的 IPv6 base-header + transport payload，遇到
+Hop-by-Hop、Routing 或 Destination Options 会直接返回 unsupported。现在分片布局解析会把
+IPv6、Hop-by-Hop、Routing 和 Routing 前的 Destination Options 作为 unfragmentable prefix，
+在其后插入 Fragment Header；Routing 后的 Destination Options 进入 fragmentable part，随
+完整 datagram 重组。AH/ESP 也不会被猜测长度，而是在 Fragment Header 后保留原始字节。
+
+新增单测覆盖大包分片、Hop-by-Hop + Routing + 后置 Destination Options 的逐字节重组，以及
+已有 Fragment Header 的 fail-closed。Podman `network=none` 中三个定向测试和随后完整
+`make workspace-tests` 均通过；本次完整 workspace 为 42 个 harness，core 145/145、runtime
+237/237、store 128/128、WireGuard 5/5，15/15 service-chain 通过。真实内核对扩展头组合的
+端到端现场和更广泛发行版/firewall matrix 仍保留 `[~]`。
+
+## 108. 2026-08-12 TUN fragmentation regression matrix
+
+为避免扩展头分片改动只通过 core 单测，本轮把验证整理成可复现的
+`make tun-ipv6-extension-smoke` 目标：Podman `--network=none` 中固定执行扩展头重组、重复
+Fragment Header 拒绝和原有 IPv6 大包分片，3/3 通过。随后执行 `YUHAIIN_SKIP_BUILD=1 make
+tun-mtu-smoke`，在 disposable user/network namespace 中以 576、1280、1500、9000、9216
+五档 MTU 发送最大合法 65507 字节 UDP，五档均完成 target receive、traffic 和 close。
+
+这两个目标都把日志写到 `~/.cache/yuhaiin-rust/integration/`，没有使用 `/tmp`；MTU 回归
+证明原有 IPv4/IPv6 TUN 数据面没有被扩展头布局修复破坏，但真实生产 firewall 和真实内核
+扩展头组合仍按 checklist 的 `[~]` 处理。
+
+## 109. 2026-08-12 WireGuard adapter 与生产 snapshot parity 收口
+
+WireGuard outbound 继续采用 Cloudflare `boringtun 0.7.1`，不再维护第二份纯 Rust
+WireGuard protocol implementation。`crates/yuhaiin-wireguard` 负责把 BoringTun 协议边界接到
+smoltcp TCP/UDP userspace stack 和 runtime `AsyncProxy`；Go 形状的 `secretKey`、本地
+`endpoint`、peer `publicKey`/PSK/`keepAlive`/`allowedIps`、MTU 和 Cloudflare WARP 的三字节
+`reserved` 均可从 SQLite/API 配置加载。认证后的 endpoint roaming 已由本地双 peer 测试固定，
+未认证 datagram 不会改变 peer endpoint；真实第三方/WARP peer 和 source-interface policy
+仍需外部环境，不能由 `network=none` 测试推断。
+
+本轮在 Podman `--network=none` 中重新通过 `make wireguard-smoke`：5/5 单测通过，覆盖
+配置解析、BoringTun handshake/data、reserved marker、双 userspace peer TCP proxy 和
+认证后的 endpoint roaming。随后 `make benchmark-wireguard-throughput` 也通过，64 MiB
+release packet benchmark 单次得到约 595.5 MiB/s；该数字只作为同机回归基线，结果位于
+`~/.cache/yuhaiin-rust/benchmarks/wireguard/`。期间修复了 benchmark 夹具将不带端口的
+`127.0.0.1` 解析成 `SocketAddr` 的问题，生产路径未放宽地址校验。
+
+另外，`make production-parity-smoke` 在三个停止态 Go snapshot（`tmp/v2/state.db`、
+`tmp/yuhaiin/state.db`、`tmp/aws/yuhaiin/state.db`）上通过：read、core mutation 和 error
+matrix 均与 Rust 一致；每个 snapshot 的副本、运行日志和临时状态都写入
+`~/.cache/yuhaiin-rust/production-parity/`，源库保持只读。远程 route list 启动刷新导致的
+实现差异和工具/license/log 元数据仍按脚本规则归一化，故 checklist 的生产 projection 项
+继续保留 `[~]`。
+
+## 110. 2026-08-12 Remote route-list refresh error projection parity
+
+对照 Go `Lists.RefreshContract` 后确认，Go 会为每个 remote route list 把本轮所有 URL 的下载
+结果写回 `route_lists_v2.data_json.errorMsgs`：成功时清空旧错误，失败时保留带 URL 的错误消息；
+local list 不参与这次写回。Rust 之前只把错误放在 activation response，重启或再次读取
+`route.lists`/`route.list.get` 时会丢失，现已补齐。
+
+`route_lists_refresh_value` 现在把 remote list 的 `errorMsgs`、route config、MaxMind metadata
+和 activation 一起放入 `mutate_and_reload`；远程缓存仍使用 sibling `.part` + atomic rename，
+因此强停不会产生半写入的 list 或管理面快照。新增单测固定 remote/local 隔离和 stale error
+清除语义。
+
+随后在 Podman 中完成 `make workspace-tests`：42 harness，core 145、runtime 241、store 128
+（5 个显式 ignored）、WireGuard 5（benchmark 单独 opt-in）、15/15 service-chain 全部通过。
+`make production-parity-smoke` 继续在三份停止态 Go snapshot 上通过，所有 read、core mutation
+和 error matrix 均 identical；副本、日志和临时状态均位于 `~/.cache/yuhaiin-rust`，未使用
+`/tmp`。
+
+## 111. 2026-08-12 Route-list refresh scheduler lifecycle
+
+此前 Rust 只有管理 API 手动调用 `/api/v2/route/lists/refresh` 时才会下载 remote route list；
+虽然 `refreshInterval` 已能写入 Go 兼容的 `route_extra.refresh_config`，长期运行的服务却不会按
+配置自动更新规则。这会让 UI 显示“已配置刷新”但运行时缓存一直停留在旧版本。
+
+现在 `RuntimeService` 启动一个与 DNS、inbound、HTTP API 同级的 route-list refresh owner：
+
+- `refreshInterval` 按 Go 合约解释为分钟，`0` 禁用，非法或溢出 legacy 值 fail-closed 为禁用；
+- controller reload 会唤醒任务，使 route-list 配置修改立即重新计算下一次 timer；
+- 定时刷新复用当前选中的 outbound transport，并沿用 `route_lists_refresh_value` 的 atomic cache、
+  `errorMsgs`、MaxMind metadata、activation 和 `mutate_and_reload` 事务边界；
+- 刷新自身产生的 reload event 会被消费后再重新计时，避免自触发忙循环；服务 shutdown 会停止
+  owner，避免后台任务脱离 RuntimeService 生命周期。
+
+新增 API 单测覆盖 Go 分钟换算、零值禁用、定时刷新写入 `lastRefreshTime` 和 shutdown；测试通过
+真实 `route_extra` 配置写入路径，避免只写 Rust 私有 config 而漏测 Go 兼容优先级。Podman 中
+完整 `make workspace-tests` 通过：42 个 harness，core 145、runtime 241、store 128、WireGuard
+5、service-chain 15；宿主机只编译 harness，运行状态仍位于 `~/.cache/yuhaiin-rust`，没有使用
+`/tmp`。
+
+## 112. 2026-08-12 Route refresh timestamp/single-flight 与选中节点删除
+
+继续按 Go 源码逐项核对后修正两处边界：`RefreshContract` 持久化的
+`lastRefreshTime` 使用 `time.Now().Unix()`，因此 Rust 不再把 Unix 毫秒写入
+`route_extra.refresh_config.last_refresh_time`；只有 activation 的
+`hostIndexRefreshAt` 保持 Unix 毫秒。手动 API 刷新和后台定时刷新共享一个原子 single-flight
+guard，重叠调用返回 Go 同样的 `refreshing` 内部错误，避免并发下载和互相覆盖配置。
+
+另修复选中节点删除时的 live selector 生命周期：删除前先关闭对应运行时 proxy，并将 selector
+临时切到 direct fallback，再在同一管理 reload 中清理三个 Go selected-node key。这样删除后
+不会因为 selector prepare 仍引用已删除节点而产生 `proxy runtime config ... was not found`；
+成功 reload 会清掉临时 retarget 状态。Go/Rust 生产 API parity、`api_contract` 进程测试和完整
+Podman `workspace-tests` 均通过。
+
+## 113. 2026-08-12 Statistics process dimensions and bounded history projection
+
+继续核对 Go `pkg/statistics` 和 `pkg/route/history.go` 的公开字段后，补齐两处运行时兼容边界：
+
+- failed history 的 key 由 `(protocol, host)` 扩展为 Go 使用的
+  `(protocol, host, process)`；同一目标由不同本地进程失败时不会互相覆盖，且通过 inbound
+  上下文传入的 process 会同时进入 failed-history 和 telemetry 的 `process` 维度；
+- route block history 的 `dumpProcessEnabled` 依据实际条目计算，不再固定返回 `false`；
+  block history 继续使用 Go route history 的 1000 条 LRU 边界，failed history 则保留 Go
+  SQLite 的全量持久化语义，仅在 API 查询结果处按 `LIMIT 1000` 截断，避免同时间戳数据因
+  Rust 侧提前淘汰而和生产数据库不一致。
+
+新增单测覆盖不同 process 的失败分组、失败 telemetry process 维度和 block history 标志。
+之后用 Podman 重跑完整 `make workspace-tests`：42 个 harness，core 145、runtime 243、store
+128、WireGuard 5、service-chain 15 全部通过；运行状态和日志仍位于
+`~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+随后再次执行 `make production-parity-smoke`，三份停止态 Go `state.db` 的 read、core
+mutation、error matrix 和全部统计 response 均 identical；结果位于
+`~/.cache/yuhaiin-rust/production-parity/`。
+另外重新通过 `make go-protocol-interop-smoke` 的 6 个 Podman 互操作 harness，覆盖 Go
+Yuubinsya TCP/UOT/native UDP/Ping、Go WebSocket→HTTP/2、HTTP/2 v1、VLESS、VMess 和 Trojan；
+`make tun-chain-service-smoke tun-api-process-smoke stats-soak-smoke` 也通过，分别固定
+TUN→TLS→HTTP/2→Yuubinsya、真实前台 binary 的 TUN API 开关、以及 12 readers×160 rounds
+和 256 writes 的 SQLite 统计并发/强停恢复。
+
+## 114. 2026-08-12 WireGuard userspace UDP session regression
+
+继续检查 WireGuard 的“纯 UDP”是否只停留在协议包加解密层后，发现原有双 peer 测试虽然覆盖
+BoringTun data round-trip，却没有把 `AsyncProxy::open_datagram`、smoltcp UDP socket、加密
+封装、对端解封装、反向回包和 session close 串起来。现已在同一个 Podman 双 userspace peer
+夹具中补齐完整 UDP echo：第一端通过 WireGuard UDP session 发往第二端虚拟地址，第二端通过
+自己的 UDP session 收到后回包，第一端收到原 payload；同时保留 TCP 建连/关闭、reserved
+marker、keepAlive 配置解析和 authenticated endpoint roaming 断言。
+
+`make wireguard-smoke` 现为 5 passed、1 ignored benchmark，Podman 日志位于
+`~/.cache/yuhaiin-rust/integration/wireguard/podman.log`。这证明 Cloudflare BoringTun
+adapter 的本地 TCP/UDP data plane 和 runtime session 生命周期；真实第三方/WARP peer 的
+公网 handshake、keepalive、NAT endpoint 变化仍需要用户自己的外部 peer 配置，不能从
+`network=none` 的确定性测试推断。对照 Go `Config` 可确认它只有 `secretKey`、`endpoint`、
+`peers`、`mtu`、`reserved`，没有 source-interface 配置，因此 Rust 不额外引入不兼容字段。

@@ -29,8 +29,9 @@ use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 use super::common::{
-    UDP_IDLE_TIMEOUT, UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows,
-    io_error, reap_expired_udp_flows, relay_counted_with_buffer, shutdown_udp_flow, udp_flow_key,
+    UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows, io_error,
+    reap_expired_udp_flows_with_timeout, relay_counted_with_buffer, shutdown_udp_flow,
+    udp_flow_key, udp_idle_timeout,
 };
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -88,7 +89,8 @@ pub(crate) async fn serve_udp_listener(
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
     let mut flows = HashMap::<UdpFlowId, UdpFlowState>::new();
     let mut close_events = monitor.subscribe_close_requests();
-    let mut idle_tick = tokio::time::interval(UDP_IDLE_TIMEOUT);
+    let idle_timeout = udp_idle_timeout();
+    let mut idle_tick = tokio::time::interval(idle_timeout);
     let mut packet = vec![0u8; udp_buffer_size];
     loop {
         tokio::select! {
@@ -190,7 +192,7 @@ pub(crate) async fn serve_udp_listener(
                 }
             }
             _ = idle_tick.tick() => {
-                reap_expired_udp_flows(&mut flows).await;
+                reap_expired_udp_flows_with_timeout(&mut flows, idle_timeout).await;
             }
             else => break,
         }
@@ -241,6 +243,15 @@ fn bind_udp_socket(listen: SocketAddr) -> Result<AsyncFd<Socket>> {
         socket
             .set_ip_transparent_v4(true)
             .map_err(|error| capability_error("IP_TRANSPARENT", error))?;
+        if !socket
+            .ip_transparent_v4()
+            .map_err(|error| capability_error("IP_TRANSPARENT readback", error))?
+        {
+            return Err(Error::new(
+                ErrorKind::Io,
+                "IP_TRANSPARENT readback was disabled",
+            ));
+        }
         setsockopt(&socket, sockopt::Ipv4OrigDstAddr, &true).map_err(|error| {
             Error::new(
                 ErrorKind::Io,
@@ -251,6 +262,15 @@ fn bind_udp_socket(listen: SocketAddr) -> Result<AsyncFd<Socket>> {
         socket
             .set_ip_transparent_v6(true)
             .map_err(|error| capability_error("IPV6_TRANSPARENT", error))?;
+        if !socket
+            .ip_transparent_v6()
+            .map_err(|error| capability_error("IPV6_TRANSPARENT readback", error))?
+        {
+            return Err(Error::new(
+                ErrorKind::Io,
+                "IPV6_TRANSPARENT readback was disabled",
+            ));
+        }
         setsockopt(&socket, sockopt::Ipv6OrigDstAddr, &true).map_err(|error| {
             Error::new(
                 ErrorKind::Io,
@@ -261,6 +281,37 @@ fn bind_udp_socket(listen: SocketAddr) -> Result<AsyncFd<Socket>> {
     socket
         .bind(&listen.into())
         .map_err(|error| capability_error("transparent UDP bind", error))?;
+    // Keep this post-bind as well as the pre-bind setup above. Go's
+    // net.ListenUDP path applies the transparent option after bind, and this
+    // makes the Rust socket contract explicit for kernels that inspect the
+    // bound UDP socket during TPROXY lookup.
+    if listen.is_ipv4() {
+        socket
+            .set_ip_transparent_v4(true)
+            .map_err(|error| capability_error("IP_TRANSPARENT post-bind", error))?;
+        if !socket
+            .ip_transparent_v4()
+            .map_err(|error| capability_error("IP_TRANSPARENT post-bind readback", error))?
+        {
+            return Err(Error::new(
+                ErrorKind::Io,
+                "IP_TRANSPARENT post-bind readback was disabled",
+            ));
+        }
+    } else {
+        socket
+            .set_ip_transparent_v6(true)
+            .map_err(|error| capability_error("IPV6_TRANSPARENT post-bind", error))?;
+        if !socket
+            .ip_transparent_v6()
+            .map_err(|error| capability_error("IPV6_TRANSPARENT post-bind readback", error))?
+        {
+            return Err(Error::new(
+                ErrorKind::Io,
+                "IPV6_TRANSPARENT post-bind readback was disabled",
+            ));
+        }
+    }
     socket.set_nonblocking(true).map_err(io_error)?;
     AsyncFd::new(socket).map_err(io_error)
 }
@@ -394,12 +445,18 @@ async fn handle_connection(
     context.source = Some(Endpoint::ip(Network::Tcp, peer));
     spec.annotate_context(&mut context);
     selector.route_context(&mut context);
+    let process = context.process.clone();
     let outbound = selector
         .select(&context)
         .connect(&context)
         .await
         .inspect_err(|error| {
-            monitor.record_failure(protocol, &endpoint.to_string(), &error.to_string());
+            monitor.record_failure_with_process(
+                protocol,
+                &endpoint.to_string(),
+                &error.to_string(),
+                process.as_deref(),
+            );
         })?;
     relay_counted_with_buffer(
         stream,

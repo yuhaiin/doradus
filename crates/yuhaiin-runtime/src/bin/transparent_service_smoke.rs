@@ -83,6 +83,17 @@ async fn run() -> Result<()> {
     let ipv6_done_file = std::env::var_os("YUHAIIN_IPV6_CLIENT_DONE")
         .map(PathBuf::from)
         .unwrap_or_else(|| database.with_file_name("ipv6-client.done"));
+    let idle_wait_ms = std::env::var("YUHAIIN_TPROXY_IDLE_WAIT_MS")
+        .ok()
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                Error::invalid(format!(
+                    "YUHAIIN_TPROXY_IDLE_WAIT_MS must be a non-negative integer, got {value:?}"
+                ))
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
 
     let target_listener = TcpListener::bind(target).await.map_err(io_error)?;
     let target_listener_v6 = match target_v6 {
@@ -217,6 +228,50 @@ async fn run() -> Result<()> {
                 "transparent flow statistics incomplete: total={total} udp_connections={udp_connections}"
             ),
         ));
+    }
+
+    let force_service_stop = std::env::var("YUHAIIN_TPROXY_FORCE_SERVICE_STOP")
+        .map(|value| value != "0")
+        .unwrap_or(false);
+    if force_service_stop {
+        if let Some(ready_file) = std::env::var_os("YUHAIIN_TPROXY_FORCE_STOP_READY") {
+            std::fs::write(&ready_file, b"ready\n").map_err(io_error)?;
+        }
+        println!("transparent-force-stop-ready");
+        loop {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    if tproxy_enabled && idle_wait_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(idle_wait_ms)).await;
+        let after_idle = controller.monitor().connections_value();
+        let after_udp_connections = after_idle
+            .get("connections")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item.pointer("/network/connType") == Some(&json!("udp")))
+                    .count()
+            })
+            .unwrap_or_default();
+        if after_udp_connections != 0 {
+            let _ = shutdown_tx.send(true);
+            let _ = service.await;
+            target_task.abort();
+            let _ = target_task.await;
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!(
+                    "transparent UDP idle flows were not reaped: before={udp_connections} after={after_udp_connections} wait_ms={idle_wait_ms}"
+                ),
+            ));
+        }
+        println!(
+            "transparent-tproxy-idle-reaped before={} after={} wait_ms={idle_wait_ms}",
+            udp_connections, after_udp_connections
+        );
     }
 
     shutdown_tx
@@ -466,8 +521,9 @@ fn run_tproxy_probe() -> std::io::Result<()> {
     socket.set_ip_transparent_v4(true)?;
     setsockopt(&socket, sockopt::Ipv4OrigDstAddr, &true)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let transparent = socket.ip_transparent_v4()?;
     socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into())?;
-    println!("transparent-tproxy-socket-ok");
+    println!("transparent-tproxy-socket-ok ip-transparent={transparent}");
     Ok(())
 }
 

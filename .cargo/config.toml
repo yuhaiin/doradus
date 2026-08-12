@@ -1,0 +1,7 @@
+# smoltcp's default outgoing-fragmentation buffer is 1500 bytes.  A TUN
+# interface may receive a full IPv4 UDP datagram up to 65507 bytes and then
+# has to fragment the echo/reply back to the kernel MTU.  Keep the sizing at
+# the workspace boundary so every target (including musl builds) uses the
+# same packet contract instead of silently dropping datagrams above 1500.
+[env]
+SMOLTCP_FRAGMENTATION_BUFFER_SIZE = "65535"

@@ -311,6 +311,21 @@ impl RuntimeSnapshot {
             build_vless_transport_proxy(&config, timeout, self.resolver.clone()).await?
         } else if is_vmess_transport_config(&config) {
             build_vmess_transport_proxy(&config, timeout, self.resolver.clone()).await?
+        } else if config.transport == yuhaiin_store::GoProxyTransport::Wireguard {
+            let layer = config
+                .layers
+                .iter()
+                .find(|layer| layer.kind.eq_ignore_ascii_case("wireguard"))
+                .ok_or_else(|| Error::invalid("WireGuard protocol layer is missing"))?;
+            let wireguard: yuhaiin_wireguard::WireGuardConfig =
+                serde_json::from_value(layer.config.clone()).map_err(|error| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid WireGuard node configuration: {error}"),
+                    )
+                })?;
+            Arc::new(yuhaiin_wireguard::build_proxy(wireguard, timeout).await?)
+                as Arc<dyn AsyncProxy>
         } else if is_chain_config(&config) {
             let json = std::str::from_utf8(&config.data_json).map_err(|error| {
                 Error::new(
@@ -794,6 +809,7 @@ pub struct RuntimeProxySelector {
     drop_id: String,
     timeout: Duration,
     closed_nodes: RwLock<BTreeSet<String>>,
+    retargeted_nodes: RwLock<BTreeSet<String>>,
     metadata: RwLock<ProxyContextMetadata>,
     settings: RwLock<crate::RuntimeSettings>,
     loopback: LoopbackDetector,
@@ -813,6 +829,10 @@ impl RuntimeProxySelector {
             .closed_nodes
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let retargeted_nodes = self
+            .retargeted_nodes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         [
             self.direct_id.as_str(),
             self.proxy_id.as_str(),
@@ -821,7 +841,9 @@ impl RuntimeProxySelector {
             self.drop_id.as_str(),
         ]
         .into_iter()
-        .filter(|id| !id.is_empty() && !closed_nodes.contains(*id))
+        .filter(|id| {
+            !id.is_empty() && !closed_nodes.contains(*id) && !retargeted_nodes.contains(*id)
+        })
         .map(str::to_owned)
         .collect()
     }
@@ -852,6 +874,7 @@ impl RuntimeProxySelector {
             drop_id: drop_id.to_owned(),
             timeout,
             closed_nodes: RwLock::new(BTreeSet::new()),
+            retargeted_nodes: RwLock::new(BTreeSet::new()),
             metadata: RwLock::new(
                 snapshot
                     .proxy_context_metadata(
@@ -872,14 +895,19 @@ impl RuntimeProxySelector {
         &self,
         snapshot: &RuntimeSnapshot,
     ) -> Result<PreparedProxySelector> {
+        let direct_id = self.effective_node_id(&self.direct_id);
+        let proxy_id = self.effective_node_id(&self.proxy_id);
+        let udp_proxy_id = self.effective_node_id(&self.udp_proxy_id);
+        let bypass_id = self.effective_node_id(&self.bypass_id);
+        let drop_id = self.effective_node_id(&self.drop_id);
         Ok(PreparedProxySelector {
             selector: track_selector(
                 snapshot
                     .build_routed_proxy_selector(
-                        &self.direct_id,
-                        &self.proxy_id,
-                        &self.bypass_id,
-                        &self.drop_id,
+                        &direct_id,
+                        &proxy_id,
+                        &bypass_id,
+                        &drop_id,
                         self.timeout,
                     )
                     .await?,
@@ -888,23 +916,17 @@ impl RuntimeProxySelector {
             udp_selector: track_selector(
                 snapshot
                     .build_routed_proxy_selector(
-                        &self.direct_id,
-                        &self.udp_proxy_id,
-                        &self.bypass_id,
-                        &self.drop_id,
+                        &direct_id,
+                        &udp_proxy_id,
+                        &bypass_id,
+                        &drop_id,
                         self.timeout,
                     )
                     .await?,
                 &self.loopback,
             ),
             metadata: snapshot
-                .proxy_context_metadata(
-                    &self.direct_id,
-                    &self.proxy_id,
-                    &self.udp_proxy_id,
-                    &self.bypass_id,
-                    &self.drop_id,
-                )
+                .proxy_context_metadata(&direct_id, &proxy_id, &udp_proxy_id, &bypass_id, &drop_id)
                 .await?,
             settings: snapshot.settings.clone(),
         })
@@ -921,6 +943,10 @@ impl RuntimeProxySelector {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.udp_selector;
         self.closed_nodes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.retargeted_nodes
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
@@ -980,6 +1006,33 @@ impl RuntimeProxySelector {
         }
     }
 
+    /// Retarget a node that is about to be deleted to the built-in direct
+    /// slot. Go removes a selected node and reloads the inbound runtime in one
+    /// management operation; keeping the old ID in a live selector would
+    /// make that reload fail while preparing the selector. Existing flows are
+    /// already closed by `close_node`; the next successful replacement then
+    /// installs the direct fallback for new flows.
+    pub(crate) async fn retarget_node_to_direct(&self, id: &str) {
+        self.close_node(id).await;
+        self.retargeted_nodes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id.to_owned());
+    }
+
+    fn effective_node_id(&self, id: &str) -> String {
+        if self
+            .retargeted_nodes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(id)
+        {
+            String::new()
+        } else {
+            id.to_owned()
+        }
+    }
+
     pub(crate) fn relay_buffer_size(&self) -> usize {
         self.settings
             .read()
@@ -1011,6 +1064,10 @@ pub(crate) struct PreparedProxySelector {
 
 impl AsyncProxySelector for RuntimeProxySelector {
     fn route_context(&self, context: &mut FlowContext) {
+        let direct_id = self.effective_node_id(&self.direct_id);
+        let proxy_id = self.effective_node_id(&self.proxy_id);
+        let udp_proxy_id = self.effective_node_id(&self.udp_proxy_id);
+        let bypass_id = self.effective_node_id(&self.bypass_id);
         let metadata = self
             .metadata
             .read()
@@ -1037,10 +1094,10 @@ impl AsyncProxySelector for RuntimeProxySelector {
         annotate_connection_metadata(
             context,
             &metadata,
-            &self.direct_id,
-            &self.proxy_id,
-            &self.udp_proxy_id,
-            &self.bypass_id,
+            &direct_id,
+            &proxy_id,
+            &udp_proxy_id,
+            &bypass_id,
         );
     }
 
@@ -1464,6 +1521,7 @@ fn build_protocol_tls_proxy(
 mod tests {
     use super::*;
     use crate::RuntimeSnapshot;
+    use base64::Engine;
     use std::sync::Arc;
     use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
     use yuhaiin_core::proxy::FixedAsyncProxy;
@@ -1530,6 +1588,39 @@ mod tests {
             kind: BaseProxyKind::Direct,
             timeout: Duration::from_secs(1),
         };
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_builds_wireguard_from_go_layer() {
+        let key = |value| base64::engine::general_purpose::STANDARD.encode([value; 32]);
+        let config = GoProxyRuntimeConfig {
+            id: "wireguard".to_owned(),
+            name: "WireGuard".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec!["wireguard".to_owned()],
+            layers: vec![GoProxyLayer {
+                kind: "wireguard".to_owned(),
+                config: serde_json::json!({
+                    "secretKey": key(1),
+                    "endpoint": ["10.0.0.2/32"],
+                    "reserved": "AAAA",
+                    "peers": [{
+                        "publicKey": key(2),
+                        "endpoint": "127.0.0.1:51820",
+                        "allowedIps": ["0.0.0.0/0"]
+                    }]
+                }),
+            }],
+            transport: GoProxyTransport::Wireguard,
+            data_json: Vec::new(),
+        };
+        let built = snapshot(config)
+            .build_proxy("wireguard", Duration::from_secs(1))
+            .await
+            .unwrap();
+        built.proxy.close().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

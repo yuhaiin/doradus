@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use crate::dns::{DnsRecordType, DnsResponse};
 use crate::dns_hosts::HostsTable;
 use crate::dns_resolver_async::AsyncIpResolver;
 use crate::{BoxFuture, DomainName, IpSet, ResolveStrategy, Result};
@@ -37,6 +38,37 @@ impl AsyncIpResolver for AsyncHostsResolver {
                 self.upstream.resolve(domain, strategy).await?,
                 strategy,
             ))
+        })
+    }
+
+    fn query<'a>(
+        &'a self,
+        domain: &'a DomainName,
+        record_type: DnsRecordType,
+    ) -> BoxFuture<'a, Result<DnsResponse>> {
+        Box::pin(async move {
+            let Some(addresses) = self.hosts.resolve(domain)? else {
+                return self.upstream.query(domain, record_type).await;
+            };
+            let addresses = match record_type {
+                DnsRecordType::A => IpSet {
+                    v4: addresses.v4,
+                    v6: Vec::new(),
+                },
+                DnsRecordType::Aaaa => IpSet {
+                    v4: Vec::new(),
+                    v6: addresses.v6,
+                },
+                DnsRecordType::Ptr | DnsRecordType::Https | DnsRecordType::Svcb => {
+                    return self.upstream.query(domain, record_type).await;
+                }
+            };
+            Ok(DnsResponse {
+                addresses,
+                ptr_names: Vec::new(),
+                service_bindings: Vec::new(),
+                minimum_ttl: Some(60),
+            })
         })
     }
 }

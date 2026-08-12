@@ -20,6 +20,21 @@ use crate::{ConnectionMonitor, RuntimeProxySelector};
 
 /// Matches Go's `configuration.UDPIdleTimeout` (90 seconds).
 pub(crate) const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const TEST_UDP_IDLE_TIMEOUT_ENV: &str = "YUHAIIN_TEST_UDP_IDLE_TIMEOUT_MS";
+
+/// Returns the production timeout unless an explicitly test-scoped override
+/// is present. This is deliberately not part of the user configuration.
+pub(crate) fn udp_idle_timeout() -> Duration {
+    std::env::var(TEST_UDP_IDLE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| parse_udp_idle_timeout(&value))
+        .unwrap_or(UDP_IDLE_TIMEOUT)
+}
+
+fn parse_udp_idle_timeout(value: &str) -> Option<Duration> {
+    let milliseconds = value.parse::<u64>().ok()?;
+    (milliseconds > 0).then(|| Duration::from_millis(milliseconds))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct UdpFlowId {
@@ -81,11 +96,14 @@ pub(crate) fn udp_flow_expired(
     now.saturating_duration_since(last_seen) >= timeout
 }
 
-pub(crate) async fn reap_expired_udp_flows(flows: &mut HashMap<UdpFlowId, UdpFlowState>) -> usize {
+pub(crate) async fn reap_expired_udp_flows_with_timeout(
+    flows: &mut HashMap<UdpFlowId, UdpFlowState>,
+    timeout: Duration,
+) -> usize {
     let now = std::time::Instant::now();
     let ids = flows
         .iter()
-        .filter(|(_, state)| udp_flow_expired(state.last_seen, now, UDP_IDLE_TIMEOUT))
+        .filter(|(_, state)| udp_flow_expired(state.last_seen, now, timeout))
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
     let count = ids.len();
@@ -408,6 +426,13 @@ mod tests {
             now,
             UDP_IDLE_TIMEOUT,
         ));
+    }
+
+    #[test]
+    fn test_udp_idle_timeout_override_accepts_only_positive_milliseconds() {
+        assert_eq!(parse_udp_idle_timeout("1000"), Some(Duration::from_secs(1)));
+        assert_eq!(parse_udp_idle_timeout("0"), None);
+        assert_eq!(parse_udp_idle_timeout("nope"), None);
     }
 
     struct CloseTrackingDatagram {

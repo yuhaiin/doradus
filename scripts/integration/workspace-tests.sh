@@ -72,7 +72,7 @@ run_in_podman() {
     -v "${target_dir}/debug/yuhaiin:/usr/local/bin/yuhaiin:ro" \
     -e YUHAIIN_RUNTIME_BIN=/usr/local/bin/yuhaiin \
     -e HOME=/state/home \
-    -e TMPDIR=/state/tmp \
+    -e TMPDIR=/state/cache/tmp \
     -e XDG_CACHE_HOME=/state/cache \
     -e YUHAIIN_CACHE_DIR=/state/cache/yuhaiin-rust \
     -e YUHAIIN_INTEGRATION_DIR=/state/integration \

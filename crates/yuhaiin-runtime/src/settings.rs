@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use serde_json::Value;
+use yuhaiin_core::dns::{DnsRecordType, DnsResponse, DnsServiceParam};
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::{BoxFuture, DomainName, IpSet, ResolveStrategy, Result};
 use yuhaiin_store::{ConfigStore, GoSettingsKvRecord};
@@ -404,6 +405,25 @@ impl AsyncIpResolver for Ipv6PolicyResolver {
                 result.v6.clear();
             }
             Ok(result)
+        })
+    }
+
+    fn query<'a>(
+        &'a self,
+        domain: &'a DomainName,
+        record_type: DnsRecordType,
+    ) -> BoxFuture<'a, Result<DnsResponse>> {
+        Box::pin(async move {
+            let mut response = self.upstream.query(domain, record_type).await?;
+            if !self.enabled {
+                response.addresses.v6.clear();
+                for binding in &mut response.service_bindings {
+                    binding
+                        .params
+                        .retain(|param| !matches!(param, DnsServiceParam::Ipv6Hint(_)));
+                }
+            }
+            Ok(response)
         })
     }
 }
