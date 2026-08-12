@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use std::io::{Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -1062,11 +1062,29 @@ impl ServiceProcess {
         if let Some(mut stderr) = child.stderr.take() {
             let diagnostics_writer = diagnostics.clone();
             std::thread::spawn(move || {
+                let mut reader = BufReader::new(&mut stderr);
                 let mut output = String::new();
-                let _ = stderr.read_to_string(&mut output);
-                *diagnostics_writer
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = output;
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) != 0 {
+                    output.push_str(&line);
+                    // Keep diagnostics useful while bounding the memory held
+                    // by a long-running child. The tail contains the latest
+                    // startup/reload failure, which is what a timed-out
+                    // integration test needs.
+                    if output.len() > 64 * 1024 {
+                        let trim_at = output.len() - 64 * 1024;
+                        let trim_at = output
+                            .char_indices()
+                            .find(|(index, _)| *index >= trim_at)
+                            .map(|(index, _)| index)
+                            .unwrap_or(0);
+                        output.drain(..trim_at);
+                    }
+                    *diagnostics_writer
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = output.clone();
+                    line.clear();
+                }
             });
         }
         let _ = rustls_rustcrypto::provider().install_default();

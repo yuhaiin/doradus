@@ -4032,3 +4032,25 @@ MSVC 或 Apple SDK 验证。构建缓存和下载的 toolchain 均位于 `~/.cac
 本轮构建并发结束后运行仓库自带 `cache-prune`，清理 0 个过期 integration 目录和可重建的
 `cargo-target/debug` 依赖目录，保留 debug binary、release 产物、Cargo registry 和可复用
 fixture；缓存从约 23G 降至约 16G，没有使用 `/tmp`。
+
+## 145. 2026-08-12 Darwin/Windows target 编译边界
+
+为检查发布矩阵中的 `cfg` 分支，先在 Podman 中以 Rust 1.97.1 对四个 native release target
+做了 `cargo check --all-features` 尝试。Linux 容器没有 Apple clang/SDK，Darwin target 在
+`ring` C 编译阶段无法处理 `-arch`、`-mmacosx-version-min`；同理，Windows MSVC target
+缺少 Windows SDK 头文件（`assert.h`）。这两次失败是交叉环境能力边界，不是 Rust 源码的编译
+诊断，也不应通过切换 GNU target 来掩盖 MSVC/Apple 验收缺失。
+
+随后在同一个 Podman Rust 环境安装 MinGW，完成了 `x86_64-pc-windows-gnu`、
+`yuhaiin-runtime --bin yuhaiin --all-features` 的完整 `cargo check`。这覆盖了 Windows
+条件编译分支，包括 `windows-service`、TUN、BoringTun、HTTP API 和 SQLite；它证明 Windows
+代码不会在 `cfg(windows)` 下直接失效，但不替代 workflow 中 Windows x86_64/arm64 MSVC 的
+原生链接。Darwin x86_64/arm64 与 Windows MSVC x86_64/arm64 仍由 macOS/Windows runner 的
+release job 负责最终证据。
+
+本轮专用 target 位于 `~/.cache/yuhaiin-rust/cross-platform-check`，验证后删除；没有使用
+`/tmp`。
+
+同时收紧了 Podman 服务测试的诊断读取：`ServiceProcess` 现在持续读取子进程 stderr，并只保留
+最近 64 KiB，超时或启动失败时仍能看到最新错误，同时避免异常长日志把测试进程的诊断缓冲无限
+增长。`make api-contract-smoke` 的 3 个真实进程测试已在该改动后通过。

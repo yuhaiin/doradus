@@ -253,6 +253,8 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `make tun-api-process-smoke`（2026-08-12 当前轮） | Podman disposable user/network namespace、前台 runtime、`/dev/net/tun` | 1/1 通过；真实设备按 disabled→enabled→disabled→enabled→disabled 出现/消失，并验证两个同时 enabled 的 TUN 可独立关闭，排除“API 已保存但 TUN supervisor 未切换” |
 | `make build MUSL=1`（2026-08-12 当前轮） | 宿主只做 target 编译，产物留在 `~/.cache/yuhaiin-rust` | `x86_64-unknown-linux-musl` debug runtime 构建通过；未把宿主编译当作容器运行时证据 |
 | Podman musl release matrix（2026-08-12 当前轮） | workflow 同版本 `cross-tools/musl-cross@20260515`，x86_64/aarch64 toolchain SHA 校验，构建目录在 `~/.cache/yuhaiin-rust` | `x86_64-unknown-linux-musl` 与 `aarch64-unknown-linux-musl` 的 `yuhaiin --all-features --release` 均成功；分别产出 static-pie x86-64 与静态 ARM64 ELF |
+| Podman Windows cfg check（2026-08-12 当前轮） | `rust:latest`、MinGW、`x86_64-pc-windows-gnu`、`--all-features` | `windows-service`、TUN、BoringTun、HTTP API 等 Windows cfg 分支完整 `cargo check` 通过；GNU 检查不冒充 MSVC release |
+| Podman Darwin/MSVC cross-check boundary（2026-08-12 当前轮） | Linux 容器尝试 Apple/Windows MSVC target | `ring` 需要 Apple clang/SDK 或 Windows SDK；容器分别因 `-arch/-mmacosx-version-min`、缺少 `assert.h` 失败，故保留为 native macOS/Windows runner 验证项，不记为源码失败 |
 | `make startup-logs-smoke` | foreground Podman；不传命令、不传 `YUHAIIN_DB/YUHAIIN_HTTP/YUHAIIN_QUIET`，只隔离 HOME/config | 真实 `./yuhaiin` 默认启动会在 stderr 输出 database、API bind、runtime ready、shutdown/stopped；因此不是静默卡死；`YUHAIIN_QUIET=1` 仍可显式关闭 |
 
 ## 常用命令
