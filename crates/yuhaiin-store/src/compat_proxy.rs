@@ -248,6 +248,17 @@ fn select_proxy_transport(chain_types: &[String], layers: &[GoProxyLayer]) -> Go
         .map(String::as_str)
         .chain(layers.iter().map(|layer| layer.kind.as_str()))
         .collect::<Vec<_>>();
+    // Go registers `none` as a no-op point. A node containing only that point
+    // therefore starts from the zero/direct proxy instead of being rejected
+    // as an unknown transport. Keep mixed future chains unknown so this
+    // compatibility rule cannot silently discard a protocol we do not know.
+    if !all_types.is_empty()
+        && all_types
+            .iter()
+            .all(|kind| kind.eq_ignore_ascii_case("none"))
+    {
+        return GoProxyTransport::Direct;
+    }
     // The outer protocol is the effective runtime proxy: HTTP/SOCKS5 wraps a
     // fixed dialer, and Yuubinsya wraps the full fixed/TLS/HTTP2 chain.
     for preferred in [
@@ -280,9 +291,16 @@ fn select_proxy_transport(chain_types: &[String], layers: &[GoProxyLayer]) -> Go
     }
     all_types
         .iter()
+        .filter(|kind| !kind.eq_ignore_ascii_case("none"))
         .map(|kind| parse_proxy_transport(kind))
         .find(|transport| !matches!(transport, GoProxyTransport::Unknown { .. }))
         .unwrap_or_else(|| GoProxyTransport::Unknown {
-            name: all_types.first().copied().unwrap_or("unknown").to_owned(),
+            name: all_types
+                .iter()
+                .find(|kind| !kind.eq_ignore_ascii_case("none"))
+                .copied()
+                .or_else(|| all_types.first().copied())
+                .unwrap_or("unknown")
+                .to_owned(),
         })
 }

@@ -408,6 +408,8 @@ fn go_node_runtime_preserves_proxy_layers_and_selects_supported_base() {
         ("aead", GoProxyTransport::Aead),
         ("tls", GoProxyTransport::Tls),
         ("http2", GoProxyTransport::Http2),
+        // Go's `none` point is a no-op wrapper around the zero/direct proxy.
+        ("none", GoProxyTransport::Direct),
     ];
     for (protocol, expected) in cases {
         let record = GoNodeRecord {
@@ -473,6 +475,26 @@ fn go_node_runtime_preserves_proxy_layers_and_selects_supported_base() {
     assert_eq!(
         wrapped_base.to_proxy_runtime_config().unwrap().transport,
         GoProxyTransport::Fixed
+    );
+
+    let none_with_unknown = GoNodeRecord {
+        id: "node-none-unknown".to_owned(),
+        name: "none-unknown".to_owned(),
+        group_name: "test".to_owned(),
+        origin: "manual".to_owned(),
+        enabled: true,
+        chain_types_json: br#"["none","future_protocol"]"#.to_vec(),
+        updated_at: 1,
+        data_json: br#"{"chain":[{"type":"none","none":{}},{"type":"future_protocol","future_protocol":{}}]}"#.to_vec(),
+    };
+    assert_eq!(
+        none_with_unknown
+            .to_proxy_runtime_config()
+            .unwrap()
+            .transport,
+        GoProxyTransport::Unknown {
+            name: "future_protocol".to_owned()
+        }
     );
 }
 
