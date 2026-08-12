@@ -258,6 +258,86 @@ async fn protocol_outbound_server(
     }
 }
 
+async fn protocol_udp_outbound_server(
+    kind: ProtocolOutboundKind,
+    listener: TcpListener,
+    expected_payload: &'static [u8],
+) {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let destination = Endpoint::ip(Network::Udp, "8.8.8.8:5353".parse().unwrap());
+    match kind {
+        ProtocolOutboundKind::Vless => {
+            let uuid = vless::parse_uuid("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+            let request = vless::read_request(&mut stream, &uuid).await.unwrap();
+            assert_eq!(request.command, vless::Command::Udp);
+            assert_eq!(request.destination, destination);
+
+            let length = stream.read_u16().await.unwrap();
+            assert_eq!(usize::from(length), expected_payload.len());
+            let mut payload = vec![0u8; usize::from(length)];
+            stream.read_exact(&mut payload).await.unwrap();
+            assert_eq!(payload, expected_payload);
+            stream.write_u16(length).await.unwrap();
+            stream.write_all(expected_payload).await.unwrap();
+        }
+        ProtocolOutboundKind::Trojan => {
+            let hash = trojan::password_hash(b"runtime-protocol-password");
+            let request = trojan::read_request(&mut stream, &hash).await.unwrap();
+            assert_eq!(request.command, trojan::Command::Associate);
+            assert_eq!(request.destination, destination);
+
+            let mut buffer = vec![0u8; 2048];
+            let (length, target) = trojan::read_udp_frame(&mut stream, &mut buffer)
+                .await
+                .unwrap();
+            assert_eq!(target, destination);
+            assert_eq!(&buffer[..length], expected_payload);
+            trojan::write_udp_frame(&mut stream, &target, expected_payload)
+                .await
+                .unwrap();
+        }
+        ProtocolOutboundKind::Vmess => {
+            const UUID: [u8; 16] = [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ];
+            let request = vmess::read_request(&mut stream, &UUID).await.unwrap();
+            assert_eq!(request.command, 2, "VMess command must be UDP");
+            assert_eq!(request.destination, destination);
+            let response_key = sha256_key(&request.body_key);
+            let response_iv = sha256_key(&request.body_iv);
+            stream
+                .write_all(
+                    &vmess::encode_response_header(request.response_v, &response_key, &response_iv)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let payload = vmess::read_body_frame(
+                &mut stream,
+                &request.body_key,
+                &request.body_iv,
+                request.security,
+                0,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(payload, expected_payload);
+            vmess::write_body_frame(
+                &mut stream,
+                &response_key,
+                &response_iv,
+                request.security,
+                0,
+                expected_payload,
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
 async fn read_http_headers(stream: &mut TcpStream) -> Vec<u8> {
     let mut request = Vec::new();
     let mut byte = [0u8; 1];
@@ -282,6 +362,7 @@ async fn configure_protocol_outbound_chain(
     kind: ProtocolOutboundKind,
     inbound: SocketAddr,
     server: SocketAddr,
+    udp: bool,
 ) {
     let node_id = kind.node_id();
     let inbound_id = kind.inbound_id();
@@ -331,13 +412,18 @@ async fn configure_protocol_outbound_chain(
     )
     .await;
 
+    let inbound_protocol = if udp {
+        json!({"type":"mixed","mixed":{"username":"","password":""}})
+    } else {
+        json!({"type":"http","http":{"username":"","password":""}})
+    };
     let inbound = json!({
         "id":inbound_id,
         "name":format!("{} runtime protocol inbound", kind.name()),
         "enabled":true,
-        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
+        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":if udp { "enabled" } else { "disabled" }}},
         "transports":[{"type":"normal","normal":{}}],
-        "protocol":{"type":"http","http":{"username":"","password":""}}
+        "protocol":inbound_protocol
     });
     api_json(
         &service.client,
@@ -386,7 +472,7 @@ async fn run_protocol_outbound_chain(kind: ProtocolOutboundKind) {
     let database = root.join("state.sqlite");
     seed_empty_database(&database).await;
     let service = ServiceProcess::start(&database).await;
-    configure_protocol_outbound_chain(&service, kind, inbound, protocol_server).await;
+    configure_protocol_outbound_chain(&service, kind, inbound, protocol_server, false).await;
 
     let mut client = connect_loopback(inbound).await;
     let authority = "example.test:443";
@@ -461,6 +547,81 @@ async fn run_protocol_outbound_chain(kind: ProtocolOutboundKind) {
     server_task.await.unwrap();
 }
 
+async fn run_protocol_udp_outbound_chain(kind: ProtocolOutboundKind) {
+    let expected_payload: &'static [u8] = match kind {
+        ProtocolOutboundKind::Vless => b"runtime-vless-udp-outbound",
+        ProtocolOutboundKind::Vmess => b"runtime-vmess-udp-outbound",
+        ProtocolOutboundKind::Trojan => b"runtime-trojan-udp-outbound",
+    };
+    let protocol_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let protocol_server = protocol_listener.local_addr().unwrap();
+    let server_task = tokio::spawn(protocol_udp_outbound_server(
+        kind,
+        protocol_listener,
+        expected_payload,
+    ));
+
+    let _default_mixed_blocker = TcpListener::bind("127.0.0.1:1080").await.ok();
+    let inbound = support::reserve_loopback().await;
+    let root = integration_dir(&format!("service-{}-runtime-udp-outbound", kind.name()));
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_protocol_outbound_chain(&service, kind, inbound, protocol_server, true).await;
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut packet = vec![0, 0, 0, 1, 8, 8, 8, 8];
+    packet.extend_from_slice(&5353u16.to_be_bytes());
+    packet.extend_from_slice(expected_payload);
+
+    let mut response = [0u8; 2048];
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut received = None;
+    while std::time::Instant::now() < deadline {
+        client.send_to(&packet, inbound).await.unwrap();
+        if let Ok(Ok(result)) =
+            tokio::time::timeout(Duration::from_millis(50), client.recv_from(&mut response)).await
+        {
+            received = Some(result);
+            break;
+        }
+    }
+    let (length, _) = received.unwrap_or_else(|| {
+        panic!(
+            "protocol UDP inbound timed out; diagnostics={}",
+            service.diagnostics()
+        )
+    });
+    assert!(
+        response[..length]
+            .windows(expected_payload.len())
+            .any(|window| window == expected_payload),
+        "protocol UDP response did not contain payload: {:?}",
+        &response[..length]
+    );
+
+    let connections = wait_for_connection(&service.client, &service.base_url).await;
+    let item = connections["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inboundName"] == kind.inbound_id())
+        .expect("runtime protocol UDP connection must be visible");
+    assert_eq!(item["inbound"], "mixed");
+    assert_eq!(item["outbound"], protocol_server.to_string());
+    assert_eq!(item["nodeId"], kind.node_id());
+    assert_eq!(item["mode"], "proxy");
+    assert!(item["matchHistory"].as_array().is_some_and(|history| {
+        history
+            .iter()
+            .any(|entry| entry["ruleName"] == kind.rule_name())
+    }));
+
+    service.shutdown().await;
+    server_task.await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_protocol_outbounds_round_trip_through_http_router() {
     for kind in [
@@ -469,6 +630,17 @@ async fn runtime_protocol_outbounds_round_trip_through_http_router() {
         ProtocolOutboundKind::Trojan,
     ] {
         run_protocol_outbound_chain(kind).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_protocol_outbounds_round_trip_through_mixed_udp_router() {
+    for kind in [
+        ProtocolOutboundKind::Vless,
+        ProtocolOutboundKind::Vmess,
+        ProtocolOutboundKind::Trojan,
+    ] {
+        run_protocol_udp_outbound_chain(kind).await;
     }
 }
 

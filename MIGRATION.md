@@ -3736,7 +3736,7 @@ cache-backed `backups/remote-state.sqlite`，并返回 managed-service restart c
 ## 127. 2026-08-12 workspace 回归与缓存边界收口
 
 在 VLESS UDP framing 和 MinIO smoke 收口后，重新执行 `make workspace-tests`：Podman 中运行 48 个
-harness，core 145、runtime 252、store 128、service-chain 15、WireGuard 7 和 WireGuard runtime
+harness，core 145、runtime 252、store 128、service-chain 16、WireGuard 7 和 WireGuard runtime
 chain 2 全部通过；外部第三方/WARP 的 2 个测试、Go 互操作 harness 等需要外部条件的项目仍按
 显式 `ignored` 处理。静态检查 `cargo fmt --all -- --check`、脚本 `bash -n` 和 `git diff --check`
 也通过。
@@ -3746,3 +3746,20 @@ chain 2 全部通过；外部第三方/WARP 的 2 个测试、Go 互操作 harne
 `~/.cache/yuhaiin-rust/cargo-target/debug` 下的 `deps/build/.fingerprint/examples/incremental`，
 保留 debug binary、release/musl target、fixtures 和集成日志。缓存从约 21 GiB 降到约 9.4 GiB，
 仍没有使用 `/tmp`。
+
+## 128. 2026-08-12 VLESS/VMess/Trojan runtime UDP 组合矩阵
+
+在 Go wire interop 已覆盖 VLESS UDP、而 runtime service-chain 主要验证 TCP 的基础上，补充了
+`runtime_protocol_outbounds_round_trip_through_mixed_udp_router`。同一测试按 VLESS、VMess、Trojan
+三种 outbound 分别创建真实 `yuhaiin` 子进程、mixed UDP inbound、domain/CIDR router 和协议 TCP
+listener；UDP inbound 先解析 SOCKS5 UDP frame，再由 runtime 选择协议 outbound，协议服务校验 UDP
+command、目标 `8.8.8.8:5353` 和加密/长度 framing，最后把 payload 回传到客户端，并检查 connection
+metadata、selected node、mode 和 match history。
+
+`make service-chain-smoke` 在 Podman host-network 中最终通过 16/16；之前的 UDP 首次调试还捕获了
+测试地址被默认 LAN direct 规则抢先匹配的问题，改用非 LAN 的 `8.8.8.8` fixture 后确认协议
+outbound 确实被打开。该组合把 checklist 中 VLESS/VMess/Trojan 的 UDP runtime 主路径补齐；更广的
+TLS/WebSocket/HTTP2、不同目标地址族和真实远端 listener 组合仍保留为 `[~]`，不把单一 fixture
+外推成完整 Go 兼容性。
+
+本轮新测试及所有 service-chain 状态均写入 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。

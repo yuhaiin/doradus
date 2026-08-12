@@ -88,7 +88,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `pkg/net/proxy/yuubinsya/*`、`yuubinsya2/*` | `crates/yuhaiin-core/src/yuubinsya.rs`、`crates/yuhaiin-chain/src/session.rs`、`direct_uot.rs` | `[x]` | TCP、native UDP、UOT/dup-over-TCP、Ping、migration/reconnect、Go client interop | — |
 | `pkg/net/proxy/aead/*` | `crates/yuhaiin-protocol/src/aead.rs` | `[x]` | TCP/UDP wire and Go interop | — |
 | `pkg/net/proxy/websocket/*`、HTTP obfs | `crates/yuhaiin-protocol/src/websocket.rs`、`http_obfs.rs`、`crates/yuhaiin-runtime/src/proxy/websocket.rs` | `[x]` | Go WebSocket→HTTP/2 interop、fragmented headers、early data | — |
-| `pkg/net/proxy/vless/*`、`vmess/*`、`trojan/*` | `crates/yuhaiin-protocol/src/{vless,vmess,trojan}.rs`、runtime counterparts | `[~]` | parser/runtime/unit coverage；`make service-chain-smoke` 在 Podman 中通过 API→HTTP inbound→domain router→普通 VLESS/VMess/Trojan outbound 的 3/3 payload echo、connections、totals 和 node latency；`make go-protocol-interop-smoke` 通过真实 Go listener/client wire round-trip，包含 VLESS over RustCrypto TLS → Go server、Go VLESS UDP → Rust server，以及 Go TLS → WebSocket → HTTP/2 → Yuubinsya → Rust server（9/9 互操作项） | 更广的 runtime listener/outbound、UDP 组合矩阵 |
+| `pkg/net/proxy/vless/*`、`vmess/*`、`trojan/*` | `crates/yuhaiin-protocol/src/{vless,vmess,trojan}.rs`、runtime counterparts | `[~]` | parser/runtime/unit coverage；`make service-chain-smoke` 在 Podman 中通过 API→HTTP inbound→domain router→普通 VLESS/VMess/Trojan outbound 的 TCP 3/3 payload echo，并新增 mixed UDP→VLESS/VMess/Trojan outbound 3/3 framing、connections、selected node、match history；`make go-protocol-interop-smoke` 通过真实 Go listener/client wire round-trip，包含 VLESS over RustCrypto TLS → Go server、Go VLESS UDP → Rust server，以及 Go TLS → WebSocket → HTTP/2 → Yuubinsya → Rust server（9/9 互操作项） | 更广的 runtime listener/outbound、TLS/WebSocket/HTTP2、地址族和远端 UDP 组合矩阵 |
 | `pkg/net/proxy/tproxy/*`、`redir/*` | `crates/yuhaiin-runtime/src/proxy/transparent.rs` | `[~]` | REDIRECT TCP、IPv4/IPv6 ancillary decoder unit tests；rootful iptables 与 native nft TPROXY UDP 均已完成 2 flow、original destination、reply/rebind、monitor 统计、socket readback、加速 idle reap；iptables/nft service SIGKILL 也已通过；Debian VM 现场再次通过 iptables、native nft 和 IPv6 REDIRECT | 真实生产 firewall/nftables 组合 matrix |
 | `pkg/net/proxy/shadowsocks/*`、`shadowsocksr/*` | Rust protocol modules remain compatibility code | `延期` | 当前迁移范围不以 SS/SSR 为门槛 | 后续若 Go 未废弃再决定是否保留 |
 | `pkg/net/proxy/quic/*`、`reality/*`、`mux/*`、`tailscale/*` | — | `延期` | 用户明确暂不实现 | 不阻塞 Linux desktop replacement |
@@ -201,13 +201,13 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 | 命令 | Podman 场景 | 结果 |
 | --- | --- | --- |
-| `make workspace-tests` | 46 个 harness；isolated/stats/host-network 分组 | 0 失败；预计 ignored 项保持 ignored |
+| `make workspace-tests`（2026-08-12 当前轮） | 48 个 harness；isolated/stats/host-network 分组 | core 145、runtime 252、store 128、service-chain 16、WireGuard 7（1 个 benchmark ignored）、WireGuard runtime chain 2；0 失败 |
 | `make workspace-tests`（2026-08-12 update helper） | Podman；宿主机只编译 harness | `run_update_helper` 成功替换、保留 `.update-backup`、重启失败恢复旧 binary 和保留 staged retry 两项单测通过 |
 | `YUHAIIN_SOURCE_DB=... make go-api-parity-smoke`（2026-08-12 当前轮） | 既有停止态 Go 快照复制到 Podman；Go/Rust 独立数据库副本 | info/settings/nodes/inbounds/resolvers/routes/publishes/connections、全部 mutation 和错误矩阵 identical |
 | `make production-parity-smoke`（2026-08-12 当前轮） | 3 份停止态 Go v5/v6/AWS-shaped snapshot；每份在 Podman 独立运行 Go/Rust | 3/3 API read、core mutation、error matrix identical |
 | `make go-live-flow-parity-smoke` + `make go-rust-stats-smoke`（2026-08-12 当前轮） | Podman Go/Rust live mixed inbound，共享 SQLite 统计接管 | Go/Rust 真实流量、connections/total/traffic/history 和 reload 后统计均通过 |
 | `make go-protocol-interop-smoke`（2026-08-12 当前轮） | Podman host network；真实 Go checkout/client/server | 9/9：Yuubinsya TCP/UOT/native UDP/Ping、WebSocket→H2、TLS→WebSocket→H2→Yuubinsya、H2 v1、VLESS TCP、VLESS UDP、VLESS over TLS、VMess、Trojan |
-| `make service-chain-smoke` | host-network | 15/15：多个 inbound→router→outbound chain，含普通 VLESS/VMess/Trojan outbound |
+| `make service-chain-smoke`（2026-08-12 当前轮） | host-network | 16/16：多个 inbound→router→outbound chain，含 HTTP/TLS/HTTP2/SOCKS5/Yuubinsya、普通 VLESS/VMess/Trojan TCP，以及 mixed UDP→VLESS/VMess/Trojan outbound |
 | `make tun-reload-traffic-smoke` | rootless Podman + `unshare -Urn` + `/dev/net/tun` | 3 cycle：disable、不可达、reopen、traffic、close 通过 |
 | `make tun-reset-reconnect-smoke` / Debian VM rootful `tun-service.sh` | `/dev/net/tun`、`YUHAIIN_TUN_USER_NAMESPACE=0` | RST flow 被 target 接受并关闭；随后正常 reconnect echo、device close 通过 |
 | `make tun-mtu-smoke` | 同上 | IPv4 MTU 576/1280/1500/9000/9216 全部通过；默认最大合法 IPv4 UDP payload 65507 字节 |
