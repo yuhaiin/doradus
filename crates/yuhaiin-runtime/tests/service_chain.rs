@@ -219,6 +219,94 @@ async fn protocol_outbound_server(
     }
 }
 
+async fn protocol_h2_outbound_server(
+    kind: ProtocolOutboundKind,
+    listener: TcpListener,
+    expected_payload: &'static [u8],
+) {
+    let (socket, _) = listener.accept().await.unwrap();
+    let mut connection = h2::server::handshake(socket).await.unwrap();
+    let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+    assert_eq!(request.method(), http::Method::CONNECT);
+    assert_eq!(request.uri().host(), Some("localhost"));
+    let mut body = request.into_body();
+    let mut send = respond
+        .send_response(http::Response::new(()), false)
+        .unwrap();
+    let (application, relay) = tokio::io::duplex(64 * 1024);
+    let (mut relay_read, mut relay_write) = tokio::io::split(relay);
+    let body_to_relay = tokio::spawn(async move {
+        while let Some(data) = body.data().await {
+            let Ok(data) = data else { break };
+            if body.flow_control().release_capacity(data.len()).is_err() {
+                break;
+            }
+            if relay_write.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+        let _ = relay_write.shutdown().await;
+    });
+    let relay_to_body = tokio::spawn(async move {
+        let mut buffer = [0u8; 4096];
+        loop {
+            let length = match relay_read.read(&mut buffer).await {
+                Ok(length) => length,
+                Err(_) => break,
+            };
+            if length == 0 {
+                break;
+            }
+            if send
+                .send_data(Bytes::copy_from_slice(&buffer[..length]), false)
+                .is_err()
+            {
+                break;
+            }
+        }
+        let _ = send.send_data(Bytes::new(), true);
+    });
+    let destination = Endpoint::domain(Network::Tcp, DomainName::new("example.test").unwrap(), 443);
+    let protocol_task = tokio::spawn(async move {
+        match kind {
+            ProtocolOutboundKind::Vless => {
+                let mut application = application;
+                serve_vless_connection(&mut application, 0, destination, expected_payload).await;
+            }
+            ProtocolOutboundKind::Vmess => {
+                let mut application = application;
+                serve_vmess_connection(&mut application, 0, destination, expected_payload).await;
+            }
+            ProtocolOutboundKind::Trojan => {
+                let mut application = application;
+                serve_trojan_connection(&mut application, 0, destination, expected_payload).await;
+            }
+            ProtocolOutboundKind::VlessTlsWebsocket
+            | ProtocolOutboundKind::VmessTlsWebsocket
+            | ProtocolOutboundKind::TrojanWebsocket
+            | ProtocolOutboundKind::TrojanTlsWebsocket => {
+                panic!("TLS/WebSocket protocol variants are not part of this H2 fixture")
+            }
+        }
+    });
+
+    // Keep polling the H2 connection while the protocol task exchanges bytes.
+    let driver = tokio::spawn(async move {
+        while let Some(result) = connection.accept().await {
+            let Ok((request, mut respond)) = result else {
+                break;
+            };
+            let _ = request.into_body();
+            let _ = respond.send_response(http::Response::new(()), true);
+        }
+    });
+    protocol_task.await.unwrap();
+    body_to_relay.await.unwrap();
+    relay_to_body.await.unwrap();
+    driver.abort();
+    let _ = driver.await;
+}
+
 async fn serve_vless_connection<S>(
     stream: &mut S,
     connection: usize,
@@ -601,6 +689,164 @@ async fn configure_protocol_outbound_chain(
     tokio::time::sleep(Duration::from_millis(120)).await;
 }
 
+async fn configure_protocol_h2_outbound_chain(
+    service: &ServiceProcess,
+    kind: ProtocolOutboundKind,
+    inbound: SocketAddr,
+    server: SocketAddr,
+) {
+    let protocol_layer = match kind {
+        ProtocolOutboundKind::Vless | ProtocolOutboundKind::VlessTlsWebsocket => json!({
+            "type":"vless",
+            "vless":{"uuid":"00112233-4455-6677-8899-aabbccddeeff"}
+        }),
+        ProtocolOutboundKind::Vmess | ProtocolOutboundKind::VmessTlsWebsocket => json!({
+            "type":"vmess",
+            "vmess":{
+                "id":"00112233-4455-6677-8899-aabbccddeeff",
+                "aid":"0",
+                "security":"aes-128-gcm"
+            }
+        }),
+        ProtocolOutboundKind::Trojan
+        | ProtocolOutboundKind::TrojanWebsocket
+        | ProtocolOutboundKind::TrojanTlsWebsocket => json!({
+            "type":"trojan",
+            "trojan":{"password":"runtime-protocol-password"}
+        }),
+    };
+    let node_id = kind.node_id();
+    let node = json!({
+        "id":node_id,
+        "name":format!("{} runtime HTTP/2 protocol outbound", kind.name()),
+        "group":"integration",
+        "enabled":true,
+        "chain":[
+            {"type":"fixed","fixed":{"host":"127.0.0.1","port":server.port()}},
+            {"type":"http2","http2":{"concurrency":1,"max_streams":8,"idle_timeout_secs":30}},
+            protocol_layer
+        ]
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes",
+        Some(&node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        &format!("/api/v2/nodes/{node_id}/use"),
+        None,
+    )
+    .await;
+
+    let inbound = json!({
+        "id":kind.inbound_id(),
+        "name":kind.inbound_name(),
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":{"type":"http","http":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+    let rule = json!({
+        "name":kind.rule_name(),
+        "mode":"proxy",
+        "match":{"domain":"example.test"},
+        "tag":"protocol-integration"
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/route/rules",
+        Some(&rule),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+}
+
+async fn run_protocol_h2_outbound_chain(kind: ProtocolOutboundKind) {
+    eprintln!(
+        "starting HTTP/2 protocol outbound integration: {}",
+        kind.name()
+    );
+    let expected_payload: &'static [u8] = match kind {
+        ProtocolOutboundKind::Vless => b"runtime-vless-http2-outbound",
+        ProtocolOutboundKind::Vmess => b"runtime-vmess-http2-outbound",
+        ProtocolOutboundKind::Trojan => b"runtime-trojan-http2-outbound",
+        ProtocolOutboundKind::VlessTlsWebsocket
+        | ProtocolOutboundKind::VmessTlsWebsocket
+        | ProtocolOutboundKind::TrojanWebsocket
+        | ProtocolOutboundKind::TrojanTlsWebsocket => {
+            panic!("TLS/WebSocket protocol variants are not part of this H2 fixture")
+        }
+    };
+    let protocol_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let protocol_server = protocol_listener.local_addr().unwrap();
+    let server_task = tokio::spawn(protocol_h2_outbound_server(
+        kind,
+        protocol_listener,
+        expected_payload,
+    ));
+
+    let _default_mixed_blocker = TcpListener::bind("127.0.0.1:1080").await.ok();
+    let inbound = support::reserve_loopback().await;
+    let root = integration_dir(&format!("service-{}-runtime-h2-outbound", kind.name()));
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_protocol_h2_outbound_chain(&service, kind, inbound, protocol_server).await;
+
+    let mut client = connect_loopback(inbound).await;
+    client
+        .write_all(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut headers = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while !headers.windows(4).any(|window| window == b"\r\n\r\n") {
+        let length = client.read(&mut buffer).await.unwrap();
+        assert!(
+            length > 0,
+            "HTTP inbound closed before H2 protocol response"
+        );
+        headers.extend_from_slice(&buffer[..length]);
+    }
+    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 200"));
+    client.write_all(expected_payload).await.unwrap();
+    let mut echoed = vec![0u8; expected_payload.len()];
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, expected_payload);
+
+    let connections = wait_for_connection(&service.client, &service.base_url).await;
+    let item = connections["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inboundName"] == kind.inbound_name())
+        .expect("HTTP/2 protocol connection must be visible");
+    assert_eq!(item["outbound"], protocol_server.to_string());
+    assert_eq!(item["nodeId"], kind.node_id());
+    assert_eq!(item["mode"], "proxy");
+
+    client.shutdown().await.unwrap();
+    service.shutdown().await;
+    server_task.await.unwrap();
+}
+
 async fn run_protocol_outbound_chain(kind: ProtocolOutboundKind) {
     eprintln!("starting protocol outbound integration: {}", kind.name());
     let expected_payload: &'static [u8] = match kind {
@@ -833,6 +1079,17 @@ async fn runtime_protocol_outbounds_round_trip_through_http_router() {
         ProtocolOutboundKind::TrojanTlsWebsocket,
     ] {
         run_protocol_outbound_chain(kind).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_protocol_outbounds_round_trip_through_http2_transport() {
+    for kind in [
+        ProtocolOutboundKind::Vless,
+        ProtocolOutboundKind::Vmess,
+        ProtocolOutboundKind::Trojan,
+    ] {
+        run_protocol_h2_outbound_chain(kind).await;
     }
 }
 

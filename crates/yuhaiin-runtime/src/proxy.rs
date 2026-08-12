@@ -523,7 +523,9 @@ impl RuntimeSnapshot {
             ));
         }
 
-        let proxy = if is_vless_websocket_config(&config) {
+        let proxy = if is_protocol_h2_config(&config) {
+            build_protocol_h2_proxy(&config, timeout, self.resolver.clone()).await?
+        } else if is_vless_websocket_config(&config) {
             build_vless_transport_proxy(&config, timeout, self.resolver.clone()).await?
         } else if is_vmess_transport_config(&config) {
             build_vmess_transport_proxy(&config, timeout, self.resolver.clone()).await?
@@ -1677,6 +1679,24 @@ fn is_chain_config(config: &GoProxyRuntimeConfig) -> bool {
     })
 }
 
+fn is_protocol_h2_config(config: &GoProxyRuntimeConfig) -> bool {
+    let has_http2 = config
+        .chain_types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("http2"));
+    let protocol = match config.transport {
+        yuhaiin_store::GoProxyTransport::Vless => "vless",
+        yuhaiin_store::GoProxyTransport::Vmess => "vmess",
+        yuhaiin_store::GoProxyTransport::Trojan => "trojan",
+        _ => return false,
+    };
+    has_http2
+        && config
+            .chain_types
+            .iter()
+            .any(|kind| kind.eq_ignore_ascii_case(protocol))
+}
+
 fn is_vless_websocket_config(config: &GoProxyRuntimeConfig) -> bool {
     let has_websocket = config
         .chain_types
@@ -1777,25 +1797,121 @@ async fn build_stream_transport_upstream(
     Ok(upstream)
 }
 
+async fn build_protocol_h2_proxy(
+    config: &GoProxyRuntimeConfig,
+    _timeout: Duration,
+    resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let protocol = match config.transport {
+        yuhaiin_store::GoProxyTransport::Vless => "vless",
+        yuhaiin_store::GoProxyTransport::Vmess => "vmess",
+        yuhaiin_store::GoProxyTransport::Trojan => "trojan",
+        _ => {
+            return Err(Error::invalid(
+                "HTTP/2 protocol transport requires VLESS, VMess, or Trojan",
+            ));
+        }
+    };
+    let mut node: serde_json::Value =
+        serde_json::from_slice(&config.data_json).map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("proxy node chain JSON is invalid: {error}"),
+            )
+        })?;
+    let chain = node
+        .get_mut("chain")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| Error::invalid("HTTP/2 protocol node requires a chain array"))?;
+    let original_len = chain.len();
+    chain.retain(|layer| {
+        !layer
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case(protocol))
+    });
+    if chain.len() == original_len {
+        return Err(Error::invalid(format!(
+            "HTTP/2 protocol node is missing its {protocol} chain layer"
+        )));
+    }
+
+    let upstream = Arc::new(ChainProxy::from_go_json_transport_with_resolver(
+        &node.to_string(),
+        resolver,
+    )?) as Arc<dyn AsyncProxy>;
+    build_protocol_proxy(config, upstream)
+}
+
+fn build_protocol_proxy(
+    config: &GoProxyRuntimeConfig,
+    upstream: Arc<dyn AsyncProxy>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let protocol = match config.transport {
+        yuhaiin_store::GoProxyTransport::Vless => "vless",
+        yuhaiin_store::GoProxyTransport::Vmess => "vmess",
+        yuhaiin_store::GoProxyTransport::Trojan => "trojan",
+        _ => {
+            return Err(Error::invalid(
+                "protocol framing requires VLESS, VMess, or Trojan",
+            ));
+        }
+    };
+    let layer = config
+        .layers
+        .iter()
+        .find(|layer| layer.kind.eq_ignore_ascii_case(protocol))
+        .ok_or_else(|| Error::invalid(format!("{protocol} protocol layer is missing")))?;
+    match config.transport {
+        yuhaiin_store::GoProxyTransport::Vless => {
+            let uuid = layer
+                .config
+                .get("uuid")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::invalid("VLESS UUID is missing"))?;
+            Ok(Arc::new(yuhaiin_protocol::vless::VlessProxy::new(
+                upstream, uuid,
+            )?))
+        }
+        yuhaiin_store::GoProxyTransport::Vmess => {
+            let uuid = layer
+                .config
+                .get("id")
+                .or_else(|| layer.config.get("uuid"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::invalid("VMess UUID is missing"))?;
+            let security = layer
+                .config
+                .get("security")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("auto");
+            let alter_id = vmess_alter_id(&layer.config)?;
+            Ok(Arc::new(yuhaiin_protocol::vmess::VmessProxy::new(
+                upstream, uuid, security, alter_id,
+            )?))
+        }
+        yuhaiin_store::GoProxyTransport::Trojan => {
+            let password = layer
+                .config
+                .get("password")
+                .and_then(serde_json::Value::as_str)
+                .filter(|password| !password.is_empty())
+                .ok_or_else(|| Error::invalid("Trojan password is empty"))?;
+            Ok(Arc::new(yuhaiin_protocol::trojan::TrojanProxy::new(
+                upstream, password,
+            )))
+        }
+        _ => unreachable!("protocol kind was validated above"),
+    }
+}
+
 async fn build_vless_transport_proxy(
     config: &GoProxyRuntimeConfig,
     timeout: Duration,
     resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     let upstream = build_stream_transport_upstream(config, timeout, resolver, "VLESS").await?;
-    let layer = config
-        .layers
-        .iter()
-        .find(|layer| layer.kind.eq_ignore_ascii_case("vless"))
-        .ok_or_else(|| Error::invalid("VLESS protocol layer is missing"))?;
-    let uuid = layer
-        .config
-        .get("uuid")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| Error::invalid("VLESS UUID is missing"))?;
-    Ok(Arc::new(yuhaiin_protocol::vless::VlessProxy::new(
-        upstream, uuid,
-    )?))
+    build_protocol_proxy(config, upstream)
 }
 
 async fn build_vmess_transport_proxy(
@@ -1804,26 +1920,7 @@ async fn build_vmess_transport_proxy(
     resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     let upstream = build_stream_transport_upstream(config, timeout, resolver, "VMess").await?;
-    let layer = config
-        .layers
-        .iter()
-        .find(|layer| layer.kind.eq_ignore_ascii_case("vmess"))
-        .ok_or_else(|| Error::invalid("VMess protocol layer is missing"))?;
-    let uuid = layer
-        .config
-        .get("id")
-        .or_else(|| layer.config.get("uuid"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| Error::invalid("VMess UUID is missing"))?;
-    let security = layer
-        .config
-        .get("security")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("auto");
-    let alter_id = vmess_alter_id(&layer.config)?;
-    Ok(Arc::new(yuhaiin_protocol::vmess::VmessProxy::new(
-        upstream, uuid, security, alter_id,
-    )?))
+    build_protocol_proxy(config, upstream)
 }
 
 async fn build_trojan_transport_proxy(
@@ -1832,20 +1929,7 @@ async fn build_trojan_transport_proxy(
     resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     let upstream = build_stream_transport_upstream(config, timeout, resolver, "Trojan").await?;
-    let layer = config
-        .layers
-        .iter()
-        .find(|layer| layer.kind.eq_ignore_ascii_case("trojan"))
-        .ok_or_else(|| Error::invalid("Trojan protocol layer is missing"))?;
-    let password = layer
-        .config
-        .get("password")
-        .and_then(serde_json::Value::as_str)
-        .filter(|password| !password.is_empty())
-        .ok_or_else(|| Error::invalid("Trojan password is empty"))?;
-    Ok(Arc::new(yuhaiin_protocol::trojan::TrojanProxy::new(
-        upstream, password,
-    )))
+    build_protocol_proxy(config, upstream)
 }
 
 fn vmess_alter_id(config: &serde_json::Value) -> Result<u32> {
@@ -3117,6 +3201,105 @@ mod tests {
             "192.0.2.1:443".parse().unwrap(),
         ));
         assert!(built.proxy.connect(&context).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn go_stream_protocols_build_over_http2_transport_chain() {
+        for (name, transport, protocol_layer) in [
+            (
+                "vless-http2",
+                GoProxyTransport::Vless,
+                serde_json::json!({
+                    "type": "vless",
+                    "vless": {"uuid": "00112233-4455-6677-8899-aabbccddeeff"}
+                }),
+            ),
+            (
+                "vmess-http2",
+                GoProxyTransport::Vmess,
+                serde_json::json!({
+                    "type": "vmess",
+                    "vmess": {
+                        "id": "00112233-4455-6677-8899-aabbccddeeff",
+                        "aid": "0",
+                        "security": "aes-128-gcm"
+                    }
+                }),
+            ),
+            (
+                "trojan-http2",
+                GoProxyTransport::Trojan,
+                serde_json::json!({
+                    "type": "trojan",
+                    "trojan": {"password": "runtime-password"}
+                }),
+            ),
+        ] {
+            let protocol = protocol_layer["type"].as_str().unwrap();
+            let config = GoProxyRuntimeConfig {
+                id: name.to_owned(),
+                name: name.to_owned(),
+                group_name: "default".to_owned(),
+                origin: "go".to_owned(),
+                enabled: true,
+                chain_types: vec![
+                    "fixedv2".to_owned(),
+                    "http2".to_owned(),
+                    protocol.to_owned(),
+                ],
+                layers: vec![yuhaiin_store::GoProxyLayer {
+                    kind: protocol.to_owned(),
+                    config: protocol_layer[protocol].clone(),
+                }],
+                transport,
+                data_json: serde_json::to_vec(&serde_json::json!({
+                    "id": name,
+                    "chain": [
+                        {"type": "fixedv2", "fixedv2": {
+                            "addresses": [{"host": "127.0.0.1", "port": 24448}]
+                        }},
+                        {"type": "http2", "http2": {"concurrency": 1}},
+                        protocol_layer
+                    ]
+                }))
+                .unwrap(),
+            };
+            let built = snapshot(config)
+                .build_proxy(name, Duration::from_secs(2))
+                .await;
+            if let Err(error) = built {
+                panic!("{name} HTTP/2 transport failed: {error}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn go_stream_protocol_http2_rejects_missing_transport_chain() {
+        let config = GoProxyRuntimeConfig {
+            id: "vless-http2-invalid".to_owned(),
+            name: "vless-http2-invalid".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned(), "http2".to_owned(), "vless".to_owned()],
+            layers: vec![yuhaiin_store::GoProxyLayer {
+                kind: "vless".to_owned(),
+                config: serde_json::json!({
+                    "uuid": "00112233-4455-6677-8899-aabbccddeeff"
+                }),
+            }],
+            transport: GoProxyTransport::Vless,
+            data_json: serde_json::to_vec(&serde_json::json!({"chain": []})).unwrap(),
+        };
+        let error = match snapshot(config)
+            .build_proxy("vless-http2-invalid", Duration::from_secs(2))
+            .await
+        {
+            Ok(_) => panic!("invalid HTTP/2 protocol chain unexpectedly built"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, ErrorKind::InvalidInput);
+        assert!(error.message.contains("chain"));
     }
 
     #[tokio::test]

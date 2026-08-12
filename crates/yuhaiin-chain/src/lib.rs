@@ -704,6 +704,30 @@ impl ChainProxy {
         Self::final_proxy(ChainClient::from_go_json_with_resolver(json, resolver)?)
     }
 
+    /// Construct only the raw Go-compatible HTTP/2 transport from a node
+    /// payload whose final protocol layer is supplied by the caller.
+    ///
+    /// Go builds protocol nodes by folding every chain item over the previous
+    /// proxy. This entry point preserves that boundary for VLESS/VMess/Trojan:
+    /// the chain crate owns fixed/TLS/WebSocket/HTTP2, while the protocol
+    /// crate remains the outer framing layer.
+    pub fn from_go_json_transport_with_resolver(
+        json: &str,
+        resolver: Arc<dyn AsyncIpResolver>,
+    ) -> Result<Self> {
+        let client = ChainClient::from_go_json_with_resolver(json, resolver)?;
+        if client.chain.yuubinsya.is_some()
+            || client.chain.http.is_some()
+            || client.chain.socks5.is_some()
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "raw HTTP/2 transport cannot contain a destination protocol",
+            ));
+        }
+        Ok(Self::new(client))
+    }
+
     pub fn client(&self) -> Option<&ChainClient> {
         match &self.backend {
             ChainProxyBackend::H2(client) => Some(client),
