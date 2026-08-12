@@ -3898,3 +3898,14 @@ GitHub Actions 的新 Clippy 将 `crates/yuhaiin-protocol/src/trojan.rs` 中的
 x86_64 musl release binary 和 `make build-release-musl` 入口也在 musl Podman 容器通过。随后完整
 `make workspace-tests` 在 Podman 通过 48 个 harness（core 145、runtime 256、store 128、
 service-chain 16、WireGuard 7、WireGuard runtime chain 2，0 失败）。
+
+## 138. 2026-08-12 完整链路、生产快照与 WireGuard benchmark 复验
+
+在多 TUN 提交之后重新执行直接替换最相关的完整矩阵，避免只依据提交前的历史输出：
+
+- `make service-chain-smoke` 在 Podman 通过 16/16；覆盖 HTTP、SOCKS5、Yuubinsya inbound，HTTP2/TLS/Yuubinsya、HTTP、SOCKS5、VLESS、VMess、Trojan outbound，以及普通/TLS/WebSocket、TCP/UDP、router、connections 和 latency。
+- `make wireguard-chain-smoke` 通过 2/2，确认 HTTP/TCP 和 SOCKS5/UDP inbound → CIDR router → Cloudflare BoringTun userspace outbound → peer 的真实 echo、metadata 和 latency。
+- `make go-live-flow-parity-smoke` 通过 Go/Rust live flow 与统计对照；`make production-parity-smoke` 对停止态 Go v5、v6、AWS-shaped 三份 SQLite 快照的读取、mutation 和错误矩阵全部 identical。
+- 64 MiB release benchmark：HTTP CONNECT 169.06 MiB/s、peak RSS 18,432 KiB；TLS/H2/Yuubinsya 47.00 MiB/s、peak RSS 20,424 KiB；BoringTun packet 579.19 MiB/s、peak RSS 3,500 KiB。结果仅作为同机回归基线，原始输出位于 `~/.cache/yuhaiin-rust/benchmarks/`。
+
+本轮构建、运行和结果文件均没有使用 `/tmp`。剩余 `[~]` 仍是需要外部现场或更大样本的项目：真实 WARP/AWS、生产 firewall matrix、跨平台权限和远程 GitHub Actions 首次运行，不把本地 Podman 结果外推为已完成。
