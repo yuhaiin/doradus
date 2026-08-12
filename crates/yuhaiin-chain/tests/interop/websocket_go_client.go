@@ -16,6 +16,7 @@ import (
 	"github.com/Asutorufa/yuhaiin/pkg/net/netapi"
 	"github.com/Asutorufa/yuhaiin/pkg/net/proxy/fixed"
 	"github.com/Asutorufa/yuhaiin/pkg/net/proxy/http2/v2"
+	tlsproxy "github.com/Asutorufa/yuhaiin/pkg/net/proxy/tls"
 	"github.com/Asutorufa/yuhaiin/pkg/net/proxy/websocket"
 	"github.com/Asutorufa/yuhaiin/pkg/net/proxy/yuubinsya"
 )
@@ -34,6 +35,16 @@ func main() {
 	fixedClient, err := fixed.NewClient(fixed.Config{Host: host, Port: int32(port)}, nil)
 	if err != nil {
 		failf("Go fixed client: %v", err)
+	}
+	if os.Getenv("WEBSOCKET_TLS") == "1" {
+		fixedClient, err = tlsproxy.NewClient(tlsproxy.TLSConfig{
+			Enable:             true,
+			ServerNames:        []string{"localhost"},
+			InsecureSkipVerify: true,
+		}, fixedClient)
+		if err != nil {
+			failf("Go TLS client: %v", err)
+		}
 	}
 	websocketClient, err := websocket.NewClient(websocket.Config{
 		Host: "localhost",
