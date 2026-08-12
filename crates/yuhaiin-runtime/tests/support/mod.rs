@@ -1915,3 +1915,73 @@ pub async fn add_yuubinsya_inbound(service: &ServiceProcess, id: &str, listen: S
     .await;
     settle_runtime_reload().await;
 }
+
+/// Configure both Go-compatible reverse inbound forms against the built-in
+/// direct outbound. Keeping the pair in one process fixture exercises the
+/// persisted inbound contract and the shared listener supervisor together.
+pub async fn add_reverse_inbounds(
+    service: &ServiceProcess,
+    reverse_tcp_listen: SocketAddr,
+    reverse_tcp_target: SocketAddr,
+    reverse_http_listen: SocketAddr,
+    reverse_http_url: &str,
+) {
+    let node = json!({
+        "id":"reverse-direct",
+        "name":"Reverse integration direct outbound",
+        "group":"integration",
+        "enabled":true,
+        "chain":[{"type":"direct","direct":{}}]
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes",
+        Some(&node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes/reverse-direct/use",
+        None,
+    )
+    .await;
+
+    let reverse_tcp = json!({
+        "id":"reverse-tcp-in",
+        "name":"Reverse TCP integration inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":reverse_tcp_listen.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":{"type":"reverse_tcp","reverse_tcp":{"host":reverse_tcp_target.to_string()}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&reverse_tcp),
+    )
+    .await;
+
+    let reverse_http = json!({
+        "id":"reverse-http-in",
+        "name":"Reverse HTTP integration inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":reverse_http_listen.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":{"type":"reverse_http","reverse_http":{"url":reverse_http_url}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&reverse_http),
+    )
+    .await;
+    settle_runtime_reload().await;
+}

@@ -4136,3 +4136,22 @@ service-chain 矩阵保持通过。
 Podman Rust image 中执行，宿主机只负责挂载源码、`~/.cache/yuhaiin-rust/cargo-target` 和日志；
 运行阶段继续使用独立 Podman Debian container。编译和测试临时目录均指向 cache-backed
 `/state/cache/tmp`，不使用宿主机 `/tmp`。
+
+## 151. 2026-08-12 reverse inbound 真实进程链回归
+
+此前 Rust 的 `reverse_tcp`/`reverse_http` 已有 parser、selector 和 `serve_*` 单元测试，但缺少
+从 API 持久化配置到前台 runtime listener supervisor 的进程级证据。本轮在
+`crates/yuhaiin-runtime/tests/service_chain.rs` 增加同一服务进程内的双 reverse 回归：
+
+- `reverse_tcp` 使用 Go-compatible `protocol.reverse_tcp.host`，客户端发送 raw payload，经过
+  shared selector 和 direct outbound 到真实 loopback TCP target，再收到原样 echo；
+- `reverse_http` 使用 `protocol.reverse_http.url`，客户端请求 `/health`，目标收到重写后的
+  `/base/health` 和目标 authority `Host`，响应 body 原样回传；
+- 两个 inbound 都通过 `/api/v2/inbounds` 创建，验证 listener owner reload 后可以接入；
+  `/api/v2/connections` 逐条固定 `inbound`、`inboundName`、`outbound` 和 direct `mode`，避免
+  只验证业务 payload 而漏掉运行时观察面。
+
+`make service-chain-smoke` 在 Podman host-network 中通过 17/17；测试运行、临时目录和状态均
+位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。因此 reverse TCP/HTTP 从本轮的“代码存在 +
+单测”提升为 Linux desktop 主路径的真实进程 `[x]`，剩余 `[~]` 只保留更广泛的生产现场/样本、
+真实 firewall 组合、第三方 WireGuard peer 和原生 macOS/Windows 权限验收。

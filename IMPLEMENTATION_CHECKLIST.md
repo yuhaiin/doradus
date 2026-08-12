@@ -17,10 +17,10 @@
 | 指标 | 当前值 |
 | --- | ---: |
 | 纳入统计的验收项 | 48 |
-| 已完成 `[x]` | 33 |
-| 主路径可用但仍有现场/样本缺口 `[~]` | 15 |
+| 已完成 `[x]` | 34 |
+| 主路径可用但仍有现场/样本缺口 `[~]` | 14 |
 | 有实际功能缺口 `[ ]` | 0 |
-| 加权覆盖率 | **84.4%** = `(33 + 15 × 0.5) / 48` |
+| 加权覆盖率 | **85.4%** = `(34 + 14 × 0.5) / 48` |
 | 主目标 | Linux desktop：Rust 可启动、管理前端可接入、普通 inbound/outbound 可串联 |
 | 当前结论 | **主路径已可在 Linux desktop 进行替换前验收**；rootful TUN 多路由 lease、RST/reconnect、graceful/SIGKILL teardown 和 TPROXY UDP delivery/idle/force-stop 已闭环，生产异常快照、真实 firewall 组合和第三方 WireGuard 仍是 `[~]` |
 
@@ -115,7 +115,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | Go 权威入口 | Rust 位置 | 状态 | 证据 | 下一动作 |
 | --- | --- | :---: | --- | --- |
 | `pkg/node/runtime.go`、`pkg/inbound/*` | `crates/yuhaiin-runtime/src/controller.rs`、`inbounds/mod.rs` | `[x]` | immutable snapshot、atomic reload；普通 node/route/resolver reload 只替换已注册 live selector，并同步长期 TUN DNS handler，inbound/user/selected-node/apply 才发送专用事件重绑 listener；HTTP CONNECT 持久连接在 route reload 期间继续传输，inbound reload 仍采用 latest-wins | — |
-| `pkg/inbound/*`、`pkg/net/proxy/{http,socks5,yuubinsya,tls}.go` | `crates/yuhaiin-runtime/src/inbounds/*`、`proxy/*` | `[x]` | inbound→router→outbound service chain；HTTP/SOCKS5/Yuubinsya/TLS/HTTP2/mixed/reverse | — |
+| `pkg/inbound/*`、`pkg/net/proxy/{http,socks5,yuubinsya,tls}.go`、`pkg/net/proxy/reverse/*` | `crates/yuhaiin-runtime/src/inbounds/*`、`proxy/*` | `[x]` | inbound→router→outbound service chain；HTTP/SOCKS5/Yuubinsya/TLS/HTTP2/mixed/reverse；Podman 真实前台进程已覆盖 reverse TCP raw relay 和 reverse HTTP path/Host rewrite、direct outbound、connections metadata | — |
 | Go TUN inbound contract | `crates/yuhaiin-runtime/src/inbounds/mod.rs`、`data_plane.rs` | `[~]` | TUN 作为 inbound supervisor；真实 user+network namespace、rootful TCP+UDP fixed traffic、multi-route lease、reload、RST/reconnect、graceful/SIGKILL teardown 已通过；真实 kernel IPv4 五档、IPv6 合法 MTU 四档 fragmentation matrix 已通过；扩展头分片布局在 Podman core harness 中通过；`tun-api-process-smoke` 还验证真实前台二进制通过 API 对默认禁用 TUN、单个新增 TUN 和两个同时 enabled 的 TUN 做开关，两个设备可同时在 `/proc/net/dev` 出现并独立关闭 | 继续补更广泛发行版/firewall 组合和真实 IPv6 extension-header 现场 |
 | `pkg/httpapi/v2*.go`、`register.go` | `crates/yuhaiin-runtime/src/api.rs` | `[x]` | generated frontend RPC route coverage、read/mutation/error parity、API reload/live flow；`inbounds/config` 的 DNS 劫持变更会触发 inbound owner reload | 更多生产 response 字段样本 |
 | `pkg/net/netapi/{conn,server}.go`、`pkg/statistics/notify.go` | `crates/yuhaiin-runtime/src/monitor.rs`、`log.rs`、`service.rs` | `[~]` | connections、SSE、traffic、history、telemetry、node latency、pprof、启动日志 | 完整 response/历史数据逐字段 parity |
@@ -144,6 +144,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | Yuubinsya TCP | 是 | 是 | `[x]` |
 | Yuubinsya native UDP | 是 | 是 | `[x]` |
 | Yuubinsya UOT / dup-over-TCP | 是 | 是 | `[x]` |
+| reverse TCP / reverse HTTP | 是 | — | `[x]`：真实前台进程分别验证 raw relay、HTTP path/Host rewrite、direct outbound 和 connections metadata |
 | TUN | 是 | — | `[~]`：真实 user/rootful data-plane、每个 enabled inbound 独立设备、3-route lease、reload、reset/reconnect、teardown、IPv4 五档和 IPv6 合法 MTU 四档 fragmentation 通过；扩展头布局单测通过，更广泛 firewall/真实 extension-header 现场仍补 |
 | redir TCP / TPROXY UDP | 是 | — | `[~]`：rootful iptables/nft 2-flow delivery、original destination、回包/rebind、idle reap、force-stop 通过；真实生产 firewall matrix 仍补充 |
 | DNS UDP / TCP / DoH / DoT | server/client | resolver/client | `[x]` |
@@ -218,7 +219,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `make tun-chain-service-smoke`（2026-08-12 当前轮） | disposable user/network Podman namespace、真实 TUN inbound | TUN→fixed→TLS→HTTP/2→Yuubinsya→echo 通过；`runtime-tun-chain-ready`、traffic、close 全部通过 |
 | `make go-live-flow-parity-smoke` + `make go-rust-stats-smoke`（2026-08-12 当前轮） | Podman Go/Rust live mixed inbound，共享 SQLite 统计接管 | Go/Rust 真实流量、connections/total/traffic/history 和 reload 后统计均通过 |
 | `make go-protocol-interop-smoke`（2026-08-12 当前轮） | Podman host network；真实 Go checkout/client/server | 14/14 个测试用例：Yuubinsya TCP/UOT/native UDP/Ping、WebSocket→H2（普通/TLS）、H2 v1、VLESS 双向普通/TLS/TLS+WebSocket、VLESS UDP、VMess 普通/TLS+WebSocket、Trojan 普通/TLS+WebSocket |
-| `make service-chain-smoke`（2026-08-12 当前轮） | Podman host-network | 16/16：多个 inbound→router→outbound chain，含 HTTP/TLS/HTTP2/SOCKS5/Yuubinsya、普通 VLESS/VMess/Trojan TCP、Trojan→WebSocket、VLESS/VMess/Trojan→TLS→WebSocket，以及 mixed UDP→VLESS/VMess/Trojan（含 VLESS/VMess TLS→WebSocket）；HTTP chain 让普通 selected node 指向不可用 `http-default`，再由 `node_tags_v2` 的 `integration` tag 实际选择 `http-out`，且 metadata endpoint 正确 |
+| `make service-chain-smoke`（2026-08-12 当前轮） | Podman host-network | 17/17：在原有多个 inbound→router→outbound chain、协议 TCP/UDP 矩阵和 mixed UDP 域名回归之外，新增 reverse TCP raw relay 与 reverse HTTP path/Host rewrite；两条链均通过真实 API 配置、listener supervisor、direct outbound、目标 TCP listener 和 connections metadata；HTTP chain 仍由 `node_tags_v2` 的 `integration` tag 实际选择 `http-out` |
 | `make tun-reload-traffic-smoke` | rootless Podman + `unshare -Urn` + `/dev/net/tun` | 3 cycle：disable、不可达、reopen、traffic、close 通过 |
 | `make tun-reset-reconnect-smoke` / Debian VM rootful `tun-service.sh` | `/dev/net/tun`、`YUHAIIN_TUN_USER_NAMESPACE=0` | RST flow 被 target 接受并关闭；随后正常 reconnect echo、device close 通过 |
 | `make tun-mtu-smoke` | 同上 | IPv4 MTU 576/1280/1500/9000/9216 全部通过；默认最大合法 IPv4 UDP payload 65507 字节 |
@@ -243,7 +244,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `make api-contract-smoke`（2026-08-12 当前轮） | `network=none` Podman、真实前台 runtime | direct node latency 解析、嵌套路由 match history、前端管理 API round-trip 3/3 通过 |
 | `make node-latency-dns-smoke`（2026-08-12 当前轮） | `network=none` Podman、runtime API test binary | 选中 proxy datagram 的 domain latency/DNS probe 1/1 通过 |
 | `make go-live-flow-parity-smoke`（2026-08-12 当前轮） | Go/Rust 两个真实服务、HTTP inbound→router→HTTP outbound、Podman sidecar echo | Go/Rust live connections、total、traffic、history、telemetry 和 reload 后统计均通过 |
-| `make service-chain-smoke`（2026-08-12 当前轮） | Podman host-network、复用 runtime binary | 16/16 通过；另对 mixed UDP protocol outbound 做 5 次连续重复验证，5/5 通过 |
+| `make service-chain-smoke`（2026-08-12 当前轮） | Podman host-network、复用 runtime binary | 17/17 通过；新增 reverse TCP/HTTP 真实进程链，另对 mixed UDP protocol outbound 做 5 次连续重复验证，5/5 通过 |
 | `make benchmark-throughput`（2026-08-12 当前轮，16 MiB） | release harness、Podman host network、单流 loopback | HTTP CONNECT 157.12 MiB/s、peak RSS 18,428 KiB；TLS/H2/Yuubinsya 51.66 MiB/s、peak RSS 20,232 KiB |
 | `make benchmark-tun-throughput`（2026-08-12 当前轮，4 MiB） | privileged Podman、真实 kernel TUN | TUN→fixed→loopback 30.98 MiB/s、peak RSS 13,192 KiB |
 | `make benchmark-wireguard-throughput`（2026-08-12 当前轮，16 MiB） | `--network=none` Podman、BoringTun userspace | BoringTun packet baseline 359.94 MiB/s、peak RSS 3,748 KiB；仅作为同机趋势基线 |

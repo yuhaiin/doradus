@@ -16,12 +16,12 @@ use yuhaiin_protocol::{trojan, vless, vmess};
 
 use support::{
     ConnectFixture, H2FinalProtocol, H2ProtocolFixture, H2YuubinsyaFixture, ServiceProcess,
-    Socks5Fixture, YUUBINSYA_PASSWORD, add_mixed_udp_inbound, add_socks5_inbound,
-    add_yuubinsya_inbound, api_json, configure_h2_http_chain, configure_h2_http_inbound,
-    configure_h2_socks5_chain, configure_http_chain, configure_socks5_chain,
-    configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound,
-    connect_loopback, connect_tls_h2_loopback, connect_tls_loopback, integration_dir,
-    seed_empty_database, tls_server_acceptor, wait_for_connection,
+    Socks5Fixture, YUUBINSYA_PASSWORD, add_mixed_udp_inbound, add_reverse_inbounds,
+    add_socks5_inbound, add_yuubinsya_inbound, api_json, configure_h2_http_chain,
+    configure_h2_http_inbound, configure_h2_socks5_chain, configure_http_chain,
+    configure_socks5_chain, configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain,
+    configure_tls_http_inbound, connect_loopback, connect_tls_h2_loopback, connect_tls_loopback,
+    integration_dir, seed_empty_database, tls_server_acceptor, wait_for_connection,
 };
 
 #[cfg(target_os = "linux")]
@@ -2491,4 +2491,150 @@ async fn socks5_and_yuubinsya_inbounds_route_through_the_runtime_process() {
     socks5.shutdown().await.unwrap();
     service.shutdown().await;
     fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reverse_inbounds_route_through_the_runtime_process() {
+    let reverse_tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let reverse_tcp_inbound = reverse_tcp_listener.local_addr().unwrap();
+    drop(reverse_tcp_listener);
+    let reverse_http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let reverse_http_inbound = reverse_http_listener.local_addr().unwrap();
+    drop(reverse_http_listener);
+
+    let tcp_target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_target = tcp_target_listener.local_addr().unwrap();
+    let tcp_target_payload = b"reverse-process-tcp";
+    let tcp_target_task = tokio::spawn(async move {
+        let (mut stream, _) = tcp_target_listener.accept().await.unwrap();
+        let mut payload = vec![0u8; tcp_target_payload.len()];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(payload, tcp_target_payload);
+        stream.write_all(tcp_target_payload).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    });
+
+    let http_target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_target = http_target_listener.local_addr().unwrap();
+    let http_target_task = tokio::spawn(async move {
+        let (mut stream, _) = http_target_listener.accept().await.unwrap();
+        let request = read_http_headers(&mut stream).await;
+        let request = String::from_utf8(request).unwrap();
+        assert!(request.starts_with("GET /base/health HTTP/1.1\r\n"));
+        assert!(request.contains(&format!("Host: {http_target}\r\n")));
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nreverse-ok!",
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    });
+
+    let root = integration_dir("service-reverse-inbounds");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    add_reverse_inbounds(
+        &service,
+        reverse_tcp_inbound,
+        tcp_target,
+        reverse_http_inbound,
+        &format!("http://{http_target}/base"),
+    )
+    .await;
+
+    let mut reverse_tcp = connect_loopback(reverse_tcp_inbound).await;
+    reverse_tcp.write_all(tcp_target_payload).await.unwrap();
+    let mut echoed = vec![0u8; tcp_target_payload.len()];
+    reverse_tcp.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(echoed, tcp_target_payload);
+
+    let mut reverse_http = connect_loopback(reverse_http_inbound).await;
+    reverse_http
+        .write_all(b"GET /health HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response_headers = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while !response_headers
+        .windows(4)
+        .any(|window| window == b"\r\n\r\n")
+    {
+        let length = tokio::time::timeout(Duration::from_secs(2), reverse_http.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(length > 0, "reverse HTTP inbound closed before response");
+        response_headers.extend_from_slice(&buffer[..length]);
+    }
+    assert!(String::from_utf8_lossy(&response_headers).starts_with("HTTP/1.1 200 OK"));
+    let body_start = response_headers
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let mut body = response_headers.split_off(body_start);
+    while body.len() < 11 {
+        let length = tokio::time::timeout(Duration::from_secs(2), reverse_http.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            length > 0,
+            "reverse HTTP inbound closed before response body"
+        );
+        body.extend_from_slice(&buffer[..length]);
+    }
+    assert_eq!(&body[..11], b"reverse-ok!");
+
+    let mut connections = serde_json::Value::Null;
+    for _ in 0..100 {
+        connections = api_json(
+            &service.client,
+            &service.base_url,
+            reqwest::Method::GET,
+            "/api/v2/connections",
+            None,
+        )
+        .await;
+        let items = connections["connections"].as_array().unwrap();
+        if items
+            .iter()
+            .any(|item| item["inboundName"] == "reverse-tcp-in")
+            && items
+                .iter()
+                .any(|item| item["inboundName"] == "reverse-http-in")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let items = connections["connections"].as_array().unwrap();
+    let tcp_connection = items
+        .iter()
+        .find(|item| item["inboundName"] == "reverse-tcp-in")
+        .expect("reverse TCP inbound connection must be visible");
+    assert_eq!(tcp_connection["inbound"], "reverse_tcp");
+    assert_eq!(tcp_connection["outbound"], tcp_target.to_string());
+    let http_connection = items
+        .iter()
+        .find(|item| item["inboundName"] == "reverse-http-in")
+        .expect("reverse HTTP inbound connection must be visible");
+    assert_eq!(http_connection["inbound"], "reverse_http");
+    assert_eq!(http_connection["outbound"], http_target.to_string());
+    assert_eq!(http_connection["mode"], "direct");
+
+    reverse_tcp.shutdown().await.unwrap();
+    reverse_http.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), tcp_target_task)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), http_target_task)
+        .await
+        .unwrap()
+        .unwrap();
+    service.shutdown().await;
 }
