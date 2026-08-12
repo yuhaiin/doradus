@@ -10,22 +10,20 @@ bytes="${YUHAIIN_BENCH_BYTES:-67108864}"
 
 mkdir -p "${scenario_dir}"
 
-echo "[throughput] building release runtime and benchmark test"
-cargo build \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[throughput] building release runtime and benchmark test in Podman"
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  cargo build \
   -p yuhaiin-runtime \
   --all-features \
-  --offline \
   --release \
   --bin yuhaiin \
   >"${scenario_dir}/runtime-build.log"
-cargo test \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  cargo test \
   -p yuhaiin-runtime \
   --all-features \
-  --offline \
   --release \
   --test throughput \
   --no-run \

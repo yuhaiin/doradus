@@ -24,14 +24,13 @@ fi
 mkdir -p "${scenario_dir}"
 config_path="$(realpath "${config_path}")"
 
-echo "[wireguard-external] compiling the opt-in harness on the host"
-CARGO_TERM_COLOR=never cargo test \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[wireguard-external] compiling the opt-in harness in Podman"
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  cargo test \
   -p yuhaiin-wireguard \
   --test external \
   --no-run \
-  --offline \
   >"${scenario_dir}/build.log" 2>&1
 
 harness_path="$(sed -n 's/^  Executable tests\/external.rs (\(.*\))$/\1/p' "${scenario_dir}/build.log" | tail -n 1)"

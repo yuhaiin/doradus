@@ -16,7 +16,6 @@ scenario_root="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/go-live-flow
 keep_runs="${YUHAIIN_KEEP_RUNS:-3}"
 
 command -v curl >/dev/null
-command -v go >/dev/null
 command -v jq >/dev/null
 command -v podman >/dev/null
 command -v python3 >/dev/null
@@ -74,14 +73,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "[go-live-flow-parity] building Go and Rust services"
-(cd "${go_root}" && GOEXPERIMENT=jsonv2,greenteagc go build -o "${go_binary}" ./cmd/yuhaiin)
-cargo build \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[go-live-flow-parity] building Go and Rust services in Podman"
+"${repo_root}/scripts/integration/podman-go.sh" \
+  --state-dir "${run_dir}" -- \
+  env GOEXPERIMENT=jsonv2,greenteagc go build -o /state/yuhaiin-go ./cmd/yuhaiin
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${run_dir}" -- \
+  cargo build \
   -p yuhaiin-runtime \
   --all-features \
-  --offline \
   --bin yuhaiin \
   >"${run_dir}/rust-build.log"
 test -x "${rust_binary}"

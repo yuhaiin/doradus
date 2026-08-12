@@ -8,13 +8,12 @@ cache_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration-reusable}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 mkdir -p "${cache_dir}"
 
-echo "[socks5-protocol] building protocol unit-test binary"
-cargo test \
-  --manifest-path "${repo_dir}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[socks5-protocol] building protocol unit-test binary in Podman"
+"${repo_dir}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${cache_dir}" -- \
+  cargo test \
   -p yuhaiin-protocol \
   --all-features \
-  --offline \
   --lib \
   --no-run \
   >"${cache_dir}/socks5-protocol-build.log"

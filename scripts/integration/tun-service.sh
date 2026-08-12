@@ -66,8 +66,9 @@ fi
 
 mkdir -p "${database_dir}"
 if [[ "${YUHAIIN_SKIP_BUILD:-0}" != "1" ]]; then
-  cd "${repo_dir}"
-  cargo build --target-dir "${target_dir}" -p yuhaiin-runtime --bin tun-service-smoke --all-features --offline
+  "${repo_dir}/scripts/integration/podman-cargo.sh" \
+    --target-dir "${target_dir}" --state-dir "${cache_dir}" -- \
+    cargo build -p yuhaiin-runtime --bin tun-service-smoke --all-features
 fi
 test -x "${binary}"
 

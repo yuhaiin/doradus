@@ -72,13 +72,12 @@ rm -f "${runtime_log}" "${client_log}" "${udp_client_log}" "${ipv6_client_log}" 
   "${state_dir}/state.sqlite-wal" "${state_dir}/state.sqlite-shm"
 
 if [[ "${YUHAIIN_SKIP_BUILD:-0}" != "1" ]]; then
-  cd "${repo_dir}"
-  cargo build \
-    --target-dir "${target_dir}" \
+  "${repo_dir}/scripts/integration/podman-cargo.sh" \
+    --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+    cargo build \
     -p yuhaiin-runtime \
     --bin transparent-service-smoke \
     --all-features \
-    --offline \
     >"${scenario_dir}/build.log"
 fi
 test -x "${binary}"

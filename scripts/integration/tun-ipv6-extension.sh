@@ -9,13 +9,12 @@ image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 
 mkdir -p "${scenario_dir}"
 
-echo "[tun-ipv6-extension] compiling core test binary"
-CARGO_TERM_COLOR=never cargo test \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[tun-ipv6-extension] compiling core test binary in Podman"
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  cargo test \
   -p yuhaiin-core \
   --all-features \
-  --offline \
   --lib \
   --no-run \
   >"${scenario_dir}/build.log" 2>&1

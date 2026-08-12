@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build the legacy snapshot test on the host, but execute the test binary in a
-# disposable Podman container. The source database is copied into the cache;
-# the original Go snapshot is never opened for writing.
+# Build and execute the legacy snapshot test in disposable Podman containers.
+# The source database is copied into the cache; the original Go snapshot is
+# never opened for writing.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source_db="${YUHAIIN_GO_LEGACY_PRODUCTION_DB:?set YUHAIIN_GO_LEGACY_PRODUCTION_DB to a copied Go v1 state.db}"
@@ -12,19 +12,17 @@ target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/legacy-v1-runtime}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 
-command -v cargo >/dev/null
 command -v podman >/dev/null
 test -f "${source_db}"
 mkdir -p "${scenario_dir}"
 cp --reflink=auto "${source_db}" "${scenario_dir}/input-state.db"
 
-echo "[legacy-v1-runtime] building ignored test binary"
-cargo test \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[legacy-v1-runtime] building ignored test binary in Podman"
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  cargo test \
   -p yuhaiin-runtime \
   --all-features \
-  --offline \
   --test legacy_v1_runtime \
   --no-run \
   >"${scenario_dir}/build.log" 2>&1

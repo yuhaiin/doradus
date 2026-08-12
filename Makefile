@@ -100,7 +100,7 @@ help:
 		'make node-latency-dns-smoke run API DNS latency chain smoke in Podman' \
 		'make stats-concurrency-smoke run concurrent statistics/restart smoke in Podman' \
 		'make startup-logs-smoke run foreground startup log smoke' \
-		'make workspace-tests   compile harnesses on host and run all workspace tests in Podman' \
+		'make workspace-tests   compile harnesses and run all workspace tests in Podman' \
 		'make run ARGS="..."    run the runtime binary with arguments' \
 		'make version            run the binary version command' \
 		'make check              cargo check for the whole workspace' \

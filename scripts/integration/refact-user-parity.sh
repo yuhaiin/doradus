@@ -26,12 +26,11 @@ command -v jq >/dev/null
 command -v podman >/dev/null
 mkdir -p "${scenario_dir}"
 
-cargo build \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  cargo build \
   -p yuhaiin-runtime \
   --all-features \
-  --offline \
   --bin yuhaiin \
   >"${scenario_dir}/rust-build.log"
 rust_binary="${target_dir}/debug/yuhaiin"
@@ -39,7 +38,10 @@ test -x "${rust_binary}"
 
 go_binary="${YUHAIIN_GO_BIN:-${scenario_dir}/yuhaiin-go}"
 if [[ -z "${YUHAIIN_GO_BIN:-}" ]]; then
-  (cd "${go_root}" && GOEXPERIMENT=jsonv2,greenteagc go build -o "${go_binary}" ./cmd/yuhaiin)
+  YUHAIIN_GO_DIR="${go_root}" \
+    "${repo_root}/scripts/integration/podman-go.sh" \
+    --state-dir "${scenario_dir}" -- \
+    env GOEXPERIMENT=jsonv2,greenteagc go build -o /state/yuhaiin-go ./cmd/yuhaiin
 fi
 test -x "${go_binary}"
 

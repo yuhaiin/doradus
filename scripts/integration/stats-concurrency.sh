@@ -12,21 +12,19 @@ write_rounds="${YUHAIIN_STATS_WRITE_ROUNDS:-64}"
 
 mkdir -p "${scenario_dir}"
 
-echo "[stats-concurrency] building runtime integration test binary"
-cargo build \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[stats-concurrency] building runtime integration test binary in Podman"
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  cargo build \
   -p yuhaiin-runtime \
   --all-features \
-  --offline \
   --bin yuhaiin \
   >"${scenario_dir}/runtime-build.log"
-cargo test \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  cargo test \
   -p yuhaiin-runtime \
   --all-features \
-  --offline \
   --test stats_concurrency \
   --no-run \
   >"${scenario_dir}/build.log"

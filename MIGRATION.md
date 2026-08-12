@@ -4175,7 +4175,7 @@ Podman Rust image 中执行，宿主机只负责挂载源码、`~/.cache/yuhaiin
 
 ## 153. 2026-08-12 缓存临时 target 清理边界
 
-当前 `~/.cache/yuhaiin-rust` 约 47G，其中主 `cargo-target/debug` 约 21G，另外有多份一次性
+当前 `~/.cache/yuhaiin-rust` 约 49G，其中主 `cargo-target/debug` 约 21G，另外有多份一次性
 cross/CI/musl target。此前 `cache-prune` 只清理过期 integration/parity/benchmark 目录，
 无法处理这些重复构建根目录。
 
@@ -4184,3 +4184,25 @@ cross/CI/musl target。此前 `cache-prune` 只清理过期 integration/parity/b
 检测到 cache 下有 cargo/rustc 活跃进程时 fail-closed。当前已用 retention=0 dry-run 验证可
 识别 9 个临时 target，未删除任何用户缓存；主 `cargo-target`、fixtures、rules 和集成状态
 仍保持独立。
+
+## 154. 2026-08-12 集成/benchmark 构建统一移入 Podman
+
+为落实“不要在本机测试”，新增两个共享入口：
+
+- `scripts/integration/podman-cargo.sh`：把 workspace 只读挂载到 Rust image，把
+  `CARGO_TARGET_DIR` 和场景状态挂载到 `~/.cache/yuhaiin-rust`，并显式设置
+  `HOME=/state/home`、`TMPDIR=/state/cache/tmp`、`CARGO_NET_OFFLINE=true`；
+- `scripts/integration/podman-go.sh`：在 Go image 中编译兼容 runtime，复用
+  `~/.cache/yuhaiin-rust/go-cache`，并将 `GOCACHE`、`GOMODCACHE`、`GOTMPDIR`、`TMPDIR`
+  全部指向 cache-backed state。
+
+API contract/reload、DNS/DoH、legacy snapshot、MaxMind、S3、stats、systemd、transparent、
+TUN、WireGuard、Go live/stats/parity、协议互操作和三个 benchmark 入口均改为通过共享 Rust
+helper；Go live/stats/refact-user 的 Go binary 也通过 Go helper 构建。runtime/test harness
+和代理数据面仍在独立 Podman 容器内运行，宿主只负责路径准备、Podman 调度、curl 和结果收集。
+
+本轮验证：`make api-reload-flow-smoke` 2/2、`make wireguard-chain-smoke` 2/2、
+`make stats-concurrency-smoke` 2/2、`make tun-service-smoke` 通过，`make go-rust-stats-smoke`
+通过。Go 首次完整依赖编译后缓存约 49G，其中 `go-cache` 约 1.9G、主 `cargo-target` 约 25G；
+没有删除缓存，也没有使用宿主 `/tmp`。现有历史记录中“宿主只编译”的描述保留为历史证据，
+当前脚本执行边界以本节和清单顶部为准。

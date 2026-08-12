@@ -9,13 +9,12 @@ image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 
 mkdir -p "${scenario_dir}"
 
-echo "[startup-logs] building runtime"
-cargo build \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[startup-logs] building runtime in Podman"
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  cargo build \
   -p yuhaiin-runtime \
   --all-features \
-  --offline \
   --bin yuhaiin \
   >"${scenario_dir}/runtime-build.log"
 runtime_binary="${target_dir}/debug/yuhaiin"

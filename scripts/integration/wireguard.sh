@@ -1,27 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Compile the WireGuard harness on the host, then execute it in an isolated
-# Podman namespace. The test creates two local userspace peers, so it needs no
-# external network and does not touch a host WireGuard device.
+# Compile and execute the WireGuard harness in isolated Podman containers. The
+# test creates two local userspace peers, so it needs no external network and
+# does not touch a host WireGuard device.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 integration_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/wireguard}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 
-command -v cargo >/dev/null
 command -v podman >/dev/null
 mkdir -p "${integration_dir}"
 
-echo "[wireguard] compiling the harness on the host"
-CARGO_TERM_COLOR=never cargo test \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[wireguard] compiling the harness in Podman"
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${integration_dir}" -- \
+  cargo test \
   -p yuhaiin-wireguard \
   --all-targets \
   --no-run \
-  --offline \
   >"${integration_dir}/build.log" 2>&1
 
 harness_path="$(sed -n 's/^  Executable unittests src\/lib.rs (\(.*\))$/\1/p' "${integration_dir}/build.log" | tail -n 1)"

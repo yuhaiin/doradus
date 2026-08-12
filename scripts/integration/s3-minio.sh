@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Exercise the real S3-compatible request path against MinIO.  The runtime,
-# MinIO and the bucket helper all run in disposable Podman containers; only
-# the binary build happens on the host.  State and logs stay below ~/.cache.
+# MinIO, the bucket helper and the binary build all run in disposable Podman
+# containers. State and logs stay below ~/.cache.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
@@ -16,7 +16,6 @@ access_key="${YUHAIIN_MINIO_ACCESS_KEY:-yuhaiin-access}"
 secret_key="${YUHAIIN_MINIO_SECRET_KEY:-yuhaiin-secret-123}"
 bucket="${YUHAIIN_MINIO_BUCKET:-yuhaiin-smoke}"
 
-command -v cargo >/dev/null
 command -v curl >/dev/null
 command -v jq >/dev/null
 command -v podman >/dev/null
@@ -33,10 +32,10 @@ ensure_image() {
 ensure_image "${image}"
 ensure_image "${mc_image}"
 
-echo "[s3-minio] building runtime"
-cargo build \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[s3-minio] building runtime in Podman"
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  cargo build \
   -p yuhaiin-runtime --bin yuhaiin --all-features --offline \
   >"${scenario_dir}/runtime-build.log" 2>&1
 runtime_binary="${target_dir}/debug/yuhaiin"

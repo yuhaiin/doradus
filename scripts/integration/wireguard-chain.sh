@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Compile the process-level chain harness on the host, then run both the
+# Compile the process-level chain harness in Podman, then run both the
 # runtime child and its deterministic BoringTun peer inside one disposable
 # Podman namespace. No host runtime, host network, or /tmp is used.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -10,19 +10,18 @@ target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 integration_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/wireguard-chain}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 
-command -v cargo >/dev/null
 command -v podman >/dev/null
 mkdir -p "${integration_dir}"
 
-echo "[wireguard-chain] compiling runtime and process harness on the host"
-CARGO_TERM_COLOR=never cargo build \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[wireguard-chain] compiling runtime and process harness in Podman"
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${integration_dir}" -- \
+  cargo build \
   -p yuhaiin-runtime --bin yuhaiin --all-features --offline \
   >"${integration_dir}/runtime-build.log" 2>&1
-CARGO_TERM_COLOR=never cargo test \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${integration_dir}" -- \
+  cargo test \
   -p yuhaiin-runtime --all-features --test wireguard_chain --no-run --offline \
   >"${integration_dir}/build.log" 2>&1
 

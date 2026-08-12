@@ -8,19 +8,17 @@ scenario_dir="${YUHAIIN_WIREGUARD_BENCH_DIR:-${cache_root}/benchmarks/wireguard}
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 bytes="${YUHAIIN_WIREGUARD_BENCH_BYTES:-67108864}"
 
-command -v cargo >/dev/null
 command -v podman >/dev/null
 mkdir -p "${scenario_dir}"
 
-echo "[wireguard-throughput] compiling the release harness on the host"
-CARGO_TERM_COLOR=never cargo test \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[wireguard-throughput] compiling the release harness in Podman"
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  env CARGO_TERM_COLOR=never cargo test \
   -p yuhaiin-wireguard \
   --all-targets \
   --no-run \
   --release \
-  --offline \
   >"${scenario_dir}/build.log" 2>&1
 
 harness_path="$(sed -n 's/^  Executable unittests src\/lib.rs (\(.*\))$/\1/p' "${scenario_dir}/build.log" | tail -n 1)"

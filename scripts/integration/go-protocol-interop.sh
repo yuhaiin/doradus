@@ -8,7 +8,6 @@ target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 scenario_dir="${YUHAIIN_GO_INTEROP_DIR:-${cache_root}/integration/go-protocol-interop}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 
-command -v cargo >/dev/null
 command -v podman >/dev/null
 command -v go >/dev/null
 test -d "${go_checkout}"
@@ -23,21 +22,20 @@ test -d "${go_mod_cache}"
 mkdir -p "${scenario_dir}"
 mkdir -p "${scenario_dir}/go-tmp"
 
-echo "[go-protocol-interop] compiling Rust harnesses on the host"
-CARGO_TERM_COLOR=never cargo test \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[go-protocol-interop] compiling Rust harnesses in Podman"
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  env CARGO_TERM_COLOR=never cargo test \
   -p yuhaiin-chain \
   --test go_yuubinsya_interop \
   --test go_websocket_interop \
   --test standalone_http2 \
   --no-run \
-  --offline \
   >"${scenario_dir}/build.log" 2>&1
 
-CARGO_TERM_COLOR=never cargo test \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  env CARGO_TERM_COLOR=never cargo test \
   -p yuhaiin-protocol \
   --all-features \
   --test go_vless_interop \
@@ -46,7 +44,6 @@ CARGO_TERM_COLOR=never cargo test \
   --test go_vmess_interop \
   --test go_trojan_interop \
   --no-run \
-  --offline \
   >"${scenario_dir}/protocol-build.log" 2>&1
 
 tests=(go_yuubinsya_interop go_websocket_interop standalone_http2)

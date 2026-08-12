@@ -22,14 +22,13 @@ fi
 
 mkdir -p "${scenario_dir}"
 
-echo "[tun-throughput] building release TUN smoke benchmark"
-cargo build \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[tun-throughput] building release TUN smoke benchmark in Podman"
+"${repo_root}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  cargo build \
   -p yuhaiin-core \
   --bin tun-smoke \
   --features tun,async-proxy \
-  --offline \
   --release \
   >"${scenario_dir}/build.log"
 test -x "${binary}"

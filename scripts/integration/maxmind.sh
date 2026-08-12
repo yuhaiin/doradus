@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Fetch the user-selected Country-without-asn database into the persistent
-# cache, compile the ignored fixture test on the host, and run the test itself
-# inside Podman. The source URL is public and the checksum prevents a partial
+# cache, compile the ignored fixture test, and run the test itself inside
+# Podman. The source URL is public and the checksum prevents a partial
 # or replaced download from becoming a test fixture.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
@@ -26,14 +26,13 @@ if [[ ! -f "${fixture}" ]] || [[ "$(sha256sum "${fixture}" | awk '{print $1}')" 
   mv "${partial}" "${fixture}"
 fi
 
-echo "[maxmind] compiling the fixture harness on the host"
-cargo test \
-  --manifest-path "${repo_dir}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[maxmind] compiling the fixture harness in Podman"
+"${repo_dir}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
+  cargo test \
   -p yuhaiin-geo \
   --all-targets \
   --no-run \
-  --offline \
   >"${scenario_dir}/build.log" 2>&1
 
 harness="$({

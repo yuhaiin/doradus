@@ -19,13 +19,12 @@ binary="${target_dir}/debug/yuhaiin"
 command -v podman >/dev/null
 mkdir -p "${run_dir}"
 
-echo "[systemd-service] building runtime binary"
-cargo build \
-  --manifest-path "${repo_dir}/Cargo.toml" \
-  --target-dir "${target_dir}" \
+echo "[systemd-service] building runtime binary in Podman"
+"${repo_dir}/scripts/integration/podman-cargo.sh" \
+  --target-dir "${target_dir}" --state-dir "${run_dir}" -- \
+  cargo build \
   -p yuhaiin-runtime \
   --all-features \
-  --offline \
   --bin yuhaiin \
   >"${run_dir}/build.log"
 test -x "${binary}"
