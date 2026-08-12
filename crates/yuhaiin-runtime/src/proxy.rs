@@ -326,8 +326,15 @@ impl RuntimeSnapshot {
                         format!("invalid WireGuard node configuration: {error}"),
                     )
                 })?;
-            Arc::new(yuhaiin_wireguard::build_proxy(wireguard, timeout).await?)
-                as Arc<dyn AsyncProxy>
+            let bind_interface = config.network_interface();
+            Arc::new(
+                yuhaiin_wireguard::build_proxy_with_interface(
+                    wireguard,
+                    timeout,
+                    bind_interface.as_deref(),
+                )
+                .await?,
+            ) as Arc<dyn AsyncProxy>
         } else if is_chain_config(&config) {
             let json = std::str::from_utf8(&config.data_json).map_err(|error| {
                 Error::new(

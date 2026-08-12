@@ -3926,15 +3926,16 @@ service-chain 16、WireGuard 7、WireGuard runtime chain 2，0 失败）。
 重新对照 Go 的 `direct`、`fixed` 和 `fixedv2` contract 后确认，节点配置确实可以携带
 `network_interface`；它不是只用于展示的字段。Rust 现在从保留的 Go layer JSON 中提取该字段，放入
 flow context，并沿着 direct/fixed、HTTP CONNECT、SOCKS5、Yuubinsya native UDP、UOT/dup-over-TCP
-以及 TLS/HTTP2 上游链路传递。WireGuard 的 Go contract 没有独立的
-`network_interface` 字段，不把它伪造为 WireGuard 配置能力。
+以及 TLS/HTTP2 上游链路传递。WireGuard 虽然不把它作为 WireGuard protocol 配置字段，Rust 仍会
+把节点兼容层的接口策略传到 BoringTun UDP underlay，避免真正的加密隧道 endpoint 绕过该策略。
 
 Linux 上 TCP 使用预创建 socket 的 `SO_BINDTODEVICE`，UDP 在发送前对同一个 socket 应用接口绑定；
-没有接口配置时继续使用原有 source-address/interface snapshot 策略。macOS/Windows 的共享 core 不
-引入 Linux 专用 socket API，仍保留可移植的 source-address fallback。
+WireGuard 在 BoringTun 的 UDP underlay 创建处应用同一约束。没有接口配置时继续使用原有
+source-address/interface snapshot 策略。macOS/Windows 的共享 core 不引入 Linux 专用 socket API，
+仍保留可移植的 source-address fallback。
 
 验证分两层完成：完整 workspace harness 在 Podman 中通过 48 个 harness（chain 52、core 147、
 runtime 256、store 135，0 失败），随后在 privileged、`network=none` 的 Podman 中运行
-`network_interface` 回归，direct TCP 和 fixed UDP 均为 2/2，runtime wrapper 传递测试和 Clippy
-也通过。该证据只覆盖 Linux 权限可用的接口绑定和本地 loopback，不把它外推为 macOS/Windows
+`network_interface` 回归，direct TCP 和 fixed UDP 均为 2/2，WireGuard underlay 的 Linux `lo`
+绑定为 1/1，runtime wrapper 传递测试和 Clippy 也通过。该证据只覆盖 Linux 权限可用的接口绑定和本地 loopback，不把它外推为 macOS/Windows
 原生接口索引行为或第三方/WARP 网络现场；后者继续由 checklist 的外部验收项跟踪。
