@@ -927,20 +927,45 @@ async fn backup_config_get_value(state: &ApiState) -> ApiResult {
 }
 
 async fn load_backup_config_value(state: &ApiState) -> Result<Value, ApiError> {
-    if let Some(record) = state
+    let value = if let Some(record) = state
         .controller
         .store()
         .repository()
         .get_go_backup_settings()
         .await?
     {
-        return Ok(raw_json(&record.data_json, default_backup_config()));
+        raw_json(&record.data_json, default_backup_config())
+    } else {
+        let value = state.controller.store().get_config("backup.config").await?;
+        value
+            .as_deref()
+            .map(|bytes| raw_json(bytes, default_backup_config()))
+            .unwrap_or_else(default_backup_config)
+    };
+
+    // Go's BackupStore.Get lazily assigns a stable v4 UUID when an older
+    // snapshot has no instance name. Persist it through the same Go-shaped
+    // row and Rust overlay so the next API read, backup object name, and a
+    // later process restart all observe the same identity.
+    if value
+        .get("instanceName")
+        .and_then(Value::as_str)
+        .is_some_and(|instance| !instance.is_empty())
+    {
+        return Ok(value);
     }
-    let value = state.controller.store().get_config("backup.config").await?;
-    Ok(value
-        .as_deref()
-        .map(|bytes| raw_json(bytes, default_backup_config()))
-        .unwrap_or_else(default_backup_config))
+    let mut value = value;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "instanceName".to_owned(),
+            Value::String(uuid::Uuid::new_v4().to_string()),
+        );
+    } else {
+        value = default_backup_config();
+        value["instanceName"] = Value::String(uuid::Uuid::new_v4().to_string());
+    }
+    persist_backup_config_value(state, value.clone()).await?;
+    Ok(value)
 }
 
 async fn backup_config_put_value(state: &ApiState, value: Value) -> ApiResult {
@@ -3069,11 +3094,18 @@ async fn subscriptions_delete_preview_value(state: &ApiState, value: &Value) -> 
 }
 
 async fn subscriptions_update_value(_state: &ApiState, value: &Value) -> ApiResult {
-    let names = subscription_names(value, "subscriptions update")?;
+    // The Go LinkNames decoder leaves Names nil when the request is `{}`;
+    // that is the same "refresh all" request as an explicit empty array.
+    let names = if value.get("names").is_none() {
+        Vec::new()
+    } else {
+        subscription_names(value, "subscriptions update")?
+    };
     if names.is_empty() {
-        return Err(ApiError::bad(
-            "subscription update requires at least one link name or an implemented refresh worker",
-        ));
+        // Go treats an empty name list as "refresh all".  The Rust refresh
+        // worker is intentionally deferred, but an empty store still has the
+        // same observable no-op success as the Go implementation.
+        return empty();
     }
     Err(ApiError::unavailable(format!(
         "subscription refresh is not implemented for: {}",
@@ -3676,13 +3708,84 @@ async fn write_config_json(state: &ApiState, key: &str, value: Value) -> ApiResu
 
 fn node_json(record: GoNodeRecord) -> Value {
     let mut value = object_or_fallback(&record.data_json, json!({}));
+    if let Some(object) = value.as_object_mut() {
+        // `hash` is the legacy node-store key. It is not part of Go's public
+        // contract.Node even though old v1 migrations retain it in the raw
+        // JSON used by the runtime.
+        object.remove("hash");
+    }
     strip_go_internal_node_fields(&mut value);
+    normalize_go_node_optional_zero_fields(&mut value);
     set_string(&mut value, "id", record.id);
     set_string(&mut value, "name", record.name);
     set_string(&mut value, "group", record.group_name);
     set_string(&mut value, "origin", record.origin);
     set_bool(&mut value, "enabled", record.enabled);
     value
+}
+
+fn normalize_go_node_optional_zero_fields(value: &mut Value) {
+    let Some(chain) = value.get_mut("chain").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for protocol in chain {
+        let Some(protocol_object) = protocol.as_object_mut() else {
+            continue;
+        };
+        let Some(kind) = protocol_object
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let Some(config) = protocol_object
+            .get_mut(&kind)
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let optional_fields: &[&str] = match kind.as_str() {
+            "direct" => &["network_interface"],
+            "simple" | "fixed" => &["port", "alternate_host", "network_interface"],
+            "fixedv2" => &["addresses", "udp_happy_eyeballs"],
+            "socks5" => &["override_port"],
+            "yuubinsya" => &["udp_over_stream", "udp_coalesce"],
+            "http2" | "mux" => &["concurrency"],
+            "reality" => &["mldsa65_verify", "short_id", "debug"],
+            "tls" => &[
+                "servernames",
+                "ca_cert",
+                "insecure_skip_verify",
+                "next_protos",
+                "ech_config",
+            ],
+            "wireguard" => &["endpoint", "peers", "mtu", "reserved"],
+            "tailscale" => &["debug"],
+            "set" => &["nodes", "strategy"],
+            "http_mock" => &["data"],
+            "cloudflare_warp_masque" => &["local_addresses", "mtu"],
+            _ => &[],
+        };
+        for field in optional_fields {
+            if config.get(*field).is_some_and(json_value_is_go_zero) {
+                config.remove(*field);
+            }
+        }
+    }
+}
+
+fn json_value_is_go_zero(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Bool(value) => !value,
+        Value::Number(value) => {
+            value.as_i64() == Some(0) || value.as_u64() == Some(0) || value.as_f64() == Some(0.0)
+        }
+        Value::String(value) => value.is_empty(),
+        Value::Array(value) => value.is_empty(),
+        Value::Object(value) => value.is_empty(),
+    }
 }
 
 /// The persisted Go node JSON contains runtime-only `userId` fields for some
@@ -3710,14 +3813,108 @@ fn strip_go_internal_node_fields(value: &mut Value) {
 
 fn inbound_json(record: GoInboundRecord) -> Value {
     let mut value = object_or_fallback(&record.data_json, json!({}));
+    normalize_go_inbound_public_json(&mut value);
     set_string(&mut value, "id", record.id);
     set_string(&mut value, "name", record.name);
     set_bool(&mut value, "enabled", record.enabled);
     value
 }
 
+fn normalize_go_inbound_public_json(value: &mut Value) {
+    if let Some(network) = value.get_mut("network").and_then(Value::as_object_mut)
+        && let Some(tcp_udp) = network.get_mut("tcp_udp").and_then(Value::as_object_mut)
+    {
+        // These fields belong to the runtime/network adapter, not Go's
+        // public contract.TCPUDPNetwork.
+        tcp_udp.remove("control");
+        tcp_udp.remove("udp_happy_eyeballs");
+    }
+
+    let Some(protocol) = value.get_mut("protocol").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(kind) = protocol
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let Some(config) = protocol.get_mut(&kind).and_then(Value::as_object_mut) else {
+        return;
+    };
+
+    for (legacy, public) in [
+        ("force_fakeip", "forceFakeIp"),
+        ("portal_v6", "portalV6"),
+        ("post_up", "postUp"),
+        ("post_down", "postDown"),
+        ("skip_multicast", "skipMulticast"),
+        ("udp_coalesce", "udpCoalesce"),
+    ] {
+        rename_json_field(config, legacy, public);
+    }
+    config.remove("platform");
+
+    if kind == "tun" {
+        if let Some(route) = config
+            .remove("route")
+            .and_then(|value| value.as_object().cloned())
+        {
+            if !config.contains_key("routes") {
+                config.insert(
+                    "routes".to_owned(),
+                    route.get("routes").cloned().unwrap_or_else(|| json!([])),
+                );
+            }
+            if !config.contains_key("excludes") {
+                config.insert(
+                    "excludes".to_owned(),
+                    route.get("excludes").cloned().unwrap_or_else(|| json!([])),
+                );
+            }
+        }
+        for (field, default) in [
+            ("forceFakeIp", json!(false)),
+            ("skipMulticast", json!(false)),
+            ("portalV6", json!("")),
+            ("routes", json!([])),
+            ("excludes", json!([])),
+            ("postUp", json!([])),
+            ("postDown", json!([])),
+        ] {
+            config.entry(field.to_owned()).or_insert(default);
+        }
+    } else if kind == "yuubinsya"
+        && config
+            .get("udpCoalesce")
+            .is_none_or(|value| value.is_null())
+    {
+        config.insert("udpCoalesce".to_owned(), json!(false));
+    }
+}
+
+fn rename_json_field(object: &mut serde_json::Map<String, Value>, legacy: &str, public: &str) {
+    if object.contains_key(public) {
+        object.remove(legacy);
+    } else if let Some(value) = object.remove(legacy) {
+        object.insert(public.to_owned(), value);
+    }
+}
+
 fn resolver_json(record: GoResolverRecord) -> Value {
     let mut value = object_or_fallback(&record.data_json, json!({}));
+    if let Some(object) = value.as_object_mut() {
+        // `tls_servername` is a legacy SQLite column spelling, not part of
+        // Go's public resolver contract. The camel-case field is contract
+        // data, but `omitzero` removes it (and subnet) when empty.
+        object.remove("tls_servername");
+        for field in ["subnet", "tlsServerName", "system"] {
+            if object.get(field).is_some_and(json_value_is_go_zero) {
+                object.remove(field);
+            }
+        }
+    }
     set_string(&mut value, "id", record.id);
     set_string(&mut value, "type", record.resolver_type);
     set_string(&mut value, "host", record.host);
@@ -4403,16 +4600,54 @@ mod tests {
             chain_types_json: b"[\"yuubinsya\"]".to_vec(),
             updated_at: 0,
             data_json: br#"{
+                "hash":"legacy-hash",
                 "id":"raw-id",
                 "futureField":"preserve-for-compatibility",
-                "chain":[{"type":"yuubinsya","yuubinsya":{"userId":"runtime-only"}}]
+                "chain":[
+                    {"type":"simple","simple":{"host":"127.0.0.1","port":1080,"alternate_host":[],"network_interface":""}},
+                    {"type":"socks5","socks5":{"hostname":"127.0.0.1","user":"","password":"","override_port":0}},
+                    {"type":"yuubinsya","yuubinsya":{"userId":"runtime-only"}}
+                ]
             }"#
             .to_vec(),
         });
         assert_eq!(value["id"], "node-1");
         assert_eq!(value["name"], "Node 1");
         assert_eq!(value["futureField"], "preserve-for-compatibility");
-        assert!(value["chain"][0]["yuubinsya"].get("userId").is_none());
+        assert!(value.get("hash").is_none());
+        assert!(value["chain"][0]["simple"].get("alternate_host").is_none());
+        assert!(
+            value["chain"][0]["simple"]
+                .get("network_interface")
+                .is_none()
+        );
+        assert!(value["chain"][1]["socks5"].get("override_port").is_none());
+        assert!(value["chain"][2]["yuubinsya"].get("userId").is_none());
+    }
+
+    #[test]
+    fn resolver_public_json_uses_go_omitzero_shape() {
+        let value = resolver_json(yuhaiin_store::GoResolverRecord {
+            id: "direct".to_owned(),
+            resolver_type: "doh".to_owned(),
+            host: "223.5.5.5".to_owned(),
+            updated_at: 0,
+            data_json: br#"{
+                "id":"legacy-id",
+                "type":"doh",
+                "host":"223.5.5.5",
+                "subnet":"",
+                "tlsServerName":"",
+                "tls_servername":""
+            }"#
+            .to_vec(),
+        });
+        assert_eq!(value["id"], "direct");
+        assert_eq!(value["type"], "doh");
+        assert_eq!(value["host"], "223.5.5.5");
+        assert!(value.get("subnet").is_none());
+        assert!(value.get("tlsServerName").is_none());
+        assert!(value.get("tls_servername").is_none());
     }
 
     #[test]
@@ -4462,6 +4697,46 @@ mod tests {
         .unwrap();
         assert_eq!(settings["advanced"]["udpBufferSize"], 65536);
         assert_eq!(settings["backup"]["instanceName"], "");
+
+        let generated = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v2/rpc/backup.config.get")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(generated.status(), StatusCode::OK);
+        let generated: Value =
+            serde_json::from_slice(&to_bytes(generated.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        let generated_id = generated["instanceName"].as_str().unwrap();
+        assert_eq!(
+            uuid::Uuid::parse_str(generated_id)
+                .unwrap()
+                .get_version_num(),
+            4
+        );
+
+        let second_read = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v2/rpc/backup.config.get")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second_read: Value = serde_json::from_slice(
+            &to_bytes(second_read.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second_read["instanceName"], generated_id);
 
         let backup = json!({
             "instanceName":"rust-instance",
@@ -5813,6 +6088,30 @@ mod tests {
                 .unwrap();
         assert_eq!(listed["items"][0]["name"], "prod");
         assert_eq!(listed["items"][0]["future"], true);
+
+        let refresh_all = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v2/subscriptions/update")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refresh_all.status(), StatusCode::OK);
+
+        let refresh_named = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v2/subscriptions/update")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"names":["prod"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refresh_named.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let preview = app
             .clone()

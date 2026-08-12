@@ -199,6 +199,14 @@ normalize() {
       # fields.
       jq -S 'with_entries(if (.key | IN("version", "commit", "buildTime", "goVersion", "arch", "platform", "os", "compiler", "build")) then .value = "<implementation>" else . end)'
       ;;
+    backup.config.get)
+      # Go lazily assigns a random v4 instance name on first read. When Go
+      # and Rust each migrate an old snapshot independently, the values must
+      # differ, but both must still be valid UUID-shaped persisted identities.
+      # Keep non-UUID configured names strict so this does not hide a real
+      # backup configuration mismatch.
+      jq -S 'if (.instanceName | type) == "string" and (.instanceName | test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")) then .instanceName = "<generated-uuid>" else . end'
+      ;;
     nodes.get|resolvers.get|inbounds.get)
       jq -S 'if (.items | type) == "array" then .items |= sort_by(.id) else . end'
       ;;
@@ -258,6 +266,10 @@ declare -a operations=(
   'route.tags.get|{}'
   'tools.interfaces|{}'
   'tools.licenses|{}'
+  # Go treats an empty LinkNames request as "refresh all". The Rust refresh
+  # worker remains deferred, but an empty subscription store is an observable
+  # no-op success and must stay compatible with the frontend contract.
+  'subscriptions.update|{}'
 )
 
 for request_spec in "${operations[@]}"; do
@@ -513,7 +525,6 @@ declare -a error_operations=(
   'route-priority-source-required|route.rules.priority|{"target":{"name":"missing"}}'
   'route-priority-operate-invalid|route.rules.priority|{"source":{"name":"missing"},"target":{"name":"missing"},"operate":"invalid"}'
   'backup-restore-source-required|backup.restore|{}'
-  'subscriptions-deferred|subscriptions.update|{}'
 )
 
 for request_spec in "${error_operations[@]}"; do

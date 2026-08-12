@@ -181,7 +181,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` `production-parity-smoke` 现在额外在 Podman 中审计三份停止态快照的 SQLite 对象、逐表列约束和索引保留；Rust 允许的 `dns_resolvers`、`route_rules`、小时级 traffic/failure projection schema migration 被显式列出，其余源表/对象缺失会直接失败，行数变化会保留在 JSON 报告中供 projection 复核。
 - `[~]` 增加更长时间 telemetry/history、强停和 reload 组合样本；当前已补充 Podman 真实前台进程的 32 readers×1200 rounds、3000 writes 压力回归（2/2 passed，132.56s），并保留 24×1000、2000 writes 结果。
 - `[x]` SQLite 升级/启动与统计投影的锁竞争已有跨进程 Podman 回归：真实持有 `<db>-yuhaiin-write-lock` 时，另一个 `ConfigStore::open` 会等待并在释放后完成；真实 `BEGIN IMMEDIATE` 持有者释放后，`replace_go_statistics` 会通过生产 busy-retry 路径完成，6 个 cross-process tests 通过（另 1 个长压 test 显式 ignored）。
-- `[x]` 使用缓存中的停止态 Go `state.db` 做 Go/Rust API read + core mutation parity；包括 `connections.history` 的 UTC 时间格式、节点/入站/解析器/路由/发布/订阅 deferred 错误 contract。
+- `[x]` 使用缓存中的停止态 Go `state.db` 做 Go/Rust API read + core mutation parity；包括 `connections.history` 的 UTC 时间格式、节点/入站/解析器/路由/发布，以及订阅更新空请求的 Go “refresh all” 成功 contract。另用真实 Go v1 `/home/asutorufa/Documents/Programming/yuhaiin/tmp/state.db` 的独立副本完成同一读/写/错误矩阵 parity；源库保持只读，所有副本和日志位于 `~/.cache/yuhaiin-rust`。
 - `[x]` refact-user 分支的 users API parity harness 现在也完全在 Podman 中运行；先在容器内让 Rust 接管 prepared SQLite，再用独立 Go/Rust 容器对 basic/UUID/token 的 create/update/get/list/delete、node reference conflict 和 missing-user 错误做对照。
 - `[~]` S3 backup 已不再静默退化为本地备份：`backup.run` 按 Go object name 上传，`backup.restore` 空请求按配置下载，失败返回 unavailable；SigV4、本地兼容端点、Go BLAKE2b hash 和“经选中 outbound proxy 访问 S3”的 HTTP/HTTPS transport 已测试。`make s3-minio-smoke` 已在 Podman 通过真实 MinIO 完成 bucket 创建、SigV4 PUT/GET、object 校验和 restore 下载；真实 AWS 权限现场及更多异常快照逐表 diff 仍待补。
 - `[x]` 统计公开契约已逐字段对齐：connections 的完整 metadata/matchHistory、total 的 string counters、traffic 的 UTC bucket、telemetry 的固定九维/失败计数、history/failed-history/block-history 的 process、count、time、dumpProcessEnabled 和 API 1000 条边界均有单测或 Podman parity；失败项按 `(protocol, host, process)` 分组，阻断历史不再丢失进程标志，同时保留 Go failed-history 全量 SQLite 语义。
@@ -218,7 +218,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 | 类别 | 命令 | Podman 验证结果 |
 | --- | --- | --- |
-| 全 workspace | `make workspace-tests` | 49 个 harness，0 失败；chain 55、core 154、runtime 286、store 131（5 ignored）、trie 27、service-chain 23、WireGuard 11（1 benchmark ignored）、WireGuard runtime chain 2、stats concurrency 2；外部 WARP 测试显式 ignored；新增 RuntimeDnsHandler→UDP/TCP server/client 原始 QTYPE 回归 |
+| 全 workspace | `make workspace-tests` | 49 个 harness，0 失败；chain 55、core 154、runtime 287、store 131（5 ignored）、trie 27、service-chain 23、WireGuard 11（1 benchmark ignored）、WireGuard runtime chain 2、stats concurrency 2；外部 WARP 测试显式 ignored；新增 RuntimeDnsHandler→UDP/TCP server/client 原始 QTYPE 回归 |
 | Go API / SQLite | `make production-parity-smoke` | 3 份停止态 Go SQLite 的 info/settings/nodes/inbounds/resolvers/routes/publishes/connections/统计读接口、核心 mutation 和错误矩阵逐项 identical；Rust takeover 结构审计逐表保留源对象/列约束/索引，已知 projection migration 单独记录 |
 | Go live flow | `make go-live-flow-parity-smoke` | Go/Rust 真实 HTTP inbound → router → HTTP outbound 流量、connections、total、traffic、history、telemetry 和 reload 后统计 parity |
 | SQLite lock contention | `podman-cargo.sh -- cargo test -p yuhaiin-store --test cross_process --no-run`，随后在 Debian Podman 执行 harness | 升级/启动 write-lock 与统计 `BEGIN IMMEDIATE` holder 两条跨进程场景通过；6 passed、1 ignored |
@@ -239,6 +239,19 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | musl release build | `make build-release-musl` | Podman 内成功完成 `x86_64-unknown-linux-musl` release 构建，产出 static PIE `yuhaiin` |
 | benchmark | `make benchmark-throughput`、`make benchmark-tun-throughput`、`make benchmark-wireguard-throughput` | HTTP CONNECT 158.39 MiB/s / 17,904 KiB；TLS/H2/Yuubinsya 33.38 MiB/s / 20,320 KiB；TUN 44.88 MiB/s / 13,224 KiB；BoringTun 595.89 MiB/s / 3,504 KiB（64 MiB run）。均为同机趋势基线 |
 | quality gate | `make check`、`make clippy` | Podman 中 workspace check 与 `clippy --workspace --all-targets --all-features -- -D warnings` 通过 |
+
+本轮新增的 v1 对照命令为：
+
+```bash
+YUHAIIN_PREPARE=0 \
+YUHAIIN_SOURCE_DB=/home/asutorufa/Documents/Programming/yuhaiin/tmp/state.db \
+make production-parity-smoke
+```
+
+结果为所有 read、core mutation 和 error case `identical`，包括空 `{}` 的
+`subscriptions.update`。v1 源库不能先由 Rust takeover 后再交给当前 Go 迁移器，因此该
+旧 schema 使用两个服务各自从只读副本启动的 independent parity 模式；新版生产库仍保留
+默认 Rust-first takeover 模式。
 
 ## 常用命令
 

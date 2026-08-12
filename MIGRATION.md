@@ -4536,3 +4536,18 @@ transport 层 raw packet 单测，但没有把两者通过真实 runtime DNS ser
 模型改写。Podman 定向结果为 `1 passed`；这补的是 server 集成证据，不把 DNS typed API
 扩大宣称为任意 RR 的结构化解析。构建和运行均使用 Podman，状态位于
 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+
+## 173. 2026-08-13 Go v1 快照 API parity 与订阅空请求兼容
+
+本轮用真实 Go v1 `/home/asutorufa/Documents/Programming/yuhaiin/tmp/state.db` 的只读副本
+执行 `YUHAIIN_PREPARE=0 make production-parity-smoke`。Rust public projection 修正了
+Go `omitzero` 语义和 legacy storage 字段泄漏：backup 首次读取会持久化 Go 一致的 v4
+`instanceName`，节点隐藏 legacy `hash`/零值 optional protocol fields，resolver 移除
+旧 `tls_servername` 和空 optional fields，inbound 将旧 snake_case/嵌套 TUN 字段投影为
+frontend 使用的 camelCase/扁平 contract。结果覆盖所有 read、core mutation 和 error
+case，全部 `identical`，源库保持只读，副本和日志在 `~/.cache/yuhaiin-rust`。
+
+同时核对 Go `Subscribe.Update`：请求 `{}` 表示刷新全部，而不是参数错误。Rust 在订阅
+刷新 worker 仍延期的边界下对空列表返回相同的成功 no-op；指定订阅名称仍明确返回
+`unavailable`。单测和 parity harness 均已覆盖该行为。整个过程由 Podman 构建/运行，未使用
+`/tmp`。
