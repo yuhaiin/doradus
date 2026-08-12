@@ -146,6 +146,161 @@ struct ParsedConfig {
 }
 
 impl WireGuardConfig {
+    /// Parse either the Go JSON contract or a standard `wg-quick`/WARP
+    /// profile.  The runtime still receives the typed Go contract, while this
+    /// entry point makes the external validation path useful with the files
+    /// Cloudflare and WireGuard tooling actually export.
+    pub fn from_json_or_ini(input: &[u8]) -> Result<Self> {
+        let input = std::str::from_utf8(input)
+            .map_err(|error| Error::invalid(format!("WireGuard config is not UTF-8: {error}")))?;
+        if input.trim_start().starts_with('{') {
+            return serde_json::from_str(input).map_err(|error| {
+                Error::invalid(format!("invalid WireGuard JSON configuration: {error}"))
+            });
+        }
+        Self::from_wireguard_ini(input)
+    }
+
+    /// Parse a standard `[Interface]`/`[Peer]` WireGuard profile.
+    ///
+    /// Unknown keys are ignored intentionally: WARP profiles commonly carry
+    /// `DNS`, `Table`, and `SaveConfig` fields that are meaningful to
+    /// `wg-quick` but not to a userspace outbound proxy.
+    pub fn from_wireguard_ini(input: &str) -> Result<Self> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Section {
+            None,
+            Interface,
+            Peer,
+            Other,
+        }
+
+        let mut section = Section::None;
+        let mut secret_key = None;
+        let mut endpoint = Vec::new();
+        let mut mtu = 0;
+        let mut reserved = Vec::new();
+        let mut peers = Vec::new();
+        let mut current_peer: Option<WireGuardPeerConfig> = None;
+
+        let push_peer = |current_peer: &mut Option<WireGuardPeerConfig>, peers: &mut Vec<_>| {
+            if let Some(peer) = current_peer.take() {
+                peers.push(peer);
+            }
+        };
+
+        for (line_number, raw_line) in input.lines().enumerate() {
+            let line = raw_line
+                .split('#')
+                .next()
+                .unwrap_or(raw_line)
+                .split(';')
+                .next()
+                .unwrap_or(raw_line)
+                .trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(header) = line
+                .strip_prefix('[')
+                .and_then(|line| line.strip_suffix(']'))
+            {
+                let header = header.trim().to_ascii_lowercase();
+                push_peer(&mut current_peer, &mut peers);
+                section = match header.as_str() {
+                    "interface" => Section::Interface,
+                    "peer" => {
+                        current_peer = Some(WireGuardPeerConfig {
+                            public_key: String::new(),
+                            pre_shared_key: String::new(),
+                            endpoint: String::new(),
+                            keep_alive: 0,
+                            allowed_ips: Vec::new(),
+                        });
+                        Section::Peer
+                    }
+                    _ => Section::Other,
+                };
+                continue;
+            }
+
+            let (key, value) = line.split_once('=').ok_or_else(|| {
+                Error::invalid(format!(
+                    "WireGuard config line {} is missing '='",
+                    line_number + 1
+                ))
+            })?;
+            let key = key.trim().to_ascii_lowercase().replace('_', "");
+            let value = value.trim();
+            match section {
+                Section::Interface => match key.as_str() {
+                    "privatekey" => secret_key = Some(value.to_owned()),
+                    "address" => endpoint.extend(split_ini_list(value)),
+                    "mtu" => {
+                        mtu = value.parse::<i32>().map_err(|error| {
+                            Error::invalid(format!("invalid WireGuard MTU: {error}"))
+                        })?;
+                    }
+                    "reserved" => reserved = parse_ini_reserved(value)?,
+                    _ => {}
+                },
+                Section::Peer => {
+                    let peer = current_peer.as_mut().ok_or_else(|| {
+                        Error::invalid(format!(
+                            "WireGuard config line {} is outside a peer",
+                            line_number + 1
+                        ))
+                    })?;
+                    match key.as_str() {
+                        "publickey" => peer.public_key = value.to_owned(),
+                        "presharedkey" => peer.pre_shared_key = value.to_owned(),
+                        "endpoint" => peer.endpoint = value.to_owned(),
+                        "persistentkeepalive" => {
+                            peer.keep_alive = if value.eq_ignore_ascii_case("off") {
+                                0
+                            } else {
+                                value.parse::<i32>().map_err(|error| {
+                                    Error::invalid(format!(
+                                        "invalid WireGuard persistent keepalive: {error}"
+                                    ))
+                                })?
+                            };
+                        }
+                        "allowedips" => peer.allowed_ips = split_ini_list(value),
+                        _ => {}
+                    }
+                }
+                Section::None | Section::Other => {}
+            }
+        }
+        push_peer(&mut current_peer, &mut peers);
+
+        let secret_key = secret_key
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::invalid("WireGuard [Interface] is missing PrivateKey"))?;
+        if endpoint.is_empty() {
+            return Err(Error::invalid("WireGuard [Interface] is missing Address"));
+        }
+        if peers.is_empty() {
+            return Err(Error::invalid("WireGuard config is missing [Peer]"));
+        }
+        for (index, peer) in peers.iter().enumerate() {
+            if peer.public_key.is_empty() || peer.endpoint.is_empty() || peer.allowed_ips.is_empty()
+            {
+                return Err(Error::invalid(format!(
+                    "WireGuard [Peer] {index} is missing PublicKey, Endpoint, or AllowedIPs"
+                )));
+            }
+        }
+        Ok(Self {
+            secret_key,
+            endpoint,
+            peers,
+            mtu,
+            reserved,
+        })
+    }
+
     fn parse(&self, peers: Vec<ParsedPeer>) -> Result<ParsedConfig> {
         let local_addresses = self
             .endpoint
@@ -180,6 +335,35 @@ impl WireGuardConfig {
             reserved: self.reserved.clone(),
         })
     }
+}
+
+fn split_ini_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn parse_ini_reserved(value: &str) -> Result<Vec<u8>> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    if value.contains(',') {
+        return value
+            .split(',')
+            .map(str::trim)
+            .map(|value| {
+                value.parse::<u8>().map_err(|error| {
+                    Error::invalid(format!("invalid WireGuard reserved byte: {error}"))
+                })
+            })
+            .collect();
+    }
+    STANDARD
+        .decode(value.trim())
+        .map_err(|error| Error::invalid(format!("invalid WireGuard reserved value: {error}")))
 }
 
 impl WireGuardPeerConfig {
@@ -1532,8 +1716,51 @@ mod tests {
                 "allowedIps": ["0.0.0.0/0"]
             }]
         });
-        let decoded: WireGuardConfig = serde_json::from_value(json).unwrap();
+        let json_bytes = serde_json::to_vec(&json).unwrap();
+        let decoded = WireGuardConfig::from_json_or_ini(&json_bytes).unwrap();
         assert_eq!(decoded.reserved, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn parses_cloudflare_warp_wireguard_ini() {
+        let config = WireGuardConfig::from_json_or_ini(
+            br#"
+                [Interface]
+                PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+                Address = 172.16.0.2/32, 2606:4700:110:8765:1111:2222:3333:4444/128
+                DNS = 1.1.1.1
+                MTU = 1280
+                Reserved = 1, 2, 3
+
+                [Peer]
+                PublicKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
+                AllowedIPs = 0.0.0.0/0, ::/0
+                Endpoint = engage.cloudflareclient.com:2408
+                PersistentKeepalive = 25
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.endpoint.len(), 2);
+        assert_eq!(config.mtu, 1_280);
+        assert_eq!(config.reserved, vec![1, 2, 3]);
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].allowed_ips, ["0.0.0.0/0", "::/0"]);
+        assert_eq!(config.peers[0].keep_alive, 25);
+        assert_eq!(config.peers[0].endpoint, "engage.cloudflareclient.com:2408");
+    }
+
+    #[test]
+    fn rejects_incomplete_wireguard_ini() {
+        let error = WireGuardConfig::from_wireguard_ini(
+            "[Interface]\nPrivateKey = invalid\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = invalid\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("missing PublicKey, Endpoint, or AllowedIPs")
+        );
     }
 
     #[cfg(target_os = "linux")]

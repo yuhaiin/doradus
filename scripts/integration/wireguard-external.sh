@@ -9,7 +9,7 @@ image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 config_path="${YUHAIIN_WIREGUARD_EXTERNAL_CONFIG:-}"
 
 if [[ -z "${config_path}" ]]; then
-  echo "set YUHAIIN_WIREGUARD_EXTERNAL_CONFIG to a user-supplied WARP/WireGuard JSON file" >&2
+  echo "set YUHAIIN_WIREGUARD_EXTERNAL_CONFIG to a user-supplied WARP/WireGuard JSON or wg-quick INI file" >&2
   exit 2
 fi
 if [[ ! -r "${config_path}" ]]; then

@@ -38,7 +38,7 @@ async fn external_proxy() -> Result<yuhaiin_wireguard::WireGuardProxy> {
     let config_path = required_env("YUHAIIN_WIREGUARD_EXTERNAL_CONFIG");
     let config_bytes = std::fs::read(Path::new(&config_path))
         .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?;
-    let config: WireGuardConfig = serde_json::from_slice(&config_bytes)
+    let config = WireGuardConfig::from_json_or_ini(&config_bytes)
         .map_err(|error| Error::invalid(format!("invalid external WireGuard config: {error}")))?;
     build_proxy(config, Duration::from_secs(15)).await
 }

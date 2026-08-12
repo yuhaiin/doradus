@@ -20,10 +20,10 @@ debug 二进制。所有临时状态仍放在 `~/.cache/yuhaiin-rust`，不使�
 | 指标 | 当前值 |
 | --- | ---: |
 | 纳入统计的验收项 | 48 |
-| 已完成 `[x]` | 36 |
-| 主路径可用但仍有现场/样本缺口 `[~]` | 12 |
+| 已完成 `[x]` | 37 |
+| 主路径可用但仍有现场/样本缺口 `[~]` | 11 |
 | 有实际功能缺口 `[ ]` | 0 |
-| 加权覆盖率 | **87.5%** = `(36 + 12 × 0.5) / 48` |
+| 加权覆盖率 | **88.5%** = `(37 + 11 × 0.5) / 48` |
 | 主目标 | Linux desktop：Rust 可启动、管理前端可接入、普通 inbound/outbound 可串联 |
 | 当前结论 | **主路径已可在 Linux desktop 进行替换前验收**；rootful TUN 多路由 lease、RST/reconnect、graceful/SIGKILL teardown、Debian rootful firewall matrix 和 TPROXY UDP delivery/idle/force-stop 已闭环，生产异常快照、更多平台现场和第三方 WireGuard 仍是 `[~]` |
 
@@ -101,8 +101,8 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 | Go 权威入口 | Rust 位置 | 状态 | 证据 | 下一动作 |
 | --- | --- | :---: | --- | --- |
-| `pkg/net/proxy/wireguard/{wireguard,bind,device}.go` | `crates/yuhaiin-wireguard/src/lib.rs`、`crates/yuhaiin-runtime/tests/wireguard_chain.rs` | `[~]` | Cloudflare `boringtun 0.7.1`、reserved/base64/PSK/keepalive/AllowedIPs、smoltcp TCP/UDP adapter；本地双 peer 已验证 authenticated endpoint roaming 和完整 UDP session；runtime WireGuard 现在让 peer endpoint 和最终目标都使用配置 resolver，驱动初始化也在构建返回前完成 ready/error 握手；`make wireguard-chain-smoke` 在 Podman 通过真实 runtime HTTP/TCP 与 SOCKS5/UDP inbound→CIDR router→WireGuard outbound→BoringTun peer 的 TCP/UDP echo、连接元数据和 latency；最新 packet benchmark 为 596.28 MiB/s、peak RSS 3,480 KiB | 真实第三方/WARP peer、真实链路 keepalive/NAT endpoint 变化 |
-| Go `WireGuard` node config | `crates/yuhaiin-store/src/compat_proxy*.rs`、`crates/yuhaiin-runtime/src/proxy.rs` | `[x]` | `make wireguard-smoke`：Podman `--network=none` 双 userspace peer，9/9（另 1 个 benchmark ignored） | — |
+| `pkg/net/proxy/wireguard/{wireguard,bind,device}.go` | `crates/yuhaiin-wireguard/src/lib.rs`、`crates/yuhaiin-runtime/tests/wireguard_chain.rs` | `[x]` | Cloudflare `boringtun 0.7.1`、reserved/base64/PSK/keepalive/AllowedIPs、smoltcp TCP/UDP adapter；本地双 peer 已验证 authenticated endpoint roaming 和完整 UDP session；runtime WireGuard 让 peer endpoint 和最终目标都使用配置 resolver，驱动初始化也在构建返回前完成 ready/error 握手；外部验证入口同时接受 Go JSON 与标准 WARP/`wg-quick` INI；`make wireguard-chain-smoke` 在 Podman 通过真实 runtime HTTP/TCP 与 SOCKS5/UDP inbound→CIDR router→WireGuard outbound→BoringTun peer 的 TCP/UDP echo、连接元数据和 latency；16 MiB packet benchmark 为 593.24 MiB/s、peak RSS 3,428 KiB | 真实第三方/WARP peer、真实链路 keepalive/NAT endpoint 变化归入下方外部兼容项 |
+| Go `WireGuard` node config | `crates/yuhaiin-store/src/compat_proxy*.rs`、`crates/yuhaiin-runtime/src/proxy.rs` | `[x]` | `make wireguard-smoke`：Podman `--network=none` 双 userspace peer，11/11（另 1 个 benchmark ignored），并覆盖 WARP/`wg-quick` INI 解析和不完整配置拒绝 | — |
 | Go packet path | `scripts/benchmark/wireguard.sh` | `[x]` | release BoringTun packet benchmark，结果只作同机回归基线 | 公网/第三方链路性能不能由本地 benchmark 推断 |
 
 ### 6. SQLite、配置兼容、FakeIP persistence 和统计
@@ -192,7 +192,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 ### WireGuard 外部兼容
 
-- `[~]` 使用真实第三方/WARP peer 验证 reserved、handshake、keepalive 和 NAT endpoint 变化；本地 authenticated roaming 及 TCP/UDP userspace session 已由双 peer 单测覆盖。`make wireguard-external-smoke` 已提供用户配置驱动的 Podman host-network 入口。Go WireGuard contract 没有独立的 `network_interface` 字段；仍需第三方现场确认 endpoint roaming 和真实链路行为。
+- `[~]` 使用真实第三方/WARP peer 验证 reserved、handshake、keepalive 和 NAT endpoint 变化；本地 authenticated roaming 及 TCP/UDP userspace session 已由双 peer 单测覆盖。`make wireguard-external-smoke` 已提供用户配置驱动的 Podman host-network 入口，现在可直接读取 Go JSON 或标准 WARP/`wg-quick` INI；仍需第三方现场确认 endpoint roaming 和真实链路行为。
 - `[x]` 保持本地双 peer smoke 和 release packet benchmark；两者只证明协议/适配器正确性和同机趋势，不宣称公网性能。
 
 ### CI 与发布（不计入上面的 48 项功能覆盖率）
@@ -215,7 +215,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 | 类别 | 命令 | Podman 验证结果 |
 | --- | --- | --- |
-| 全 workspace | `make workspace-tests` | 48 个 harness，0 失败；chain 55、core 153、runtime 283、store 131（5 ignored）、trie 27、service-chain 20、WireGuard 9（1 benchmark ignored）、WireGuard runtime chain 2、stats concurrency 2；外部 WARP 测试显式 ignored |
+| 全 workspace | `make workspace-tests` | 48 个 harness，0 失败；chain 55、core 153、runtime 283、store 131（5 ignored）、trie 27、service-chain 20、WireGuard 11（1 benchmark ignored）、WireGuard runtime chain 2、stats concurrency 2；外部 WARP 测试显式 ignored |
 | Go API / SQLite | `make production-parity-smoke` | 3 份停止态 Go SQLite 的 info/settings/nodes/inbounds/resolvers/routes/publishes/connections/统计读接口、核心 mutation 和错误矩阵逐项 identical |
 | Go live flow | `make go-live-flow-parity-smoke` | Go/Rust 真实 HTTP inbound → router → HTTP outbound 流量、connections、total、traffic、history、telemetry 和 reload 后统计 parity |
 | Go wire interop | `make go-protocol-interop-smoke` | 14 passed，覆盖 Yuubinsya、WebSocket/H2、H2 v1、VLESS TCP/UDP、VMess、Trojan 的 Go↔Rust wire tests |
@@ -226,12 +226,12 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | TUN data plane | `make tun-chain-service-smoke` | 真实 TUN → fixed → TLS → HTTP/2 → Yuubinsya → echo 通过；rootful route lease、MTU、RST/reconnect、UDP、graceful/SIGKILL teardown 已有对应证据 |
 | rootful TUN process | `YUHAIIN_TUN_USER_NAMESPACE=0 make tun-api-process-smoke tun-service-smoke tun-chain-service-smoke` | Podman rootful namespace 通过 API 设备开关、TUN packet echo，以及 TUN → TLS/H2/Yuubinsya chain；共享 harness entrypoint 修复后真实执行 |
 | transparent | `make transparent-service-smoke` + Debian rootful VM matrix | 当前源码二进制通过 IPv4/IPv6 REDIRECT、iptables/native nft TPROXY UDP 2-flow、original destination、reply/rebind、idle reap、SIGKILL force-stop；脚本由 Podman 执行，VM kernel 为 Debian 6.5 |
-| WireGuard protocol | `make wireguard-smoke` | Cloudflare BoringTun userspace 双 peer：9 passed，1 ignored；authenticated handshake、PSK、reserved、keepalive、AllowedIPs、TCP/UDP、resolver 和 interface bind 覆盖 |
+| WireGuard protocol | `make wireguard-smoke` | Cloudflare BoringTun userspace 双 peer：11 passed，1 ignored；authenticated handshake、PSK、reserved、keepalive、AllowedIPs、TCP/UDP、resolver、interface bind 和 WARP/`wg-quick` INI 配置覆盖 |
 | WireGuard chain | `make wireguard-chain-smoke` | 2 passed；HTTP/TCP 与 SOCKS5/UDP inbound → CIDR router → BoringTun WireGuard outbound → peer echo 通过 |
 | startup / service | `make startup-logs-smoke`、`make systemd-service-smoke` | 默认前台日志、runtime ready/shutdown、systemd install/health/自动 rollback/显式 rollback 通过 |
 | release contract | `make release-contract-smoke` | Linux musl、Darwin、Windows 的 amd64/arm64 六目标、产物名、checksum、checks gate、rolling-main contract 通过 |
 | musl release build | `make build-release-musl` | Podman 内成功完成 `x86_64-unknown-linux-musl` release 构建，产出 static PIE `yuhaiin` |
-| benchmark | `make benchmark-throughput`、`make benchmark-tun-throughput`、`make benchmark-wireguard-throughput` | HTTP CONNECT 158.39 MiB/s / 17,904 KiB；TLS/H2/Yuubinsya 33.38 MiB/s / 20,320 KiB；TUN 44.88 MiB/s / 13,224 KiB；BoringTun 596.28 MiB/s / 3,480 KiB。均为同机趋势基线 |
+| benchmark | `make benchmark-throughput`、`make benchmark-tun-throughput`、`make benchmark-wireguard-throughput` | HTTP CONNECT 158.39 MiB/s / 17,904 KiB；TLS/H2/Yuubinsya 33.38 MiB/s / 20,320 KiB；TUN 44.88 MiB/s / 13,224 KiB；BoringTun 593.24 MiB/s / 3,428 KiB（16 MiB run）。均为同机趋势基线 |
 | quality gate | `make check`、`make clippy` | Podman 中 workspace check 与 `clippy --workspace --all-targets --all-features -- -D warnings` 通过 |
 
 ## 常用命令
