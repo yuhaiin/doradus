@@ -28,6 +28,7 @@ mkdir -p "${go_cache_root}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 rust_build_image="${YUHAIIN_BUILD_IMAGE:-docker.io/library/rust:latest}"
 go_build_image="${YUHAIIN_GO_BUILD_IMAGE:-docker.io/library/golang:latest}"
+sqlite_audit_image="${YUHAIIN_SQLITE_AUDIT_IMAGE:-docker.io/library/python:3.13-slim}"
 run_id="${BASHPID}-$(date +%s)"
 go_container="yuhaiin-go-api-parity-${run_id}"
 rust_container="yuhaiin-rust-api-parity-${run_id}"
@@ -120,6 +121,18 @@ if [[ "${prepare_enabled}" == "1" ]]; then
   podman rm -f "${prepare_container}" >"${scenario_dir}/prepare-rm.log"
   cp --reflink=auto "${scenario_dir}/prepared/state.sqlite" "${scenario_dir}/go/state.db"
   cp --reflink=auto "${scenario_dir}/prepared/state.sqlite" "${scenario_dir}/rust/state.sqlite"
+
+  echo "[go-api-parity] auditing SQLite schema retained by the Rust takeover"
+  podman run --rm --network=none \
+    -v "${source_db}:/state/source.sqlite:ro" \
+    -v "${scenario_dir}/prepared/state.sqlite:/state/prepared.sqlite:ro" \
+    -v "${repo_root}/scripts/integration/audit-sqlite-snapshot.py:/state/audit.py:ro" \
+    --entrypoint python3 \
+    "${sqlite_audit_image}" \
+    /state/audit.py \
+      --source /state/source.sqlite \
+      --prepared /state/prepared.sqlite \
+    | tee "${scenario_dir}/sqlite-schema-audit.json"
 else
   cp --reflink=auto "${source_db}" "${scenario_dir}/go/state.db"
   cp --reflink=auto "${source_db}" "${scenario_dir}/rust/state.sqlite"

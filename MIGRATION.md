@@ -4422,3 +4422,27 @@ MaxMind smoke 的普通 feature 构建捕获了一个之前只在 `--all-feature
 all-features 时漏掉单 crate 的最小 feature 组合。
 
 本轮所有构建、测试和运行均使用 Podman；缓存和临时状态位于 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+
+## 165. 2026-08-13 Go SQLite takeover schema audit
+
+`production-parity-smoke` 现在在 Rust 接管停止态 Go 数据库后增加结构级审计，脚本位于
+`scripts/integration/audit-sqlite-snapshot.py`。它以 immutable/read-only 方式打开源库和 Rust
+prepared 副本，逐项检查 `sqlite_master` 对象是否仍存在、每个源表的列顺序/声明类型/NULL 约束/主键
+位置是否保留，以及源索引是否仍可寻址。Rust 对 `dns_resolvers`、`route_rules` 和小时级
+traffic/failure projection 的已知 typed migration 不会被误报为错误；任何其他源表或对象丢失、未知
+列结构变化都会使 smoke 失败。新增对象和行数变化仍输出到每份 scenario 的
+`sqlite-schema-audit.json`，用于区分兼容表补建和正常 projection。
+
+本轮三份停止态 Go snapshot 均通过结构审计，报告显示源对象全部保留；与 API read/mutation/error
+parity 一起执行，仍保持源库只读。审计运行在 Podman 的 Python SQLite 环境，缓存位于
+`~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+
+## 166. 2026-08-13 统计长压与强停复测
+
+在不改变统计实现的前提下，重新执行真实前台 runtime 的统计长压：16 个并发 reader，每个 400 轮，
+800 次 16 KiB live flow 写入，同时查询 connections、total、traffic、telemetry、history 和
+failed-history；随后执行 force-stop，再用同一个 SQLite 重启并读取 totals/history。Podman 结果为
+`2 passed`，耗时 38.31 秒。此前更高压力的 24 readers×1000 rounds、2000 writes 结果仍保留在清单中。
+
+这确认的是运行期 checkpoint、Go statistics projection、并发读取和异常重启恢复；真实升级工具持有
+SQLite 写锁时的跨平台现场仍保留为 `[~]`，没有把普通并发 soak 误报为完整升级验收。
