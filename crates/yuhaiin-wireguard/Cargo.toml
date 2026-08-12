@@ -18,3 +18,4 @@ workspace = true
 
 [dev-dependencies]
 futures-lite = "2.6.1"
+hex = "0.4.3"

@@ -440,6 +440,7 @@ async fn health() -> StatusCode {
 
 #[derive(Debug, Default, Deserialize)]
 struct PprofQuery {
+    #[cfg(unix)]
     seconds: Option<u64>,
 }
 
@@ -458,6 +459,7 @@ async fn pprof_index(State(state): State<ApiState>) -> Response {
         .into_response()
 }
 
+#[cfg(unix)]
 async fn pprof_profile(State(state): State<ApiState>, Query(query): Query<PprofQuery>) -> Response {
     if !state.controller.handle().load().settings.pprof {
         return StatusCode::NOT_FOUND.into_response();
@@ -518,6 +520,22 @@ async fn pprof_profile(State(state): State<ApiState>, Query(query): Query<PprofQ
             )
                 .into_response()
         })
+}
+
+#[cfg(not(unix))]
+async fn pprof_profile(
+    State(state): State<ApiState>,
+    Query(_query): Query<PprofQuery>,
+) -> Response {
+    if !state.controller.handle().load().settings.pprof {
+        StatusCode::NOT_FOUND.into_response()
+    } else {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Rust CPU profiling is unavailable on this platform",
+        )
+            .into_response()
+    }
 }
 
 fn digest(value: &[u8]) -> [u8; 32] {
@@ -4797,6 +4815,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn rust_pprof_index_follows_runtime_setting() {
         let state = state().await;

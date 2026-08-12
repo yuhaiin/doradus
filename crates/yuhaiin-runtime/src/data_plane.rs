@@ -374,12 +374,13 @@ fn parse_tun_routes(routes: &[String]) -> Result<Vec<yuhaiin_core::tun::TunRoute
 
 #[cfg(feature = "tun")]
 pub(crate) fn open_tun(config: &TunRuntimeConfig) -> Result<yuhaiin_core::tun::TunRuntime> {
-    let mut tun = yuhaiin_core::tun::TunRuntime::open(config.tun.clone()).map_err(io_error)?;
+    let tun = yuhaiin_core::tun::TunRuntime::open(config.tun.clone()).map_err(io_error)?;
     if config.routes.is_empty() {
         return Ok(tun);
     }
     #[cfg(all(feature = "tun-routes", target_os = "linux"))]
     {
+        let mut tun = tun;
         let routes = parse_tun_routes(&config.routes)?;
         for route in &routes {
             match route.destination {

@@ -520,15 +520,34 @@ fn update_staging_dir() -> PathBuf {
 }
 
 fn spawn_update_helper(staged: PathBuf) -> Result<(), std::io::Error> {
-    let target = env::current_exe()?;
-    let mut command = std::process::Command::new(&target);
-    command.arg("update-helper").arg(&target).arg(staged);
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        let target = env::current_exe()?;
+        // The service executable stays open for its whole lifetime on
+        // Windows. Copying it first gives the helper an image that can
+        // survive stopping the service and replacing the installed binary.
+        let helper = target.with_extension("update-helper.exe");
+        let _ = std::fs::remove_file(&helper);
+        std::fs::copy(&target, &helper)?;
+        let mut command = std::process::Command::new(&helper);
+        command.arg("update-helper").arg(&target).arg(staged);
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        return command.spawn().map(|_| ());
     }
-    command.spawn().map(|_| ())
+
+    #[cfg(not(windows))]
+    {
+        let target = env::current_exe()?;
+        let mut command = std::process::Command::new(&target);
+        command.arg("update-helper").arg(&target).arg(staged);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        command.spawn().map(|_| ())
+    }
 }
 
 /// Replace an installed executable after the service has handed control to a
@@ -550,41 +569,223 @@ pub fn run_update_helper(target: &Path, staged: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(&replacement);
         return Err(format!("set staged executable permissions: {error}"));
     }
+    stop_platform_service()?;
     let backup = target.with_extension("update-backup");
     let _ = std::fs::remove_file(&backup);
-    std::fs::rename(&target, &backup)
-        .map_err(|error| format!("backup current executable: {error}"))?;
+    std::fs::rename(&target, &backup).map_err(|error| {
+        let _ = restart_platform_service();
+        format!("backup current executable: {error}")
+    })?;
     if let Err(error) = std::fs::rename(&replacement, &target) {
         let _ = std::fs::remove_file(&replacement);
         let _ = std::fs::rename(&backup, &target);
+        let _ = restart_platform_service();
         return Err(format!("install updated executable: {error}"));
     }
     #[cfg(unix)]
     if let Err(error) = set_executable(&target) {
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::rename(&backup, &target);
+        let _ = restart_platform_service();
         return Err(format!("set executable permissions: {error}"));
     }
-    let restart = env::var("YUHAIIN_UPDATE_RESTART_COMMAND").unwrap_or_else(|_| {
-        if cfg!(target_os = "linux") {
-            "systemctl restart yuhaiin.service".to_owned()
-        } else {
-            "launchctl kickstart -kp system/com.asutorufa.yuhaiin".to_owned()
-        }
-    });
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&restart)
-        .status()
-        .map_err(|error| format!("restart updated service: {error}"))?;
-    if !status.success() {
+    if let Err(error) = restart_platform_service() {
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::rename(&backup, &target);
-        return Err(format!("restart updated service exited with {status}"));
+        let recovery = restart_platform_service();
+        return Err(match recovery {
+            Ok(()) => format!("restart updated service: {error}"),
+            Err(recovery) => {
+                format!("restart updated service: {error}; recovery restart failed: {recovery}")
+            }
+        });
     }
     let _ = std::fs::remove_file(staged);
-    let _ = std::fs::remove_file(backup);
+    // Keep the previous image so the native service rollback action can
+    // restore the last successfully installed release. The next update
+    // replaces this single backup atomically.
+    #[cfg(windows)]
+    {
+        let helper = target.with_extension("update-helper.exe");
+        let _ = std::fs::remove_file(helper);
+    }
     Ok(())
+}
+
+fn stop_platform_service() -> Result<(), String> {
+    if let Ok(command) = env::var("YUHAIIN_UPDATE_STOP_COMMAND") {
+        return run_shell_command(&command, "stop updated service");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return windows_service_stop();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // bootout is allowed to fail when the binary is being used in the
+        // foreground; bootstrap below remains the authoritative check.
+        let _ = std::process::Command::new("launchctl")
+            .args([
+                "bootout",
+                "system/",
+                "/Library/LaunchDaemons/com.asutorufa.yuhaiin.plist",
+            ])
+            .status();
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+fn restart_platform_service() -> Result<(), String> {
+    if let Ok(command) = env::var("YUHAIIN_UPDATE_RESTART_COMMAND") {
+        return run_shell_command(&command, "restart updated service");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return windows_service_start();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        run_command(
+            "launchctl",
+            &[
+                "bootstrap",
+                "system",
+                "/Library/LaunchDaemons/com.asutorufa.yuhaiin.plist",
+            ],
+            "bootstrap updated launchd service",
+        )?;
+        return run_command(
+            "launchctl",
+            &["kickstart", "-kp", "system/com.asutorufa.yuhaiin"],
+            "start updated launchd service",
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return run_command(
+            "systemctl",
+            &["restart", "yuhaiin.service"],
+            "restart updated systemd service",
+        );
+    }
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_command(program: &str, args: &[&str], action: &str) -> Result<(), String> {
+    let status = std::process::Command::new(program)
+        .args(args)
+        .status()
+        .map_err(|error| format!("{action}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{action} exited with {status}"))
+    }
+}
+
+fn run_shell_command(command: &str, action: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    let mut process = {
+        let mut process = std::process::Command::new("cmd.exe");
+        process.args(["/D", "/C", command]);
+        process
+    };
+    #[cfg(not(windows))]
+    let mut process = {
+        let mut process = std::process::Command::new("sh");
+        process.args(["-c", command]);
+        process
+    };
+    let status = process
+        .status()
+        .map_err(|error| format!("{action}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{action} exited with {status}"))
+    }
+}
+
+#[cfg(windows)]
+fn windows_service() -> Result<windows_service::service::Service, String> {
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|error| format!("open Windows Service Control Manager: {error}"))?;
+    manager
+        .open_service(
+            "yuhaiin",
+            ServiceAccess::QUERY_STATUS | ServiceAccess::START | ServiceAccess::STOP,
+        )
+        .map_err(|error| format!("open Windows service yuhaiin: {error}"))
+}
+
+#[cfg(windows)]
+fn windows_service_stop() -> Result<(), String> {
+    use windows_service::service::ServiceState;
+    let service = windows_service()?;
+    let status = service
+        .query_status()
+        .map_err(|error| format!("query Windows service: {error}"))?;
+    if status.current_state == ServiceState::Stopped {
+        return Ok(());
+    }
+    if status.current_state != ServiceState::StopPending {
+        service
+            .stop()
+            .map_err(|error| format!("stop Windows service: {error}"))?;
+    }
+    windows_wait_service_state(&service, ServiceState::Stopped)
+}
+
+#[cfg(windows)]
+fn windows_service_start() -> Result<(), String> {
+    use std::ffi::OsStr;
+    use windows_service::service::ServiceState;
+    let service = windows_service()?;
+    let status = service
+        .query_status()
+        .map_err(|error| format!("query Windows service: {error}"))?;
+    if status.current_state == ServiceState::Running {
+        return Ok(());
+    }
+    if status.current_state != ServiceState::StartPending {
+        service
+            .start::<&OsStr>(&[])
+            .map_err(|error| format!("start Windows service: {error}"))?;
+    }
+    windows_wait_service_state(&service, ServiceState::Running)
+}
+
+#[cfg(windows)]
+fn windows_wait_service_state(
+    service: &windows_service::service::Service,
+    expected: windows_service::service::ServiceState,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = service
+            .query_status()
+            .map_err(|error| format!("query Windows service state: {error}"))?;
+        if status.current_state == expected {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for Windows service state {expected:?}; current={:?}",
+                status.current_state
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 #[cfg(unix)]

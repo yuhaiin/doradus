@@ -18,11 +18,14 @@ use support::{
     ConnectFixture, H2FinalProtocol, H2ProtocolFixture, H2YuubinsyaFixture, ServiceProcess,
     Socks5Fixture, YUUBINSYA_PASSWORD, add_mixed_udp_inbound, add_socks5_inbound,
     add_yuubinsya_inbound, api_json, configure_h2_http_chain, configure_h2_http_inbound,
-    configure_h2_socks5_chain, configure_http_chain, configure_http_process_inbound_chain,
-    configure_socks5_chain, configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain,
-    configure_tls_http_inbound, connect_loopback, connect_tls_h2_loopback, connect_tls_loopback,
-    integration_dir, seed_empty_database, wait_for_connection,
+    configure_h2_socks5_chain, configure_http_chain, configure_socks5_chain,
+    configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound,
+    connect_loopback, connect_tls_h2_loopback, connect_tls_loopback, integration_dir,
+    seed_empty_database, wait_for_connection,
 };
+
+#[cfg(target_os = "linux")]
+use support::configure_http_process_inbound_chain;
 
 async fn http_connect_with_auth(
     address: SocketAddr,

@@ -46,7 +46,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | --- | --- | :---: | --- | --- |
 | `pkg/net/netapi/*`、`pkg/net/proxy/proxy/*` | `crates/yuhaiin-core/src/lib.rs`、`proxy.rs`、`flow.rs` | `[x]` | `workspace-tests`、proxy/flow unit tests | — |
 | `pkg/net/nat/table.go`、`source.go`、`migrate.go` | `crates/yuhaiin-core/src/nat.rs`、`nat_tests.rs`、`nat_process` | `[x]` | full-cone、多 source、rebind、idle reap、force-stop | — |
-| `pkg/net/proxy/tun/tun.go`、`tun/device/*` | `crates/yuhaiin-core/src/tun.rs`、`tun_unit_tests.rs`、`tun_runtime_tests.rs` | `[~]` | `tun-rs AsyncDevice + smoltcp`；TCP/UDP/ICMP、fragment、DNS/FakeIP、NAT、真实 packet echo、rootful TCP+UDP fixed traffic、3-route lease、TCP RST/reconnect、graceful/SIGKILL teardown 已有；IPv4 kernel fragmentation 五档、IPv6 合法 MTU 四档和扩展头分片布局单测均通过 | 仍需补更广泛发行版/防火墙现场，以及真实内核 IPv6 extension-header 分片现场 |
+| `pkg/net/proxy/tun/tun.go`、`tun/device/*` | `crates/yuhaiin-core/src/tun.rs`、`tun_unit_tests.rs`、`tun_runtime_tests.rs` | `[~]` | `tun-rs AsyncDevice + smoltcp`；TCP/UDP/ICMP、fragment、DNS/FakeIP、NAT、真实 packet echo、rootful TCP+UDP fixed traffic、3-route lease、TCP RST/reconnect、graceful/SIGKILL teardown 已有；IPv4 kernel fragmentation 五档、IPv6 合法 MTU 四档和扩展头分片布局单测均通过；Debian VM 又通过了 TCP/reload/force-stop、MTU 1280 UDP 和 TLS/H2/Yuubinsya chain | 仍需补更广泛发行版/防火墙现场，以及真实内核 IPv6 extension-header 分片现场 |
 | `pkg/net/proxy/tun/tun2socket/*`、`tun/gvisor/*` | 单一路径 `tun-rs + smoltcp` | `延期` | 按约定不同时维护 tun2socket 和第二套 userspace stack | 只有当前路径出现性能/兼容性问题时再评估 |
 | `pkg/route/loopback.go`、`pkg/net/netlink/*` | `crates/yuhaiin-runtime/src/loopback.rs`、`interfaces.rs`、`crates/yuhaiin-core/src/tun.rs` | `[x]` | rootful TUN connection metadata 已逐字段固定 endpoint、localAddr、process、PID、UID 和 selected node；loopback guard 单测覆盖 | — |
 
@@ -82,7 +82,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `pkg/net/proxy/aead/*` | `crates/yuhaiin-protocol/src/aead.rs` | `[x]` | TCP/UDP wire and Go interop | — |
 | `pkg/net/proxy/websocket/*`、HTTP obfs | `crates/yuhaiin-protocol/src/websocket.rs`、`http_obfs.rs`、`crates/yuhaiin-runtime/src/proxy/websocket.rs` | `[x]` | Go WebSocket→HTTP/2 interop、fragmented headers、early data | — |
 | `pkg/net/proxy/vless/*`、`vmess/*`、`trojan/*` | `crates/yuhaiin-protocol/src/{vless,vmess,trojan}.rs`、runtime counterparts | `[~]` | parser/runtime/unit coverage；`make service-chain-smoke` 在 Podman 中通过 API→HTTP inbound→domain router→普通 VLESS/VMess/Trojan outbound 的 3/3 payload echo、connections、totals 和 node latency；`make go-protocol-interop-smoke` 通过真实 Go listener/client wire round-trip（各 1 个方向） | 更广的 runtime listener/outbound、TLS/WebSocket/UDP 组合矩阵 |
-| `pkg/net/proxy/tproxy/*`、`redir/*` | `crates/yuhaiin-runtime/src/proxy/transparent.rs` | `[~]` | REDIRECT TCP、IPv4/IPv6 ancillary decoder unit tests；rootful iptables 与 native nft TPROXY UDP 均已完成 2 flow、original destination、reply/rebind、monitor 统计、socket readback、加速 idle reap；iptables/nft service SIGKILL 也已通过 | 真实生产 firewall/nftables 组合 matrix |
+| `pkg/net/proxy/tproxy/*`、`redir/*` | `crates/yuhaiin-runtime/src/proxy/transparent.rs` | `[~]` | REDIRECT TCP、IPv4/IPv6 ancillary decoder unit tests；rootful iptables 与 native nft TPROXY UDP 均已完成 2 flow、original destination、reply/rebind、monitor 统计、socket readback、加速 idle reap；iptables/nft service SIGKILL 也已通过；Debian VM 现场再次通过 iptables、native nft 和 IPv6 REDIRECT | 真实生产 firewall/nftables 组合 matrix |
 | `pkg/net/proxy/shadowsocks/*`、`shadowsocksr/*` | Rust protocol modules remain compatibility code | `延期` | 当前迁移范围不以 SS/SSR 为门槛 | 后续若 Go 未废弃再决定是否保留 |
 | `pkg/net/proxy/quic/*`、`reality/*`、`mux/*`、`tailscale/*` | — | `延期` | 用户明确暂不实现 | 不阻塞 Linux desktop replacement |
 
@@ -91,7 +91,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | Go 权威入口 | Rust 位置 | 状态 | 证据 | 下一动作 |
 | --- | --- | :---: | --- | --- |
 | `pkg/net/proxy/wireguard/{wireguard,bind,device}.go` | `crates/yuhaiin-wireguard/src/lib.rs` | `[~]` | Cloudflare `boringtun 0.7.1`、reserved/base64/PSK/keepalive/AllowedIPs、smoltcp TCP/UDP adapter；本地双 peer 已验证 authenticated endpoint roaming 和完整 UDP session，协议级测试固定 keepalive 与 AllowedIPs longest-prefix | 真实第三方/WARP peer、真实链路 keepalive/NAT endpoint 变化；Go node contract 没有独立 source-interface 字段 |
-| Go `WireGuard` node config | `crates/yuhaiin-store/src/compat_proxy*.rs`、`crates/yuhaiin-runtime/src/proxy.rs` | `[x]` | `make wireguard-smoke`：Podman `--network=none` 双 userspace peer，5/5 | — |
+| Go `WireGuard` node config | `crates/yuhaiin-store/src/compat_proxy*.rs`、`crates/yuhaiin-runtime/src/proxy.rs` | `[x]` | `make wireguard-smoke`：Podman `--network=none` 双 userspace peer，7/7（另 1 个 benchmark ignored） | — |
 | Go packet path | `scripts/benchmark/wireguard.sh` | `[x]` | release BoringTun packet benchmark，结果只作同机回归基线 | 公网/第三方链路性能不能由本地 benchmark 推断 |
 
 ### 6. SQLite、配置兼容、FakeIP persistence 和统计
@@ -112,7 +112,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | Go TUN inbound contract | `crates/yuhaiin-runtime/src/inbounds/mod.rs`、`data_plane.rs` | `[~]` | TUN 作为 inbound supervisor；真实 user+network namespace、rootful TCP+UDP fixed traffic、multi-route lease、reload、RST/reconnect、graceful/SIGKILL teardown 已通过；真实 kernel IPv4 五档、IPv6 合法 MTU 四档 fragmentation matrix 已通过；扩展头分片布局在 Podman core harness 中通过；`tun-api-process-smoke` 还验证真实前台二进制通过 API 对默认禁用 TUN 与用户新增 TUN 做 disable/enable 切换，设备在 `/proc/net/dev` 中出现/消失 | 继续补更广泛发行版/firewall 组合和真实 IPv6 extension-header 现场 |
 | `pkg/httpapi/v2*.go`、`register.go` | `crates/yuhaiin-runtime/src/api.rs` | `[x]` | generated frontend RPC route coverage、read/mutation/error parity、API reload/live flow | 更多生产 response 字段样本 |
 | `pkg/net/netapi/{conn,server}.go`、`pkg/statistics/notify.go` | `crates/yuhaiin-runtime/src/monitor.rs`、`log.rs`、`service.rs` | `[~]` | connections、SSE、traffic、history、telemetry、node latency、pprof、启动日志 | 完整 response/历史数据逐字段 parity |
-| Go service lifecycle | `crates/yuhaiin-runtime/src/service.rs`、`src/bin/service/*` | `[x]` | Linux systemd install/rollback/health smoke；foreground 默认 stderr progress | — |
+| Go service lifecycle | `crates/yuhaiin-runtime/src/service.rs`、`src/bin/service/*` | `[~]` | Linux systemd install/rollback/health smoke；macOS launchd plist/bootstrap/kickstart、Windows Service SCM install/start/stop/delete/recovery-actions/health/rollback 已实现；foreground 默认 stderr progress | macOS/Windows 真实权限现场安装、更新和回滚 |
 
 ### 8. Platform boundary
 
@@ -156,7 +156,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` IPv6 ingress/egress fragmentation 已在 Debian VM rootful Podman 通过合法 MTU 1280/1500/9000/9216 四档；每档均回环最大合法 IPv6 UDP payload 65507 字节，覆盖 kernel ingress 分片、Rust ingress 重组、proxy echo、TUN boundary egress 分片和 kernel egress 重组。IPv6 MTU 576 按协议最低 MTU 约束 fail-closed，不作为合法档位。
 - `[x]` 在同一 rootful namespace 执行 TPROXY UDP：默认 iptables 与 native nft backend 均通过 transparent socket readback、original destination `10.254.1.2:18082`、local listener `0.0.0.0:18083`、两个 source flow、回包、rebind 和 upload/download monitor 统计。
 - `[x]` TPROXY UDP 在 rootful VM 用测试专用 1 秒 timeout 验证了 2 个 flow 的 idle reap；iptables 与 native nft 均通过 service SIGKILL 后的进程级观测，生产默认仍保持 90 秒 `UDP_IDLE_TIMEOUT`。
-- `[~]` 真实生产 firewall/nftables 组合 matrix 仍待补；公共 `UDP_IDLE_TIMEOUT`/reap/close 单测和容器 namespace teardown 已覆盖基础生命周期。
+- `[~]` 真实生产 firewall/nftables 组合 matrix 仍待补；公共 `UDP_IDLE_TIMEOUT`/reap/close 单测、容器 namespace teardown 和 Debian VM 的 iptables/native nft/IPv6 REDIRECT 现场已覆盖基础生命周期。
 - `[~]` 将当前 user+network namespace TUN smoke 保持为 CI 默认路径；它证明真实 kernel TUN packet path，但 rootful route takeover 另由 `tun-route-matrix-smoke` 验证。
 - `[x]` IPv6 出方向扩展头分片布局已在 Podman `network=none` 中通过：Hop-by-Hop、Routing、Routing 后 Destination Options、分片重组和重复分片拒绝均有断言；真实内核对该组合的端到端现场仍待补。
 - `[x]` rootful TUN connection metadata 已在 rootful fixture 中逐字段固定 endpoint/localAddr、selected node、process、PID 和 UID；本轮现场为 `/usr/local/bin/tun-service-smoke`、pid `7`、uid `0`。
@@ -169,25 +169,31 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` 使用缓存中的停止态 Go `state.db` 做 Go/Rust API read + core mutation parity；包括 `connections.history` 的 UTC 时间格式、节点/入站/解析器/路由/发布/订阅 deferred 错误 contract。
 - `[x]` 统计公开契约已逐字段对齐：connections 的完整 metadata/matchHistory、total 的 string counters、traffic 的 UTC bucket、telemetry 的固定九维/失败计数、history/failed-history/block-history 的 process、count、time、dumpProcessEnabled 和 API 1000 条边界均有单测或 Podman parity；失败项按 `(protocol, host, process)` 分组，阻断历史不再丢失进程标志，同时保留 Go failed-history 全量 SQLite 语义。
 - `[x]` route list `refreshInterval` 已由 RuntimeService 持有后台 timer：配置 reload 立即重读，刷新产生的 reload 不会忙循环，服务 shutdown 会停止任务；定时刷新夹具验证 `lastRefreshTime` 和 reload 生命周期。
-- `[~]` 补完整 API response 字段、更多生产 route/resolver projection、MaxMind country/ASN projection 样本；remote route refresh 的持久化错误字段已补齐。
+- `[~]` 补完整 API response 字段、更多生产 route/resolver projection 和 MaxMind country projection 样本；Go 当前 MaxMind 接口只暴露 country，不额外把 ASN 当作迁移缺口；remote route refresh 的持久化错误字段已补齐。
 - `[x]` Runtime DNS handler 在 socket/TUN 共用边界上恢复预加载 FakeIP 的 `in-addr.arpa`/`ip6.arpa` PTR 映射；未知 PTR 仍按上游 resolver 的现有能力处理。
 
 ### WireGuard 外部兼容
 
-- `[~]` 使用真实第三方/WARP peer 验证 reserved、handshake、keepalive 和 NAT endpoint 变化；本地 authenticated roaming 及 TCP/UDP userspace session 已由双 peer 单测覆盖。Go 的 WireGuard node contract 没有独立 source-interface 字段，因此不把不存在的配置项扩进 Rust API。
+- `[~]` 使用真实第三方/WARP peer 验证 reserved、handshake、keepalive 和 NAT endpoint 变化；本地 authenticated roaming 及 TCP/UDP userspace session 已由双 peer 单测覆盖。`make wireguard-external-smoke` 已提供用户配置驱动的 Podman host-network 入口。Go 的 WireGuard node contract 没有独立 source-interface 字段，因此不把不存在的配置项扩进 Rust API。
 - `[x]` 保持本地双 peer smoke 和 release packet benchmark；两者只证明协议/适配器正确性和同机趋势，不宣称公网性能。
+
+### CI 与发布（不计入上面的 48 项功能覆盖率）
+
+- `[~]` `.github/workflows/rust.yml` 已加入 Rust/Podman 检查、Linux `x86_64/aarch64-unknown-linux-musl`、Darwin `x86_64/aarch64`、Windows `x86_64/aarch64` 六项 release matrix；本地 YAML、target 名称、产物名和 checksum contract 已检查，仍需第一次 GitHub Actions 远程运行确认 runner/SDK 的现场差异。
+- `[x]` 发布资产名称与运行时 update contract 对齐：`yuhaiin-{linux,darwin,windows}-{amd64,arm64}`，Windows 保留 `.exe`；`v*` tag 发布稳定 release，`main` 生成可覆盖的 rolling prerelease 并更新 `main` tag。
+- `[~]` macOS launchd 与 Windows Service 的安装/更新/回滚代码、跨 target 编译和单测已完成；真实 launchd/SCM 权限现场及远程 Actions 首次运行仍待验收。
 
 ### 主动延期（本轮不阻塞）
 
 - `延期` DoQ、DoH3、QUIC、Reality、Mux、yamux、Tailscale。
 - `延期` Shadowsocks、ShadowsocksR、订阅。
-- `延期` Android 独立应用、AAR/JNI/VpnService lifecycle、macOS utun/独立应用。
+- `延期` Android 独立应用、AAR/JNI/VpnService lifecycle、macOS utun/独立应用；macOS launchd 桌面服务已纳入本轮。
 
 ## 最近一次可复现证据
 
 | 命令 | Podman 场景 | 结果 |
 | --- | --- | --- |
-| `make workspace-tests` | 42 个 harness；isolated/stats/host-network 分组 | 0 失败；预计 ignored 项保持 ignored |
+| `make workspace-tests` | 43 个 harness；isolated/stats/host-network 分组 | 0 失败；预计 ignored 项保持 ignored |
 | `make production-parity-smoke` | 3 份停止态 Go `state.db`，每份 Go/Rust 均在 Podman 中运行 | 3/3：read、core mutation、error matrix identical；日志存 `~/.cache/yuhaiin-rust/production-parity/` |
 | `make service-chain-smoke` | host-network | 15/15：多个 inbound→router→outbound chain，含普通 VLESS/VMess/Trojan outbound |
 | `make go-protocol-interop-smoke` | 挂载 Go checkout、GOROOT、module cache；所有 Go scratch 位于 `~/.cache` | 6/6：Go Yuubinsya TCP/UOT/native UDP/Ping、Go WS→H2、Go H2 v1、VLESS、VMess、Trojan |
@@ -199,19 +205,22 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `make tun-connection-metadata-smoke` | 同上 | `component=tun`、node、outbound、localAddr、process、PID、UID 逐字段通过 |
 | Debian VM rootful `tun-service.sh` | Podman `rootless=false`、`/dev/net/tun`、`YUHAIIN_TUN_USER_NAMESPACE=0` | 普通 256B traffic、3-cycle reload、MTU 576/1280/1500/9000/9216、TLS/H2/Yuubinsya chain、force-stop 全通过 |
 | Debian VM rootful `tun-route-matrix.sh` | Podman `--privileged --network=none`、`tun-routes`、3-route lease | 3 条 route 存在于 owner 存活期间，graceful close 与 SIGKILL 后均 absent |
-| Debian VM rootful `transparent-service.sh` / iptables | TPROXY UDP、isolated client/target netns | socket probe、2 个 UDP source flow、original destination、reply/rebind、monitor stats 通过 |
-| Debian VM rootful `transparent-service.sh` / nft | native nft TPROXY、同一 isolated netns | 与 iptables backend 同样通过；fixture 入口设置 `service-client/accept_local=1` 以满足 Linux 本地源包校验 |
+| Debian VM rootful `transparent-service.sh` / iptables | TPROXY UDP、isolated client/target netns | socket probe、2 个 UDP source flow、original destination、reply/rebind、monitor stats 通过；本轮 VM 复核再次通过 |
+| Debian VM rootful `transparent-service.sh` / nft | native nft TPROXY、同一 isolated netns | 与 iptables backend 同样通过；fixture 入口设置 `service-client/accept_local=1` 以满足 Linux 本地源包校验；本轮 VM 复核再次通过 |
 | Debian VM rootful `transparent-service.sh` idle/force-stop | iptables + native nft；idle 为测试专用 1 秒 timeout | 两个 UDP flow idle 后 monitor 从 2→0；两种 backend 的 service SIGKILL 均观测到 status=137，fixture cleanup 完成 |
 | Debian VM rootful `tun-service.sh` connection metadata | rootful `/dev/net/tun`、direct outbound | `component=tun`、`node=tun-fixed`、`outbound=127.0.0.1:*`、`local=198.18.0.1:*` 通过 |
 | Debian VM rootful `tun-udp-service-smoke` | `YUHAIIN_TUN_UDP_TRAFFIC=1`、fixed outbound、独立 UDP client 子进程 | `runtime-tun-udp-target-received bytes=32`、`runtime-tun-udp-traffic-ok`、`runtime-tun-closed` 通过；UDP-first 顺序也通过 |
-| `make wireguard-smoke` | `--network=none` 双 userspace peer | 5/5 |
+| Debian VM rootful `tun-service.sh` UDP/chain | MTU 1280、8192-byte UDP；`tls-h2-yuubinsya` | UDP-first target 原样收到 8192 bytes；TUN→TLS→HTTP/2→Yuubinsya 32-byte echo 通过 |
+| `make wireguard-smoke` | `--network=none` 双 userspace peer | 7/7（另 1 个 benchmark ignored） |
 | `make benchmark-wireguard-throughput` | release harness、`--network=none` | 64 MiB BoringTun packet baseline 595.5 MiB/s（单次同机趋势，不外推公网），结果存 `~/.cache/yuhaiin-rust` |
 | `make api-reload-flow-smoke` | disposable Podman service | 普通 inbound/node/route reload 和 TUN 配置持久化通过；TUN API 子用例不冒充 rootful device evidence |
 | `make tun-api-process-smoke` | disposable Podman user/network namespace、真实 `/dev/net/tun`、前台 binary | API TUN disable/enable 后真实设备 visibility 通过；覆盖默认禁用 TUN 与新增启用 TUN 并存 |
 | `make maxmind-smoke` | 缓存真实 `Country-without-asn.mmdb`、Podman `--network=none` | 固定 SHA-256；IPv4 与 IPv4-mapped IPv6 查询通过 |
 | `make tun-ipv6-extension-smoke` | Podman `--network=none`、core test harness | Hop-by-Hop/Routing/后置 Destination Options 分片重组通过；已有 Fragment Header fail-closed |
 | `make stats-soak-smoke` | `--network=none` Podman、可复用 SQLite fixture | 12 个并发 readers 各 160 轮、256 个流量写入，force-stop/restart、connections/traffic/telemetry/history 全部通过 |
-| `make workspace-tests`（本轮 route refresh） | Podman；宿主机只编译 harness | 42 个 harness；core 145、runtime 241、store 128、WireGuard 5、service-chain 15 全部通过，含 scheduled route-list refresh reload/shutdown、Unix 秒时间戳和 refresh single-flight test |
+| `make workspace-tests`（当前最新回归） | Podman；宿主机只编译 harness | 43 个 harness；core 145、runtime 243、store 128、WireGuard 7、service-chain 15 全部通过；外部 WireGuard harness 的 2 个公网测试显式 ignored；另有 Debian VM rootful TUN/TPROXY 现场复核 |
+| `make tun-api-process-smoke`（2026-08-12 当前轮） | Podman disposable user/network namespace、前台 runtime、`/dev/net/tun` | 1/1 通过；真实设备按 disabled→enabled→disabled→enabled→disabled 出现/消失，排除“API 已保存但 TUN supervisor 未切换” |
+| `make build MUSL=1`（2026-08-12 当前轮） | 宿主只做 target 编译，产物留在 `~/.cache/yuhaiin-rust` | `x86_64-unknown-linux-musl` debug runtime 构建通过；未把宿主编译当作容器运行时证据 |
 | `make startup-logs-smoke` | foreground Podman | 默认 stderr 输出 database、API bind、runtime ready、shutdown/stopped |
 
 ## 常用命令
@@ -230,6 +239,7 @@ make tun-mtu-smoke
 make wireguard-smoke
 make tun-api-process-smoke
 make maxmind-smoke
+YUHAIIN_WIREGUARD_EXTERNAL_CONFIG=... YUHAIIN_WIREGUARD_EXTERNAL_TCP_TARGET=... make wireguard-external-smoke
 make benchmark-throughput
 make benchmark-tun-throughput
 make benchmark-wireguard-throughput

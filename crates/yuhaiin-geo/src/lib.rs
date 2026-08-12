@@ -4,7 +4,9 @@
 //! MaxMind reader, artifact validation, and replacement lifecycle so neither
 //! SQLite nor route matching needs to know about reader internals.
 
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};

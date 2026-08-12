@@ -3412,3 +3412,131 @@ adapter 的本地 TCP/UDP data plane 和 runtime session 生命周期；真实�
 公网 handshake、keepalive、NAT endpoint 变化仍需要用户自己的外部 peer 配置，不能从
 `network=none` 的确定性测试推断。对照 Go `Config` 可确认它只有 `secretKey`、`endpoint`、
 `peers`、`mtu`、`reserved`，没有 source-interface 配置，因此 Rust 不额外引入不兼容字段。
+
+## 115. 2026-08-12 WireGuard external peer smoke harness
+
+为了不把真实 WARP/第三方 peer 的验证留成一次性手工命令，新增了
+`crates/yuhaiin-wireguard/tests/external.rs` 和 `scripts/integration/wireguard-external.sh`。
+它们不携带任何密钥或公网配置：调用者通过
+`YUHAIIN_WIREGUARD_EXTERNAL_CONFIG` 挂载自己的 Go 形状 JSON，通过
+`YUHAIIN_WIREGUARD_EXTERNAL_TCP_TARGET` 或 `YUHAIIN_WIREGUARD_EXTERNAL_UDP_TARGET` 指定
+目标；脚本在 Podman `--network=host` 中运行，支持 TCP 建连、可选请求写入，以及 UDP 发包/回包。
+没有配置时脚本明确失败，不会把“未测公网”报告成成功。
+
+例如在用户已经有 WARP 配置时可以执行：
+
+```bash
+YUHAIIN_WIREGUARD_EXTERNAL_CONFIG="$HOME/.cache/yuhaiin-rust/warp.json" \\
+YUHAIIN_WIREGUARD_EXTERNAL_TCP_TARGET=1.1.1.1:443 \\
+make wireguard-external-smoke
+```
+
+本轮只验证了 harness 编译和普通 WireGuard Podman 回归；没有伪造第三方账号/私钥，
+因此公网 handshake、keepalive 和 NAT roaming 仍等待用户提供真实 peer 后再记录结果。
+
+## 116. 2026-08-12 Debian VM rootful data-plane recheck
+
+使用用户提供的 Debian VM `192.168.122.2`，把当前构建的 smoke binary 和脚本放入 VM 的
+`~/.cache/yuhaiin-rust` 后重新执行，运行过程没有使用宿主机 TUN 或宿主机网络命名空间：
+
+- rootful TUN：普通 TCP echo、3 次 disable/reload/reopen、force-stop teardown 全部通过；
+- rootful TUN UDP：MTU 1280、8192 字节 payload、UDP-first 顺序通过，target 原样收到；
+- rootful TUN chain：`TUN inbound → TLS → HTTP/2 → Yuubinsya → echo` 通过；
+- transparent service：iptables TPROXY、native nft TPROXY、IPv6 REDIRECT 三种组合均通过，
+  包含 original destination、两个 UDP source flow、reply/rebind、monitor counters 和 close。
+
+日志分别保存在 VM 的
+`~/.cache/yuhaiin-rust/integration/vm-tun-service*` 和
+`~/.cache/yuhaiin-rust/integration/vm-transparent/`。这增强了真实 rootful Linux 的权限、
+路由和 firewall 证据，但仍不把生产发行版数量或 IPv6 extension-header 特殊报文现场宣称为
+全覆盖；后者需要额外的 raw packet fixture。
+
+## 117. 2026-08-12 Current workspace verification and cache boundary
+
+新增外部 WireGuard harness 后，在 Podman 中重新执行 `make wireguard-smoke` 和
+`make workspace-tests`：WireGuard library 为 7 passed、1 ignored benchmark；workspace 为
+43 个 harness，core 145、runtime 243、store 128、service-chain 15，外部 peer harness 的
+2 个测试保持显式 ignored，0 失败。`make fmt-check`、`make clippy`、shell syntax check 和
+`git diff --check` 也通过。
+
+宿主缓存检查时发现 `~/.cache/yuhaiin-rust` 曾达到约 35G，其中约 22G 是可重建的 debug
+测试依赖；已将精确的 host debug deps、musl debug deps 和已延期 macOS target 移入桌面回收站，
+保留最终二进制、SQLite/GeoIP fixture、验收日志和 `~/.cache/yuhaiin-rust` 下的可复用测试状态，
+当前缓存目录约 14G。后续构建会按需重新生成测试依赖，不使用 `/tmp`。
+
+## 118. 2026-08-12 Rust GitHub Actions release matrix
+
+补充 `.github/workflows/rust.yml`，结构与 Go 版 workflow 保持一致但只覆盖当前 desktop
+目标：Linux `x86_64/aarch64-unknown-linux-musl`、Darwin `x86_64/aarch64`、Windows
+`x86_64/aarch64`。Linux job 下载带 SHA-256 固定校验的 musl-cross toolchain，再由 Cargo
+按 target linker 编译；其余平台使用对应 GitHub hosted runner 和 Rust target。每个 job 都只
+上传一个经过命名的 runtime 二进制，名称与 `crates/yuhaiin-runtime/src/update.rs` 的
+`release_os/release_arch` 结果一致：
+
+```text
+yuhaiin-linux-amd64
+yuhaiin-linux-arm64
+yuhaiin-darwin-amd64
+yuhaiin-darwin-arm64
+yuhaiin-windows-amd64.exe
+yuhaiin-windows-arm64.exe
+```
+
+`checks` job 先执行格式检查、Clippy，并通过现有 `make workspace-tests` 在 Podman 中运行
+workspace harness；所有 release build 使用 `--locked --all-features`。`v*` tag 会发布稳定
+release，push 到 `main` 会生成与 Go 版相同语义的 rolling `main` prerelease，并强制移动
+`main` tag。发布 job 合并六个二进制、生成不带目录前缀的 `checksums.txt`（否则运行时的
+asset-name 精确匹配会失败）和变更日志。
+
+本地已完成 YAML 解析、六个 target/asset 名称检查、Cargo metadata 和 `git diff --check`；
+GitHub runner 的 macOS SDK、Windows ARM64 linker 以及 musl-cross 下载需要 workflow 首次
+运行后再记录为现场证据，不能在本机交叉编译成功的假设上提前标 `[x]`。
+
+## 119. 2026-08-12 macOS launchd 与 Windows Service 生命周期
+
+桌面端安装/更新现在不只发布跨平台二进制，而是保留 Go service command 的生命周期边界：
+
+- macOS 使用 `/Library/LaunchDaemons/com.asutorufa.yuhaiin.plist`、`launchctl
+  bootstrap/bootout/kickstart`，安装会写入 Go 兼容的 `-host/-path/-nfs-mode` 参数，
+  `health` 检查 launchd 状态与未认证 `/health`，`rollback` 恢复上一份 update backup；
+- Windows 使用纯 Rust 的 windows-service crate（底层 Windows API，不依赖 C 运行库），
+  服务名为 yuhaiin，LocalSystem 自动启动，配置描述、失败自动重启、停止等待、删除等待、
+  SCM 状态和 /health 均由 Rust binary 管理；
+- Windows update API 先把当前 exe 复制为独立的 yuhaiin.update-helper.exe，helper
+  通过 SCM 停止服务后再替换 exe，启动失败会用 `.update-backup` 恢复；macOS updater
+  对应执行 launchd bootout、替换、bootstrap/kickstart。成功更新保留单份旧 binary，供
+  `rollback` 使用，下一次更新会原子替换这份 backup；
+- Linux updater 仍使用 systemd restart；显式的
+  YUHAIIN_UPDATE_STOP_COMMAND/YUHAIIN_UPDATE_RESTART_COMMAND 只作为运维覆盖入口，
+  Windows 使用 cmd.exe，Unix 使用 sh，不再让 Windows 默认路径调用 Unix shell。
+
+新增的跨平台单测覆盖服务参数、launchd plist、Windows ServiceInfo/启动参数和更新选择逻辑。
+本轮实际验证：
+
+- make workspace-tests 在 Podman 中通过：43 个 harness，core 145、runtime 243、store
+  128、WireGuard 7（1 个 benchmark ignored）、service-chain 15，0 失败；
+- make clippy、make fmt-check、git diff --check、workflow 六 target/asset YAML 检查、
+  ast-grep cfg 审计均通过；
+- cargo check --locked --tests --target x86_64-pc-windows-gnu -p yuhaiin-runtime
+  --all-features 通过，包含 Windows Service test-cfg；Linux host 的 Windows GNU 检查
+  只验证编译门禁，不替代 Windows SCM 现场；
+- macOS launchd 和 Windows SCM 的真实 root/admin 安装、更新、回滚仍必须在对应平台权限
+  环境或 GitHub runner/VM 现场执行，不能用宿主 Linux 的交叉编译结果冒充现场验收。
+
+所有可复现测试状态继续写入 ~/.cache/yuhaiin-rust，不使用 /tmp。
+
+## 120. 2026-08-12 TUN API 实时开关与 musl 当前轮复核
+
+本轮针对“inbound/TUN 实时开关可能只改了 SQLite、没有切换真实设备”的风险重新走了前台
+二进制路径。`make tun-api-process-smoke` 在 Podman disposable user/network namespace 中启动
+真实 runtime，先通过 `/api/v2/inbounds/{id}` 写入 disabled TUN，再依次执行
+enabled、disabled、enabled、disabled；夹具直接读取容器内 `/proc/net/dev`，确认接口按每次
+reload 出现或消失，结果为 `1 passed, 0 failed`。因此当前代码不需要为这个已覆盖的竞态再引入
+额外 supervisor 分支；TUN owner 仍由 `run_desktop_tun_supervisor` 管理旧设备的退出、配置重读
+和新设备创建，正常 listener reload 与 TUN device teardown 保持隔离。
+
+同一轮执行 `make build MUSL=1`，使用 Rust toolchain 的 `rust-lld` 完成
+`x86_64-unknown-linux-musl` debug runtime 构建，产物位于
+`~/.cache/yuhaiin-rust/cargo-target/x86_64-unknown-linux-musl/debug/yuhaiin`。这只证明
+target/linker 构建门禁，不替代 Podman 内的 runtime 运行测试；所有集成测试状态仍留在
+`~/.cache/yuhaiin-rust`，没有使用 `/tmp`。

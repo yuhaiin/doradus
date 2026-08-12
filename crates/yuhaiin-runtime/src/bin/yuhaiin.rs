@@ -52,6 +52,14 @@ async fn main_result() -> Result<()> {
         .map_err(|error| Error::new(ErrorKind::Io, error))?;
         return Ok(());
     }
+    #[cfg(windows)]
+    if args
+        .first()
+        .map(|arg| arg == "--windows-service")
+        .unwrap_or(false)
+    {
+        return service::run_windows_service(args[1..].to_vec());
+    }
     if args
         .first()
         .map(|arg| arg == "version" || arg == "-v" || arg == "--version")
@@ -78,10 +86,16 @@ async fn main_result() -> Result<()> {
         return Ok(());
     }
     let options = parse_run_options(&args)?;
-    tokio::task::LocalSet::new().run_until(run(options)).await
+    tokio::task::LocalSet::new()
+        .run_until(run_with_shutdown(options, None))
+        .await
 }
 
-async fn run(options: RunOptions) -> Result<()> {
+async fn run_with_shutdown(
+    options: RunOptions,
+    #[cfg(windows)] service_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg(not(windows))] _service_shutdown: Option<()>,
+) -> Result<()> {
     let database = options
         .database
         .or_else(|| std::env::var_os("YUHAIIN_DB").map(PathBuf::from))
@@ -121,7 +135,19 @@ async fn run(options: RunOptions) -> Result<()> {
     ));
     let signal_tx = service.shutdown_handle();
     tokio::spawn(async move {
-        wait_for_process_shutdown().await;
+        #[cfg(windows)]
+        if let Some(mut service_shutdown) = service_shutdown {
+            tokio::select! {
+                _ = wait_for_process_shutdown() => {}
+                _ = &mut service_shutdown => {}
+            }
+        } else {
+            wait_for_process_shutdown().await;
+        }
+        #[cfg(not(windows))]
+        {
+            wait_for_process_shutdown().await;
+        }
         console_notice("shutdown requested; stopping runtime tasks");
         let _ = signal_tx.send(true);
     });
@@ -199,7 +225,7 @@ fn required_option_value(
 
 fn print_help() {
     println!(
-        "Usage: yuhaiin-rust [action] [options]\n\nActions:\n  install     install the native Linux systemd/macOS launchd service\n  uninstall   uninstall the native service\n  rollback    restore the latest automatic service backup\n  health      check systemd state and the unauthenticated /health endpoint\n  start       start the native service\n  stop        stop the native service\n  restart     restart the native service\n  run         run the service (default)\n\nNo command is equivalent to run and starts the service.\nConsole logs are enabled by default; set YUHAIIN_QUIET=1 to disable them.\n\nRun options:\n  -host, --host ADDR       HTTP listen address (default 0.0.0.0:50051)\n  -path, --path DIR        Go-compatible data directory (DIR/state.db)\n  -u, --username NAME      HTTP Basic Auth username\n  -p, --password PASSWORD  HTTP Basic Auth password\n  -eweb, --external-web DIR  Accepted for Go service-command compatibility\n  -nfs-mode                Accepted for Go service-command compatibility\n\nInstall options:\n  -host, --host ADDR       HTTP listen address (default 0.0.0.0:50051)\n  -path, --path DIR        service data directory\n  -nfs-mode                preserve Go service compatibility\n\nRollback/health options:\n  -host, --host ADDR       health endpoint address (0.0.0.0 is probed as 127.0.0.1)\n  -path, --path DIR        service data directory containing service-backups\n\nOther:\n  version                  print version\n  update-helper TARGET STAGED  apply a staged update"
+        "Usage: yuhaiin-rust [action] [options]\n\nActions:\n  install     install the native systemd/launchd/Windows Service\n  uninstall   uninstall the native service\n  rollback    restore the latest automatic service backup\n  health      check native service state and /health\n  start       start the native service\n  stop        stop the native service\n  restart     restart the native service\n  run         run the service (default)\n\nNo command is equivalent to run and starts the service.\nConsole logs are enabled by default; set YUHAIIN_QUIET=1 to disable them.\n\nRun options:\n  -host, --host ADDR       HTTP listen address (default 0.0.0.0:50051)\n  -path, --path DIR        Go-compatible data directory (DIR/state.db)\n  -u, --username NAME      HTTP Basic Auth username\n  -p, --password PASSWORD  HTTP Basic Auth password\n  -eweb, --external-web DIR  Accepted for Go service-command compatibility\n  -nfs-mode                Accepted for Go service-command compatibility\n\nInstall options:\n  -host, --host ADDR       HTTP listen address (default 0.0.0.0:50051)\n  -path, --path DIR        service data directory\n  -nfs-mode                preserve Go service compatibility\n\nRollback/health options:\n  -host, --host ADDR       health endpoint address (0.0.0.0 is probed as 127.0.0.1)\n  -path, --path DIR        service data directory containing service-backups\n\nOther:\n  version                  print version\n  update-helper TARGET STAGED  apply a staged update"
     );
 }
 

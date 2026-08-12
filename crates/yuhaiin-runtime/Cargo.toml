@@ -30,7 +30,6 @@ websocket = [
 
 [dependencies]
 base64 = "0.22.1"
-pprof = { version = "0.15.0", default-features = false, features = ["prost-codec"] }
 sha2 = { version = "0.11.0", default-features = false }
 bytes = { version = "1.12.1", optional = true }
 futures-util = { version = "0.3.33", optional = true, default-features = false, features = ["std"] }
@@ -58,6 +57,7 @@ yuhaiin-store = { path = "../yuhaiin-store", features = ["async-dns"] }
 yuhaiin-trie = { path = "../yuhaiin-trie", features = ["async-proxy"] }
 yuhaiin-wireguard = { path = "../yuhaiin-wireguard" }
 yuhaiin-platform = { path = "../yuhaiin-platform" }
+socket2 = { version = "0.6.5", features = ["all"] }
 
 [lints]
 workspace = true
@@ -89,4 +89,9 @@ nix = { version = "0.30.1", default-features = false, features = ["net", "uio", 
 netlink-packet-core = "0.8.2"
 netlink-packet-route = "0.31.0"
 netlink-sys = "0.8.8"
-socket2 = { version = "0.6.5", features = ["all"] }
+
+[target.'cfg(unix)'.dependencies]
+pprof = { version = "0.15.0", default-features = false, features = ["prost-codec"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.0"
