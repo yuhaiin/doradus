@@ -132,6 +132,36 @@ fn spawn_batch_writer(worker: &Path, path: &Path, id: usize, items: usize) -> Ch
         .unwrap()
 }
 
+fn spawn_hold_write_lock(worker: &Path, path: &Path, hold_ms: u64) -> Child {
+    Command::new(worker)
+        .args([
+            "hold-write-lock",
+            path.to_str().unwrap(),
+            &hold_ms.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn spawn_statistics_projector(worker: &Path, path: &Path) -> Child {
+    Command::new(worker)
+        .args(["project-statistics", path.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn wait_until_ready(child: &mut Child) {
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut ready = String::new();
+    reader.read_line(&mut ready).unwrap();
+    assert_eq!(ready.trim(), "READY");
+}
+
 #[test]
 fn independent_processes_can_initialize_and_write_one_store() {
     let _test_guard = process_test_guard();
@@ -158,6 +188,80 @@ fn independent_processes_can_initialize_and_write_one_store() {
     for (key, value) in values {
         assert_eq!(value, key.as_bytes());
     }
+    remove_database_artifacts(&path);
+}
+
+#[test]
+fn cross_process_initialization_waits_for_upgrade_write_lock() {
+    let _test_guard = process_test_guard();
+    let path = database_path();
+    let worker = worker_path();
+    let mut holder = spawn_hold_write_lock(&worker, &path, 500);
+    wait_until_ready(&mut holder);
+
+    let mut writer = spawn_writer(&worker, &path, 0, 1);
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    assert!(
+        writer.try_wait().unwrap().is_none(),
+        "ConfigStore::open must wait for the upgrade write lock"
+    );
+
+    let holder_output = holder.wait_with_output().unwrap();
+    assert!(
+        holder_output.status.success(),
+        "write-lock holder failed: {}",
+        String::from_utf8_lossy(&holder_output.stderr)
+    );
+    let writer_output = writer.wait_with_output().unwrap();
+    assert!(
+        writer_output.status.success(),
+        "writer did not recover after upgrade lock release: {}",
+        String::from_utf8_lossy(&writer_output.stderr)
+    );
+
+    let store = block_on(ConfigStore::open(&path)).unwrap();
+    assert_eq!(
+        block_on(store.list_config("cross-process-")).unwrap().len(),
+        1
+    );
+    remove_database_artifacts(&path);
+}
+
+#[test]
+fn cross_process_statistics_projection_retries_after_sqlite_writer_releases() {
+    let _test_guard = process_test_guard();
+    let path = database_path();
+    let worker = worker_path();
+    let store = block_on(ConfigStore::open(&path)).unwrap();
+    block_on(store.put_config("cross-process-ready", b"yes")).unwrap();
+
+    let mut holder = Command::new(&worker)
+        .args(["uncommitted", path.to_str().unwrap(), "700"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until_ready(&mut holder);
+    let mut projector = spawn_statistics_projector(&worker, &path);
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    assert!(
+        projector.try_wait().unwrap().is_none(),
+        "statistics projection must remain pending while SQLite holds BEGIN IMMEDIATE"
+    );
+
+    let holder_output = holder.wait_with_output().unwrap();
+    assert!(
+        holder_output.status.success(),
+        "SQLite lock holder failed: {}",
+        String::from_utf8_lossy(&holder_output.stderr)
+    );
+    let projector_output = projector.wait_with_output().unwrap();
+    assert!(
+        projector_output.status.success(),
+        "statistics projection did not recover after SQLite lock release: {}",
+        String::from_utf8_lossy(&projector_output.stderr)
+    );
+    assert!(store.load_go_statistics().is_ok());
     remove_database_artifacts(&path);
 }
 

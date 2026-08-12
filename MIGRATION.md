@@ -4444,5 +4444,24 @@ parity 一起执行，仍保持源库只读。审计运行在 Podman 的 Python 
 failed-history；随后执行 force-stop，再用同一个 SQLite 重启并读取 totals/history。Podman 结果为
 `2 passed`，耗时 38.31 秒。此前更高压力的 24 readers×1000 rounds、2000 writes 结果仍保留在清单中。
 
-这确认的是运行期 checkpoint、Go statistics projection、并发读取和异常重启恢复；真实升级工具持有
-SQLite 写锁时的跨平台现场仍保留为 `[~]`，没有把普通并发 soak 误报为完整升级验收。
+这确认的是运行期 checkpoint、Go statistics projection、并发读取和异常重启恢复；更长 production
+projection 时段仍保留为 `[~]`，没有把一次长压误报为完整长期现场验收。
+
+## 167. 2026-08-13 SQLite 升级启动与统计投影锁竞争
+
+根据实际生产调用链，`ConfigStore::open` 的初始化/迁移和 `with_write_retry` 的普通写入、
+`replace_go_statistics` 的 Go 表投影都会使用同一个 `<db>-yuhaiin-write-lock` 文件锁；SQLite
+事务层则由 `BEGIN IMMEDIATE` 和 busy retry 处理另一进程已经持有的写事务。此前的统计 soak
+覆盖了并发压力，但没有直接断言锁持有期间调用者仍在等待、释放后能够继续。
+
+本轮扩展 `store_worker` 和 `crates/yuhaiin-store/tests/cross_process.rs`：
+
+- 一个独立进程真实持有 write-lock，另一个进程从 `ConfigStore::open` 开始初始化并写入；测试在
+  holder 尚未释放时确认 writer 仍未退出，释放后确认数据库初始化和写入完成。
+- 另一个独立进程对同一 SQLite 持有 `BEGIN IMMEDIATE`，第三个进程执行真实
+  `load_go_statistics` + `replace_go_statistics`；测试确认 projection 在锁期间保持 pending，
+  holder 释放后通过现有 `with_write_retry` 完成。
+
+Podman 中运行 `cross_process` harness 的结果为 `6 passed, 0 failed, 1 ignored`；本轮编译、运行和
+测试状态均位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。这闭合了本地跨进程锁语义的回归证据，
+更长生产 projection、真实升级工具/服务重启编排和跨平台文件锁现场仍按清单保留为未完成样本。

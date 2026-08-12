@@ -1,4 +1,5 @@
 use std::env;
+use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::Write;
 use std::path::Path;
@@ -24,6 +25,8 @@ fn usage() -> ! {
         "usage: store_worker write <database> <worker> <items> | \
          store_worker batch <database> <worker> <items> | \
          store_worker read <database> <prefix> <loops> | \
+         store_worker hold-write-lock <database> <hold_ms> | \
+         store_worker project-statistics <database> | \
          store_worker uncommitted <database> <hold_ms> | \
          store_worker fakeip-uncommitted <database> <hold_ms>"
     );
@@ -58,6 +61,27 @@ fn write_transaction(path: &str, worker: &str, items: usize) {
         })
         .collect::<Vec<_>>();
     block_on(store.apply(&mutations)).unwrap();
+}
+
+fn hold_write_lock(path: &str, hold_ms: u64) {
+    let lock_path = format!("{path}-yuhaiin-write-lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    file.lock().unwrap();
+    println!("READY");
+    std::io::stdout().flush().unwrap();
+    std::thread::sleep(Duration::from_millis(hold_ms));
+}
+
+fn project_statistics(path: &str) {
+    let store = block_on(ConfigStore::open(Path::new(path))).unwrap();
+    let snapshot = store.load_go_statistics().unwrap();
+    store.replace_go_statistics(&snapshot).unwrap();
 }
 
 fn hold_uncommitted(path: &str, hold_ms: u64) {
@@ -136,6 +160,19 @@ fn main() {
                 .parse::<usize>()
                 .unwrap_or_else(|_| usage());
             write_transaction(&path, &worker, items);
+        }
+        Some("hold-write-lock") => {
+            let path = database_path(arguments.next());
+            let hold_ms = arguments
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<u64>()
+                .unwrap_or_else(|_| usage());
+            hold_write_lock(&path, hold_ms);
+        }
+        Some("project-statistics") => {
+            let path = database_path(arguments.next());
+            project_statistics(&path);
         }
         Some("uncommitted") => {
             let path = database_path(arguments.next());

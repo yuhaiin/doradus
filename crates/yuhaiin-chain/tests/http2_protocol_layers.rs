@@ -110,11 +110,7 @@ async fn spawn_server(protocol: Protocol) -> (std::net::SocketAddr, tokio::task:
         });
         let relay_to_body = tokio::spawn(async move {
             let mut buffer = [0u8; 4096];
-            loop {
-                let length = match relay_read.read(&mut buffer).await {
-                    Ok(length) => length,
-                    Err(_) => break,
-                };
+            while let Ok(length) = relay_read.read(&mut buffer).await {
                 if length == 0 {
                     break;
                 }
