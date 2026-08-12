@@ -9,10 +9,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::proxy::{
-    AsyncProxy, BlockingStreamProxy, DirectAsyncProxy, DropAsyncProxy, FixedAsyncProxy,
-    HttpProxyConnector, Socks5AsyncProxy, StreamConnector, YuubinsyaUdpProxy,
+    AsyncProxy, BindInterfaceProxy, BlockingStreamProxy, DirectAsyncProxy, DropAsyncProxy,
+    FallbackAsyncProxy, FixedAsyncProxy, HttpProxyConnector, Socks5AsyncProxy, StreamConnector,
+    YuubinsyaUdpProxy,
 };
 use crate::{Error, ErrorKind, Result};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseProxyEndpoint {
+    pub address: SocketAddr,
+    pub bind_interface: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BaseProxyKind {
@@ -21,8 +28,16 @@ pub enum BaseProxyKind {
     Fixed {
         address: SocketAddr,
     },
+    FixedMany {
+        endpoints: Vec<BaseProxyEndpoint>,
+    },
     Http {
         proxy: SocketAddr,
+        username: Option<String>,
+        password: Option<String>,
+    },
+    HttpMany {
+        endpoints: Vec<BaseProxyEndpoint>,
         username: Option<String>,
         password: Option<String>,
     },
@@ -31,8 +46,18 @@ pub enum BaseProxyKind {
         username: Option<String>,
         password: Option<String>,
     },
+    Socks5Many {
+        endpoints: Vec<BaseProxyEndpoint>,
+        username: Option<String>,
+        password: Option<String>,
+    },
     YuubinsyaUdp {
         server: SocketAddr,
+        password_hash: [u8; 32],
+        socks5_prefix: bool,
+    },
+    YuubinsyaUdpMany {
+        endpoints: Vec<BaseProxyEndpoint>,
         password_hash: [u8; 32],
         socks5_prefix: bool,
     },
@@ -61,6 +86,7 @@ impl BaseProxyConfig {
                 address: *address,
                 timeout: self.timeout,
             }),
+            BaseProxyKind::FixedMany { endpoints } => fallback_fixed(endpoints, self.timeout)?,
             BaseProxyKind::Http {
                 proxy,
                 username,
@@ -71,6 +97,11 @@ impl BaseProxyConfig {
                 username: username.clone(),
                 password: password.clone(),
             })),
+            BaseProxyKind::HttpMany {
+                endpoints,
+                username,
+                password,
+            } => fallback_http(endpoints, self.timeout, username.clone(), password.clone())?,
             BaseProxyKind::Socks5 {
                 proxy,
                 username,
@@ -81,6 +112,11 @@ impl BaseProxyConfig {
                 username: username.clone(),
                 password: password.clone(),
             }),
+            BaseProxyKind::Socks5Many {
+                endpoints,
+                username,
+                password,
+            } => fallback_socks5(endpoints, self.timeout, username.clone(), password.clone())?,
             BaseProxyKind::YuubinsyaUdp {
                 server,
                 password_hash,
@@ -90,9 +126,107 @@ impl BaseProxyConfig {
                 password_hash: *password_hash,
                 socks5_prefix: *socks5_prefix,
             }),
+            BaseProxyKind::YuubinsyaUdpMany {
+                endpoints,
+                password_hash,
+                socks5_prefix,
+            } => fallback_yuubinsya(endpoints, *password_hash, *socks5_prefix)?,
         };
         Ok(proxy)
     }
+}
+
+fn bind_endpoint(proxy: Arc<dyn AsyncProxy>, endpoint: &BaseProxyEndpoint) -> Arc<dyn AsyncProxy> {
+    Arc::new(BindInterfaceProxy::new(
+        proxy,
+        endpoint.bind_interface.clone(),
+    ))
+}
+
+fn fallback_fixed(
+    endpoints: &[BaseProxyEndpoint],
+    timeout: Duration,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let proxies = endpoints
+        .iter()
+        .map(|endpoint| {
+            bind_endpoint(
+                Arc::new(FixedAsyncProxy {
+                    address: endpoint.address,
+                    timeout,
+                }),
+                endpoint,
+            )
+        })
+        .collect();
+    Ok(Arc::new(FallbackAsyncProxy::new(proxies)?))
+}
+
+fn fallback_http(
+    endpoints: &[BaseProxyEndpoint],
+    timeout: Duration,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let proxies = endpoints
+        .iter()
+        .map(|endpoint| {
+            bind_endpoint(
+                Arc::new(blocking_connector(HttpProxyConnector {
+                    proxy: endpoint.address,
+                    timeout,
+                    username: username.clone(),
+                    password: password.clone(),
+                })),
+                endpoint,
+            )
+        })
+        .collect();
+    Ok(Arc::new(FallbackAsyncProxy::new(proxies)?))
+}
+
+fn fallback_socks5(
+    endpoints: &[BaseProxyEndpoint],
+    timeout: Duration,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let proxies = endpoints
+        .iter()
+        .map(|endpoint| {
+            bind_endpoint(
+                Arc::new(Socks5AsyncProxy {
+                    proxy: endpoint.address,
+                    timeout,
+                    username: username.clone(),
+                    password: password.clone(),
+                }),
+                endpoint,
+            )
+        })
+        .collect();
+    Ok(Arc::new(FallbackAsyncProxy::new(proxies)?))
+}
+
+fn fallback_yuubinsya(
+    endpoints: &[BaseProxyEndpoint],
+    password_hash: [u8; 32],
+    socks5_prefix: bool,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let proxies = endpoints
+        .iter()
+        .map(|endpoint| {
+            bind_endpoint(
+                Arc::new(YuubinsyaUdpProxy {
+                    server: endpoint.address,
+                    password_hash,
+                    socks5_prefix,
+                }),
+                endpoint,
+            )
+        })
+        .collect();
+    Ok(Arc::new(FallbackAsyncProxy::new(proxies)?))
 }
 
 fn blocking_connector(connector: impl StreamConnector + 'static) -> BlockingStreamProxy {
@@ -105,6 +239,7 @@ fn blocking_connector(connector: impl StreamConnector + 'static) -> BlockingStre
 mod tests {
     use super::*;
     use crate::{Endpoint, FlowContext, Network};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn timeout() -> Duration {
         Duration::from_secs(3)
@@ -168,6 +303,39 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind, ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn fixed_many_falls_back_after_a_failed_upstream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let working = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut payload = [0; 8];
+            stream.read_exact(&mut payload).await.unwrap();
+            payload
+        });
+        let proxy = BaseProxyConfig {
+            kind: BaseProxyKind::FixedMany {
+                endpoints: vec![
+                    BaseProxyEndpoint {
+                        address: "127.0.0.1:1".parse().unwrap(),
+                        bind_interface: None,
+                    },
+                    BaseProxyEndpoint {
+                        address: working,
+                        bind_interface: None,
+                    },
+                ],
+            },
+            timeout: timeout(),
+        }
+        .build()
+        .unwrap();
+        let context = FlowContext::new(Endpoint::ip(Network::Tcp, working));
+        let mut stream = proxy.connect(&context).await.unwrap();
+        stream.write_all(b"fallback").await.unwrap();
+        assert_eq!(&accept.await.unwrap(), b"fallback");
     }
 
     #[test]

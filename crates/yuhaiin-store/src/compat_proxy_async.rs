@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
-use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyKind};
+use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyEndpoint, BaseProxyKind};
 use yuhaiin_core::{DomainName, Error, ErrorKind, Result};
 
 use crate::{GoProxyLayer, GoProxyRuntimeConfig, GoProxyTransport};
@@ -21,10 +21,13 @@ impl GoProxyRuntimeConfig {
         &self,
         resolver: &dyn AsyncIpResolver,
     ) -> Result<Option<SocketAddr>> {
-        let Some(endpoint) = self.fixed_endpoint().transpose()? else {
+        let Some(endpoint) = self.fixed_endpoints()?.into_iter().next() else {
             return Ok(None);
         };
-        Ok(Some(resolve_endpoint(&endpoint, resolver).await?))
+        Ok(resolve_endpoints(&endpoint, resolver)
+            .await?
+            .into_iter()
+            .next())
     }
 
     /// Convert a Go node whose base transport is implemented by core into the
@@ -32,13 +35,18 @@ impl GoProxyRuntimeConfig {
     /// here and must go through `yuhaiin-chain::parse_go_node` instead.
     pub fn to_base_proxy_config(&self, timeout: Duration) -> Result<BaseProxyConfig> {
         self.ensure_base_transport()?;
-        let address = self
-            .fixed_endpoint()
-            .transpose()?
-            .map(|endpoint| resolve_socket_addr(&endpoint.text()))
-            .transpose()?;
+        let endpoints = self
+            .fixed_endpoints()?
+            .into_iter()
+            .map(|endpoint| {
+                Ok(BaseProxyEndpoint {
+                    address: resolve_socket_addr(&endpoint.text())?,
+                    bind_interface: endpoint.bind_interface,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(BaseProxyConfig {
-            kind: self.base_proxy_kind(address)?,
+            kind: self.base_proxy_kind(endpoints)?,
             timeout,
         })
     }
@@ -52,12 +60,17 @@ impl GoProxyRuntimeConfig {
         resolver: Arc<dyn AsyncIpResolver>,
     ) -> Result<BaseProxyConfig> {
         self.ensure_base_transport()?;
-        let address = match self.fixed_endpoint().transpose()? {
-            Some(endpoint) => Some(resolve_endpoint(&endpoint, resolver.as_ref()).await?),
-            None => None,
-        };
+        let mut endpoints = Vec::new();
+        for endpoint in self.fixed_endpoints()? {
+            for address in resolve_endpoints(&endpoint, resolver.as_ref()).await? {
+                endpoints.push(BaseProxyEndpoint {
+                    address,
+                    bind_interface: endpoint.bind_interface.clone(),
+                });
+            }
+        }
         Ok(BaseProxyConfig {
-            kind: self.base_proxy_kind(address)?,
+            kind: self.base_proxy_kind(endpoints)?,
             timeout,
         })
     }
@@ -107,7 +120,7 @@ impl GoProxyRuntimeConfig {
         Ok(())
     }
 
-    fn fixed_endpoint(&self) -> Option<Result<ProxyEndpoint>> {
+    fn fixed_endpoints(&self) -> Result<Vec<ProxyEndpoint>> {
         match &self.transport {
             GoProxyTransport::Fixed
             | GoProxyTransport::HttpProxy
@@ -118,56 +131,89 @@ impl GoProxyRuntimeConfig {
             | GoProxyTransport::Vless
             | GoProxyTransport::Vmess
             | GoProxyTransport::Yuubinsya
-            | GoProxyTransport::Aead => Some(fixed_endpoint(&self.layers)),
-            _ => None,
+            | GoProxyTransport::Aead => fixed_endpoints(&self.layers),
+            _ => Ok(Vec::new()),
         }
     }
 
-    fn base_proxy_kind(&self, address: Option<SocketAddr>) -> Result<BaseProxyKind> {
+    fn base_proxy_kind(&self, endpoints: Vec<BaseProxyEndpoint>) -> Result<BaseProxyKind> {
+        let single_address = || {
+            (endpoints.len() == 1 && endpoints[0].bind_interface.is_none())
+                .then(|| endpoints[0].address)
+        };
         Ok(match &self.transport {
             GoProxyTransport::Direct => BaseProxyKind::Direct,
             GoProxyTransport::Drop => BaseProxyKind::Drop,
-            GoProxyTransport::Fixed => BaseProxyKind::Fixed {
-                address: address.ok_or_else(|| Error::invalid("fixed proxy has no endpoint"))?,
+            GoProxyTransport::Fixed => match single_address() {
+                Some(address) => BaseProxyKind::Fixed { address },
+                None => BaseProxyKind::FixedMany { endpoints },
             },
             GoProxyTransport::HttpProxy => {
                 let config = layer_config(&self.layers, "http")
                     .or_else(|_| layer_config(&self.layers, "http_proxy"))?;
-                BaseProxyKind::Http {
-                    proxy: address.ok_or_else(|| Error::invalid("HTTP proxy has no endpoint"))?,
-                    username: optional_string(config, "user"),
-                    password: optional_string(config, "password"),
+                let username = optional_string(config, "user");
+                let password = optional_string(config, "password");
+                match single_address() {
+                    Some(proxy) => BaseProxyKind::Http {
+                        proxy,
+                        username,
+                        password,
+                    },
+                    None => BaseProxyKind::HttpMany {
+                        endpoints,
+                        username,
+                        password,
+                    },
                 }
             }
             GoProxyTransport::Socks5 => {
                 let config = layer_config(&self.layers, "socks5")?;
-                BaseProxyKind::Socks5 {
-                    proxy: address.ok_or_else(|| Error::invalid("SOCKS5 proxy has no endpoint"))?,
-                    username: optional_string(config, "user"),
-                    password: optional_string(config, "password"),
+                let username = optional_string(config, "user");
+                let password = optional_string(config, "password");
+                match single_address() {
+                    Some(proxy) => BaseProxyKind::Socks5 {
+                        proxy,
+                        username,
+                        password,
+                    },
+                    None => BaseProxyKind::Socks5Many {
+                        endpoints,
+                        username,
+                        password,
+                    },
                 }
             }
             GoProxyTransport::Shadowsocks
             | GoProxyTransport::Shadowsocksr
             | GoProxyTransport::Trojan
             | GoProxyTransport::Vless
-            | GoProxyTransport::Vmess => BaseProxyKind::Fixed {
-                address: address.ok_or_else(|| Error::invalid("proxy protocol has no endpoint"))?,
+            | GoProxyTransport::Vmess => match single_address() {
+                Some(address) => BaseProxyKind::Fixed { address },
+                None => BaseProxyKind::FixedMany { endpoints },
             },
-            GoProxyTransport::Aead => BaseProxyKind::Fixed {
-                address: address.ok_or_else(|| Error::invalid("AEAD proxy has no endpoint"))?,
+            GoProxyTransport::Aead => match single_address() {
+                Some(address) => BaseProxyKind::Fixed { address },
+                None => BaseProxyKind::FixedMany { endpoints },
             },
             GoProxyTransport::Yuubinsya => {
                 let config = layer_config(&self.layers, "yuubinsya")?;
                 let password = required_string(config, "password")?;
-                BaseProxyKind::YuubinsyaUdp {
-                    server: address
-                        .ok_or_else(|| Error::invalid("Yuubinsya proxy has no endpoint"))?,
-                    password_hash: yuhaiin_core::yuubinsya::derive_salt(password.as_bytes()),
-                    socks5_prefix: config
-                        .get("socks5_prefix")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false),
+                let password_hash = yuhaiin_core::yuubinsya::derive_salt(password.as_bytes());
+                let socks5_prefix = config
+                    .get("socks5_prefix")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                match single_address() {
+                    Some(server) => BaseProxyKind::YuubinsyaUdp {
+                        server,
+                        password_hash,
+                        socks5_prefix,
+                    },
+                    None => BaseProxyKind::YuubinsyaUdpMany {
+                        endpoints,
+                        password_hash,
+                        socks5_prefix,
+                    },
                 }
             }
             GoProxyTransport::Wireguard => {
@@ -235,6 +281,7 @@ fn required_string(config: &serde_json::Value, key: &str) -> Result<String> {
 struct ProxyEndpoint {
     host: String,
     port: u16,
+    bind_interface: Option<String>,
 }
 
 impl ProxyEndpoint {
@@ -247,22 +294,58 @@ impl ProxyEndpoint {
     }
 }
 
-fn fixed_endpoint(layers: &[GoProxyLayer]) -> Result<ProxyEndpoint> {
+fn fixed_endpoints(layers: &[GoProxyLayer]) -> Result<Vec<ProxyEndpoint>> {
     let config = layers
         .iter()
         .find(|layer| matches!(layer.kind.as_str(), "fixed" | "simple" | "fixedv2"))
         .map(|layer| &layer.config)
         .ok_or_else(|| Error::invalid("Go proxy chain has no fixed endpoint layer"))?;
+    let default_interface = crate::compat_proxy::network_interface_field(config);
     if let Some(addresses) = config
         .get("addresses")
         .and_then(serde_json::Value::as_array)
     {
+        if addresses.is_empty() {
+            return Err(Error::invalid("Go fixed endpoint addresses is empty"));
+        }
         return addresses
-            .first()
-            .ok_or_else(|| Error::invalid("Go fixed endpoint addresses is empty"))
-            .and_then(proxy_endpoint_value);
+            .iter()
+            .map(|value| {
+                let mut endpoint = proxy_endpoint_value(value)?;
+                if endpoint.bind_interface.is_none() {
+                    endpoint.bind_interface = crate::compat_proxy::network_interface_field(value)
+                        .or_else(|| default_interface.clone());
+                }
+                Ok(endpoint)
+            })
+            .collect();
     }
-    proxy_endpoint_value(config)
+    let mut endpoints = Vec::new();
+    if config.get("host").is_some() {
+        endpoints.push(proxy_endpoint_value(config)?);
+    }
+    if let Some(alternates) = config
+        .get("alternate_host")
+        .and_then(serde_json::Value::as_array)
+    {
+        endpoints.extend(
+            alternates
+                .iter()
+                .map(proxy_endpoint_value)
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    if endpoints.is_empty() {
+        return Err(Error::invalid(
+            "Go fixed node requires addresses or host/port",
+        ));
+    }
+    for endpoint in &mut endpoints {
+        if endpoint.bind_interface.is_none() {
+            endpoint.bind_interface = default_interface.clone();
+        }
+    }
+    Ok(endpoints)
 }
 
 fn proxy_endpoint_value(value: &serde_json::Value) -> Result<ProxyEndpoint> {
@@ -271,10 +354,15 @@ fn proxy_endpoint_value(value: &serde_json::Value) -> Result<ProxyEndpoint> {
             return Ok(ProxyEndpoint {
                 host: address.ip().to_string(),
                 port: address.port(),
+                bind_interface: None,
             });
         }
         let (host, port) = split_endpoint_text(value)?;
-        return Ok(ProxyEndpoint { host, port });
+        return Ok(ProxyEndpoint {
+            host,
+            port,
+            bind_interface: None,
+        });
     }
     let host = value
         .get("host")
@@ -291,6 +379,7 @@ fn proxy_endpoint_value(value: &serde_json::Value) -> Result<ProxyEndpoint> {
         host: host.to_owned(),
         port: u16::try_from(port)
             .map_err(|_| Error::invalid("Go proxy endpoint port is out of range"))?,
+        bind_interface: crate::compat_proxy::network_interface_field(value),
     })
 }
 
@@ -339,22 +428,28 @@ fn resolve_socket_addr(value: &str) -> Result<SocketAddr> {
         })
 }
 
-async fn resolve_endpoint(
+async fn resolve_endpoints(
     endpoint: &ProxyEndpoint,
     resolver: &dyn AsyncIpResolver,
-) -> Result<SocketAddr> {
+) -> Result<Vec<SocketAddr>> {
     if let Ok(address) = endpoint.text().parse() {
-        return Ok(address);
+        return Ok(vec![address]);
     }
     let domain = DomainName::new(&endpoint.host)?;
     let addresses = resolver
         .resolve(&domain, yuhaiin_core::ResolveStrategy::Default)
         .await?;
-    addresses
+    let addresses = addresses
         .iter()
-        .next()
         .map(|address| SocketAddr::new(address, endpoint.port))
-        .ok_or_else(|| Error::invalid(format!("proxy endpoint {} resolved to no address", domain)))
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(Error::invalid(format!(
+            "proxy endpoint {} resolved to no address",
+            domain
+        )));
+    }
+    Ok(addresses)
 }
 
 #[cfg(test)]
@@ -430,6 +525,46 @@ mod tests {
             .unwrap(),
         };
         assert_eq!(config.network_interface().as_deref(), Some("wan0"));
+    }
+
+    #[test]
+    fn preserves_fixedv2_alternate_endpoints_and_interface_policy() {
+        let config = GoProxyRuntimeConfig {
+            id: "fixed".to_owned(),
+            name: "fixed".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "local".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned()],
+            layers: vec![GoProxyLayer {
+                kind: "fixedv2".to_owned(),
+                config: serde_json::json!({
+                    "network_interface": "lo",
+                    "addresses": [
+                        { "host": "127.0.0.1", "port": 18080 },
+                        { "host": "127.0.0.1", "port": 18081 }
+                    ]
+                }),
+            }],
+            transport: GoProxyTransport::Fixed,
+            data_json: Vec::new(),
+        };
+        let built = config.to_base_proxy_config(Duration::from_secs(3)).unwrap();
+        assert_eq!(
+            built.kind,
+            BaseProxyKind::FixedMany {
+                endpoints: vec![
+                    BaseProxyEndpoint {
+                        address: "127.0.0.1:18080".parse().unwrap(),
+                        bind_interface: Some("lo".to_owned()),
+                    },
+                    BaseProxyEndpoint {
+                        address: "127.0.0.1:18081".parse().unwrap(),
+                        bind_interface: Some("lo".to_owned()),
+                    },
+                ],
+            }
+        );
     }
 
     #[test]

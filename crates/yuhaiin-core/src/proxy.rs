@@ -974,6 +974,134 @@ pub struct FixedAsyncProxy {
     pub timeout: Duration,
 }
 
+/// Apply one node's per-endpoint interface policy before entering the actual
+/// proxy implementation.  Go's fixedv2 model allows alternate addresses to
+/// carry their own interface, while the common `FlowContext` keeps the
+/// policy at the flow boundary; this adapter bridges those two shapes.
+#[cfg(feature = "async-proxy")]
+pub struct BindInterfaceProxy {
+    pub inner: Arc<dyn AsyncProxy>,
+    pub interface: Option<String>,
+}
+
+impl BindInterfaceProxy {
+    pub fn new(inner: Arc<dyn AsyncProxy>, interface: Option<String>) -> Self {
+        Self { inner, interface }
+    }
+
+    fn context(&self, context: &FlowContext) -> FlowContext {
+        let mut context = context.clone();
+        context.bind_interface = self.interface.clone();
+        context
+    }
+}
+
+#[cfg(feature = "async-proxy")]
+impl AsyncProxy for BindInterfaceProxy {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        let context = self.context(context);
+        Box::pin(async move { self.inner.connect(&context).await })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+        let context = self.context(context);
+        Box::pin(async move { self.inner.open_datagram(&context).await })
+    }
+
+    fn ping<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<Duration>> {
+        let context = self.context(context);
+        Box::pin(async move { self.inner.ping(&context).await })
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        self.inner.close()
+    }
+}
+
+/// Try the endpoints of one Go fixedv2 node in order.  The first successful
+/// endpoint is enough for a flow; failures during a protocol handshake (not
+/// just the TCP connect) are deliberately included in the fallback boundary.
+#[cfg(feature = "async-proxy")]
+pub struct FallbackAsyncProxy {
+    pub proxies: Vec<Arc<dyn AsyncProxy>>,
+}
+
+#[cfg(feature = "async-proxy")]
+impl FallbackAsyncProxy {
+    pub fn new(proxies: Vec<Arc<dyn AsyncProxy>>) -> Result<Self> {
+        if proxies.is_empty() {
+            return Err(Error::invalid("proxy endpoint fallback has no endpoints"));
+        }
+        Ok(Self { proxies })
+    }
+}
+
+#[cfg(feature = "async-proxy")]
+impl AsyncProxy for FallbackAsyncProxy {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        let proxies = self.proxies.clone();
+        let context = context.clone();
+        Box::pin(async move {
+            let mut last_error = None;
+            for proxy in proxies {
+                match proxy.connect(&context).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| Error::invalid("proxy endpoint fallback failed")))
+        })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+        let proxies = self.proxies.clone();
+        let context = context.clone();
+        Box::pin(async move {
+            let mut last_error = None;
+            for proxy in proxies {
+                match proxy.open_datagram(&context).await {
+                    Ok(datagram) => return Ok(datagram),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| Error::invalid("proxy endpoint fallback failed")))
+        })
+    }
+
+    fn ping<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<Duration>> {
+        let proxies = self.proxies.clone();
+        let context = context.clone();
+        Box::pin(async move {
+            let mut last_error = None;
+            for proxy in proxies {
+                match proxy.ping(&context).await {
+                    Ok(duration) => return Ok(duration),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| Error::invalid("proxy endpoint fallback failed")))
+        })
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let mut last_error = None;
+            for proxy in &self.proxies {
+                if let Err(error) = proxy.close().await {
+                    last_error = Some(error);
+                }
+            }
+            last_error.map_or(Ok(()), Err)
+        })
+    }
+}
+
 #[cfg(feature = "async-proxy")]
 impl AsyncProxy for FixedAsyncProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {

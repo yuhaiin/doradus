@@ -190,7 +190,7 @@ fn redact_config(value: &Value) -> Value {
     }
 }
 
-fn network_interface_from_value(value: &Value) -> Option<String> {
+pub(crate) fn network_interface_field(value: &Value) -> Option<String> {
     for key in ["network_interface", "networkInterface"] {
         if let Some(interface) = value
             .get(key)
@@ -200,6 +200,13 @@ fn network_interface_from_value(value: &Value) -> Option<String> {
         {
             return Some(interface.to_owned());
         }
+    }
+    None
+}
+
+fn network_interface_from_value(value: &Value) -> Option<String> {
+    if let Some(interface) = network_interface_field(value) {
+        return Some(interface);
     }
 
     value
