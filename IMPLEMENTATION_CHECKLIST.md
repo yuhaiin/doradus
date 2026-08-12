@@ -189,6 +189,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 ### CI 与发布（不计入上面的 48 项功能覆盖率）
 
 - `[~]` `.github/workflows/rust.yml` 已加入 Rust/Podman 检查、Linux `x86_64/aarch64-unknown-linux-musl`、Darwin `x86_64/aarch64`、Windows `x86_64/aarch64` 六项 release matrix；本地 YAML、target 名称、产物名和 checksum contract 已检查，仍需第一次 GitHub Actions 远程运行确认 runner/SDK 的现场差异。
+- `[x]` 旧 Actions 的 `trojan.rs` `clippy::byte-char-slices` 已通过 `*b"\r\n"` 修复，`rusqlite 0.39.0` / `libsqlite3-sys 0.37.0` 锁定；Rust 1.97.1 Podman 中 fmt、全 workspace Clippy 和 workspace tests 均通过。HTTP/2 pool 的 key 还纳入 endpoint `network_interface`，避免相同地址的不同网卡策略复用连接。
 - `[x]` 发布资产名称与运行时 update contract 对齐：`yuhaiin-{linux,darwin,windows}-{amd64,arm64}`，Windows 保留 `.exe`；`v*` tag 发布稳定 release，`main` 生成可覆盖的 rolling prerelease 并更新 `main` tag。
 - `[~]` macOS launchd 与 Windows Service 的安装/更新/回滚代码、跨 target 编译和单测已完成；update helper 的替换事务已通过注入 platform hooks 覆盖成功与 restart failure rollback；真实 launchd/SCM 权限现场及远程 Actions 首次运行仍待验收。
 
@@ -203,6 +204,8 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 | 命令 | Podman 场景 | 结果 |
 | --- | --- | --- |
+| `cargo fmt --all -- --check` + `cargo clippy --locked --workspace --all-targets --all-features --offline -- -D warnings`（2026-08-12 当前轮） | Rust 1.97.1 Podman，cargo registry/target 挂载自用户缓存 | format 与 Clippy 通过；没有重新出现 `byte-char-slices` 或 `libsqlite3-sys 0.38.1` 问题 |
+| `cargo test --locked --workspace --all-features --offline --no-fail-fast -- --test-threads=1`（2026-08-12 当前轮） | Rust 1.97.1 Podman，`network=host`，临时目录在用户缓存 | chain 54、core 148、runtime 257、store 131（5 ignored）、service-chain 16、WireGuard 8（1 benchmark ignored），0 失败 |
 | `make workspace-tests`（2026-08-12 当前轮） | 48 个 harness；isolated/stats/host-network 分组 | chain 52、core 148、runtime 257、store 131（5 个 ignored）、service-chain 16、WireGuard 8（1 个 benchmark ignored）、WireGuard runtime chain 2；0 失败 |
 | `make workspace-tests`（2026-08-12 update helper） | Podman；宿主机只编译 harness | `run_update_helper` 成功替换、保留 `.update-backup`、重启失败恢复旧 binary 和保留 staged retry 两项单测通过 |
 | `YUHAIIN_SOURCE_DB=... make go-api-parity-smoke`（2026-08-12 当前轮） | 既有停止态 Go 快照复制到 Podman；Go/Rust 独立数据库副本 | info/settings/nodes/inbounds/resolvers/routes/publishes/connections、全部 mutation 和错误矩阵 identical |

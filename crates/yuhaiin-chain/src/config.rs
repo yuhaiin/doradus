@@ -51,6 +51,8 @@ pub struct FixedV2Config {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FixedAddress {
     pub host: String,
+    #[serde(default, alias = "networkInterface")]
+    pub network_interface: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -134,6 +136,7 @@ pub struct ValidatedChain {
 pub struct ValidatedFixedAddress {
     pub host: String,
     pub port: u16,
+    pub network_interface: Option<String>,
 }
 
 impl ValidatedFixedAddress {
@@ -312,7 +315,15 @@ impl ChainConfig {
                     )
                 })?;
             }
-            fixed_addresses.push(ValidatedFixedAddress { host, port });
+            let network_interface = address
+                .network_interface
+                .map(|interface| interface.trim().to_owned())
+                .filter(|interface| !interface.is_empty());
+            fixed_addresses.push(ValidatedFixedAddress {
+                host,
+                port,
+                network_interface,
+            });
         }
 
         let tls = match tls {
@@ -573,6 +584,7 @@ mod tests {
             ValidatedFixedAddress {
                 host: "127.0.0.1".to_owned(),
                 port: 12103,
+                network_interface: None,
             }
         );
         assert_eq!(chain.http2.concurrency, 8);

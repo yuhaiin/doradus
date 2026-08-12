@@ -56,19 +56,23 @@ fn normalize_chain_node(node: &Value) -> Result<Value> {
 }
 
 fn fixed_addresses(source: &Value) -> Result<Vec<Value>> {
+    let default_interface = network_interface(source);
     if let Some(addresses) = source.get("addresses").and_then(Value::as_array) {
-        return addresses.iter().map(endpoint_value).collect();
+        return addresses
+            .iter()
+            .map(|value| endpoint_value_with_default(value, default_interface))
+            .collect();
     }
 
     let mut values = Vec::new();
     if source.get("host").is_some() {
-        values.push(endpoint_value(source)?);
+        values.push(endpoint_value_with_default(source, default_interface)?);
     }
     if let Some(alternates) = source.get("alternate_host").and_then(Value::as_array) {
         values.extend(
             alternates
                 .iter()
-                .map(endpoint_value)
+                .map(|value| endpoint_value_with_default(value, default_interface))
                 .collect::<Result<Vec<_>>>()?,
         );
     }
@@ -106,7 +110,33 @@ fn endpoint_value(value: &Value) -> Result<Value> {
             format!("{host}:{port}")
         }
     };
-    Ok(json!({ "host": endpoint }))
+    let mut normalized = json!({ "host": endpoint });
+    if let Some(interface) = network_interface(value) {
+        normalized["network_interface"] = Value::String(interface.to_owned());
+    }
+    Ok(normalized)
+}
+
+fn endpoint_value_with_default(value: &Value, default_interface: Option<&str>) -> Result<Value> {
+    let mut endpoint = endpoint_value(value)?;
+    if endpoint
+        .get("network_interface")
+        .and_then(Value::as_str)
+        .is_none()
+        && let Some(interface) = default_interface
+    {
+        endpoint["network_interface"] = Value::String(interface.to_owned());
+    }
+    Ok(endpoint)
+}
+
+fn network_interface(value: &Value) -> Option<&str> {
+    value
+        .get("network_interface")
+        .or_else(|| value.get("networkInterface"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|interface| !interface.is_empty())
 }
 
 #[cfg(test)]
@@ -151,6 +181,7 @@ mod tests {
             vec![crate::config::ValidatedFixedAddress {
                 host: "127.0.0.1".to_owned(),
                 port: 12103,
+                network_interface: None,
             }]
         );
         assert_eq!(parsed.http2.max_streams, 8);
@@ -173,6 +204,35 @@ mod tests {
         assert_eq!(parsed.fixed_addresses[0].port, 443);
         assert_eq!(parsed.fixed_addresses[1].host, "127.0.0.1");
         assert_eq!(parsed.fixed_addresses[1].port, 8443);
+    }
+
+    #[test]
+    fn preserves_per_endpoint_and_legacy_default_network_interfaces() {
+        let parsed = parse_go_node(&chain(json!({
+            "type": "fixed",
+            "fixed": {
+                "host": "127.0.0.1",
+                "port": 443,
+                "network_interface": "eth0",
+                "alternate_host": [
+                    { "host": "127.0.0.2", "port": 8443 },
+                    { "host": "127.0.0.3", "port": 9443, "network_interface": "lo" }
+                ]
+            }
+        })))
+        .unwrap();
+        assert_eq!(
+            parsed.fixed_addresses[0].network_interface.as_deref(),
+            Some("eth0")
+        );
+        assert_eq!(
+            parsed.fixed_addresses[1].network_interface.as_deref(),
+            Some("eth0")
+        );
+        assert_eq!(
+            parsed.fixed_addresses[2].network_interface.as_deref(),
+            Some("lo")
+        );
     }
 
     #[test]

@@ -773,6 +773,7 @@ fn insecure_chain_client(address: SocketAddr) -> ChainClient {
         fixed_addresses: vec![yuhaiin_chain::ValidatedFixedAddress {
             host: address.ip().to_string(),
             port: address.port(),
+            network_interface: None,
         }],
         tls: ValidatedTls {
             insecure_skip_verify: true,
@@ -808,6 +809,7 @@ fn chain_client_with_max_streams(
         fixed_addresses: vec![yuhaiin_chain::ValidatedFixedAddress {
             host: address.ip().to_string(),
             port: address.port(),
+            network_interface: None,
         }],
         tls: ValidatedTls {
             insecure_skip_verify: false,
@@ -942,6 +944,7 @@ async fn tls_websocket_http2_chain_uses_http11_upgrade_before_h2() {
         fixed_addresses: vec![yuhaiin_chain::ValidatedFixedAddress {
             host: address.ip().to_string(),
             port: address.port(),
+            network_interface: None,
         }],
         tls: ValidatedTls {
             insecure_skip_verify: false,

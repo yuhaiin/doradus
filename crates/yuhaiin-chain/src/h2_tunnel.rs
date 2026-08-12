@@ -306,14 +306,22 @@ impl Drop for H2Connection {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct H2PoolKey {
     address: SocketAddr,
+    bind_interface: Option<String>,
     tls_identity: String,
 }
 
-/// A small endpoint and TLS-identity keyed HTTP/2 pool. Each fixed address
-/// and configured TLS identity gets at most the configured number of live h2
-/// connections, while each connection carries many CONNECT streams. This
-/// prevents a future caller that shares a pool across TLS identities from
-/// accidentally coalescing them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct H2PoolEndpoint {
+    pub(crate) address: SocketAddr,
+    pub(crate) bind_interface: Option<String>,
+}
+
+/// A small endpoint, interface-policy, and TLS-identity keyed HTTP/2 pool.
+/// Each fixed address/interface policy and configured TLS identity gets at
+/// most the configured number of live h2 connections, while each connection
+/// carries many CONNECT streams. This prevents a future caller that shares a
+/// pool across TLS identities or network interfaces from accidentally
+/// coalescing them.
 pub struct H2Pool {
     connections: Mutex<HashMap<H2PoolKey, Vec<Arc<H2Connection>>>>,
     connect_lock: Mutex<()>,
@@ -382,6 +390,7 @@ impl H2Pool {
             .0)
     }
 
+    #[cfg(test)]
     pub async fn open_with_identity_and_local_addr<F, Fut>(
         &self,
         addresses: &[SocketAddr],
@@ -393,15 +402,41 @@ impl H2Pool {
         F: Fn(SocketAddr) -> Fut,
         Fut: Future<Output = Result<Arc<H2Connection>>>,
     {
-        if addresses.is_empty() {
+        let endpoints = addresses
+            .iter()
+            .copied()
+            .map(|address| H2PoolEndpoint {
+                address,
+                bind_interface: None,
+            })
+            .collect::<Vec<_>>();
+        self.open_with_endpoints_and_local_addr(&endpoints, tls_identity, concurrency, |endpoint| {
+            connect(endpoint.address)
+        })
+        .await
+    }
+
+    pub(crate) async fn open_with_endpoints_and_local_addr<F, Fut>(
+        &self,
+        endpoints: &[H2PoolEndpoint],
+        tls_identity: &str,
+        concurrency: usize,
+        connect: F,
+    ) -> Result<(DuplexStream, Option<SocketAddr>)>
+    where
+        F: Fn(H2PoolEndpoint) -> Fut,
+        Fut: Future<Output = Result<Arc<H2Connection>>>,
+    {
+        if endpoints.is_empty() {
             return Err(Error::invalid("HTTP/2 pool has no fixed endpoint"));
         }
         self.reap_idle().await;
         let start = self.next.fetch_add(1, Ordering::Relaxed);
-        for offset in 0..addresses.len() {
-            let address = addresses[(start + offset) % addresses.len()];
+        for offset in 0..endpoints.len() {
+            let endpoint = endpoints[(start + offset) % endpoints.len()].clone();
             let key = H2PoolKey {
-                address,
+                address: endpoint.address,
+                bind_interface: endpoint.bind_interface.clone(),
                 tls_identity: tls_identity.to_owned(),
             };
             let connections = self
@@ -437,9 +472,10 @@ impl H2Pool {
         }
 
         let _guard = self.connect_lock.lock().await;
-        for address in addresses {
+        for endpoint in endpoints {
             let key = H2PoolKey {
-                address: *address,
+                address: endpoint.address,
+                bind_interface: endpoint.bind_interface.clone(),
                 tls_identity: tls_identity.to_owned(),
             };
             let connections = self
@@ -477,7 +513,7 @@ impl H2Pool {
             self.metrics
                 .connection_attempts
                 .fetch_add(1, Ordering::Relaxed);
-            let connection = match connect(*address).await {
+            let connection = match connect(endpoint.clone()).await {
                 Ok(connection) => connection,
                 Err(error) => {
                     self.metrics
@@ -926,6 +962,22 @@ mod tests {
             (stream_id >> 8) as u8,
             stream_id as u8,
         ]
+    }
+
+    #[test]
+    fn h2_pool_key_keeps_interface_binding_isolated() {
+        let address = "127.0.0.1:443".parse().unwrap();
+        let without_interface = H2PoolKey {
+            address,
+            bind_interface: None,
+            tls_identity: "identity".to_owned(),
+        };
+        let with_interface = H2PoolKey {
+            address,
+            bind_interface: Some("eth0".to_owned()),
+            tls_identity: "identity".to_owned(),
+        };
+        assert_ne!(without_interface, with_interface);
     }
 
     #[tokio::test(flavor = "current_thread")]

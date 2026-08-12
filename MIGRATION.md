@@ -3966,3 +3966,23 @@ TUN、DNS、router、协议、service-chain 和 BoringTun WireGuard。UDP endpoi
 Happy-Eyeballs 时序实现，也不把 loopback/interface 单测外推为真实多网卡生产路由；后者继续由
 Linux 权限和第三方网络现场 checklist 跟踪。所有测试和缓存仍使用 `~/.cache/yuhaiin-rust`，
 没有使用 `/tmp`。
+
+## 142. 2026-08-12 CI Clippy 报错与 HTTP/2 endpoint 接口策略收口
+
+GitHub Actions 之前在旧提交上报告 `trojan.rs:20` 的
+`clippy::byte-char-slices`。当前树已经使用等价的 `pub const CRLF: [u8; 2] = *b"\r\n";`，
+因此继续保留 `-D warnings`，不通过 `allow` 隐藏问题。`rusqlite 0.39.0` / `libsqlite3-sys
+0.37.0` 的锁定版本也保持不变，避免再次落回 stable 尚不兼容的 `libsqlite3-sys 0.38.1`。
+
+本轮还把上一节的 `fixedv2` endpoint 元数据贯穿到 HTTP/2 chain：每个解析后的地址携带自己的
+`network_interface`，HTTP/2 pool 的 key 同时包含地址、接口策略和 TLS identity。这样相同
+`SocketAddr` 但不同网卡的 endpoint 不会错误复用连接；endpoint 级接口优先于外层 flow 的默认
+接口，未配置 endpoint 接口时仍使用外层默认值。域名解析展开出的每个 IP 也保留同一条 endpoint
+接口策略。
+
+新增 H2 pool key 隔离单测，并在 Rust 1.97.1 Podman 中通过 `cargo fmt --all -- --check`、
+`cargo clippy --locked --workspace --all-targets --all-features --offline -- -D warnings`、
+`cargo test --locked -p yuhaiin-chain --all-features --offline --no-fail-fast -- --test-threads=1`
+和完整 workspace 测试。完整 workspace 本轮为 chain 54、core 148、runtime 257、store 131
+（5 ignored）、service-chain 16、WireGuard 8（1 benchmark ignored），0 失败；所有临时目录
+和 cargo target 仍位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。

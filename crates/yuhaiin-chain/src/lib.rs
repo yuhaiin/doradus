@@ -55,7 +55,7 @@ use yuhaiin_core::{
 };
 
 use crate::direct_uot::{DirectUotProxy, parse_go_direct_uot};
-use crate::h2_tunnel::{H2Connection, H2Pool};
+use crate::h2_tunnel::{H2Connection, H2Pool, H2PoolEndpoint};
 use crate::session::{MAX_UOT_COALESCE_BYTES, MAX_UOT_COALESCE_FRAMES, read_uot_frame};
 
 /// A single best-effort runtime observation for the reusable chain client.
@@ -490,14 +490,31 @@ impl ChainClient {
     ) -> Result<BoxAsyncStream> {
         self.ensure_open()?;
         let tls_identity = self.transport_identity();
-        let addresses = self.resolve_fixed_addresses().await?;
+        let endpoints = self
+            .resolve_fixed_addresses()
+            .await?
+            .iter()
+            .map(|(address, bind_interface)| H2PoolEndpoint {
+                address: *address,
+                bind_interface: bind_interface.clone(),
+            })
+            .collect::<Vec<_>>();
         let stream = self
             .pool
-            .open_with_identity_and_local_addr(
-                &addresses,
+            .open_with_endpoints_and_local_addr(
+                &endpoints,
                 &tls_identity,
                 self.chain.http2.concurrency,
-                |address| self.open_h2_connection(address, local_bind_addresses, bind_interface),
+                |endpoint| {
+                    let endpoint_interface = endpoint
+                        .bind_interface
+                        .or_else(|| bind_interface.map(str::to_owned));
+                    self.open_h2_connection(
+                        endpoint.address,
+                        local_bind_addresses,
+                        endpoint_interface,
+                    )
+                },
             )
             .await?;
         let (stream, local_addr) = stream;
@@ -522,11 +539,11 @@ impl ChainClient {
         format!("{}\0websocket:{websocket}", self.chain.tls.pool_identity())
     }
 
-    async fn resolve_fixed_addresses(&self) -> Result<Vec<SocketAddr>> {
+    async fn resolve_fixed_addresses(&self) -> Result<Vec<(SocketAddr, Option<String>)>> {
         let mut addresses = Vec::new();
         for endpoint in &self.chain.fixed_addresses {
             if let Some(address) = endpoint.socket_addr() {
-                addresses.push(address);
+                addresses.push((address, endpoint.network_interface.clone()));
                 continue;
             }
             let domain = endpoint
@@ -536,11 +553,12 @@ impl ChainClient {
                 .resolver
                 .resolve(&domain, ResolveStrategy::Default)
                 .await?;
-            addresses.extend(
-                resolved
-                    .iter()
-                    .map(|address| SocketAddr::new(address, endpoint.port)),
-            );
+            addresses.extend(resolved.iter().map(|address| {
+                (
+                    SocketAddr::new(address, endpoint.port),
+                    endpoint.network_interface.clone(),
+                )
+            }));
         }
         if addresses.is_empty() {
             return Err(Error::invalid("fixedv2 has no resolved upstream address"));
@@ -559,7 +577,7 @@ impl ChainClient {
         &self,
         address: SocketAddr,
         local_bind_addresses: &[std::net::IpAddr],
-        bind_interface: Option<&str>,
+        bind_interface: Option<String>,
     ) -> Result<Arc<H2Connection>> {
         let local_bind = local_bind_addresses
             .iter()
@@ -569,7 +587,7 @@ impl ChainClient {
         let stream = connect_tokio_tcp_with_interface(
             address,
             local_bind,
-            bind_interface,
+            bind_interface.as_deref(),
             Duration::from_secs(15),
         )
         .await?;

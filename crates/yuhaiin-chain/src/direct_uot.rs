@@ -30,6 +30,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 struct DirectUotEndpoint {
     host: String,
     port: u16,
+    network_interface: Option<String>,
 }
 
 #[derive(Clone)]
@@ -126,16 +127,20 @@ pub(crate) fn parse_go_direct_uot(
 }
 
 fn fixed_endpoints(config: &Value) -> Result<Vec<DirectUotEndpoint>> {
+    let default_interface = network_interface(config);
     if let Some(addresses) = config.get("addresses").and_then(Value::as_array) {
-        return addresses.iter().map(endpoint_value).collect();
+        return addresses
+            .iter()
+            .map(|value| endpoint_value_with_default(value, default_interface))
+            .collect();
     }
     if config.get("host").is_some() {
-        let mut endpoints = vec![endpoint_value(config)?];
+        let mut endpoints = vec![endpoint_value_with_default(config, default_interface)?];
         if let Some(alternates) = config.get("alternate_host").and_then(Value::as_array) {
             endpoints.extend(
                 alternates
                     .iter()
-                    .map(endpoint_value)
+                    .map(|value| endpoint_value_with_default(value, default_interface))
                     .collect::<Result<Vec<_>>>()?,
             );
         }
@@ -149,7 +154,7 @@ fn fixed_endpoints(config: &Value) -> Result<Vec<DirectUotEndpoint>> {
 fn endpoint_value(value: &Value) -> Result<DirectUotEndpoint> {
     if let Some(text) = value.as_str() {
         let (host, port) = split_host_port(text)?;
-        return validate_endpoint(host, port);
+        return validate_endpoint(host, port, None);
     }
     let host = value
         .get("host")
@@ -160,7 +165,31 @@ fn endpoint_value(value: &Value) -> Result<DirectUotEndpoint> {
         .and_then(Value::as_u64)
         .ok_or_else(|| Error::invalid("Go fixed endpoint requires port"))?;
     let port = u16::try_from(port).map_err(|_| Error::invalid("Go fixed port is out of range"))?;
-    validate_endpoint(host.to_owned(), port)
+    validate_endpoint(
+        host.to_owned(),
+        port,
+        network_interface(value).map(str::to_owned),
+    )
+}
+
+fn endpoint_value_with_default(
+    value: &Value,
+    default_interface: Option<&str>,
+) -> Result<DirectUotEndpoint> {
+    let mut endpoint = endpoint_value(value)?;
+    if endpoint.network_interface.is_none() {
+        endpoint.network_interface = default_interface.map(str::to_owned);
+    }
+    Ok(endpoint)
+}
+
+fn network_interface(value: &Value) -> Option<&str> {
+    value
+        .get("network_interface")
+        .or_else(|| value.get("networkInterface"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|interface| !interface.is_empty())
 }
 
 fn split_host_port(value: &str) -> Result<(String, u16)> {
@@ -182,14 +211,22 @@ fn split_host_port(value: &str) -> Result<(String, u16)> {
     Ok((host.to_owned(), port))
 }
 
-fn validate_endpoint(host: String, port: u16) -> Result<DirectUotEndpoint> {
+fn validate_endpoint(
+    host: String,
+    port: u16,
+    network_interface: Option<String>,
+) -> Result<DirectUotEndpoint> {
     if host.is_empty() || port == 0 {
         return Err(Error::invalid("fixed endpoint host/port is invalid"));
     }
     if host.parse::<std::net::IpAddr>().is_err() {
         DomainName::new(&host)?;
     }
-    Ok(DirectUotEndpoint { host, port })
+    Ok(DirectUotEndpoint {
+        host,
+        port,
+        network_interface,
+    })
 }
 
 impl AsyncProxy for DirectUotProxy {
@@ -282,16 +319,17 @@ impl DirectUotProxy {
     ) -> Result<(Arc<DirectUotSession>, u64)> {
         let addresses = resolve_endpoints(&self.endpoints, self.resolver.as_ref()).await?;
         let mut last_error = None;
-        for address in addresses {
+        for (address, endpoint_interface) in addresses {
             let local_bind = local_bind_addresses
                 .iter()
                 .copied()
                 .find(|ip| ip.is_ipv4() == address.ip().is_ipv4())
                 .map(|ip| SocketAddr::new(ip, 0));
+            let endpoint_interface = endpoint_interface.as_deref().or(bind_interface);
             let stream = match connect_tokio_tcp_with_interface(
                 address,
                 local_bind,
-                bind_interface,
+                endpoint_interface,
                 CONNECT_TIMEOUT,
             )
             .await
@@ -330,18 +368,26 @@ impl DirectUotProxy {
 async fn resolve_endpoints(
     endpoints: &[DirectUotEndpoint],
     resolver: &dyn AsyncIpResolver,
-) -> Result<Vec<SocketAddr>> {
+) -> Result<Vec<(SocketAddr, Option<String>)>> {
     let mut addresses = Vec::new();
     for endpoint in endpoints {
         if let Ok(ip) = endpoint.host.parse() {
-            addresses.push(SocketAddr::new(ip, endpoint.port));
+            addresses.push((
+                SocketAddr::new(ip, endpoint.port),
+                endpoint.network_interface.clone(),
+            ));
             continue;
         }
         let domain = DomainName::new(&endpoint.host)?;
         let resolved = resolver
             .resolve(&domain, yuhaiin_core::ResolveStrategy::Default)
             .await?;
-        addresses.extend(resolved.iter().map(|ip| SocketAddr::new(ip, endpoint.port)));
+        addresses.extend(resolved.iter().map(|ip| {
+            (
+                SocketAddr::new(ip, endpoint.port),
+                endpoint.network_interface.clone(),
+            )
+        }));
     }
     Ok(addresses)
 }
@@ -674,5 +720,22 @@ mod tests {
         )
         .unwrap();
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn direct_uot_preserves_endpoint_network_interfaces() {
+        let endpoints = fixed_endpoints(&serde_json::json!({
+            "host": "127.0.0.1",
+            "port": 443,
+            "network_interface": "eth0",
+            "alternate_host": [
+                { "host": "127.0.0.2", "port": 8443 },
+                { "host": "127.0.0.3", "port": 9443, "network_interface": "lo" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(endpoints[0].network_interface.as_deref(), Some("eth0"));
+        assert_eq!(endpoints[1].network_interface.as_deref(), Some("eth0"));
+        assert_eq!(endpoints[2].network_interface.as_deref(), Some("lo"));
     }
 }
