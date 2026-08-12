@@ -17,7 +17,7 @@ use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, 
 
 pub const MAX_PACKET_SIZE: usize = 8 * 1024;
 pub const PASSWORD_HASH_LENGTH: usize = 56;
-pub const CRLF: [u8; 2] = [b'\r', b'\n'];
+pub const CRLF: [u8; 2] = *b"\r\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
