@@ -39,7 +39,9 @@ CARGO_TERM_COLOR=never cargo test \
   --manifest-path "${repo_root}/Cargo.toml" \
   --target-dir "${target_dir}" \
   -p yuhaiin-protocol \
+  --all-features \
   --test go_vless_interop \
+  --test go_transport_interop \
   --test go_vmess_interop \
   --test go_trojan_interop \
   --no-run \
@@ -82,7 +84,7 @@ for test_name in "${tests[@]}"; do
   grep -q 'test result: ok' "${log_path}"
 done
 
-protocol_tests=(go_vless_interop go_vmess_interop go_trojan_interop)
+protocol_tests=(go_vless_interop go_transport_interop go_vmess_interop go_trojan_interop)
 for test_name in "${protocol_tests[@]}"; do
   harness_path="$(sed -n "s#^  Executable tests/${test_name}\.rs (\(.*\))\$#\1#p" "${scenario_dir}/protocol-build.log" | tail -n 1)"
   harness="${harness_path##*/}"

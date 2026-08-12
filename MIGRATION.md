@@ -67,7 +67,7 @@
 
 > 2026-08-12 replacement parity recheck：当前提交在 Podman 重新通过停止态 Go 快照的
 > API read/mutation/error matrix（单快照和 3 份 production parity）、Go/Rust live-flow
-> statistics、Go protocol interop 6/6，以及 4 次连续 `api-reload-flow-smoke`。本轮没有发现
+> statistics、Go protocol interop 7/7（新增 RustCrypto TLS → VLESS → Go server），以及 4 次连续 `api-reload-flow-smoke`。本轮没有发现
 > 新的 API、统计、协议或 inbound reload 回归；剩余 `[~]` 主要是第三方 WARP、真实跨平台权限、
 > 远程 Actions 和更广生产现场矩阵。
 
