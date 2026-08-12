@@ -3983,6 +3983,6 @@ GitHub Actions 之前在旧提交上报告 `trojan.rs:20` 的
 新增 H2 pool key 隔离单测，并在 Rust 1.97.1 Podman 中通过 `cargo fmt --all -- --check`、
 `cargo clippy --locked --workspace --all-targets --all-features --offline -- -D warnings`、
 `cargo test --locked -p yuhaiin-chain --all-features --offline --no-fail-fast -- --test-threads=1`
-和完整 workspace 测试。完整 workspace 本轮为 chain 54、core 148、runtime 257、store 131
+和完整 workspace 测试。完整 workspace 本轮为 chain 55、core 148、runtime 257、store 131
 （5 ignored）、service-chain 16、WireGuard 8（1 benchmark ignored），0 失败；所有临时目录
 和 cargo target 仍位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。

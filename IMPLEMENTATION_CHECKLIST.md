@@ -205,8 +205,8 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | 命令 | Podman 场景 | 结果 |
 | --- | --- | --- |
 | `cargo fmt --all -- --check` + `cargo clippy --locked --workspace --all-targets --all-features --offline -- -D warnings`（2026-08-12 当前轮） | Rust 1.97.1 Podman，cargo registry/target 挂载自用户缓存 | format 与 Clippy 通过；没有重新出现 `byte-char-slices` 或 `libsqlite3-sys 0.38.1` 问题 |
-| `cargo test --locked --workspace --all-features --offline --no-fail-fast -- --test-threads=1`（2026-08-12 当前轮） | Rust 1.97.1 Podman，`network=host`，临时目录在用户缓存 | chain 54、core 148、runtime 257、store 131（5 ignored）、service-chain 16、WireGuard 8（1 benchmark ignored），0 失败 |
-| `make workspace-tests`（2026-08-12 当前轮） | 48 个 harness；isolated/stats/host-network 分组 | chain 52、core 148、runtime 257、store 131（5 个 ignored）、service-chain 16、WireGuard 8（1 个 benchmark ignored）、WireGuard runtime chain 2；0 失败 |
+| `cargo test --locked --workspace --all-features --offline --no-fail-fast -- --test-threads=1`（2026-08-12 当前轮） | Rust 1.97.1 Podman，`network=host`，临时目录在用户缓存 | chain 55、core 148、runtime 257、store 131（5 ignored）、service-chain 16、WireGuard 8（1 benchmark ignored），0 失败 |
+| `make workspace-tests`（2026-08-12 当前轮） | 48 个 harness；isolated/stats/host-network 分组 | chain 54、core 148、runtime 257、store 131（5 个 ignored）、service-chain 16、WireGuard 8（1 个 benchmark ignored）、WireGuard runtime chain 2；0 失败 |
 | `make workspace-tests`（2026-08-12 update helper） | Podman；宿主机只编译 harness | `run_update_helper` 成功替换、保留 `.update-backup`、重启失败恢复旧 binary 和保留 staged retry 两项单测通过 |
 | `YUHAIIN_SOURCE_DB=... make go-api-parity-smoke`（2026-08-12 当前轮） | 既有停止态 Go 快照复制到 Podman；Go/Rust 独立数据库副本 | info/settings/nodes/inbounds/resolvers/routes/publishes/connections、全部 mutation 和错误矩阵 identical |
 | `make production-parity-smoke`（2026-08-12 当前轮） | 3 份停止态 Go v5/v6/AWS-shaped snapshot；每份在 Podman 独立运行 Go/Rust | 3/3 API read、core mutation、error matrix identical |
