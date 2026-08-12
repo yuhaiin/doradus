@@ -50,6 +50,7 @@ pub enum GoProxyTransport {
     Yuubinsya,
     Wireguard,
     Aead,
+    NetworkSplit,
     Tls,
     Http2,
     Unknown { name: String },
@@ -74,6 +75,29 @@ pub struct GoProxyRuntimeConfig {
 }
 
 impl GoProxyRuntimeConfig {
+    /// Build an internal one-layer view for a protocol branch that wraps an
+    /// already-constructed parent proxy.  It is not exposed through the HTTP
+    /// API; the original node JSON remains the persisted source of truth.
+    pub fn single_layer(layer: &GoProxyLayer, transport: GoProxyTransport) -> Self {
+        let mut node = serde_json::Map::new();
+        node.insert("type".to_owned(), Value::String(layer.kind.clone()));
+        node.insert(layer.kind.clone(), layer.config.clone());
+        Self {
+            id: format!("network-split-{}", layer.kind),
+            name: layer.kind.clone(),
+            group_name: String::new(),
+            origin: "runtime".to_owned(),
+            enabled: true,
+            chain_types: vec![layer.kind.clone()],
+            layers: vec![layer.clone()],
+            transport,
+            data_json: serde_json::to_vec(&serde_json::json!({
+                "chain": [Value::Object(node)]
+            }))
+            .unwrap_or_default(),
+        }
+    }
+
     /// Return the node-level interface requested by Go's Direct/Fixed
     /// contracts.  It is intentionally derived from the preserved layer JSON
     /// instead of being added to the HTTP-facing runtime struct: unknown Go
@@ -94,6 +118,66 @@ impl GoProxyRuntimeConfig {
                     .and_then(|value| network_interface_from_value(&value))
             })
     }
+
+    /// Return the chain prefix before a Go `network_split` point.
+    ///
+    /// Go folds protocol points from left to right and passes the already
+    /// built proxy into the split point.  Keeping this operation in the
+    /// compatibility layer prevents runtime builders from reimplementing
+    /// chain JSON slicing and transport selection independently.
+    pub fn chain_prefix(&self, prefix_len: usize) -> Result<Self> {
+        if prefix_len > self.layers.len() {
+            return Err(Error::invalid("proxy chain prefix exceeds layer count"));
+        }
+        let layers = self.layers[..prefix_len].to_vec();
+        let chain_types: Vec<String> = layers.iter().map(|layer| layer.kind.clone()).collect();
+        let data_json = chain_prefix_json(&self.data_json, &layers)?;
+        let transport = select_proxy_transport(&chain_types, &layers);
+        Ok(Self {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            group_name: self.group_name.clone(),
+            origin: self.origin.clone(),
+            enabled: self.enabled,
+            chain_types,
+            layers,
+            transport,
+            data_json,
+        })
+    }
+}
+
+fn chain_prefix_json(data_json: &[u8], layers: &[GoProxyLayer]) -> Result<Vec<u8>> {
+    let mut value = if data_json.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_slice::<Value>(data_json).map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("proxy chain JSON is invalid while slicing prefix: {error}"),
+            )
+        })?
+    };
+    let chain = layers
+        .iter()
+        .map(|layer| {
+            let mut node = serde_json::Map::new();
+            node.insert("type".to_owned(), Value::String(layer.kind.clone()));
+            node.insert(layer.kind.clone(), layer.config.clone());
+            Value::Object(node)
+        })
+        .collect();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("chain".to_owned(), Value::Array(chain));
+    } else {
+        value = serde_json::json!({ "chain": chain });
+    }
+    serde_json::to_vec(&value).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("encode proxy chain prefix failed: {error}"),
+        )
+    })
 }
 
 impl GoNodeRecord {
@@ -234,6 +318,7 @@ fn parse_proxy_transport(value: &str) -> GoProxyTransport {
         "yuubinsya" => GoProxyTransport::Yuubinsya,
         "wireguard" | "wire_guard" | "wg" => GoProxyTransport::Wireguard,
         "aead" => GoProxyTransport::Aead,
+        "network_split" | "networksplit" => GoProxyTransport::NetworkSplit,
         "tls" => GoProxyTransport::Tls,
         "http2" => GoProxyTransport::Http2,
         other => GoProxyTransport::Unknown {
@@ -263,6 +348,7 @@ fn select_proxy_transport(chain_types: &[String], layers: &[GoProxyLayer]) -> Go
     // fixed dialer, and Yuubinsya wraps the full fixed/TLS/HTTP2 chain.
     for preferred in [
         "http_mock",
+        "network_split",
         "yuubinsya",
         "wireguard",
         "aead",

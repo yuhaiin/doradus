@@ -12,19 +12,198 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use yuhaiin_chain::ChainProxy;
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::proxy::{
-    AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream, DropAsyncProxy,
-    stream_local_addr, with_stream_local_addr,
+    AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream, DelayedDropAsyncProxy,
+    DirectAsyncProxy, DropAsyncProxy, YuubinsyaUdpDatagram, stream_local_addr,
+    with_stream_local_addr,
 };
 use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyKind};
 use yuhaiin_core::{
     BoxFuture, Endpoint, Error, ErrorKind, FlowContext, GeoLookup, IpSet, ResolveStrategy, Result,
 };
-use yuhaiin_store::GoProxyRuntimeConfig;
+use yuhaiin_store::{GoProxyLayer, GoProxyRuntimeConfig, GoProxyTransport};
 use yuhaiin_trie::router::RuntimeRoutedProxySelector;
 
 use crate::RuntimeSnapshot;
 use crate::loopback::LoopbackDetector;
 use crate::route::RouteListSnapshot;
+
+/// Go's `network_split` point keeps one already-built parent proxy and
+/// selects an independent wrapper for TCP and UDP.  The selection happens at
+/// the common async boundary so every inbound (including TUN) gets the same
+/// semantics.
+struct NetworkSplitProxy {
+    tcp: Arc<dyn AsyncProxy>,
+    udp: Arc<dyn AsyncProxy>,
+    parent: Arc<dyn AsyncProxy>,
+}
+
+impl AsyncProxy for NetworkSplitProxy {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        self.tcp.connect(context)
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+        self.udp.open_datagram(context)
+    }
+
+    fn ping<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<Duration>> {
+        // Go embeds the parent proxy, so Ping is intentionally not selected
+        // by network here.
+        self.parent.ping(context)
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        let proxies = [
+            Arc::clone(&self.tcp),
+            Arc::clone(&self.udp),
+            Arc::clone(&self.parent),
+        ];
+        Box::pin(async move {
+            let mut last_error = None;
+            for proxy in proxies {
+                if let Err(error) = proxy.close().await {
+                    last_error = Some(error);
+                }
+            }
+            last_error.map_or(Ok(()), Err)
+        })
+    }
+}
+
+/// A single nested Yuubinsya point used by `network_split`.  Full HTTP/2
+/// chains use `yuhaiin-chain::ChainProxy`; this adapter is for the Go point
+/// contract where the branch wraps an already-built parent stream.
+struct NetworkSplitYuubinsyaProxy {
+    upstream: Arc<dyn AsyncProxy>,
+    password_hash: [u8; 32],
+    udp_over_stream: bool,
+    udp_coalesce: bool,
+    udp_server: Option<Endpoint>,
+}
+
+impl AsyncProxy for NetworkSplitYuubinsyaProxy {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        Box::pin(async move {
+            let stream = self.upstream.connect(context).await?;
+            let session = yuhaiin_chain::AsyncYuubinsyaTcpSession::connect(
+                stream,
+                self.password_hash,
+                context.effective_destination(),
+            )
+            .await?;
+            let local_addr = stream_local_addr(session.transport());
+            Ok(with_stream_local_addr(
+                Box::new(session) as BoxAsyncStream,
+                local_addr,
+            ))
+        })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+        Box::pin(async move {
+            if self.udp_over_stream {
+                let stream = self.upstream.connect(context).await?;
+                let session = yuhaiin_chain::AsyncYuubinsyaUotSession::connect(
+                    stream,
+                    self.password_hash,
+                    context.udp_migrate_id.load(Ordering::Acquire),
+                    self.udp_coalesce,
+                )
+                .await?;
+                context
+                    .udp_migrate_id
+                    .store(session.migrate_id, Ordering::Release);
+                let local_addr = stream_local_addr(session.transport());
+                return Ok(Box::new(NetworkSplitYuubinsyaUotDatagram {
+                    session: tokio::sync::Mutex::new(Some(session)),
+                    local_addr,
+                }) as Box<dyn AsyncDatagram>);
+            }
+
+            let server = self.udp_server.clone().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unsupported,
+                    "network_split Yuubinsya native UDP requires a fixed parent endpoint",
+                )
+            })?;
+            let transport = self.upstream.open_datagram(context).await?;
+            Ok(Box::new(YuubinsyaUdpDatagram::new(
+                transport,
+                self.password_hash,
+                server,
+                false,
+            )?) as Box<dyn AsyncDatagram>)
+        })
+    }
+
+    fn ping<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<Duration>> {
+        self.upstream.ping(context)
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        self.upstream.close()
+    }
+}
+
+struct NetworkSplitYuubinsyaUotDatagram {
+    session: tokio::sync::Mutex<Option<yuhaiin_chain::AsyncYuubinsyaUotSession<BoxAsyncStream>>>,
+    local_addr: Option<SocketAddr>,
+}
+
+impl AsyncDatagram for NetworkSplitYuubinsyaUotDatagram {
+    fn send_to<'a>(&'a self, payload: &'a [u8], target: Endpoint) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            let mut session = self.session.lock().await;
+            let session = session
+                .as_mut()
+                .ok_or_else(|| Error::new(ErrorKind::Closed, "Yuubinsya UDP session is closed"))?;
+            session.send_to(&target, payload).await?;
+            Ok(payload.len())
+        })
+    }
+
+    fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
+        Box::pin(async move {
+            let mut session = self.session.lock().await;
+            let session = session
+                .as_mut()
+                .ok_or_else(|| Error::new(ErrorKind::Closed, "Yuubinsya UDP session is closed"))?;
+            let (target, payload) = session.recv_from().await?;
+            if buffer.len() < payload.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Yuubinsya UDP payload exceeds receive buffer",
+                ));
+            }
+            buffer[..payload.len()].copy_from_slice(&payload);
+            Ok((payload.len(), target))
+        })
+    }
+
+    fn local_addr(&self) -> Result<Endpoint> {
+        Ok(Endpoint::ip(
+            yuhaiin_core::Network::Udp,
+            self.local_addr
+                .unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid wildcard endpoint")),
+        ))
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let session = self.session.lock().await.take();
+            if let Some(mut session) = session {
+                session.shutdown().await?;
+            }
+            Ok(())
+        })
+    }
+}
 
 /// Keep a selected outbound proxy's socket in the loopback registry for the
 /// exact lifetime of the returned stream. Protocol layers may replace the
@@ -514,6 +693,204 @@ fn select_resolved_address(
 }
 
 impl RuntimeSnapshot {
+    async fn build_network_split_proxy(
+        &self,
+        config: &GoProxyRuntimeConfig,
+        timeout: Duration,
+    ) -> Result<Arc<dyn AsyncProxy>> {
+        let (split_index, split) = config
+            .layers
+            .iter()
+            .enumerate()
+            .find(|(_, layer)| layer.kind.eq_ignore_ascii_case("network_split"))
+            .ok_or_else(|| Error::invalid("network_split protocol layer is missing"))?;
+        let object = split
+            .config
+            .as_object()
+            .ok_or_else(|| Error::invalid("network_split configuration must be an object"))?;
+        let tcp = network_split_branch(object.get("tcp"))?;
+        let udp = network_split_branch(object.get("udp"))?;
+        if tcp.is_none() && udp.is_none() {
+            return Err(Error::invalid("network_split protocols are empty"));
+        }
+
+        let parent_config = config.chain_prefix(split_index)?;
+        let parent = if split_index == 0 {
+            let proxy: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy { timeout });
+            self.resolve_proxy(proxy)
+        } else {
+            let mut parent_snapshot = self.clone();
+            parent_snapshot.proxies = vec![parent_config.clone()];
+            Box::pin(parent_snapshot.build_proxy(&parent_config.id, timeout))
+                .await?
+                .proxy
+        };
+        let udp_server = parent_config
+            .resolved_fixed_endpoint(self.resolver.as_ref())
+            .await?
+            .map(|address| Endpoint::ip(yuhaiin_core::Network::Udp, address));
+        let tcp = match tcp {
+            Some(layer) => {
+                self.build_network_split_branch(
+                    &layer,
+                    Arc::clone(&parent),
+                    timeout,
+                    udp_server.clone(),
+                )
+                .await?
+            }
+            None => Arc::clone(&parent),
+        };
+        let udp = match udp {
+            Some(layer) => {
+                self.build_network_split_branch(&layer, Arc::clone(&parent), timeout, udp_server)
+                    .await?
+            }
+            None => Arc::clone(&parent),
+        };
+        Ok(Arc::new(NetworkSplitProxy { tcp, udp, parent }))
+    }
+
+    async fn build_network_split_branch(
+        &self,
+        layer: &GoProxyLayer,
+        parent: Arc<dyn AsyncProxy>,
+        timeout: Duration,
+        udp_server: Option<Endpoint>,
+    ) -> Result<Arc<dyn AsyncProxy>> {
+        let kind = layer.kind.to_ascii_lowercase();
+        match kind.as_str() {
+            "none" => Ok(parent),
+            "direct" => {
+                let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Direct);
+                let proxy: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy { timeout });
+                let proxy = Arc::new(SocketPolicyProxy {
+                    inner: proxy,
+                    bind_addresses: self.socket_bind_addresses.clone(),
+                    bind_interface: child.network_interface(),
+                }) as Arc<dyn AsyncProxy>;
+                Ok(self.resolve_proxy(proxy))
+            }
+            "reject" | "block" => Ok(Arc::new(DropAsyncProxy)),
+            "drop" => Ok(Arc::new(DelayedDropAsyncProxy::new())),
+            "fixed" | "simple" | "fixedv2" => {
+                let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Fixed);
+                Ok(child
+                    .to_base_proxy_config_with_resolver(timeout, self.resolver.clone())
+                    .await?
+                    .build()?)
+            }
+            "http" | "http_proxy" => {
+                let user = layer_string(layer, "user").unwrap_or_default();
+                let password = layer_string(layer, "password").unwrap_or_default();
+                Ok(Arc::new(yuhaiin_protocol::http::HttpProxy::new(
+                    parent, user, password,
+                )))
+            }
+            "socks5" => {
+                let user = layer_string(layer, "user").unwrap_or_default();
+                let password = layer_string(layer, "password").unwrap_or_default();
+                let hostname = layer_string(layer, "hostname").unwrap_or_default();
+                let override_port = layer
+                    .config
+                    .get("override_port")
+                    .or_else(|| layer.config.get("overridePort"))
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                let override_port = i32::try_from(override_port)
+                    .map_err(|_| Error::invalid("SOCKS5 override_port is out of range"))?;
+                Ok(Arc::new(yuhaiin_protocol::socks5::Socks5Proxy::new(
+                    parent,
+                    user,
+                    password,
+                    hostname,
+                    override_port,
+                )?))
+            }
+            "http_mock" => Ok(Arc::new(yuhaiin_protocol::http_mock::HttpMockProxy::new(
+                parent,
+            ))),
+            "tls" => {
+                let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Tls);
+                #[cfg(feature = "doh-tls")]
+                {
+                    build_protocol_tls_proxy(&child, parent)
+                }
+                #[cfg(not(feature = "doh-tls"))]
+                {
+                    let _ = child;
+                    Err(Error::new(
+                        ErrorKind::Unsupported,
+                        "network_split TLS branch requires the doh-tls feature",
+                    ))
+                }
+            }
+            "websocket" => {
+                let child = GoProxyRuntimeConfig::single_layer(
+                    layer,
+                    GoProxyTransport::Unknown {
+                        name: "websocket".to_owned(),
+                    },
+                );
+                build_protocol_websocket_proxy(&child, parent)
+            }
+            "shadowsocks" | "shadowsocksr" | "trojan" | "vless" | "vmess" => {
+                let transport = match kind.as_str() {
+                    "shadowsocks" => GoProxyTransport::Shadowsocks,
+                    "shadowsocksr" => GoProxyTransport::Shadowsocksr,
+                    "trojan" => GoProxyTransport::Trojan,
+                    "vless" => GoProxyTransport::Vless,
+                    "vmess" => GoProxyTransport::Vmess,
+                    _ => unreachable!(),
+                };
+                let child = GoProxyRuntimeConfig::single_layer(layer, transport);
+                build_protocol_proxy(&child, parent)
+            }
+            "aead" => {
+                let password = layer_string(layer, "password")
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| Error::invalid("AEAD password is empty"))?;
+                let method = layer
+                    .config
+                    .get("cryptoMethod")
+                    .or_else(|| layer.config.get("crypto_method"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(yuhaiin_protocol::aead::CryptoMethod::parse)
+                    .unwrap_or(yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305);
+                Ok(Arc::new(yuhaiin_protocol::aead::AeadProxy::new(
+                    parent, password, method, None,
+                )))
+            }
+            "yuubinsya" => {
+                let password = layer_string(layer, "password")
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| Error::invalid("Yuubinsya password is empty"))?;
+                Ok(Arc::new(NetworkSplitYuubinsyaProxy {
+                    upstream: parent,
+                    password_hash: yuhaiin_core::yuubinsya::derive_salt(password.as_bytes()),
+                    udp_over_stream: layer_bool(layer, "udp_over_stream", "udpOverStream"),
+                    udp_coalesce: layer_bool(layer, "udp_coalesce", "udpCoalesce"),
+                    udp_server,
+                }))
+            }
+            "http2" => Err(Error::new(
+                ErrorKind::Unsupported,
+                "network_split HTTP/2 branch requires a complete fixed/TLS/HTTP2 chain",
+            )),
+            "wireguard" | "wire_guard" | "wg" => Err(Error::new(
+                ErrorKind::Unsupported,
+                "network_split WireGuard branch is not composable with a parent proxy",
+            )),
+            "network_split" | "networksplit" => {
+                Err(Error::invalid("nested network_split is not supported"))
+            }
+            other => Err(Error::new(
+                ErrorKind::Unsupported,
+                format!("network_split branch protocol {other:?} is not supported"),
+            )),
+        }
+    }
+
     pub async fn build_proxy(&self, id: &str, timeout: Duration) -> Result<ProxyBuild> {
         let config = self.require_proxy_config(id)?.clone();
         if !config.enabled {
@@ -523,7 +900,9 @@ impl RuntimeSnapshot {
             ));
         }
 
-        let proxy = if is_protocol_h2_config(&config) {
+        let proxy = if config.transport == yuhaiin_store::GoProxyTransport::NetworkSplit {
+            self.build_network_split_proxy(&config, timeout).await?
+        } else if is_protocol_h2_config(&config) {
             build_protocol_h2_proxy(&config, timeout, self.resolver.clone()).await?
         } else if is_vless_websocket_config(&config) {
             build_vless_transport_proxy(&config, timeout, self.resolver.clone()).await?
@@ -1644,6 +2023,48 @@ fn annotate_connection_metadata(
     }
 }
 
+fn network_split_branch(value: Option<&serde_json::Value>) -> Result<Option<GoProxyLayer>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| Error::invalid("network_split branch must be an object"))?;
+    let kind = object
+        .get("type")
+        .or_else(|| object.get("protocol"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::invalid("network_split branch requires a protocol type"))?;
+    let config = object
+        .get(kind)
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Object(object.clone()));
+    Ok(Some(GoProxyLayer {
+        kind: kind.to_owned(),
+        config,
+    }))
+}
+
+fn layer_string(layer: &GoProxyLayer, key: &str) -> Option<String> {
+    layer
+        .config
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn layer_bool(layer: &GoProxyLayer, snake: &str, camel: &str) -> bool {
+    layer
+        .config
+        .get(snake)
+        .or_else(|| layer.config.get(camel))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn is_chain_config(config: &GoProxyRuntimeConfig) -> bool {
     if config
         .chain_types
@@ -2356,6 +2777,87 @@ mod tests {
         let mut response = [0u8; 4];
         stream.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"pong");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_network_split_dispatches_tcp_and_udp_branches() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+        let config = GoProxyRuntimeConfig {
+            id: "network-split".to_owned(),
+            name: "network split".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned(), "network_split".to_owned()],
+            layers: vec![
+                GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({
+                        "addresses": [{
+                            "host": target.ip().to_string(),
+                            "port": target.port()
+                        }]
+                    }),
+                },
+                GoProxyLayer {
+                    kind: "network_split".to_owned(),
+                    config: serde_json::json!({
+                        "tcp": {"type": "direct", "direct": {}},
+                        "udp": {"type": "drop", "drop": {}}
+                    }),
+                },
+            ],
+            transport: GoProxyTransport::NetworkSplit,
+            data_json: Vec::new(),
+        };
+        let proxy = snapshot(config)
+            .build_proxy("network-split", Duration::from_secs(1))
+            .await
+            .unwrap()
+            .proxy;
+
+        let tcp_context = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            target,
+        ));
+        let mut stream = proxy.connect(&tcp_context).await.unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
+
+        let udp_context = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Udp,
+            "127.0.0.1:53".parse().unwrap(),
+        ));
+        let datagram = proxy.open_datagram(&udp_context).await.unwrap();
+        assert_eq!(
+            datagram
+                .send_to(b"drop", udp_context.destination.clone())
+                .await
+                .unwrap(),
+            4
+        );
+        let mut dropped = [0u8; 8];
+        let error = match datagram.recv_from(&mut dropped).await {
+            Ok(_) => panic!("UDP must be dispatched to the drop branch"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, ErrorKind::Closed);
+
+        datagram.close().await.unwrap();
+        proxy.close().await.unwrap();
         server.await.unwrap();
     }
 

@@ -406,6 +406,7 @@ fn go_node_runtime_preserves_proxy_layers_and_selects_supported_base() {
         ("vmess", GoProxyTransport::Vmess),
         ("yuubinsya", GoProxyTransport::Yuubinsya),
         ("aead", GoProxyTransport::Aead),
+        ("network_split", GoProxyTransport::NetworkSplit),
         ("tls", GoProxyTransport::Tls),
         ("http2", GoProxyTransport::Http2),
         // Go's `none` point is a no-op wrapper around the zero/direct proxy.
@@ -496,6 +497,32 @@ fn go_node_runtime_preserves_proxy_layers_and_selects_supported_base() {
             name: "future_protocol".to_owned()
         }
     );
+}
+
+#[test]
+fn go_network_split_runtime_keeps_branch_layers_and_prefix_transport() {
+    let record = GoNodeRecord {
+        id: "node-network-split".to_owned(),
+        name: "network split".to_owned(),
+        group_name: "test".to_owned(),
+        origin: "manual".to_owned(),
+        enabled: true,
+        chain_types_json: br#"["fixedv2","network_split"]"#.to_vec(),
+        updated_at: 1,
+        data_json: br#"{"chain":[{"type":"fixedv2","fixedv2":{"addresses":[{"host":"127.0.0.1","port":443}]}},{"type":"network_split","network_split":{"tcp":{"type":"direct","direct":{}},"udp":{"type":"drop","drop":{}}}}]}"#.to_vec(),
+    };
+    let runtime = record.to_proxy_runtime_config().unwrap();
+    assert_eq!(runtime.transport, GoProxyTransport::NetworkSplit);
+    assert_eq!(runtime.layers.len(), 2);
+    assert_eq!(runtime.layers[1].kind, "network_split");
+    assert_eq!(runtime.layers[1].config["tcp"]["type"], "direct");
+    assert_eq!(runtime.layers[1].config["udp"]["type"], "drop");
+
+    let prefix = runtime.chain_prefix(1).unwrap();
+    assert_eq!(prefix.transport, GoProxyTransport::Fixed);
+    assert_eq!(prefix.layers.len(), 1);
+    let prefix_json: serde_json::Value = serde_json::from_slice(&prefix.data_json).unwrap();
+    assert_eq!(prefix_json["chain"].as_array().unwrap().len(), 1);
 }
 
 #[test]
