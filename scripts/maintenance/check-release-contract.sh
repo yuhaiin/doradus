@@ -59,9 +59,12 @@ required_literals=(
   'actions/upload-artifact@v7'
   'actions/download-artifact@v7'
   'sha256sum -- * | sort -k2'
+  ') > release/checksums.txt'
   'github.ref_type == '\''tag'\'' || (github.ref_type == '\''branch'\'' && github.ref_name == '\''main'\'')'
   'git push origin refs/tags/main --force'
   'files: |'
+  'release/*'
+  'release_notes.txt'
 )
 
 for literal in "${required_literals[@]}"; do
@@ -70,6 +73,11 @@ for literal in "${required_literals[@]}"; do
     exit 1
   fi
 done
+
+if grep -Fq -- $'            checksums.txt' "${workflow}"; then
+  echo "[release-contract] checksum must be published from release/checksums.txt" >&2
+  exit 1
+fi
 
 for artifact in \
   yuhaiin-linux-amd64 \

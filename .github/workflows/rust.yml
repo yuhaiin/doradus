@@ -199,7 +199,7 @@ jobs:
           (
             cd release
             sha256sum -- * | sort -k2
-          ) > checksums.txt
+          ) > release/checksums.txt
 
           if [[ "${{ github.ref_type }}" == "tag" ]]; then
             previous_tag=$(git describe --tags --match 'v*' --abbrev=0 HEAD^ 2>/dev/null || true)
@@ -235,5 +235,4 @@ jobs:
           prerelease: ${{ github.ref_type == 'branch' && github.ref_name == 'main' || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
           files: |
             release/*
-            checksums.txt
             release_notes.txt

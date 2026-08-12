@@ -4490,3 +4490,15 @@ userspace TCP/UDP 和 runtime proxy 集成，不再引入第二份纯 Rust WireG
 JSON 保存在 `~/.cache/yuhaiin-rust/benchmarks/wireguard/`，本轮没有使用 `/tmp`。
 真实第三方/WARP peer、公网 keepalive、NAT roaming 和 source-interface policy 仍保留
 为外部验证项，没有由本地 userspace 双 peer 结果外推完成。
+
+## 170. 2026-08-13 GitHub release checksum 资产路径修复
+
+审计 `.github/workflows/rust.yml` 时发现 release assemble 步骤在 `release/` 目录内生成
+`release/checksums.txt`，但 publish 步骤额外引用仓库根目录的 `checksums.txt`。这会让
+自动发布在干净 runner 上出现 checksum 路径不一致，或者依赖 action 对不存在路径的宽松处理。
+
+现已让 publish 只通过 `release/*` 上传实际生成的 `release/checksums.txt`，并增强
+`scripts/maintenance/check-release-contract.sh`：它必须看到该路径，同时拒绝重新引入
+根目录 `checksums.txt`。Podman `network=none` 中执行 release contract smoke 通过；这仍是
+工作流结构和资产契约验证，六个 native runner 的真实编译与第一次远程 Actions 运行继续保留
+为 `[~]`，没有把本地结构检查冒充远程发布成功。
