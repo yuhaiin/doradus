@@ -82,7 +82,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 | Go 权威入口 | Rust 位置 | 状态 | 证据 | 下一动作 |
 | --- | --- | :---: | --- | --- |
-| `pkg/net/proxy/direct/*`、`fixed/*`、`fixedv2/*`、`drop/*`、`http/*`、`mock/http.go` | `crates/yuhaiin-core/src/proxy.rs`、`crates/yuhaiin-core/src/proxy_factory.rs`、`crates/yuhaiin-protocol/src/http.rs`、`http_mock.rs`、`crates/yuhaiin-runtime/src/proxy/http.rs`、`proxy.rs` | `[x]` | direct/fixed/drop/HTTP CONNECT service chain；域名 endpoint async resolve 已修复；Go `fixedv2` 的首地址与 alternate 地址会保留为有序 endpoint 列表，连接失败时按顺序回退；每地址 `network_interface` 会传到 Linux TCP/UDP socket 的 `SO_BINDTODEVICE`，并由 Podman 单测验证；Go outbound `http_mock` 的固定 GET 请求、runtime 节点映射和底层 datagram 透传已补齐，`yuhaiin-runtime` 进程 builder 的真实 TCP echo 测试通过；Go inbound `proxy`/`http_mock` 透明 transport 也复用普通 listener，`service-chain-smoke` 通过 2/2 实际 HTTP echo | — |
+| `pkg/net/proxy/direct/*`、`fixed/*`、`fixedv2/*`、`drop/*`、`reject/*`、`http/*`、`mock/http.go` | `crates/yuhaiin-core/src/proxy.rs`、`crates/yuhaiin-core/src/proxy_factory.rs`、`crates/yuhaiin-protocol/src/http.rs`、`http_mock.rs`、`crates/yuhaiin-runtime/src/proxy/http.rs`、`proxy.rs` | `[x]` | direct/fixed/drop/reject(block)/HTTP CONNECT service chain；Go `drop` 的 per-destination 512-entry/5-second expiry adaptive delay、TCP/UDP write sink 和 delayed EOF 已与立即 reject 分离并由 core TCP/UDP tests 固定；域名 endpoint async resolve 已修复；Go `fixedv2` 的首地址与 alternate 地址会保留为有序 endpoint 列表，连接失败时按顺序回退；每地址 `network_interface` 会传到 Linux TCP/UDP socket 的 `SO_BINDTODEVICE`，并由 Podman 单测验证；Go outbound `http_mock` 的固定 GET 请求、runtime 节点映射和底层 datagram 透传已补齐，`yuhaiin-runtime` 进程 builder 的真实 TCP echo 测试通过；Go inbound `proxy`/`http_mock` 透明 transport 也复用普通 listener，`service-chain-smoke` 通过 2/2 实际 HTTP echo | — |
 | `pkg/net/proxy/socks5/client.go`、`server.go` | `crates/yuhaiin-protocol/src/socks5.rs`、`socks5_server.rs`、`crates/yuhaiin-runtime/src/inbounds/socks5.rs` | `[x]` | TCP auth/request、UDP ASSOCIATE、IPv4/IPv6/domain framing、inbound/outbound chain | — |
 | `pkg/net/proxy/socks4a/server.go`、`mixed/*` | `crates/yuhaiin-runtime/src/proxy/socks4a.rs`、`inbounds/mod.rs` | `[x]` | mixed inbound dispatches SOCKS4A/SOCKS5/HTTP | — |
 | `pkg/net/proxy/tls/*` | `crates/yuhaiin-protocol/src/tls.rs`、`crates/yuhaiin-runtime/src/proxy/*` | `[x]` | RustCrypto TLS inbound/outbound、SNI、CA、insecureSkipVerify contract | — |
@@ -136,7 +136,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 | 能力 | Inbound | Outbound | 当前状态 |
 | --- | :---: | :---: | :---: |
-| direct / drop / fixed | fixed/direct listener | 是 | `[x]` |
+| direct / reject(block) / drop / fixed | fixed/direct listener | 是 | `[x]` |
 | HTTP proxy / CONNECT | 是 | 是 | `[x]` |
 | SOCKS5 TCP | 是 | 是 | `[x]` |
 | SOCKS5 UDP ASSOCIATE | 是 | 是 | `[x]` |
@@ -225,6 +225,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `cargo test -p yuhaiin-runtime --all-features --offline --lib`（2026-08-12 当前轮） | Rust 1.97.1 Podman、host network；编译/运行在容器，状态和临时目录位于 `~/.cache/yuhaiin-rust` | 276/276 通过；包含 AEAD→HTTP/2、AEAD→WebSocket 真实 TCP flow，以及 TLS/AEAD wrapper 声明顺序单测。一个历史 route-list HTTPS fixture 测试访问外部地址，未作为本轮功能依赖 |
 | `make workspace-tests`（2026-08-12 当前轮，AEAD composition 接入后） | 48 个 harness；编译和运行均在 isolated/stats/host-network Podman 分组 | chain 55、core 148、runtime 275、store 131（5 ignored）、service-chain 19、WireGuard 8（1 benchmark ignored）、WireGuard runtime chain 2、stats concurrency 2；0 失败。随后只增加 wrapper-order 单测，已由上行 runtime 276/276 覆盖 |
 | `make workspace-tests`（2026-08-13 Makefile 容器化后复核） | 48 个 harness；编译和运行均在 Podman，日志位于 `~/.cache/yuhaiin-rust/integration/workspace-tests` | chain 55、core 150、runtime 283、store 131（5 ignored）、trie 27、service-chain 20、WireGuard 8（1 benchmark ignored）、WireGuard runtime chain 2、stats concurrency 2；0 失败；外部 WARP 2 项按需配置显式 ignored |
+| `make workspace-tests`（2026-08-13 drop/reject compatibility） | 48 个 harness；Rust 编译和所有 harness 均在 Podman，状态位于 `~/.cache/yuhaiin-rust/integration/workspace-tests` | core 153、runtime 283、store 131（5 ignored）、chain 55、trie 27、service-chain 20、WireGuard 8（1 benchmark ignored）、WireGuard runtime chain 2、stats concurrency 2；0 失败；新增 core drop TCP/UDP 行为与 Go `reject/block` 导入回归 |
 | `cargo clippy --locked --workspace --all-targets --all-features --offline -- -D warnings`（2026-08-12 当前轮） | Rust 1.97.1 Podman，一次性安装缺失的 clippy component，cargo registry/target 挂载自用户缓存 | Clippy 通过；当前镜像缺少 rustfmt component，宿主只做只读 `rustfmt --check` 和 `git diff --check`，没有在宿主编译/运行测试 |
 | `cargo test --locked --workspace --all-features --offline --no-fail-fast -- --test-threads=1`（2026-08-12 当前轮） | Rust 1.97.1 Podman，`network=host`，临时目录在用户缓存 | chain 55、core 148、runtime 269、store 131（5 ignored）、service-chain 18、WireGuard 8（1 benchmark ignored），0 失败 |
 | `make workspace-tests`（2026-08-12 当前轮） | 48 个 harness；编译和运行均在 isolated/stats/host-network Podman 分组 | chain 55、core 148、runtime 269（含 `tls_auto` focused 6/6）、store 131（5 个 ignored）、service-chain 18、WireGuard 8（1 个 benchmark ignored）、WireGuard runtime chain 2；0 失败 |

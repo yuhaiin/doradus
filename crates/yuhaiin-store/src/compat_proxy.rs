@@ -36,6 +36,7 @@ impl Serialize for GoProxyLayer {
 #[serde(rename_all = "snake_case")]
 pub enum GoProxyTransport {
     Direct,
+    Reject,
     Drop,
     Fixed,
     HttpMock,
@@ -219,7 +220,8 @@ fn network_interface_from_value(value: &Value) -> Option<String> {
 fn parse_proxy_transport(value: &str) -> GoProxyTransport {
     match value.trim().to_ascii_lowercase().as_str() {
         "direct" => GoProxyTransport::Direct,
-        "drop" | "block" => GoProxyTransport::Drop,
+        "reject" | "block" => GoProxyTransport::Reject,
+        "drop" => GoProxyTransport::Drop,
         "fixed" | "simple" | "fixedv2" => GoProxyTransport::Fixed,
         "http_mock" | "httpmock" => GoProxyTransport::HttpMock,
         "http" | "http_proxy" => GoProxyTransport::HttpProxy,
@@ -261,6 +263,7 @@ fn select_proxy_transport(chain_types: &[String], layers: &[GoProxyLayer]) -> Go
         "trojan",
         "http",
         "http_proxy",
+        "reject",
         "drop",
         "block",
         "fixed",

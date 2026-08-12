@@ -144,6 +144,7 @@ impl GoProxyRuntimeConfig {
         };
         Ok(match &self.transport {
             GoProxyTransport::Direct => BaseProxyKind::Direct,
+            GoProxyTransport::Reject => BaseProxyKind::Reject,
             GoProxyTransport::Drop => BaseProxyKind::Drop,
             GoProxyTransport::Fixed => match single_address() {
                 Some(address) => BaseProxyKind::Fixed { address },
@@ -243,6 +244,7 @@ impl GoProxyRuntimeConfig {
 fn transport_name(transport: &GoProxyTransport) -> &str {
     match transport {
         GoProxyTransport::Direct => "direct",
+        GoProxyTransport::Reject => "reject",
         GoProxyTransport::Drop => "drop",
         GoProxyTransport::Fixed => "fixed",
         GoProxyTransport::HttpMock => "http_mock",

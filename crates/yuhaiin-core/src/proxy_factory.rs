@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::proxy::{
-    AsyncProxy, BindInterfaceProxy, BlockingStreamProxy, DirectAsyncProxy, DropAsyncProxy,
-    FallbackAsyncProxy, FixedAsyncProxy, HttpProxyConnector, Socks5AsyncProxy, StreamConnector,
-    YuubinsyaUdpProxy,
+    AsyncProxy, BindInterfaceProxy, BlockingStreamProxy, DelayedDropAsyncProxy, DirectAsyncProxy,
+    DropAsyncProxy, FallbackAsyncProxy, FixedAsyncProxy, HttpProxyConnector, Socks5AsyncProxy,
+    StreamConnector, YuubinsyaUdpProxy,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -24,6 +24,9 @@ pub struct BaseProxyEndpoint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BaseProxyKind {
     Direct,
+    /// Immediate reject used by Go's `reject` node and route `block` policy.
+    Reject,
+    /// Delayed, write-accepting sink used by Go's `drop` node.
     Drop,
     Fixed {
         address: SocketAddr,
@@ -81,7 +84,8 @@ impl BaseProxyConfig {
             BaseProxyKind::Direct => Arc::new(DirectAsyncProxy {
                 timeout: self.timeout,
             }),
-            BaseProxyKind::Drop => Arc::new(DropAsyncProxy),
+            BaseProxyKind::Reject => Arc::new(DropAsyncProxy),
+            BaseProxyKind::Drop => Arc::new(DelayedDropAsyncProxy::new()),
             BaseProxyKind::Fixed { address } => Arc::new(FixedAsyncProxy {
                 address: *address,
                 timeout: self.timeout,
@@ -258,6 +262,10 @@ mod tests {
                 timeout: timeout(),
             },
             BaseProxyConfig {
+                kind: BaseProxyKind::Reject,
+                timeout: timeout(),
+            },
+            BaseProxyConfig {
                 kind: BaseProxyKind::Fixed { address },
                 timeout: timeout(),
             },
@@ -339,9 +347,9 @@ mod tests {
     }
 
     #[test]
-    fn built_drop_proxy_fails_closed_for_stream_and_datagram() {
+    fn built_reject_proxy_fails_closed_for_stream_and_datagram() {
         let proxy = BaseProxyConfig {
-            kind: BaseProxyKind::Drop,
+            kind: BaseProxyKind::Reject,
             timeout: timeout(),
         }
         .build()
@@ -353,15 +361,54 @@ mod tests {
             .build()
             .unwrap();
         let error = match runtime.block_on(proxy.connect(&context)) {
-            Ok(_) => panic!("drop proxy must reject stream"),
+            Ok(_) => panic!("reject proxy must reject stream"),
             Err(error) => error,
         };
         assert_eq!(error.kind, ErrorKind::Closed);
         let error = match runtime.block_on(proxy.open_datagram(&context)) {
-            Ok(_) => panic!("drop proxy must reject datagram"),
+            Ok(_) => panic!("reject proxy must reject datagram"),
             Err(error) => error,
         };
         assert_eq!(error.kind, ErrorKind::Closed);
+    }
+
+    #[tokio::test]
+    async fn built_drop_proxy_accepts_writes_and_ends_reads() {
+        let proxy = BaseProxyConfig {
+            kind: BaseProxyKind::Drop,
+            timeout: timeout(),
+        }
+        .build()
+        .unwrap();
+        let context =
+            FlowContext::new(Endpoint::ip(Network::Tcp, "127.0.0.1:443".parse().unwrap()));
+        let mut stream = proxy.connect(&context).await.unwrap();
+        assert_eq!(stream.write(b"discarded").await.unwrap(), 9);
+        let mut buffer = [0u8; 1];
+        assert_eq!(stream.read(&mut buffer).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn built_drop_proxy_accepts_udp_writes_and_closes_reads() {
+        let proxy = BaseProxyConfig {
+            kind: BaseProxyKind::Drop,
+            timeout: timeout(),
+        }
+        .build()
+        .unwrap();
+        let target = Endpoint::domain(
+            Network::Udp,
+            crate::DomainName::new("udp-blocked.example").unwrap(),
+            53,
+        );
+        let context = FlowContext::new(target.clone());
+        let datagram = proxy.open_datagram(&context).await.unwrap();
+        assert_eq!(datagram.local_addr().unwrap().port(), Some(0));
+        assert_eq!(datagram.send_to(b"discarded", target).await.unwrap(), 9);
+        let mut buffer = [0u8; 1];
+        let error = datagram.recv_from(&mut buffer).await.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Closed);
+        datagram.close().await.unwrap();
     }
 
     #[test]

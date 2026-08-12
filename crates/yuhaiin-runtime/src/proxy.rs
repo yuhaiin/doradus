@@ -858,7 +858,7 @@ impl RuntimeSnapshot {
             .build_proxy_slot(bypass_id, timeout, BaseProxyKind::Direct)
             .await?;
         let drop = self
-            .build_proxy_slot(drop_id, timeout, BaseProxyKind::Drop)
+            .build_proxy_slot(drop_id, timeout, BaseProxyKind::Reject)
             .await?;
 
         Ok(RuntimeRoutedProxySelector {

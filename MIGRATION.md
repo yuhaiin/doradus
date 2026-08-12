@@ -17,6 +17,13 @@
 > `YUHAIIN_QUIET` 只有 `1/true/yes/on` 才会关闭这些 console notice，避免环境中设置 `YUHAIIN_QUIET=0` 时误以为没有日志。
 > `IMPLEMENTATION_CHECKLIST.md` 现在按 crate 模块树、协议矩阵、未完成项和验收命令组织；rootful TUN route lease、RST/reconnect 与 TPROXY UDP delivery/idle/force-stop 已有独立 VM 现场证据，但 TUN kernel fragment、Android/macOS 和生产/发布现场仍保留为 `[~]`，不能从单元测试覆盖率推导为完整替换。
 
+> 2026-08-13 block/drop compatibility：对照 Go `reject`、route `block` 和 `drop` 的不同
+> contract，Rust 不再把它们合并为同一个立即失败代理。`reject/block` 继续用于立即
+> fail-closed，Go `drop` 则按目的地保留 512 项、5 秒过期的自适应延迟（0、1、2、4 秒，
+> 上限 30 秒），TCP/UDP 写入返回已消费而读取在延迟后结束；运行时关闭节点的内部
+> placeholder 仍保持立即 fail-closed。新增 core TCP/UDP 行为测试、兼容导入测试，随后
+> Podman `make workspace-tests` 的 48 个 harness 全部通过。
+
 > 2026-08-12 inbound AEAD transport composition：Go 的 `listenContract` 会按
 > `config.Transports` 顺序逐层包裹 listener，Rust 入站现在通过统一的
 > `prepare_inbound_stream` 复现这一边界：TLS、AEAD 先完成 stream handshake，再交给

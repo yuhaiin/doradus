@@ -391,6 +391,8 @@ fn go_resolver_runtime_preserves_supported_transport_kinds() {
 fn go_node_runtime_preserves_proxy_layers_and_selects_supported_base() {
     let cases = [
         ("direct", GoProxyTransport::Direct),
+        ("reject", GoProxyTransport::Reject),
+        ("block", GoProxyTransport::Reject),
         ("drop", GoProxyTransport::Drop),
         ("fixed", GoProxyTransport::Fixed),
         ("http_mock", GoProxyTransport::HttpMock),
