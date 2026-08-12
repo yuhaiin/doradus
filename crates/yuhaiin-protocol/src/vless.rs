@@ -246,10 +246,7 @@ impl AsyncProxy for VlessProxy {
             write_request(&mut stream, &self.uuid, Command::Udp, &destination).await?;
             let (reader, writer) = split(stream);
             Ok(Box::new(VlessDatagram {
-                reader: Mutex::new(VlessDatagramReader {
-                    reader,
-                    response_read: false,
-                }),
+                reader: Mutex::new(VlessDatagramReader { reader }),
                 writer: Mutex::new(writer),
                 destination,
             }) as Box<dyn AsyncDatagram>)
@@ -372,7 +369,6 @@ impl AsyncWrite for VlessStream {
 
 struct VlessDatagramReader {
     reader: tokio::io::ReadHalf<BoxAsyncStream>,
-    response_read: bool,
 }
 
 struct VlessDatagram {
@@ -400,10 +396,6 @@ impl AsyncDatagram for VlessDatagram {
     fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
         Box::pin(async move {
             let mut reader = self.reader.lock().await;
-            if !reader.response_read {
-                read_response(&mut reader.reader).await?;
-                reader.response_read = true;
-            }
             let length = usize::from(reader.reader.read_u16().await.map_err(io_error)?);
             let mut payload = vec![0u8; length];
             reader
@@ -593,14 +585,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn datagram_uses_response_header_and_length_prefixed_packets() {
+    async fn datagram_uses_length_prefixed_packets_without_response_header() {
         let uuid = parse_uuid(UUID).unwrap();
         let destination = target(Network::Udp);
         let (client, mut server) = tokio::io::duplex(4096);
         let server_task = tokio::spawn(async move {
             let request = read_request(&mut server, &uuid).await.unwrap();
             assert_eq!(request.command, Command::Udp);
-            write_response(&mut server, &[]).await.unwrap();
             let length = usize::from(server.read_u16().await.unwrap());
             let mut packet = vec![0u8; length];
             server.read_exact(&mut packet).await.unwrap();
@@ -614,10 +605,7 @@ mod tests {
             .await
             .unwrap();
         let datagram = VlessDatagram {
-            reader: Mutex::new(VlessDatagramReader {
-                reader,
-                response_read: false,
-            }),
+            reader: Mutex::new(VlessDatagramReader { reader }),
             writer: Mutex::new(writer),
             destination: destination.clone(),
         };

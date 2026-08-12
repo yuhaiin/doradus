@@ -78,10 +78,11 @@ where
 }
 
 /// Serve a VLESS UDP request. VLESS v0 fixes the destination in the initial
-/// request; each subsequent packet is only length-prefixed, matching the Go
-/// implementation's `PacketConn` behavior.
+/// request; each subsequent packet is only length-prefixed. The UDP path does
+/// not emit a response header because Go's `PacketConn.ReadFrom` starts at the
+/// first packet length, while the TCP path still uses the response header.
 async fn serve_udp<S>(
-    mut stream: S,
+    stream: S,
     peer: SocketAddr,
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
@@ -91,7 +92,6 @@ async fn serve_udp<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    vless::write_response(&mut stream, &[]).await?;
     let mut context = FlowContext::new(destination.clone());
     context.source = Some(Endpoint::ip(Network::Udp, peer));
     context.original_domain = destination.host().cloned();

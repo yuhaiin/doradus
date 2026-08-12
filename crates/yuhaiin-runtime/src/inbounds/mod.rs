@@ -2715,9 +2715,6 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         vless::write_request(&mut client, &uuid, VlessCommand::Udp, &destination)
             .await
             .unwrap();
-        let mut response = [0u8; 2];
-        client.read_exact(&mut response).await.unwrap();
-        assert_eq!(response, [0, 0]);
         client.write_u16(9).await.unwrap();
         client.write_all(b"vless-udp").await.unwrap();
         let length = usize::from(client.read_u16().await.unwrap());

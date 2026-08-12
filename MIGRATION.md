@@ -67,7 +67,7 @@
 
 > 2026-08-12 replacement parity recheck：当前提交在 Podman 重新通过停止态 Go 快照的
 > API read/mutation/error matrix（单快照和 3 份 production parity）、Go/Rust live-flow
-> statistics、Go protocol interop 8/8（新增 RustCrypto TLS → VLESS → Go server，以及 Go TLS → WebSocket → HTTP/2 → Yuubinsya → Rust server），以及 4 次连续 `api-reload-flow-smoke`。本轮没有发现
+> statistics、Go protocol interop 9/9（新增 RustCrypto TLS → VLESS → Go server、Go VLESS UDP → Rust server，以及 Go TLS → WebSocket → HTTP/2 → Yuubinsya → Rust server），以及 4 次连续 `api-reload-flow-smoke`。本轮没有发现
 > 新的 API、统计、协议或 inbound reload 回归；剩余 `[~]` 主要是第三方 WARP、真实跨平台权限、
 > 远程 Actions 和更广生产现场矩阵。
 
@@ -1269,6 +1269,12 @@ WebSocket 只负责 HTTP upgrade 和 byte-stream framing，不把 VLESS 逻辑�
 VLESS 的 UUID、IPv4/domain/IPv6 地址编码、TCP/UDP framing、Rust→Go wire 互操作和
 `fixedv2 -> websocket -> vless` runtime 构造均有自动化测试；HTTP/2 VLESS、early-data、
 XTLS/flow 等高级变体仍明确保持 unsupported，而不是静默降级。
+
+UDP framing 遵循当前 Go `PacketConn` 的实际边界：request 后直接读取
+`uint16 length + payload`，不发送或等待 TCP 用的 two-byte response header；TCP 仍然严格校验
+VLESS response version/addon。该边界由 `go_vless_udp_interop` 在 Podman 中以真实 Go
+`fixedv2 -> vless.PacketConn` client → Rust wire server 验证，避免把 `[0,0]` response header
+误当成一个空 UDP datagram。
 
 VMess 当前按 Go yuhaiin 的 outbound-only modern path 迁移：`VmessProxy` 使用
 `alter_id=0` 的 AEAD request header、响应 header 和有界 chunk stream，支持 AES-128-GCM、
@@ -3693,3 +3699,19 @@ VLESS、VLESS-over-TLS、VMess、Trojan；本轮 `7/7` 通过。Go 的 `GOTMPDIR
 文件、Rust harness 日志和构建状态都位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
 该证据仍是 protocol wire/transport 组合验证，不替代更广的 runtime listener、UDP 和
 生产证书/代理链现场矩阵，因此 VLESS/VMess/Trojan 总项继续保持 `[~]`。
+
+## 125. 2026-08-12 Go VLESS UDP framing 互操作
+
+新增 `go_vless_udp_interop.rs` 和 `vless_udp_go_client.go`，用 Go 仓库中的真实
+`fixedv2 -> vless.PacketConn` client 连接 Rust wire fixture。fixture 校验 VLESS v0 UUID、
+UDP command、domain destination `example.com:53`，然后按 Go 的 UDP contract 完成
+`uint16 length + payload` 的 echo。该测试在 Podman host-network 场景中通过，修正前会把
+Rust 发送的 `[0,0]` response header 读成空 UDP datagram，Go client 明确返回空响应。
+
+修复将 VLESS response header 限定在 TCP stream：Rust UDP inbound 不再先写 response header，
+`VlessDatagram` outbound 也不再等待该 header；UDP 仍保持有界的 length-prefixed packet，TCP
+response version/addon 校验和现有 TLS/WebSocket/HTTP2 transport 行为不变。协议单测、runtime
+VLESS UDP inbound 回归和完整 `make go-protocol-interop-smoke` 均通过，后者当前为 9/9：
+Yuubinsya 四种模式、WebSocket→H2（普通/TLS）、H2 v1、VLESS TCP、VLESS UDP、VLESS-over-TLS、
+VMess 和 Trojan。所有 Go scratch、fixture、日志和构建缓存继续位于 `~/.cache/yuhaiin-rust`，
+没有使用 `/tmp`。
