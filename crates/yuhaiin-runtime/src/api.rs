@@ -1249,7 +1249,7 @@ async fn inbounds_config_put_value(state: &ApiState, value: Value) -> ApiResult 
         .map_err(|error| ApiError::bad(format!("invalid inbound settings: {error}")))?;
     state
         .controller
-        .mutate_and_reload(move |store| async move {
+        .mutate_and_reload_inbounds(move |store| async move {
             store.repository().put_inbound_settings(settings).await
         })
         .await?;

@@ -9,7 +9,7 @@ use yuhaiin_core::Result;
 use yuhaiin_core::proxy::AsyncProxy;
 use yuhaiin_store::{ConfigMutation, ConfigStore};
 
-use crate::data_plane::inbound_dns_handler;
+use crate::data_plane::{ReloadableAsyncDnsHandler, inbound_dns_handler};
 use crate::monitor::SocketDnsHandler;
 use crate::{
     ConnectionMonitor, RuntimeBuilder, RuntimeHandle, RuntimeProxySelector, RuntimeSnapshot,
@@ -31,6 +31,7 @@ pub struct RuntimeController {
     monitor: Arc<ConnectionMonitor>,
     reload_events: tokio::sync::broadcast::Sender<()>,
     inbound_reload_events: tokio::sync::broadcast::Sender<()>,
+    tun_dns_handler: Arc<ReloadableAsyncDnsHandler>,
     restore_request: Arc<RwLock<Option<PathBuf>>>,
 }
 
@@ -47,6 +48,9 @@ impl RuntimeController {
             inbound_dns_handler(&initial_snapshot)
                 .map(|handler| handler as Arc<dyn SocketDnsHandler>),
         );
+        let tun_dns_handler = Arc::new(ReloadableAsyncDnsHandler::new(
+            inbound_dns_handler(&initial_snapshot).map(|handler| (*handler).clone()),
+        ));
         let handle = RuntimeHandle::new(initial_snapshot);
         Ok(Self {
             builder,
@@ -57,6 +61,7 @@ impl RuntimeController {
             monitor,
             reload_events,
             inbound_reload_events,
+            tun_dns_handler,
             restore_request: Arc::new(RwLock::new(None)),
         })
     }
@@ -71,6 +76,10 @@ impl RuntimeController {
 
     pub fn monitor(&self) -> Arc<ConnectionMonitor> {
         self.monitor.clone()
+    }
+
+    pub(crate) fn tun_dns_handler(&self) -> Arc<ReloadableAsyncDnsHandler> {
+        self.tun_dns_handler.clone()
     }
 
     /// Flush and stop the monitor's owned SQLite persistence task after all
@@ -420,6 +429,8 @@ impl RuntimeController {
         self.monitor.set_dns_handler(
             inbound_dns_handler(&next).map(|handler| handler as Arc<dyn SocketDnsHandler>),
         );
+        self.tun_dns_handler
+            .replace(inbound_dns_handler(&next).map(|handler| (*handler).clone()));
         let _ = self.reload_events.send(());
         if reload_inbounds {
             let _ = self.inbound_reload_events.send(());

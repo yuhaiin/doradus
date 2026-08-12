@@ -576,9 +576,9 @@ async fn toggle_persisted_tun(
     data["enabled"] = serde_json::Value::Bool(enabled);
     record.data_json = serde_json::to_vec(&data).map_err(io_error)?;
     controller
-        .mutate_and_reload(
-            move |store| async move { store.repository().put_go_inbound(&record).await },
-        )
+        .mutate_and_reload_inbounds(move |store| async move {
+            store.repository().put_go_inbound(&record).await
+        })
         .await?;
 
     let deadline = Instant::now() + Duration::from_secs(5);

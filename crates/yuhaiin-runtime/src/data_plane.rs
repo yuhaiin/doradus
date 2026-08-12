@@ -8,7 +8,7 @@
 use std::net::IpAddr;
 #[cfg(feature = "tun")]
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -36,6 +36,51 @@ const DEFAULT_DNS_SERVER: &str = "127.0.0.1:5353";
 pub struct RuntimeDnsHandler {
     pub resolver: Arc<dyn AsyncIpResolver>,
     pub fakeip: Option<yuhaiin_store::FakeIpPools>,
+}
+
+/// A live DNS handler slot for long-lived TUN runtimes.
+///
+/// Ordinary resolver reloads must update DNS policy without rebuilding the
+/// TUN device or interrupting existing flows. The slot snapshots the current
+/// handler for each query, so an in-flight query can finish on the old
+/// immutable snapshot while the next query observes the new one.
+#[derive(Clone, Default)]
+pub(crate) struct ReloadableAsyncDnsHandler {
+    current: Arc<RwLock<Option<RuntimeDnsHandler>>>,
+}
+
+impl ReloadableAsyncDnsHandler {
+    pub(crate) fn new(handler: Option<RuntimeDnsHandler>) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(handler)),
+        }
+    }
+
+    pub(crate) fn replace(&self, handler: Option<RuntimeDnsHandler>) {
+        *self
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = handler;
+    }
+}
+
+impl AsyncDnsHandler for ReloadableAsyncDnsHandler {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+        let handler = self
+            .current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        Box::pin(async move {
+            match handler {
+                Some(handler) => handler.answer(packet).await,
+                None => Err(yuhaiin_core::Error::new(
+                    yuhaiin_core::ErrorKind::Closed,
+                    "TUN DNS hijacking is disabled",
+                )),
+            }
+        })
+    }
 }
 
 impl AsyncDnsHandler for RuntimeDnsHandler {
@@ -453,8 +498,10 @@ pub async fn run_tun_device_until_ref(
         _ => crate::inbound::selected_proxy_ids(&controller).await?,
     };
     let snapshot = controller.handle().load();
-    let async_dns_handler = inbound_dns_handler(&snapshot)
-        .map(|handler| handler as Arc<dyn yuhaiin_core::dns::AsyncDnsHandler>);
+    let async_dns_handler = snapshot
+        .inbound_settings
+        .hijack_dns
+        .then(|| controller.tun_dns_handler() as Arc<dyn yuhaiin_core::dns::AsyncDnsHandler>);
     let mut proxy_runtime = controller
         .build_tun_proxy_runtime_with_dns_and_udp(
             &config.direct_id,
@@ -710,6 +757,25 @@ mod tests {
     }
 
     struct ServiceBindingResolver;
+
+    struct FixedAddressResolver {
+        address: Ipv4Addr,
+    }
+
+    impl AsyncIpResolver for FixedAddressResolver {
+        fn resolve<'a>(
+            &'a self,
+            _domain: &'a DomainName,
+            _strategy: ResolveStrategy,
+        ) -> BoxFuture<'a, Result<IpSet>> {
+            Box::pin(async move {
+                Ok(IpSet {
+                    v4: vec![self.address],
+                    v6: Vec::new(),
+                })
+            })
+        }
+    }
 
     impl AsyncIpResolver for ServiceBindingResolver {
         fn resolve<'a>(
@@ -976,6 +1042,45 @@ mod tests {
         let decoded = decode_response(&response, 0x4242, DnsRecordType::Ptr).unwrap();
         assert_eq!(decoded.ptr_names, vec![original]);
         assert_eq!(decoded.minimum_ttl, Some(60));
+    }
+
+    #[tokio::test]
+    async fn reloadable_tun_dns_handler_switches_snapshots_without_rebuilding_owner() {
+        let domain = DomainName::new("reload.example.test").unwrap();
+        let packet = encode_query(0x1212, &domain, DnsRecordType::A).unwrap();
+        let handler = ReloadableAsyncDnsHandler::new(Some(RuntimeDnsHandler {
+            resolver: Arc::new(FixedAddressResolver {
+                address: Ipv4Addr::new(192, 0, 2, 10),
+            }),
+            fakeip: None,
+        }));
+        let response = handler.answer(&packet).await.unwrap();
+        assert_eq!(
+            decode_response(&response, 0x1212, DnsRecordType::A)
+                .unwrap()
+                .addresses
+                .v4,
+            vec![Ipv4Addr::new(192, 0, 2, 10)]
+        );
+
+        handler.replace(Some(RuntimeDnsHandler {
+            resolver: Arc::new(FixedAddressResolver {
+                address: Ipv4Addr::new(192, 0, 2, 11),
+            }),
+            fakeip: None,
+        }));
+        let response = handler.answer(&packet).await.unwrap();
+        assert_eq!(
+            decode_response(&response, 0x1212, DnsRecordType::A)
+                .unwrap()
+                .addresses
+                .v4,
+            vec![Ipv4Addr::new(192, 0, 2, 11)]
+        );
+
+        handler.replace(None);
+        let error = handler.answer(&packet).await.unwrap_err();
+        assert!(error.to_string().contains("DNS hijacking is disabled"));
     }
 
     #[tokio::test]

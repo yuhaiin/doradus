@@ -19,6 +19,14 @@
 > 运行中新增/切换节点时 selector 角色 ID 需要重建的兼容路径。普通 reload 不再误杀已有 flow，真正
 > 的 inbound 结构/认证变化仍明确触发 listener replacement。
 
+> 2026-08-12 TUN DNS hot-reload closure：TUN dispatcher 的 DNS 劫持不再把初始
+> `RuntimeSnapshot` 中的 resolver 永久捕获。controller 现在持有可热替换的、跨线程安全的
+> `RuntimeDnsHandler` 快照；resolver/FakeIP/inbound DNS policy reload 后，下一条 TUN DNS
+> query 使用新快照，进行中的 query 仍完成旧快照。`inbounds/config` 变更同时走专用 inbound
+> reload，使 `hijackDns` 开关能唤醒 TUN owner；不重建设备，也不打断无关既有 flow。新增
+> `reloadable_tun_dns_handler_switches_snapshots_without_rebuilding_owner` 单测，并由
+> Podman `make workspace-tests` 和 `make tun-api-process-smoke` 回归。
+
 > 2026-08-12 TUN Podman data-plane recheck：当前 rootless Podman 连接在显式传入宿主
 > `/dev/net/tun`、`--privileged`、`--network=none` 后，已实际通过 runtime-owned TUN
 > device lifecycle、普通 `fixed` TCP packet echo、disable/enable reload 后 packet echo 和
