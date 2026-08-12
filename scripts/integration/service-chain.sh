@@ -6,26 +6,40 @@ cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 cache_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration-reusable}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+build_image="${YUHAIIN_BUILD_IMAGE:-docker.io/library/rust:latest}"
+command -v podman >/dev/null
 mkdir -p "${cache_dir}"
 
-echo "[service-chain] building runtime and process test"
-cargo build \
-  --manifest-path "${repo_dir}/Cargo.toml" \
-  --target-dir "${target_dir}" \
-  -p yuhaiin-runtime \
-  --all-features \
-  --offline \
-  --bin yuhaiin \
-  >"${cache_dir}/runtime-build.log"
-cargo test \
-  --manifest-path "${repo_dir}/Cargo.toml" \
-  --target-dir "${target_dir}" \
-  -p yuhaiin-runtime \
-  --all-features \
-  --offline \
-  --test service_chain \
-  --no-run \
-  >"${cache_dir}/build.log"
+echo "[service-chain] compiling runtime and process test in Podman"
+podman run --rm --network=host \
+  -v "${repo_dir}:/workspace:ro" \
+  -v "${target_dir}:/target:Z" \
+  -v "${cache_dir}:/state:Z" \
+  -v "${HOME}/.cargo:/cargo-home:ro" \
+  --entrypoint /bin/sh \
+  "${build_image}" \
+  -ec '
+    set -eu
+    mkdir -p /state/home /state/cache/tmp
+    export HOME=/state/home
+    export CARGO_HOME=/cargo-home
+    export CARGO_TARGET_DIR=/target
+    export TMPDIR=/state/cache/tmp
+    export CARGO_NET_OFFLINE=true
+    CARGO_TERM_COLOR=never cargo build \
+      --manifest-path /workspace/Cargo.toml \
+      -p yuhaiin-runtime \
+      --all-features \
+      --bin yuhaiin \
+      >/state/runtime-build.log 2>&1
+    CARGO_TERM_COLOR=never cargo test \
+      --manifest-path /workspace/Cargo.toml \
+      -p yuhaiin-runtime \
+      --all-features \
+      --test service_chain \
+      --no-run \
+      >/state/build.log 2>&1
+  '
 
 test_binary="$({
   find "${target_dir}/debug/deps" -maxdepth 1 -type f -executable \

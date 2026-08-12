@@ -2340,11 +2340,13 @@ async fn mixed_inbound_exposes_socks5_udp_and_keeps_supervisor_alive() {
 
     let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let payload = b"mixed-udp-payload";
-    let mut packet = vec![0, 0, 0, 1];
-    match target_address {
-        SocketAddr::V4(address) => packet.extend_from_slice(&address.ip().octets()),
-        SocketAddr::V6(_) => panic!("mixed UDP integration target must be IPv4"),
-    }
+    // Keep the destination as a domain all the way through the inbound and
+    // direct outbound. This is the process-level regression for the old
+    // "already-resolved IP endpoint" failure; the local echo server still
+    // gives the resolver a deterministic loopback result.
+    let target_domain = b"localhost";
+    let mut packet = vec![0, 0, 0, 3, target_domain.len() as u8];
+    packet.extend_from_slice(target_domain);
     packet.extend_from_slice(&target_address.port().to_be_bytes());
     packet.extend_from_slice(payload);
 
@@ -2374,8 +2376,24 @@ async fn mixed_inbound_exposes_socks5_udp_and_keeps_supervisor_alive() {
         .find(|item| item["inboundName"] == "mixed")
         .expect("mixed UDP connection must be visible");
     assert_eq!(item["inbound"], "mixed");
-    assert_eq!(item["outbound"], target_address.to_string());
+    assert_eq!(item["domain"], "localhost");
+    assert_eq!(
+        item["destination"],
+        format!("localhost:{}", target_address.port())
+    );
     assert!(length > payload.len());
+
+    let logs = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/rpc/tools.logs",
+        Some(&json!({})),
+    )
+    .await
+    .to_string();
+    assert!(!logs.contains("protocol \\\"mixed\\\" has no UDP mode"));
+    assert!(!logs.contains("direct async proxy requires an already-resolved IP endpoint"));
 
     let _ = target_task.await;
     service.shutdown().await;

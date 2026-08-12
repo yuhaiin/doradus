@@ -4122,3 +4122,17 @@ Windows 原生 runner 等继续按清单保留；本轮只修正了已纳入桌�
 
 该单测已在 Podman `network=none` 中通过；生产 route/resolver projection 仍需要更多停止态
 Go 数据库样本，所以 checklist 的 `[~]` 保持不变。
+
+## 150. 2026-08-12 mixed UDP 域名目标回归与 service-chain 容器化
+
+历史日志中的两条错误现在由同一条真实进程回归固定：`mixed` inbound 发送 SOCKS5 UDP
+domain target `localhost:<port>`，经过 direct outbound 解析并回到 loopback UDP echo；测试同时
+检查连接 metadata 中保留 `domain=localhost` 和 `destination=localhost:<port>`，以及日志不再出现
+`protocol "mixed" has no UDP mode` 或 `direct async proxy requires an already-resolved IP endpoint`。
+这补上了此前只用 IPv4 字面量验证 mixed UDP 的盲区；该测试在 Podman 中通过，16/16
+service-chain 矩阵保持通过。
+
+另外，`scripts/integration/service-chain.sh` 的 runtime 和 test harness 编译阶段也改为在
+Podman Rust image 中执行，宿主机只负责挂载源码、`~/.cache/yuhaiin-rust/cargo-target` 和日志；
+运行阶段继续使用独立 Podman Debian container。编译和测试临时目录均指向 cache-backed
+`/state/cache/tmp`，不使用宿主机 `/tmp`。
