@@ -212,6 +212,10 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 | 命令 | Podman 场景 | 结果 |
 | --- | --- | --- |
+| `make tun-chain-service-smoke`（2026-08-13 当前轮） | disposable user/network Podman namespace；runtime、真实 TUN、echo target 和临时状态均在容器，日志位于 `~/.cache/yuhaiin-rust/integration/tun-chain-service` | `runtime-tun-chain-ready`、`runtime-tun-traffic-ok`、`runtime-tun-closed` 全部通过；实际链路为 TUN → fixed → TLS → HTTP/2 → Yuubinsya → echo |
+| `make wireguard-chain-smoke`（2026-08-13 当前轮） | Podman `--privileged --network=none`；runtime、BoringTun peer、SQLite 和 harness 均在容器，日志位于 `~/.cache/yuhaiin-rust/integration/wireguard-chain` | `2 passed, 0 failed`；HTTP/TCP 与 SOCKS5/UDP 两条 inbound → CIDR router → Cloudflare BoringTun WireGuard outbound 链均通过 |
+| `make api-contract-smoke`（2026-08-13 当前轮） | `network=none` Podman；真实前台 runtime 和 API contract harness 均在容器，日志位于 `~/.cache/yuhaiin-rust/integration/api-contract` | `3 passed, 0 failed`；前端管理 API round-trip、嵌套路由 match history、direct domain latency 全部通过 |
+| `make service-chain-smoke`（2026-08-13 当前轮） | Podman host-network；runtime/process harness 和目标 listener 均在容器，日志位于 `~/.cache/yuhaiin-rust/integration-reusable` | `20 passed, 0 failed`；包含 mixed UDP、TLS/H2/Yuubinsya、VLESS/VMess/Trojan TCP/UDP、reverse、透明 wrapper 和实时状态链 |
 | `cargo test -p yuhaiin-runtime --all-features --offline --lib transparent_tls_transport_is_unwrapped_before_relay -- --nocapture --test-threads=1`（2026-08-12 当前轮） | Rust 1.97.1 Podman、host network；编译/运行和状态均位于 `~/.cache/yuhaiin-rust` | `1 passed, 0 failed`；真实 RustCrypto TLS handshake → transparent relay → direct outbound → TCP echo |
 | `cargo test -p yuhaiin-runtime --all-features --offline --lib transparent_ -- --nocapture --test-threads=1`（2026-08-12 当前轮） | Rust 1.97.1 Podman、host network；状态位于 `~/.cache/yuhaiin-rust` | 透明 transport 相关 `5 passed, 0 failed`；allow-list、TLS→relay、AEAD→relay 和原有 REDIRECT listener 单测 |
 | `make transparent-service-smoke`（2026-08-12 当前轮） | privileged Podman transparent namespace；运行日志位于 `~/.cache/yuhaiin-rust/integration/transparent-service` | REDIRECT TCP 2 flows、upload/download、关闭流程通过；rootless capability policy 下 TPROXY UDP 明确 skipped |
