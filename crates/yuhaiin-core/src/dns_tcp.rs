@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::dns::{
     DnsHandler, DnsRecordType, DnsResponse, answer_query, decode_response, encode_query,
+    validate_query_packet, validate_response_packet,
 };
 use crate::{DomainName, Error, ErrorKind, IpSet, ResolveStrategy, Result};
 
@@ -23,15 +24,21 @@ pub struct TcpDnsClient {
 }
 
 impl TcpDnsClient {
-    pub fn query(&self, domain: &DomainName, record_type: DnsRecordType) -> Result<DnsResponse> {
+    pub fn query_packet(&self, packet: &[u8]) -> Result<Vec<u8>> {
+        validate_query_packet(packet)?;
         let mut stream = TcpStream::connect_timeout(&self.server, self.timeout)
             .map_err(|error| Error::new(ErrorKind::Timeout, format!("connect DNS TCP: {error}")))?;
         configure_stream(&stream, self.timeout)?;
+        write_frame(&mut stream, packet)?;
+        let response = read_frame(&mut stream, self.max_packet_size)?;
+        validate_response_packet(packet, &response)?;
+        Ok(response)
+    }
 
+    pub fn query(&self, domain: &DomainName, record_type: DnsRecordType) -> Result<DnsResponse> {
         let id = next_transaction_id();
         let request = encode_query(id, domain, record_type)?;
-        write_frame(&mut stream, &request)?;
-        let response = read_frame(&mut stream, self.max_packet_size)?;
+        let response = self.query_packet(&request)?;
         decode_response(&response, id, record_type)
     }
 

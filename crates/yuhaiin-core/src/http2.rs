@@ -13,7 +13,8 @@ use crate::LocalBoxFuture;
 #[cfg(feature = "async-proxy")]
 use crate::dns::AsyncDnsHandler;
 use crate::dns::{
-    DnsRecordType, DnsResponse, decode_query, decode_response, encode_query, encode_response,
+    DnsRecordType, DnsResponse, decode_response, encode_query, validate_query_packet,
+    validate_response_packet,
 };
 use crate::{BoxFuture, DomainName, Error, ErrorKind, Result};
 
@@ -49,13 +50,23 @@ impl<C: H2DohConnector> H2DohClient<C> {
         domain: &DomainName,
         record_type: DnsRecordType,
     ) -> Result<DnsResponse> {
+        let id = next_transaction_id();
+        let body = encode_query(id, domain, record_type)?;
+        let response = self.query_packet(&body).await?;
+        decode_response(&response, id, record_type)
+    }
+
+    /// Send a complete RFC 8484 DNS message and return the upstream message
+    /// unchanged. Keeping this boundary packet-oriented means DoH does not
+    /// lose records, EDNS options or DNSSEC data that the typed resolver does
+    /// not model.
+    pub async fn query_packet(&self, query_packet: &[u8]) -> Result<Vec<u8>> {
+        validate_query_packet(query_packet)?;
         let stream = self.connector.connect(&self.endpoint).await?;
         let (mut sender, connection) = h2::client::handshake(stream).await.map_err(|error| {
             Error::new(ErrorKind::Protocol, format!("HTTP/2 handshake: {error}"))
         })?;
 
-        let id = next_transaction_id();
-        let body = encode_query(id, domain, record_type)?;
         let request = Request::builder()
             .method("POST")
             .uri(self.endpoint.clone())
@@ -69,7 +80,7 @@ impl<C: H2DohConnector> H2DohClient<C> {
             .send_request(request, false)
             .map_err(|error| Error::new(ErrorKind::Protocol, format!("HTTP/2 request: {error}")))?;
         send_body
-            .send_data(Bytes::from(body), true)
+            .send_data(Bytes::copy_from_slice(query_packet), true)
             .map_err(|error| Error::new(ErrorKind::Protocol, format!("HTTP/2 body: {error}")))?;
 
         let response_future = async {
@@ -109,7 +120,8 @@ impl<C: H2DohConnector> H2DohClient<C> {
                     })?;
                 bytes.extend_from_slice(&chunk);
             }
-            decode_response(&bytes, id, record_type)
+            validate_response_packet(query_packet, &bytes)?;
+            Ok(bytes)
         };
 
         // A DoH server normally keeps the HTTP/2 connection alive for reuse.
@@ -140,17 +152,7 @@ impl<C: H2DohConnector> H2DohClient<C> {
 #[cfg(feature = "async-proxy")]
 impl<C: H2DohConnector> AsyncDnsHandler for H2DohDnsHandler<C> {
     fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
-        let question = match decode_query(packet) {
-            Ok(question) => question,
-            Err(error) => return Box::pin(async move { Err(error) }),
-        };
-        Box::pin(async move {
-            let answer = self
-                .client
-                .query(&question.domain, question.record_type)
-                .await?;
-            encode_response(packet, &answer)
-        })
+        Box::pin(async move { self.client.query_packet(packet).await })
     }
 }
 
@@ -163,6 +165,7 @@ fn next_transaction_id() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns::encode_response;
 
     #[test]
     fn relative_uri_is_not_an_absolute_doh_endpoint() {

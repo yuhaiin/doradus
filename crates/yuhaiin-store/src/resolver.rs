@@ -266,6 +266,13 @@ impl AsyncIpResolver for FakeIpResolver {
             Ok(response)
         })
     }
+
+    fn query_packet<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        // FakeIP only rewrites address-bearing records. Unknown records must
+        // retain their upstream wire representation and are therefore passed
+        // through unchanged.
+        self.upstream.query_packet(packet)
+    }
 }
 
 fn empty_dns_response() -> DnsResponse {

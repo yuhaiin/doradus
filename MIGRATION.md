@@ -4350,4 +4350,23 @@ transparent relay 前完成 server handshake；Go 的 `http_mock` listener 不�
 语义，当前仍显式拒绝，避免把 TPROXY/REDIRECT 的原始目的地址静默替换成 listener 地址。
 同时，`tls_auto` inbound 的 connection metadata 现在与 TLS 一样标记为 `protocol=tls`，避免
 TLS 握手后的协议嗅探覆盖 transport 级信息。当前轮 runtime 全量单测 `280/280`、透明
-transport focused `5/5`、`make transparent-service-smoke` 均在 Podman 通过。
+ transport focused `5/5`、`make transparent-service-smoke` 均在 Podman 通过。
+
+## 162. 2026-08-13 DNS 原始报文透传边界
+
+对照 Go DNS server/resolver 的 raw message 行为后确认，Rust 之前把 DNS
+QTYPE 收窄为 A/AAAA/PTR/HTTPS/SVCB；这会让 MX、TXT、CNAME、NS 和 DNSSEC
+等合法请求在 server、DoH 或 DoT 链路中直接返回 `Unsupported`，不符合代理
+DNS server 的透明转发职责。
+
+本轮在 `yuhaiin-core` 增加 packet-level query boundary：UDP、TCP、DoH
+client 均能发送并返回完整 DNS message，校验 query/response transaction id，
+不重建或丢弃 EDNS、DNSSEC 和未知 QTYPE 字段。异步 resolver 的 boxed、hosts、
+FakeIP、IPv6 policy、timeout、fallback wrapper 均转发该边界；A/AAAA/PTR/
+HTTPS/SVCB 仍使用原有 typed API，以保留 FakeIP、PTR reverse 和 SVCB hint
+策略。Unix system resolver 在 raw query 时读取 `/etc/resolv.conf` 的
+nameserver 并走 UDP；runtime DNS handler 对未建模 QTYPE 走这个 packet path。
+
+新增 UDP/TCP raw TXT query unit、runtime raw DNS unit；Podman 中 core
+`--all-features` 为 `150 passed, 0 failed`，runtime raw DNS focused 为
+`1 passed, 0 failed`。宿主只执行了 `cargo fmt`/diff 检查，未使用 `/tmp`。

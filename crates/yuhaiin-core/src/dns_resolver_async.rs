@@ -48,6 +48,19 @@ pub trait AsyncIpResolver: Send + Sync {
             })
         })
     }
+
+    /// Forward a complete DNS message without converting its QTYPE or
+    /// answer records into the address-oriented model above.  Implementations
+    /// backed by UDP/TCP/DoH override this method; policy layers forward it so
+    /// uncommon records remain usable through the runtime DNS server.
+    fn query_packet<'a>(&'a self, _packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async {
+            Err(crate::Error::new(
+                crate::ErrorKind::Unsupported,
+                "resolver does not support raw DNS packet queries",
+            ))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -91,6 +104,59 @@ impl AsyncIpResolver for SystemAsyncIpResolver {
             Ok(result)
         })
     }
+
+    fn query_packet<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            let server = tokio::task::spawn_blocking(read_system_dns_server)
+                .await
+                .map_err(|error| {
+                    crate::Error::new(
+                        crate::ErrorKind::Io,
+                        format!("read system DNS server task: {error}"),
+                    )
+                })??;
+            AsyncUdpDnsClient {
+                server,
+                timeout: std::time::Duration::from_secs(5),
+                max_packet_size: 65535,
+                local_bind_addresses: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+            }
+            .query_packet(packet)
+            .await
+        })
+    }
+}
+
+fn read_system_dns_server() -> Result<std::net::SocketAddr> {
+    #[cfg(unix)]
+    {
+        let contents = std::fs::read_to_string("/etc/resolv.conf").map_err(|error| {
+            crate::Error::new(
+                crate::ErrorKind::Io,
+                format!("read /etc/resolv.conf: {error}"),
+            )
+        })?;
+        for line in contents.lines() {
+            let mut fields = line.split_whitespace();
+            if fields.next() != Some("nameserver") {
+                continue;
+            }
+            if let Some(address) = fields.next().and_then(|value| value.parse().ok()) {
+                return Ok(std::net::SocketAddr::new(address, 53));
+            }
+        }
+        Err(crate::Error::new(
+            crate::ErrorKind::NotFound,
+            "system DNS configuration has no nameserver",
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(crate::Error::new(
+            crate::ErrorKind::Unsupported,
+            "raw system DNS queries are only supported on Unix hosts",
+        ))
+    }
 }
 
 /// Query-level variant whose future can safely cross a Tokio task boundary.
@@ -100,6 +166,16 @@ pub trait SendAsyncDnsQuery: Send + Sync {
         domain: &'a DomainName,
         record_type: DnsRecordType,
     ) -> BoxFuture<'a, Result<DnsResponse>>;
+
+    fn query_packet_send<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            let question = decode_query(packet)?;
+            let answer = self
+                .query_send(&question.domain, question.record_type)
+                .await?;
+            encode_response(packet, &answer)
+        })
+    }
 }
 
 impl<T: SendAsyncDnsQuery + ?Sized> SendAsyncDnsQuery for Box<T> {
@@ -110,6 +186,10 @@ impl<T: SendAsyncDnsQuery + ?Sized> SendAsyncDnsQuery for Box<T> {
     ) -> BoxFuture<'a, Result<DnsResponse>> {
         (**self).query_send(domain, record_type)
     }
+
+    fn query_packet_send<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        (**self).query_packet_send(packet)
+    }
 }
 
 pub trait AsyncDnsQuery: Send + Sync {
@@ -118,6 +198,14 @@ pub trait AsyncDnsQuery: Send + Sync {
         domain: &'a DomainName,
         record_type: DnsRecordType,
     ) -> LocalBoxFuture<'a, Result<DnsResponse>>;
+
+    fn query_packet<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            let question = decode_query(packet)?;
+            let answer = self.query(&question.domain, question.record_type).await?;
+            encode_response(packet, &answer)
+        })
+    }
 }
 
 impl AsyncDnsQuery for AsyncUdpDnsClient {
@@ -127,6 +215,10 @@ impl AsyncDnsQuery for AsyncUdpDnsClient {
         record_type: DnsRecordType,
     ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
         Box::pin(async move { AsyncUdpDnsClient::query(self, domain, record_type).await })
+    }
+
+    fn query_packet<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move { self.query_packet(packet).await })
     }
 }
 
@@ -138,6 +230,10 @@ impl SendAsyncDnsQuery for AsyncUdpDnsClient {
     ) -> BoxFuture<'a, Result<DnsResponse>> {
         Box::pin(async move { AsyncUdpDnsClient::query(self, domain, record_type).await })
     }
+
+    fn query_packet_send<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move { self.query_packet(packet).await })
+    }
 }
 
 impl<T: AsyncDnsQuery + ?Sized> AsyncDnsQuery for Box<T> {
@@ -147,6 +243,10 @@ impl<T: AsyncDnsQuery + ?Sized> AsyncDnsQuery for Box<T> {
         record_type: DnsRecordType,
     ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
         (**self).query(domain, record_type)
+    }
+
+    fn query_packet<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+        (**self).query_packet(packet)
     }
 }
 
@@ -159,6 +259,10 @@ impl<C: crate::http2::H2DohConnector> AsyncDnsQuery for crate::http2::H2DohClien
     ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
         Box::pin(async move { crate::http2::H2DohClient::query(self, domain, record_type).await })
     }
+
+    fn query_packet<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move { self.query_packet(packet).await })
+    }
 }
 
 #[cfg(feature = "http2")]
@@ -169,6 +273,10 @@ impl<C: crate::http2::H2DohConnector> SendAsyncDnsQuery for crate::http2::H2DohC
         record_type: DnsRecordType,
     ) -> BoxFuture<'a, Result<DnsResponse>> {
         Box::pin(async move { crate::http2::H2DohClient::query(self, domain, record_type).await })
+    }
+
+    fn query_packet_send<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move { self.query_packet(packet).await })
     }
 }
 
@@ -325,17 +433,26 @@ impl<Q: SendAsyncDnsQuery> AsyncIpResolver for AsyncDnsResolver<Q> {
     ) -> BoxFuture<'a, Result<DnsResponse>> {
         self.query_send(domain, record_type)
     }
+
+    fn query_packet<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        self.upstream.query_packet_send(packet)
+    }
 }
 
 impl<Q: AsyncDnsQuery> AsyncDnsHandler for AsyncDnsResolver<Q> {
     fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
-        let question = match decode_query(packet) {
-            Ok(question) => question,
-            Err(error) => return Box::pin(async move { Err(error) }),
-        };
+        let packet_result = decode_query(packet);
         Box::pin(async move {
-            let answer = self.query(&question.domain, question.record_type).await?;
-            encode_response(packet, &answer)
+            match packet_result {
+                Ok(question) => {
+                    let answer = self.query(&question.domain, question.record_type).await?;
+                    encode_response(packet, &answer)
+                }
+                Err(error) if error.kind == crate::ErrorKind::Unsupported => {
+                    self.upstream.query_packet(packet).await
+                }
+                Err(error) => Err(error),
+            }
         })
     }
 }

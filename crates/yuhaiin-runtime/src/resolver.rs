@@ -98,6 +98,14 @@ impl AsyncIpResolver for TimeoutResolver {
                 .map_err(|_| Error::new(ErrorKind::Timeout, "DNS resolver query timed out"))?
         })
     }
+
+    fn query_packet<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            tokio::time::timeout(self.timeout, self.inner.query_packet(packet))
+                .await
+                .map_err(|_| Error::new(ErrorKind::Timeout, "DNS resolver query timed out"))?
+        })
+    }
 }
 
 impl FallbackResolver {
@@ -144,6 +152,26 @@ impl AsyncIpResolver for FallbackResolver {
                 Err(primary_error) => self
                     .fallback
                     .query(domain, record_type)
+                    .await
+                    .map_err(|fallback_error| {
+                        Error::new(
+                            ErrorKind::Io,
+                            format!(
+                                "resolver primary failed: {primary_error}; fallback failed: {fallback_error}"
+                            ),
+                        )
+                    }),
+            }
+        })
+    }
+
+    fn query_packet<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            match self.primary.query_packet(packet).await {
+                Ok(response) => Ok(response),
+                Err(primary_error) => self
+                    .fallback
+                    .query_packet(packet)
                     .await
                     .map_err(|fallback_error| {
                         Error::new(

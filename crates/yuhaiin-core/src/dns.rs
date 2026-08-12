@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hickory_proto::op::{Message, Query};
+use hickory_proto::op::{Message, MessageType, Query};
 use hickory_proto::rr::rdata::svcb::{
     Alpn, EchConfigList, IpHint, Mandatory, SvcParamKey, SvcParamValue, Unknown,
 };
@@ -383,6 +383,24 @@ pub fn encode_query(id: u16, domain: &DomainName, record_type: DnsRecordType) ->
         .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))
 }
 
+/// Encode a DNS query for a QTYPE that is intentionally outside the typed
+/// resolver model. This is primarily useful to packet-forwarding callers and
+/// tests; address resolution should continue to use [`encode_query`].
+pub fn encode_raw_query(id: u16, domain: &DomainName, record_type: u16) -> Result<Vec<u8>> {
+    let name = Name::from_utf8(format!("{}.", domain))
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+    let mut message = Message::new(
+        id,
+        hickory_proto::op::MessageType::Query,
+        hickory_proto::op::OpCode::Query,
+    );
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(name, RecordType::from(record_type)));
+    message
+        .to_vec()
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))
+}
+
 pub fn decode_response(
     packet: &[u8],
     expected_id: u16,
@@ -452,6 +470,66 @@ pub fn decode_query(packet: &[u8]) -> Result<DnsQuestion> {
         domain,
         record_type,
     })
+}
+
+/// Validate a DNS query before handing it to a raw transport.
+///
+/// The typed resolver API intentionally models only records that yuhaiin
+/// interprets locally.  Transport-facing callers still need to forward every
+/// valid DNS question (for example MX, TXT, CNAME, NS and DNSSEC records), so
+/// this helper validates the wire message without narrowing its QTYPE.
+pub fn validate_query_packet(packet: &[u8]) -> Result<()> {
+    let message = Message::from_vec(packet)
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+    if message.queries.is_empty() {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "DNS request has no question",
+        ));
+    }
+    Ok(())
+}
+
+/// Check that a raw upstream response belongs to the original DNS query.
+pub fn validate_response_packet(query: &[u8], response: &[u8]) -> Result<()> {
+    let query = Message::from_vec(query)
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+    let response_message = Message::from_vec(response)
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+    if response_message.metadata.id != query.metadata.id {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "DNS transaction id mismatch",
+        ));
+    }
+    if response_message.metadata.message_type != MessageType::Response {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "DNS upstream returned a query instead of a response",
+        ));
+    }
+    Ok(())
+}
+
+/// Build an empty response for any valid DNS QTYPE while retaining every
+/// question from the request. Policy layers use this instead of the typed
+/// encoder when they intentionally block a raw record query.
+pub fn encode_empty_response(packet: &[u8]) -> Result<Vec<u8>> {
+    let message = Message::from_vec(packet)
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+    if message.queries.is_empty() {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "DNS request has no question",
+        ));
+    }
+    let mut response = Message::response(message.metadata.id, message.metadata.op_code);
+    for query in &message.queries {
+        response.add_query(query.clone());
+    }
+    response
+        .to_vec()
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))
 }
 
 pub fn encode_response(packet: &[u8], answer: &DnsResponse) -> Result<Vec<u8>> {
@@ -539,18 +617,26 @@ pub struct DohClient<T> {
 }
 
 impl<T: DohTransport> DohClient<T> {
+    pub fn query_packet(&self, packet: &[u8]) -> Result<Vec<u8>> {
+        validate_query_packet(packet)?;
+        let response = self
+            .transport
+            .post_dns_message(&self.endpoint, packet, self.timeout)?;
+        validate_response_packet(packet, &response)?;
+        Ok(response)
+    }
+
     pub fn query(&self, domain: &DomainName, record_type: DnsRecordType) -> Result<DnsResponse> {
         let id = next_transaction_id();
         let request = encode_query(id, domain, record_type)?;
-        let response = self
-            .transport
-            .post_dns_message(&self.endpoint, &request, self.timeout)?;
+        let response = self.query_packet(&request)?;
         decode_response(&response, id, record_type)
     }
 }
 
 impl UdpDnsClient {
-    pub fn query(&self, domain: &DomainName, record_type: DnsRecordType) -> Result<DnsResponse> {
+    pub fn query_packet(&self, packet: &[u8]) -> Result<Vec<u8>> {
+        validate_query_packet(packet)?;
         let socket = if self.server.is_ipv4() {
             UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         } else {
@@ -563,16 +649,22 @@ impl UdpDnsClient {
         socket
             .set_write_timeout(Some(self.timeout))
             .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?;
-        let id = next_transaction_id();
-        let request = encode_query(id, domain, record_type)?;
         socket
-            .send_to(&request, self.server)
+            .send_to(packet, self.server)
             .map_err(|error| Error::new(ErrorKind::Io, format!("send DNS query: {error}")))?;
         let mut response = vec![0; self.max_packet_size.max(512)];
         let size = socket.recv(&mut response).map_err(|error| {
             Error::new(ErrorKind::Timeout, format!("receive DNS response: {error}"))
         })?;
-        decode_response(&response[..size], id, record_type)
+        validate_response_packet(packet, &response[..size])?;
+        Ok(response[..size].to_vec())
+    }
+
+    pub fn query(&self, domain: &DomainName, record_type: DnsRecordType) -> Result<DnsResponse> {
+        let id = next_transaction_id();
+        let request = encode_query(id, domain, record_type)?;
+        let response = self.query_packet(&request)?;
+        decode_response(&response, id, record_type)
     }
 
     pub fn resolve(&self, domain: &DomainName, strategy: ResolveStrategy) -> Result<IpSet> {
@@ -627,18 +719,7 @@ impl<H: AsyncDnsHandler> AsyncDnsHandler for AsyncPolicyDnsHandler<H> {
                     "DNS query blocked by route policy",
                 ))
             }),
-            DnsPolicy::Empty => Box::pin(async move {
-                decode_query(packet)?;
-                encode_response(
-                    packet,
-                    &DnsResponse {
-                        addresses: IpSet::default(),
-                        ptr_names: Vec::new(),
-                        service_bindings: Vec::new(),
-                        minimum_ttl: Some(0),
-                    },
-                )
-            }),
+            DnsPolicy::Empty => Box::pin(async move { encode_empty_response(packet) }),
         }
     }
 }

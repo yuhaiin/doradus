@@ -426,6 +426,12 @@ impl AsyncIpResolver for Ipv6PolicyResolver {
             Ok(response)
         })
     }
+
+    fn query_packet<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        // IPv6 policy can safely transform the typed address model, but raw
+        // DNS records must keep their original wire representation.
+        self.upstream.query_packet(packet)
+    }
 }
 
 #[cfg(test)]

@@ -14,8 +14,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::dns::{
-    AsyncDnsHandler, DnsRecordType, DnsResponse, decode_query, decode_response, encode_query,
-    encode_response,
+    AsyncDnsHandler, DnsRecordType, DnsResponse, decode_response, encode_query,
+    validate_query_packet, validate_response_packet,
 };
 use crate::dns_resolver_async::{AsyncDnsQuery, SendAsyncDnsQuery};
 use crate::{
@@ -33,6 +33,56 @@ pub struct AsyncTcpDnsClient {
 }
 
 impl AsyncTcpDnsClient {
+    /// Send a complete DNS message, preserving uncommon QTYPEs and all
+    /// caller-provided EDNS/DNSSEC fields. The typed `query` API remains the
+    /// address-oriented convenience layer used by proxy dialing.
+    pub async fn query_packet(&self, packet: &[u8]) -> Result<Vec<u8>> {
+        validate_query_packet(packet)?;
+        let local_bind = self
+            .local_bind_addresses
+            .iter()
+            .copied()
+            .find(|address| address.is_ipv4() == self.server.is_ipv4())
+            .map(|address| SocketAddr::new(address, 0));
+        let connect = async {
+            if let Some(local_bind) = local_bind {
+                let socket = if self.server.is_ipv4() {
+                    tokio::net::TcpSocket::new_v4()
+                } else {
+                    tokio::net::TcpSocket::new_v6()
+                }
+                .map_err(|error| {
+                    Error::new(ErrorKind::Io, format!("create DNS TCP socket: {error}"))
+                })?;
+                socket.bind(local_bind).map_err(|error| {
+                    Error::new(ErrorKind::Io, format!("bind DNS TCP socket: {error}"))
+                })?;
+                socket
+                    .connect(self.server)
+                    .await
+                    .map_err(|error| Error::new(ErrorKind::Io, format!("connect DNS TCP: {error}")))
+            } else {
+                TcpStream::connect(self.server)
+                    .await
+                    .map_err(|error| Error::new(ErrorKind::Io, format!("connect DNS TCP: {error}")))
+            }
+        };
+        let mut stream = tokio::time::timeout(self.timeout, connect)
+            .await
+            .map_err(|_| Error::new(ErrorKind::Timeout, "connect DNS TCP timed out"))??;
+        stream
+            .set_nodelay(true)
+            .map_err(|error| Error::new(ErrorKind::Io, format!("configure DNS TCP: {error}")))?;
+        let response = tokio::time::timeout(self.timeout, async {
+            write_frame(&mut stream, packet).await?;
+            read_frame(&mut stream, self.max_packet_size).await
+        })
+        .await
+        .map_err(|_| Error::new(ErrorKind::Timeout, "DNS TCP query timed out"))??;
+        validate_response_packet(packet, &response)?;
+        Ok(response)
+    }
+
     pub async fn query(
         &self,
         domain: &DomainName,
@@ -116,6 +166,10 @@ impl AsyncDnsQuery for AsyncTcpDnsClient {
     ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
         Box::pin(async move { AsyncTcpDnsClient::query(self, domain, record_type).await })
     }
+
+    fn query_packet<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move { self.query_packet(packet).await })
+    }
 }
 
 impl SendAsyncDnsQuery for AsyncTcpDnsClient {
@@ -125,6 +179,10 @@ impl SendAsyncDnsQuery for AsyncTcpDnsClient {
         record_type: DnsRecordType,
     ) -> BoxFuture<'a, Result<DnsResponse>> {
         Box::pin(async move { AsyncTcpDnsClient::query(self, domain, record_type).await })
+    }
+
+    fn query_packet_send<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move { self.query_packet(packet).await })
     }
 }
 
@@ -140,17 +198,7 @@ impl AsyncTcpDnsHandler {
 
 impl AsyncDnsHandler for AsyncTcpDnsHandler {
     fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
-        let question = match decode_query(packet) {
-            Ok(question) => question,
-            Err(error) => return Box::pin(async move { Err(error) }),
-        };
-        Box::pin(async move {
-            let answer = self
-                .client
-                .query(&question.domain, question.record_type)
-                .await?;
-            encode_response(packet, &answer)
-        })
+        Box::pin(async move { self.client.query_packet(packet).await })
     }
 }
 
@@ -352,6 +400,7 @@ fn next_transaction_id() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns::{decode_query, encode_raw_query, encode_response};
     use std::net::Ipv4Addr;
 
     struct StaticHandler;
@@ -416,6 +465,45 @@ mod tests {
                 vec![Ipv4Addr::new(192, 0, 2, 53)]
             );
         });
+    }
+
+    #[test]
+    fn async_tcp_client_forwards_unmodeled_qtypes_as_raw_packets() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(async {
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let request = read_frame(&mut stream, 2048).await.unwrap();
+                    assert_eq!(
+                        decode_query(&request).unwrap_err().kind,
+                        ErrorKind::Unsupported
+                    );
+                    let mut response = request.clone();
+                    response[2] |= 0x80;
+                    write_frame(&mut stream, &response).await.unwrap();
+                });
+
+                let client = AsyncTcpDnsClient {
+                    server: address,
+                    timeout: Duration::from_secs(1),
+                    max_packet_size: 2048,
+                    local_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
+                };
+                let query = encode_raw_query(0x6b6b, &DomainName::new("example.com").unwrap(), 16)?;
+                let response = client.query_packet(&query).await?;
+                let mut expected = query.clone();
+                expected[2] |= 0x80;
+                assert_eq!(response, expected);
+                server.await.unwrap();
+                Ok::<_, Error>(())
+            })
+            .unwrap();
     }
 
     #[test]

@@ -12,8 +12,8 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 
 use crate::dns::{
-    AsyncDnsHandler, DnsRecordType, DnsResponse, decode_query, decode_response, encode_query,
-    encode_response,
+    AsyncDnsHandler, DnsRecordType, DnsResponse, decode_response, encode_query,
+    validate_query_packet, validate_response_packet,
 };
 use crate::{DomainName, Error, ErrorKind, IpSet, LocalBoxFuture, ResolveStrategy, Result};
 
@@ -26,6 +26,49 @@ pub struct AsyncUdpDnsClient {
 }
 
 impl AsyncUdpDnsClient {
+    /// Send a complete DNS message without narrowing its QTYPE to the
+    /// address-oriented resolver model. This is used for MX/TXT/CNAME and
+    /// DNSSEC queries received by the runtime DNS server.
+    pub async fn query_packet(&self, packet: &[u8]) -> Result<Vec<u8>> {
+        validate_query_packet(packet)?;
+        let default_bind = if self.server.is_ipv4() {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        } else {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        };
+        let bind_address = self
+            .local_bind_addresses
+            .iter()
+            .copied()
+            .find(|address| address.is_ipv4() == self.server.is_ipv4())
+            .map(|address| SocketAddr::new(address, 0))
+            .unwrap_or(default_bind);
+        let socket = UdpSocket::bind(bind_address)
+            .await
+            .map_err(|error| Error::new(ErrorKind::Io, format!("bind DNS UDP socket: {error}")))?;
+        let max_packet_size = self.max_packet_size.max(512);
+        let server = self.server;
+        tokio::time::timeout(self.timeout, async move {
+            socket
+                .send_to(packet, server)
+                .await
+                .map_err(|error| Error::new(ErrorKind::Io, format!("send DNS query: {error}")))?;
+            let mut response = vec![0; max_packet_size];
+            loop {
+                let (size, peer) = socket.recv_from(&mut response).await.map_err(|error| {
+                    Error::new(ErrorKind::Io, format!("receive DNS response: {error}"))
+                })?;
+                if peer != server {
+                    continue;
+                }
+                validate_response_packet(packet, &response[..size])?;
+                return Ok(response[..size].to_vec());
+            }
+        })
+        .await
+        .map_err(|_| Error::new(ErrorKind::Timeout, "DNS UDP query timed out"))?
+    }
+
     pub async fn query(
         &self,
         domain: &DomainName,
@@ -104,17 +147,7 @@ impl AsyncUdpDnsHandler {
 
 impl AsyncDnsHandler for AsyncUdpDnsHandler {
     fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
-        let question = match decode_query(packet) {
-            Ok(question) => question,
-            Err(error) => return Box::pin(async move { Err(error) }),
-        };
-        Box::pin(async move {
-            let answer = self
-                .client
-                .query(&question.domain, question.record_type)
-                .await?;
-            encode_response(packet, &answer)
-        })
+        Box::pin(async move { self.client.query_packet(packet).await })
     }
 }
 
@@ -191,7 +224,7 @@ fn next_transaction_id() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::encode_query;
+    use crate::dns::{decode_query, encode_query, encode_raw_query, encode_response};
 
     #[test]
     fn async_udp_client_and_handler_round_trip_with_original_transaction() {
@@ -260,6 +293,44 @@ mod tests {
             };
             tokio::join!(server_future, client_future);
         });
+    }
+
+    #[test]
+    fn async_udp_client_forwards_unmodeled_qtypes_as_raw_packets() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(async {
+                let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+                let address = socket.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let mut request = vec![0; 2048];
+                    let (size, peer) = socket.recv_from(&mut request).await.unwrap();
+                    let request = &request[..size];
+                    assert_eq!(
+                        decode_query(request).unwrap_err().kind,
+                        ErrorKind::Unsupported
+                    );
+                    let mut response = request.to_vec();
+                    response[2] |= 0x80;
+                    socket.send_to(&response, peer).await.unwrap();
+                });
+
+                let client = AsyncUdpDnsClient {
+                    server: address,
+                    timeout: Duration::from_secs(1),
+                    max_packet_size: 2048,
+                    local_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
+                };
+                let query = encode_raw_query(0x5a5a, &DomainName::new("example.com").unwrap(), 16)?;
+                let response = client.query_packet(&query).await?;
+                assert_eq!(&response[..2], &query[..2]);
+                server.await.unwrap();
+                Ok::<_, Error>(())
+            })
+            .unwrap();
     }
 
     #[test]

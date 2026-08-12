@@ -93,6 +93,9 @@ impl RuntimeDnsHandler {
     async fn answer_impl(&self, packet: &[u8]) -> Result<Vec<u8>> {
         let question = match decode_query(packet) {
             Ok(question) => question,
+            Err(error) if error.kind == yuhaiin_core::ErrorKind::Unsupported => {
+                return self.resolver.query_packet(packet).await;
+            }
             Err(error) => return Err(error),
         };
         if question.record_type == DnsRecordType::Ptr
@@ -1104,6 +1107,48 @@ mod tests {
                 .params
                 .contains(&DnsServiceParam::Port(8443))
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_dns_forwards_unmodeled_qtypes_to_the_resolver() {
+        use yuhaiin_core::dns::{decode_query, encode_raw_query};
+
+        struct RawResolver;
+
+        impl AsyncIpResolver for RawResolver {
+            fn resolve<'a>(
+                &'a self,
+                _domain: &'a DomainName,
+                _strategy: ResolveStrategy,
+            ) -> BoxFuture<'a, Result<IpSet>> {
+                Box::pin(async { Ok(IpSet::default()) })
+            }
+
+            fn query_packet<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+                Box::pin(async move {
+                    assert_eq!(
+                        decode_query(packet).unwrap_err().kind,
+                        ErrorKind::Unsupported
+                    );
+                    let mut response = packet.to_vec();
+                    response[2] |= 0x80;
+                    Ok(response)
+                })
+            }
+        }
+
+        let query =
+            encode_raw_query(0x6161, &DomainName::new("example.test").unwrap(), 16).unwrap();
+        let handler = RuntimeDnsHandler {
+            resolver: Arc::new(RawResolver),
+            fakeip: None,
+        };
+        let response = handler.answer(&query).await.unwrap();
+        assert_eq!(response, {
+            let mut expected = query.clone();
+            expected[2] |= 0x80;
+            expected
+        });
     }
 
     #[tokio::test]

@@ -71,6 +71,10 @@ impl AsyncIpResolver for AsyncHostsResolver {
             })
         })
     }
+
+    fn query_packet<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        self.upstream.query_packet(packet)
+    }
 }
 
 fn filter_strategy(mut addresses: IpSet, strategy: ResolveStrategy) -> IpSet {

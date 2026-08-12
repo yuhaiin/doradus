@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::dns::{
     DnsCache, DnsHandler, DnsRecordType, DnsResponse, DohClient, DohTransport, UdpDnsClient,
+    decode_query, encode_response, validate_query_packet,
 };
 use crate::dns_tcp::TcpDnsClient;
 use crate::{DomainName, IpSet, ResolveStrategy, Result};
@@ -83,6 +84,23 @@ impl DnsResolver {
             cache.insert(domain.clone(), record_type, response.clone())?;
         }
         Ok(response)
+    }
+
+    /// Forward a complete DNS message through the selected transport. The
+    /// typed cache is deliberately bypassed because EDNS/DNSSEC flags and
+    /// non-address records are part of the caller's wire-level contract.
+    pub fn query_packet(&self, packet: &[u8]) -> Result<Vec<u8>> {
+        validate_query_packet(packet)?;
+        match &self.transport {
+            ResolverTransport::Udp(client) => client.query_packet(packet),
+            ResolverTransport::Tcp(client) => client.query_packet(packet),
+            ResolverTransport::Doh(client) => client.query_packet(packet),
+            ResolverTransport::Handler(handler) => {
+                let question = decode_query(packet)?;
+                let answer = handler.resolve(&question.domain, question.record_type)?;
+                encode_response(packet, &answer)
+            }
+        }
     }
 
     pub fn resolve(&self, domain: &DomainName, strategy: ResolveStrategy) -> Result<IpSet> {
