@@ -758,7 +758,14 @@ impl RuntimeSnapshot {
             }),
             semaphore: self.connect_semaphore.clone(),
         }) as Arc<dyn AsyncProxy>;
-        let proxy = if config.transport == yuhaiin_store::GoProxyTransport::Direct {
+        let proxy = if matches!(
+            config.transport,
+            yuhaiin_store::GoProxyTransport::Direct | yuhaiin_store::GoProxyTransport::Wireguard
+        ) {
+            // Direct and the userspace WireGuard stack both require an IP
+            // endpoint before opening their final socket. Keep their lookup
+            // on the runtime resolver boundary so route resolver policy,
+            // hosts and FakeIP are not silently replaced by getaddrinfo.
             self.resolve_proxy(proxy)
         } else {
             proxy
@@ -1986,12 +1993,19 @@ mod tests {
     use yuhaiin_trie::router::{RouteDecision, Router, RouterRuntime};
 
     fn snapshot(config: GoProxyRuntimeConfig) -> RuntimeSnapshot {
+        snapshot_with_resolver(config, Arc::new(SystemAsyncIpResolver))
+    }
+
+    fn snapshot_with_resolver(
+        config: GoProxyRuntimeConfig,
+        resolver: Arc<dyn AsyncIpResolver>,
+    ) -> RuntimeSnapshot {
         RuntimeSnapshot {
             settings: crate::RuntimeSettings::default(),
             connect_semaphore: Arc::new(tokio::sync::Semaphore::new(250)),
             socket_bind_addresses: Arc::from(Vec::<std::net::IpAddr>::new().into_boxed_slice()),
-            resolver: Arc::new(SystemAsyncIpResolver),
-            dns_resolver: Arc::new(SystemAsyncIpResolver),
+            resolver: Arc::clone(&resolver),
+            dns_resolver: resolver,
             hosts: yuhaiin_core::dns_hosts::HostsTable::new(),
             fakeip: None,
             inbound_settings: yuhaiin_store::InboundSettings::default(),
@@ -2291,6 +2305,82 @@ mod tests {
             .await
             .unwrap();
         built.proxy.close().await.unwrap();
+    }
+
+    struct MappingResolver {
+        address: std::net::Ipv4Addr,
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl AsyncIpResolver for MappingResolver {
+        fn resolve<'a>(
+            &'a self,
+            domain: &'a yuhaiin_core::DomainName,
+            _strategy: ResolveStrategy,
+        ) -> BoxFuture<'a, Result<IpSet>> {
+            self.queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(domain.to_string());
+            let address = self.address;
+            Box::pin(async move {
+                Ok(IpSet {
+                    v4: vec![address],
+                    v6: Vec::new(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_wireguard_resolves_domain_targets_with_configured_resolver() {
+        let key = |value| base64::engine::general_purpose::STANDARD.encode([value; 32]);
+        let config = GoProxyRuntimeConfig {
+            id: "wireguard-domain".to_owned(),
+            name: "WireGuard domain".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["wireguard".to_owned()],
+            layers: vec![GoProxyLayer {
+                kind: "wireguard".to_owned(),
+                config: serde_json::json!({
+                    "secretKey": key(3),
+                    "endpoint": ["10.0.0.2/32"],
+                    "peers": [{
+                        "publicKey": key(4),
+                        "endpoint": "127.0.0.1:51820",
+                        "allowedIps": ["0.0.0.0/0"]
+                    }]
+                }),
+            }],
+            transport: GoProxyTransport::Wireguard,
+            data_json: Vec::new(),
+        };
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let resolver = Arc::new(MappingResolver {
+            address: std::net::Ipv4Addr::LOCALHOST,
+            queries: Arc::clone(&queries),
+        });
+        let built = snapshot_with_resolver(config, resolver)
+            .build_proxy("wireguard-domain", Duration::from_secs(1))
+            .await
+            .unwrap();
+        let context = FlowContext::new(Endpoint::domain(
+            yuhaiin_core::Network::Tcp,
+            yuhaiin_core::DomainName::new("resolver-only.invalid").unwrap(),
+            80,
+        ));
+        let _stream = built.proxy.connect(&context).await.unwrap();
+        built.proxy.close().await.unwrap();
+
+        assert_eq!(
+            queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            ["resolver-only.invalid"]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
