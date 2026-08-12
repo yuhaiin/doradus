@@ -3867,3 +3867,15 @@ checklist 中的 `[~]` 项跟踪。
 - Linux `/proc/<pid>/exe` 在进程被替换后可能带有 ` (deleted)` 后缀；route-list process membership 和 loopback process guard 现在统一按去除该后缀后的路径比较，并由 route/loopback 单元回归覆盖。
 
 本轮仍没有把 rootful firewall/IPv6 extension-header 现场、第三方 WARP peer、真实 AWS、跨平台权限和远程 Actions 误报为完成；它们继续保持 checklist 的 `[~]`。
+
+## 135. 2026-08-12 TUN reload 现场与单设备边界
+
+本轮继续在 Podman 中验证 TUN owner 的实时生命周期，而不是只检查 SQLite 是否写入：
+
+- `make tun-reload-smoke` 通过 4 个 disable → reload → reopen 周期，确认 supervisor 会在配置通知后关闭旧设备、重新加载配置并恢复运行。
+- `YUHAIIN_TUN_RELOAD_CYCLES=2 make tun-reload-traffic-smoke` 通过，确认 reload 后仍能完成 fixed outbound 的真实 TUN packet echo；TUN 关闭期间也不会错误地产生 route 流量。
+- `make tun-api-process-smoke` 继续通过真实 `/dev/net/tun` 和 `/proc/net/dev` 的 disabled → enabled → disabled → enabled → disabled 进程级检查；`make startup-logs-smoke` 继续确认前台二进制默认输出 database、API bind、runtime ready、shutdown 和 stopped。
+
+Go 的 `inbounds_v2` 可以保存多个 TUN 记录，但本 Rust 桌面实现按当前“最简单的一种 TUN”约定只管理一个 OS TUN。多个同时启用的 TUN 记录会在选择阶段返回明确错误，而不是静默选择一个；这保留了配置错误可见性，也避免在尚未需要时引入多设备 route lease、名称冲突和并发 supervisor 编排。注入式 FD/mobile 边界仍是独立 API，不代表桌面多 TUN 支持。
+
+本轮没有发现需要为前端补写的 API projection 字段；Go/Rust API parity 脚本当前只忽略实现依赖的版本、远程 route cache、接口 link-local、license/log metadata，其他响应、mutation 和错误仍做严格比较。现场缓存继续只使用 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
