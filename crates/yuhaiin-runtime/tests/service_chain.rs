@@ -116,7 +116,9 @@ async fn connect_socks5_with_auth(
 #[derive(Clone, Copy)]
 enum ProtocolOutboundKind {
     Vless,
+    VlessTlsWebsocket,
     Vmess,
+    VmessTlsWebsocket,
     Trojan,
     TrojanWebsocket,
     TrojanTlsWebsocket,
@@ -126,7 +128,9 @@ impl ProtocolOutboundKind {
     fn name(self) -> &'static str {
         match self {
             Self::Vless => "vless",
+            Self::VlessTlsWebsocket => "vless-tls-websocket",
             Self::Vmess => "vmess",
+            Self::VmessTlsWebsocket => "vmess-tls-websocket",
             Self::Trojan => "trojan",
             Self::TrojanWebsocket => "trojan-websocket",
             Self::TrojanTlsWebsocket => "trojan-tls-websocket",
@@ -160,26 +164,16 @@ async fn protocol_outbound_server(
         );
         match kind {
             ProtocolOutboundKind::Vless => {
-                let uuid = vless::parse_uuid("00112233-4455-6677-8899-aabbccddeeff").unwrap();
-                let request = vless::read_request(&mut stream, &uuid).await.unwrap();
-                assert_eq!(request.command, vless::Command::Tcp);
-                assert_eq!(request.destination, destination);
-                vless::write_response(&mut stream, &[]).await.unwrap();
-                if connection == 0 {
-                    let mut payload = vec![0u8; expected_payload.len()];
-                    stream.read_exact(&mut payload).await.unwrap();
-                    assert_eq!(payload, expected_payload);
-                    stream.write_all(expected_payload).await.unwrap();
-                } else {
-                    let request = read_http_headers(&mut stream).await;
-                    assert!(request.starts_with(b"GET /health HTTP/1.1\r\n"));
-                    stream
-                        .write_all(
-                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        )
-                        .await
-                        .unwrap();
-                }
+                serve_vless_connection(&mut stream, connection, destination, expected_payload)
+                    .await;
+            }
+            ProtocolOutboundKind::VlessTlsWebsocket => {
+                let stream = tls_server_acceptor().accept(stream).await.unwrap();
+                let websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut stream = WebSocketIo::new(websocket);
+                serve_vless_connection(&mut stream, connection, destination, expected_payload)
+                    .await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
             ProtocolOutboundKind::Trojan => {
                 serve_trojan_connection(&mut stream, connection, destination, expected_payload)
@@ -204,62 +198,106 @@ async fn protocol_outbound_server(
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             ProtocolOutboundKind::Vmess => {
-                const UUID: [u8; 16] = [
-                    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
-                    0xdd, 0xee, 0xff,
-                ];
-                let request = vmess::read_request(&mut stream, &UUID).await.unwrap();
-                assert_eq!(request.destination, destination);
-                let response_key = sha256_key(&request.body_key);
-                let response_iv = sha256_key(&request.body_iv);
-                stream
-                    .write_all(
-                        &vmess::encode_response_header(
-                            request.response_v,
-                            &response_key,
-                            &response_iv,
-                        )
-                        .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let payload = vmess::read_body_frame(
-                    &mut stream,
-                    &request.body_key,
-                    &request.body_iv,
-                    request.security,
-                    0,
-                )
-                .await
-                .unwrap()
-                .unwrap();
-                if connection == 0 {
-                    assert_eq!(payload, expected_payload);
-                    vmess::write_body_frame(
-                        &mut stream,
-                        &response_key,
-                        &response_iv,
-                        request.security,
-                        0,
-                        expected_payload,
-                    )
-                    .await
-                    .unwrap();
-                } else {
-                    assert!(payload.starts_with(b"GET /health HTTP/1.1\r\n"));
-                    vmess::write_body_frame(
-                        &mut stream,
-                        &response_key,
-                        &response_iv,
-                        request.security,
-                        0,
-                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .await
-                    .unwrap();
-                }
+                serve_vmess_connection(&mut stream, connection, destination, expected_payload)
+                    .await;
+            }
+            ProtocolOutboundKind::VmessTlsWebsocket => {
+                let stream = tls_server_acceptor().accept(stream).await.unwrap();
+                let websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut stream = WebSocketIo::new(websocket);
+                serve_vmess_connection(&mut stream, connection, destination, expected_payload)
+                    .await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
+    }
+}
+
+async fn serve_vless_connection<S>(
+    stream: &mut S,
+    connection: usize,
+    destination: Endpoint,
+    expected_payload: &'static [u8],
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let uuid = vless::parse_uuid("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+    let request = vless::read_request(stream, &uuid).await.unwrap();
+    assert_eq!(request.command, vless::Command::Tcp);
+    assert_eq!(request.destination, destination);
+    vless::write_response(stream, &[]).await.unwrap();
+    if connection == 0 {
+        let mut payload = vec![0u8; expected_payload.len()];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(payload, expected_payload);
+        stream.write_all(expected_payload).await.unwrap();
+    } else {
+        let request = read_http_headers(stream).await;
+        assert!(request.starts_with(b"GET /health HTTP/1.1\r\n"));
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    }
+}
+
+async fn serve_vmess_connection<S>(
+    stream: &mut S,
+    connection: usize,
+    destination: Endpoint,
+    expected_payload: &'static [u8],
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    const UUID: [u8; 16] = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ];
+    let request = vmess::read_request(stream, &UUID).await.unwrap();
+    assert_eq!(request.destination, destination);
+    let response_key = sha256_key(&request.body_key);
+    let response_iv = sha256_key(&request.body_iv);
+    stream
+        .write_all(
+            &vmess::encode_response_header(request.response_v, &response_key, &response_iv)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let payload = vmess::read_body_frame(
+        stream,
+        &request.body_key,
+        &request.body_iv,
+        request.security,
+        0,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    if connection == 0 {
+        assert_eq!(payload, expected_payload);
+        vmess::write_body_frame(
+            stream,
+            &response_key,
+            &response_iv,
+            request.security,
+            0,
+            expected_payload,
+        )
+        .await
+        .unwrap();
+    } else {
+        assert!(payload.starts_with(b"GET /health HTTP/1.1\r\n"));
+        vmess::write_body_frame(
+            stream,
+            &response_key,
+            &response_iv,
+            request.security,
+            0,
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
     }
 }
 
@@ -299,18 +337,13 @@ async fn protocol_udp_outbound_server(
     let destination = Endpoint::ip(Network::Udp, "8.8.8.8:5353".parse().unwrap());
     match kind {
         ProtocolOutboundKind::Vless => {
-            let uuid = vless::parse_uuid("00112233-4455-6677-8899-aabbccddeeff").unwrap();
-            let request = vless::read_request(&mut stream, &uuid).await.unwrap();
-            assert_eq!(request.command, vless::Command::Udp);
-            assert_eq!(request.destination, destination);
-
-            let length = stream.read_u16().await.unwrap();
-            assert_eq!(usize::from(length), expected_payload.len());
-            let mut payload = vec![0u8; usize::from(length)];
-            stream.read_exact(&mut payload).await.unwrap();
-            assert_eq!(payload, expected_payload);
-            stream.write_u16(length).await.unwrap();
-            stream.write_all(expected_payload).await.unwrap();
+            serve_vless_udp_connection(&mut stream, destination, expected_payload).await;
+        }
+        ProtocolOutboundKind::VlessTlsWebsocket => {
+            let stream = tls_server_acceptor().accept(stream).await.unwrap();
+            let websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut stream = WebSocketIo::new(websocket);
+            serve_vless_udp_connection(&mut stream, destination, expected_payload).await;
         }
         ProtocolOutboundKind::Trojan => {
             let hash = trojan::password_hash(b"runtime-protocol-password");
@@ -329,48 +362,85 @@ async fn protocol_udp_outbound_server(
                 .unwrap();
         }
         ProtocolOutboundKind::Vmess => {
-            const UUID: [u8; 16] = [
-                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
-                0xee, 0xff,
-            ];
-            let request = vmess::read_request(&mut stream, &UUID).await.unwrap();
-            assert_eq!(request.command, 2, "VMess command must be UDP");
-            assert_eq!(request.destination, destination);
-            let response_key = sha256_key(&request.body_key);
-            let response_iv = sha256_key(&request.body_iv);
-            stream
-                .write_all(
-                    &vmess::encode_response_header(request.response_v, &response_key, &response_iv)
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let payload = vmess::read_body_frame(
-                &mut stream,
-                &request.body_key,
-                &request.body_iv,
-                request.security,
-                0,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(payload, expected_payload);
-            vmess::write_body_frame(
-                &mut stream,
-                &response_key,
-                &response_iv,
-                request.security,
-                0,
-                expected_payload,
-            )
-            .await
-            .unwrap();
+            serve_vmess_udp_connection(&mut stream, destination, expected_payload).await;
+        }
+        ProtocolOutboundKind::VmessTlsWebsocket => {
+            let stream = tls_server_acceptor().accept(stream).await.unwrap();
+            let websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut stream = WebSocketIo::new(websocket);
+            serve_vmess_udp_connection(&mut stream, destination, expected_payload).await;
         }
         ProtocolOutboundKind::TrojanWebsocket | ProtocolOutboundKind::TrojanTlsWebsocket => {
             panic!("Trojan WebSocket does not expose a datagram transport");
         }
     }
+}
+
+async fn serve_vless_udp_connection<S>(
+    stream: &mut S,
+    destination: Endpoint,
+    expected_payload: &'static [u8],
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let uuid = vless::parse_uuid("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+    let request = vless::read_request(stream, &uuid).await.unwrap();
+    assert_eq!(request.command, vless::Command::Udp);
+    assert_eq!(request.destination, destination);
+
+    let length = stream.read_u16().await.unwrap();
+    assert_eq!(usize::from(length), expected_payload.len());
+    let mut payload = vec![0u8; usize::from(length)];
+    stream.read_exact(&mut payload).await.unwrap();
+    assert_eq!(payload, expected_payload);
+    stream.write_u16(length).await.unwrap();
+    stream.write_all(expected_payload).await.unwrap();
+}
+
+async fn serve_vmess_udp_connection<S>(
+    stream: &mut S,
+    destination: Endpoint,
+    expected_payload: &'static [u8],
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    const UUID: [u8; 16] = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ];
+    let request = vmess::read_request(stream, &UUID).await.unwrap();
+    assert_eq!(request.command, 2, "VMess command must be UDP");
+    assert_eq!(request.destination, destination);
+    let response_key = sha256_key(&request.body_key);
+    let response_iv = sha256_key(&request.body_iv);
+    stream
+        .write_all(
+            &vmess::encode_response_header(request.response_v, &response_key, &response_iv)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let payload = vmess::read_body_frame(
+        stream,
+        &request.body_key,
+        &request.body_iv,
+        request.security,
+        0,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(payload, expected_payload);
+    vmess::write_body_frame(
+        stream,
+        &response_key,
+        &response_iv,
+        request.security,
+        0,
+        expected_payload,
+    )
+    .await
+    .unwrap();
 }
 
 async fn read_http_headers<S: AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
@@ -403,11 +473,11 @@ async fn configure_protocol_outbound_chain(
     let inbound_id = kind.inbound_id();
     let rule_name = kind.rule_name();
     let protocol_layer = match kind {
-        ProtocolOutboundKind::Vless => json!({
+        ProtocolOutboundKind::Vless | ProtocolOutboundKind::VlessTlsWebsocket => json!({
             "type":"vless",
             "vless":{"uuid":"00112233-4455-6677-8899-aabbccddeeff"}
         }),
-        ProtocolOutboundKind::Vmess => json!({
+        ProtocolOutboundKind::Vmess | ProtocolOutboundKind::VmessTlsWebsocket => json!({
             "type":"vmess",
             "vmess":{
                 "id":"00112233-4455-6677-8899-aabbccddeeff",
@@ -432,7 +502,12 @@ async fn configure_protocol_outbound_chain(
         "type":"fixed",
         "fixed":{"host":"127.0.0.1","port":server.port()}
     })];
-    if matches!(kind, ProtocolOutboundKind::TrojanTlsWebsocket) {
+    if matches!(
+        kind,
+        ProtocolOutboundKind::VlessTlsWebsocket
+            | ProtocolOutboundKind::VmessTlsWebsocket
+            | ProtocolOutboundKind::TrojanTlsWebsocket
+    ) {
         chain.push(json!({
             "type":"tls",
             "tls":{
@@ -446,7 +521,10 @@ async fn configure_protocol_outbound_chain(
     }
     if matches!(
         kind,
-        ProtocolOutboundKind::TrojanWebsocket | ProtocolOutboundKind::TrojanTlsWebsocket
+        ProtocolOutboundKind::VlessTlsWebsocket
+            | ProtocolOutboundKind::VmessTlsWebsocket
+            | ProtocolOutboundKind::TrojanWebsocket
+            | ProtocolOutboundKind::TrojanTlsWebsocket
     ) {
         chain.push(json!({
             "type":"websocket",
@@ -521,7 +599,9 @@ async fn run_protocol_outbound_chain(kind: ProtocolOutboundKind) {
     eprintln!("starting protocol outbound integration: {}", kind.name());
     let expected_payload: &'static [u8] = match kind {
         ProtocolOutboundKind::Vless => b"runtime-vless-outbound",
+        ProtocolOutboundKind::VlessTlsWebsocket => b"runtime-vless-tls-websocket-outbound",
         ProtocolOutboundKind::Vmess => b"runtime-vmess-outbound",
+        ProtocolOutboundKind::VmessTlsWebsocket => b"runtime-vmess-tls-websocket-outbound",
         ProtocolOutboundKind::Trojan => b"runtime-trojan-outbound",
         ProtocolOutboundKind::TrojanWebsocket => b"runtime-trojan-websocket-outbound",
         ProtocolOutboundKind::TrojanTlsWebsocket => b"runtime-trojan-tls-websocket-outbound",
@@ -644,7 +724,9 @@ async fn run_protocol_outbound_chain(kind: ProtocolOutboundKind) {
 async fn run_protocol_udp_outbound_chain(kind: ProtocolOutboundKind) {
     let expected_payload: &'static [u8] = match kind {
         ProtocolOutboundKind::Vless => b"runtime-vless-udp-outbound",
+        ProtocolOutboundKind::VlessTlsWebsocket => b"runtime-vless-tls-websocket-udp-outbound",
         ProtocolOutboundKind::Vmess => b"runtime-vmess-udp-outbound",
+        ProtocolOutboundKind::VmessTlsWebsocket => b"runtime-vmess-tls-websocket-udp-outbound",
         ProtocolOutboundKind::Trojan => b"runtime-trojan-udp-outbound",
         ProtocolOutboundKind::TrojanWebsocket | ProtocolOutboundKind::TrojanTlsWebsocket => {
             panic!("Trojan WebSocket does not expose a datagram transport")
@@ -723,7 +805,9 @@ async fn run_protocol_udp_outbound_chain(kind: ProtocolOutboundKind) {
 async fn runtime_protocol_outbounds_round_trip_through_http_router() {
     for kind in [
         ProtocolOutboundKind::Vless,
+        ProtocolOutboundKind::VlessTlsWebsocket,
         ProtocolOutboundKind::Vmess,
+        ProtocolOutboundKind::VmessTlsWebsocket,
         ProtocolOutboundKind::Trojan,
         ProtocolOutboundKind::TrojanWebsocket,
         ProtocolOutboundKind::TrojanTlsWebsocket,
@@ -736,7 +820,9 @@ async fn runtime_protocol_outbounds_round_trip_through_http_router() {
 async fn runtime_protocol_outbounds_round_trip_through_mixed_udp_router() {
     for kind in [
         ProtocolOutboundKind::Vless,
+        ProtocolOutboundKind::VlessTlsWebsocket,
         ProtocolOutboundKind::Vmess,
+        ProtocolOutboundKind::VmessTlsWebsocket,
         ProtocolOutboundKind::Trojan,
     ] {
         run_protocol_udp_outbound_chain(kind).await;

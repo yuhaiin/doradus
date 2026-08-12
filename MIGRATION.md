@@ -3802,3 +3802,37 @@ benchmark ignored）、WireGuard runtime chain 2，0 失败。workspace 编排�
 
 这补齐了当前主要 transport builder 的本地组合证据，但不把它外推为真实远端证书、地址族、UDP
 或更广 listener/HTTP2 组合的完整 Go 兼容性；VLESS/VMess/Trojan 总项继续保持 `[~]`。
+
+## 131. 2026-08-12 VLESS/VMess TLS + WebSocket runtime 矩阵
+
+继续沿用上一轮的共享 stream transport builder，把真实 service-chain fixture 从 Trojan 扩展到
+VLESS 和 VMess。测试服务端把同一套协议 framing handler 泛型化到 `AsyncRead + AsyncWrite`，因此
+普通 TCP、TLS+WebSocket TCP、普通 UDP-over-stream 和 TLS+WebSocket UDP 使用相同的 wire 校验，
+不会因为测试 fixture 复制协议逻辑而掩盖 transport 差异。
+
+`make service-chain-smoke` 在 Podman 中通过：VLESS/VMess/Trojan 普通及 TLS+WebSocket TCP 共 7/7；
+VLESS/VMess 普通及 TLS+WebSocket UDP 共 5/5。每条真实链路都经过 API 配置、HTTP 或 mixed inbound、
+domain router、协议 outbound、payload echo、connections metadata/match history 和 node latency；
+Trojan WebSocket 继续明确不伪造 UDP 能力。随后 `make workspace-tests` 仍为 48 个 harness，core
+145、runtime 253、store 128、service-chain 16、WireGuard 7、WireGuard runtime chain 2，0 失败。
+
+这把当前 Rust builder 支持的 VLESS/VMess/Trojan TLS/WebSocket 主路径从单元证据推进到真实 runtime
+TCP/UDP 组合；远端 listener、HTTP/2 组合、地址族、生产证书和完整 Go 现场矩阵仍保留 `[~]`。
+
+## 131. 2026-08-12 直接替换边界复验与缓存回收
+
+为避免只依赖历史日志，本轮在当前 `HEAD` 重新执行了三类最接近直接替换 Go 后端的现场：
+
+- `make production-parity-smoke` 使用停止态 Go v5、v6 和 AWS-shaped 三份 SQLite 快照，三份均完成
+  `info/settings/nodes/inbounds/resolvers/routes/publishes/connections` 读取、核心 mutation 和错误矩阵
+  对照，结果均为 identical；源数据库未被修改，副本和日志仍在 `~/.cache/yuhaiin-rust`。
+- `make go-live-flow-parity-smoke` 与 `make go-rust-stats-smoke` 均通过，确认 Go/Rust 真实
+  inbound→router→outbound 流量、connections、traffic/history/telemetry 和共享 SQLite 统计接管仍可用。
+- `make tun-chain-service-smoke` 通过真实 TUN inbound → fixed → TLS → HTTP/2 → Yuubinsya → echo，
+  同时确认 TUN owner 的 open、route mode、traffic 和 close 生命周期。
+
+依赖边界也重新核对：WireGuard 只在明确允许的 BoringTun 路径中引入 `ring`；SQLite 使用已验证的
+`rusqlite + bundled SQLite`，普通 TLS/HTTP 数据面仍走 RustCrypto，不引入 native-tls/OpenSSL。
+缓存检查时约 18 GiB，其中可重建的 debug 依赖中间产物约 8 GiB；通过仓库维护脚本仅删除
+`cargo-target/debug/deps/build/.fingerprint/examples/incremental` 后降至约 9.8 GiB，debug 二进制、
+release/musl target、fixtures 和集成状态均保留，没有使用 `/tmp`。
