@@ -196,8 +196,11 @@ pub async fn run_until_with_tun_runtime(
                         tun_monitor.error(format!(
                             "injected TUN inbound stopped; waiting for reload: {error}"
                         ));
-                        if crate::wait_for_shutdown_or_reload(&tun_controller, tun_shutdown.clone())
-                            .await
+                        if crate::wait_for_shutdown_or_inbound_reload(
+                            &tun_controller,
+                            tun_shutdown.clone(),
+                        )
+                        .await
                         {
                             break;
                         }
@@ -220,8 +223,11 @@ pub async fn run_until_with_tun_runtime(
                 Ok(config) => config,
                 Err(error) => {
                     tun_monitor.error(format!("reload TUN inbound config failed: {error}"));
-                    if crate::wait_for_shutdown_or_reload(&tun_controller, tun_shutdown.clone())
-                        .await
+                    if crate::wait_for_shutdown_or_inbound_reload(
+                        &tun_controller,
+                        tun_shutdown.clone(),
+                    )
+                    .await
                     {
                         break;
                     }
@@ -229,7 +235,8 @@ pub async fn run_until_with_tun_runtime(
                 }
             };
             if !config.enabled
-                && crate::wait_for_shutdown_or_reload(&tun_controller, tun_shutdown.clone()).await
+                && crate::wait_for_shutdown_or_inbound_reload(&tun_controller, tun_shutdown.clone())
+                    .await
             {
                 break;
             }
@@ -282,7 +289,7 @@ async fn run_desktop_tun_supervisor(
             Ok(config) => break config,
             Err(error) => {
                 monitor.error(format!("load TUN inbound config failed: {error}"));
-                if crate::wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+                if crate::wait_for_shutdown_or_inbound_reload(&controller, shutdown.clone()).await {
                     return;
                 }
             }
@@ -296,7 +303,7 @@ async fn run_desktop_tun_supervisor(
 
         if !config.enabled {
             monitor.info("TUN inbound disabled");
-            if crate::wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+            if crate::wait_for_shutdown_or_inbound_reload(&controller, shutdown.clone()).await {
                 break;
             }
         } else {
@@ -312,14 +319,18 @@ async fn run_desktop_tun_supervisor(
                     .await
                     {
                         monitor.error(format!("TUN inbound stopped: {error}"));
-                        if crate::wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+                        if crate::wait_for_shutdown_or_inbound_reload(&controller, shutdown.clone())
+                            .await
+                        {
                             break;
                         }
                     }
                 }
                 Err(error) => {
                     monitor.error(format!("TUN inbound open failed: {error}"));
-                    if crate::wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+                    if crate::wait_for_shutdown_or_inbound_reload(&controller, shutdown.clone())
+                        .await
+                    {
                         break;
                     }
                 }
@@ -334,7 +345,9 @@ async fn run_desktop_tun_supervisor(
                 Ok(config) => break config,
                 Err(error) => {
                     monitor.error(format!("reload TUN inbound config failed: {error}"));
-                    if crate::wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+                    if crate::wait_for_shutdown_or_inbound_reload(&controller, shutdown.clone())
+                        .await
+                    {
                         return;
                     }
                 }
@@ -347,7 +360,7 @@ async fn run_until_inner(
     controller: RuntimeController,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut reload = controller.subscribe_reload();
+    let mut reload = controller.subscribe_inbound_reload();
     let mut listeners = Vec::new();
     let result = async {
         loop {

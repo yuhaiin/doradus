@@ -11,6 +11,14 @@
 > `YUHAIIN_QUIET` 只有 `1/true/yes/on` 才会关闭这些 console notice，避免环境中设置 `YUHAIIN_QUIET=0` 时误以为没有日志。
 > `IMPLEMENTATION_CHECKLIST.md` 现在按 crate 模块树、协议矩阵、未完成项和验收命令组织；rootful TUN route lease、RST/reconnect 与 TPROXY UDP delivery/idle/force-stop 已有独立 VM 现场证据，但 TUN kernel fragment、Android/macOS 和生产/发布现场仍保留为 `[~]`，不能从单元测试覆盖率推导为完整替换。
 
+> 2026-08-12 inbound reload boundary：对照 Go `Inbound.SaveContract`，Rust 不再让所有配置变更
+> 中断全部 socket listeners。普通 node/route/resolver/backup/settings reload 只构建并原子替换已注册
+> `RuntimeProxySelector`；inbound、中心用户、selected-node 和全量 apply 变更才发布专用 inbound
+> reload，由 owner latest-wins 重绑监听。新增 controller 通知边界单测，并在 Podman 的
+> `make api-reload-flow-smoke` 中保持同一 HTTP CONNECT 隧道跨 route reload 连续 echo；同时修正
+> 运行中新增/切换节点时 selector 角色 ID 需要重建的兼容路径。普通 reload 不再误杀已有 flow，真正
+> 的 inbound 结构/认证变化仍明确触发 listener replacement。
+
 > 2026-08-12 TUN Podman data-plane recheck：当前 rootless Podman 连接在显式传入宿主
 > `/dev/net/tun`、`--privileged`、`--network=none` 后，已实际通过 runtime-owned TUN
 > device lifecycle、普通 `fixed` TCP packet echo、disable/enable reload 后 packet echo 和
@@ -3591,6 +3599,30 @@ backup crate 本轮为 6 个单元测试加 1 个 local compatible endpoint wire
 proxy transport、chunked/error boundary 和 API S3 测试均在上述 workspace harness 中通过。
 
 本轮格式检查、`cargo check --locked --workspace --all-features --offline`、Clippy `-D warnings`、
-`git diff --check` 和 Podman workspace tests 均通过。缓存目录当前约 27G，其中约 18G 为可重建的
+`git diff --check` 和 Podman workspace tests 均通过。该历史检查点的缓存目录约 27G，其中约 18G 为可重建的
 `cargo-target`；仍只使用 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`，后续应按精确 target/scenario
 目录回收，不做宽泛递归删除。
+
+## 123. 2026-08-12 WireGuard 真实 runtime 链路与 smoltcp TCP EOF 修复
+
+在进程级链路夹具中把验证范围从单独的 `build_proxy` 扩展到真实 `yuhaiin` 子进程：同一个
+Podman namespace 内由 BoringTun userspace peer 提供 `192.0.2.1` 虚拟 TCP endpoint，runtime
+接收 HTTP CONNECT，经 CIDR route 选中 WireGuard outbound，完成 Noise handshake、加密 TCP
+echo、连接 metadata 和 node HTTP latency probe。新增可复现入口：
+`make wireguard-chain-smoke`，其构建、runtime、SQLite 和网络执行均在缓存挂载的 Podman 中，
+不使用宿主 runtime 或 `/tmp`。
+
+夹具首先发现了一个与 WireGuard 无关但会影响所有 userspace TCP outbound 的真实问题：
+`Driver::process_sessions` 使用 smoltcp 的 `may_recv()` 判断数据可读；该函数在 Established
+状态下即使接收缓冲区为空也返回 true，导致零长度 `Read` 被推入异步流，HTTP inbound 将其
+解释为 EOF 并关闭连接。已改为 `can_recv()`，只在确实有 payload 时转发；现有 EOF/close
+生命周期仍由 session close 路径处理。
+
+回归证据：`make wireguard-chain-smoke` 在 Podman 通过 1/1；随后 `make workspace-tests`
+在 Podman 通过 46 个 harness，core 145、runtime 249、store 128、WireGuard 7（1 个 benchmark
+ignored）、service-chain 15，0 失败。workspace 编排将这个进程级 loopback harness 与
+service-chain 一样放入独立 host-network 容器组，避免大量普通 harness 共用 `--network=none`
+时触发环境已知的 loopback reset；仍没有把 host-network 容器等同于宿主机运行。
+
+最后检查 `~/.cache/yuhaiin-rust` 约 31G，其中约 22G 为可重建的 Cargo target（debug 约 18G），
+集成日志和状态仍全部位于该 cache 根目录；没有使用 `/tmp`，也没有执行宽泛递归删除。

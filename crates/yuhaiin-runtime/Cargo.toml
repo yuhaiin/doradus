@@ -80,10 +80,12 @@ path = "src/bin/transparent_service_smoke.rs"
 required-features = ["http-api"]
 
 [dev-dependencies]
+boringtun = { version = "0.7.1", default-features = false }
 bytes = "1.12.1"
 h2 = "0.4.15"
 http-body-util = "0.1.4"
 http = "1.5.0"
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }
 tower = { version = "0.5.2", features = ["util"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

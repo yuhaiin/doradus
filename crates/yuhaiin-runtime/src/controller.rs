@@ -30,6 +30,7 @@ pub struct RuntimeController {
     selectors: Arc<RwLock<Vec<Weak<RuntimeProxySelector>>>>,
     monitor: Arc<ConnectionMonitor>,
     reload_events: tokio::sync::broadcast::Sender<()>,
+    inbound_reload_events: tokio::sync::broadcast::Sender<()>,
     restore_request: Arc<RwLock<Option<PathBuf>>>,
 }
 
@@ -39,6 +40,7 @@ impl RuntimeController {
         let builder = Arc::new(builder);
         let initial_snapshot = builder.build().await?;
         let (reload_events, _) = tokio::sync::broadcast::channel(32);
+        let (inbound_reload_events, _) = tokio::sync::broadcast::channel(32);
         let monitor = Arc::new(ConnectionMonitor::load_with_store(builder.store().clone()).await?);
         monitor.set_sniff_enabled(initial_snapshot.inbound_settings.sniff);
         monitor.set_dns_handler(
@@ -54,6 +56,7 @@ impl RuntimeController {
             selectors: Arc::new(RwLock::new(Vec::new())),
             monitor,
             reload_events,
+            inbound_reload_events,
             restore_request: Arc::new(RwLock::new(None)),
         })
     }
@@ -108,6 +111,16 @@ impl RuntimeController {
 
     pub fn subscribe_reload(&self) -> tokio::sync::broadcast::Receiver<()> {
         self.reload_events.subscribe()
+    }
+
+    /// Subscribe to changes that require rebinding inbound listeners.
+    ///
+    /// Node, route, resolver, and backup changes publish only the ordinary
+    /// reload event because registered selectors are refreshed in place.
+    /// Inbound/user changes additionally publish this event so listeners can
+    /// be replaced without interrupting unrelated live connections.
+    pub fn subscribe_inbound_reload(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.inbound_reload_events.subscribe()
     }
 
     pub fn request_restore(&self, source: PathBuf) {
@@ -325,7 +338,7 @@ impl RuntimeController {
     /// reloads are serialized so a slower build cannot supersede a newer one.
     pub async fn reload(&self) -> Result<Arc<RuntimeSnapshot>> {
         let _guard = self.reload_lock.lock().await;
-        self.rebuild_locked().await
+        self.rebuild_locked(false).await
     }
 
     /// Run a typed repository mutation under the same management lock, then
@@ -342,7 +355,23 @@ impl RuntimeController {
             self.set_reload_error(&error.to_string());
             return Err(error);
         }
-        self.rebuild_locked().await
+        self.rebuild_locked(false).await
+    }
+
+    pub async fn mutate_and_reload_inbounds<F, Fut>(
+        &self,
+        operation: F,
+    ) -> Result<Arc<RuntimeSnapshot>>
+    where
+        F: FnOnce(ConfigStore) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let _guard = self.reload_lock.lock().await;
+        if let Err(error) = operation(self.store().clone()).await {
+            self.set_reload_error(&error.to_string());
+            return Err(error);
+        }
+        self.rebuild_locked(true).await
     }
 
     /// Commit generic configuration mutations, then rebuild the runtime from
@@ -351,11 +380,11 @@ impl RuntimeController {
     /// flows; the returned error tells the management layer to report/retry it.
     pub async fn apply(&self, mutations: &[ConfigMutation]) -> Result<Arc<RuntimeSnapshot>> {
         let mutations = mutations.to_vec();
-        self.mutate_and_reload(|store| async move { store.apply(&mutations).await })
+        self.mutate_and_reload_inbounds(|store| async move { store.apply(&mutations).await })
             .await
     }
 
-    async fn rebuild_locked(&self) -> Result<Arc<RuntimeSnapshot>> {
+    async fn rebuild_locked(&self, reload_inbounds: bool) -> Result<Arc<RuntimeSnapshot>> {
         let expected_revision = self.handle.revision();
         let next = match self.builder.build().await {
             Ok(snapshot) => Arc::new(snapshot),
@@ -392,6 +421,9 @@ impl RuntimeController {
             inbound_dns_handler(&next).map(|handler| handler as Arc<dyn SocketDnsHandler>),
         );
         let _ = self.reload_events.send(());
+        if reload_inbounds {
+            let _ = self.inbound_reload_events.send(());
+        }
         self.set_reload_error("");
         Ok(next)
     }
@@ -466,6 +498,26 @@ mod tests {
         );
         assert_eq!(controller.handle().revision(), before.0 + 1);
         assert!(Arc::ptr_eq(&next, &controller.handle().load()));
+    }
+
+    #[test]
+    fn inbound_reload_notifications_are_reserved_for_listener_changes() {
+        let controller = controller();
+        let mut ordinary = controller.subscribe_reload();
+        let mut inbound = controller.subscribe_inbound_reload();
+
+        block_on(controller.reload()).unwrap();
+        assert!(ordinary.try_recv().is_ok());
+        assert!(matches!(
+            inbound.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        block_on(controller.mutate_and_reload_inbounds(|store| async move {
+            store.put_config("test.inbound", b"changed").await
+        }))
+        .unwrap();
+        assert!(inbound.try_recv().is_ok());
     }
 
     #[test]

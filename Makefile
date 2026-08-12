@@ -42,7 +42,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-udp-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-reset-reconnect-smoke tun-mtu-smoke tun-ipv6-extension-smoke tun-route-matrix-smoke tun-api-process-smoke wireguard-smoke wireguard-external-smoke maxmind-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke go-protocol-interop-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput benchmark-wireguard-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke socks5-protocol-smoke node-latency-dns-smoke stats-concurrency-smoke stats-soak-smoke startup-logs-smoke workspace-tests \
+.PHONY: help cache-usage build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-udp-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-reset-reconnect-smoke tun-mtu-smoke tun-ipv6-extension-smoke tun-route-matrix-smoke tun-api-process-smoke wireguard-smoke wireguard-chain-smoke wireguard-external-smoke maxmind-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke go-protocol-interop-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput benchmark-wireguard-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke socks5-protocol-smoke node-latency-dns-smoke stats-concurrency-smoke stats-soak-smoke startup-logs-smoke workspace-tests \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
 
@@ -70,6 +70,7 @@ help:
 		'make tun-route-matrix-smoke run rootful TUN multi-route and force-stop lease smoke' \
 		'make tun-api-process-smoke verify the foreground binary TUN API toggle against /dev/net/tun' \
 		'make wireguard-smoke run BoringTun userspace two-peer smoke in Podman' \
+		'make wireguard-chain-smoke run a real runtime HTTP -> router -> WireGuard chain in Podman' \
 		'make wireguard-external-smoke run an opt-in user-supplied WARP peer smoke in Podman' \
 		'make maxmind-smoke    download/cache and query the real Country-without-asn.mmdb in Podman' \
 		'make transparent-service-smoke run REDIRECT TCP smoke; rootless Podman records TPROXY skip' \
@@ -177,6 +178,9 @@ tun-api-process-smoke:
 
 wireguard-smoke:
 	./scripts/integration/wireguard.sh
+
+wireguard-chain-smoke:
+	./scripts/integration/wireguard-chain.sh
 
 wireguard-external-smoke:
 	./scripts/integration/wireguard-external.sh

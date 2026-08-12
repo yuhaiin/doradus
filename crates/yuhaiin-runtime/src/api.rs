@@ -1946,7 +1946,7 @@ async fn select_node_value(state: &ApiState, id: String) -> ApiResult {
     let bytes = serde_json::to_vec(&json!({"id": id}))?;
     state
         .controller
-        .mutate_and_reload(move |store| async move {
+        .mutate_and_reload_inbounds(move |store| async move {
             store.put_config(SELECTED_TCP_NODE_KEY, &bytes).await?;
             store.put_config(SELECTED_UDP_NODE_KEY, &bytes).await?;
             store.put_config(LEGACY_SELECTED_NODE_KEY, &bytes).await?;
@@ -2006,9 +2006,9 @@ async fn save_inbound_value(state: &ApiState, value: Value, _index: Option<usize
     };
     state
         .controller
-        .mutate_and_reload(
-            move |store| async move { store.repository().put_go_inbound(&record).await },
-        )
+        .mutate_and_reload_inbounds(move |store| async move {
+            store.repository().put_go_inbound(&record).await
+        })
         .await?;
     // Go's saveInbound calls Inbounds.Get after Save, so the response is the
     // persisted contract (including any fields normalized by the store), not
@@ -2019,7 +2019,7 @@ async fn save_inbound_value(state: &ApiState, value: Value, _index: Option<usize
 async fn delete_inbound_value(state: &ApiState, id: String) -> ApiResult {
     let result = state
         .controller
-        .mutate_and_reload(move |store| async move {
+        .mutate_and_reload_inbounds(move |store| async move {
             if store.repository().delete_go_inbound(&id).await? {
                 Ok(())
             } else {
@@ -3315,7 +3315,7 @@ async fn user_save_value(state: &ApiState, value: Value, id: Option<String>) -> 
         let reload_id = id.clone();
         state
             .controller
-            .mutate_and_reload(move |store| async move {
+            .mutate_and_reload_inbounds(move |store| async move {
                 let repository = store.repository();
                 let mut user: GoUserRecord = repository.get_go_user(&reload_id).await?;
                 user.name = request.name;
@@ -3342,7 +3342,7 @@ async fn user_save_value(state: &ApiState, value: Value, id: Option<String>) -> 
         let id = record.id.clone();
         state
             .controller
-            .mutate_and_reload(move |store| async move {
+            .mutate_and_reload_inbounds(move |store| async move {
                 store.repository().save_go_user(&record).await
             })
             .await?;
@@ -3359,7 +3359,9 @@ async fn user_save_value(state: &ApiState, value: Value, id: Option<String>) -> 
 async fn user_delete_value(state: &ApiState, id: String) -> ApiResult {
     state
         .controller
-        .mutate_and_reload(move |store| async move { store.repository().delete_go_user(&id).await })
+        .mutate_and_reload_inbounds(move |store| async move {
+            store.repository().delete_go_user(&id).await
+        })
         .await?;
     empty()
 }

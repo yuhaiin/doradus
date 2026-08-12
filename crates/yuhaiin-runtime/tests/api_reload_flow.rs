@@ -14,6 +14,12 @@ use support::{
 };
 
 async fn connect_and_echo(inbound: SocketAddr, authority: &str, payload: &[u8]) {
+    let mut client = open_http_tunnel(inbound, authority).await;
+    echo_on_tunnel(&mut client, payload).await;
+    client.shutdown().await.unwrap();
+}
+
+async fn open_http_tunnel(inbound: SocketAddr, authority: &str) -> TcpStream {
     let mut client = connect_loopback(inbound).await;
     client
         .write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
@@ -31,12 +37,14 @@ async fn connect_and_echo(inbound: SocketAddr, authority: &str, payload: &[u8]) 
         headers.extend_from_slice(&buffer[..length]);
     }
     assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 200"));
+    client
+}
 
+async fn echo_on_tunnel(client: &mut TcpStream, payload: &[u8]) {
     client.write_all(payload).await.unwrap();
     let mut echoed = vec![0u8; payload.len()];
     client.read_exact(&mut echoed).await.unwrap();
     assert_eq!(echoed, payload);
-    client.shutdown().await.unwrap();
 }
 
 async fn wait_for_authority(fixture: &ConnectFixture, expected: &str) {
@@ -199,6 +207,9 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     .await;
     connect_and_echo(moved_inbound, &second_authority, b"after-inbound-reenable").await;
 
+    let mut persistent = open_http_tunnel(moved_inbound, &second_authority).await;
+    echo_on_tunnel(&mut persistent, b"before-route-reload-persistent").await;
+
     let proxy_authority_count_before_direct_route = second
         .connect_authorities
         .lock()
@@ -216,6 +227,8 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
         })),
     )
     .await;
+    echo_on_tunnel(&mut persistent, b"after-route-reload-persistent").await;
+    persistent.shutdown().await.unwrap();
     let route_test = api_json(
         &service.client,
         &service.base_url,

@@ -474,7 +474,7 @@ pub async fn run_tun_device_until_ref(
         &mut proxy_runtime,
         Duration::from_millis(10),
         async {
-            let _ = wait_for_shutdown_or_reload(&controller, shutdown.clone()).await;
+            let _ = wait_for_shutdown_or_inbound_reload(&controller, shutdown.clone()).await;
         },
     )
     .await
@@ -594,6 +594,20 @@ pub async fn wait_for_shutdown_or_reload(
         return true;
     }
     let mut reload = controller.subscribe_reload();
+    tokio::select! {
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+        changed = reload.recv() => changed.is_err() && *shutdown.borrow(),
+    }
+}
+
+pub async fn wait_for_shutdown_or_inbound_reload(
+    controller: &RuntimeController,
+    mut shutdown: watch::Receiver<bool>,
+) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+    let mut reload = controller.subscribe_inbound_reload();
     tokio::select! {
         changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
         changed = reload.recv() => changed.is_err() && *shutdown.borrow(),

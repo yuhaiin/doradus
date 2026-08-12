@@ -1109,7 +1109,10 @@ impl Driver {
                     }
                 }
             }
-            if socket.may_recv() && !session.close_requested {
+            // `may_recv` is true for every established socket, including an
+            // empty receive buffer. Only forward an actual payload; an empty
+            // async read is EOF to the inbound relay.
+            if socket.can_recv() && !session.close_requested {
                 let mut data = vec![0; SOCKET_BUFFER_SIZE.min(self.config.mtu.saturating_mul(8))];
                 if let Ok(length) = socket.recv_slice(&mut data) {
                     data.truncate(length);

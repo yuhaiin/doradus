@@ -1129,6 +1129,15 @@ impl ServiceProcess {
     /// shutdown opportunity. This deliberately models SIGKILL/force-stop so
     /// callers can verify SQLite WAL recovery and the next process takeover.
     pub async fn force_stop(mut self) {
+        self.force_stop_inner().await;
+    }
+
+    pub async fn force_stop_with_diagnostics(mut self) -> String {
+        self.force_stop_inner().await;
+        self.diagnostics()
+    }
+
+    async fn force_stop_inner(&mut self) {
         if self.child.try_wait().unwrap().is_none() {
             let _ = self.child.kill();
         }
