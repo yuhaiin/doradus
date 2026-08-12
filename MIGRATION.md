@@ -3678,3 +3678,18 @@ service-chain 一样放入独立 host-network 容器组，避免大量普通 har
 
 最后检查 `~/.cache/yuhaiin-rust` 约 31G，其中约 22G 为可重建的 Cargo target（debug 约 18G），
 集成日志和状态仍全部位于该 cache 根目录；没有使用 `/tmp`，也没有执行宽泛递归删除。
+
+## 124. 2026-08-12 VLESS-over-TLS Go 互操作
+
+为补齐协议组合矩阵，新增 `go_transport_interop.rs` 和独立的 Go TLS/VLESS fixture。
+测试由 Rust VLESS client 发起：先通过 `RustCryptoTlsProxy` 完成 TLS 1.2 握手，再发送
+VLESS request；Go server 校验 UUID、command、network 和 domain destination，回写 VLESS
+response header 后完成 `ping/pong` payload round-trip。证书只在该 fixture 内生成，client
+明确使用 `insecure_skip_verify`，不会改变生产配置的 CA/校验默认值。
+
+`scripts/integration/go-protocol-interop.sh` 现在在宿主只编译 ignored harness，并在 Podman
+中执行 7 个互操作项：Yuubinsya TCP/UOT/native UDP/Ping、WebSocket→HTTP/2、HTTP/2 v1、
+VLESS、VLESS-over-TLS、VMess、Trojan；本轮 `7/7` 通过。Go 的 `GOTMPDIR`、fixture ready
+文件、Rust harness 日志和构建状态都位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+该证据仍是 protocol wire/transport 组合验证，不替代更广的 runtime listener、UDP 和
+生产证书/代理链现场矩阵，因此 VLESS/VMess/Trojan 总项继续保持 `[~]`。
