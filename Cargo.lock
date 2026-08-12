@@ -3803,6 +3803,7 @@ dependencies = [
  "p256",
  "rand 0.10.2",
  "rustls",
+ "rustls-pemfile",
  "rustls-rustcrypto",
  "sha1",
  "sha2 0.10.9",

@@ -33,5 +33,8 @@ default = []
 tls-rustcrypto = ["dep:rustls", "dep:rustls-rustcrypto", "dep:tokio-rustls"]
 websocket = ["dep:futures-util", "dep:tokio-tungstenite", "yuhaiin-core/websocket"]
 
+[dev-dependencies]
+rustls-pemfile = "2.2.0"
+
 [lints]
 workspace = true

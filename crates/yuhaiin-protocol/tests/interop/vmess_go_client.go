@@ -10,7 +10,9 @@ import (
 	"github.com/Asutorufa/yuhaiin/pkg/net/netapi"
 	"github.com/Asutorufa/yuhaiin/pkg/net/proxy/direct"
 	"github.com/Asutorufa/yuhaiin/pkg/net/proxy/fixed"
+	tlsproxy "github.com/Asutorufa/yuhaiin/pkg/net/proxy/tls"
 	"github.com/Asutorufa/yuhaiin/pkg/net/proxy/vmess"
+	websocketproxy "github.com/Asutorufa/yuhaiin/pkg/net/proxy/websocket"
 )
 
 func main() {
@@ -29,11 +31,29 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	var dialer netapi.Proxy = parent
+	if os.Getenv("VMESS_TRANSPORT") == "tls-websocket" {
+		dialer, err = tlsproxy.NewClient(tlsproxy.TLSConfig{
+			Enable:             true,
+			ServerNames:        []string{"localhost"},
+			InsecureSkipVerify: true,
+		}, dialer)
+		if err != nil {
+			panic(err)
+		}
+		dialer, err = websocketproxy.NewClient(websocketproxy.Config{
+			Host: "localhost",
+			Path: "/vmess",
+		}, dialer)
+		if err != nil {
+			panic(err)
+		}
+	}
 	proxy, err := vmess.NewClient(vmess.Config{
 		UUID:     "00112233-4455-6677-8899-aabbccddeeff",
 		AlterID:  "0",
 		Security: "aes-128-gcm",
-	}, parent)
+	}, dialer)
 	if err != nil {
 		panic(err)
 	}

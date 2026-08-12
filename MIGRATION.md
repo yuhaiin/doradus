@@ -3836,3 +3836,23 @@ TCP/UDP 组合；远端 listener、HTTP/2 组合、地址族、生产证书和�
 缓存检查时约 18 GiB，其中可重建的 debug 依赖中间产物约 8 GiB；通过仓库维护脚本仅删除
 `cargo-target/debug/deps/build/.fingerprint/examples/incremental` 后降至约 9.8 GiB，debug 二进制、
 release/musl target、fixtures 和集成状态均保留，没有使用 `/tmp`。
+
+## 133. 2026-08-12 Go/Rust VLESS、VMess、Trojan transport 互操作矩阵
+
+在 runtime 的本地 service-chain 矩阵之外，补齐协议层的跨语言双向证据。新增 Go VLESS client
+连接 Rust wire fixture 的普通 TCP 和 `TLS → WebSocket` 两条测试；已有 Rust VLESS client→Go
+server 的 TLS 测试同时加入 TLS+WebSocket 变体。VMess 和 Trojan 也分别加入 Go client→Rust
+wire fixture 的普通与 `TLS → WebSocket` 测试。TLS fixture 使用 RustCrypto/rustls 或 Go 标准库
+测试证书，只在测试中允许跳过证书校验，不改变生产默认校验策略。
+
+本轮先发现固定 `24446/24447` 端口会让重跑受到残留进程影响，随后把 VLESS-over-TLS fixture
+改为监听 `127.0.0.1:0`，ready 文件返回实际地址，并用 child guard 在断言失败时回收 Go 子进程。
+`make go-protocol-interop-smoke` 在 Podman host network 中通过 8 个 harness、14/14 个测试用例：
+Yuubinsya 及 WebSocket/H2、H2 v1、VLESS 双向普通/TLS/TLS+WebSocket、VLESS UDP、VMess 普通/
+TLS+WebSocket、Trojan 普通/TLS+WebSocket。`make clippy`、Rust/Go 格式检查和 `git diff --check`
+也通过；Go scratch、ready 文件、日志和构建状态仍全部位于 `~/.cache/yuhaiin-rust`，没有使用
+`/tmp`。
+
+这只扩展了 wire/transport 的真实 Go 兼容性证据，不把测试证书或 loopback fixture 外推为生产
+远端证书、HTTP/2 listener、地址族、UDP+TLS/WebSocket 或第三方节点的完整矩阵；这些边界继续由
+checklist 中的 `[~]` 项跟踪。

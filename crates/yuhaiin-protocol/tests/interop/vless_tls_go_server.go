@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -11,8 +12,12 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
+	"net/http"
 	"os"
 	"time"
+
+	websocket "github.com/Asutorufa/yuhaiin/pkg/net/proxy/websocket/x"
 )
 
 var expectedUUID, _ = hex.DecodeString("00112233445566778899aabbccddeeff")
@@ -36,18 +41,23 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	listener, err := tls.Listen("tcp", os.Getenv("VLESS_TLS_LISTEN"), &tls.Config{
-		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
-		MinVersion:   tls.VersionTLS12,
-	})
+	listener, err := net.Listen("tcp", os.Getenv("VLESS_TLS_LISTEN"))
 	if err != nil {
 		panic(err)
 	}
-	defer listener.Close()
-	if err := os.WriteFile(os.Getenv("VLESS_TLS_READY"), []byte(listener.Addr().String()), 0o600); err != nil {
+	tlsListener := tls.NewListener(listener, &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+		MinVersion:   tls.VersionTLS12,
+	})
+	defer tlsListener.Close()
+	if err := os.WriteFile(os.Getenv("VLESS_TLS_READY"), []byte(tlsListener.Addr().String()), 0o600); err != nil {
 		panic(err)
 	}
-	conn, err := listener.Accept()
+	if os.Getenv("VLESS_TLS_WEBSOCKET") == "1" {
+		serveWebSocket(tlsListener)
+		return
+	}
+	conn, err := tlsListener.Accept()
 	if err != nil {
 		panic(err)
 	}
@@ -66,6 +76,41 @@ func main() {
 		panic("unexpected VLESS payload")
 	}
 	if _, err := conn.Write([]byte("pong")); err != nil {
+		panic(err)
+	}
+}
+
+func serveWebSocket(listener net.Listener) {
+	server := &http.Server{}
+	server.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/vless" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		conn, err := websocket.NewServerConn(w, req, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if err := readRequest(conn); err != nil {
+			panic(err)
+		}
+		if _, err := conn.Write([]byte{0, 0}); err != nil {
+			panic(err)
+		}
+		var request [4]byte
+		if _, err := io.ReadFull(conn, request[:]); err != nil {
+			panic(err)
+		}
+		if string(request[:]) != "ping" {
+			panic("unexpected VLESS payload")
+		}
+		if _, err := conn.Write([]byte("pong")); err != nil {
+			panic(err)
+		}
+		go func() { _ = server.Shutdown(context.Background()) }()
+	})
+	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 		panic(err)
 	}
 }

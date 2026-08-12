@@ -6,10 +6,14 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use yuhaiin_core::proxy::{AsyncProxy, FixedAsyncProxy};
 use yuhaiin_core::{DomainName, Endpoint, FlowContext, Network};
-use yuhaiin_protocol::vless::VlessProxy;
+use yuhaiin_protocol::vless::{self, VlessProxy};
+
+#[cfg(all(feature = "tls-rustcrypto", feature = "websocket"))]
+mod support;
 
 #[tokio::test]
 #[ignore = "requires the sibling Go checkout and Go toolchain"]
@@ -71,4 +75,99 @@ async fn rust_vless_client_round_trips_against_go_server() {
         .unwrap();
     assert!(status.success(), "Go VLESS server failed: {status}");
     let _ = std::fs::remove_file(ready);
+}
+
+#[tokio::test]
+#[ignore = "requires the sibling Go checkout and Go toolchain"]
+async fn go_vless_client_round_trips_against_rust_wire_server() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        serve_vless_wire(&mut stream).await;
+    });
+
+    run_go_vless_client(address, None).await;
+    server.await.unwrap();
+}
+
+#[cfg(all(feature = "tls-rustcrypto", feature = "websocket"))]
+#[tokio::test]
+#[ignore = "requires the sibling Go checkout and Go toolchain"]
+async fn go_vless_client_over_tls_websocket_round_trips_against_rust_wire_server() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let websocket = support::accept_tls_websocket(stream).await;
+        let mut stream = yuhaiin_core::websocket::WebSocketIo::new(websocket);
+        serve_vless_wire(&mut stream).await;
+    });
+
+    run_go_vless_client(address, Some("tls-websocket")).await;
+    server.await.unwrap();
+}
+
+async fn serve_vless_wire<S>(stream: &mut S)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = vless::read_request(
+        stream,
+        &[
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(request.command, vless::Command::Tcp);
+    assert_eq!(
+        request.destination,
+        Endpoint::domain(Network::Tcp, DomainName::new("example.com").unwrap(), 443)
+    );
+    vless::write_response(stream, &[]).await.unwrap();
+    let mut payload = [0u8; 4];
+    stream.read_exact(&mut payload).await.unwrap();
+    assert_eq!(&payload, b"ping");
+    stream.write_all(b"pong").await.unwrap();
+}
+
+async fn run_go_vless_client(address: std::net::SocketAddr, transport: Option<&str>) {
+    let go_root = std::env::var_os("YUHAIIN_GO_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from("/home/asutorufa/Documents/Programming/yuhaiin")
+        });
+    let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/interop/vless_go_client.go");
+    let cache_root = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/home/asutorufa/.cache"))
+        .join("yuhaiin-rust/go-tmp");
+    std::fs::create_dir_all(&cache_root).unwrap();
+    let listen = address.to_string();
+    let transport = transport.map(str::to_owned);
+    let output = tokio::task::spawn_blocking(move || {
+        let mut command = Command::new("go");
+        command
+            .arg("run")
+            .arg(helper)
+            .current_dir(&go_root)
+            .env("GOEXPERIMENT", "jsonv2,greenteagc")
+            .env("GOTMPDIR", &cache_root)
+            .env("VLESS_LISTEN", listen);
+        if let Some(transport) = transport {
+            command.env("VLESS_TRANSPORT", transport);
+        }
+        command.output().unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "Go VLESS client failed: {}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

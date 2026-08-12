@@ -10,13 +10,13 @@ import (
 	"github.com/Asutorufa/yuhaiin/pkg/net/netapi"
 	"github.com/Asutorufa/yuhaiin/pkg/net/proxy/direct"
 	"github.com/Asutorufa/yuhaiin/pkg/net/proxy/fixed"
-	tlsproxy "github.com/Asutorufa/yuhaiin/pkg/net/proxy/tls"
-	"github.com/Asutorufa/yuhaiin/pkg/net/proxy/trojan"
+	"github.com/Asutorufa/yuhaiin/pkg/net/proxy/tls"
+	"github.com/Asutorufa/yuhaiin/pkg/net/proxy/vless"
 	websocketproxy "github.com/Asutorufa/yuhaiin/pkg/net/proxy/websocket"
 )
 
 func main() {
-	listen := os.Getenv("TROJAN_LISTEN")
+	listen := os.Getenv("VLESS_LISTEN")
 	host, portText, err := net.SplitHostPort(listen)
 	if err != nil {
 		panic(err)
@@ -32,8 +32,8 @@ func main() {
 		panic(err)
 	}
 	var dialer netapi.Proxy = parent
-	if os.Getenv("TROJAN_TRANSPORT") == "tls-websocket" {
-		dialer, err = tlsproxy.NewClient(tlsproxy.TLSConfig{
+	if os.Getenv("VLESS_TRANSPORT") == "tls-websocket" {
+		dialer, err = tls.NewClient(tls.TLSConfig{
 			Enable:             true,
 			ServerNames:        []string{"localhost"},
 			InsecureSkipVerify: true,
@@ -43,13 +43,15 @@ func main() {
 		}
 		dialer, err = websocketproxy.NewClient(websocketproxy.Config{
 			Host: "localhost",
-			Path: "/trojan",
+			Path: "/vless",
 		}, dialer)
 		if err != nil {
 			panic(err)
 		}
 	}
-	proxy, err := trojan.NewClient(trojan.Config{Password: "secret"}, dialer)
+	proxy, err := vless.NewClient(vless.Config{
+		UUID: "00112233-4455-6677-8899-aabbccddeeff",
+	}, dialer)
 	if err != nil {
 		panic(err)
 	}
