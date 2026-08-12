@@ -35,7 +35,10 @@ configure_tun_container_namespace() {
     TUN_CONTAINER_COMMAND_ARGS=(-Urn "${command_path}")
     echo "[${label}] using disposable user/network namespace"
   else
-    TUN_CONTAINER_ENTRYPOINT=/usr/local/bin/tun-service-smoke
+    # Rootful callers may mount a different harness (for example the
+    # foreground API process test). Keep the entrypoint aligned with the
+    # command path instead of silently invoking an unrelated binary.
+    TUN_CONTAINER_ENTRYPOINT="${command_path}"
     TUN_CONTAINER_COMMAND_ARGS=()
   fi
 }
