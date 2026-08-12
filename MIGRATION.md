@@ -4102,3 +4102,23 @@ packet 和 latency 路径上都会按成员失败重试。此前 Rust 已把 tag
 
 这块仍不把 `[~]` 外部现场项改成完成：WireGuard 第三方/WARP peer、真实 firewall 组合、Darwin/
 Windows 原生 runner 等继续按清单保留；本轮只修正了已纳入桌面主路径的 route tag 数据面。
+
+## 149. 2026-08-12 Remote route-list content and runtime reload fixture
+
+之前的 route-list 回归已经覆盖了下载失败时 `errorMsgs` 的持久化和 MaxMind 的真实文件下载，
+但还缺少一条不依赖公网的成功路径证据。本轮在 `api::tests` 增加 loopback HTTP fixture：先通过
+正常 route-list API 保存一个 remote list，再让 fixture 返回 `remote.example`，最后调用 Go
+兼容的 refresh handler。
+
+该测试固定了完整的数据流：
+
+- HTTP body 被下载到 `~/.cache/yuhaiin-rust/rules/`，使用 sibling `.part` 后 atomic rename；
+- refresh 的公开返回仍是 Go 兼容的空对象，`refreshed/errors` 从 `route.lists.activation`
+  读取，而不是伪造新的 handler response 字段；
+- `mutate_and_reload` 完成后，当前 `RuntimeSnapshot.route_lists` 能查到
+  `remote.example`，`route.list.get` 中历史 `errorMsgs` 被清空为 `[]`；
+- fixture 使用随机 loopback 端口并在断言后删除对应 cache file，不依赖外部 DNS/HTTP，也没有
+  使用 `/tmp`。
+
+该单测已在 Podman `network=none` 中通过；生产 route/resolver projection 仍需要更多停止态
+Go 数据库样本，所以 checklist 的 `[~]` 保持不变。

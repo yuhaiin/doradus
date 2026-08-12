@@ -5386,6 +5386,63 @@ mod tests {
         assert!(local["preview"].as_str().unwrap().contains("example.test"));
     }
 
+    #[tokio::test]
+    async fn route_list_refresh_downloads_remote_content_and_reloads_runtime_snapshot() {
+        let state = state().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/rules.txt");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut request)
+                .await
+                .unwrap();
+            let body = b"remote.example\n";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut stream, header.as_bytes())
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, body)
+                .await
+                .unwrap();
+        });
+
+        let list_name = format!("remote-http-{}", std::process::id());
+        let _ = save_route_list_value(
+            &state,
+            json!({
+                "name":list_name,
+                "type":"host",
+                "source":{"type":"remote","remote":{"urls":[url]}}
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let _ = route_lists_refresh_value(&state).await.unwrap();
+        server.await.unwrap();
+        let report = route_lists_activation_value(&state).await.unwrap();
+        assert_eq!(report.0["refreshed"], 1);
+        assert_eq!(report.0["errors"], json!({}));
+
+        let snapshot = state.controller.handle().load();
+        assert_eq!(
+            snapshot.route_lists.values(&list_name).unwrap(),
+            &["remote.example".to_owned()][..]
+        );
+        let detail = get_route_list_value(&state, list_name.clone())
+            .await
+            .unwrap();
+        assert_eq!(detail.0["errorMsgs"], json!([]));
+
+        let cache_path = crate::route::route_list_cache_path(&url);
+        let _ = std::fs::remove_file(cache_path);
+    }
+
     #[test]
     fn route_list_refresh_interval_matches_go_minutes_and_zero_disables() {
         assert_eq!(
