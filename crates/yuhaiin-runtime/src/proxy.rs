@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -120,6 +121,218 @@ fn track_datagram(
         inner: datagram,
         connection: Mutex::new(connection),
     })
+}
+
+/// Go route tags resolve to a node set. Keep the set at the common async
+/// proxy boundary so TCP, UDP and stateful protocol chains share the same
+/// retry behavior. A failed member is tried before the set reports the
+/// connection failure to the inbound.
+struct NodeSetProxy {
+    members: Vec<Arc<dyn AsyncProxy>>,
+    cursor: AtomicUsize,
+    round_robin: bool,
+}
+
+impl NodeSetProxy {
+    fn new(members: Vec<Arc<dyn AsyncProxy>>, round_robin: bool) -> Result<Self> {
+        if members.is_empty() {
+            return Err(Error::invalid("node tag has no usable members"));
+        }
+        Ok(Self {
+            members,
+            cursor: AtomicUsize::new(0),
+            round_robin,
+        })
+    }
+
+    fn ordered_members(&self) -> Vec<Arc<dyn AsyncProxy>> {
+        let length = self.members.len();
+        let ticket = self.cursor.fetch_add(1, Ordering::Relaxed);
+        // Go defaults to a random set strategy. A cheap deterministic
+        // permutation spreads new flows without adding a runtime RNG to this
+        // hot path; explicit round_robin keeps strict order.
+        let start = if self.round_robin {
+            ticket % length
+        } else {
+            ticket
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15u64 as usize)
+                .wrapping_add(0x243f_6a88_85a3_08d3u64 as usize)
+                % length
+        };
+        (0..length)
+            .map(|offset| Arc::clone(&self.members[(start + offset) % length]))
+            .collect()
+    }
+}
+
+impl AsyncProxy for NodeSetProxy {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        let members = self.ordered_members();
+        let context = context.clone();
+        Box::pin(async move {
+            let mut last_error = None;
+            for member in members {
+                match member.connect(&context).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| Error::invalid("node tag proxy failed")))
+        })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+        let members = self.ordered_members();
+        let context = context.clone();
+        Box::pin(async move {
+            let mut last_error = None;
+            for member in members {
+                match member.open_datagram(&context).await {
+                    Ok(datagram) => return Ok(datagram),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| Error::invalid("node tag datagram failed")))
+        })
+    }
+
+    fn ping<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<Duration>> {
+        let members = self.ordered_members();
+        let context = context.clone();
+        Box::pin(async move {
+            let mut last_error = None;
+            for member in members {
+                match member.ping(&context).await {
+                    Ok(duration) => return Ok(duration),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| Error::invalid("node tag ping failed")))
+        })
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let mut last_error = None;
+            for member in &self.members {
+                if let Err(error) = member.close().await {
+                    last_error = Some(error);
+                }
+            }
+            last_error.map_or(Ok(()), Err)
+        })
+    }
+}
+
+fn track_tagged_proxies(
+    proxies: BTreeMap<String, Arc<dyn AsyncProxy>>,
+    detector: &LoopbackDetector,
+) -> BTreeMap<String, Arc<dyn AsyncProxy>> {
+    proxies
+        .into_iter()
+        .map(|(tag, proxy)| {
+            (
+                tag,
+                Arc::new(LoopbackTrackingProxy {
+                    inner: proxy,
+                    detector: detector.clone(),
+                }) as Arc<dyn AsyncProxy>,
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct NodeTagDefinition {
+    kind: String,
+    targets: Vec<String>,
+    round_robin: bool,
+}
+
+fn parse_node_tag(record: &yuhaiin_store::GoNodeTagRecord) -> Result<NodeTagDefinition> {
+    let value: serde_json::Value =
+        serde_json::from_slice(&record.members_json).map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid node tag {:?} JSON: {error}", record.name),
+            )
+        })?;
+    let object = value.as_object().ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("node tag {:?} must be a JSON object", record.name),
+        )
+    })?;
+    let kind = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .filter(|kind| !kind.trim().is_empty())
+        .unwrap_or("node")
+        .to_ascii_lowercase();
+    if kind != "node" && kind != "mirror" {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("unknown node tag {:?} type {kind:?}", record.name),
+        ));
+    }
+    let targets = match object.get("hash") {
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+            vec![value.trim().to_owned()]
+        }
+        Some(_) => {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("node tag {:?} hash must be a string or array", record.name),
+            ));
+        }
+        None => Vec::new(),
+    };
+    let strategy = object
+        .get("strategy")
+        .or_else(|| object.get("mode"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    Ok(NodeTagDefinition {
+        kind,
+        targets,
+        round_robin: strategy.eq_ignore_ascii_case("round_robin")
+            || strategy.eq_ignore_ascii_case("round-robin")
+            || strategy.eq_ignore_ascii_case("roundrobin"),
+    })
+}
+
+fn resolve_node_tag_targets(
+    tag: &str,
+    definitions: &BTreeMap<String, NodeTagDefinition>,
+    visiting: &mut BTreeSet<String>,
+) -> Vec<String> {
+    let Some(definition) = definitions.get(tag) else {
+        return Vec::new();
+    };
+    if !visiting.insert(tag.to_owned()) {
+        return Vec::new();
+    }
+    let targets = if definition.kind == "mirror" {
+        definition
+            .targets
+            .first()
+            .map(|target| resolve_node_tag_targets(target, definitions, visiting))
+            .unwrap_or_default()
+    } else {
+        definition.targets.clone()
+    };
+    visiting.remove(tag);
+    targets
 }
 
 fn track_selector(
@@ -832,6 +1045,8 @@ async fn build_aead_proxy(
 pub struct RuntimeProxySelector {
     current: RwLock<RuntimeRoutedProxySelector>,
     udp_current: RwLock<RuntimeRoutedProxySelector>,
+    tagged: RwLock<BTreeMap<String, Arc<dyn AsyncProxy>>>,
+    udp_tagged: RwLock<BTreeMap<String, Arc<dyn AsyncProxy>>>,
     direct_id: String,
     proxy_id: String,
     udp_proxy_id: String,
@@ -851,6 +1066,8 @@ struct ProxyContextMetadata {
     route_lists: RouteListSnapshot,
     geo: Option<Arc<dyn GeoLookup>>,
     endpoints: BTreeMap<String, SocketAddr>,
+    tag_endpoints: BTreeMap<String, SocketAddr>,
+    tag_node_ids: BTreeMap<String, String>,
 }
 
 impl RuntimeProxySelector {
@@ -894,9 +1111,13 @@ impl RuntimeProxySelector {
         let udp_current = snapshot
             .build_routed_proxy_selector(direct_id, udp_proxy_id, bypass_id, drop_id, timeout)
             .await?;
+        let tagged = snapshot.build_tagged_proxies(timeout).await?;
+        let udp_tagged = snapshot.build_tagged_proxies(timeout).await?;
         Ok(Self {
             current: RwLock::new(track_selector(current, &loopback)),
             udp_current: RwLock::new(track_selector(udp_current, &loopback)),
+            tagged: RwLock::new(track_tagged_proxies(tagged, &loopback)),
+            udp_tagged: RwLock::new(track_tagged_proxies(udp_tagged, &loopback)),
             direct_id: direct_id.to_owned(),
             proxy_id: tcp_proxy_id.to_owned(),
             udp_proxy_id: udp_proxy_id.to_owned(),
@@ -930,6 +1151,8 @@ impl RuntimeProxySelector {
         let udp_proxy_id = self.effective_node_id(&self.udp_proxy_id);
         let bypass_id = self.effective_node_id(&self.bypass_id);
         let drop_id = self.effective_node_id(&self.drop_id);
+        let tagged = snapshot.build_tagged_proxies(self.timeout).await?;
+        let udp_tagged = snapshot.build_tagged_proxies(self.timeout).await?;
         Ok(PreparedProxySelector {
             selector: track_selector(
                 snapshot
@@ -955,6 +1178,8 @@ impl RuntimeProxySelector {
                     .await?,
                 &self.loopback,
             ),
+            tagged: track_tagged_proxies(tagged, &self.loopback),
+            udp_tagged: track_tagged_proxies(udp_tagged, &self.loopback),
             metadata: snapshot
                 .proxy_context_metadata(&direct_id, &proxy_id, &udp_proxy_id, &bypass_id, &drop_id)
                 .await?,
@@ -972,6 +1197,14 @@ impl RuntimeProxySelector {
             .udp_current
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.udp_selector;
+        *self
+            .tagged
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.tagged;
+        *self
+            .udp_tagged
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.udp_tagged;
         self.closed_nodes
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1026,6 +1259,16 @@ impl RuntimeProxySelector {
             close_slot!(&self.udp_proxy_id, &mut udp_current.proxy);
             close_slot!(&self.bypass_id, &mut udp_current.bypass);
             close_slot!(&self.drop_id, &mut udp_current.drop);
+            let mut tagged = self
+                .tagged
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            old_proxies.extend(std::mem::take(&mut *tagged).into_values());
+            let mut udp_tagged = self
+                .udp_tagged
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            old_proxies.extend(std::mem::take(&mut *udp_tagged).into_values());
             if !old_proxies.is_empty() {
                 closed_nodes.insert(id.to_owned());
             }
@@ -1088,6 +1331,8 @@ impl RuntimeProxySelector {
 pub(crate) struct PreparedProxySelector {
     pub(crate) selector: RuntimeRoutedProxySelector,
     pub(crate) udp_selector: RuntimeRoutedProxySelector,
+    tagged: BTreeMap<String, Arc<dyn AsyncProxy>>,
+    udp_tagged: BTreeMap<String, Arc<dyn AsyncProxy>>,
     metadata: ProxyContextMetadata,
     settings: crate::RuntimeSettings,
 }
@@ -1132,6 +1377,22 @@ impl AsyncProxySelector for RuntimeProxySelector {
     }
 
     fn select(&self, context: &FlowContext) -> Arc<dyn AsyncProxy> {
+        if context.route_mode != yuhaiin_core::RouteMode::Block {
+            let tagged = if context.network == yuhaiin_core::Network::Udp {
+                self.udp_tagged
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            } else {
+                self.tagged
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            };
+            if let Some(tag) = context.tag.as_deref().filter(|tag| !tag.trim().is_empty())
+                && let Some(proxy) = tagged.get(tag)
+            {
+                return Arc::clone(proxy);
+            }
+        }
         let current = if context.network == yuhaiin_core::Network::Udp {
             self.udp_current
                 .read()
@@ -1146,6 +1407,58 @@ impl AsyncProxySelector for RuntimeProxySelector {
 }
 
 impl RuntimeSnapshot {
+    fn node_tag_definitions(&self) -> Result<BTreeMap<String, NodeTagDefinition>> {
+        let mut definitions = BTreeMap::new();
+        for record in &self.node_tags {
+            let name = if record.name.trim().is_empty() {
+                record.id.trim()
+            } else {
+                record.name.trim()
+            };
+            if name.is_empty() {
+                return Err(Error::invalid("node tag name is empty"));
+            }
+            definitions.insert(name.to_owned(), parse_node_tag(record)?);
+        }
+        Ok(definitions)
+    }
+
+    async fn build_tagged_proxies(
+        &self,
+        timeout: Duration,
+    ) -> Result<BTreeMap<String, Arc<dyn AsyncProxy>>> {
+        let definitions = self.node_tag_definitions()?;
+
+        let mut tagged = BTreeMap::new();
+        for (tag, definition) in &definitions {
+            let ids = resolve_node_tag_targets(tag, &definitions, &mut BTreeSet::new());
+            let mut members = Vec::new();
+            let mut seen = BTreeSet::new();
+            for id in ids {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                // Go's node set skips members that cannot be opened and lets
+                // the ordinary route-mode slot handle an empty set. This is
+                // important during a partial node migration or after a node
+                // was disabled without deleting its tag membership.
+                if let Ok(build) = self.build_proxy(&id, timeout).await {
+                    members.push(build.proxy);
+                }
+            }
+            if members.is_empty() {
+                continue;
+            }
+            let proxy = if members.len() == 1 {
+                members.pop().expect("one node tag member was checked")
+            } else {
+                Arc::new(NodeSetProxy::new(members, definition.round_robin)?)
+            };
+            tagged.insert(tag.clone(), proxy);
+        }
+        Ok(tagged)
+    }
+
     async fn proxy_context_metadata(
         &self,
         direct_id: &str,
@@ -1167,12 +1480,43 @@ impl RuntimeSnapshot {
                 endpoints.insert(id.to_owned(), endpoint);
             }
         }
+        let (tag_endpoints, tag_node_ids) = self.tag_metadata().await?;
         Ok(ProxyContextMetadata {
             hosts: self.hosts.clone(),
             route_lists: self.route_lists.clone(),
             geo: self.geo.clone(),
             endpoints,
+            tag_endpoints,
+            tag_node_ids,
         })
+    }
+
+    async fn tag_metadata(
+        &self,
+    ) -> Result<(BTreeMap<String, SocketAddr>, BTreeMap<String, String>)> {
+        let definitions = self.node_tag_definitions()?;
+
+        let mut endpoints = BTreeMap::new();
+        let mut node_ids = BTreeMap::new();
+        for tag in definitions.keys() {
+            let ids = resolve_node_tag_targets(tag, &definitions, &mut BTreeSet::new());
+            for id in ids {
+                let Some(config) = self.proxy_config(&id) else {
+                    continue;
+                };
+                if !config.enabled {
+                    continue;
+                }
+                node_ids.entry(tag.clone()).or_insert_with(|| id.clone());
+                if let Ok(Some(endpoint)) =
+                    config.resolved_fixed_endpoint(self.resolver.as_ref()).await
+                {
+                    endpoints.insert(tag.clone(), endpoint);
+                    break;
+                }
+            }
+        }
+        Ok((endpoints, node_ids))
     }
 }
 
@@ -1214,12 +1558,18 @@ fn annotate_connection_metadata(
         yuhaiin_core::RouteMode::Block => return,
     };
     if context.route_mode == yuhaiin_core::RouteMode::Proxy && !selected_id.is_empty() {
-        context.outbound = Some(selected_id.to_owned());
+        context.outbound = context
+            .tag
+            .as_deref()
+            .and_then(|tag| metadata.tag_node_ids.get(tag))
+            .cloned()
+            .or_else(|| Some(selected_id.to_owned()));
     }
-    let endpoint = metadata
-        .endpoints
-        .get(selected_id)
-        .copied()
+    let endpoint = context
+        .tag
+        .as_deref()
+        .and_then(|tag| metadata.tag_endpoints.get(tag).copied())
+        .or_else(|| metadata.endpoints.get(selected_id).copied())
         .or_else(|| context.destination.addr())
         .or_else(|| context.effective_destination().addr());
     let Some(endpoint) = endpoint else {
@@ -1604,6 +1954,7 @@ mod tests {
             resolvers: Vec::new(),
             route: None,
             route_rules: Vec::new(),
+            node_tags: Vec::new(),
             route_lists: crate::RouteListSnapshot::default(),
             router: RouterRuntime::new(
                 Router::compile(
@@ -1623,6 +1974,150 @@ mod tests {
             geo: None,
             proxies: vec![config],
             nat: yuhaiin_store::NatConfigRecord::default(),
+        }
+    }
+
+    #[test]
+    fn node_tag_parser_accepts_legacy_and_extended_member_shapes() {
+        let legacy = yuhaiin_store::GoNodeTagRecord {
+            id: "edge".to_owned(),
+            name: "edge".to_owned(),
+            members_json: br#"{"type":"node","hash":"node-a"}"#.to_vec(),
+            updated_at: 1,
+        };
+        let parsed = parse_node_tag(&legacy).unwrap();
+        assert_eq!(parsed.kind, "node");
+        assert_eq!(parsed.targets, ["node-a"]);
+
+        let extended = yuhaiin_store::GoNodeTagRecord {
+            id: "mirror".to_owned(),
+            name: "mirror".to_owned(),
+            members_json: br#"{"type":"mirror","hash":["edge"],"strategy":"round_robin"}"#.to_vec(),
+            updated_at: 1,
+        };
+        let parsed = parse_node_tag(&extended).unwrap();
+        assert_eq!(parsed.kind, "mirror");
+        assert_eq!(parsed.targets, ["edge"]);
+        assert!(parsed.round_robin);
+    }
+
+    #[test]
+    fn node_tag_mirror_resolution_stops_on_cycles() {
+        let definitions = BTreeMap::from([
+            (
+                "a".to_owned(),
+                NodeTagDefinition {
+                    kind: "mirror".to_owned(),
+                    targets: vec!["b".to_owned()],
+                    round_robin: false,
+                },
+            ),
+            (
+                "b".to_owned(),
+                NodeTagDefinition {
+                    kind: "mirror".to_owned(),
+                    targets: vec!["a".to_owned()],
+                    round_robin: false,
+                },
+            ),
+            (
+                "edge".to_owned(),
+                NodeTagDefinition {
+                    kind: "node".to_owned(),
+                    targets: vec!["node-a".to_owned(), "node-b".to_owned()],
+                    round_robin: false,
+                },
+            ),
+        ]);
+        assert!(resolve_node_tag_targets("a", &definitions, &mut BTreeSet::new()).is_empty());
+        assert_eq!(
+            resolve_node_tag_targets("edge", &definitions, &mut BTreeSet::new()),
+            ["node-a", "node-b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn node_set_proxy_retries_a_failed_member() {
+        let failed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let failed_address = failed_listener.local_addr().unwrap();
+        drop(failed_listener);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+        });
+        let proxy = NodeSetProxy::new(
+            vec![
+                Arc::new(FixedAsyncProxy {
+                    address: failed_address,
+                    timeout: Duration::from_secs(1),
+                }),
+                Arc::new(FixedAsyncProxy {
+                    address,
+                    timeout: Duration::from_secs(1),
+                }),
+            ],
+            true,
+        )
+        .unwrap();
+        let context = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        assert!(proxy.connect(&context).await.is_ok());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_selector_uses_node_tag_for_tcp_and_udp() {
+        let config = GoProxyRuntimeConfig {
+            id: "tagged-node".to_owned(),
+            name: "tagged-node".to_owned(),
+            group_name: String::new(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["direct".to_owned()],
+            layers: Vec::new(),
+            transport: GoProxyTransport::Direct,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        };
+        let mut snapshot = snapshot(config);
+        snapshot.node_tags.push(yuhaiin_store::GoNodeTagRecord {
+            id: "edge".to_owned(),
+            name: "edge".to_owned(),
+            members_json: br#"{"type":"node","hash":["tagged-node"]}"#.to_vec(),
+            updated_at: 1,
+        });
+        let selector = snapshot
+            .build_proxy_selector("", "", "", "", Duration::from_secs(1))
+            .await
+            .unwrap();
+        for network in [yuhaiin_core::Network::Tcp, yuhaiin_core::Network::Udp] {
+            let mut context = FlowContext::new(yuhaiin_core::Endpoint::ip(
+                network,
+                "192.0.2.1:443".parse().unwrap(),
+            ));
+            context.route_mode = RouteMode::Proxy;
+            context.tag = Some("edge".to_owned());
+            let selected = selector.select(&context);
+            let tagged = if network == yuhaiin_core::Network::Udp {
+                selector
+                    .udp_tagged
+                    .read()
+                    .unwrap()
+                    .get("edge")
+                    .cloned()
+                    .unwrap()
+            } else {
+                selector
+                    .tagged
+                    .read()
+                    .unwrap()
+                    .get("edge")
+                    .cloned()
+                    .unwrap()
+            };
+            assert!(Arc::ptr_eq(&selected, &tagged));
         }
     }
 

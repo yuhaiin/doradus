@@ -1227,12 +1227,38 @@ pub async fn configure_http_chain(
         Some(&node),
     )
     .await;
+    let default_node = json!({
+        "id":"http-default",
+        "name":"HTTP default fallback",
+        "group":"integration",
+        "enabled":true,
+        "chain":[
+            {"type":"fixed","fixed":{"host":"127.0.0.1","port":1}},
+            {"type":"http","http":{"user":"","password":""}}
+        ]
+    });
     api_json(
         &service.client,
         &service.base_url,
         reqwest::Method::POST,
-        "/api/v2/nodes/http-out/use",
+        "/api/v2/nodes",
+        Some(&default_node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes/http-default/use",
         None,
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::PUT,
+        "/api/v2/route/tags/integration",
+        Some(&json!({"type":"node","hash":"http-out"})),
     )
     .await;
 

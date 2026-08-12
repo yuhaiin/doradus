@@ -4080,3 +4080,25 @@ Go `pkg/httpapi/v2_routes.go` 的公开 operation inventory，并检查 Rust `rp
 当前 Go v2 的 82 个 operation 全部通过检查。Rust 额外保留的 users、TUN config 和
 `subscriptions.delete_preview` 属于当前前端/运行时扩展，不会被静态检查误报为 Go 缺失；订阅更新
 本身仍按本轮范围返回 deferred contract。
+
+## 148. 2026-08-12 路由 tag 数据面与节点集合
+
+审计 Go `pkg/node/runtime.go` 后确认，route rule 的 `tag` 不只是连接元数据：Go 会先解析
+`node_tags_v2`，支持 node tag 和 mirror tag，再从目标节点中选择 dialer；节点集合在连接、UDP
+packet 和 latency 路径上都会按成员失败重试。此前 Rust 已把 tag 写入 `FlowContext`，但 selector
+仍只按 direct/proxy/bypass/drop 四个 mode slot 选择，导致 tag 规则在某些配置中“匹配成功但没有
+切换出站”。
+
+本轮实现位于 runtime crate 的公共 `AsyncProxy` 边界：
+
+- `RuntimeSnapshot` 加载并保留 `GoNodeTagRecord`，解析旧版 `hash: string` 和当前 `hash: []`，
+  mirror 递归解析带环检测；禁用、缺失或暂时不可构建的节点不会污染普通 mode fallback。
+- TCP 和 UDP selector 各自构建 tag map；多成员使用可配置的 round-robin 或默认分散顺序，并对
+  connect/open_datagram/ping 按成员顺序重试。reload 会原子替换两张 map，节点关闭时清理 tag
+  proxy，避免旧成员继续接收新流。
+- 单元测试覆盖 JSON 兼容、mirror 环、TCP/UDP selector 命中和失败成员重试；`make
+  service-chain-smoke` 在 Podman 中让 HTTP inbound→router→HTTP outbound 的 `integration`
+  规则实际通过 `node_tags_v2` 选择 `http-out`，16/16 全部通过。
+
+这块仍不把 `[~]` 外部现场项改成完成：WireGuard 第三方/WARP peer、真实 firewall 组合、Darwin/
+Windows 原生 runner 等继续按清单保留；本轮只修正了已纳入桌面主路径的 route tag 数据面。

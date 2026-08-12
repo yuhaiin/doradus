@@ -1313,6 +1313,7 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
         .expect("HTTP inbound connection must be visible");
     assert_eq!(item["inbound"], "http");
     assert_eq!(item["outbound"], fixture.outbound.to_string());
+    assert_eq!(item["nodeId"], "http-out");
     assert_eq!(item["mode"], "proxy");
     assert_eq!(item["localAddr"], inbound.to_string());
     assert_eq!(item["network"]["underlyingType"], "tcp");

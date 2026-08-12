@@ -1,43 +1,56 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Compile test harnesses on the host, then run every generated harness inside
-# disposable Podman containers. This keeps loopback, filesystem writes and
-# capability failures out of the host runtime while preserving one complete
-# workspace-test command.
+# Compile test harnesses and run every generated harness inside disposable
+# Podman containers. This keeps the Rust toolchain, loopback, filesystem writes
+# and capability failures out of the host runtime while preserving one
+# complete workspace-test command.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/workspace-tests}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+build_image="${YUHAIIN_BUILD_IMAGE:-docker.io/library/rust:latest}"
 
-command -v cargo >/dev/null
 command -v podman >/dev/null
 mkdir -p "${scenario_dir}"
 
-echo "[workspace-tests] compiling test harnesses on the host"
-CARGO_TERM_COLOR=never cargo build \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
-  -p yuhaiin-runtime \
-  --all-features \
-  --offline \
-  --bin yuhaiin \
-  >"${scenario_dir}/runtime-build.log" 2>&1
-CARGO_TERM_COLOR=never cargo test \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
-  --workspace \
-  --all-features \
-  --offline \
-  --no-run \
-  >"${scenario_dir}/build.log" 2>&1
+echo "[workspace-tests] compiling test harnesses in Podman"
+podman run --rm --network=host \
+  -v "${repo_root}:/workspace:ro" \
+  -v "${target_dir}:/target:Z" \
+  -v "${scenario_dir}:/state:Z" \
+  -v "${HOME}/.cargo:/cargo-home:ro" \
+  --entrypoint /bin/sh \
+  "${build_image}" \
+  -ec '
+    set -eu
+    mkdir -p /state/home /state/cache/tmp
+    export HOME=/state/home
+    export CARGO_HOME=/cargo-home
+    export CARGO_TARGET_DIR=/target
+    export TMPDIR=/state/cache/tmp
+    export CARGO_NET_OFFLINE=true
+    CARGO_TERM_COLOR=never cargo build \
+      --manifest-path /workspace/Cargo.toml \
+      -p yuhaiin-runtime \
+      --all-features \
+      --bin yuhaiin \
+      >/state/runtime-build.log 2>&1
+    CARGO_TERM_COLOR=never cargo test \
+      --manifest-path /workspace/Cargo.toml \
+      --workspace \
+      --all-features \
+      --no-run \
+      >/state/build.log 2>&1
+  '
 
 declare -a test_binaries=()
 while IFS= read -r binary; do
-  [[ -x "${binary}" ]] || continue
-  test_binaries+=("/target/debug/deps/$(basename "${binary}")")
+  binary_name="$(basename "${binary}")"
+  [[ -x "${target_dir}/debug/deps/${binary_name}" ]] || continue
+  test_binaries+=("/target/debug/deps/${binary_name}")
 done < <(awk '/^ *Executable / { gsub(/[()]/, "", $NF); print $NF }' "${scenario_dir}/build.log")
 
 if (( ${#test_binaries[@]} == 0 )); then

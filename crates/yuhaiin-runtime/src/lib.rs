@@ -49,9 +49,9 @@ use yuhaiin_core::{
 use yuhaiin_geo::{GeoDatabaseManager, GeoMetadata};
 use yuhaiin_store::fakeip::{FakeIpPool, FakeIpPoolOptions, FakeIpV6Pool};
 use yuhaiin_store::{
-    ConfigRepository, ConfigStore, FakeIpPolicy, FakeIpPools, FakeIpResolver, GoProxyRuntimeConfig,
-    GoResolverRuntimeConfig, GoRouteRuleRecord, GoRouteRuntimeConfig, InboundSettings,
-    MaxMindMetadataRecord, NatConfigRecord,
+    ConfigRepository, ConfigStore, FakeIpPolicy, FakeIpPools, FakeIpResolver, GoNodeTagRecord,
+    GoProxyRuntimeConfig, GoResolverRuntimeConfig, GoRouteRuleRecord, GoRouteRuntimeConfig,
+    InboundSettings, MaxMindMetadataRecord, NatConfigRecord,
 };
 use yuhaiin_trie::router::{RouteDecision, RouterRuntime};
 
@@ -152,6 +152,9 @@ pub struct RuntimeSnapshot {
     pub resolvers: Vec<GoResolverRuntimeConfig>,
     pub route: Option<GoRouteRuntimeConfig>,
     pub route_rules: Vec<GoRouteRuleRecord>,
+    /// Go node tags are part of routing, not only a management/API view. A
+    /// route rule's tag can select a node or a mirrored tag at flow time.
+    pub node_tags: Vec<GoNodeTagRecord>,
     pub route_lists: RouteListSnapshot,
     pub router: RouterRuntime,
     pub resolver_by_id: BTreeMap<String, Arc<dyn AsyncIpResolver>>,
@@ -316,6 +319,7 @@ impl RuntimeBuilder {
         let resolvers = repository.list_go_resolver_runtime_configs().await?;
         let route = repository.load_go_route_runtime_config().await?;
         let route_rules = repository.list_go_route_rules().await?;
+        let node_tags = repository.list_go_node_tags().await?;
         let route_list_records = repository.list_go_route_lists().await?;
         let route_lists = load_route_lists(&route_list_records);
         let proxies = repository.list_go_proxy_runtime_configs().await?;
@@ -438,6 +442,7 @@ impl RuntimeBuilder {
             resolvers,
             route,
             route_rules,
+            node_tags,
             route_lists,
             router,
             resolver_by_id,
@@ -1096,6 +1101,7 @@ mod tests {
                 udp_proxy_fqdn: GoUdpProxyFqdnStrategy::Resolve,
             }),
             route_rules: Vec::new(),
+            node_tags: Vec::new(),
             route_lists: RouteListSnapshot::default(),
             router,
             resolver_by_id,
