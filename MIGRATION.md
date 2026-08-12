@@ -3934,8 +3934,8 @@ WireGuard 在 BoringTun 的 UDP underlay 创建处应用同一约束。没有接
 source-address/interface snapshot 策略。macOS/Windows 的共享 core 不引入 Linux 专用 socket API，
 仍保留可移植的 source-address fallback。
 
-验证分两层完成：完整 workspace harness 在 Podman 中通过 48 个 harness（chain 52、core 147、
-runtime 256、store 135，0 失败），随后在 privileged、`network=none` 的 Podman 中运行
+验证分两层完成：完整 workspace harness 在 Podman 中通过 48 个 harness（chain 52、core 148、
+runtime 257、store 131（5 个 ignored），0 失败），随后在 privileged、`network=none` 的 Podman 中运行
 `network_interface` 回归，direct TCP 和 fixed UDP 均为 2/2，WireGuard underlay 的 Linux `lo`
 绑定为 1/1，runtime wrapper 传递测试和 Clippy 也通过。该证据只覆盖 Linux 权限可用的接口绑定和本地 loopback，不把它外推为 macOS/Windows
 原生接口索引行为或第三方/WARP 网络现场；后者继续由 checklist 的外部验收项跟踪。
