@@ -3986,3 +3986,19 @@ GitHub Actions 之前在旧提交上报告 `trojan.rs:20` 的
 和完整 workspace 测试。完整 workspace 本轮为 chain 55、core 148、runtime 257、store 131
 （5 ignored）、service-chain 16、WireGuard 8（1 benchmark ignored），0 失败；所有临时目录
 和 cargo target 仍位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
+## 143. 2026-08-12 Linux musl release matrix
+
+按 `.github/workflows/rust.yml` 中固定的 `cross-tools/musl-cross@20260515` toolchain 和 SHA-256，
+在 Podman 中分别配置 `x86_64-unknown-linux-musl`、`aarch64-unknown-linux-musl` 的 C compiler、
+archiver 和 Rust target，执行与 release job 相同的：
+
+```text
+cargo build --locked --offline --release --target <target> -p yuhaiin-runtime --bin yuhaiin --all-features
+```
+
+两个 target 均成功链接：x86_64 产出 static-pie ELF，aarch64 产出静态 ARM64 ELF。此次检查覆盖
+`ring`、bundled SQLite、BoringTun、TUN、HTTP API 和 pprof 的完整 feature 集；Darwin/Windows
+仍由 workflow 对应的 macOS/Windows runner 负责最终原生链接，Linux 容器不把 GNU 交叉检查冒充为
+MSVC 或 Apple SDK 验证。构建缓存和下载的 toolchain 均位于 `~/.cache/yuhaiin-rust`，验证后删除了
+本轮专用的 `ci-crosscheck` target，避免长期占用磁盘。
