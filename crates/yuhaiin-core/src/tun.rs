@@ -13,6 +13,7 @@ use smoltcp::wire::{
     HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion,
     TcpPacket, UdpPacket,
 };
+use std::borrow::Cow;
 #[cfg(feature = "async-proxy")]
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
@@ -852,6 +853,82 @@ fn is_non_initial_fragment(packet: &[u8]) -> Result<bool> {
         }
         IpVersion::Ipv6 => Ok(ipv6_has_fragment_header(packet)),
     }
+}
+
+/// smoltcp's IP medium parser intentionally keeps the common path small and
+/// does not expose transport payloads behind IPv6 extension headers. TUN is an
+/// IP gateway, though, so normalize the bounded extension chain before the
+/// packet reaches smoltcp. The UDP checksum is independent of extension
+/// headers, and the original source/destination addresses remain unchanged.
+fn normalize_ipv6_extension_headers(packet: &[u8]) -> Result<Cow<'_, [u8]>> {
+    if IpVersion::of_packet(packet).ok() != Some(IpVersion::Ipv6) {
+        return Ok(Cow::Borrowed(packet));
+    }
+    smoltcp::wire::Ipv6Packet::new_checked(packet)
+        .map_err(|_| Error::invalid("malformed IPv6 packet"))?;
+
+    let mut next_header = packet[6];
+    let mut offset = 40usize;
+    let mut headers = 0usize;
+    while let Some(header_length) = match next_header {
+        // Hop-by-Hop, Routing and Destination Options use 8-octet units.
+        0 | 43 | 60 => {
+            if offset.checked_add(2).is_none_or(|end| end > packet.len()) {
+                return Err(Error::invalid("truncated IPv6 extension header"));
+            }
+            Some(
+                usize::from(packet[offset + 1])
+                    .checked_add(1)
+                    .and_then(|units| units.checked_mul(8))
+                    .ok_or_else(|| Error::invalid("IPv6 extension header length overflow"))?,
+            )
+        }
+        // Authentication Header uses 32-bit units and counts the fixed
+        // eight-byte prefix as two units.
+        51 => {
+            if offset.checked_add(2).is_none_or(|end| end > packet.len()) {
+                return Err(Error::invalid("truncated IPv6 authentication header"));
+            }
+            Some(
+                usize::from(packet[offset + 1])
+                    .checked_add(2)
+                    .and_then(|units| units.checked_mul(4))
+                    .ok_or_else(|| Error::invalid("IPv6 authentication header length overflow"))?,
+            )
+        }
+        // Fragment headers must be reassembled at recv_from_tun before this
+        // function. Leave a directly injected fragment untouched so the
+        // existing non-initial-fragment guard remains authoritative.
+        44 => return Ok(Cow::Borrowed(packet)),
+        _ => None,
+    } {
+        if header_length < 8
+            || offset
+                .checked_add(header_length)
+                .is_none_or(|end| end > packet.len())
+        {
+            return Err(Error::invalid("truncated IPv6 extension header"));
+        }
+        next_header = packet[offset];
+        offset += header_length;
+        headers += 1;
+        if headers > 16 {
+            return Err(Error::invalid("IPv6 extension header chain is too long"));
+        }
+    }
+
+    if offset == 40 {
+        return Ok(Cow::Borrowed(packet));
+    }
+    let payload_length = packet.len() - offset;
+    let payload_length = u16::try_from(payload_length)
+        .map_err(|_| Error::invalid("normalized IPv6 packet is too large"))?;
+    let mut normalized = Vec::with_capacity(40 + usize::from(payload_length));
+    normalized.extend_from_slice(&packet[..40]);
+    normalized[4..6].copy_from_slice(&payload_length.to_be_bytes());
+    normalized[6] = next_header;
+    normalized.extend_from_slice(&packet[offset..]);
+    Ok(Cow::Owned(normalized))
 }
 
 fn parse_dispatch_transport_tuple(packet: &[u8]) -> Result<Option<TransportTuple>> {
@@ -2121,6 +2198,12 @@ struct TransportTuple {
 fn parse_transport_tuple(packet: &[u8]) -> Result<Option<TransportTuple>> {
     let version = IpVersion::of_packet(packet)
         .map_err(|_| Error::invalid("TUN packet is not IPv4 or IPv6"))?;
+    let normalized = if version == IpVersion::Ipv6 {
+        normalize_ipv6_extension_headers(packet)?
+    } else {
+        Cow::Borrowed(packet)
+    };
+    let packet = normalized.as_ref();
     let (source, destination, protocol, payload) = match version {
         IpVersion::Ipv4 => {
             let packet = smoltcp::wire::Ipv4Packet::new_checked(packet)
@@ -3291,6 +3374,9 @@ impl TunRuntime {
             // inbound just because one hostile datagram was dropped.
             return Ok(length);
         };
+        let packet = normalize_ipv6_extension_headers(&packet)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
+            .into_owned();
         let accepted = self
             .smoltcp_device
             .enqueue_rx_reassembled(packet)

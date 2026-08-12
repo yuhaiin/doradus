@@ -42,4 +42,16 @@ podman run --rm \
   | tee "${scenario_dir}/podman.log"
 
 grep -q 'test result: ok' "${scenario_dir}/podman.log"
+
+echo "[tun-ipv6-extension] running real kernel TUN packet path in Podman"
+YUHAIIN_INTEGRATION_DIR="${scenario_dir}/kernel" \
+YUHAIIN_TUN_IPV6_EXTENSION=1 \
+YUHAIIN_TUN_PORTAL_V6="fd00:253::1/64" \
+YUHAIIN_TUN_ROUTE="fd00:253::2/128" \
+YUHAIIN_TUN_IPV6_SOURCE="fd00:253::1" \
+YUHAIIN_TUN_IPV6_TARGET="[fd00:253::2]:18080" \
+YUHAIIN_TUN_UDP_TRAFFIC=1 \
+YUHAIIN_TUN_UDP_TRAFFIC_BYTES=32 \
+  "${repo_root}/scripts/integration/tun-service.sh"
+
 echo "[tun-ipv6-extension] passed; logs=${scenario_dir}"

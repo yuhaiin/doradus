@@ -674,6 +674,20 @@ fn ipv6_extension_headers_are_split_at_the_wire_boundary() {
 }
 
 #[test]
+fn ipv6_transport_tuple_normalizes_extension_headers_for_smoltcp() {
+    let packet = ipv6_udp_packet_with_hbh_routing_and_destination(b"extension-payload");
+    let normalized = normalize_ipv6_extension_headers(&packet).unwrap();
+    assert_eq!(normalized[6], 17);
+    assert_eq!(normalized.len(), 40 + 8 + b"extension-payload".len());
+    assert_eq!(&normalized[48..], b"extension-payload");
+
+    let tuple = parse_transport_tuple(&packet).unwrap().unwrap();
+    assert_eq!(tuple.protocol, IpProtocol::Udp);
+    assert_eq!(tuple.source, "[::1]:41000".parse().unwrap());
+    assert_eq!(tuple.destination, "[2001:db8::2]:5353".parse().unwrap());
+}
+
+#[test]
 fn ipv6_output_fragmentation_rejects_an_existing_fragment_header() {
     let whole = ipv6_udp_packet(
         Ipv6Addr::LOCALHOST,

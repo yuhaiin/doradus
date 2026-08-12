@@ -106,7 +106,7 @@ help:
 		'make tun-reload-traffic-smoke verify TUN traffic after disable/enable reload' \
 		'make tun-reset-reconnect-smoke verify TUN TCP RST cleanup and reconnect traffic' \
 		'make tun-mtu-smoke run the runtime-owned TUN MTU boundary matrix' \
-		'make tun-ipv6-extension-smoke run IPv6 extension-header fragmentation tests in Podman' \
+		'make tun-ipv6-extension-smoke run IPv6 extension-header unit and real-kernel TUN tests in Podman' \
 		'make tun-route-matrix-smoke run rootful TUN multi-route and force-stop lease smoke' \
 		'make tun-api-process-smoke verify the foreground binary TUN API toggle against /dev/net/tun' \
 		'make wireguard-smoke run BoringTun userspace two-peer smoke in Podman' \

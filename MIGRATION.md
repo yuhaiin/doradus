@@ -4502,3 +4502,24 @@ JSON 保存在 `~/.cache/yuhaiin-rust/benchmarks/wireguard/`，本轮没有使�
 根目录 `checksums.txt`。Podman `network=none` 中执行 release contract smoke 通过；这仍是
 工作流结构和资产契约验证，六个 native runner 的真实编译与第一次远程 Actions 运行继续保留
 为 `[~]`，没有把本地结构检查冒充远程发布成功。
+
+## 171. 2026-08-13 TUN IPv6 extension-header kernel round-trip
+
+本轮把之前仅有 core 分片布局单测的 IPv6 extension-header 缺口推进到真实 kernel TUN
+路径。测试夹具在 Podman disposable user/network namespace 中配置 `fd00:253::1/64`
+和 `fd00:253::2/128`，使用 Linux raw IPv6 socket 注入带 Hop-by-Hop + Destination
+Options 的 UDP datagram；运行时将扩展头 ingress-normalize 后交给 smoltcp，再通过
+fixed UDP outbound 发到 loopback target，并把 echo 从 TUN 写回虚拟 IPv6 UDP socket。
+测试实际观察到 `runtime-tun-udp-target-received bytes=32`、
+`runtime-tun-ipv6-extension-client-roundtrip bytes=32`、`runtime-tun-closed`。
+
+现场过程中发现 smoltcp 默认 `IFACE_MAX_ADDR_COUNT=2` 无法同时容纳 IPv4 portal、IPv6
+portal 及 route virtual addresses，已在 `yuhaiin-core` 的 smoltcp feature 中固定
+`iface-max-addr-count-8`。`TunRuntime::recv_from_tun` 现在对有限长度的 Hop-by-Hop、
+Routing、Destination Options 和 AH 链做 fail-closed normalization；Fragment Header
+仍只由既有 IPv6 ingress reassembler 负责，不会被直接剥掉。新增 transport tuple 和
+checksum-preserving normalization 单测，core 定向测试、`cargo fmt --check` 和
+`make tun-ipv6-extension-smoke` 均在 Podman 中通过。
+
+本项关闭的是 Linux namespace 内真实扩展头 packet path，不等价于所有发行版、防火墙和
+移动平台权限已验收；这些仍按 `IMPLEMENTATION_CHECKLIST.md` 的 TUN `[~]` 保留。

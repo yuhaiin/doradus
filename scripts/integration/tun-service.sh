@@ -55,7 +55,7 @@ fi
 if [[ -n "${YUHAIIN_TUN_DEBUG:-}" ]]; then
   chain_env+=( -e "YUHAIIN_TUN_DEBUG=${YUHAIIN_TUN_DEBUG}" )
 fi
-for tun_fixture_env in YUHAIIN_TUN_PORTAL YUHAIIN_TUN_PORTAL_V6 YUHAIIN_TUN_ROUTE YUHAIIN_TUN_SOURCE YUHAIIN_TUN_TARGET YUHAIIN_TUN_UDP_TARGET YUHAIIN_TUN_UDP_FIRST; do
+for tun_fixture_env in YUHAIIN_TUN_PORTAL YUHAIIN_TUN_PORTAL_V6 YUHAIIN_TUN_ROUTE YUHAIIN_TUN_SOURCE YUHAIIN_TUN_IPV6_SOURCE YUHAIIN_TUN_TARGET YUHAIIN_TUN_IPV6_TARGET YUHAIIN_TUN_UDP_TARGET YUHAIIN_TUN_UDP_FIRST YUHAIIN_TUN_IPV6_EXTENSION; do
   if [[ -n "${!tun_fixture_env:-}" ]]; then
     chain_env+=( -e "${tun_fixture_env}=${!tun_fixture_env}" )
   fi
@@ -184,7 +184,12 @@ if [[ "${YUHAIIN_TUN_ASSERT_PROCESS:-0}" == "1" ]]; then
   grep -Fq "runtime-tun-process-ok" <<<"${output}"
 fi
 if [[ "${YUHAIIN_TUN_UDP_TRAFFIC:-0}" == "1" ]]; then
-  grep -Fq "runtime-tun-udp-traffic-ok" <<<"${output}"
+  if [[ "${YUHAIIN_TUN_IPV6_EXTENSION:-0}" != "1" ]]; then
+    grep -Fq "runtime-tun-udp-traffic-ok" <<<"${output}"
+  fi
+fi
+if [[ "${YUHAIIN_TUN_IPV6_EXTENSION:-0}" == "1" ]]; then
+  grep -Fq "runtime-tun-ipv6-extension-ok" <<<"${output}"
 fi
 grep -Fq "runtime-tun-closed name=${tun_name}" <<<"${output}"
 if [[ -n "${chain_mode}" ]]; then

@@ -8,7 +8,7 @@
 //! not alter the host routing table.
 
 use std::io::Cursor;
-use std::net::{SocketAddr, TcpStream};
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,6 +64,17 @@ async fn main() {
         }
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("--ipv6-extension-client") {
+        let total_bytes = std::env::var("YUHAIIN_TUN_UDP_TRAFFIC_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(32);
+        if let Err(error) = run_tun_ipv6_extension_client(total_bytes) {
+            eprintln!("tun-service-smoke: IPv6 extension client: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--reset-client") {
         if let Err(error) = run_tun_reset_client() {
             eprintln!("tun-service-smoke: reset client: {error}");
@@ -103,6 +114,7 @@ async fn run() -> Result<()> {
     }
     let traffic = std::env::var_os("YUHAIIN_TUN_TRAFFIC").is_some();
     let udp_traffic = std::env::var_os("YUHAIIN_TUN_UDP_TRAFFIC").is_some();
+    let ipv6_extension = std::env::var_os("YUHAIIN_TUN_IPV6_EXTENSION").is_some();
     let udp_first = udp_traffic && std::env::var_os("YUHAIIN_TUN_UDP_FIRST").is_some();
     if udp_traffic && !traffic {
         return Err(Error::invalid(
@@ -112,6 +124,16 @@ async fn run() -> Result<()> {
     if udp_traffic && chain_mode_is_set() {
         return Err(Error::invalid(
             "YUHAIIN_TUN_UDP_TRAFFIC is currently supported by the direct TUN fixture only",
+        ));
+    }
+    if ipv6_extension && (!traffic || !udp_traffic) {
+        return Err(Error::invalid(
+            "YUHAIIN_TUN_IPV6_EXTENSION requires both YUHAIIN_TUN_TRAFFIC and YUHAIIN_TUN_UDP_TRAFFIC",
+        ));
+    }
+    if ipv6_extension && udp_first {
+        return Err(Error::invalid(
+            "YUHAIIN_TUN_IPV6_EXTENSION cannot be combined with YUHAIIN_TUN_UDP_FIRST",
         ));
     }
     let traffic_bytes = std::env::var("YUHAIIN_TUN_TRAFFIC_BYTES")
@@ -341,6 +363,12 @@ async fn run() -> Result<()> {
     }
     println!("runtime-tun-opened name={device_name}");
 
+    if ipv6_extension {
+        eprintln!("runtime-tun-ipv6-extension-client-start bytes={udp_traffic_bytes}");
+        run_tun_ipv6_extension_child(udp_traffic_bytes).await?;
+        println!("runtime-tun-ipv6-extension-ok bytes={udp_traffic_bytes}");
+    }
+
     if udp_first {
         eprintln!("runtime-tun-udp-client-start bytes={udp_traffic_bytes}");
         run_tun_udp_traffic_child(udp_traffic_bytes).await?;
@@ -438,7 +466,7 @@ async fn run() -> Result<()> {
             }
             return Err(error.clone());
         }
-        if udp_traffic && !udp_first {
+        if udp_traffic && !udp_first && !ipv6_extension {
             eprintln!("runtime-tun-udp-client-start bytes={udp_traffic_bytes}");
             if let Err(error) = run_tun_udp_traffic_child(udp_traffic_bytes).await {
                 eprintln!(
@@ -951,6 +979,150 @@ fn run_tun_udp_traffic_client(total_bytes: usize) -> std::io::Result<()> {
     Ok(())
 }
 
+async fn run_tun_ipv6_extension_child(total_bytes: usize) -> Result<()> {
+    let executable = std::env::current_exe().map_err(io_error)?;
+    let mut child = std::process::Command::new(executable)
+        .arg("--ipv6-extension-client")
+        .env("YUHAIIN_TUN_UDP_TRAFFIC_BYTES", total_bytes.to_string())
+        .spawn()
+        .map_err(io_error)?;
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .map_err(join_error)?
+        .map_err(io_error)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io_error(std::io::Error::other(format!(
+            "TUN IPv6 extension client exited with {status}"
+        ))))
+    }
+}
+
+fn run_tun_ipv6_extension_client(total_bytes: usize) -> std::io::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = total_bytes;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "raw IPv6 extension smoke is only available on Linux",
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+        let source = configured_tun_ipv6_source()?;
+        let target = configured_tun_ipv6_target()?;
+        let source_port = 41_000;
+        let receiver = std::net::UdpSocket::bind(SocketAddrV6::new(source, source_port, 0, 0))?;
+        receiver.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut payload = vec![0u8; total_bytes];
+        fill_traffic_chunk(&mut payload, 0);
+        let packet = build_ipv6_extension_udp_packet(
+            source,
+            *target.ip(),
+            source_port,
+            target.port(),
+            &payload,
+        );
+        let socket = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::from(255)))?;
+        socket.set_header_included_v6(true)?;
+        // Raw IPv6 sockets do not accept a transport port in sockaddr_in6;
+        // the UDP destination port is carried by the packet header above.
+        let route_target = SocketAddrV6::new(*target.ip(), 0, target.flowinfo(), target.scope_id());
+        let sent = socket.send_to(&packet, &SockAddr::from(route_target))?;
+        if sent != packet.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!(
+                    "raw IPv6 extension packet was truncated: sent {sent} of {}",
+                    packet.len()
+                ),
+            ));
+        }
+        let mut echoed = vec![0u8; 65_507];
+        let (length, peer) = receiver.recv_from(&mut echoed).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("read raw IPv6 extension echo from {target}: {error}"),
+            )
+        })?;
+        if length != total_bytes || echoed[..length] != payload {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "raw IPv6 extension echo mismatch from {peer}: received {length} of {total_bytes} bytes"
+                ),
+            ));
+        }
+        eprintln!(
+            "runtime-tun-ipv6-extension-client-roundtrip bytes={} source={source} destination={target}",
+            payload.len(),
+        );
+        Ok(())
+    }
+}
+
+fn build_ipv6_extension_udp_packet(
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    source_port: u16,
+    destination_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let udp_len = 8 + payload.len();
+    let extension_len = 16;
+    let mut packet = vec![0u8; 40 + extension_len + udp_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(u16::try_from(extension_len + udp_len).unwrap()).to_be_bytes());
+    packet[6] = 0; // Hop-by-Hop Options
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&source.octets());
+    packet[24..40].copy_from_slice(&destination.octets());
+
+    // Two eight-byte extension headers. All option bytes are Pad1, which is
+    // valid and keeps this fixture focused on extension-header traversal.
+    packet[40] = 60; // Destination Options follows Hop-by-Hop Options.
+    packet[48] = 17; // UDP follows Destination Options.
+
+    let udp_offset = 56;
+    packet[udp_offset..udp_offset + 2].copy_from_slice(&source_port.to_be_bytes());
+    packet[udp_offset + 2..udp_offset + 4].copy_from_slice(&destination_port.to_be_bytes());
+    packet[udp_offset + 4..udp_offset + 6]
+        .copy_from_slice(&(u16::try_from(udp_len).unwrap()).to_be_bytes());
+    packet[udp_offset + 8..].copy_from_slice(payload);
+
+    let checksum = ipv6_udp_checksum(source, destination, &packet[udp_offset..]);
+    packet[udp_offset + 6..udp_offset + 8].copy_from_slice(&checksum.to_be_bytes());
+    packet
+}
+
+fn ipv6_udp_checksum(source: Ipv6Addr, destination: Ipv6Addr, udp_packet: &[u8]) -> u16 {
+    let mut pseudo_header = Vec::with_capacity(40 + udp_packet.len());
+    pseudo_header.extend_from_slice(&source.octets());
+    pseudo_header.extend_from_slice(&destination.octets());
+    pseudo_header.extend_from_slice(&(u32::try_from(udp_packet.len()).unwrap()).to_be_bytes());
+    pseudo_header.extend_from_slice(&[0, 0, 0, 17]);
+    pseudo_header.extend_from_slice(udp_packet);
+    internet_checksum(&pseudo_header)
+}
+
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for word in bytes.chunks_exact(2) {
+        sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
+    }
+    if let Some(&byte) = bytes.chunks_exact(2).remainder().first() {
+        sum += u32::from(byte) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 async fn run_tun_udp_traffic_child(total_bytes: usize) -> Result<()> {
     let executable = std::env::current_exe().map_err(io_error)?;
     let mut child = std::process::Command::new(executable)
@@ -1023,6 +1195,18 @@ fn configured_tun_source() -> std::io::Result<std::net::IpAddr> {
         })
 }
 
+fn configured_tun_ipv6_source() -> std::io::Result<Ipv6Addr> {
+    std::env::var("YUHAIIN_TUN_IPV6_SOURCE")
+        .unwrap_or_else(|_| "fd00:253::1".to_owned())
+        .parse()
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid YUHAIIN_TUN_IPV6_SOURCE: {error}"),
+            )
+        })
+}
+
 fn configured_tun_target() -> std::io::Result<SocketAddr> {
     std::env::var("YUHAIIN_TUN_TARGET")
         .unwrap_or_else(|_| "198.18.0.2:18080".to_owned())
@@ -1047,6 +1231,17 @@ fn configured_tun_udp_target() -> std::io::Result<SocketAddr> {
             })
         },
     )
+}
+
+fn configured_tun_ipv6_target() -> std::io::Result<SocketAddrV6> {
+    let value = std::env::var("YUHAIIN_TUN_IPV6_TARGET")
+        .unwrap_or_else(|_| "[fd00:253::2]:18080".to_owned());
+    value.parse().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid YUHAIIN_TUN_IPV6_TARGET: {error}"),
+        )
+    })
 }
 
 const YUUBINSYA_PASSWORD: &str = "runtime-tun-smoke-yuubinsya";
@@ -1260,4 +1455,34 @@ fn io_error(error: impl std::fmt::Display) -> Error {
 
 fn join_error(error: tokio::task::JoinError) -> Error {
     io_error(error)
+}
+
+#[cfg(test)]
+mod ipv6_extension_packet_tests {
+    use super::*;
+
+    #[test]
+    fn builds_two_extension_headers_before_udp() {
+        let source = "fd00:253::1".parse().unwrap();
+        let destination = "fd00:253::2".parse().unwrap();
+        let packet = build_ipv6_extension_udp_packet(source, destination, 41_000, 18_080, b"hello");
+
+        assert_eq!(packet.len(), 40 + 16 + 8 + 5);
+        assert_eq!(packet[6], 0);
+        assert_eq!(packet[40..42], [60, 0]);
+        assert_eq!(packet[48..50], [17, 0]);
+        assert_eq!(u16::from_be_bytes([packet[56], packet[57]]), 41_000);
+        assert_eq!(u16::from_be_bytes([packet[58], packet[59]]), 18_080);
+        assert_eq!(u16::from_be_bytes([packet[60], packet[61]]), 13);
+        assert_eq!(ipv6_udp_checksum(source, destination, &packet[56..]), 0);
+    }
+
+    #[test]
+    fn checksum_handles_odd_length_payloads() {
+        let source = "fd00:253::1".parse().unwrap();
+        let destination = "fd00:253::2".parse().unwrap();
+        let packet = build_ipv6_extension_udp_packet(source, destination, 1, 2, b"odd");
+
+        assert_eq!(ipv6_udp_checksum(source, destination, &packet[56..]), 0);
+    }
 }
