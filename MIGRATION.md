@@ -3876,6 +3876,25 @@ checklist 中的 `[~]` 项跟踪。
 - `YUHAIIN_TUN_RELOAD_CYCLES=2 make tun-reload-traffic-smoke` 通过，确认 reload 后仍能完成 fixed outbound 的真实 TUN packet echo；TUN 关闭期间也不会错误地产生 route 流量。
 - `make tun-api-process-smoke` 继续通过真实 `/dev/net/tun` 和 `/proc/net/dev` 的 disabled → enabled → disabled → enabled → disabled 进程级检查；`make startup-logs-smoke` 继续确认前台二进制默认输出 database、API bind、runtime ready、shutdown 和 stopped。
 
-Go 的 `inbounds_v2` 可以保存多个 TUN 记录，但本 Rust 桌面实现按当前“最简单的一种 TUN”约定只管理一个 OS TUN。多个同时启用的 TUN 记录会在选择阶段返回明确错误，而不是静默选择一个；这保留了配置错误可见性，也避免在尚未需要时引入多设备 route lease、名称冲突和并发 supervisor 编排。注入式 FD/mobile 边界仍是独立 API，不代表桌面多 TUN 支持。
+Go 的 `inbounds_v2` 可以保存多个 TUN 记录；桌面 Rust supervisor 现在按每个 enabled 记录创建独立 OS TUN、proxy runtime 和 route lease，并按稳定的记录 ID 为缺省设备名排序。相同设备名只对同时 enabled 的记录报错，disabled 定义不会阻塞另一个 TUN 启动。注入式 FD/mobile 边界仍是独立 API，继续只接受一个已经创建好的设备。
 
 本轮没有发现需要为前端补写的 API projection 字段；Go/Rust API parity 脚本当前只忽略实现依赖的版本、远程 route cache、接口 link-local、license/log metadata，其他响应、mutation 和错误仍做严格比较。现场缓存继续只使用 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
+## 136. 2026-08-12 多 TUN inbound 运行时对齐
+
+为消除前一节记录的单设备实现边界，桌面路径新增 `load_tun_configs_for_desktop`：它读取全部 Go-shaped TUN inbound，稳定排序、为缺省名称分配 `yrtunN`，只对 enabled 设备检查名称冲突，并将每个设备交给独立的 `TunRuntime` task。任意 inbound reload 会统一停止当前设备集合、释放各自 route lease，再按最新 SQLite 配置重建；单 FD 的 `run_until_with_tun_fd` 仍保留原有单设备约束。
+
+验证结果：Podman 中 `tun-api-process` 通过两个同时 enabled 的真实 `/dev/net/tun` 设备出现/消失检查；secondary 关闭时 primary 仍存在。新增 desktop loader 的 2 个 unit tests 也在 `--network=none` 容器通过。随后 `YUHAIIN_TUN_RELOAD_CYCLES=2 make tun-reload-traffic-smoke` 继续通过，证明单设备 reload/真实 packet echo 未被多设备 supervisor 改坏。
+
+## 137. 2026-08-12 GitHub Actions stable lint 与 SQLite 工具链修复
+
+GitHub Actions 的新 Clippy 将 `crates/yuhaiin-protocol/src/trojan.rs` 中的
+`[b'\r', b'\n']` 报为 `clippy::byte_char_slices`；它已改成等价的 `*b"\r\n"`，没有关闭
+`-D warnings`。同一轮还确认 `rusqlite 0.40.1` 引入的 `libsqlite3-sys 0.38.1` 在 Rust stable
+中使用尚未稳定的 `cfg_select!`，会让 Actions 在依赖编译阶段失败；因此锁定到经过验证的
+`rusqlite 0.39.0` / `libsqlite3-sys 0.37.0`，仍保留 `bundled` SQLite 和现有 typed adapter。
+
+修复后，Rust stable 容器中的 workspace check、Clippy、format check、协议单测均通过；同一锁文件的
+x86_64 musl release binary 和 `make build-release-musl` 入口也在 musl Podman 容器通过。随后完整
+`make workspace-tests` 在 Podman 通过 48 个 harness（core 145、runtime 256、store 128、
+service-chain 16、WireGuard 7、WireGuard runtime chain 2，0 失败）。

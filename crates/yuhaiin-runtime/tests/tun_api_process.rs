@@ -175,6 +175,28 @@ async fn foreground_binary_api_toggle_changes_real_tun_device() {
     assert_eq!(enabled["enabled"], true);
     wait_for_device(&tun_name, true, &diagnostics).await;
 
+    let second_id = "tun-api-process-second";
+    let second_name = format!("yrtun-b-{}", runtime.id());
+    let mut second_config = config.clone();
+    second_config["name"] = json!("TUN API process second toggle");
+    second_config["protocol"]["tun"]["name"] = json!(second_name);
+    second_config["enabled"] = json!(false);
+    let saved_second = put_inbound(&client, &base_url, second_id, &second_config).await;
+    assert_eq!(saved_second["enabled"], false);
+    wait_for_device(&second_name, false, &diagnostics).await;
+
+    second_config["enabled"] = json!(true);
+    let enabled_second = put_inbound(&client, &base_url, second_id, &second_config).await;
+    assert_eq!(enabled_second["enabled"], true);
+    wait_for_device(&tun_name, true, &diagnostics).await;
+    wait_for_device(&second_name, true, &diagnostics).await;
+
+    second_config["enabled"] = json!(false);
+    let disabled_second = put_inbound(&client, &base_url, second_id, &second_config).await;
+    assert_eq!(disabled_second["enabled"], false);
+    wait_for_device(&second_name, false, &diagnostics).await;
+    wait_for_device(&tun_name, true, &diagnostics).await;
+
     config["enabled"] = json!(false);
     let disabled = put_inbound(&client, &base_url, tun_id, &config).await;
     assert_eq!(disabled["enabled"], false);

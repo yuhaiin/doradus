@@ -21,6 +21,8 @@ use base64::Engine as _;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
+#[cfg(feature = "tun")]
+use tokio::task::JoinSet;
 
 use yuhaiin_core::process::{ProcessResolver, default_process_resolver};
 use yuhaiin_core::proxy::BoxAsyncStream;
@@ -271,25 +273,26 @@ pub async fn run_until_with_tun_fd(
     run_until_with_tun_runtime(controller, shutdown, tun, config).await
 }
 
-/// Own the desktop TUN device independently from TCP/UDP listener reloads.
+/// Own desktop TUN devices independently from TCP/UDP listener reloads.
 ///
-/// A successful proxy-runtime run returns when the controller publishes a
-/// reload. The device is then dropped before the next configuration is
-/// loaded, which gives route/device cleanup a deterministic boundary. Failed
-/// opens and failed dispatcher starts wait for a future reload instead of
-/// repeatedly retrying the same broken configuration.
+/// Go creates one listener owner per enabled TUN inbound. The desktop Rust
+/// owner mirrors that shape with one task/device/route lease per config while
+/// keeping the same shared proxy snapshot and reload boundary. Failed opens
+/// and failed dispatcher starts wait for a future reload instead of repeatedly
+/// retrying the same broken configuration.
 #[cfg(feature = "tun")]
 async fn run_desktop_tun_supervisor(
     controller: RuntimeController,
     shutdown: watch::Receiver<bool>,
 ) {
     let monitor = controller.monitor();
-    let mut config = loop {
-        match crate::load_tun_config(controller.store()).await {
-            Ok(config) => break config,
+    let mut reload = controller.subscribe_inbound_reload();
+    let mut configs = loop {
+        match crate::data_plane::load_tun_configs_for_desktop(controller.store()).await {
+            Ok(configs) => break configs,
             Err(error) => {
                 monitor.error(format!("load TUN inbound config failed: {error}"));
-                if crate::wait_for_shutdown_or_inbound_reload(&controller, shutdown.clone()).await {
+                if wait_for_shutdown_or_reload(&mut reload, shutdown.clone()).await {
                     return;
                 }
             }
@@ -301,58 +304,97 @@ async fn run_desktop_tun_supervisor(
             break;
         }
 
-        if !config.enabled {
-            monitor.info("TUN inbound disabled");
-            if crate::wait_for_shutdown_or_inbound_reload(&controller, shutdown.clone()).await {
-                break;
-            }
-        } else {
-            monitor.info("TUN inbound started");
-            match crate::data_plane::open_tun(&config) {
+        let mut tasks = JoinSet::new();
+        let mut enabled_count = 0;
+        for config in configs.iter().filter(|config| config.enabled) {
+            enabled_count += 1;
+            let name = config.tun.name.as_deref().unwrap_or("<unnamed>").to_owned();
+            monitor.info(format!("TUN inbound started name={name}"));
+            match crate::data_plane::open_tun(config) {
                 Ok(tun) => {
-                    if let Err(error) = crate::run_tun_device_until(
-                        controller.clone(),
-                        tun,
-                        config.clone(),
-                        shutdown.clone(),
-                    )
-                    .await
-                    {
-                        monitor.error(format!("TUN inbound stopped: {error}"));
-                        if crate::wait_for_shutdown_or_inbound_reload(&controller, shutdown.clone())
-                            .await
-                        {
-                            break;
+                    let controller = controller.clone();
+                    let shutdown = shutdown.clone();
+                    let config = config.clone();
+                    let monitor = monitor.clone();
+                    tasks.spawn_local(async move {
+                        let result =
+                            crate::run_tun_device_until(controller, tun, config, shutdown).await;
+                        if let Err(error) = &result {
+                            monitor.error(format!("TUN inbound stopped name={name}: {error}"));
                         }
-                    }
+                        result
+                    });
                 }
                 Err(error) => {
-                    monitor.error(format!("TUN inbound open failed: {error}"));
-                    if crate::wait_for_shutdown_or_inbound_reload(&controller, shutdown.clone())
-                        .await
-                    {
-                        break;
-                    }
+                    monitor.error(format!("TUN inbound open failed name={name}: {error}"));
                 }
             }
         }
 
-        if *shutdown.borrow() {
+        if enabled_count == 0 {
+            monitor.info("TUN inbound disabled");
+        }
+        let mut load_after_wait = false;
+        if tasks.is_empty() {
+            load_after_wait = wait_for_shutdown_or_reload(&mut reload, shutdown.clone()).await;
+        } else {
+            let mut shutdown_wait = shutdown.clone();
+            tokio::select! {
+                changed = shutdown_wait.changed() => {
+                    load_after_wait = changed.is_err() || *shutdown.borrow();
+                }
+                changed = reload.recv() => {
+                    load_after_wait = changed.is_err() && *shutdown.borrow();
+                }
+                result = tasks.join_next() => {
+                    if let Some(result) = result {
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) | Err(_) => {
+                                // Preserve the existing single-supervisor
+                                // retry boundary: a failed device waits for
+                                // an explicit inbound reload instead of a
+                                // hot loop that repeatedly opens a broken TUN.
+                                load_after_wait =
+                                    wait_for_shutdown_or_reload(&mut reload, shutdown.clone())
+                                        .await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+
+        if load_after_wait {
             break;
         }
-        config = loop {
-            match crate::load_tun_config(controller.store()).await {
-                Ok(config) => break config,
+        configs = loop {
+            match crate::data_plane::load_tun_configs_for_desktop(controller.store()).await {
+                Ok(configs) => break configs,
                 Err(error) => {
                     monitor.error(format!("reload TUN inbound config failed: {error}"));
-                    if crate::wait_for_shutdown_or_inbound_reload(&controller, shutdown.clone())
-                        .await
-                    {
+                    if wait_for_shutdown_or_reload(&mut reload, shutdown.clone()).await {
                         return;
                     }
                 }
             }
         };
+    }
+}
+
+#[cfg(feature = "tun")]
+async fn wait_for_shutdown_or_reload(
+    reload: &mut tokio::sync::broadcast::Receiver<()>,
+    mut shutdown: watch::Receiver<bool>,
+) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+    tokio::select! {
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+        changed = reload.recv() => changed.is_err() && *shutdown.borrow(),
     }
 }
 

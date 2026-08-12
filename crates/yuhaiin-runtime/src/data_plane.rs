@@ -242,13 +242,78 @@ async fn load_go_tun_config(
     Ok(Some(parse_go_tun_config(&record)?))
 }
 
-/// Select the one TUN device that the desktop runtime can own.
+/// Load every Go-shaped TUN inbound for the desktop supervisor.
+///
+/// The injected-FD/mobile entry point intentionally remains single-device,
+/// but Go's desktop listener owner creates one TUN device per enabled inbound.
+/// Keep the records sorted before assigning fallback names so a config reload
+/// cannot swap `yrtun0`/`yrtun1` merely because SQLite returned rows in a
+/// different order.
+#[cfg(feature = "tun")]
+pub(crate) async fn load_tun_configs_for_desktop(
+    store: &yuhaiin_store::ConfigStore,
+) -> Result<Vec<TunRuntimeConfig>> {
+    if let Some(mut configs) = load_go_tun_configs(store).await? {
+        if !crate::RuntimeSettings::load(store).await?.ipv6 {
+            for config in &mut configs {
+                config.tun.ipv6.clear();
+            }
+        }
+        return Ok(configs);
+    }
+    Ok(vec![load_tun_config(store).await?])
+}
+
+#[cfg(feature = "tun")]
+async fn load_go_tun_configs(
+    store: &yuhaiin_store::ConfigStore,
+) -> Result<Option<Vec<TunRuntimeConfig>>> {
+    let mut records: Vec<_> = store
+        .repository()
+        .list_go_inbounds()
+        .await?
+        .into_iter()
+        .filter(is_tun_record)
+        .collect();
+    if records.is_empty() {
+        return Ok(None);
+    }
+    records.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let mut configs = Vec::with_capacity(records.len());
+    for (index, record) in records.iter().enumerate() {
+        let mut config = parse_go_tun_config(record)?;
+        if config.tun.name.is_none() {
+            config.tun.name = Some(format!("yrtun{index}"));
+        }
+        configs.push(config);
+    }
+    let mut names = Vec::with_capacity(configs.len());
+    for config in &configs {
+        if !config.enabled {
+            continue;
+        }
+        let Some(name) = config.tun.name.as_deref() else {
+            continue;
+        };
+        if names.iter().any(|known| known == name) {
+            return Err(Error::invalid(format!(
+                "multiple TUN inbounds use the same device name {name:?}"
+            )));
+        }
+        names.push(name.to_owned());
+    }
+    Ok(Some(configs))
+}
+
+/// Select the one TUN device that an injected-FD/mobile runtime can own.
 ///
 /// Go stores disabled inbound definitions alongside the active ones. In
 /// particular, a fresh database contains a disabled `tun` default, so an API
 /// client adding its own enabled TUN must not be rejected merely because that
-/// compatibility row exists. Multiple enabled TUNs remain invalid because a
-/// desktop process has one device supervisor; when all TUNs are disabled we
+/// compatibility row exists. Multiple enabled TUNs remain invalid for this
+/// single-FD API; the desktop supervisor uses
+/// [`load_tun_configs_for_desktop`] instead. When all TUNs are disabled we
 /// keep the newest definition so editing a disabled inbound is reflected on
 /// the next enable.
 #[cfg(feature = "tun")]
@@ -257,7 +322,7 @@ fn select_go_tun_record(records: Vec<GoInboundRecord>) -> Result<Option<GoInboun
     let enabled_count = tun_records.iter().filter(|record| record.enabled).count();
     if enabled_count > 1 {
         return Err(Error::invalid(
-            "multiple enabled TUN inbounds are not supported by the single-device runtime",
+            "multiple enabled TUN inbounds cannot share one injected TUN device",
         ));
     }
     Ok(tun_records.into_iter().max_by(|left, right| {
@@ -754,6 +819,45 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(selected.id, "newer");
+    }
+
+    #[tokio::test]
+    async fn desktop_tun_loader_keeps_all_enabled_go_inbounds() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        for (id, enabled) in [("default", false), ("alpha", true), ("beta", true)] {
+            store
+                .repository()
+                .put_go_inbound(&go_tun_record(id, enabled, 1))
+                .await
+                .unwrap();
+        }
+
+        let configs = load_tun_configs_for_desktop(&store).await.unwrap();
+        assert_eq!(configs.len(), 3);
+        assert_eq!(
+            configs
+                .iter()
+                .map(|config| config.tun.name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("alpha"), Some("beta"), Some("default")]
+        );
+        assert_eq!(configs.iter().filter(|config| config.enabled).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn desktop_tun_loader_rejects_duplicate_enabled_device_names() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let mut first = go_tun_record("first", true, 1);
+        let mut second = go_tun_record("second", true, 2);
+        for record in [&mut first, &mut second] {
+            let mut value: Value = serde_json::from_slice(&record.data_json).unwrap();
+            value["protocol"]["tun"]["name"] = Value::String("tun://shared".to_owned());
+            record.data_json = serde_json::to_vec(&value).unwrap();
+            store.repository().put_go_inbound(record).await.unwrap();
+        }
+
+        let error = load_tun_configs_for_desktop(&store).await.unwrap_err();
+        assert!(error.to_string().contains("same device name"));
     }
 
     struct ServiceBindingResolver;
