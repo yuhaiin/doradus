@@ -554,6 +554,24 @@ fn spawn_update_helper(staged: PathBuf) -> Result<(), std::io::Error> {
 /// detached helper.  The old binary remains as a rollback file until the
 /// service manager successfully restarts the service.
 pub fn run_update_helper(target: &Path, staged: &Path) -> Result<(), String> {
+    run_update_helper_with_hooks(
+        target,
+        staged,
+        stop_platform_service,
+        restart_platform_service,
+    )
+}
+
+fn run_update_helper_with_hooks<FStop, FRestart>(
+    target: &Path,
+    staged: &Path,
+    stop_service: FStop,
+    restart_service: FRestart,
+) -> Result<(), String>
+where
+    FStop: Fn() -> Result<(), String>,
+    FRestart: Fn() -> Result<(), String>,
+{
     let target = target
         .canonicalize()
         .map_err(|error| format!("resolve update target: {error}"))?;
@@ -569,30 +587,30 @@ pub fn run_update_helper(target: &Path, staged: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(&replacement);
         return Err(format!("set staged executable permissions: {error}"));
     }
-    stop_platform_service()?;
+    stop_service()?;
     let backup = target.with_extension("update-backup");
     let _ = std::fs::remove_file(&backup);
     std::fs::rename(&target, &backup).map_err(|error| {
-        let _ = restart_platform_service();
+        let _ = restart_service();
         format!("backup current executable: {error}")
     })?;
     if let Err(error) = std::fs::rename(&replacement, &target) {
         let _ = std::fs::remove_file(&replacement);
         let _ = std::fs::rename(&backup, &target);
-        let _ = restart_platform_service();
+        let _ = restart_service();
         return Err(format!("install updated executable: {error}"));
     }
     #[cfg(unix)]
     if let Err(error) = set_executable(&target) {
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::rename(&backup, &target);
-        let _ = restart_platform_service();
+        let _ = restart_service();
         return Err(format!("set executable permissions: {error}"));
     }
-    if let Err(error) = restart_platform_service() {
+    if let Err(error) = restart_service() {
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::rename(&backup, &target);
-        let recovery = restart_platform_service();
+        let recovery = restart_service();
         return Err(match recovery {
             Ok(()) => format!("restart updated service: {error}"),
             Err(recovery) => {
@@ -799,8 +817,30 @@ fn set_executable(path: &Path) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn update_test_dir(name: &str) -> PathBuf {
+        let cache = env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+            .unwrap_or_else(|| PathBuf::from("."));
+        cache
+            .join("yuhaiin-rust/update-tests")
+            .join(format!("{name}-{}", std::process::id()))
+    }
+
+    fn write_update_fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = update_test_dir(name);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("yuhaiin");
+        let staged = root.join("download");
+        std::fs::write(&target, b"old executable\n").unwrap();
+        std::fs::write(&staged, b"new executable\n").unwrap();
+        (root, target, staged)
+    }
 
     fn asset(name: &str) -> ReleaseAsset {
         ReleaseAsset {
@@ -869,6 +909,64 @@ mod tests {
         assert_eq!(normalized_version("v1.2.3+build"), Some("1.2.3".to_owned()));
         assert_eq!(compare_versions("1.2.4", "1.2.3"), Ordering::Greater);
         assert_eq!(compare_versions("1.2", "1.2.0"), Ordering::Equal);
+    }
+
+    #[test]
+    fn update_helper_installs_release_and_keeps_rollback_image() {
+        let (root, target, staged) = write_update_fixture("success");
+        let stop_calls = AtomicUsize::new(0);
+        let restart_calls = AtomicUsize::new(0);
+
+        run_update_helper_with_hooks(
+            &target,
+            &staged,
+            || {
+                stop_calls.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            },
+            || {
+                restart_calls.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new executable\n");
+        assert_eq!(
+            std::fs::read(target.with_extension("update-backup")).unwrap(),
+            b"old executable\n"
+        );
+        assert!(!staged.exists());
+        assert_eq!(stop_calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(restart_calls.load(AtomicOrdering::Relaxed), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_helper_restores_previous_release_when_restart_fails() {
+        let (root, target, staged) = write_update_fixture("restart-failure");
+        let restart_calls = AtomicUsize::new(0);
+
+        let error = run_update_helper_with_hooks(
+            &target,
+            &staged,
+            || Ok(()),
+            || {
+                if restart_calls.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                    Err("fixture restart failure".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("restart updated service: fixture restart failure"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"old executable\n");
+        assert!(!target.with_extension("update-backup").exists());
+        assert!(staged.exists(), "failed update remains staged for retry");
+        assert_eq!(restart_calls.load(AtomicOrdering::Relaxed), 2);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

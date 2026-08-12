@@ -27,6 +27,29 @@
 > `reloadable_tun_dns_handler_switches_snapshots_without_rebuilding_owner` 单测，并由
 > Podman `make workspace-tests` 和 `make tun-api-process-smoke` 回归。
 
+> 2026-08-12 WireGuard runtime UDP closure：进程级 `wireguard-chain-smoke` 新增
+> `SOCKS5 UDP ASSOCIATE → CIDR router → Cloudflare BoringTun outbound → smoltcp UDP peer`
+> 的真实回环链路。首次 UDP send 可能先触发 Noise handshake；旧 adapter 会丢弃同一 IP
+> packet，TCP 因为通常在握手完成后才写入所以没有暴露该问题。现在每个 peer 对握手期间的
+> IP packet 使用有界队列（256 个），握手完成后重试；队列仍保持 userspace、无第二个 OS TUN
+> 的边界。Podman 回归同时断言 peer UDP echo、connections 的 inbound/node/matchHistory 和
+> total counters，HTTP/TCP 链保持通过。
+
+> 2026-08-12 benchmark refresh：在当前工作树上重新运行三类 Podman release benchmark。
+> HTTP inbound → router → HTTP CONNECT 为 `102.18 MiB/s`、peak RSS
+> `19,188 KiB`；HTTP inbound → router → TLS → HTTP/2 → Yuubinsya 为 `26.03 MiB/s`、
+> peak RSS `20,904 KiB`；TUN → fixed → loopback 为 `31.23 MiB/s`、peak RSS
+> `13,236 KiB`；BoringTun userspace packet 为 `588.64 MiB/s`、peak RSS `3,460 KiB`。
+> 这些数字只用于相同机器、profile、payload 和 Podman namespace 的回归比较，原始日志和
+> JSON 位于 `~/.cache/yuhaiin-rust/benchmarks/{http-throughput,tun-throughput,wireguard}`，
+> 未使用 `/tmp`，不作为 Go 对比或公网性能结论。
+
+> 2026-08-12 update helper rollback coverage：`run_update_helper` 现在把 platform
+> stop/restart 作为内部可注入边界，文件替换事务仍保持“先 staged、再 backup、后 install、成功
+> restart 才清理 staged”的顺序。Podman `make workspace-tests` 已覆盖成功安装并保留
+> `.update-backup`，以及 restart 失败时恢复旧 binary、删除临时 backup、保留 staged 供重试；真实
+> macOS launchd/Windows SCM 权限和服务管理器现场仍是独立验收项。
+
 > 2026-08-12 TUN Podman data-plane recheck：当前 rootless Podman 连接在显式传入宿主
 > `/dev/net/tun`、`--privileged`、`--network=none` 后，已实际通过 runtime-owned TUN
 > device lifecycle、普通 `fixed` TCP packet echo、disable/enable reload 后 packet echo 和

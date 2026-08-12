@@ -51,6 +51,7 @@ const WIREGUARD_OVERHEAD: usize = 32;
 const HANDSHAKE_BUFFER_SIZE: usize = 2_048;
 const MAX_PACKET_SIZE: usize = 65_535;
 const MAX_STREAM_OUTPUT_BYTES: usize = SOCKET_BUFFER_SIZE * 4;
+const MAX_PENDING_IP_PACKETS: usize = 256;
 const PORT_MIN: u16 = 32_768;
 const PORT_MAX: u16 = 60_000;
 static NEXT_TUNNEL_INDEX: AtomicU32 = AtomicU32::new(1);
@@ -351,6 +352,7 @@ struct PeerTunnel {
     endpoint: SocketAddr,
     allowed_ips: Vec<IpCidr>,
     tunnel: Tunn,
+    pending_packets: VecDeque<Vec<u8>>,
 }
 
 impl PeerTunnel {
@@ -367,6 +369,7 @@ impl PeerTunnel {
                 NEXT_TUNNEL_INDEX.fetch_add(1, Ordering::Relaxed),
                 None,
             ),
+            pending_packets: VecDeque::new(),
         }
     }
 }
@@ -450,16 +453,32 @@ impl WireGuardEngine {
 
     fn encapsulate(&mut self, packet: &[u8]) -> Result<(usize, Vec<u8>)> {
         let peer_index = self.peer_for_packet(packet)?;
+        let output = self.encapsulate_for_peer(peer_index, packet, true)?;
+        Ok((peer_index, output))
+    }
+
+    fn encapsulate_for_peer(
+        &mut self,
+        peer_index: usize,
+        packet: &[u8],
+        queue_during_handshake: bool,
+    ) -> Result<Vec<u8>> {
         let reserved = self.reserved.clone();
         let peer = &mut self.peers[peer_index];
         let mut output = vec![0; Self::packet_capacity(packet.len())];
         match peer.tunnel.encapsulate(packet, &mut output) {
             TunnResult::WriteToNetwork(bytes) => {
                 let length = bytes.len();
+                if queue_during_handshake
+                    && is_handshake_initiation(&output[..length])
+                    && peer.pending_packets.len() < MAX_PENDING_IP_PACKETS
+                {
+                    peer.pending_packets.push_back(packet.to_vec());
+                }
                 if reserved.len() == 3 && length >= 4 {
                     output[1..4].copy_from_slice(&reserved);
                 }
-                Ok((peer_index, output[..length].to_vec()))
+                Ok(output[..length].to_vec())
             }
             TunnResult::Done => Err(error_protocol("WireGuard encapsulation produced no packet")),
             TunnResult::Err(error) => Err(error_protocol_debug(error)),
@@ -467,6 +486,23 @@ impl WireGuardEngine {
                 error_protocol("WireGuard encapsulation returned a tunnel packet"),
             ),
         }
+    }
+
+    fn flush_pending_packets(&mut self, peer_index: usize) -> Vec<(usize, Vec<u8>)> {
+        let mut pending = std::mem::take(&mut self.peers[peer_index].pending_packets);
+        let mut outputs = Vec::new();
+        while let Some(packet) = pending.pop_front() {
+            match self.encapsulate_for_peer(peer_index, &packet, false) {
+                Ok(output) if is_handshake_initiation(&output) => {
+                    pending.push_front(packet);
+                    break;
+                }
+                Ok(output) => outputs.push((peer_index, output)),
+                Err(_) => break,
+            }
+        }
+        self.peers[peer_index].pending_packets = pending;
+        outputs
     }
 
     fn decapsulate(
@@ -536,6 +572,12 @@ impl WireGuardEngine {
         }
         outputs
     }
+}
+
+fn is_handshake_initiation(packet: &[u8]) -> bool {
+    packet
+        .get(..4)
+        .is_some_and(|header| u32::from_le_bytes(header.try_into().unwrap()) == 1)
 }
 
 #[derive(Debug)]
@@ -1235,13 +1277,24 @@ impl Driver {
                             .send_to_peer(peer_index, output[..length].to_vec())
                             .await;
                     }
+                    for (_, packet) in self.engine.flush_pending_packets(peer_index) {
+                        let _ = self.send_to_peer(peer_index, packet).await;
+                    }
                     break;
                 }
                 DecapsulatedPacket::Network(payload) => {
                     let _ = self.send_to_peer(peer_index, payload).await;
+                    for (_, packet) in self.engine.flush_pending_packets(peer_index) {
+                        let _ = self.send_to_peer(peer_index, packet).await;
+                    }
                     break;
                 }
-                DecapsulatedPacket::Done => {}
+                DecapsulatedPacket::Done => {
+                    for (_, packet) in self.engine.flush_pending_packets(peer_index) {
+                        let _ = self.send_to_peer(peer_index, packet).await;
+                    }
+                    break;
+                }
             }
         }
     }

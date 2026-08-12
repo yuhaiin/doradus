@@ -15,6 +15,10 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use serde_json::json;
 use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
+use smoltcp::socket::udp::{
+    PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata,
+    Socket as SmoltcpUdpSocket,
+};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket,
@@ -28,8 +32,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::watch;
 
 use support::{
-    ServiceProcess, api_json, connect_loopback, integration_dir, seed_empty_database,
-    wait_for_connection,
+    ServiceProcess, add_socks5_inbound, api_json, connect_loopback, integration_dir,
+    seed_empty_database, wait_for_connection,
 };
 
 const RUNTIME_PRIVATE_KEY: [u8; 32] = [41; 32];
@@ -38,6 +42,7 @@ const PEER_ADDRESS: Ipv4Address = Ipv4Address::new(192, 0, 2, 1);
 const PEER_TUNNEL_ADDRESS: Ipv4Address = Ipv4Address::new(10, 0, 0, 1);
 const PEER_TCP_PORT: u16 = 18_080;
 const PEER_HEALTH_PORT: u16 = 18_081;
+const PEER_UDP_PORT: u16 = 18_082;
 const MTU: usize = 1_420;
 
 struct WireGuardPeer {
@@ -55,6 +60,8 @@ struct PeerStats {
     device_packets: AtomicUsize,
     tcp_reads: AtomicUsize,
     tcp_writes: AtomicUsize,
+    udp_reads: AtomicUsize,
+    udp_writes: AtomicUsize,
     crypto_errors: AtomicUsize,
     network_responses: AtomicUsize,
     trace: Mutex<Vec<String>>,
@@ -140,6 +147,14 @@ async fn run_peer(
         .get_mut::<TcpSocket>(health_listener)
         .listen(PEER_HEALTH_PORT)
         .unwrap();
+    let udp_listener = sockets.add(SmoltcpUdpSocket::new(
+        UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 16], vec![0; 64 * 1024]),
+        UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 16], vec![0; 64 * 1024]),
+    ));
+    sockets
+        .get_mut::<SmoltcpUdpSocket>(udp_listener)
+        .bind(PEER_UDP_PORT)
+        .unwrap();
 
     let mut underlay_buffer = vec![0_u8; 65_535 + 2_048];
     let mut crypto_buffer = vec![0_u8; 65_535 + 2_048];
@@ -159,6 +174,7 @@ async fn run_peer(
         );
         echo_tcp_socket(&mut sockets, listener, &mut pending_http, &stats);
         echo_tcp_socket(&mut sockets, health_listener, &mut pending_health, &stats);
+        echo_udp_socket(&mut sockets, udp_listener, &stats);
         interface.poll(
             Instant::from_millis(current_millis()),
             &mut device,
@@ -236,6 +252,25 @@ fn echo_tcp_socket(
                 }
             }
         }
+    }
+}
+
+fn echo_udp_socket(
+    sockets: &mut SocketSet<'_>,
+    handle: smoltcp::iface::SocketHandle,
+    stats: &PeerStats,
+) {
+    let socket = sockets.get_mut::<SmoltcpUdpSocket>(handle);
+    if !socket.can_recv() {
+        return;
+    }
+    let Ok((payload, endpoint)) = socket.recv() else {
+        return;
+    };
+    let payload = payload.to_vec();
+    stats.udp_reads.fetch_add(1, Ordering::Relaxed);
+    if socket.send_slice(&payload, endpoint).is_ok() {
+        stats.udp_writes.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -335,6 +370,27 @@ async fn configure_wireguard_chain(
     inbound: SocketAddr,
     peer: &WireGuardPeer,
 ) {
+    configure_wireguard_node_and_route(service, peer).await;
+
+    let inbound_config = json!({
+        "id":"wireguard-runtime-in",
+        "name":"WireGuard runtime inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":{"type":"http","http":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound_config),
+    )
+    .await;
+}
+
+async fn configure_wireguard_node_and_route(service: &ServiceProcess, peer: &WireGuardPeer) {
     let node = json!({
         "id":"wireguard-runtime-out",
         "name":"WireGuard runtime outbound",
@@ -371,23 +427,6 @@ async fn configure_wireguard_chain(
     )
     .await;
 
-    let inbound_config = json!({
-        "id":"wireguard-runtime-in",
-        "name":"WireGuard runtime inbound",
-        "enabled":true,
-        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
-        "transports":[{"type":"normal","normal":{}}],
-        "protocol":{"type":"http","http":{"username":"","password":""}}
-    });
-    api_json(
-        &service.client,
-        &service.base_url,
-        reqwest::Method::POST,
-        "/api/v2/inbounds",
-        Some(&inbound_config),
-    )
-    .await;
-
     let route = json!({
         "name":"wireguard-cidr-route",
         "mode":"proxy",
@@ -402,6 +441,15 @@ async fn configure_wireguard_chain(
         Some(&route),
     )
     .await;
+}
+
+async fn configure_wireguard_udp_chain(
+    service: &ServiceProcess,
+    inbound: SocketAddr,
+    peer: &WireGuardPeer,
+) {
+    configure_wireguard_node_and_route(service, peer).await;
+    add_socks5_inbound(service, "wireguard-runtime-udp-in", inbound, "", "").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -583,6 +631,122 @@ async fn http_inbound_routes_through_wireguard_userspace_outbound() {
     assert_eq!(latency["ok"], true, "WireGuard latency failed: {latency}");
 
     client.shutdown().await.unwrap();
+    service.shutdown().await;
+    peer.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socks5_udp_inbound_routes_through_wireguard_userspace_outbound() {
+    let peer = WireGuardPeer::start().await;
+    let inbound_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let inbound = inbound_listener.local_addr().unwrap();
+    drop(inbound_listener);
+
+    let root = integration_dir("service-wireguard-udp-chain");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_wireguard_udp_chain(&service, inbound, &peer).await;
+
+    let mut control = connect_loopback(inbound).await;
+    control.write_all(&[5, 1, 0]).await.unwrap();
+    let mut method = [0_u8; 2];
+    control.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [5, 0]);
+
+    control
+        .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut bind_reply = [0_u8; 10];
+    control.read_exact(&mut bind_reply).await.unwrap();
+    assert_eq!(&bind_reply[..4], &[5, 0, 0, 1]);
+    let relay_address = SocketAddr::new(
+        std::net::Ipv4Addr::new(bind_reply[4], bind_reply[5], bind_reply[6], bind_reply[7]).into(),
+        u16::from_be_bytes([bind_reply[8], bind_reply[9]]),
+    );
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let payload = b"wireguard-runtime-udp-payload";
+    let mut packet = vec![0, 0, 0, 1, 192, 0, 2, 1];
+    packet.extend_from_slice(&PEER_UDP_PORT.to_be_bytes());
+    packet.extend_from_slice(payload);
+    client.send_to(&packet, relay_address).await.unwrap();
+
+    let mut response = [0_u8; 2048];
+    let received =
+        tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut response)).await;
+    let (length, source) = match received {
+        Ok(Ok(value)) => value,
+        other => {
+            let connections = api_json(
+                &service.client,
+                &service.base_url,
+                reqwest::Method::GET,
+                "/api/v2/connections",
+                None,
+            )
+            .await;
+            let logs = api_json(
+                &service.client,
+                &service.base_url,
+                reqwest::Method::POST,
+                "/api/v2/rpc/tools.logs",
+                Some(&json!({})),
+            )
+            .await;
+            panic!(
+                "WireGuard runtime UDP response missing: result={other:?}; peer underlay={} tunnel={} device={} udp_reads={} udp_writes={} crypto_errors={} network_responses={}; trace={:?}; connections={connections}; logs={logs}; stderr={}",
+                peer.stats.underlay_packets.load(Ordering::Relaxed),
+                peer.stats.tunnel_packets.load(Ordering::Relaxed),
+                peer.stats.device_packets.load(Ordering::Relaxed),
+                peer.stats.udp_reads.load(Ordering::Relaxed),
+                peer.stats.udp_writes.load(Ordering::Relaxed),
+                peer.stats.crypto_errors.load(Ordering::Relaxed),
+                peer.stats.network_responses.load(Ordering::Relaxed),
+                peer.stats
+                    .trace
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                service.diagnostics()
+            );
+        }
+    };
+    assert_eq!(source, relay_address);
+    assert!(length >= 10);
+    assert_eq!(&response[..10], &packet[..10]);
+    assert_eq!(&response[10..length], payload);
+    assert!(peer.stats.udp_reads.load(Ordering::Relaxed) > 0);
+    assert!(peer.stats.udp_writes.load(Ordering::Relaxed) > 0);
+
+    let connections = wait_for_connection(&service.client, &service.base_url).await;
+    let item = connections["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inbound"] == "socks5" && item["nodeId"] == "wireguard-runtime-out")
+        .expect("WireGuard runtime UDP connection must be visible");
+    assert_eq!(item["nodeId"], "wireguard-runtime-out");
+    assert_eq!(item["mode"], "proxy");
+    assert!(item["matchHistory"].as_array().is_some_and(|history| {
+        history
+            .iter()
+            .any(|entry| entry["ruleName"] == "wireguard-cidr-route")
+    }));
+
+    let total = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::GET,
+        "/api/v2/connections/total",
+        None,
+    )
+    .await;
+    assert!(total["download"].is_string());
+    assert!(total["upload"].is_string());
+
+    control.shutdown().await.unwrap();
     service.shutdown().await;
     peer.shutdown().await;
 }
