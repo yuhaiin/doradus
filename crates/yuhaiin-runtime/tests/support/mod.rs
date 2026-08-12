@@ -1205,6 +1205,34 @@ pub async fn wait_for_connection(client: &reqwest::Client, base_url: &str) -> Va
     panic!("connection did not become visible");
 }
 
+/// Open a real HTTP CONNECT tunnel against an HTTP inbound. Keeping this
+/// helper in the shared process fixture makes API/event tests exercise the
+/// same inbound -> router -> outbound path as reload and protocol tests.
+pub async fn open_http_tunnel(inbound: SocketAddr, authority: &str) -> TcpStream {
+    let mut client = connect_loopback(inbound).await;
+    client
+        .write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+
+    let mut headers = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while !headers.windows(4).any(|window| window == b"\r\n\r\n") {
+        let length = client.read(&mut buffer).await.unwrap();
+        assert!(length > 0, "HTTP inbound closed before CONNECT response");
+        headers.extend_from_slice(&buffer[..length]);
+    }
+    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 200"));
+    client
+}
+
+pub async fn echo_on_tunnel(client: &mut TcpStream, payload: &[u8]) {
+    client.write_all(payload).await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(echoed, payload);
+}
+
 pub async fn configure_http_chain(
     service: &ServiceProcess,
     inbound: SocketAddr,

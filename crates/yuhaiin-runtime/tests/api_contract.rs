@@ -8,7 +8,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use support::{ServiceProcess, integration_dir, seed_empty_database};
+use support::{
+    ConnectFixture, ServiceProcess, configure_http_chain, echo_on_tunnel, integration_dir,
+    open_http_tunnel, reserve_loopback, seed_empty_database,
+};
 
 async fn request_json(
     service: &ServiceProcess,
@@ -85,6 +88,43 @@ async fn expect_sse(service: &ServiceProcess, path: &str) {
         Some("text/event-stream"),
         "GET {path} content type"
     );
+}
+
+async fn next_sse_event(response: &mut reqwest::Response, buffer: &mut Vec<u8>) -> (String, Value) {
+    loop {
+        if let Some(end) = buffer.windows(2).position(|window| window == b"\n\n") {
+            let frame = buffer.drain(..end + 2).collect::<Vec<_>>();
+            let frame = String::from_utf8_lossy(&frame);
+            let mut kind = String::new();
+            let mut data = String::new();
+            for line in frame.lines() {
+                if let Some(value) = line.strip_prefix("event: ") {
+                    kind = value.to_owned();
+                } else if let Some(value) = line.strip_prefix("data: ") {
+                    data.push_str(value);
+                }
+            }
+            if !data.is_empty() {
+                let payload = serde_json::from_str(&data)
+                    .unwrap_or_else(|error| panic!("invalid SSE data {data:?}: {error}"));
+                return (kind, payload);
+            }
+            continue;
+        }
+        let chunk = response
+            .chunk()
+            .await
+            .expect("SSE response read failed")
+            .unwrap_or_else(|| panic!("SSE response ended before the next event"));
+        buffer.extend_from_slice(&chunk);
+    }
+}
+
+fn counter_is_positive(value: &Value, field: &str) -> bool {
+    value[field]
+        .as_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|value| value > 0)
 }
 
 async fn wait_for_active_node(service: &ServiceProcess, id: &str) -> Value {
@@ -175,6 +215,238 @@ async fn real_process_direct_node_latency_resolves_domain_before_connect() {
 
     server.await.unwrap();
     service.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connections_sse_and_statistics_follow_a_real_http_flow() {
+    let fixture = ConnectFixture::start().await;
+    let inbound = reserve_loopback().await;
+    let root = integration_dir("api-live-connections");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_http_chain(&service, inbound, fixture.outbound).await;
+
+    let mut response = service
+        .client
+        .get(format!("{}/api/v2/connections/events", service.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let mut sse_buffer = Vec::new();
+    let (kind, initial) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        next_sse_event(&mut response, &mut sse_buffer),
+    )
+    .await
+    .expect("initial connections SSE event timed out");
+    assert_eq!(kind, "connections_added");
+    assert!(initial["connections"].as_array().is_some());
+
+    let authority = format!("example.test:{}", fixture.target.port());
+    let mut tunnel = open_http_tunnel(inbound, &authority).await;
+    echo_on_tunnel(&mut tunnel, b"api-live-connections").await;
+
+    let mut connection = Value::Null;
+    let mut connection_id = String::new();
+    let mut observed_events = Vec::new();
+    for _ in 0..100 {
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_sse_event(&mut response, &mut sse_buffer),
+        )
+        .await;
+        let (kind, payload) = match next {
+            Ok(event) => event,
+            Err(_) => {
+                let snapshot = expect_ok(&service, Method::GET, "/api/v2/connections", None).await;
+                panic!(
+                    "live connections SSE event timed out; observed={observed_events:?}; connections={snapshot}"
+                );
+            }
+        };
+        observed_events.push(json!({"type":kind,"payload":payload}));
+        if kind != "connections_added" {
+            continue;
+        }
+        let Some(candidate) = payload["connections"].as_array().and_then(|items| {
+            items.iter().find(|item| {
+                item["inboundName"] == "HTTP chain inbound" && item["destination"] == authority
+            })
+        }) else {
+            continue;
+        };
+        if candidate["localAddr"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+        {
+            connection = candidate.clone();
+            connection_id = candidate["id"].as_str().unwrap().to_owned();
+            break;
+        }
+    }
+    assert!(
+        !connection_id.is_empty(),
+        "live connection metadata was not published"
+    );
+
+    for field in [
+        "id",
+        "addr",
+        "source",
+        "inbound",
+        "inboundName",
+        "interface",
+        "outbound",
+        "localAddr",
+        "destination",
+        "fakeIp",
+        "hosts",
+        "domain",
+        "ip",
+        "tag",
+        "nodeId",
+        "nodeName",
+        "protocol",
+        "process",
+        "pid",
+        "uid",
+        "tlsServerName",
+        "httpHost",
+        "component",
+        "udpMigrateId",
+        "mode",
+        "resolver",
+        "geo",
+        "outboundGeo",
+    ] {
+        assert!(
+            connection.get(field).is_some(),
+            "connection field {field} missing: {connection}"
+        );
+        assert!(
+            connection[field].is_string(),
+            "connection field {field} is not a string: {connection}"
+        );
+    }
+    assert_eq!(connection["network"]["connType"], "tcp");
+    assert_eq!(connection["network"]["underlyingType"], "tcp");
+    assert_eq!(connection["inboundName"], "HTTP chain inbound");
+    assert_eq!(connection["nodeId"], "http-out");
+    assert_eq!(connection["destination"], authority);
+
+    let mut total = Value::Null;
+    for _ in 0..100 {
+        total = expect_ok(&service, Method::GET, "/api/v2/connections/total", None).await;
+        if counter_is_positive(&total, "upload") && counter_is_positive(&total, "download") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        counter_is_positive(&total, "upload"),
+        "total upload: {total}"
+    );
+    assert!(
+        counter_is_positive(&total, "download"),
+        "total download: {total}"
+    );
+
+    let range_end = OffsetDateTime::now_utc();
+    let range_start = (range_end - time::Duration::hours(1))
+        .format(&Rfc3339)
+        .unwrap();
+    let range_end = (range_end + time::Duration::hours(1))
+        .format(&Rfc3339)
+        .unwrap();
+    let traffic = expect_ok(
+        &service,
+        Method::GET,
+        &format!("/api/v2/connections/traffic?interval=hour&from={range_start}&to={range_end}"),
+        None,
+    )
+    .await;
+    assert!(
+        traffic["items"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                counter_is_positive(item, "upload") && counter_is_positive(item, "download")
+            })
+        }),
+        "traffic: {traffic}"
+    );
+
+    let telemetry = expect_ok(
+        &service,
+        Method::GET,
+        &format!("/api/v2/connections/telemetry?from={range_start}&to={range_end}&limit=50"),
+        None,
+    )
+    .await;
+    assert!(
+        telemetry["groups"].as_array().is_some_and(|groups| {
+            groups.iter().any(|group| {
+                group["items"].as_array().is_some_and(|items| {
+                    items.iter().any(|item| {
+                        counter_is_positive(item, "upload") && counter_is_positive(item, "download")
+                    })
+                })
+            })
+        }),
+        "telemetry: {telemetry}"
+    );
+
+    expect_empty(
+        &service,
+        Method::POST,
+        "/api/v2/connections/close",
+        Some(json!({"ids":[connection_id]})),
+    )
+    .await;
+    let mut removed = false;
+    for _ in 0..100 {
+        let (kind, payload) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_sse_event(&mut response, &mut sse_buffer),
+        )
+        .await
+        .expect("connections remove SSE event timed out");
+        if kind == "connections_removed"
+            && payload["ids"].as_array().is_some_and(|ids| {
+                ids.iter()
+                    .any(|value| value.as_str() == Some(connection_id.as_str()))
+            })
+        {
+            removed = true;
+            break;
+        }
+    }
+    assert!(
+        removed,
+        "connections_removed did not contain {connection_id}"
+    );
+
+    let history = expect_ok(&service, Method::GET, "/api/v2/connections/history", None).await;
+    assert!(
+        history["items"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["connection"]["id"] == connection_id)
+        }),
+        "history: {history}"
+    );
+
+    tunnel.shutdown().await.unwrap();
+    service.shutdown().await;
+    fixture.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

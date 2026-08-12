@@ -5,46 +5,18 @@ use std::time::Duration;
 
 use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use support::{
-    ConnectFixture, ServiceProcess, api_json, configure_http_chain, connect_loopback,
-    integration_dir, reserve_loopback, seed_empty_database,
+    ConnectFixture, ServiceProcess, api_json, configure_http_chain, echo_on_tunnel,
+    integration_dir, open_http_tunnel, reserve_loopback, seed_empty_database,
 };
 
 async fn connect_and_echo(inbound: SocketAddr, authority: &str, payload: &[u8]) {
     let mut client = open_http_tunnel(inbound, authority).await;
     echo_on_tunnel(&mut client, payload).await;
     client.shutdown().await.unwrap();
-}
-
-async fn open_http_tunnel(inbound: SocketAddr, authority: &str) -> TcpStream {
-    let mut client = connect_loopback(inbound).await;
-    client
-        .write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
-        .await
-        .unwrap();
-
-    let mut headers = Vec::new();
-    let mut buffer = [0u8; 1024];
-    while !headers.windows(4).any(|window| window == b"\r\n\r\n") {
-        let length = client.read(&mut buffer).await.unwrap();
-        assert!(
-            length > 0,
-            "HTTP inbound closed before reload-flow response"
-        );
-        headers.extend_from_slice(&buffer[..length]);
-    }
-    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 200"));
-    client
-}
-
-async fn echo_on_tunnel(client: &mut TcpStream, payload: &[u8]) {
-    client.write_all(payload).await.unwrap();
-    let mut echoed = vec![0u8; payload.len()];
-    client.read_exact(&mut echoed).await.unwrap();
-    assert_eq!(echoed, payload);
 }
 
 async fn wait_for_authority(fixture: &ConnectFixture, expected: &str) {
