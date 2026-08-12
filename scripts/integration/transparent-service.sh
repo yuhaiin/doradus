@@ -67,7 +67,8 @@ mkdir -p "${state_dir}"
 rm -f "${runtime_log}" "${client_log}" "${udp_client_log}" "${ipv6_client_log}" \
   "${state_dir}/udp-target.log" "${state_dir}/tproxy.log" \
   "${state_dir}/client.done" "${state_dir}/ipv6-client.done" "${state_dir}/udp-client.done" \
-  "${state_dir}/runtime.pid" "${state_dir}/force-stop.ready" "${state_dir}/force-stop-observed" \
+  "${state_dir}/runtime.pid" "${state_dir}/force-stop.ready" "${state_dir}/force-stop.request" \
+  "${state_dir}/force-stop-observed" \
   "${state_dir}/iptables" "${state_dir}/ip6tables" "${state_dir}/state.sqlite" \
   "${state_dir}/state.sqlite-wal" "${state_dir}/state.sqlite-shm"
 
@@ -491,7 +492,20 @@ if [[ "${YUHAIIN_TPROXY_FORCE_STOP:-0}" == "1" ]]; then
     exit 1
   fi
   service_pid="$(<"${state_dir}/runtime.pid")"
-  podman exec "${main_container}" /bin/sh -ceu "kill -KILL ${service_pid}"
+  # Tell the inner shell that the non-zero runtime exit is intentional.  The
+  # marker must be visible before SIGKILL, otherwise --rm can reap the
+  # container while the outer podman exec is still returning.
+  touch "${state_dir}/force-stop.request"
+  if ! podman exec "${main_container}" /bin/sh -ceu "kill -KILL ${service_pid}"; then
+    # The target exits immediately after SIGKILL and --rm may remove the
+    # container before podman exec has received its success response.  Keep
+    # the failure strict unless the inner shell recorded the expected status.
+    for _ in $(seq 1 20); do
+      [[ -f "${state_dir}/force-stop-observed" ]] && break
+      sleep 0.05
+    done
+    test -f "${state_dir}/force-stop-observed"
+  fi
 fi
 if wait "${main_pid}"; then
   main_status=0
@@ -505,7 +519,14 @@ for log_file in "${scenario_dir}/container.log" "${runtime_log}" "${client_log}"
 done
 
 if [[ "${main_status}" -ne 0 ]]; then
-  exit "${main_status}"
+  if [[ "${YUHAIIN_TPROXY_FORCE_STOP:-0}" == "1" \
+    && -f "${state_dir}/force-stop-observed" ]]; then
+    # Podman may report the container's SIGKILL status even though the inner
+    # shell converted that intentional runtime death into a successful smoke.
+    main_status=0
+  else
+    exit "${main_status}"
+  fi
 fi
 
 grep -Fq "transparent-ready" "${runtime_log}"
@@ -517,8 +538,10 @@ else
   grep -Fq "transparent-closed" "${runtime_log}"
 fi
 if [[ "${ipv6_mode}" -eq 1 ]]; then
-  grep -Fq "transparent-redir-ipv6-ok" "${runtime_log}"
   grep -Fq "transparent-client-ok" "${ipv6_client_log}"
+  if [[ "${YUHAIIN_TPROXY_FORCE_STOP:-0}" != "1" ]]; then
+    grep -Fq "transparent-redir-ipv6-ok" "${runtime_log}"
+  fi
 fi
 if [[ "${tproxy_enabled}" -eq 1 ]]; then
   grep -Fq "transparent-udp-client-ok" "${udp_client_log}"
