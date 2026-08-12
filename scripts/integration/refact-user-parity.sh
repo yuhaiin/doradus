@@ -13,6 +13,7 @@ scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/refact-user-p
 go_http="${YUHAIIN_GO_HTTP:-127.0.0.1:55452}"
 rust_http="${YUHAIIN_RUST_HTTP:-127.0.0.1:55451}"
 prepare_http="${YUHAIIN_PREPARE_HTTP:-127.0.0.1:55450}"
+image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 
 test -f "${source_db}"
 test -f "${go_root}/go.mod" || {
@@ -22,6 +23,7 @@ test -f "${go_root}/go.mod" || {
 }
 command -v curl >/dev/null
 command -v jq >/dev/null
+command -v podman >/dev/null
 mkdir -p "${scenario_dir}"
 
 cargo build \
@@ -45,6 +47,7 @@ run_id="${YUHAIIN_USER_SUFFIX:-${BASHPID}}"
 run_root="${scenario_dir}/${run_id}"
 mkdir -p "${run_root}"
 cp --reflink=auto "${source_db}" "${run_root}/source.sqlite"
+mkdir -p "${run_root}/go-path" "${run_root}/tmp" "${run_root}/go-tmp" "${run_root}/go-cache"
 
 wait_ready() {
   local address="$1"
@@ -59,41 +62,62 @@ wait_ready() {
   return 1
 }
 
-stop_pid() {
-  local pid="$1"
-  if [[ -n "${pid}" ]]; then
-    kill -TERM "${pid}" 2>/dev/null || true
-    wait "${pid}" 2>/dev/null || true
-  fi
-}
-
-prepare_pid=""
-go_pid=""
-rust_pid=""
+prepare_container="yuhaiin-refact-user-prepare-${run_id}"
+go_container="yuhaiin-refact-user-go-${run_id}"
+rust_container="yuhaiin-refact-user-rust-${run_id}"
 cleanup() {
-  stop_pid "${prepare_pid}"
-  stop_pid "${go_pid}"
-  stop_pid "${rust_pid}"
+  podman logs "${prepare_container}" >"${run_root}/prepare-container.log" 2>&1 || true
+  podman logs "${go_container}" >"${run_root}/go-container.log" 2>&1 || true
+  podman logs "${rust_container}" >"${run_root}/rust-container.log" 2>&1 || true
+  podman rm -f --ignore "${prepare_container}" "${go_container}" "${rust_container}" \
+    >"${run_root}/container-cleanup.log" 2>&1 || true
 }
 trap cleanup EXIT
 
 prepared_db="${run_root}/prepared.sqlite"
 cp --reflink=auto "${run_root}/source.sqlite" "${prepared_db}"
-YUHAIIN_DB="${prepared_db}" YUHAIIN_HTTP="${prepare_http}" \
-  "${rust_binary}" >"${run_root}/prepare.log" 2>&1 &
-prepare_pid=$!
+podman run -d \
+  --name "${prepare_container}" \
+  -p "${prepare_http}:50051" \
+  -v "${run_root}:/data:Z" \
+  -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
+  -e TMPDIR=/data/tmp \
+  -e YUHAIIN_DB=/data/prepared.sqlite \
+  -e YUHAIIN_HTTP=0.0.0.0:50051 \
+  --entrypoint /usr/local/bin/yuhaiin \
+  "${image}" \
+  >"${run_root}/prepare-container-id"
 wait_ready "${prepare_http}"
-stop_pid "${prepare_pid}"
-prepare_pid=""
+podman stop "${prepare_container}" >"${run_root}/prepare-stop.log"
+podman rm -f "${prepare_container}" >"${run_root}/prepare-rm.log"
 
 cp --reflink=auto "${prepared_db}" "${run_root}/go.sqlite"
 cp --reflink=auto "${prepared_db}" "${run_root}/rust.sqlite"
+cp --reflink=auto "${run_root}/go.sqlite" "${run_root}/go-path/state.db"
 
-"${go_binary}" -host "${go_http}" -path "${run_root}/go-path" >"${run_root}/go.log" 2>&1 &
-go_pid=$!
-YUHAIIN_DB="${run_root}/rust.sqlite" YUHAIIN_HTTP="${rust_http}" \
-  "${rust_binary}" >"${run_root}/rust.log" 2>&1 &
-rust_pid=$!
+podman run -d \
+  --name "${go_container}" \
+  -p "${go_http}:50051" \
+  -v "${run_root}:/data:Z" \
+  -v "${go_binary}:/usr/local/bin/yuhaiin:ro" \
+  -e TMPDIR=/data/tmp \
+  -e GOTMPDIR=/data/go-tmp \
+  -e GOCACHE=/data/go-cache \
+  --entrypoint /usr/local/bin/yuhaiin \
+  "${image}" \
+  -host 0.0.0.0:50051 -path /data/go-path \
+  >"${run_root}/go-container-id"
+podman run -d \
+  --name "${rust_container}" \
+  -p "${rust_http}:50051" \
+  -v "${run_root}:/data:Z" \
+  -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
+  -e TMPDIR=/data/tmp \
+  -e YUHAIIN_DB=/data/rust.sqlite \
+  -e YUHAIIN_HTTP=0.0.0.0:50051 \
+  --entrypoint /usr/local/bin/yuhaiin \
+  "${image}" \
+  >"${run_root}/rust-container-id"
 wait_ready "${go_http}"
 wait_ready "${rust_http}"
 

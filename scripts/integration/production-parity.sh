@@ -9,6 +9,12 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 go_root="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
 cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 scenario_root="${YUHAIIN_PRODUCTION_PARITY_DIR:-${cache_root}/production-parity}"
+port_base="${YUHAIIN_PRODUCTION_PORT_BASE:-55250}"
+
+[[ "${port_base}" =~ ^[0-9]+$ ]] || {
+  echo "YUHAIIN_PRODUCTION_PORT_BASE must be a numeric host port" >&2
+  exit 1
+}
 
 test -d "${go_root}"
 mkdir -p "${scenario_root}"
@@ -42,10 +48,19 @@ for source_db in "${candidates[@]}"; do
   label="${label//\//-}"
   label="${label//[^[:alnum:]_.-]/-}"
   scenario_dir="${scenario_root}/${label}"
+  # pasta may retain a just-released forwarding namespace briefly. Give each
+  # snapshot its own three-port window so one slow cleanup cannot make the
+  # next independent Go/Rust comparison fail before it starts.
+  prepare_http="${YUHAIIN_PREPARE_HTTP:-127.0.0.1:$((port_base + ran * 3))}"
+  rust_http="${YUHAIIN_RUST_HTTP:-127.0.0.1:$((port_base + ran * 3 + 1))}"
+  go_http="${YUHAIIN_GO_HTTP:-127.0.0.1:$((port_base + ran * 3 + 2))}"
   echo "[production-parity] checking ${source_db}"
   YUHAIIN_GO_DIR="${go_root}" \
   YUHAIIN_SOURCE_DB="${source_db}" \
   YUHAIIN_INTEGRATION_DIR="${scenario_dir}" \
+  YUHAIIN_PREPARE_HTTP="${prepare_http}" \
+  YUHAIIN_RUST_HTTP="${rust_http}" \
+  YUHAIIN_GO_HTTP="${go_http}" \
   YUHAIIN_PREPARE="${YUHAIIN_PREPARE:-1}" \
     "${repo_root}/scripts/integration/go-api-parity.sh"
   ran=$((ran + 1))

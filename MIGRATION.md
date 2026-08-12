@@ -4054,3 +4054,18 @@ release job 负责最终证据。
 同时收紧了 Podman 服务测试的诊断读取：`ServiceProcess` 现在持续读取子进程 stderr，并只保留
 最近 64 KiB，超时或启动失败时仍能看到最新错误，同时避免异常长日志把测试进程的诊断缓冲无限
 增长。`make api-contract-smoke` 的 3 个真实进程测试已在该改动后通过。
+
+## 146. 2026-08-12 parity harness 容器化与多快照端口隔离
+
+`refact-user-parity.sh` 原先直接在宿主启动 Go/Rust 进程，与本项目“运行时在 Podman、宿主只编译
+harness”的约定不一致；现在改为和普通 `go-api-parity` 一样，由 Podman 启动 Rust takeover
+prepare、Go refact-user 和 Rust 三个容器。prepared SQLite 会先复制到 Go/Rust 两份独立副本，
+并将 `TMPDIR`、Go cache 和 Go 临时目录全部指向挂载的 `~/.cache/yuhaiin-rust` 场景目录。
+`make refact-user-parity-smoke` 已通过 basic、UUID、token 用户的 CRUD/list、节点引用冲突和
+missing-user 错误对照。
+
+同时修复 `production-parity.sh` 连续处理三份快照时固定复用 55250/55251/55252 的问题。每个
+快照现在自动占用 `YUHAIIN_PRODUCTION_PORT_BASE + 3×index` 的 prepare/Rust/Go 三端口窗口，
+避免 pasta namespace 的短暂释放延迟污染下一份 fixture；默认 base 仍为 55250，可通过环境变量
+调整。三份停止态 Go v5/v6/AWS-shaped snapshot 均已分别在 Podman 中通过全量 API read、mutation
+和 error matrix。
