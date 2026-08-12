@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(feature = "async-proxy")]
 use crate::dns::{DnsQuestion, decode_query, decode_response, encode_query};
 
 struct StaticUpstream;

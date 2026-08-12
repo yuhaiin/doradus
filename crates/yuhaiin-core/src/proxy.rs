@@ -5,21 +5,28 @@
 //! without Tokio. UDP/Yuubinsya are separate boundaries and do not share this
 //! TCP handshake state.
 
+#[cfg(feature = "async-proxy")]
 use std::any::Any;
 #[cfg(feature = "async-proxy")]
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+#[cfg(feature = "async-proxy")]
 use std::pin::Pin;
+use std::sync::Arc;
+#[cfg(feature = "async-proxy")]
+use std::sync::Mutex;
 #[cfg(feature = "async-proxy")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "async-proxy")]
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
-use crate::{DomainName, Endpoint, Error, ErrorKind, Result};
+#[cfg(feature = "async-proxy")]
+use crate::DomainName;
+use crate::{Endpoint, Error, ErrorKind, Result};
 
 #[cfg(feature = "async-proxy")]
 use crate::{BoxFuture, FlowContext, Network};
@@ -1239,6 +1246,7 @@ pub struct BindInterfaceProxy {
     pub interface: Option<String>,
 }
 
+#[cfg(feature = "async-proxy")]
 impl BindInterfaceProxy {
     pub fn new(inner: Arc<dyn AsyncProxy>, interface: Option<String>) -> Self {
         Self { inner, interface }
@@ -2318,6 +2326,7 @@ mod tests {
         Endpoint::domain(Network::Tcp, DomainName::new("example.com").unwrap(), 443)
     }
 
+    #[cfg(feature = "async-proxy")]
     #[test]
     fn delayed_drop_escalates_per_destination() {
         let state = DelayedDropState::default();

@@ -4402,3 +4402,23 @@ metadata、selected node 和 proxy mode。Podman focused 结果为 `1 passed`，
 远端 UDP 或所有发行版 firewall 兼容；这些仍按 `IMPLEMENTATION_CHECKLIST.md`
 的 `[~]` 范围处理。构建和运行均在 Podman，缓存位于
 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+
+## 164. 2026-08-13 生产快照、MaxMind 与 feature-gate 收口
+
+本轮重新执行 `make production-parity-smoke`，对 Go 的
+`tmp/v2/state.db`、`tmp/yuhaiin/state.db` 和 `tmp/aws/yuhaiin/state.db` 三份停止态快照分别建立
+独立副本，在 Podman 中对 Go/Rust 的完整管理 API read、core mutation 和预期错误矩阵逐项比较；三份均
+`identical`，源库保持只读，结果位于 `~/.cache/yuhaiin-rust/production-parity`。
+
+同时执行 `make api-route-parity-smoke`（82 个 Go v2 operation）和
+`make release-contract-smoke`（Linux musl、Darwin、Windows 的 amd64/arm64 六目标），均通过。
+`make maxmind-smoke` 在 Podman 中用用户指定的 `Country-without-asn.mmdb` 完成真实 country 查询。
+
+MaxMind smoke 的普通 feature 构建捕获了一个之前只在 `--all-features` workspace 测试中隐藏的边界：
+`yuhaiin-core/src/proxy.rs` 的 `BindInterfaceProxy` inherent impl 和 `delayed_drop` 单测没有与
+`async-proxy` 一起 gated，导致 `yuhaiin-geo` 的默认构建失败。现已补齐 gate，并增加 import 的 feature
+边界；Podman `cargo test -p yuhaiin-core --no-default-features --all-targets` 通过（core 65、NAT process
+1），之后 MaxMind 默认 feature 构建与真实数据库查询也通过。这个检查保留在清单中，避免以后只跑
+all-features 时漏掉单 crate 的最小 feature 组合。
+
+本轮所有构建、测试和运行均使用 Podman；缓存和临时状态位于 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。

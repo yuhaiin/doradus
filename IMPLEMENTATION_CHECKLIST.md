@@ -20,10 +20,10 @@ debug 二进制。所有临时状态仍放在 `~/.cache/yuhaiin-rust`，不使�
 | 指标 | 当前值 |
 | --- | ---: |
 | 纳入统计的验收项 | 48 |
-| 已完成 `[x]` | 38 |
-| 主路径可用但仍有现场/样本缺口 `[~]` | 10 |
+| 已完成 `[x]` | 39 |
+| 主路径可用但仍有现场/样本缺口 `[~]` | 9 |
 | 有实际功能缺口 `[ ]` | 0 |
-| 加权覆盖率 | **89.6%** = `(38 + 10 × 0.5) / 48` |
+| 加权覆盖率 | **90.6%** = `(39 + 9 × 0.5) / 48` |
 | 主目标 | Linux desktop：Rust 可启动、管理前端可接入、普通 inbound/outbound 可串联 |
 | 当前结论 | **主路径已可在 Linux desktop 进行替换前验收**；rootful TUN 多路由 lease、RST/reconnect、graceful/SIGKILL teardown、Debian rootful firewall matrix 和 TPROXY UDP delivery/idle/force-stop 已闭环，生产异常快照、更多平台现场和第三方 WireGuard 仍是 `[~]` |
 
@@ -185,7 +185,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` 统计公开契约已逐字段对齐：connections 的完整 metadata/matchHistory、total 的 string counters、traffic 的 UTC bucket、telemetry 的固定九维/失败计数、history/failed-history/block-history 的 process、count、time、dumpProcessEnabled 和 API 1000 条边界均有单测或 Podman parity；失败项按 `(protocol, host, process)` 分组，阻断历史不再丢失进程标志，同时保留 Go failed-history 全量 SQLite 语义。
 - `[x]` 2026-08-13 在 Podman 重跑 `make go-live-flow-parity-smoke` 和 `make workspace-tests`：Go/Rust 真实 live flow 的 connections、total、traffic、telemetry、history 对照通过；workspace 49 个 harness 全部通过（285 个 runtime tests、131 个 store tests、22 个 service-chain tests、2 个 WireGuard chain tests）。结果保存在 `~/.cache/yuhaiin-rust/integration/go-live-flow-parity/20260813034332-2381346` 与 `~/.cache/yuhaiin-rust/integration/workspace-tests`。
 - `[x]` route list `refreshInterval` 已由 RuntimeService 持有后台 timer：配置 reload 立即重读，刷新产生的 reload 不会忙循环，服务 shutdown 会停止任务；定时刷新夹具验证 `lastRefreshTime` 和 reload 生命周期。
-- `[~]` 补完整 API response 字段、更多生产 route/resolver projection 和 MaxMind country projection 样本；Go 当前 MaxMind 接口只暴露 country，不额外把 ASN 当作迁移缺口；remote route refresh 的持久化错误字段已补齐。
+- `[x]` API response 字段、生产 route/resolver projection 和 MaxMind country projection 已补齐证据：三份停止态 Go SQLite 的完整 API read/mutation/error parity、runtime route-list GeoIP metadata 持久化测试，以及 `make maxmind-smoke` 对用户指定 Country-without-asn 数据库的真实查询均通过；Go 当前 MaxMind 接口只暴露 country，不额外把 ASN 当作迁移缺口。
 - `[x]` Runtime DNS handler 在 socket/TUN 共用边界上恢复预加载 FakeIP 的 `in-addr.arpa`/`ip6.arpa` PTR 映射；未知 PTR 仍按上游 resolver 的现有能力处理。
 - `[x]` Go inbound `proxy` 与 `http_mock` transport 已按其真实 `NewServer` 语义复用普通 listener；allow-list 单测覆盖大小写和 deferred transport，Podman `service-chain-smoke` 的 18/18 进程链包含两种透明 wrapper 的 HTTP echo。
 - `[x]` 入站 transport 组合按 Go listener 声明顺序通过真实进程链验证：`TLS → AEAD → HTTP/2 → HTTP outbound`，包含 TLS/AEAD 解包、H2 CONNECT、router、SQLite connections、流量统计和 HTTP authority。
@@ -216,12 +216,12 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 | 类别 | 命令 | Podman 验证结果 |
 | --- | --- | --- |
-| 全 workspace | `make workspace-tests` | 49 个 harness，0 失败；chain 55、core 153、runtime 285、store 131（5 ignored）、trie 27、service-chain 22、WireGuard 11（1 benchmark ignored）、WireGuard runtime chain 2、stats concurrency 2；外部 WARP 测试显式 ignored |
+| 全 workspace | `make workspace-tests` | 49 个 harness，0 失败；chain 55、core 153、runtime 285、store 131（5 ignored）、trie 27、service-chain 23、WireGuard 11（1 benchmark ignored）、WireGuard runtime chain 2、stats concurrency 2；外部 WARP 测试显式 ignored |
 | Go API / SQLite | `make production-parity-smoke` | 3 份停止态 Go SQLite 的 info/settings/nodes/inbounds/resolvers/routes/publishes/connections/统计读接口、核心 mutation 和错误矩阵逐项 identical |
 | Go live flow | `make go-live-flow-parity-smoke` | Go/Rust 真实 HTTP inbound → router → HTTP outbound 流量、connections、total、traffic、history、telemetry 和 reload 后统计 parity |
 | Go wire interop | `make go-protocol-interop-smoke` | 14 passed，覆盖 Yuubinsya、WebSocket/H2、H2 v1、VLESS TCP/UDP、VMess、Trojan 的 Go↔Rust wire tests |
 | HTTP/2 protocol layering | `podman-cargo.sh -- cargo test -p yuhaiin-chain --test http2_protocol_layers` | 1 passed；同一 harness 循环验证 VLESS/VMess/Trojan 在 Go-compatible H2 CONNECT transport 上完成 TCP 握手、响应头和 payload echo；runtime service-chain 又以 1 个 TCP + 1 个 UDP 测试分别循环覆盖三种协议 |
-| service chains | `make service-chain-smoke` | 22 passed；HTTP/SOCKS5/mixed/TLS/H2/Yuubinsya、VLESS/VMess/Trojan TCP/UDP、VLESS/VMess/Trojan over HTTP/2 TCP/UDP、reverse、透明 wrapper 和实时状态链通过 |
+| service chains | `make service-chain-smoke` | 23 passed；HTTP/SOCKS5/mixed/TLS/H2/Yuubinsya、VLESS/VMess/Trojan TCP/UDP、VLESS/VMess/Trojan over HTTP/2 TCP/UDP、reverse、透明 wrapper 和实时状态链通过 |
 | statistics soak | `YUHAIIN_STATS_READER_COUNT=24 YUHAIIN_STATS_READER_ROUNDS=1000 YUHAIIN_STATS_WRITE_ROUNDS=2000 make stats-soak-smoke` | Podman 真实前台进程 24 readers×1000 rounds、2000 writes，含强停恢复：2 passed，89.50s |
 | API / SSE | `make api-contract-smoke` | 4 passed；管理 API、嵌套路由 history、domain latency、SSE 初始/新增/移除、连接字段、close、total/traffic/telemetry/history 通过 |
 | TUN lifecycle | `make tun-api-process-smoke` | 真实前台 runtime 通过 API 独立开关单个及两个 TUN，验证设备出现/消失和反复 disable→enable→disable |
@@ -230,6 +230,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | transparent | `make transparent-service-smoke` + Debian rootful VM matrix | 当前源码二进制通过 IPv4/IPv6 REDIRECT、iptables/native nft TPROXY UDP 2-flow、original destination、reply/rebind、idle reap、SIGKILL force-stop；脚本由 Podman 执行，VM kernel 为 Debian 6.5 |
 | WireGuard protocol | `make wireguard-smoke` | Cloudflare BoringTun userspace 双 peer：11 passed，1 ignored；authenticated handshake、PSK、reserved、keepalive、AllowedIPs、TCP/UDP、resolver、interface bind 和 WARP/`wg-quick` INI 配置覆盖 |
 | WireGuard chain | `make wireguard-chain-smoke` | 2 passed；HTTP/TCP 与 SOCKS5/UDP inbound → CIDR router → BoringTun WireGuard outbound → peer echo 通过 |
+| MaxMind / feature gate | `make maxmind-smoke`；`podman-cargo.sh -- cargo test -p yuhaiin-core --no-default-features --all-targets` | 真实 Country-without-asn 数据库查询 1/1 通过；core 无 async-proxy feature 65 个单测、NAT process 1 个测试通过 |
 | startup / service | `make startup-logs-smoke`、`make systemd-service-smoke` | 默认前台日志、runtime ready/shutdown、systemd install/health/自动 rollback/显式 rollback 通过 |
 | release contract | `make release-contract-smoke` | Linux musl、Darwin、Windows 的 amd64/arm64 六目标、产物名、checksum、checks gate、rolling-main contract 通过 |
 | musl release build | `make build-release-musl` | Podman 内成功完成 `x86_64-unknown-linux-musl` release 构建，产出 static PIE `yuhaiin` |
