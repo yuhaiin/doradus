@@ -4263,3 +4263,28 @@ protocol 38 passed/2 ignored、store 131 passed/5 ignored、runtime 264 passed/0
 runtime focused test 1/1；`rustfmt` 未执行是因为 Podman 的 Rust 1.97.1 toolchain 缺少组件，
 宿主仅做只读 `rustfmt --check` 和 `git diff --check`，没有在宿主编译或运行测试。所有测试状态
 仍位于 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+
+## 158. 2026-08-12 Go `tls_auto` inbound dynamic certificate
+
+对照 Go `pkg/net/proxy/tls.NewTlsAutoServer`、`TlsAutoConfig` 和
+`pkg/cert.GenerateServerCert` 后确认，`tls_auto` 不是把一张静态证书交给 TLS listener：Go
+启动时解析 `ca_cert`/`ca_key`，收到 ClientHello 后按 SNI 懒生成叶子证书，并把配置的
+`servernames` 当作精确名或单标签 wildcard 规则。叶子证书的 DNS/IP SAN、server/client EKU
+和 CA 的签名算法也必须保留，否则已有配置可能在 Rust listener 已启动后仍握手失败。
+
+Rust 新增 `crates/yuhaiin-runtime/src/inbounds/tls_auto.rs`，把动态证书逻辑从普通静态 TLS
+builder 中隔离出来。它复用 rustls `ResolvesServerCert` 和 RustCrypto provider，用纯 Rust
+`x509-cert` builder 构造叶子证书，并按规范化 SNI 做有界到配置域名的进程内缓存；Go JSON 的
+base64 字符串、byte array、PEM、snake/camel case 字段均可读取。CA 私钥按 Go 的 PKCS#8
+contract 解析，已覆盖 ECDSA P-256、Ed25519 和 RSA 三种 Go `GenerateCa` 可能产生的算法，且
+验证了证书和私钥不匹配会 fail-closed。`tls_auto` 已加入 inbound allow-list，可以与现有
+HTTP/HTTP2 listener 和 router 复用同一条入站路径。
+
+由于当前 rustls 公开 server builder 没有 Go `EncryptedClientHelloKeys` 的等价接口，ECH 配置
+不会被静默当成已实现：listener 会明确输出降级提示并继续提供普通 SNI TLS。清单状态保持
+`[~]`，下一步是用 Go/Rust live config 和真实 ECH client/server 现场确认替代方案；这不影响
+未启用 ECH 的普通 `tls_auto` 配置。
+
+验证：Podman focused runtime tests 6/6 通过，覆盖 Go-shaped nested contract、base64/byte
+输入、wildcard/规范化、动态 SNI TLS echo、CA/key mismatch，以及 ECDSA/Ed25519/RSA CA；全程
+使用 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。

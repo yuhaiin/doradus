@@ -44,6 +44,9 @@ pub(crate) type InboundTlsAcceptor = tokio_rustls::TlsAcceptor;
 #[cfg(not(feature = "doh-tls"))]
 pub(crate) type InboundTlsAcceptor = ();
 
+#[cfg(feature = "doh-tls")]
+mod tls_auto;
+
 fn has_transport(transports: &[String], kind: &str) -> bool {
     transports
         .iter()
@@ -67,6 +70,7 @@ fn is_supported_inbound_transport(transport: &str) -> bool {
         || transport.eq_ignore_ascii_case("aead")
         || transport.eq_ignore_ascii_case("proxy")
         || transport.eq_ignore_ascii_case("http_mock")
+        || transport.eq_ignore_ascii_case("tls_auto")
 }
 
 fn supports_socks5_udp(protocol: &str, protocol_udp: bool) -> bool {
@@ -1262,6 +1266,22 @@ fn build_inbound_tls_acceptor(
     data_json: &[u8],
     transports: &[String],
 ) -> Result<Option<InboundTlsAcceptor>> {
+    if has_transport(transports, "tls_auto") {
+        #[cfg(not(feature = "doh-tls"))]
+        {
+            let _ = data_json;
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "inbound TLS-auto transport requires the doh-tls feature",
+            ));
+        }
+
+        #[cfg(feature = "doh-tls")]
+        {
+            return tls_auto::build(data_json, transports);
+        }
+    }
+
     let enabled = transports
         .iter()
         .any(|transport| transport.eq_ignore_ascii_case("tls"));
@@ -2240,12 +2260,13 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             );
         }
 
-        for transport in ["mux", "reality", "tls_auto", "quic", "unknown"] {
+        for transport in ["mux", "reality", "quic", "unknown"] {
             assert!(
                 !is_supported_inbound_transport(transport),
                 "transport {transport} must remain explicitly deferred"
             );
         }
+        assert!(is_supported_inbound_transport("tls_auto"));
     }
 
     async fn direct_runtime() -> (Arc<RuntimeProxySelector>, Arc<ConnectionMonitor>) {

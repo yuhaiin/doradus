@@ -86,6 +86,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `pkg/net/proxy/socks5/client.go`、`server.go` | `crates/yuhaiin-protocol/src/socks5.rs`、`socks5_server.rs`、`crates/yuhaiin-runtime/src/inbounds/socks5.rs` | `[x]` | TCP auth/request、UDP ASSOCIATE、IPv4/IPv6/domain framing、inbound/outbound chain | — |
 | `pkg/net/proxy/socks4a/server.go`、`mixed/*` | `crates/yuhaiin-runtime/src/proxy/socks4a.rs`、`inbounds/mod.rs` | `[x]` | mixed inbound dispatches SOCKS4A/SOCKS5/HTTP | — |
 | `pkg/net/proxy/tls/*` | `crates/yuhaiin-protocol/src/tls.rs`、`crates/yuhaiin-runtime/src/proxy/*` | `[x]` | RustCrypto TLS inbound/outbound、SNI、CA、insecureSkipVerify contract | — |
+| Go `pkg/net/proxy/tls.NewTlsAutoServer`、`pkg/cert.GenerateServerCert` | `crates/yuhaiin-runtime/src/inbounds/tls_auto.rs` | `[~]` | 动态 SNI 叶子证书、精确/单标签 wildcard、DNS/IP SAN、ALPN、按配置域名共享证书缓存；RustCrypto X.509 builder 已兼容 Go 的 ECDSA P-256、Ed25519、RSA CA/PKCS#8，6 个 Podman focused tests 通过 | rustls server-side ECH 尚未有等价公开 API；补 Go/Rust live config 和 ECH 现场后再升为 `[x]` |
 | `pkg/net/proxy/http2/v1/*`、`v2/*` | `crates/yuhaiin-chain/src/h2_tunnel.rs`、`h2_server.rs`、`crates/yuhaiin-core/src/http2.rs` | `[x]` | prior-knowledge、TLS ALPN、pool/drain/GOAWAY、HTTP CONNECT/SOCKS5 bridge | — |
 | `pkg/net/proxy/yuubinsya/*`、`yuubinsya2/*` | `crates/yuhaiin-core/src/yuubinsya.rs`、`crates/yuhaiin-chain/src/session.rs`、`direct_uot.rs` | `[x]` | TCP、native UDP、UOT/dup-over-TCP、Ping、migration/reconnect、Go client interop | — |
 | `pkg/net/proxy/aead/*` | `crates/yuhaiin-protocol/src/aead.rs` | `[x]` | TCP/UDP wire and Go interop | — |
@@ -185,6 +186,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[~]` 补完整 API response 字段、更多生产 route/resolver projection 和 MaxMind country projection 样本；Go 当前 MaxMind 接口只暴露 country，不额外把 ASN 当作迁移缺口；remote route refresh 的持久化错误字段已补齐。
 - `[x]` Runtime DNS handler 在 socket/TUN 共用边界上恢复预加载 FakeIP 的 `in-addr.arpa`/`ip6.arpa` PTR 映射；未知 PTR 仍按上游 resolver 的现有能力处理。
 - `[x]` Go inbound `proxy` 与 `http_mock` transport 已按其真实 `NewServer` 语义复用普通 listener；allow-list 单测覆盖大小写和 deferred transport，Podman `service-chain-smoke` 的 18/18 进程链包含两种透明 wrapper 的 HTTP echo。
+- `[~]` Go `tls_auto` inbound 已进入普通 TCP/TLS listener：从 Go-shaped `ca_cert`/`ca_key`/`servernames`/`next_protos` 生成动态 SNI 证书，支持 ECDSA P-256、Ed25519、RSA CA 和 wildcard/SAN；runtime focused test 在 Podman 通过 6/6。ECH server key API 仍保留为明确缺口，不伪装成完整支持。
 
 ### WireGuard 外部兼容
 
@@ -210,8 +212,8 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | 命令 | Podman 场景 | 结果 |
 | --- | --- | --- |
 | `cargo clippy --locked --workspace --all-targets --all-features --offline -- -D warnings`（2026-08-12 当前轮） | Rust 1.97.1 Podman，一次性安装缺失的 clippy component，cargo registry/target 挂载自用户缓存 | Clippy 通过；当前镜像缺少 rustfmt component，宿主只做只读 `rustfmt --check` 和 `git diff --check`，没有在宿主编译/运行测试 |
-| `cargo test --locked --workspace --all-features --offline --no-fail-fast -- --test-threads=1`（2026-08-12 当前轮） | Rust 1.97.1 Podman，`network=host`，临时目录在用户缓存 | chain 55、core 148、runtime 264、store 131（5 ignored）、service-chain 18、WireGuard 8（1 benchmark ignored），0 失败 |
-| `make workspace-tests`（2026-08-12 当前轮） | 48 个 harness；编译和运行均在 isolated/stats/host-network Podman 分组 | chain 55、core 148、runtime 264、store 131（5 个 ignored）、service-chain 18、WireGuard 8（1 个 benchmark ignored）、WireGuard runtime chain 2；0 失败 |
+| `cargo test --locked --workspace --all-features --offline --no-fail-fast -- --test-threads=1`（2026-08-12 当前轮） | Rust 1.97.1 Podman，`network=host`，临时目录在用户缓存 | chain 55、core 148、runtime 269、store 131（5 ignored）、service-chain 18、WireGuard 8（1 benchmark ignored），0 失败 |
+| `make workspace-tests`（2026-08-12 当前轮） | 48 个 harness；编译和运行均在 isolated/stats/host-network Podman 分组 | chain 55、core 148、runtime 269（含 `tls_auto` focused 6/6）、store 131（5 个 ignored）、service-chain 18、WireGuard 8（1 个 benchmark ignored）、WireGuard runtime chain 2；0 失败 |
 | `make workspace-tests`（2026-08-12 update helper） | 编译、运行均在 Podman；宿主机只调度 | `run_update_helper` 成功替换、保留 `.update-backup`、重启失败恢复旧 binary 和保留 staged retry 两项单测通过 |
 | `YUHAIIN_SOURCE_DB=... make go-api-parity-smoke`（2026-08-12 当前轮） | Go/Rust 编译和服务均在 Podman；Go/Rust 使用独立数据库副本，宿主只驱动 curl | info/settings/nodes/inbounds/resolvers/routes/publishes/connections、全部 mutation 和错误矩阵 identical |
 | `make production-parity-smoke`（2026-08-12 当前轮） | 3 份停止态 Go v5/v6/AWS-shaped snapshot；Go/Rust 编译和服务均在 Podman | 3/3 API read、core mutation、error matrix identical |
@@ -256,7 +258,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `make tun-ipv6-extension-smoke` | Podman `--network=none`、core test harness | Hop-by-Hop/Routing/后置 Destination Options 分片重组通过；已有 Fragment Header fail-closed |
 | `make stats-soak-smoke` | `--network=none` Podman、可复用 SQLite fixture | 12 个并发 readers 各 160 轮、256 个流量写入，force-stop/restart、connections/traffic/telemetry/history 全部通过 |
 | `cargo test --offline -p yuhaiin-backup`、runtime API S3 test、`make s3-minio-smoke` | Podman workspace 会执行 local compatible endpoint；MinIO smoke 在独立 Podman network 中包含真实 SigV4 PUT/GET、API upload/download 和选中 outbound proxy transport | 6 个 backup crate 单元测试 + 1 个 local wire test、runtime S3 run/restore、Go hash/object contract 通过；MinIO smoke 通过 bucket/object/restore 校验；状态位于 `~/.cache/yuhaiin-rust` |
-| `make workspace-tests`（2026-08-12 当前轮） | Podman 编译和执行；宿主机只负责调度，缓存位于 `~/.cache/yuhaiin-rust` | 48 个 harness；chain 55、core 148、runtime 264、store 131（5 个 ignored）、WireGuard 8、service-chain 18、WireGuard runtime chain 2 全部通过；新增 Go outbound `http_mock`、reverse TCP/HTTP 进程链、Go `proxy`/`http_mock` 透明 transport、remote route-list HTTP fixture 与 node tag parser/selector/retry 回归通过；外部 WireGuard harness 的 2 个公网测试显式 ignored；另有 Debian VM rootful TUN/TPROXY 现场复核 |
+| `make workspace-tests`（2026-08-12 当前轮） | Podman 编译和执行；宿主机只负责调度，缓存位于 `~/.cache/yuhaiin-rust` | 48 个 harness；chain 55、core 148、runtime 269、store 131（5 个 ignored）、WireGuard 8、service-chain 18、WireGuard runtime chain 2 全部通过；新增 `tls_auto` 动态证书 6/6、Go outbound `http_mock`、reverse TCP/HTTP 进程链、Go `proxy`/`http_mock` 透明 transport、remote route-list HTTP fixture 与 node tag parser/selector/retry 回归通过；外部 WireGuard harness 的 2 个公网测试显式 ignored；另有 Debian VM rootful TUN/TPROXY 现场复核 |
 | Podman Rust 1.97.1 Clippy + workspace tests（2026-08-12 当前轮） | `docker.io/library/rust:latest`、privileged、host network、`--offline`；缓存只挂载 `~/.cache/yuhaiin-rust` | `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` 通过；workspace 148 core、264 runtime、131 store（5 ignored）、18 service-chain、2 WireGuard chain 及其他 crate tests 全部通过；`fixedv2` alternate/interface fallback、Go `http_mock` builder、node tag selector 和 remote route-list refresh 回归通过 |
 | Podman interface regression（2026-08-12 当前轮） | privileged、`--network=none`；宿主机不运行 runtime/test | direct TCP + fixed UDP 的 Linux `lo` 绑定 2/2；runtime wrapper 的 node interface 传递测试通过；`cargo clippy --workspace --all-targets --all-features --offline -- -D warnings` 通过 |
 | `make tun-api-process-smoke`（2026-08-12 当前轮） | Podman 编译和运行、disposable user/network namespace、前台 runtime、`/dev/net/tun` | 1/1 通过；真实设备按 disabled→enabled→disabled→enabled→disabled 出现/消失，并验证两个同时 enabled 的 TUN 可独立关闭，排除“API 已保存但 TUN supervisor 未切换” |
