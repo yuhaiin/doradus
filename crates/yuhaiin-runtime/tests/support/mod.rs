@@ -1381,7 +1381,7 @@ pub async fn configure_http_process_inbound_chain(
         "mode":"proxy",
         "rules":[{"type":"all","all":[
             {"type":"process","process":{"list":"process-current"}},
-            {"type":"inbound","inbound":{"names":["http-process-in"]}},
+            {"type":"inbound","inbound":{"names":["HTTP process matcher inbound"]}},
             {"type":"network","network":{"network":"tcp"}}
         ]}],
         "tag":"process-inbound-integration"

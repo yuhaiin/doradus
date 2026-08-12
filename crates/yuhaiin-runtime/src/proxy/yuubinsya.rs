@@ -16,7 +16,8 @@ use yuhaiin_core::{BoxFuture, Error, FlowContext, Result};
 
 use super::common::{
     RoutedProxy, UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows,
-    reap_expired_udp_flows_with_timeout, shutdown_udp_flow, udp_flow_key, udp_idle_timeout,
+    reap_expired_udp_flows_with_timeout, record_outbound_datagram, shutdown_udp_flow, udp_flow_key,
+    udp_idle_timeout,
 };
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -151,6 +152,7 @@ pub(crate) async fn serve_udp(
                     selector.route_context(&mut context);
                     let key = udp_flow_key(peer_addr, &target);
                     let datagram = selector.select(&context).open_datagram(&context).await?;
+                    record_outbound_datagram(&mut context, &*datagram);
                     let datagram: Arc<dyn AsyncDatagram> = Arc::from(datagram);
                     let observation =
                         FlowObserverGuard::open(monitor.clone(), TunFlow { key }, context);

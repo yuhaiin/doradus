@@ -341,6 +341,11 @@ pub struct FlowContext {
     /// distinct from `outbound`, which stores the configured node ID used by
     /// the React contract's `nodeId` field.
     pub outbound_addr: Option<Endpoint>,
+    /// Local socket endpoint allocated by the selected outbound proxy. Go's
+    /// connection contract exposes this as `localAddr`; it must remain
+    /// separate from `local_addr`, which is the inbound listener endpoint
+    /// used by loopback detection.
+    pub outbound_local_addr: Option<Endpoint>,
     /// Process metadata supplied by a platform process resolver. TUN callers
     /// can leave this empty when the operating system does not expose socket
     /// ownership; inbound and test callers can still provide it explicitly.
@@ -383,6 +388,7 @@ impl FlowContext {
             interface: None,
             outbound_geo: None,
             outbound_addr: None,
+            outbound_local_addr: None,
             process: None,
             process_id: None,
             user_id: None,

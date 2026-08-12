@@ -87,6 +87,7 @@ fn inbound_process_resolver() -> Option<&'static dyn ProcessResolver> {
 #[derive(Debug, Clone)]
 pub(crate) struct InboundSpec {
     pub(crate) id: String,
+    pub(crate) name: String,
     pub(crate) protocol: String,
     pub(crate) listen: SocketAddr,
     pub(crate) username: String,
@@ -653,6 +654,7 @@ async fn start_listeners(
                 else {
                     continue;
                 };
+                spec.listen = listener.local_addr().unwrap_or(spec.listen);
                 let selector = selector.clone();
                 let monitor = monitor.clone();
                 let spec = spec.clone();
@@ -735,6 +737,7 @@ async fn start_listeners(
                 else {
                     continue;
                 };
+                spec.listen = listener.local_addr().unwrap_or(spec.listen);
                 let selector = selector.clone();
                 let monitor = monitor.clone();
                 let spec = spec.clone();
@@ -762,6 +765,7 @@ async fn start_listeners(
             let Some(listener) = bind_tcp_listener(spec.listen, &spec.id, &monitor).await else {
                 continue;
             };
+            spec.listen = listener.local_addr().unwrap_or(spec.listen);
             let selector = selector.clone();
             let monitor = monitor.clone();
             let spec = spec.clone();
@@ -1109,6 +1113,7 @@ impl InboundSpec {
         };
         Ok(Self {
             id: record.id,
+            name: record.name,
             protocol,
             listen,
             username,
@@ -1134,8 +1139,24 @@ impl InboundSpec {
         context: &mut FlowContext,
         resolver: Option<&dyn ProcessResolver>,
     ) {
-        context.inbound = Some(self.protocol.clone());
-        context.inbound_name = Some(self.id.clone());
+        let inbound = if context.network == yuhaiin_core::Network::Tcp
+            && self.listen.ip().is_unspecified()
+            && self.listen.ip().is_ipv4()
+        {
+            // Go's dual-stack net.Listen canonicalizes an IPv4 wildcard to
+            // the IPv6 wildcard in Listener.Addr(). Keep the public contract
+            // stable while local_addr remains the actual endpoint used by
+            // loopback protection.
+            format!("[::]:{}", self.listen.port())
+        } else {
+            self.listen.to_string()
+        };
+        context.inbound = Some(inbound);
+        context.inbound_name = Some(if self.name.trim().is_empty() {
+            self.id.clone()
+        } else {
+            self.name.clone()
+        });
         if context.local_addr.is_none() {
             context.local_addr = Some(Endpoint::ip(context.network, self.listen));
         }
@@ -2372,6 +2393,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         let (mut client, server) = tokio::io::duplex(16 * 1024);
         let spec = InboundSpec {
             id: "reverse-tcp-inbound".to_owned(),
+            name: "reverse-tcp-inbound".to_owned(),
             protocol: "reverse_tcp".to_owned(),
             listen: "127.0.0.1:19084".parse().unwrap(),
             username: String::new(),
@@ -2422,6 +2444,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         let (mut client, server) = tokio::io::duplex(16 * 1024);
         let spec = InboundSpec {
             id: "reverse-http-inbound".to_owned(),
+            name: "reverse-http-inbound".to_owned(),
             protocol: "reverse_http".to_owned(),
             listen: "127.0.0.1:19085".parse().unwrap(),
             username: String::new(),
@@ -2599,6 +2622,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             "none".to_owned(),
             InboundSpec {
                 id: "none".to_owned(),
+                name: "none".to_owned(),
                 protocol: "none".to_owned(),
                 listen: "127.0.0.1:12347".parse().unwrap(),
                 username: String::new(),
@@ -2630,6 +2654,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         let address = listener.local_addr().unwrap();
         let spec = InboundSpec {
             id: "aead-socks5-inbound".to_owned(),
+            name: "aead-socks5-inbound".to_owned(),
             protocol: "socks5".to_owned(),
             listen: address,
             username: String::new(),
@@ -2700,6 +2725,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         let (mut client, server) = tokio::io::duplex(16 * 1024);
         let spec = InboundSpec {
             id: "trojan-inbound".to_owned(),
+            name: "trojan-inbound".to_owned(),
             protocol: "trojan".to_owned(),
             listen: "127.0.0.1:19080".parse().unwrap(),
             username: String::new(),
@@ -2742,6 +2768,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         let (mut client, server) = tokio::io::duplex(16 * 1024);
         let spec = InboundSpec {
             id: "vless-inbound".to_owned(),
+            name: "vless-inbound".to_owned(),
             protocol: "vless".to_owned(),
             listen: "127.0.0.1:19082".parse().unwrap(),
             username: String::new(),
@@ -2793,6 +2820,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         let (mut client, server) = tokio::io::duplex(16 * 1024);
         let spec = InboundSpec {
             id: "vless-udp-inbound".to_owned(),
+            name: "vless-udp-inbound".to_owned(),
             protocol: "vless".to_owned(),
             listen: "127.0.0.1:19083".parse().unwrap(),
             username: String::new(),
@@ -2843,6 +2871,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         let (mut client, server) = tokio::io::duplex(16 * 1024);
         let spec = InboundSpec {
             id: "trojan-udp-inbound".to_owned(),
+            name: "trojan-udp-inbound".to_owned(),
             protocol: "trojan".to_owned(),
             listen: "127.0.0.1:19081".parse().unwrap(),
             username: String::new(),
@@ -2928,6 +2957,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
     fn inbound_context_enriches_process_metadata_before_shared_router_selection() {
         let spec = InboundSpec {
             id: "process-inbound".to_owned(),
+            name: "process display name".to_owned(),
             protocol: "http".to_owned(),
             listen: "127.0.0.1:18080".parse().unwrap(),
             username: String::new(),
@@ -2951,8 +2981,11 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             "127.0.0.1:41000".parse().unwrap(),
         ));
         spec.annotate_context_with_process_resolver(&mut context, Some(&FixedProcessResolver));
-        assert_eq!(context.inbound.as_deref(), Some("http"));
-        assert_eq!(context.inbound_name.as_deref(), Some("process-inbound"));
+        assert_eq!(context.inbound.as_deref(), Some("127.0.0.1:18080"));
+        assert_eq!(
+            context.inbound_name.as_deref(),
+            Some("process display name")
+        );
         assert_eq!(context.outbound.as_deref(), Some("direct"));
         assert_eq!(
             context.local_addr,
@@ -2976,6 +3009,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             let (_server, peer) = listener.accept().await.unwrap();
             let spec = InboundSpec {
                 id: "real-process-inbound".to_owned(),
+                name: "real-process-inbound".to_owned(),
                 protocol: "socks5".to_owned(),
                 listen,
                 username: String::new(),
@@ -3018,6 +3052,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 inbound_listener,
                 InboundSpec {
                     id: "socks-inbound".to_owned(),
+                    name: "socks-inbound".to_owned(),
                     protocol: "socks5".to_owned(),
                     listen: inbound_address,
                     username: String::new(),
@@ -3082,6 +3117,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 inbound_listener,
                 InboundSpec {
                     id: "socks4a-inbound".to_owned(),
+                    name: "socks4a-inbound".to_owned(),
                     protocol: "socks4a".to_owned(),
                     listen: inbound_address,
                     username: String::new(),
@@ -3143,6 +3179,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 inbound_listener,
                 InboundSpec {
                     id: "mixed-inbound".to_owned(),
+                    name: "mixed-inbound".to_owned(),
                     protocol: "mixed".to_owned(),
                     listen: inbound_address,
                     username: String::new(),
@@ -3241,6 +3278,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 inbound_listener,
                 InboundSpec {
                     id: "socks-close-inbound".to_owned(),
+                    name: "socks-close-inbound".to_owned(),
                     protocol: "socks5".to_owned(),
                     listen: inbound_address,
                     username: String::new(),
@@ -3319,6 +3357,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 inbound_listener,
                 InboundSpec {
                     id: "socks-abort-inbound".to_owned(),
+                    name: "socks-abort-inbound".to_owned(),
                     protocol: "socks5".to_owned(),
                     listen: inbound_address,
                     username: String::new(),
@@ -3415,6 +3454,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 server,
                 InboundSpec {
                     id: "socks-udp-close-inbound".to_owned(),
+                    name: "socks-udp-close-inbound".to_owned(),
                     protocol: "socks5".to_owned(),
                     listen: server_address,
                     username: String::new(),
@@ -3508,6 +3548,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     peer,
                     InboundSpec {
                         id: "socks-associate-inbound".to_owned(),
+                        name: "socks-associate-inbound".to_owned(),
                         protocol: "socks5".to_owned(),
                         listen: inbound_address,
                         username: String::new(),
@@ -3604,6 +3645,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 inbound_listener,
                 InboundSpec {
                     id: "http-inbound".to_owned(),
+                    name: "http-inbound".to_owned(),
                     protocol: "http".to_owned(),
                     listen: inbound_address,
                     username: String::new(),
@@ -3665,6 +3707,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 inbound_listener,
                 InboundSpec {
                     id: "websocket-http-inbound".to_owned(),
+                    name: "websocket-http-inbound".to_owned(),
                     protocol: "http".to_owned(),
                     listen: inbound_address,
                     username: String::new(),
@@ -3744,6 +3787,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 inbound_listener,
                 InboundSpec {
                     id: "yuubinsya-inbound".to_owned(),
+                    name: "yuubinsya-inbound".to_owned(),
                     protocol: "yuubinsya".to_owned(),
                     listen: inbound_address,
                     username: String::new(),
@@ -3826,6 +3870,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 inbound_listener,
                 InboundSpec {
                     id: "tls-http-inbound".to_owned(),
+                    name: "tls-http-inbound".to_owned(),
                     protocol: "http".to_owned(),
                     listen: inbound_address,
                     username: String::new(),
@@ -3918,6 +3963,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 inbound_listener,
                 InboundSpec {
                     id: "websocket-http2-inbound".to_owned(),
+                    name: "websocket-http2-inbound".to_owned(),
                     protocol: "http".to_owned(),
                     listen: inbound_address,
                     username: String::new(),
@@ -4008,6 +4054,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 inbound_listener,
                 InboundSpec {
                     id: "http2-http-inbound".to_owned(),
+                    name: "http2-http-inbound".to_owned(),
                     protocol: "http".to_owned(),
                     listen: inbound_address,
                     username: String::new(),

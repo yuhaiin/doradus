@@ -8,7 +8,10 @@ use yuhaiin_core::flow::FlowKey as TunFlowKey;
 use yuhaiin_core::proxy::AsyncProxySelector;
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
-use super::common::{io_error, relay_counted_with_buffer, relay_counted_with_prefix_and_buffer};
+use super::common::{
+    io_error, record_outbound_stream, relay_counted_with_buffer,
+    relay_counted_with_prefix_and_buffer,
+};
 use crate::inbound::{InboundAuth, InboundSpec};
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -68,9 +71,6 @@ where
         let mut context = FlowContext::new(destination.clone());
         context.source = Some(source);
         context.original_domain = destination.host().cloned();
-        // The HTTP proxy consumes the CONNECT request before the shared relay
-        // can sniff it, so preserve the application protocol explicitly.
-        context.protocol = Some("http".to_owned());
         spec.annotate_context(&mut context);
         selector.route_context(&mut context);
         let process = context.process.clone();
@@ -87,6 +87,7 @@ where
                 return Err(error);
             }
         };
+        record_outbound_stream(&mut context, &outbound);
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
@@ -113,7 +114,6 @@ where
     let mut context = FlowContext::new(destination.clone());
     context.source = Some(source);
     context.original_domain = destination.host().cloned();
-    context.protocol = Some("http".to_owned());
     context.http_host = yuhaiin_core::sniff::http_host(headers.as_bytes());
     spec.annotate_context(&mut context);
     selector.route_context(&mut context);
@@ -130,6 +130,7 @@ where
             return Err(error);
         }
     };
+    record_outbound_stream(&mut context, &outbound);
     let request = rewrite_forward_request(method, &origin_target, &headers)?;
     relay_counted_with_prefix_and_buffer(
         stream,

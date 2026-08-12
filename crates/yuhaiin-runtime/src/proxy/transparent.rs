@@ -30,8 +30,8 @@ use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 use super::common::{
     UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows, io_error,
-    reap_expired_udp_flows_with_timeout, relay_counted_with_buffer, shutdown_udp_flow,
-    udp_flow_key, udp_idle_timeout,
+    reap_expired_udp_flows_with_timeout, record_outbound_datagram, record_outbound_stream,
+    relay_counted_with_buffer, shutdown_udp_flow, udp_flow_key, udp_idle_timeout,
 };
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -130,7 +130,10 @@ pub(crate) async fn serve_udp_listener(
                         .open_datagram(&context)
                         .await
                     {
-                        Ok(datagram) => Arc::from(datagram),
+                        Ok(datagram) => {
+                            record_outbound_datagram(&mut context, &*datagram);
+                            Arc::from(datagram)
+                        }
                         Err(error) => {
                             monitor.error(format!("transparent UDP open outbound failed: {error}"));
                             return Err(error);
@@ -458,6 +461,7 @@ async fn handle_connection(
                 process.as_deref(),
             );
         })?;
+    record_outbound_stream(&mut context, &outbound);
     relay_counted_with_buffer(
         stream,
         outbound,

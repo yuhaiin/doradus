@@ -605,9 +605,9 @@ async fn http_inbound_routes_through_wireguard_userspace_outbound() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inboundName"] == "wireguard-runtime-in")
+        .find(|item| item["inboundName"] == "WireGuard runtime inbound")
         .expect("WireGuard runtime chain connection must be visible");
-    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["inbound"], inbound.to_string());
     assert_eq!(item["nodeId"], "wireguard-runtime-out");
     assert_eq!(item["mode"], "proxy");
     assert!(item["matchHistory"].as_array().is_some_and(|history| {
@@ -725,7 +725,10 @@ async fn socks5_udp_inbound_routes_through_wireguard_userspace_outbound() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inbound"] == "socks5" && item["nodeId"] == "wireguard-runtime-out")
+        .find(|item| {
+            item["inboundName"] == "SOCKS5 integration inbound"
+                && item["nodeId"] == "wireguard-runtime-out"
+        })
         .expect("WireGuard runtime UDP connection must be visible");
     assert_eq!(item["nodeId"], "wireguard-runtime-out");
     assert_eq!(item["mode"], "proxy");

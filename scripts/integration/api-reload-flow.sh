@@ -42,6 +42,7 @@ podman run --rm \
   -v "${scenario_dir}:/state" \
   -e YUHAIIN_RUNTIME_BIN=/usr/local/bin/yuhaiin \
   -e YUHAIIN_INTEGRATION_DIR=/state \
+  -e YUHAIIN_RESET_INTEGRATION_STATE=1 \
   --entrypoint /bin/sh \
   "${image}" \
   -ec '

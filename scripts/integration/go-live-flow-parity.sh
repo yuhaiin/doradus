@@ -307,8 +307,11 @@ wait "${rust_flow_pid}"
 for service in go rust; do
   jq -S ' {
     connections: [.connections[] | select(.addr == "example.test:443") |
-      {addr,destination,mode,outbound,nodeId:"http-out",tag,
-       inbound:"http",protocol:"http",
+      {addr,destination,mode,outbound,nodeId:"http-out",nodeName,tag,
+       inbound:(if (.inbound | test("^(\\[::\\]|0\\.0\\.0\\.0):")) then "http" else .inbound end),
+       inboundName,protocol,resolver,domain,udpMigrateId,
+       localAddrPresent:(.localAddr != ""),
+       network:{connType:.network.connType,underlyingType:.network.underlyingType},
        matchHistory: [.matchHistory[]? |
          {ruleName:(if (.ruleName | endswith("-route")) then "live-route" else .ruleName end),
           history:[.history[]? |

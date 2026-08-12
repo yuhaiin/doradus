@@ -1318,22 +1318,24 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         };
     let source = endpoint_string(&flow.key.source_endpoint());
     let local_addr = context
-        .local_addr
+        .outbound_local_addr
         .as_ref()
         .and_then(Endpoint::addr)
         .map(|address| address.to_string())
-        .unwrap_or_else(|| source.clone());
+        .unwrap_or_default();
     let underlying_type = context
-        .local_addr
+        .outbound_local_addr
         .as_ref()
         .map(|endpoint| endpoint.network().to_string())
         .unwrap_or_default();
-    let domain = context
-        .original_domain
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_default();
     let is_tun = context.component.as_deref() == Some("tun");
+    // Go only fills Domain after resolver/FakeIP or route processing. Socket
+    // proxy requests retain their hostname for routing but do not expose it
+    // as Domain merely because the request used a domain endpoint.
+    let domain = (is_tun || context.inbound.is_none())
+        .then(|| context.original_domain.as_ref().map(ToString::to_string))
+        .flatten()
+        .unwrap_or_default();
     let inbound = context
         .inbound
         .as_deref()
@@ -1375,7 +1377,10 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         "tlsServerName": context.tls_server_name.as_deref().unwrap_or_default(),
         "httpHost": context.http_host.as_deref().unwrap_or_default(),
         "component": context.component.as_deref().unwrap_or_default(),
-        "udpMigrateId": context.udp_migrate_id.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+        "udpMigrateId": match context.udp_migrate_id.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => "".to_owned(),
+            value => value.to_string(),
+        },
         "mode": route_mode(context.route_mode),
         "matchHistory": context
             .match_history
@@ -1899,6 +1904,10 @@ mod tests {
             Network::Tcp,
             "127.0.0.1:1080".parse().unwrap(),
         ));
+        context.outbound_local_addr = Some(Endpoint::ip(
+            Network::Tcp,
+            "192.0.2.20:52000".parse().unwrap(),
+        ));
         context.outbound = Some("node-id".to_owned());
         context.outbound_addr = Some(Endpoint::ip(
             Network::Tcp,
@@ -1917,11 +1926,28 @@ mod tests {
         assert_eq!(connection["httpHost"], "example.com:443");
         assert_eq!(connection["interface"], "eth0");
         assert_eq!(connection["outboundGeo"], "US");
-        assert_eq!(connection["localAddr"], "127.0.0.1:1080");
+        assert_eq!(connection["localAddr"], "192.0.2.20:52000");
         assert_eq!(connection["network"]["underlyingType"], "tcp");
         assert_eq!(connection["protocol"], "http");
         assert_eq!(connection["outbound"], "192.0.2.10:8443");
         assert_eq!(connection["nodeId"], "node-id");
+    }
+
+    #[test]
+    fn monitor_keeps_socket_local_metadata_empty_without_outbound_socket() {
+        let monitor = ConnectionMonitor::new();
+        let (flow, mut context) = flow();
+        context.local_addr = Some(Endpoint::ip(
+            Network::Tcp,
+            "127.0.0.1:1080".parse().unwrap(),
+        ));
+        context.udp_migrate_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        monitor.opened(flow, context);
+
+        let connection = &monitor.connections_value()["connections"][0];
+        assert_eq!(connection["localAddr"], "");
+        assert_eq!(connection["network"]["underlyingType"], "");
+        assert_eq!(connection["udpMigrateId"], "");
     }
 
     #[test]

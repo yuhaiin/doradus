@@ -16,8 +16,8 @@ use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 use yuhaiin_protocol::trojan::{self, Command};
 
 use super::common::{
-    answer_dns_packet, relay_counted_with_buffer, relay_counted_with_prefix, udp_flow_expired,
-    udp_idle_timeout,
+    answer_dns_packet, record_outbound_datagram, record_outbound_stream, relay_counted_with_buffer,
+    relay_counted_with_prefix, udp_flow_expired, udp_idle_timeout,
 };
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -79,6 +79,7 @@ where
             return Err(error);
         }
     };
+    record_outbound_stream(&mut context, &outbound);
     relay_counted_with_buffer(
         stream,
         outbound,
@@ -165,7 +166,9 @@ where
                         source: peer,
                         destination: target.addr().unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
                     };
-                    let datagram: Arc<dyn AsyncDatagram> = Arc::from(selector.select(&context).open_datagram(&context).await?);
+                    let datagram = selector.select(&context).open_datagram(&context).await?;
+                    record_outbound_datagram(&mut context, &*datagram);
+                    let datagram: Arc<dyn AsyncDatagram> = Arc::from(datagram);
                     let observation =
                         FlowObserverGuard::open(monitor.clone(), Flow { key: flow }, context);
                     let receiver = Arc::clone(&datagram);

@@ -19,8 +19,8 @@ use yuhaiin_core::{Endpoint, FlowContext, Network, Result};
 use crate::inbound::InboundSpec;
 use crate::proxy::common::{
     UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows, io_error,
-    reap_expired_udp_flows_with_timeout, relay_counted_with_buffer, shutdown_udp_flow,
-    udp_flow_key, udp_idle_timeout,
+    reap_expired_udp_flows_with_timeout, record_outbound_datagram, record_outbound_stream,
+    relay_counted_with_buffer, shutdown_udp_flow, udp_flow_key, udp_idle_timeout,
 };
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -94,6 +94,7 @@ where
             return Err(error);
         }
     };
+    record_outbound_stream(&mut context, &outbound);
     yuhaiin_protocol::socks5_server::write_reply(&mut stream, 0).await?;
     relay_counted_with_buffer(
         stream,
@@ -180,6 +181,7 @@ pub(crate) async fn serve_socks5_udp_loop(
                     selector.route_context(&mut context);
                     let key = udp_flow_key(peer, &target);
                     let datagram = selector.select(&context).open_datagram(&context).await?;
+                    record_outbound_datagram(&mut context, &*datagram);
                     let datagram: Arc<dyn AsyncDatagram> = Arc::from(datagram);
                     let observation =
                         FlowObserverGuard::open(monitor.clone(), TunFlow { key }, context);

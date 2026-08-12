@@ -84,7 +84,7 @@ async fn wait_for_history(service: &ServiceProcess) -> serde_json::Value {
         .await;
         if history["items"].as_array().is_some_and(|items| {
             items.iter().any(|item| {
-                item["connection"]["inboundName"] == "http-chain-in"
+                item["connection"]["inboundName"] == "HTTP chain inbound moved"
                     && item["count"]
                         .as_str()
                         .and_then(|value| value.parse::<u64>().ok())
@@ -349,7 +349,7 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     assert!(persisted_history["items"].as_array().is_some_and(|items| {
         items
             .iter()
-            .any(|item| item["connection"]["inboundName"] == "http-chain-in")
+            .any(|item| item["connection"]["inboundName"] == "HTTP chain inbound moved")
     }));
     assert!(history["items"].is_array());
 

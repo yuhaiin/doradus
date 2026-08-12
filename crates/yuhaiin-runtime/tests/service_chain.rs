@@ -146,6 +146,10 @@ impl ProtocolOutboundKind {
         format!("{}-runtime-in", self.name())
     }
 
+    fn inbound_name(self) -> String {
+        format!("{} runtime protocol inbound", self.name())
+    }
+
     fn rule_name(self) -> String {
         format!("proxy-example-test-over-{}", self.name())
     }
@@ -670,15 +674,14 @@ async fn run_protocol_outbound_chain(kind: ProtocolOutboundKind) {
         kind.name(),
         service.diagnostics()
     );
-    let inbound_id = kind.inbound_id();
     let node_id = kind.node_id();
     let item = connections["connections"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inboundName"] == inbound_id)
+        .find(|item| item["inboundName"] == kind.inbound_name())
         .expect("runtime protocol outbound connection must be visible");
-    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["inbound"], inbound.to_string());
     assert_eq!(item["outbound"], protocol_server.to_string());
     assert_eq!(item["nodeId"], node_id);
     assert_eq!(item["mode"], "proxy");
@@ -801,9 +804,9 @@ async fn run_protocol_udp_outbound_chain(kind: ProtocolOutboundKind) {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inboundName"] == kind.inbound_id())
+        .find(|item| item["inboundName"] == kind.inbound_name())
         .expect("runtime protocol UDP connection must be visible");
-    assert_eq!(item["inbound"], "mixed");
+    assert_eq!(item["inbound"], inbound.to_string());
     assert_eq!(item["outbound"], protocol_server.to_string());
     assert_eq!(item["nodeId"], kind.node_id());
     assert_eq!(item["mode"], "proxy");
@@ -958,11 +961,14 @@ async fn http2_inbound_routes_through_http_outbound() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inboundName"] == "h2-http-in")
+        .find(|item| item["inboundName"] == "HTTP/2 HTTP inbound")
         .expect("HTTP/2 inbound connection must be visible");
-    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["inbound"], inbound.to_string());
     assert_eq!(item["outbound"], fixture.outbound.to_string());
-    assert_eq!(item["protocol"], "http");
+    // This HTTP/2 fixture carries the proxy request inside an H2 data stream;
+    // the Go monitor leaves protocol empty when no application sniff metadata
+    // survives that bridge.
+    assert_eq!(item["protocol"], "");
 
     let total = api_json(
         &service.client,
@@ -1044,9 +1050,9 @@ async fn tls_http_inbound_terminates_tls_and_routes_through_direct_outbound() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inboundName"] == "tls-http-in")
+        .find(|item| item["inboundName"] == "TLS HTTP inbound")
         .expect("TLS HTTP inbound connection must be visible");
-    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["inbound"], inbound.to_string());
     assert_eq!(item["outbound"], fixture.target.to_string());
     assert_eq!(item["protocol"], "tls");
 
@@ -1118,9 +1124,9 @@ async fn tls_http2_inbound_routes_through_http_outbound() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inboundName"] == "tls-h2-http-in")
+        .find(|item| item["inboundName"] == "TLS HTTP/2 inbound")
         .expect("TLS/HTTP2 inbound connection must be visible");
-    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["inbound"], inbound.to_string());
     // TLS is intentionally retained as the protocol metadata when the
     // inbound transport is TLS-wrapped; this matches the existing Go-facing
     // precedence used by `InboundSpec::annotate_context`.
@@ -1150,15 +1156,15 @@ async fn run_h2_protocol_chain(protocol: H2FinalProtocol) {
     let inbound = inbound_listener.local_addr().unwrap();
     drop(inbound_listener);
 
-    let (node_id, inbound_id, rule_name) = match protocol {
+    let (node_id, inbound_name, rule_name) = match protocol {
         H2FinalProtocol::Http => (
             "h2-http-out",
-            "h2-http-chain-in",
+            "HTTP/2 protocol chain inbound",
             "proxy-example-test-over-h2-http",
         ),
         H2FinalProtocol::Socks5 => (
             "h2-socks5-out",
-            "h2-socks5-chain-in",
+            "HTTP/2 protocol chain inbound",
             "proxy-example-test-over-h2-socks5",
         ),
     };
@@ -1203,9 +1209,9 @@ async fn run_h2_protocol_chain(protocol: H2FinalProtocol) {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inboundName"] == inbound_id)
+        .find(|item| item["inboundName"] == inbound_name)
         .expect("HTTP/2 protocol chain connection must be visible");
-    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["inbound"], inbound.to_string());
     assert_eq!(item["outbound"], fixture.outbound.to_string());
     assert_eq!(item["mode"], "proxy");
     assert!(
@@ -1310,15 +1316,20 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inboundName"] == "http-chain-in")
+        .find(|item| item["inboundName"] == "HTTP chain inbound")
         .expect("HTTP inbound connection must be visible");
-    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["inbound"], inbound.to_string());
     assert_eq!(item["outbound"], fixture.outbound.to_string());
     assert_eq!(item["nodeId"], "http-out");
     assert_eq!(item["mode"], "proxy");
-    assert_eq!(item["localAddr"], inbound.to_string());
+    assert!(
+        item["localAddr"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_ne!(item["localAddr"], inbound.to_string());
     assert_eq!(item["network"]["underlyingType"], "tcp");
-    assert_eq!(item["protocol"], "http");
+    assert_eq!(item["protocol"], "");
     assert!(item["matchHistory"].as_array().is_some_and(|history| {
         history
             .iter()
@@ -1473,7 +1484,7 @@ async fn process_and_inbound_route_matchers_select_real_http_outbound() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inboundName"] == "http-process-in")
+        .find(|item| item["inboundName"] == "HTTP process matcher inbound")
         .expect("process/inbound matcher connection must be visible");
     assert_eq!(item["mode"], "proxy");
     assert_eq!(item["outbound"], fixture.outbound.to_string());
@@ -1590,9 +1601,9 @@ async fn central_basic_user_authenticates_http_inbound_chain() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inboundName"] == "http-chain-in")
+        .find(|item| item["inboundName"] == "HTTP chain inbound")
         .expect("central-auth HTTP inbound connection must be visible");
-    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["inbound"], inbound.to_string());
     assert_eq!(item["outbound"], fixture.outbound.to_string());
     assert!(item["matchHistory"].as_array().is_some_and(|history| {
         history
@@ -1819,10 +1830,10 @@ async fn central_basic_user_authenticates_socks5_and_yuubinsya_inbounds() {
         let items = current["connections"].as_array().unwrap();
         if items
             .iter()
-            .any(|item| item["inboundName"] == "central-auth-socks5-in")
+            .any(|item| item["inboundName"] == "SOCKS5 integration inbound")
             && items
                 .iter()
-                .any(|item| item["inboundName"] == "central-auth-yuubinsya-in")
+                .any(|item| item["inboundName"] == "Yuubinsya integration inbound")
         {
             connections = Some(current);
             break;
@@ -1831,15 +1842,15 @@ async fn central_basic_user_authenticates_socks5_and_yuubinsya_inbounds() {
     }
     let connections = connections.expect("both centrally authenticated inbounds must be visible");
     let items = connections["connections"].as_array().unwrap();
-    for (inbound, protocol) in [
-        ("central-auth-socks5-in", "socks5"),
-        ("central-auth-yuubinsya-in", "yuubinsya"),
+    for (inbound_name, inbound_address) in [
+        ("SOCKS5 integration inbound", socks5_inbound),
+        ("Yuubinsya integration inbound", yuubinsya_inbound),
     ] {
         let item = items
             .iter()
-            .find(|item| item["inboundName"] == inbound)
-            .unwrap_or_else(|| panic!("connection for {inbound} is missing"));
-        assert_eq!(item["inbound"], protocol);
+            .find(|item| item["inboundName"] == inbound_name)
+            .unwrap_or_else(|| panic!("connection for {inbound_name} is missing"));
+        assert_eq!(item["inbound"], inbound_address.to_string());
         assert_eq!(item["outbound"], fixture.outbound.to_string());
         assert_eq!(item["mode"], "proxy");
         assert!(item["matchHistory"].as_array().is_some_and(|history| {
@@ -1896,9 +1907,9 @@ async fn http_inbound_routes_through_socks5_outbound() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inboundName"] == "socks5-chain-in")
+        .find(|item| item["inboundName"] == "SOCKS5 outbound chain inbound")
         .expect("SOCKS5 outbound chain connection must be visible");
-    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["inbound"], inbound.to_string());
     assert_eq!(item["outbound"], fixture.outbound.to_string());
     assert!(item["matchHistory"].as_array().is_some_and(|history| {
         history
@@ -2008,9 +2019,9 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inboundName"] == "tls-h2-yuubinsya-in")
+        .find(|item| item["inboundName"] == "TLS H2 Yuubinsya chain inbound")
         .expect("TLS/H2/Yuubinsya connection must be visible");
-    assert_eq!(item["inbound"], "http");
+    assert_eq!(item["inbound"], inbound.to_string());
     assert_eq!(item["outbound"], fixture.outbound.to_string());
     assert_eq!(item["mode"], "proxy");
     assert!(item["matchHistory"].as_array().is_some_and(|history| {
@@ -2149,7 +2160,7 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
             .and_then(|items| {
                 items
                     .iter()
-                    .find(|item| item["inboundName"] == "tls-h2-yuubinsya-udp-in")
+                    .find(|item| item["inboundName"] == "TLS H2 Yuubinsya UDP chain inbound")
             })
             .cloned();
         if udp_connection.is_some() {
@@ -2158,7 +2169,7 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let udp_item = udp_connection.expect("TLS/H2/Yuubinsya UDP connection must be visible");
-    assert_eq!(udp_item["inbound"], "mixed");
+    assert_eq!(udp_item["inbound"], udp_inbound.to_string());
     assert_eq!(udp_item["outbound"], fixture.outbound.to_string());
     assert_eq!(udp_item["mode"], "proxy");
     assert!(udp_length > udp_payload.len());
@@ -2191,7 +2202,7 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
         history = current["items"].as_array().and_then(|items| {
             items
                 .iter()
-                .find(|item| item["connection"]["inboundName"] == "tls-h2-yuubinsya-in")
+                .find(|item| item["connection"]["inboundName"] == "TLS H2 Yuubinsya chain inbound")
                 .cloned()
         });
         if history.is_some() {
@@ -2289,15 +2300,15 @@ async fn socks5_and_yuubinsya_inbounds_route_through_tls_h2_yuubinsya_outbound()
 
     let connections = wait_for_connection(&service.client, &service.base_url).await;
     let connections = connections["connections"].as_array().unwrap();
-    for (inbound, protocol) in [
-        ("tls-h2-yuubinsya-socks5-in", "socks5"),
-        ("tls-h2-yuubinsya-yuubinsya-in", "yuubinsya"),
+    for (inbound_name, inbound_address) in [
+        ("SOCKS5 integration inbound", socks5_inbound),
+        ("Yuubinsya integration inbound", yuubinsya_inbound),
     ] {
         let item = connections
             .iter()
-            .find(|item| item["inboundName"] == inbound)
-            .unwrap_or_else(|| panic!("connection for {inbound} is missing"));
-        assert_eq!(item["inbound"], protocol);
+            .find(|item| item["inboundName"] == inbound_name)
+            .unwrap_or_else(|| panic!("connection for {inbound_name} is missing"));
+        assert_eq!(item["inbound"], inbound_address.to_string());
         assert_eq!(item["outbound"], fixture.outbound.to_string());
         assert_eq!(item["mode"], "proxy");
         assert!(item["matchHistory"].as_array().is_some_and(|history| {
@@ -2422,8 +2433,11 @@ async fn mixed_inbound_exposes_socks5_udp_and_keeps_supervisor_alive() {
         .iter()
         .find(|item| item["inboundName"] == "mixed")
         .expect("mixed UDP connection must be visible");
-    assert_eq!(item["inbound"], "mixed");
-    assert_eq!(item["domain"], "localhost");
+    assert_eq!(item["inbound"], mixed.to_string());
+    // The Go contract only exposes domain after resolver/FakeIP routing has
+    // explicitly recorded it; a socket flow's original SOCKS5 domain is not
+    // emitted as `domain` by itself.
+    assert_eq!(item["domain"], "");
     assert_eq!(
         item["destination"],
         format!("localhost:{}", target_address.port())
@@ -2523,15 +2537,18 @@ async fn socks5_and_yuubinsya_inbounds_route_through_the_runtime_process() {
     let connections = connections["connections"].as_array().unwrap();
     let socks5_connection = connections
         .iter()
-        .find(|item| item["inboundName"] == "socks5-required-in")
+        .find(|item| item["inboundName"] == "SOCKS5 integration inbound")
         .expect("SOCKS5 inbound connection must be visible");
-    assert_eq!(socks5_connection["inbound"], "socks5");
+    assert_eq!(socks5_connection["inbound"], socks5_inbound.to_string());
     assert_eq!(socks5_connection["outbound"], fixture.target.to_string());
     let yuubinsya_connection = connections
         .iter()
-        .find(|item| item["inboundName"] == "yuubinsya-required-in")
+        .find(|item| item["inboundName"] == "Yuubinsya integration inbound")
         .expect("Yuubinsya inbound connection must be visible");
-    assert_eq!(yuubinsya_connection["inbound"], "yuubinsya");
+    assert_eq!(
+        yuubinsya_connection["inbound"],
+        yuubinsya_inbound.to_string()
+    );
     assert_eq!(yuubinsya_connection["outbound"], fixture.target.to_string());
 
     yuubinsya.shutdown().await.unwrap();
@@ -2649,10 +2666,10 @@ async fn reverse_inbounds_route_through_the_runtime_process() {
         let items = connections["connections"].as_array().unwrap();
         if items
             .iter()
-            .any(|item| item["inboundName"] == "reverse-tcp-in")
+            .any(|item| item["inboundName"] == "Reverse TCP integration inbound")
             && items
                 .iter()
-                .any(|item| item["inboundName"] == "reverse-http-in")
+                .any(|item| item["inboundName"] == "Reverse HTTP integration inbound")
         {
             break;
         }
@@ -2661,15 +2678,15 @@ async fn reverse_inbounds_route_through_the_runtime_process() {
     let items = connections["connections"].as_array().unwrap();
     let tcp_connection = items
         .iter()
-        .find(|item| item["inboundName"] == "reverse-tcp-in")
+        .find(|item| item["inboundName"] == "Reverse TCP integration inbound")
         .expect("reverse TCP inbound connection must be visible");
-    assert_eq!(tcp_connection["inbound"], "reverse_tcp");
+    assert_eq!(tcp_connection["inbound"], reverse_tcp_inbound.to_string());
     assert_eq!(tcp_connection["outbound"], tcp_target.to_string());
     let http_connection = items
         .iter()
-        .find(|item| item["inboundName"] == "reverse-http-in")
+        .find(|item| item["inboundName"] == "Reverse HTTP integration inbound")
         .expect("reverse HTTP inbound connection must be visible");
-    assert_eq!(http_connection["inbound"], "reverse_http");
+    assert_eq!(http_connection["inbound"], reverse_http_inbound.to_string());
     assert_eq!(http_connection["outbound"], http_target.to_string());
     assert_eq!(http_connection["mode"], "direct");
 

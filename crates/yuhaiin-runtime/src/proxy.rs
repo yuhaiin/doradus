@@ -13,7 +13,7 @@ use yuhaiin_chain::ChainProxy;
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::proxy::{
     AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream, DropAsyncProxy,
-    stream_local_addr,
+    stream_local_addr, with_stream_local_addr,
 };
 use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyKind};
 use yuhaiin_core::{
@@ -72,10 +72,13 @@ fn track_stream(detector: &LoopbackDetector, stream: BoxAsyncStream) -> BoxAsync
     let Some(local_addr) = stream_local_addr(&*stream) else {
         return stream;
     };
-    Box::new(LoopbackTrackedStream {
-        inner: stream,
-        _connection: detector.track_connection(local_addr),
-    })
+    with_stream_local_addr(
+        Box::new(LoopbackTrackedStream {
+            inner: stream,
+            _connection: detector.track_connection(local_addr),
+        }),
+        Some(local_addr),
+    )
 }
 
 struct LoopbackTrackedDatagram {
@@ -1075,6 +1078,9 @@ struct ProxyContextMetadata {
     endpoints: BTreeMap<String, SocketAddr>,
     tag_endpoints: BTreeMap<String, SocketAddr>,
     tag_node_ids: BTreeMap<String, String>,
+    node_names: BTreeMap<String, String>,
+    direct_resolver: Option<String>,
+    proxy_resolver: Option<String>,
 }
 
 impl RuntimeProxySelector {
@@ -1373,6 +1379,13 @@ impl AsyncProxySelector for RuntimeProxySelector {
         // above. Restore the complete snapshot-derived membership afterward
         // so connection metadata is independent of which rule was selected.
         context.lists = matched_lists;
+        context.resolver = match context.route_mode {
+            yuhaiin_core::RouteMode::Proxy => metadata.proxy_resolver.clone(),
+            yuhaiin_core::RouteMode::Direct | yuhaiin_core::RouteMode::Bypass => {
+                metadata.direct_resolver.clone()
+            }
+            yuhaiin_core::RouteMode::Block => None,
+        };
         annotate_connection_metadata(
             context,
             &metadata,
@@ -1488,6 +1501,24 @@ impl RuntimeSnapshot {
             }
         }
         let (tag_endpoints, tag_node_ids) = self.tag_metadata().await?;
+        let node_names = self
+            .proxies
+            .iter()
+            .filter(|config| !config.name.trim().is_empty())
+            .map(|config| (config.id.clone(), config.name.clone()))
+            .collect();
+        let (direct_resolver, proxy_resolver) = self
+            .route
+            .as_ref()
+            .map(|route| {
+                (
+                    (!route.direct_resolver.trim().is_empty())
+                        .then(|| route.direct_resolver.trim().to_owned()),
+                    (!route.proxy_resolver.trim().is_empty())
+                        .then(|| route.proxy_resolver.trim().to_owned()),
+                )
+            })
+            .unwrap_or_default();
         Ok(ProxyContextMetadata {
             hosts: self.hosts.clone(),
             route_lists: self.route_lists.clone(),
@@ -1495,6 +1526,9 @@ impl RuntimeSnapshot {
             endpoints,
             tag_endpoints,
             tag_node_ids,
+            node_names,
+            direct_resolver,
+            proxy_resolver,
         })
     }
 
@@ -1571,6 +1605,9 @@ fn annotate_connection_metadata(
             .and_then(|tag| metadata.tag_node_ids.get(tag))
             .cloned()
             .or_else(|| Some(selected_id.to_owned()));
+    }
+    if let Some(node_id) = context.outbound.as_deref() {
+        context.outbound_name = metadata.node_names.get(node_id).cloned();
     }
     let endpoint = context
         .tag
@@ -1982,6 +2019,18 @@ mod tests {
             proxies: vec![config],
             nat: yuhaiin_store::NatConfigRecord::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn loopback_stream_wrapper_preserves_outbound_local_address() {
+        let detector = LoopbackDetector::new();
+        let (stream, _peer) = tokio::io::duplex(64);
+        let local = "127.0.0.1:41000".parse().unwrap();
+        let stream = with_stream_local_addr(Box::new(stream), Some(local));
+
+        let tracked = track_stream(&detector, stream);
+
+        assert_eq!(stream_local_addr(&*tracked), Some(local));
     }
 
     #[test]

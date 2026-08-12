@@ -13,7 +13,9 @@ use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
     FlowObserver as TunFlowObserver, FlowObserverGuard,
 };
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream};
+use yuhaiin_core::proxy::{
+    AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream, stream_local_addr,
+};
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -118,6 +120,26 @@ pub(crate) async fn reap_expired_udp_flows_with_timeout(
 #[derive(Clone)]
 pub(crate) struct RoutedProxy {
     pub(crate) selector: Arc<RuntimeProxySelector>,
+}
+
+/// Record the local endpoint chosen by the outbound stream. This is kept at
+/// the relay boundary because the concrete socket is only available after
+/// proxy selection/connect succeeds.
+pub(crate) fn record_outbound_stream(context: &mut FlowContext, stream: &BoxAsyncStream) {
+    if let Some(address) = stream_local_addr(&**stream) {
+        context.outbound_local_addr = Some(Endpoint::ip(context.network, address));
+    }
+}
+
+pub(crate) fn record_outbound_datagram(context: &mut FlowContext, datagram: &dyn AsyncDatagram) {
+    // Some protocol datagrams (notably Yuubinsya UOT) intentionally do not
+    // expose a socket endpoint. Missing metadata must not tear down an
+    // otherwise valid UDP flow; Go simply reports an empty localAddr there.
+    if let Ok(endpoint) = datagram.local_addr()
+        && endpoint.addr().is_some()
+    {
+        context.outbound_local_addr = Some(endpoint);
+    }
 }
 
 impl AsyncProxy for RoutedProxy {

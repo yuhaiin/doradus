@@ -17,7 +17,7 @@ use yuhaiin_core::flow::FlowKey as TunFlowKey;
 use yuhaiin_core::proxy::{AsyncProxySelector, BoxAsyncStream};
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
-use super::common::{io_error, relay_counted_with_prefix_and_buffer};
+use super::common::{io_error, record_outbound_stream, relay_counted_with_prefix_and_buffer};
 use crate::inbound::{InboundSpec, ReverseHttpConfig};
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -113,6 +113,7 @@ where
                 process.as_deref(),
             );
         })?;
+    record_outbound_stream(&mut context, &outbound);
     let outbound = wrap_https_if_needed(outbound, &config).await?;
     let flow = flow_key(peer, &destination);
     relay_counted_with_prefix_and_buffer(
@@ -157,6 +158,7 @@ where
                 process.as_deref(),
             );
         })?;
+    record_outbound_stream(&mut context, &outbound);
     let flow = flow_key(peer, &target);
     relay_counted_with_prefix_and_buffer(
         stream,

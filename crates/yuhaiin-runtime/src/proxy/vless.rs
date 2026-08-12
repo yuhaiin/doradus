@@ -17,7 +17,10 @@ use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
 use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 use yuhaiin_protocol::vless::{self, Command};
 
-use super::common::{answer_dns_packet, relay_counted_with_buffer, udp_flow_key};
+use super::common::{
+    answer_dns_packet, record_outbound_datagram, record_outbound_stream, relay_counted_with_buffer,
+    udp_flow_key,
+};
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -61,6 +64,7 @@ where
                     return Err(error);
                 }
             };
+            record_outbound_stream(&mut context, &outbound);
             vless::write_response(&mut stream, &[]).await?;
             relay_counted_with_buffer(
                 stream,
@@ -98,8 +102,9 @@ where
     spec.annotate_context(&mut context);
     selector.route_context(&mut context);
     let flow = udp_flow_key(peer, &destination);
-    let datagram: Arc<dyn AsyncDatagram> =
-        Arc::from(selector.select(&context).open_datagram(&context).await?);
+    let datagram = selector.select(&context).open_datagram(&context).await?;
+    record_outbound_datagram(&mut context, &*datagram);
+    let datagram: Arc<dyn AsyncDatagram> = Arc::from(datagram);
     let _observation = FlowObserverGuard::open(monitor.clone(), TunFlow { key: flow }, context);
     let (mut reader, writer) = split(stream);
     let writer = Arc::new(Mutex::new(writer));
