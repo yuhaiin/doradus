@@ -4523,3 +4523,16 @@ checksum-preserving normalization 单测，core 定向测试、`cargo fmt --chec
 
 本项关闭的是 Linux namespace 内真实扩展头 packet path，不等价于所有发行版、防火墙和
 移动平台权限已验收；这些仍按 `IMPLEMENTATION_CHECKLIST.md` 的 TUN `[~]` 保留。
+
+## 172. 2026-08-13 Runtime DNS server 的原始 QTYPE 边界回归
+
+DNS typed resolver 只建模 A、AAAA、PTR、HTTPS 和 SVCB；Go 前端或系统客户端仍可能发送
+TXT、MX、CNAME、NS、DNSSEC 等其它 QTYPE。此前已有 `RuntimeDnsHandler` 单测和 UDP/TCP
+transport 层 raw packet 单测，但没有把两者通过真实 runtime DNS server 连接起来。
+
+本轮新增 `runtime_dns_servers_forward_unmodeled_qtypes_over_udp_and_tcp`：同一个运行时 handler
+分别挂到 `AsyncUdpDnsServer` 和 `AsyncTcpDnsServer`，由对应 client 发出 TXT QTYPE=16，使用
+原始 resolver 回送 response bit，并逐字节校验 transaction、question 和报文边界未被 typed
+模型改写。Podman 定向结果为 `1 passed`；这补的是 server 集成证据，不把 DNS typed API
+扩大宣称为任意 RR 的结构化解析。构建和运行均使用 Podman，状态位于
+`~/.cache/yuhaiin-rust`，未使用 `/tmp`。

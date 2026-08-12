@@ -741,10 +741,12 @@ mod tests {
     use std::sync::Arc;
     use yuhaiin_core::dns::{
         AsyncDnsHandler, DnsRecordType, DnsResponse, DnsServiceBinding, DnsServiceParam,
-        decode_response, encode_query,
+        decode_query, decode_response, encode_query, encode_raw_query,
     };
     use yuhaiin_core::dns_resolver_async::{AsyncIpResolver, SystemAsyncIpResolver};
-    use yuhaiin_core::{BoxFuture, DomainName, IpSet, ResolveStrategy};
+    use yuhaiin_core::dns_tcp_async::{AsyncTcpDnsClient, AsyncTcpDnsServer};
+    use yuhaiin_core::dns_udp_async::{AsyncUdpDnsClient, AsyncUdpDnsServer};
+    use yuhaiin_core::{BoxFuture, DomainName, ErrorKind, IpSet, ResolveStrategy};
     use yuhaiin_store::fakeip::{FakeIpConfig, FakeIpPool, FakeIpV6Config, FakeIpV6Pool};
     use yuhaiin_store::{ConfigStore, FakeIpPools};
 
@@ -867,6 +869,30 @@ mod tests {
 
     struct FixedAddressResolver {
         address: Ipv4Addr,
+    }
+
+    struct RawPacketResolver;
+
+    impl AsyncIpResolver for RawPacketResolver {
+        fn resolve<'a>(
+            &'a self,
+            _domain: &'a DomainName,
+            _strategy: ResolveStrategy,
+        ) -> BoxFuture<'a, Result<IpSet>> {
+            Box::pin(async { Ok(IpSet::default()) })
+        }
+
+        fn query_packet<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(async move {
+                assert_eq!(
+                    decode_query(packet).unwrap_err().kind,
+                    ErrorKind::Unsupported
+                );
+                let mut response = packet.to_vec();
+                response[2] |= 0x80;
+                Ok(response)
+            })
+        }
     }
 
     impl AsyncIpResolver for FixedAddressResolver {
@@ -1149,6 +1175,52 @@ mod tests {
             expected[2] |= 0x80;
             expected
         });
+    }
+
+    #[tokio::test]
+    async fn runtime_dns_servers_forward_unmodeled_qtypes_over_udp_and_tcp() {
+        let query =
+            encode_raw_query(0x7171, &DomainName::new("example.test").unwrap(), 16).unwrap();
+        let handler = RuntimeDnsHandler {
+            resolver: Arc::new(RawPacketResolver),
+            fakeip: None,
+        };
+
+        let udp_server =
+            AsyncUdpDnsServer::bind("127.0.0.1:0".parse().unwrap(), handler.clone(), 2048)
+                .await
+                .unwrap();
+        let udp_client = AsyncUdpDnsClient {
+            server: udp_server.local_addr().unwrap(),
+            timeout: Duration::from_secs(1),
+            max_packet_size: 2048,
+            local_bind_addresses: Arc::from(Vec::new().into_boxed_slice()),
+        };
+        let (udp_server_result, udp_response) =
+            tokio::join!(udp_server.serve_once(), udp_client.query_packet(&query));
+        assert!(udp_server_result.unwrap() > 0);
+        let mut expected = query.clone();
+        expected[2] |= 0x80;
+        assert_eq!(udp_response.unwrap(), expected);
+
+        let tcp_server = AsyncTcpDnsServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            handler,
+            2048,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let tcp_client = AsyncTcpDnsClient {
+            server: tcp_server.local_addr().unwrap(),
+            timeout: Duration::from_secs(1),
+            max_packet_size: 2048,
+            local_bind_addresses: Arc::from(Vec::new().into_boxed_slice()),
+        };
+        let (tcp_server_result, tcp_response) =
+            tokio::join!(tcp_server.serve_once(), tcp_client.query_packet(&query));
+        assert!(tcp_server_result.unwrap() > 2);
+        assert_eq!(tcp_response.unwrap(), expected);
     }
 
     #[tokio::test]
