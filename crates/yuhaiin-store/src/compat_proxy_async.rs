@@ -68,7 +68,9 @@ impl GoProxyRuntimeConfig {
                 || (kind.eq_ignore_ascii_case("websocket")
                     && !matches!(
                         self.transport,
-                        GoProxyTransport::Vless | GoProxyTransport::Vmess
+                        GoProxyTransport::Trojan
+                            | GoProxyTransport::Vless
+                            | GoProxyTransport::Vmess
                     ))
                 || (kind.eq_ignore_ascii_case("tls")
                     && !matches!(

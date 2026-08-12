@@ -3763,3 +3763,23 @@ TLS/WebSocket/HTTP2、不同目标地址族和真实远端 listener 组合仍保
 外推成完整 Go 兼容性。
 
 本轮新测试及所有 service-chain 状态均写入 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
+## 129. 2026-08-12 Trojan WebSocket transport builder 与共享 stream transport
+
+对照 Go 的 contract-point 组合方式检查 outbound builder 后，补上了一个实际兼容缺口：Go
+允许 `fixedv2 -> websocket -> trojan`（以及可选 `tls`）这样的协议层组合，Rust 原先会在
+`GoProxyRuntimeConfig::ensure_base_transport` 处把 WebSocket 误判为只能交给
+`yuhaiin-chain` 的通用 chain。现在 runtime 对 Trojan WebSocket 进入专用 builder，底层固定
+endpoint、TLS、WebSocket transport 和 Trojan framing 按同一 stream 顺序组装；VLESS/VMess/Trojan
+三者共用 transport-upstream builder，TLS feature 缺失时仍明确 fail-closed。
+
+新增 `runtime_builds_trojan_over_websocket_transport_chain`，并让 store 的 base-transport guard
+允许 Trojan WebSocket；真实 service-chain 的 protocol matrix 也加入 Trojan WebSocket，执行
+HTTP inbound → router → WebSocket handshake → Trojan framing → payload echo。第一次 workspace
+回归确实捕获了 guard 未同步的问题，修复后 `make workspace-tests` 在 Podman 通过 48 个 harness：
+core 145、runtime 253、store 128、service-chain 16、WireGuard 7、WireGuard runtime chain 2，
+0 失败；`make fmt-check`、Clippy `-D warnings`、ast-grep outline 和 `git diff --check` 也通过。
+
+这只证明 Trojan WebSocket builder 和现有协议边界已经接通，不把单元 builder 证据外推为
+真实远端 Trojan WebSocket listener/UDP/地址族完整矩阵；VLESS/VMess/Trojan 总项继续保持
+`[~]`，下一步仍是更广 runtime listener/outbound 与远端组合现场。

@@ -311,6 +311,8 @@ impl RuntimeSnapshot {
             build_vless_transport_proxy(&config, timeout, self.resolver.clone()).await?
         } else if is_vmess_transport_config(&config) {
             build_vmess_transport_proxy(&config, timeout, self.resolver.clone()).await?
+        } else if is_trojan_websocket_config(&config) {
+            build_trojan_transport_proxy(&config, timeout, self.resolver.clone()).await?
         } else if config.transport == yuhaiin_store::GoProxyTransport::Wireguard {
             let layer = config
                 .layers
@@ -1294,11 +1296,35 @@ fn is_vmess_transport_config(config: &GoProxyRuntimeConfig) -> bool {
         })
 }
 
-async fn build_vless_transport_proxy(
+fn is_trojan_websocket_config(config: &GoProxyRuntimeConfig) -> bool {
+    let has_websocket = config
+        .chain_types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("websocket"));
+    let has_trojan = config
+        .chain_types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("trojan"));
+    config.transport == yuhaiin_store::GoProxyTransport::Trojan
+        && has_websocket
+        && has_trojan
+        && config.chain_types.iter().all(|kind| {
+            matches!(
+                kind.to_ascii_lowercase().as_str(),
+                "fixed" | "fixedv2" | "tls" | "websocket" | "trojan"
+            )
+        })
+}
+
+async fn build_stream_transport_upstream(
     config: &GoProxyRuntimeConfig,
     timeout: Duration,
     resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
+    protocol_name: &str,
 ) -> Result<Arc<dyn AsyncProxy>> {
+    #[cfg(feature = "doh-tls")]
+    let _ = protocol_name;
+
     let base = config
         .to_base_proxy_config_with_resolver(timeout, resolver)
         .await?;
@@ -1316,7 +1342,7 @@ async fn build_vless_transport_proxy(
         {
             return Err(Error::new(
                 ErrorKind::Unsupported,
-                "VLESS TLS transport requires the doh-tls feature",
+                format!("{protocol_name} TLS transport requires the doh-tls feature"),
             ));
         }
     }
@@ -1327,6 +1353,15 @@ async fn build_vless_transport_proxy(
     {
         upstream = build_protocol_websocket_proxy(config, upstream)?;
     }
+    Ok(upstream)
+}
+
+async fn build_vless_transport_proxy(
+    config: &GoProxyRuntimeConfig,
+    timeout: Duration,
+    resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let upstream = build_stream_transport_upstream(config, timeout, resolver, "VLESS").await?;
     let layer = config
         .layers
         .iter()
@@ -1347,34 +1382,7 @@ async fn build_vmess_transport_proxy(
     timeout: Duration,
     resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
 ) -> Result<Arc<dyn AsyncProxy>> {
-    let base = config
-        .to_base_proxy_config_with_resolver(timeout, resolver)
-        .await?;
-    let mut upstream: Arc<dyn AsyncProxy> = base.build()?;
-    if config
-        .chain_types
-        .iter()
-        .any(|kind| kind.eq_ignore_ascii_case("tls"))
-    {
-        #[cfg(feature = "doh-tls")]
-        {
-            upstream = build_protocol_tls_proxy(config, upstream)?;
-        }
-        #[cfg(not(feature = "doh-tls"))]
-        {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                "VMess TLS transport requires the doh-tls feature",
-            ));
-        }
-    }
-    if config
-        .chain_types
-        .iter()
-        .any(|kind| kind.eq_ignore_ascii_case("websocket"))
-    {
-        upstream = build_protocol_websocket_proxy(config, upstream)?;
-    }
+    let upstream = build_stream_transport_upstream(config, timeout, resolver, "VMess").await?;
     let layer = config
         .layers
         .iter()
@@ -1395,6 +1403,28 @@ async fn build_vmess_transport_proxy(
     Ok(Arc::new(yuhaiin_protocol::vmess::VmessProxy::new(
         upstream, uuid, security, alter_id,
     )?))
+}
+
+async fn build_trojan_transport_proxy(
+    config: &GoProxyRuntimeConfig,
+    timeout: Duration,
+    resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let upstream = build_stream_transport_upstream(config, timeout, resolver, "Trojan").await?;
+    let layer = config
+        .layers
+        .iter()
+        .find(|layer| layer.kind.eq_ignore_ascii_case("trojan"))
+        .ok_or_else(|| Error::invalid("Trojan protocol layer is missing"))?;
+    let password = layer
+        .config
+        .get("password")
+        .and_then(serde_json::Value::as_str)
+        .filter(|password| !password.is_empty())
+        .ok_or_else(|| Error::invalid("Trojan password is empty"))?;
+    Ok(Arc::new(yuhaiin_protocol::trojan::TrojanProxy::new(
+        upstream, password,
+    )))
 }
 
 fn vmess_alter_id(config: &serde_json::Value) -> Result<u32> {
@@ -2648,6 +2678,45 @@ mod tests {
             block_on(snapshot(config).build_proxy("vmess-websocket", Duration::from_secs(1)))
                 .unwrap();
         assert_eq!(built.config.id, "vmess-websocket");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn runtime_builds_trojan_over_websocket_transport_chain() {
+        let config = GoProxyRuntimeConfig {
+            id: "trojan-websocket".to_owned(),
+            name: "trojan-websocket".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec![
+                "fixedv2".to_owned(),
+                "websocket".to_owned(),
+                "trojan".to_owned(),
+            ],
+            layers: vec![
+                GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({
+                        "addresses": [{"host": "127.0.0.1", "port": 40503}]
+                    }),
+                },
+                GoProxyLayer {
+                    kind: "websocket".to_owned(),
+                    config: serde_json::json!({"host": "localhost", "path": "/trojan"}),
+                },
+                GoProxyLayer {
+                    kind: "trojan".to_owned(),
+                    config: serde_json::json!({"password": "secret"}),
+                },
+            ],
+            transport: GoProxyTransport::Trojan,
+            data_json: serde_json::json!({}).to_string().into_bytes(),
+        };
+        let built =
+            block_on(snapshot(config).build_proxy("trojan-websocket", Duration::from_secs(1)))
+                .unwrap();
+        assert_eq!(built.config.id, "trojan-websocket");
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {

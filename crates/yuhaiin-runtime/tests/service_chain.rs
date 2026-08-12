@@ -8,10 +8,10 @@ use bytes::Bytes;
 use http::Request;
 use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use yuhaiin_chain::AsyncYuubinsyaTcpSession;
-use yuhaiin_core::{DomainName, Endpoint, Network};
+use yuhaiin_core::{DomainName, Endpoint, Network, websocket::WebSocketIo};
 use yuhaiin_protocol::{trojan, vless, vmess};
 
 use support::{
@@ -118,6 +118,7 @@ enum ProtocolOutboundKind {
     Vless,
     Vmess,
     Trojan,
+    TrojanWebsocket,
 }
 
 impl ProtocolOutboundKind {
@@ -126,6 +127,7 @@ impl ProtocolOutboundKind {
             Self::Vless => "vless",
             Self::Vmess => "vmess",
             Self::Trojan => "trojan",
+            Self::TrojanWebsocket => "trojan-websocket",
         }
     }
 
@@ -178,25 +180,14 @@ async fn protocol_outbound_server(
                 }
             }
             ProtocolOutboundKind::Trojan => {
-                let hash = trojan::password_hash(b"runtime-protocol-password");
-                let request = trojan::read_request(&mut stream, &hash).await.unwrap();
-                assert_eq!(request.command, trojan::Command::Connect);
-                assert_eq!(request.destination, destination);
-                if connection == 0 {
-                    let mut payload = vec![0u8; expected_payload.len()];
-                    stream.read_exact(&mut payload).await.unwrap();
-                    assert_eq!(payload, expected_payload);
-                    stream.write_all(expected_payload).await.unwrap();
-                } else {
-                    let request = read_http_headers(&mut stream).await;
-                    assert!(request.starts_with(b"GET /health HTTP/1.1\r\n"));
-                    stream
-                        .write_all(
-                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        )
-                        .await
-                        .unwrap();
-                }
+                serve_trojan_connection(&mut stream, connection, destination, expected_payload)
+                    .await;
+            }
+            ProtocolOutboundKind::TrojanWebsocket => {
+                let websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut stream = WebSocketIo::new(websocket);
+                serve_trojan_connection(&mut stream, connection, destination, expected_payload)
+                    .await;
             }
             ProtocolOutboundKind::Vmess => {
                 const UUID: [u8; 16] = [
@@ -255,6 +246,35 @@ async fn protocol_outbound_server(
                 }
             }
         }
+    }
+}
+
+async fn serve_trojan_connection<S>(
+    stream: &mut S,
+    connection: usize,
+    destination: Endpoint,
+    expected_payload: &'static [u8],
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let hash = trojan::password_hash(b"runtime-protocol-password");
+    let request = trojan::read_request(stream, &hash).await.unwrap();
+    assert_eq!(request.command, trojan::Command::Connect);
+    assert_eq!(request.destination, destination);
+    if connection == 0 {
+        let mut payload = vec![0u8; expected_payload.len()];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(payload, expected_payload);
+        stream.write_all(expected_payload).await.unwrap();
+    } else {
+        let request = read_http_headers(stream).await;
+        assert!(request.starts_with(b"GET /health HTTP/1.1\r\n"));
+        stream
+            .write_all(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
     }
 }
 
@@ -335,10 +355,13 @@ async fn protocol_udp_outbound_server(
             .await
             .unwrap();
         }
+        ProtocolOutboundKind::TrojanWebsocket => {
+            panic!("Trojan WebSocket does not expose a datagram transport");
+        }
     }
 }
 
-async fn read_http_headers(stream: &mut TcpStream) -> Vec<u8> {
+async fn read_http_headers<S: AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
     let mut request = Vec::new();
     let mut byte = [0u8; 1];
     while !request.ends_with(b"\r\n\r\n") {
@@ -384,16 +407,28 @@ async fn configure_protocol_outbound_chain(
             "type":"trojan",
             "trojan":{"password":"runtime-protocol-password"}
         }),
+        ProtocolOutboundKind::TrojanWebsocket => json!({
+            "type":"trojan",
+            "trojan":{"password":"runtime-protocol-password"}
+        }),
     };
+    let mut chain = vec![json!({
+        "type":"fixed",
+        "fixed":{"host":"127.0.0.1","port":server.port()}
+    })];
+    if matches!(kind, ProtocolOutboundKind::TrojanWebsocket) {
+        chain.push(json!({
+            "type":"websocket",
+            "websocket":{"host":"localhost","path":"/trojan"}
+        }));
+    }
+    chain.push(protocol_layer);
     let node = json!({
         "id":node_id,
         "name":format!("{} runtime protocol outbound", kind.name()),
         "group":"integration",
         "enabled":true,
-        "chain":[
-            {"type":"fixed","fixed":{"host":"127.0.0.1","port":server.port()}},
-            protocol_layer
-        ]
+        "chain":chain
     });
     api_json(
         &service.client,
@@ -456,6 +491,7 @@ async fn run_protocol_outbound_chain(kind: ProtocolOutboundKind) {
         ProtocolOutboundKind::Vless => b"runtime-vless-outbound",
         ProtocolOutboundKind::Vmess => b"runtime-vmess-outbound",
         ProtocolOutboundKind::Trojan => b"runtime-trojan-outbound",
+        ProtocolOutboundKind::TrojanWebsocket => b"runtime-trojan-websocket-outbound",
     };
     let protocol_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let protocol_server = protocol_listener.local_addr().unwrap();
@@ -552,6 +588,9 @@ async fn run_protocol_udp_outbound_chain(kind: ProtocolOutboundKind) {
         ProtocolOutboundKind::Vless => b"runtime-vless-udp-outbound",
         ProtocolOutboundKind::Vmess => b"runtime-vmess-udp-outbound",
         ProtocolOutboundKind::Trojan => b"runtime-trojan-udp-outbound",
+        ProtocolOutboundKind::TrojanWebsocket => {
+            panic!("Trojan WebSocket does not expose a datagram transport")
+        }
     };
     let protocol_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let protocol_server = protocol_listener.local_addr().unwrap();
@@ -628,6 +667,7 @@ async fn runtime_protocol_outbounds_round_trip_through_http_router() {
         ProtocolOutboundKind::Vless,
         ProtocolOutboundKind::Vmess,
         ProtocolOutboundKind::Trojan,
+        ProtocolOutboundKind::TrojanWebsocket,
     ] {
         run_protocol_outbound_chain(kind).await;
     }
