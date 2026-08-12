@@ -20,10 +20,10 @@ debug 二进制。所有临时状态仍放在 `~/.cache/yuhaiin-rust`，不使�
 | 指标 | 当前值 |
 | --- | ---: |
 | 纳入统计的验收项 | 48 |
-| 已完成 `[x]` | 34 |
-| 主路径可用但仍有现场/样本缺口 `[~]` | 14 |
+| 已完成 `[x]` | 35 |
+| 主路径可用但仍有现场/样本缺口 `[~]` | 13 |
 | 有实际功能缺口 `[ ]` | 0 |
-| 加权覆盖率 | **85.4%** = `(34 + 14 × 0.5) / 48` |
+| 加权覆盖率 | **86.5%** = `(35 + 13 × 0.5) / 48` |
 | 主目标 | Linux desktop：Rust 可启动、管理前端可接入、普通 inbound/outbound 可串联 |
 | 当前结论 | **主路径已可在 Linux desktop 进行替换前验收**；rootful TUN 多路由 lease、RST/reconnect、graceful/SIGKILL teardown 和 TPROXY UDP delivery/idle/force-stop 已闭环，生产异常快照、真实 firewall 组合和第三方 WireGuard 仍是 `[~]` |
 
@@ -76,7 +76,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | --- | --- | :---: | --- | --- |
 | `pkg/net/trie/domain/*`、`pkg/net/trie/cidr/*` | `crates/yuhaiin-trie/src/lib.rs`、`router.rs` | `[x]` | parent/wildcard/normalize、IPv4/IPv6 LPM、随机 naive model 对照 | — |
 | `pkg/route/rule.go`、`nested.go`、`history.go` | `crates/yuhaiin-runtime/src/route.rs`、`crates/yuhaiin-trie/src/router.rs`、`crates/yuhaiin-runtime/src/proxy.rs` | `[x]` | priority、host/CIDR/port、all/any/not、negative matcher、match history，以及 Go `node_tags_v2` 的 node/mirror tag 数据面选择；TCP/UDP node set 均支持成员失败重试，且 tag endpoint 会同步到连接 metadata；Podman HTTP inbound→tag→HTTP outbound 链通过 | — |
-| `pkg/route/list.go`、`downloader.go`、`contract.go` | `crates/yuhaiin-runtime/src/route.rs`、`api.rs` | `[~]` | local/HTTP route list、atomic cache、API mutation/reload；Podman loopback HTTP fixture 已验证 remote body→`.part` 原子缓存→reload→运行时 trie→`errorMsgs=[]`；RuntimeService 已按 Go 分钟语义启动可 reload/shutdown 的后台刷新 timer | 更多生产 route/resolver projection snapshot |
+| `pkg/route/list.go`、`downloader.go`、`contract.go` | `crates/yuhaiin-runtime/src/route.rs`、`api.rs` | `[x]` | local/HTTP route list、atomic cache、API mutation/reload；Podman loopback HTTP fixture 已验证 remote body→`.part` 原子缓存→reload→运行时 trie→`errorMsgs=[]`；RuntimeService 已按 Go 分钟语义启动可 reload/shutdown 的后台刷新 timer；3 个停止态 Go SQLite 的 route/resolver projection、mutation 和错误 contract 均与 Rust identical | — |
 | `pkg/route/loopback.go`、process/inbound matchers | `crates/yuhaiin-runtime/src/loopback.rs`、`route.rs`、`proxy.rs` | `[x]` | process/inbound/local endpoint metadata 参与选择；自环 fail-closed | TUN 真实 kernel 现场另计 |
 
 ### 4. Protocol、transport 和 proxy chain
