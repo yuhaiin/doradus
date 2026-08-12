@@ -55,7 +55,9 @@
 > 代理/浏览器缓存层被误处理；`connections.events` 的首屏 snapshot、added/removed event 和
 > tools log stream 仍共用 axum 的 bounded broadcast。新增 `make cache-prune`，只清理缓存中超过
 > 1 天的 integration/parity/benchmark 场景目录，默认保留 `cargo-target` 与 `fixtures`，所有
-> 路径仍位于 `~/.cache/yuhaiin-rust`，不使用 `/tmp`。
+> 路径仍位于 `~/.cache/yuhaiin-rust`，不使用 `/tmp`。如果确认没有 cargo/rustc 占用缓存，
+> `YUHAIIN_CACHE_PRUNE_DEBUG=1 make cache-prune` 还可以释放 `cargo-target/debug` 的依赖中间产物，
+> 但会保留已生成的 debug 二进制。
 
 > 2026-08-12 no-argument startup log closure：前台二进制默认启动路径现在由
 > `make startup-logs-smoke` 按用户实际方式验证：Podman 只提供隔离的 `HOME`/`XDG_CONFIG_HOME`，

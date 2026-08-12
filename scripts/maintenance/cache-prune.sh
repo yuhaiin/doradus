@@ -7,6 +7,7 @@ set -euo pipefail
 cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 retention_days="${YUHAIIN_CACHE_RETENTION_DAYS:-1}"
 dry_run="${YUHAIIN_CACHE_DRY_RUN:-0}"
+prune_debug="${YUHAIIN_CACHE_PRUNE_DEBUG:-0}"
 
 if [[ ! "${retention_days}" =~ ^[0-9]+$ ]]; then
   echo "YUHAIIN_CACHE_RETENTION_DAYS must be a non-negative integer" >&2
@@ -14,6 +15,10 @@ if [[ ! "${retention_days}" =~ ^[0-9]+$ ]]; then
 fi
 if [[ "${dry_run}" != 0 && "${dry_run}" != 1 ]]; then
   echo "YUHAIIN_CACHE_DRY_RUN must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "${prune_debug}" != 0 && "${prune_debug}" != 1 ]]; then
+  echo "YUHAIIN_CACHE_PRUNE_DEBUG must be 0 or 1" >&2
   exit 2
 fi
 
@@ -53,9 +58,35 @@ for parent in "${parents[@]}"; do
     -mmin "+$((retention_days * 1440))" -print0)
 done
 
+if [[ "${prune_debug}" == 1 ]]; then
+  if ps -eo args= | grep -E '(cargo|rustc)' | grep -F -- "${cache_root}" >/dev/null; then
+    echo "[cache-prune] refusing cargo debug cleanup while cargo/rustc uses ${cache_root}" >&2
+    exit 3
+  fi
+  debug_root="${cache_root}/cargo-target/debug"
+  for path in \
+    "${debug_root}/deps" \
+    "${debug_root}/build" \
+    "${debug_root}/.fingerprint" \
+    "${debug_root}/examples" \
+    "${debug_root}/incremental"; do
+    if [[ "${dry_run}" == 1 ]]; then
+      [[ -e "${path}" ]] && echo "[cache-prune] debug artifact (dry-run): ${path}"
+    elif [[ -e "${path}" ]]; then
+      echo "[cache-prune] remove debug artifact: ${path}"
+      rm -rf -- "${path}"
+    fi
+  done
+fi
+
 after="$(size_kib)"
 echo "[cache-prune] stale-directories=${stale_count} size-after=${after} KiB"
 if [[ "${dry_run}" == 1 ]]; then
   echo "[cache-prune] dry-run only; set YUHAIIN_CACHE_DRY_RUN=0 to remove them"
 fi
-echo "[cache-prune] cargo-target and fixtures were not modified"
+if [[ "${prune_debug}" == 1 ]]; then
+  echo "[cache-prune] selected cargo-target/debug dependency artifacts were pruned; debug binaries remain"
+else
+  echo "[cache-prune] cargo-target and fixtures were not modified"
+  echo "[cache-prune] set YUHAIIN_CACHE_PRUNE_DEBUG=1 for opt-in debug dependency cleanup"
+fi

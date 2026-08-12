@@ -9,7 +9,8 @@
 缓存维护：`make cache-usage` 查看分层占用；`make cache-prune` 只清理超过
 `YUHAIIN_CACHE_RETENTION_DAYS`（默认 1 天）的 integration/parity/benchmark 场景目录，保留
 `cargo-target` 和 `fixtures`。需要预览时设置 `YUHAIIN_CACHE_DRY_RUN=1`；不会自动删除可复用
-构建产物。
+构建产物；确认没有 cargo/rustc 运行时，可额外设置 `YUHAIIN_CACHE_PRUNE_DEBUG=1` 清掉
+`cargo-target/debug` 的依赖中间产物，但保留 debug 二进制。
 
 ## 总体状态
 
