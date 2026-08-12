@@ -544,10 +544,11 @@ impl RuntimeSnapshot {
                 })?;
             let bind_interface = config.network_interface();
             Arc::new(
-                yuhaiin_wireguard::build_proxy_with_interface(
+                yuhaiin_wireguard::build_proxy_with_interface_and_resolver(
                     wireguard,
                     timeout,
                     bind_interface.as_deref(),
+                    Some(self.resolver.clone()),
                 )
                 .await?,
             ) as Arc<dyn AsyncProxy>
@@ -2333,7 +2334,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn runtime_wireguard_resolves_domain_targets_with_configured_resolver() {
+    async fn runtime_wireguard_resolves_peer_and_domain_targets_with_configured_resolver() {
         let key = |value| base64::engine::general_purpose::STANDARD.encode([value; 32]);
         let config = GoProxyRuntimeConfig {
             id: "wireguard-domain".to_owned(),
@@ -2349,7 +2350,7 @@ mod tests {
                     "endpoint": ["10.0.0.2/32"],
                     "peers": [{
                         "publicKey": key(4),
-                        "endpoint": "127.0.0.1:51820",
+                        "endpoint": "peer-resolver-only.invalid:51820",
                         "allowedIps": ["0.0.0.0/0"]
                     }]
                 }),
@@ -2379,7 +2380,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .as_slice(),
-            ["resolver-only.invalid"]
+            ["peer-resolver-only.invalid", "resolver-only.invalid"]
         );
     }
 

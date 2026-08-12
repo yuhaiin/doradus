@@ -42,8 +42,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
+use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
-use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use yuhaiin_core::{
+    BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, ResolveStrategy,
+    Result,
+};
 
 const DEFAULT_MTU: usize = 1_420;
 const DEFAULT_QUEUE_CAPACITY: usize = 256;
@@ -179,8 +183,12 @@ impl WireGuardConfig {
 }
 
 impl WireGuardPeerConfig {
-    async fn parse(&self, timeout: Duration) -> Result<ParsedPeer> {
-        let endpoint = resolve_endpoint(&self.endpoint, timeout).await?;
+    async fn parse(
+        &self,
+        timeout: Duration,
+        resolver: Option<&dyn AsyncIpResolver>,
+    ) -> Result<ParsedPeer> {
+        let endpoint = resolve_endpoint(&self.endpoint, timeout, resolver).await?;
         let allowed_ips = self
             .allowed_ips
             .iter()
@@ -272,11 +280,40 @@ fn parse_cidr_or_host(value: &str) -> Result<IpCidr> {
     ))
 }
 
-async fn resolve_endpoint(value: &str, timeout: Duration) -> Result<SocketAddr> {
+async fn resolve_endpoint(
+    value: &str,
+    timeout: Duration,
+    resolver: Option<&dyn AsyncIpResolver>,
+) -> Result<SocketAddr> {
     if let Ok(address) = value.parse::<SocketAddr>() {
         return Ok(address);
     }
     let (host, port) = split_host_port(value)?;
+    if let Some(resolver) = resolver {
+        let domain = DomainName::new(&host)?;
+        let addresses =
+            tokio::time::timeout(timeout, resolver.resolve(&domain, ResolveStrategy::Default))
+                .await
+                .map_err(|_| {
+                    Error::new(
+                        ErrorKind::Timeout,
+                        format!("resolve WireGuard endpoint {value} timed out"),
+                    )
+                })??;
+        let address = addresses
+            .v4
+            .first()
+            .copied()
+            .map(IpAddr::V4)
+            .or_else(|| addresses.v6.first().copied().map(IpAddr::V6))
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Io,
+                    format!("WireGuard endpoint {value} resolved to no address"),
+                )
+            })?;
+        return Ok(SocketAddr::new(address, port));
+    }
     let mut addresses =
         tokio::time::timeout(timeout, tokio::net::lookup_host((host.as_str(), port)))
             .await
@@ -392,7 +429,7 @@ impl WireGuardEngine {
             let private_key = decode_key(&config.secret_key, "secretKey")?;
             let mut peers = Vec::with_capacity(config.peers.len());
             for peer in &config.peers {
-                peers.push(peer.parse(timeout).await?);
+                peers.push(peer.parse(timeout, None).await?);
             }
             Ok(Self::new(config.parse(peers)?, private_key))
         })
@@ -592,7 +629,7 @@ enum DecapsulatedPacket {
 /// userspace IP stack and one UDP underlay; individual yuhaiin flows become
 /// smoltcp TCP or UDP sockets on that stack.
 pub async fn build_proxy(config: WireGuardConfig, timeout: Duration) -> Result<WireGuardProxy> {
-    build_proxy_with_interface(config, timeout, None).await
+    build_proxy_with_interface_and_resolver(config, timeout, None, None).await
 }
 
 /// Construct a WireGuard proxy while constraining its UDP underlay to an
@@ -604,10 +641,23 @@ pub async fn build_proxy_with_interface(
     timeout: Duration,
     bind_interface: Option<&str>,
 ) -> Result<WireGuardProxy> {
+    build_proxy_with_interface_and_resolver(config, timeout, bind_interface, None).await
+}
+
+/// Construct a WireGuard proxy using the runtime's resolver for peer endpoint
+/// hostnames. This keeps hosts/FakeIP/DNS policy consistent with the rest of
+/// the proxy graph; the no-resolver wrappers retain the standalone API and
+/// use the system resolver for compatibility.
+pub async fn build_proxy_with_interface_and_resolver(
+    config: WireGuardConfig,
+    timeout: Duration,
+    bind_interface: Option<&str>,
+    resolver: Option<Arc<dyn AsyncIpResolver>>,
+) -> Result<WireGuardProxy> {
     let private_key = decode_key(&config.secret_key, "secretKey")?;
     let mut parsed_peers = Vec::with_capacity(config.peers.len());
     for peer in &config.peers {
-        parsed_peers.push(peer.parse(timeout).await?);
+        parsed_peers.push(peer.parse(timeout, resolver.as_deref()).await?);
     }
     let parsed = config.parse(parsed_peers)?;
     WireGuardProxy::start(ParsedConfig { ..parsed }, private_key, bind_interface).await
@@ -631,13 +681,20 @@ impl WireGuardProxy {
         };
         let underlay = bind_udp_underlay(bind_address, bind_interface).await?;
         let (command_tx, command_rx) = mpsc::channel(64);
+        let (ready_tx, ready_rx) = oneshot::channel();
         let closed = Arc::new(AtomicBool::new(false));
         let task_closed = Arc::clone(&closed);
         tokio::spawn(async move {
             Driver::new(config, private_key, underlay, command_rx, task_closed)
-                .run()
+                .run(Some(ready_tx))
                 .await;
         });
+        ready_rx.await.map_err(|_| {
+            Error::new(
+                ErrorKind::Closed,
+                "WireGuard driver exited before it became ready",
+            )
+        })??;
         Ok(Self { command_tx, closed })
     }
 }
@@ -1009,12 +1066,18 @@ impl Driver {
         }
     }
 
-    async fn run(mut self) {
+    async fn run(mut self, ready: Option<oneshot::Sender<Result<()>>>) {
         let mut device =
             match yuhaiin_core::tun::SmoltcpTunDevice::new(self.config.mtu, DEFAULT_QUEUE_CAPACITY)
             {
                 Ok(device) => device,
-                Err(_) => return,
+                Err(error) => {
+                    if let Some(ready) = ready {
+                        let _ = ready.send(Err(error_io(error)));
+                    }
+                    self.closed.store(true, Ordering::Release);
+                    return;
+                }
             };
         let mut interface = Interface::new(
             InterfaceConfig::new(HardwareAddress::Ip),
@@ -1046,6 +1109,9 @@ impl Driver {
             let _ = interface
                 .routes_mut()
                 .add_default_ipv6_route(Ipv6Address::UNSPECIFIED);
+        }
+        if let Some(ready) = ready {
+            let _ = ready.send(Ok(()));
         }
         let mut sockets = SocketSet::new(vec![]);
         let mut underlay_buffer = vec![0; MAX_PACKET_SIZE + HANDSHAKE_BUFFER_SIZE];
@@ -1406,6 +1472,25 @@ fn current_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yuhaiin_core::IpSet;
+
+    struct FixedResolver;
+
+    impl AsyncIpResolver for FixedResolver {
+        fn resolve<'a>(
+            &'a self,
+            domain: &'a DomainName,
+            _strategy: ResolveStrategy,
+        ) -> BoxFuture<'a, Result<IpSet>> {
+            assert_eq!(domain.as_str(), "peer.invalid");
+            Box::pin(async {
+                Ok(IpSet {
+                    v4: vec![std::net::Ipv4Addr::LOCALHOST],
+                    v6: Vec::new(),
+                })
+            })
+        }
+    }
 
     fn key(byte: u8) -> String {
         STANDARD.encode([byte; 32])
@@ -1427,7 +1512,10 @@ mod tests {
             reserved: vec![0, 0, 0],
         };
         let parsed = futures_lite::future::block_on(async {
-            let peer = config.peers[0].parse(Duration::from_secs(1)).await.unwrap();
+            let peer = config.peers[0]
+                .parse(Duration::from_secs(1), None)
+                .await
+                .unwrap();
             config.parse(vec![peer]).unwrap()
         });
         assert_eq!(parsed.local_addresses.len(), 1);
@@ -1462,6 +1550,22 @@ mod tests {
     fn rejects_non_32_byte_keys() {
         let error = decode_key("AQ==", "secretKey").unwrap_err();
         assert_eq!(error.kind, ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_endpoint_uses_injected_runtime_resolver() {
+        let peer = WireGuardPeerConfig {
+            public_key: key(2),
+            pre_shared_key: String::new(),
+            endpoint: "peer.invalid:51820".to_owned(),
+            keep_alive: 0,
+            allowed_ips: vec!["0.0.0.0/0".to_owned()],
+        };
+        let parsed = peer
+            .parse(Duration::from_secs(1), Some(&FixedResolver))
+            .await
+            .unwrap();
+        assert_eq!(parsed.endpoint, "127.0.0.1:51820".parse().unwrap());
     }
 
     #[test]
@@ -1668,7 +1772,7 @@ mod tests {
                 first_rx,
                 Arc::clone(&first_closed),
             )
-            .run(),
+            .run(None),
         );
         let second_task = tokio::spawn(
             Driver::new(
@@ -1678,7 +1782,7 @@ mod tests {
                 second_rx,
                 Arc::clone(&second_closed),
             )
-            .run(),
+            .run(None),
         );
 
         let proxy = WireGuardProxy {
