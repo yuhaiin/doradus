@@ -13,6 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use base64::Engine;
 use bytes::Bytes;
 use http::Response;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -1402,8 +1403,6 @@ pub async fn configure_http_process_inbound_chain(
 /// shared process fixture makes it reusable for future TLS/SOCKS5 and
 /// TLS/HTTP2 inbound matrix tests.
 pub async fn configure_tls_http_inbound(service: &ServiceProcess, inbound: SocketAddr) {
-    use base64::Engine;
-
     let node = json!({
         "id":"tls-inbound-direct",
         "name":"TLS inbound direct outbound",
@@ -1606,11 +1605,69 @@ pub async fn configure_tls_h2_http_inbound(
     inbound: SocketAddr,
     outbound: SocketAddr,
 ) {
-    use base64::Engine;
+    configure_tls_h2_http_inbound_with_transports(
+        service,
+        inbound,
+        outbound,
+        "tls-h2-inbound-http-out",
+        "TLS HTTP/2 inbound HTTP outbound",
+        "tls-h2-http-in",
+        "TLS HTTP/2 inbound",
+        "proxy-example-test-over-tls-h2-inbound",
+        json!([
+            {"type":"tls","tls":{"tls":{
+                "certificates":[{"certBase64":base64::engine::general_purpose::STANDARD.encode(LEAF_CERTIFICATE_PEM),"keyBase64":base64::engine::general_purpose::STANDARD.encode(PRIVATE_KEY_PEM)}],
+                "nextProtos":[]
+            }}},
+            {"type":"http2","http2":{}}
+        ]),
+    )
+    .await;
+}
 
+/// Configure TLS followed by AEAD and HTTP/2. The declaration order is
+/// intentional: the runtime must unwrap TLS first, then AEAD, before handing
+/// the stream to the prior-knowledge H2 server.
+pub async fn configure_tls_aead_h2_http_inbound(
+    service: &ServiceProcess,
+    inbound: SocketAddr,
+    outbound: SocketAddr,
+) {
+    configure_tls_h2_http_inbound_with_transports(
+        service,
+        inbound,
+        outbound,
+        "tls-aead-h2-inbound-http-out",
+        "TLS AEAD HTTP/2 inbound HTTP outbound",
+        "tls-aead-h2-http-in",
+        "TLS AEAD HTTP/2 inbound",
+        "proxy-example-test-over-tls-aead-h2-inbound",
+        json!([
+            {"type":"tls","tls":{"tls":{
+                "certificates":[{"certBase64":base64::engine::general_purpose::STANDARD.encode(LEAF_CERTIFICATE_PEM),"keyBase64":base64::engine::general_purpose::STANDARD.encode(PRIVATE_KEY_PEM)}],
+                "nextProtos":[]
+            }}},
+            {"type":"aead","aead":{"password":"runtime-aead-password","cryptoMethod":"XChacha20Poly1305"}},
+            {"type":"http2","http2":{}}
+        ]),
+    )
+    .await;
+}
+
+async fn configure_tls_h2_http_inbound_with_transports(
+    service: &ServiceProcess,
+    inbound: SocketAddr,
+    outbound: SocketAddr,
+    node_id: &str,
+    node_name: &str,
+    inbound_id: &str,
+    inbound_name: &str,
+    rule_name: &str,
+    transports: Value,
+) {
     let node = json!({
-        "id":"tls-h2-inbound-http-out",
-        "name":"TLS HTTP/2 inbound HTTP outbound",
+        "id":node_id,
+        "name":node_name,
         "group":"integration",
         "enabled":true,
         "chain":[
@@ -1626,29 +1683,22 @@ pub async fn configure_tls_h2_http_inbound(
         Some(&node),
     )
     .await;
+    let node_use_path = format!("/api/v2/nodes/{node_id}/use");
     api_json(
         &service.client,
         &service.base_url,
         reqwest::Method::POST,
-        "/api/v2/nodes/tls-h2-inbound-http-out/use",
+        &node_use_path,
         None,
     )
     .await;
 
-    let certificate = base64::engine::general_purpose::STANDARD.encode(LEAF_CERTIFICATE_PEM);
-    let private_key = base64::engine::general_purpose::STANDARD.encode(PRIVATE_KEY_PEM);
     let inbound = json!({
-        "id":"tls-h2-http-in",
-        "name":"TLS HTTP/2 inbound",
+        "id":inbound_id,
+        "name":inbound_name,
         "enabled":true,
         "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
-        "transports":[
-            {"type":"tls","tls":{"tls":{
-                "certificates":[{"certBase64":certificate,"keyBase64":private_key}],
-                "nextProtos":[]
-            }}},
-            {"type":"http2","http2":{}}
-        ],
+        "transports":transports,
         "protocol":{"type":"http","http":{"username":"","password":""}}
     });
     api_json(
@@ -1661,7 +1711,7 @@ pub async fn configure_tls_h2_http_inbound(
     .await;
 
     let rule = json!({
-        "name":"proxy-example-test-over-tls-h2-inbound",
+        "name":rule_name,
         "mode":"proxy",
         "match":{"domain":"example.test"},
         "tag":"integration"

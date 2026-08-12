@@ -20,9 +20,10 @@ use support::{
     add_socks5_inbound, add_yuubinsya_inbound, api_json, configure_aead_h2_http_inbound,
     configure_h2_http_chain, configure_h2_http_inbound, configure_h2_socks5_chain,
     configure_http_chain, configure_http_chain_with_transport, configure_socks5_chain,
-    configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound,
-    connect_loopback, connect_tls_h2_loopback, connect_tls_loopback, integration_dir,
-    seed_empty_database, tls_server_acceptor, wait_for_connection,
+    configure_tls_aead_h2_http_inbound, configure_tls_h2_http_inbound,
+    configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound, connect_loopback,
+    connect_tls_h2_loopback, connect_tls_loopback, integration_dir, seed_empty_database,
+    tls_server_acceptor, wait_for_connection,
 };
 
 #[cfg(target_os = "linux")]
@@ -1233,6 +1234,108 @@ async fn tls_http2_inbound_routes_through_http_outbound() {
     // precedence used by `InboundSpec::annotate_context`.
     assert_eq!(item["protocol"], "tls");
     assert_eq!(item["outbound"], fixture.outbound.to_string());
+
+    let authorities = fixture
+        .connect_authorities
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert!(
+        authorities.iter().any(|value| value == &authority),
+        "HTTP outbound authorities: {authorities:?}"
+    );
+
+    connection_task.abort();
+    let _ = connection_task.await;
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_aead_http2_inbound_routes_through_http_outbound() {
+    let fixture = ConnectFixture::start().await;
+    let _default_mixed_blocker = tokio::net::TcpListener::bind("127.0.0.1:1080").await.ok();
+    let inbound = support::reserve_loopback().await;
+
+    let root = integration_dir("service-tls-aead-h2-http-inbound");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_tls_aead_h2_http_inbound(&service, inbound, fixture.outbound).await;
+
+    let tls = connect_tls_h2_loopback(inbound).await;
+    let transport = yuhaiin_protocol::aead::client(
+        Box::new(tls),
+        b"runtime-aead-password",
+        yuhaiin_protocol::aead::CryptoMethod::XChacha20Poly1305,
+    )
+    .await
+    .unwrap();
+    let (mut client, connection) = h2::client::handshake(transport).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = Request::builder()
+        .method(http::Method::CONNECT)
+        .uri("https://localhost")
+        .body(())
+        .unwrap();
+    let (response, mut request_body) = client.send_request(request, false).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+
+    let authority = format!("example.test:{}", fixture.target.port());
+    request_body
+        .send_data(
+            Bytes::from(format!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n"
+            )),
+            false,
+        )
+        .unwrap();
+    let payload = b"tls-aead-h2-inbound-http-outbound";
+    request_body
+        .send_data(Bytes::from_static(payload), true)
+        .unwrap();
+
+    let mut body = response.into_body();
+    let mut received = Vec::new();
+    while let Some(data) = body.data().await {
+        let data = data.unwrap();
+        body.flow_control().release_capacity(data.len()).unwrap();
+        received.extend_from_slice(&data);
+        if received.ends_with(payload) {
+            break;
+        }
+    }
+    assert!(
+        received.starts_with(b"HTTP/1.1 200 Connection Established\r\n\r\n"),
+        "TLS/AEAD/H2 inbound response: {received:?}"
+    );
+    assert!(received.ends_with(payload));
+
+    let connection_value = wait_for_connection(&service.client, &service.base_url).await;
+    let item = connection_value["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inboundName"] == "TLS AEAD HTTP/2 inbound")
+        .expect("TLS/AEAD/H2 inbound connection must be visible");
+    assert_eq!(item["inbound"], inbound.to_string());
+    assert_eq!(item["outbound"], fixture.outbound.to_string());
+    assert_eq!(item["protocol"], "tls");
+
+    let total = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::GET,
+        "/api/v2/connections/total",
+        None,
+    )
+    .await;
+    assert!(total["upload"].as_str().unwrap().parse::<u64>().unwrap() > 0);
+    assert!(total["download"].as_str().unwrap().parse::<u64>().unwrap() > 0);
 
     let authorities = fixture
         .connect_authorities

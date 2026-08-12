@@ -4307,3 +4307,17 @@ HTTP/HTTP2 listener 和 router 复用同一条入站路径。
 验证：Podman focused runtime tests 6/6 通过，覆盖 Go-shaped nested contract、base64/byte
 输入、wildcard/规范化、动态 SNI TLS echo、CA/key mismatch，以及 ECDSA/Ed25519/RSA CA；全程
 使用 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+
+## 159. 2026-08-12 TLS/AEAD/HTTP2 入站组合回归
+
+在 AEAD 入站已经覆盖 plain HTTP/2 和 WebSocket、TLS 入站已经覆盖 HTTP/2 的基础上，补齐
+三层 transport 的真实进程组合。测试配置复用同一个 transport builder，明确保存 Go contract
+声明顺序 `TLS → AEAD → HTTP/2`；客户端先完成 TLS ALPN `h2`，再通过 XChaCha20-Poly1305
+解包，最后执行 prior-knowledge H2 CONNECT。这样可以直接捕获“单层测试都通过、组合时 wrapper
+顺序错位”的回归。
+
+`tls_aead_http2_inbound_routes_through_http_outbound` 通过同一个前台 runtime 的 API/SQLite
+配置完成 `inbound → router → fixed → HTTP CONNECT → TCP echo`，并断言 echo payload、连接
+的 inbound/outbound/protocol metadata、upload/download counters 和 HTTP outbound 的真实
+authority。Podman focused test 结果为 `1 passed, 0 failed`；编译、runtime、SQLite 和测试
+状态均位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
