@@ -3819,7 +3819,7 @@ Trojan WebSocket 继续明确不伪造 UDP 能力。随后 `make workspace-tests
 这把当前 Rust builder 支持的 VLESS/VMess/Trojan TLS/WebSocket 主路径从单元证据推进到真实 runtime
 TCP/UDP 组合；远端 listener、HTTP/2 组合、地址族、生产证书和完整 Go 现场矩阵仍保留 `[~]`。
 
-## 131. 2026-08-12 直接替换边界复验与缓存回收
+## 132. 2026-08-12 直接替换边界复验与缓存回收
 
 为避免只依赖历史日志，本轮在当前 `HEAD` 重新执行了三类最接近直接替换 Go 后端的现场：
 

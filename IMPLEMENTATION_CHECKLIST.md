@@ -210,7 +210,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `make tun-chain-service-smoke`（2026-08-12 当前轮） | disposable user/network Podman namespace、真实 TUN inbound | TUN→fixed→TLS→HTTP/2→Yuubinsya→echo 通过；`runtime-tun-chain-ready`、traffic、close 全部通过 |
 | `make go-live-flow-parity-smoke` + `make go-rust-stats-smoke`（2026-08-12 当前轮） | Podman Go/Rust live mixed inbound，共享 SQLite 统计接管 | Go/Rust 真实流量、connections/total/traffic/history 和 reload 后统计均通过 |
 | `make go-protocol-interop-smoke`（2026-08-12 当前轮） | Podman host network；真实 Go checkout/client/server | 9/9：Yuubinsya TCP/UOT/native UDP/Ping、WebSocket→H2、TLS→WebSocket→H2→Yuubinsya、H2 v1、VLESS TCP、VLESS UDP、VLESS over TLS、VMess、Trojan |
-| `make service-chain-smoke`（2026-08-12 当前轮） | host-network | 16/16：多个 inbound→router→outbound chain，含 HTTP/TLS/HTTP2/SOCKS5/Yuubinsya、普通 VLESS/VMess/Trojan TCP、Trojan→WebSocket/TLS→WebSocket，以及 mixed UDP→VLESS/VMess/Trojan outbound |
+| `make service-chain-smoke`（2026-08-12 当前轮） | host-network | 16/16：多个 inbound→router→outbound chain，含 HTTP/TLS/HTTP2/SOCKS5/Yuubinsya、普通 VLESS/VMess/Trojan TCP、Trojan→WebSocket、VLESS/VMess/Trojan→TLS→WebSocket，以及 mixed UDP→VLESS/VMess/Trojan（含 VLESS/VMess TLS→WebSocket） |
 | `make tun-reload-traffic-smoke` | rootless Podman + `unshare -Urn` + `/dev/net/tun` | 3 cycle：disable、不可达、reopen、traffic、close 通过 |
 | `make tun-reset-reconnect-smoke` / Debian VM rootful `tun-service.sh` | `/dev/net/tun`、`YUHAIIN_TUN_USER_NAMESPACE=0` | RST flow 被 target 接受并关闭；随后正常 reconnect echo、device close 通过 |
 | `make tun-mtu-smoke` | 同上 | IPv4 MTU 576/1280/1500/9000/9216 全部通过；默认最大合法 IPv4 UDP payload 65507 字节 |
