@@ -8,6 +8,7 @@ cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 retention_days="${YUHAIIN_CACHE_RETENTION_DAYS:-1}"
 dry_run="${YUHAIIN_CACHE_DRY_RUN:-0}"
 prune_debug="${YUHAIIN_CACHE_PRUNE_DEBUG:-0}"
+prune_transient="${YUHAIIN_CACHE_PRUNE_TRANSIENT:-0}"
 
 if [[ ! "${retention_days}" =~ ^[0-9]+$ ]]; then
   echo "YUHAIIN_CACHE_RETENTION_DAYS must be a non-negative integer" >&2
@@ -19,6 +20,10 @@ if [[ "${dry_run}" != 0 && "${dry_run}" != 1 ]]; then
 fi
 if [[ "${prune_debug}" != 0 && "${prune_debug}" != 1 ]]; then
   echo "YUHAIIN_CACHE_PRUNE_DEBUG must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "${prune_transient}" != 0 && "${prune_transient}" != 1 ]]; then
+  echo "YUHAIIN_CACHE_PRUNE_TRANSIENT must be 0 or 1" >&2
   exit 2
 fi
 
@@ -58,7 +63,7 @@ for parent in "${parents[@]}"; do
     -mmin "+$((retention_days * 1440))" -print0)
 done
 
-if [[ "${prune_debug}" == 1 ]]; then
+if [[ "${prune_debug}" == 1 || "${prune_transient}" == 1 ]]; then
   active_build=""
   for proc_dir in /proc/[0-9]*; do
     proc_pid="${proc_dir##*/}"
@@ -72,9 +77,12 @@ if [[ "${prune_debug}" == 1 ]]; then
     fi
   done
   if [[ -n "${active_build}" ]]; then
-    echo "[cache-prune] refusing cargo debug cleanup while cargo/rustc uses ${cache_root}: ${active_build}" >&2
+    echo "[cache-prune] refusing build cleanup while cargo/rustc uses ${cache_root}: ${active_build}" >&2
     exit 3
   fi
+fi
+
+if [[ "${prune_debug}" == 1 ]]; then
   debug_root="${cache_root}/cargo-target/debug"
   for path in \
     "${debug_root}/deps" \
@@ -91,6 +99,37 @@ if [[ "${prune_debug}" == 1 ]]; then
   done
 fi
 
+transient_count=0
+if [[ "${prune_transient}" == 1 ]]; then
+  # These roots are disposable outputs from one-off cross/CI experiments.
+  # Keep the allowlist explicit: cargo-target, fixtures, rules, and integration
+  # state are intentionally outside this branch.
+  transient_roots=(
+    "${cache_root}/cargo-target-ci"
+    "${cache_root}/ci-udp-hardening-target"
+    "${cache_root}/cross-target"
+    "${cache_root}/cross-aarch64-apple-darwin"
+    "${cache_root}/cross-x86_64-apple-darwin"
+    "${cache_root}/cross-x86_64-pc-windows-gnu"
+    "${cache_root}/final-musl-target"
+    "${cache_root}/make-musl-target"
+    "${cache_root}/static-cargo-target"
+  )
+  for path in "${transient_roots[@]}"; do
+    [[ -d "${path}" && ! -L "${path}" ]] || continue
+    if find "${path}" -maxdepth 0 -type d \
+      -mmin "+$((retention_days * 1440))" -print -quit | grep -q .; then
+      transient_count=$((transient_count + 1))
+      if [[ "${dry_run}" == 1 ]]; then
+        echo "[cache-prune] transient (dry-run): ${path}"
+      else
+        echo "[cache-prune] remove transient: ${path}"
+        rm -rf -- "${path}"
+      fi
+    fi
+  done
+fi
+
 after="$(size_kib)"
 echo "[cache-prune] stale-directories=${stale_count} size-after=${after} KiB"
 if [[ "${dry_run}" == 1 ]]; then
@@ -101,4 +140,10 @@ if [[ "${prune_debug}" == 1 ]]; then
 else
   echo "[cache-prune] cargo-target and fixtures were not modified"
   echo "[cache-prune] set YUHAIIN_CACHE_PRUNE_DEBUG=1 for opt-in debug dependency cleanup"
+fi
+if [[ "${prune_transient}" == 1 ]]; then
+  echo "[cache-prune] transient-roots=${transient_count} (allowlisted, retention=${retention_days}d)"
+else
+  echo "[cache-prune] one-off cross/CI target roots were not modified"
+  echo "[cache-prune] set YUHAIIN_CACHE_PRUNE_TRANSIENT=1 for opt-in cleanup"
 fi

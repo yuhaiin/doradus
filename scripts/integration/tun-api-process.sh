@@ -6,6 +6,7 @@ cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/tun-api-process}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+build_image="${YUHAIIN_BUILD_IMAGE:-docker.io/library/rust:latest}"
 
 mkdir -p "${scenario_dir}"
 if [[ ! -c /dev/net/tun ]]; then
@@ -17,23 +18,36 @@ source "${repo_dir}/scripts/integration/tun-container-common.sh"
 configure_tun_container_namespace tun-api-process /usr/local/bin/tun-api-process
 
 echo "[tun-api-process] compiling runtime and process harness"
-cargo build \
-  --manifest-path "${repo_dir}/Cargo.toml" \
-  --target-dir "${target_dir}" \
-  -p yuhaiin-runtime \
-  --all-features \
-  --offline \
-  --bin yuhaiin \
-  >"${scenario_dir}/runtime-build.log"
-cargo test \
-  --manifest-path "${repo_dir}/Cargo.toml" \
-  --target-dir "${target_dir}" \
-  -p yuhaiin-runtime \
-  --all-features \
-  --offline \
-  --test tun_api_process \
-  --no-run \
-  >"${scenario_dir}/build.log"
+podman run --rm --network=host \
+  -v "${repo_dir}:/workspace:ro" \
+  -v "${target_dir}:/target:Z" \
+  -v "${scenario_dir}:/state:Z" \
+  -v "${HOME}/.cargo:/cargo-home:ro" \
+  --entrypoint /bin/sh \
+  "${build_image}" \
+  -ec '
+    set -eu
+    mkdir -p /state/home /state/cache/tmp
+    export HOME=/state/home
+    export CARGO_HOME=/cargo-home
+    export CARGO_TARGET_DIR=/target
+    export TMPDIR=/state/cache/tmp
+    export CARGO_NET_OFFLINE=true
+    cd /workspace
+    cargo build \
+      --manifest-path /workspace/Cargo.toml \
+      -p yuhaiin-runtime \
+      --all-features \
+      --bin yuhaiin \
+      >/state/runtime-build.log 2>&1
+    cargo test \
+      --manifest-path /workspace/Cargo.toml \
+      -p yuhaiin-runtime \
+      --all-features \
+      --test tun_api_process \
+      --no-run \
+      >/state/build.log 2>&1
+  '
 
 test_binary="$({
   find "${target_dir}/debug/deps" -maxdepth 1 -type f -executable \

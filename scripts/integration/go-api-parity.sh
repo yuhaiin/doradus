@@ -3,14 +3,15 @@ set -euo pipefail
 
 # Compare public management responses from a stopped, consistent Go database
 # snapshot. Go and Rust always receive separate copies; neither process may
-# write the source fixture or share a live state.db. The host only builds the
-# binaries and drives curl; both services run in disposable Podman containers.
+# write the source fixture or share a live state.db. Compilation and runtime
+# both happen in disposable Podman containers; the host only drives curl.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 go_root="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
 source_db="${YUHAIIN_SOURCE_DB:?set YUHAIIN_SOURCE_DB to a stopped, consistent Go state.db snapshot}"
 cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/go-api-parity}"
+go_cache_root="${YUHAIIN_GO_CACHE_DIR:-${cache_root}/go-cache}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 go_http="${YUHAIIN_GO_HTTP:-127.0.0.1:55252}"
 rust_http="${YUHAIIN_RUST_HTTP:-127.0.0.1:55251}"
@@ -19,12 +20,14 @@ prepare_enabled="${YUHAIIN_PREPARE:-1}"
 
 command -v curl >/dev/null
 command -v jq >/dev/null
-command -v go >/dev/null
 command -v podman >/dev/null
 test -f "${source_db}"
 mkdir -p "${scenario_dir}/go" "${scenario_dir}/rust" "${scenario_dir}/prepared"
+mkdir -p "${go_cache_root}"
 
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+rust_build_image="${YUHAIIN_BUILD_IMAGE:-docker.io/library/rust:latest}"
+go_build_image="${YUHAIIN_GO_BUILD_IMAGE:-docker.io/library/golang:latest}"
 run_id="${BASHPID}-$(date +%s)"
 go_container="yuhaiin-go-api-parity-${run_id}"
 rust_container="yuhaiin-rust-api-parity-${run_id}"
@@ -32,16 +35,46 @@ prepare_container="yuhaiin-rust-api-parity-prepare-${run_id}"
 
 echo "[go-api-parity] building Go and Rust services"
 go_binary="${scenario_dir}/yuhaiin-go"
-(cd "${go_root}" && GOEXPERIMENT=jsonv2,greenteagc go build -o "${go_binary}" ./cmd/yuhaiin)
-cargo build \
-  --manifest-path "${repo_root}/Cargo.toml" \
-  --target-dir "${target_dir}" \
-  -p yuhaiin-runtime \
-  --all-features \
-  --offline \
-  --bin yuhaiin \
-  >"${scenario_dir}/rust-build.log"
+podman run --rm --network=host \
+  -v "${go_root}:/go-src:ro" \
+  -v "${scenario_dir}:/state:Z" \
+  -v "${go_cache_root}:/go-cache:Z" \
+  --entrypoint /bin/sh \
+  "${go_build_image}" \
+  -ec '
+    set -eu
+    mkdir -p /go-cache/build /go-cache/mod /state/go-tmp
+    export GOCACHE=/go-cache/build
+    export GOMODCACHE=/go-cache/mod
+    export GOTMPDIR=/state/go-tmp
+    cd /go-src
+    GOEXPERIMENT=jsonv2,greenteagc go build -o /state/yuhaiin-go ./cmd/yuhaiin
+  ' >"${scenario_dir}/go-build.log" 2>&1
+podman run --rm --network=host \
+  -v "${repo_root}:/workspace:ro" \
+  -v "${target_dir}:/target:Z" \
+  -v "${scenario_dir}:/state:Z" \
+  -v "${HOME}/.cargo:/cargo-home:ro" \
+  --entrypoint /bin/sh \
+  "${rust_build_image}" \
+  -ec '
+    set -eu
+    mkdir -p /state/home /state/cache/tmp
+    export HOME=/state/home
+    export CARGO_HOME=/cargo-home
+    export CARGO_TARGET_DIR=/target
+    export TMPDIR=/state/cache/tmp
+    export CARGO_NET_OFFLINE=true
+    cd /workspace
+    cargo build \
+      --manifest-path /workspace/Cargo.toml \
+      -p yuhaiin-runtime \
+      --all-features \
+      --bin yuhaiin \
+      >/state/rust-build.log 2>&1
+  '
 rust_binary="${target_dir}/debug/yuhaiin"
+test -x "${go_binary}"
 test -x "${rust_binary}"
 
 wait_ready() {

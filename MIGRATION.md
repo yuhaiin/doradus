@@ -4155,3 +4155,32 @@ Podman Rust image 中执行，宿主机只负责挂载源码、`~/.cache/yuhaiin
 位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。因此 reverse TCP/HTTP 从本轮的“代码存在 +
 单测”提升为 Linux desktop 主路径的真实进程 `[x]`，剩余 `[~]` 只保留更广泛的生产现场/样本、
 真实 firewall 组合、第三方 WireGuard peer 和原生 macOS/Windows 权限验收。
+
+## 152. 2026-08-12 TUN/API 与 parity 编译阶段容器化
+
+复核“不要在本机测试”的执行边界时发现，`tun-api-process.sh` 和
+`go-api-parity.sh` 原先仍在宿主机执行 `cargo build`/`cargo test --no-run`，以及 Go runtime
+编译；虽然最终服务在 Podman 中运行，但这会让宿主工具链和宿主临时目录影响结果。本轮改为：
+
+- `tun-api-process.sh` 在 Rust Podman image 中编译 runtime/test harness，再在独立 disposable
+  user/network namespace 中挂载并运行真实 `/dev/net/tun` 开关测试；
+- `go-api-parity.sh` 分别在 Go/Rust Podman build image 中编译，Go module/build 临时缓存写入
+  `~/.cache/yuhaiin-rust/go-cache` 共享缓存，场景目录只保留结果和临时工作文件，随后 Go、Rust、
+  Rust takeover prepare 三个服务仍使用独立 Podman 容器；
+- `YUHAIIN_SOURCE_DB=... make go-api-parity-smoke` 在该路径下通过，API read、mutation 和
+  error matrix 保持 identical；TUN API toggle 也通过 1/1。
+
+这些脚本的宿主职责现在只剩路径准备、curl/Podman 调度和结果收集；构建、测试函数和 runtime
+均不在宿主机执行。新增的构建缓存仍位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
+## 153. 2026-08-12 缓存临时 target 清理边界
+
+当前 `~/.cache/yuhaiin-rust` 约 47G，其中主 `cargo-target/debug` 约 21G，另外有多份一次性
+cross/CI/musl target。此前 `cache-prune` 只清理过期 integration/parity/benchmark 目录，
+无法处理这些重复构建根目录。
+
+现新增 `YUHAIIN_CACHE_PRUNE_TRANSIENT=1` 的显式 allowlist 清理模式：只允许清理固定列出的
+`cross-*`、CI 和一次性 musl target；默认仍不动，`YUHAIIN_CACHE_DRY_RUN=1` 可先查看，且
+检测到 cache 下有 cargo/rustc 活跃进程时 fail-closed。当前已用 retention=0 dry-run 验证可
+识别 9 个临时 target，未删除任何用户缓存；主 `cargo-target`、fixtures、rules 和集成状态
+仍保持独立。
