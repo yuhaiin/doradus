@@ -3715,3 +3715,34 @@ VLESS UDP inbound 回归和完整 `make go-protocol-interop-smoke` 均通过，�
 Yuubinsya 四种模式、WebSocket→H2（普通/TLS）、H2 v1、VLESS TCP、VLESS UDP、VLESS-over-TLS、
 VMess 和 Trojan。所有 Go scratch、fixture、日志和构建缓存继续位于 `~/.cache/yuhaiin-rust`，
 没有使用 `/tmp`。
+
+## 126. 2026-08-12 MinIO S3 backup/restore 现场 smoke
+
+新增 `make s3-minio-smoke`，把此前只经过 local compatible endpoint 的 S3 管理面再推进到真实
+S3-compatible server。脚本只在宿主机编译 Rust binary；MinIO、bucket helper 和 runtime 全部运行在
+同一个 disposable Podman network，状态、日志、Cargo target 和 Go scratch 均放在
+`~/.cache/yuhaiin-rust`，不使用 `/tmp`。
+
+本轮实际通过的步骤包括：启动 MinIO、用 `mc` 创建 bucket；通过 Rust API 写入 Go camelCase
+`backup.config`，执行 `backup.run` 并用 `mc stat` 校验 `{instanceName}-state.db` object；读取
+64 位十六进制 `lastBackupHash`；最后调用空参数 `backup.restore`，确认 Rust 从 MinIO 下载到
+cache-backed `backups/remote-state.sqlite`，并返回 managed-service restart contract。这个 smoke
+覆盖了真实 HTTP endpoint、path-style object URL、SigV4 Authorization、PUT/GET 及 restore
+生命周期，不把 local compatible endpoint 测试冒充 MinIO 行为。
+
+真实 AWS account、IAM 权限/拒绝矩阵、网络重试和更多损坏/异常快照仍保留在 checklist 的 `[~]`，
+因此本轮只把 MinIO 现场从未验证更新为已验证，不宣称 AWS 兼容性已经完成。
+
+## 127. 2026-08-12 workspace 回归与缓存边界收口
+
+在 VLESS UDP framing 和 MinIO smoke 收口后，重新执行 `make workspace-tests`：Podman 中运行 48 个
+harness，core 145、runtime 252、store 128、service-chain 15、WireGuard 7 和 WireGuard runtime
+chain 2 全部通过；外部第三方/WARP 的 2 个测试、Go 互操作 harness 等需要外部条件的项目仍按
+显式 `ignored` 处理。静态检查 `cargo fmt --all -- --check`、脚本 `bash -n` 和 `git diff --check`
+也通过。
+
+缓存维护脚本发现 debug cleanup 的旧进程探测会把自身的 grep 命令误判为 cargo/rustc，已改为读取
+`/proc/*/cmdline` 并只匹配实际 cargo/rustc 进程；随后安全清理了
+`~/.cache/yuhaiin-rust/cargo-target/debug` 下的 `deps/build/.fingerprint/examples/incremental`，
+保留 debug binary、release/musl target、fixtures 和集成日志。缓存从约 21 GiB 降到约 9.4 GiB，
+仍没有使用 `/tmp`。

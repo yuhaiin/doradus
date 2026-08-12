@@ -59,8 +59,20 @@ for parent in "${parents[@]}"; do
 done
 
 if [[ "${prune_debug}" == 1 ]]; then
-  if ps -eo args= | grep -E '(cargo|rustc)' | grep -F -- "${cache_root}" >/dev/null; then
-    echo "[cache-prune] refusing cargo debug cleanup while cargo/rustc uses ${cache_root}" >&2
+  active_build=""
+  for proc_dir in /proc/[0-9]*; do
+    proc_pid="${proc_dir##*/}"
+    [[ "${proc_pid}" == "$$" ]] && continue
+    [[ -r "${proc_dir}/cmdline" ]] || continue
+    proc_cmdline="$(tr '\0' ' ' <"${proc_dir}/cmdline" 2>/dev/null || true)"
+    if [[ " ${proc_cmdline} " =~ (^|[[:space:]])([^[:space:]]*/)?(cargo|rustc)([[:space:]]|$) ]] &&
+      [[ "${proc_cmdline}" == *"${cache_root}"* ]]; then
+      active_build="${proc_cmdline}"
+      break
+    fi
+  done
+  if [[ -n "${active_build}" ]]; then
+    echo "[cache-prune] refusing cargo debug cleanup while cargo/rustc uses ${cache_root}: ${active_build}" >&2
     exit 3
   fi
   debug_root="${cache_root}/cargo-target/debug"
