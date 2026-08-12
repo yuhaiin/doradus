@@ -155,7 +155,7 @@ help:
 		'MUSL=$(MUSL) MUSL_TARGET=$(MUSL_TARGET) MUSL_LINKER=$(MUSL_LINKER)'
 
 cache-usage:
-	@du -h -d 2 "$(CACHE_ROOT)" 2>/dev/null | sort -h | tail -25
+	YUHAIIN_CACHE_DIR="$(CACHE_ROOT)" ./scripts/maintenance/cache-usage.sh
 
 cache-prune:
 	YUHAIIN_CACHE_DIR="$(CACHE_ROOT)" ./scripts/maintenance/cache-prune.sh
