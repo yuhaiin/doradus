@@ -3156,6 +3156,43 @@ mod tests {
         assert!(built.proxy.connect(&context).await.is_err());
     }
 
+    #[tokio::test]
+    async fn go_vmess_legacy_alter_id_builds_runtime_proxy() {
+        let config = GoProxyRuntimeConfig {
+            id: "vmess-legacy".to_owned(),
+            name: "vmess-legacy".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned(), "vmess".to_owned()],
+            layers: vec![
+                yuhaiin_store::GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({"addresses":[{"host":"127.0.0.1","port":24447}]}),
+                },
+                yuhaiin_store::GoProxyLayer {
+                    kind: "vmess".to_owned(),
+                    config: serde_json::json!({
+                        "id":"00112233-4455-6677-8899-aabbccddeeff",
+                        "aid":"2",
+                        "security":"aes-128-gcm"
+                    }),
+                },
+            ],
+            transport: GoProxyTransport::Vmess,
+            data_json: Vec::new(),
+        };
+        let built = snapshot(config)
+            .build_proxy("vmess-legacy", Duration::from_secs(2))
+            .await
+            .unwrap();
+        let context = yuhaiin_core::FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        assert!(built.proxy.connect(&context).await.is_err());
+    }
+
     #[cfg(feature = "doh-tls")]
     #[tokio::test]
     async fn go_trojan_layer_builds_tls_transport_before_protocol_wrapper() {

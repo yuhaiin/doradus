@@ -1654,6 +1654,7 @@ pub async fn configure_tls_aead_h2_http_inbound(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn configure_tls_h2_http_inbound_with_transports(
     service: &ServiceProcess,
     inbound: SocketAddr,

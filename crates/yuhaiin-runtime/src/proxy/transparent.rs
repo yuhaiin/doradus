@@ -552,7 +552,7 @@ mod tests {
     use std::io::Cursor;
 
     #[cfg(feature = "doh-tls")]
-    use rustls::pki_types::{CertificateDer, ServerName};
+    use rustls::pki_types::ServerName;
     #[cfg(feature = "doh-tls")]
     use rustls::{ClientConfig, RootCertStore, ServerConfig};
     #[cfg(feature = "doh-tls")]
@@ -608,7 +608,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .unwrap()
             .with_no_client_auth()
-            .with_single_cert(vec![CertificateDer::from(certificate)], key)
+            .with_single_cert(vec![certificate], key)
             .unwrap();
         TlsAcceptor::from(Arc::new(config))
     }

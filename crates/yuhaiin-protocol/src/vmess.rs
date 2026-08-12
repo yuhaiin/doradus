@@ -1,11 +1,11 @@
-//! VMess v2 (AEAD header) TCP client and wire codec.
+//! VMess v2 TCP client and wire codec.
 //!
 //! The Go implementation used by yuhaiin exposes VMess as an outbound-only
-//! protocol.  This module deliberately implements the modern `alter_id=0`
-//! path: the authenticated AEAD request header, AES-128-GCM/ChaCha20-Poly1305
-//! (or plaintext) chunk stream, the encrypted response header, and the
-//! symmetric-target UDP packet mode. Legacy alter-id/CFB users remain
-//! explicitly unsupported instead of being silently treated as modern VMess.
+//! protocol. It supports both the modern `alter_id=0` path and the legacy
+//! `alter_id>0` path used by older yuhaiin configurations. Both paths share
+//! the AES-GCM/ChaCha20-Poly1305 (or plaintext) chunk stream and symmetric-
+//! target UDP packet mode, while their request/response headers use the wire
+//! formats required by their respective server generations.
 
 use std::io;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes128Gcm, Nonce};
 use chacha20poly1305::ChaCha20Poly1305;
 use crc32fast::Hasher as Crc32;
+use hmac::{Hmac, Mac};
 use md5::{Digest as Md5Digest, Md5};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split};
@@ -41,6 +42,9 @@ const VMESS_HEADER_PAYLOAD_IV: &[u8] = b"VMess Header AEAD Nonce";
 const VMESS_HEADER_PAYLOAD_LENGTH_KEY: &[u8] = b"VMess Header AEAD Key_Length";
 const VMESS_HEADER_PAYLOAD_LENGTH_IV: &[u8] = b"VMess Header AEAD Nonce_Length";
 const UUID_SUFFIX: &[u8] = b"c48619fe-8f02-49e0-b9e9-edf763e17e21";
+const ALTER_ID_SUFFIX: &[u8] = b"16167dc8-16b6-4e6d-b8bb-65dd68113a81";
+const ALTER_ID_COLLISION_SUFFIX: &[u8] = b"533eff8a-4113-4b10-b5ce-0f5d76b98cd2";
+const MAX_ALTER_ID: u32 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -85,6 +89,8 @@ pub struct Request {
     pub security: Security,
     pub command: u8,
     pub destination: Endpoint,
+    /// True when the legacy timestamp-HMAC/CFB header format is in use.
+    pub legacy: bool,
 }
 
 /// Derive the VMess command key from the user's UUID.
@@ -102,6 +108,38 @@ pub fn encode_request(
     security: Security,
     command: u8,
     destination: &Endpoint,
+) -> Result<(Vec<u8>, Request)> {
+    encode_request_inner(uuid, uuid, security, command, destination, false)
+}
+
+/// Build a legacy VMess request for one randomly selectable alter-id user.
+///
+/// The command key is derived from the primary UUID, just like the Go client;
+/// the selected alter-id UUID is used only for the timestamp HMAC prefix.
+pub fn encode_legacy_request(
+    primary_uuid: &[u8; 16],
+    user_uuid: &[u8; 16],
+    security: Security,
+    command: u8,
+    destination: &Endpoint,
+) -> Result<(Vec<u8>, Request)> {
+    encode_request_inner(
+        primary_uuid,
+        user_uuid,
+        security,
+        command,
+        destination,
+        true,
+    )
+}
+
+fn encode_request_inner(
+    primary_uuid: &[u8; 16],
+    user_uuid: &[u8; 16],
+    security: Security,
+    command: u8,
+    destination: &Endpoint,
+    legacy: bool,
 ) -> Result<(Vec<u8>, Request)> {
     if command == CMD_TCP && destination.network() != Network::Tcp {
         return Err(Error::invalid(
@@ -145,7 +183,26 @@ pub fn encode_request(
     let checksum = fnv1a(&plaintext);
     plaintext.extend_from_slice(&checksum.to_be_bytes());
 
-    let header = seal_header(&command_key(uuid), &plaintext)?;
+    let header = if legacy {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| Error::new(ErrorKind::Protocol, "system clock is before Unix epoch"))?
+            .as_secs();
+        let timestamp_bytes = timestamp.to_be_bytes();
+        let auth_id = legacy_auth_id(user_uuid, &timestamp_bytes)?;
+        let encrypted = aes_cfb_xor(
+            &command_key(primary_uuid),
+            &legacy_timestamp_iv(timestamp),
+            &plaintext,
+            false,
+        )?;
+        let mut header = Vec::with_capacity(auth_id.len() + encrypted.len());
+        header.extend_from_slice(&auth_id);
+        header.extend_from_slice(&encrypted);
+        header
+    } else {
+        seal_header(&command_key(primary_uuid), &plaintext)?
+    };
     Ok((
         header,
         Request {
@@ -156,6 +213,7 @@ pub fn encode_request(
             security,
             command,
             destination: destination.clone(),
+            legacy,
         },
     ))
 }
@@ -212,6 +270,7 @@ pub fn decode_request(packet: &[u8], uuid: &[u8; 16]) -> Result<Request> {
         security,
         command,
         destination,
+        legacy: false,
     })
 }
 
@@ -270,6 +329,20 @@ pub fn encode_response_header(
     Ok(output)
 }
 
+/// Build the four-byte legacy VMess response header using AES-128-CFB.
+pub fn encode_legacy_response_header(
+    response_v: u8,
+    body_key: &[u8; 16],
+    body_iv: &[u8; 16],
+) -> Result<Vec<u8>> {
+    aes_cfb_xor(
+        &md5_digest(body_key),
+        &md5_digest(body_iv),
+        &[response_v, 0, 0, 0],
+        false,
+    )
+}
+
 /// Decode a VMess AEAD response header from a complete byte slice.
 pub fn decode_response_header(
     packet: &[u8],
@@ -303,6 +376,7 @@ pub fn decode_response_header(
 pub struct VmessProxy {
     upstream: Arc<dyn AsyncProxy>,
     uuid: [u8; 16],
+    users: Vec<[u8; 16]>,
     security: Security,
 }
 
@@ -313,15 +387,18 @@ impl VmessProxy {
         security: &str,
         alter_id: u32,
     ) -> Result<Self> {
-        if alter_id != 0 {
+        if alter_id > MAX_ALTER_ID {
             return Err(Error::new(
-                ErrorKind::Unsupported,
-                "VMess alter_id is not supported; use modern alter_id=0",
+                ErrorKind::InvalidInput,
+                format!("VMess alter_id exceeds the safety limit of {MAX_ALTER_ID}"),
             ));
         }
+        let uuid = crate::vless::parse_uuid(uuid)?;
+        let users = alter_id_users(uuid, alter_id)?;
         Ok(Self {
             upstream,
-            uuid: crate::vless::parse_uuid(uuid)?,
+            uuid,
+            users,
             security: Security::parse(security)?,
         })
     }
@@ -330,8 +407,14 @@ impl VmessProxy {
         Self {
             upstream,
             uuid,
+            users: vec![uuid],
             security,
         }
+    }
+
+    fn random_user(&self) -> [u8; 16] {
+        let index = rand::random::<u64>() as usize % self.users.len();
+        self.users[index]
     }
 }
 
@@ -340,8 +423,12 @@ impl AsyncProxy for VmessProxy {
         Box::pin(async move {
             let mut upstream = self.upstream.connect(context).await?;
             let destination = context.effective_destination();
-            let (request, state) =
-                encode_request(&self.uuid, self.security, CMD_TCP, &destination)?;
+            let user_uuid = self.random_user();
+            let (request, state) = if self.users.len() == 1 {
+                encode_request(&self.uuid, self.security, CMD_TCP, &destination)?
+            } else {
+                encode_legacy_request(&self.uuid, &user_uuid, self.security, CMD_TCP, &destination)?
+            };
             upstream.write_all(&request).await.map_err(io_error)?;
 
             let (client, relay) = tokio::io::duplex(64 * 1024);
@@ -350,10 +437,11 @@ impl AsyncProxy for VmessProxy {
             tokio::spawn(relay_remote_to_local(
                 remote_reader,
                 local_writer,
-                response_key(&state.body_key),
-                response_key(&state.body_iv),
+                response_key_for(&state.body_key, state.legacy),
+                response_key_for(&state.body_iv, state.legacy),
                 state.response_v,
                 state.security,
+                state.legacy,
             ));
             tokio::spawn(relay_local_to_remote(
                 local_reader,
@@ -373,17 +461,22 @@ impl AsyncProxy for VmessProxy {
         Box::pin(async move {
             let mut upstream = self.upstream.connect(context).await?;
             let destination = context.effective_destination();
-            let (request, state) =
-                encode_request(&self.uuid, self.security, CMD_UDP, &destination)?;
+            let user_uuid = self.random_user();
+            let (request, state) = if self.users.len() == 1 {
+                encode_request(&self.uuid, self.security, CMD_UDP, &destination)?
+            } else {
+                encode_legacy_request(&self.uuid, &user_uuid, self.security, CMD_UDP, &destination)?
+            };
             upstream.write_all(&request).await.map_err(io_error)?;
             let (reader, writer) = split(upstream);
             Ok(Box::new(VmessDatagram {
                 reader: Mutex::new(VmessDatagramReader {
                     reader,
-                    response_key: response_key(&state.body_key),
-                    response_iv: response_key(&state.body_iv),
+                    response_key: response_key_for(&state.body_key, state.legacy),
+                    response_iv: response_key_for(&state.body_iv, state.legacy),
                     response_v: state.response_v,
                     security: state.security,
+                    legacy: state.legacy,
                     count: 0,
                     response_read: false,
                     destination: destination.clone(),
@@ -411,6 +504,7 @@ struct VmessDatagramReader {
     response_iv: [u8; 16],
     response_v: u8,
     security: Security,
+    legacy: bool,
     count: u16,
     response_read: bool,
     destination: Endpoint,
@@ -458,10 +552,17 @@ impl AsyncDatagram for VmessDatagram {
             let response_key = reader.response_key;
             let response_iv = reader.response_iv;
             let response_v = reader.response_v;
+            let legacy = reader.legacy;
             if !reader.response_read {
-                read_response_header(&mut reader.reader, &response_key, &response_iv, response_v)
-                    .await
-                    .map_err(io_error)?;
+                read_response_header(
+                    &mut reader.reader,
+                    &response_key,
+                    &response_iv,
+                    response_v,
+                    legacy,
+                )
+                .await
+                .map_err(io_error)?;
                 reader.response_read = true;
             }
             let security = reader.security;
@@ -510,11 +611,12 @@ async fn relay_remote_to_local<R, W>(
     body_iv: [u8; 16],
     response_v: u8,
     security: Security,
+    legacy: bool,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    if read_response_header(&mut remote, &body_key, &body_iv, response_v)
+    if read_response_header(&mut remote, &body_key, &body_iv, response_v, legacy)
         .await
         .is_err()
     {
@@ -583,7 +685,23 @@ async fn read_response_header<R: AsyncRead + Unpin>(
     body_key: &[u8; 16],
     body_iv: &[u8; 16],
     response_v: u8,
+    legacy: bool,
 ) -> io::Result<()> {
+    if legacy {
+        let mut encrypted = [0u8; 4];
+        reader.read_exact(&mut encrypted).await?;
+        let decrypted = aes_cfb_xor(
+            &md5_digest(body_key),
+            &md5_digest(body_iv),
+            &encrypted,
+            true,
+        )
+        .map_err(|error| invalid_io(error.to_string()))?;
+        if decrypted.len() < 4 || decrypted[0] != response_v || decrypted[2] != 0 {
+            return Err(invalid_io("invalid legacy VMess response header"));
+        }
+        return Ok(());
+    }
     let mut length_packet = [0u8; 18];
     reader.read_exact(&mut length_packet).await?;
     let length_key = kdf16(body_key, &[AEAD_RESP_HEADER_LEN_KEY]);
@@ -701,8 +819,90 @@ fn chacha_key(key: &[u8; 16]) -> [u8; 32] {
     output
 }
 
-fn response_key(key: &[u8; 16]) -> [u8; 16] {
-    Sha256::digest(key)[..16].try_into().unwrap()
+fn response_key_for(key: &[u8; 16], legacy: bool) -> [u8; 16] {
+    if legacy {
+        md5_digest(key)
+    } else {
+        Sha256::digest(key)[..16].try_into().unwrap()
+    }
+}
+
+fn alter_id_users(primary: [u8; 16], alter_id: u32) -> Result<Vec<[u8; 16]>> {
+    if alter_id > MAX_ALTER_ID {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("VMess alter_id exceeds the safety limit of {MAX_ALTER_ID}"),
+        ));
+    }
+    let capacity = usize::try_from(alter_id)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "VMess alter_id is too large"))?;
+    let mut users = Vec::with_capacity(capacity);
+    users.push(primary);
+    let mut previous = primary;
+    for _ in 0..alter_id {
+        let next = next_alter_id_uuid(&previous);
+        users.push(next);
+        previous = next;
+    }
+    Ok(users)
+}
+
+fn next_alter_id_uuid(previous: &[u8; 16]) -> [u8; 16] {
+    let mut digest = Md5::new();
+    digest.update(previous);
+    digest.update(ALTER_ID_SUFFIX);
+    let mut next: [u8; 16] = digest.clone().finalize().into();
+    if &next == previous {
+        digest.update(ALTER_ID_COLLISION_SUFFIX);
+        next = digest.finalize().into();
+    }
+    next
+}
+
+fn legacy_auth_id(user_uuid: &[u8; 16], timestamp: &[u8; 8]) -> Result<[u8; 16]> {
+    let mut mac = <Hmac<Md5> as Mac>::new_from_slice(user_uuid)
+        .map_err(|_| Error::new(ErrorKind::Protocol, "invalid legacy VMess user UUID"))?;
+    mac.update(timestamp);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+fn legacy_timestamp_iv(timestamp: u64) -> [u8; 16] {
+    let timestamp = timestamp.to_be_bytes();
+    let mut input = [0u8; 32];
+    input[..8].copy_from_slice(&timestamp);
+    input[8..16].copy_from_slice(&timestamp);
+    input[16..24].copy_from_slice(&timestamp);
+    input[24..].copy_from_slice(&timestamp);
+    md5_digest(&input)
+}
+
+/// AES-128-CFB with a full-block feedback register.
+///
+/// VMess legacy headers are short, so keeping this small implementation here
+/// avoids pulling a mode crate into the protocol surface. CFB encryption and
+/// decryption both use AES encryption; only the feedback source differs.
+fn aes_cfb_xor(key: &[u8; 16], iv: &[u8; 16], input: &[u8], decrypt: bool) -> Result<Vec<u8>> {
+    let cipher = Aes128::new_from_slice(key)
+        .map_err(|_| Error::new(ErrorKind::Protocol, "invalid legacy VMess AES key"))?;
+    let mut feedback = *iv;
+    let mut output = Vec::with_capacity(input.len());
+    for chunk in input.chunks(16) {
+        let mut stream = GenericArray::clone_from_slice(&feedback);
+        cipher.encrypt_block(&mut stream);
+        let mut result = vec![0u8; chunk.len()];
+        for (index, byte) in chunk.iter().enumerate() {
+            result[index] = *byte ^ stream[index];
+        }
+        if decrypt {
+            feedback[..chunk.len()].copy_from_slice(chunk);
+        } else {
+            feedback[..chunk.len()].copy_from_slice(&result);
+        }
+        output.extend_from_slice(&result);
+    }
+    Ok(output)
 }
 
 fn seal_header(key: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>> {
@@ -1036,6 +1236,76 @@ mod tests {
         assert!(decode_request(&encoded[..10], &uuid).is_err());
     }
 
+    #[test]
+    fn legacy_request_matches_go_user_and_cfb_header_shape() {
+        let primary = crate::vless::parse_uuid(UUID).unwrap();
+        let users = alter_id_users(primary, 2).unwrap();
+        assert_eq!(users.len(), 3);
+        assert_ne!(users[0], users[1]);
+        assert_ne!(users[1], users[2]);
+
+        let destination =
+            Endpoint::domain(Network::Tcp, DomainName::new("example.com").unwrap(), 443);
+        let (encoded, state) = encode_legacy_request(
+            &primary,
+            &users[1],
+            Security::Aes128Gcm,
+            CMD_TCP,
+            &destination,
+        )
+        .unwrap();
+        assert!(state.legacy);
+        assert!(encoded.len() > 16);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut matched_timestamp = false;
+        for timestamp in now.saturating_sub(1)..=now.saturating_add(1) {
+            let timestamp_bytes = timestamp.to_be_bytes();
+            if encoded[..16] != legacy_auth_id(&users[1], &timestamp_bytes).unwrap() {
+                continue;
+            }
+            let plaintext = aes_cfb_xor(
+                &command_key(&primary),
+                &legacy_timestamp_iv(timestamp),
+                &encoded[16..],
+                true,
+            )
+            .unwrap();
+            assert_eq!(plaintext[0], VERSION);
+            assert_eq!(plaintext[37], CMD_TCP);
+            assert_eq!(plaintext[38..40], 443u16.to_be_bytes());
+            assert_eq!(plaintext[40], 2);
+            assert_eq!(plaintext[41], 11);
+            assert_eq!(&plaintext[42..53], b"example.com",);
+            assert_eq!(
+                fnv1a(&plaintext[..plaintext.len() - 4]),
+                u32::from_be_bytes(plaintext[plaintext.len() - 4..].try_into().unwrap())
+            );
+            matched_timestamp = true;
+            break;
+        }
+        assert!(matched_timestamp, "legacy request timestamp was not found");
+    }
+
+    #[test]
+    fn legacy_response_header_and_body_keys_round_trip() {
+        let body_key = [0x11; 16];
+        let body_iv = [0x22; 16];
+        let encoded = encode_legacy_response_header(0x7f, &body_key, &body_iv).unwrap();
+        let decrypted = aes_cfb_xor(
+            &response_key_for(&body_key, true),
+            &response_key_for(&body_iv, true),
+            &encoded,
+            true,
+        )
+        .unwrap();
+        assert_eq!(decrypted, [0x7f, 0, 0, 0]);
+        assert!(alter_id_users(body_key, MAX_ALTER_ID + 1).is_err());
+    }
+
     #[tokio::test]
     async fn udp_command_round_trips_with_independent_direction_counters() {
         let uuid = crate::vless::parse_uuid(UUID).unwrap();
@@ -1052,8 +1322,8 @@ mod tests {
 
             let response_header = encode_response_header(
                 request.response_v,
-                &response_key(&request.body_key),
-                &response_key(&request.body_iv),
+                &response_key_for(&request.body_key, false),
+                &response_key_for(&request.body_iv, false),
             )
             .unwrap();
             server.write_all(&response_header).await.unwrap();
@@ -1070,8 +1340,8 @@ mod tests {
             assert_eq!(payload, b"ping");
             write_body_frame(
                 &mut server,
-                &response_key(&request.body_key),
-                &response_key(&request.body_iv),
+                &response_key_for(&request.body_key, false),
+                &response_key_for(&request.body_iv, false),
                 request.security,
                 0,
                 b"pong",
@@ -1086,10 +1356,11 @@ mod tests {
         let datagram = VmessDatagram {
             reader: Mutex::new(VmessDatagramReader {
                 reader: client_reader,
-                response_key: response_key(&state.body_key),
-                response_iv: response_key(&state.body_iv),
+                response_key: response_key_for(&state.body_key, false),
+                response_iv: response_key_for(&state.body_iv, false),
                 response_v: state.response_v,
                 security: state.security,
+                legacy: false,
                 count: 0,
                 response_read: false,
                 destination: destination.clone(),
