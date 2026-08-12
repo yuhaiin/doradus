@@ -3560,10 +3560,37 @@ Rust API 的真实功能缺口：`backup.run` 过去无论配置如何都只创�
   endpoint wire test 覆盖真实 HTTP PUT/GET、Authorization、payload hash 和 storage class；
   runtime API test 覆盖 `backup.run` 上传、`lastBackupHash` 持久化和空参数 restore 下载。
 
-当前仍明确标为 `[~]`：真实 AWS/MinIO 权限现场，以及将 S3 HTTP 连接接入 Go 所用的选中
-outbound proxy。这个缺口不会再被本地备份的成功响应掩盖，后续应通过可注入的 async connector
-补齐，而不是在 API 层复制 proxy 选择逻辑。
+真实 AWS/MinIO 权限现场仍明确标为 `[~]`。选中 outbound proxy 的连接路径已经补齐：
+`yuhaiin-backup::S3Transport` 只负责签名请求，runtime 的 `ProxyS3Transport` 通过同一份
+`AsyncProxy` 建立 HTTP/HTTPS 请求，并复用 direct、HTTP、SOCKS5、TLS/HTTP2、Yuubinsya 和
+WireGuard 等已有出口；这样没有在 backup crate 里复制 proxy 选择逻辑。runtime API 的 local
+compatible endpoint test 覆盖了该路径，真实 AWS/MinIO 的权限、重试和服务端行为仍需要现场验收。
 
-本轮 `make workspace-tests` 在 Podman 中最终执行 45 个 harness：core 145、runtime 246、
+本轮 `make workspace-tests` 在 Podman 中最终执行 45 个 harness：core 145、runtime 248、
 store 128、WireGuard 7（1 个 benchmark ignored）、service-chain 15，0 失败；S3 backup
 新增测试没有改变其它 inbound→router→outbound 链路的通过状态。
+
+## 122. 2026-08-12 WireGuard 与管理面代理链当前回归
+
+WireGuard 按用户决定固定采用 Cloudflare BoringTun，不再计划维护纯 Rust WireGuard 协议实现。
+`crates/yuhaiin-wireguard` 的 `boringtun 0.7.1` 负责 Noise handshake、session、定时器和 packet
+crypto；smoltcp 只作为 userspace IP/TCP/UDP adapter。依赖审计显示 `ring` 只由 BoringTun 引入，
+属于本次明确允许的 Cloudflare 外部实现例外。
+
+本轮在 Podman 中重新执行 `make wireguard-smoke`，结果为 7 passed、1 个显式 ignored benchmark；
+`make workspace-tests` 结果为 45 个 harness，runtime 248、core 145、store 128、WireGuard 7、
+service-chain 15，0 失败。外部第三方/WARP peer 的两个测试仍要求用户提供真实配置，不把
+`network=none` 双 peer 结果冒充公网兼容性。
+
+同时完成了 S3 管理面 transport：`backup.run`/空参数 `backup.restore` 会先按 Go 的 TCP/UDP 选择
+构造短生命周期 outbound，再通过该出口发送签名的 HTTP/HTTPS S3 请求；响应大小、chunked body、
+timeout 和错误状态均有边界。GitHub Actions checks job 也显式安装并打印 Podman 版本，避免 CI
+未预装 Podman 时在真正测试前失败。
+
+backup crate 本轮为 6 个单元测试加 1 个 local compatible endpoint wire test；runtime 新增的
+proxy transport、chunked/error boundary 和 API S3 测试均在上述 workspace harness 中通过。
+
+本轮格式检查、`cargo check --locked --workspace --all-features --offline`、Clippy `-D warnings`、
+`git diff --check` 和 Podman workspace tests 均通过。缓存目录当前约 27G，其中约 18G 为可重建的
+`cargo-target`；仍只使用 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`，后续应按精确 target/scenario
+目录回收，不做宽泛递归删除。

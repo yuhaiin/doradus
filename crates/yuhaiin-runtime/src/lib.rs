@@ -6,6 +6,7 @@
 
 #[cfg(feature = "http-api")]
 pub mod api;
+mod backup_transport;
 mod controller;
 mod data_plane;
 mod defaults;

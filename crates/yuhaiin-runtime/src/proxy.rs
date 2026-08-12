@@ -541,6 +541,15 @@ impl RuntimeSnapshot {
         })
     }
 
+    pub async fn build_proxy_for_management(
+        &self,
+        id: &str,
+        timeout: Duration,
+    ) -> Result<Arc<dyn AsyncProxy>> {
+        self.build_proxy_slot(id, timeout, BaseProxyKind::Direct)
+            .await
+    }
+
     /// Build the four proxy slots consumed by the TUN dispatcher.
     ///
     /// The persisted records are reused directly; the method only assembles

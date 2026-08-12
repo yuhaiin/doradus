@@ -6,6 +6,7 @@ use std::{
 };
 
 use yuhaiin_core::Result;
+use yuhaiin_core::proxy::AsyncProxy;
 use yuhaiin_store::{ConfigMutation, ConfigStore};
 
 use crate::data_plane::inbound_dns_handler;
@@ -139,6 +140,20 @@ impl RuntimeController {
             direct_id, proxy_id, proxy_id, bypass_id, drop_id, timeout,
         )
         .await
+    }
+
+    /// Build one short-lived proxy for management-plane traffic such as S3
+    /// backup. It uses the same immutable snapshot and proxy slot assembly as
+    /// inbound flows, but does not register a second long-lived selector.
+    pub async fn build_management_proxy(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Arc<dyn AsyncProxy>> {
+        self.handle
+            .load()
+            .build_proxy_for_management(id, timeout)
+            .await
     }
 
     /// Build a live selector with independent TCP and UDP proxy nodes, as

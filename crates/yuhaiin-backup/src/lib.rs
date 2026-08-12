@@ -7,6 +7,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
@@ -42,6 +45,7 @@ pub enum Error {
     Invalid(String),
     Url(url::ParseError),
     Request(reqwest::Error),
+    Transport(String),
     Response { status: StatusCode, body: String },
     Header(String),
     Time(time::error::Format),
@@ -53,6 +57,7 @@ impl Display for Error {
             Self::Invalid(message) => formatter.write_str(message),
             Self::Url(error) => write!(formatter, "S3 endpoint URL: {error}"),
             Self::Request(error) => write!(formatter, "S3 request: {error}"),
+            Self::Transport(message) => write!(formatter, "S3 transport: {message}"),
             Self::Response { status, body } => {
                 write!(formatter, "S3 response {status}: {body}")
             }
@@ -82,15 +87,64 @@ impl From<time::error::Format> for Error {
     }
 }
 
-#[derive(Debug, Clone)]
+/// A signed request handed to a runtime-specific network transport.
+///
+/// The backup crate deliberately does not depend on the runtime proxy graph.
+/// A desktop runtime can therefore route this request through its selected
+/// HTTP/SOCKS5/TLS/HTTP2/Yuubinsya outbound while tests can provide a tiny
+/// in-process transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Request {
+    pub method: String,
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+    pub path_and_query: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Response {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+pub trait S3Transport: Send + Sync {
+    fn execute<'a>(&'a self, request: S3Request) -> BoxFuture<'a, Result<S3Response, Error>>;
+}
+
+struct SignedRequest {
+    method: Method,
+    url: Url,
+    headers: HeaderMap,
+    transport: S3Request,
+    body: Vec<u8>,
+}
+
+#[derive(Clone)]
 pub struct S3Client {
     client: Client,
     config: S3Config,
     endpoint: Url,
+    transport: Option<Arc<dyn S3Transport>>,
 }
 
 impl S3Client {
     pub fn new(config: S3Config) -> Result<Self, Error> {
+        Self::build(config, None)
+    }
+
+    pub fn with_transport(
+        config: S3Config,
+        transport: Arc<dyn S3Transport>,
+    ) -> Result<Self, Error> {
+        Self::build(config, Some(transport))
+    }
+
+    fn build(config: S3Config, transport: Option<Arc<dyn S3Transport>>) -> Result<Self, Error> {
         if !config.enabled {
             return Err(Error::Invalid("S3 backup is disabled".to_owned()));
         }
@@ -121,28 +175,54 @@ impl S3Client {
             client,
             config,
             endpoint,
+            transport,
         })
     }
 
     pub async fn put(&self, object: &str, body: &[u8]) -> Result<(), Error> {
-        let request = self.signed_request(Method::PUT, object, body).await?;
-        let response = self.client.execute(request).await.map_err(Error::Request)?;
+        let signed = self.signed_request(Method::PUT, object, body)?;
+        if let Some(transport) = &self.transport {
+            let response = transport.execute(signed.transport).await?;
+            return ensure_transport_success(response).map(|_| ());
+        }
+        let mut request = self
+            .client
+            .request(signed.method, signed.url)
+            .headers(signed.headers);
+        if !signed.body.is_empty() {
+            request = request.body(signed.body);
+        }
+        let response = self
+            .client
+            .execute(request.build().map_err(Error::Request)?)
+            .await
+            .map_err(Error::Request)?;
         ensure_success(response).await
     }
 
     pub async fn get(&self, object: &str) -> Result<Vec<u8>, Error> {
-        let request = self.signed_request(Method::GET, object, &[]).await?;
+        let signed = self.signed_request(Method::GET, object, &[])?;
+        if let Some(transport) = &self.transport {
+            let response = transport.execute(signed.transport).await?;
+            return ensure_transport_success(response).map(|response| response.body);
+        }
+        let request = self
+            .client
+            .request(signed.method, signed.url)
+            .headers(signed.headers)
+            .build()
+            .map_err(Error::Request)?;
         let response = self.client.execute(request).await.map_err(Error::Request)?;
         let response = ensure_success_response(response).await?;
         Ok(response.bytes().await.map_err(Error::Request)?.to_vec())
     }
 
-    async fn signed_request(
+    fn signed_request(
         &self,
         method: Method,
         object: &str,
         body: &[u8],
-    ) -> Result<reqwest::Request, Error> {
+    ) -> Result<SignedRequest, Error> {
         if object.is_empty() || object.starts_with('/') {
             return Err(Error::Invalid("S3 object key is invalid".to_owned()));
         }
@@ -211,11 +291,44 @@ impl S3Client {
         if let Some(storage_class) = headers.get("x-amz-storage-class") {
             insert_header(&mut request_headers, "x-amz-storage-class", storage_class)?;
         }
-        let mut request = self.client.request(method, url).headers(request_headers);
-        if !body.is_empty() {
-            request = request.body(body.to_vec());
-        }
-        request.build().map_err(Error::Request)
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| Error::Invalid("S3 endpoint port is missing".to_owned()))?;
+        let path_and_query = match url.query() {
+            Some(query) => format!("{}?{query}", url.path()),
+            None => url.path().to_owned(),
+        };
+        let transport_headers = request_headers
+            .iter()
+            .map(|(name, value)| {
+                Ok::<_, Error>((
+                    name.as_str().to_owned(),
+                    value
+                        .to_str()
+                        .map_err(|error| Error::Header(error.to_string()))?
+                        .to_owned(),
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let transport = S3Request {
+            method: method.as_str().to_owned(),
+            scheme: url.scheme().to_owned(),
+            host: url
+                .host_str()
+                .ok_or_else(|| Error::Invalid("S3 endpoint host is missing".to_owned()))?
+                .to_owned(),
+            port,
+            path_and_query,
+            headers: transport_headers,
+            body: body.to_vec(),
+        };
+        Ok(SignedRequest {
+            method,
+            url,
+            headers: request_headers,
+            transport,
+            body: body.to_vec(),
+        })
     }
 
     fn object_url(&self, object: &str) -> Result<(Url, String), Error> {
@@ -246,6 +359,19 @@ impl S3Client {
 
 async fn ensure_success(response: reqwest::Response) -> Result<(), Error> {
     ensure_success_response(response).await.map(|_| ())
+}
+
+fn ensure_transport_success(response: S3Response) -> Result<S3Response, Error> {
+    if (200..300).contains(&response.status) {
+        return Ok(response);
+    }
+    Err(Error::Response {
+        status: StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        body: String::from_utf8_lossy(&response.body)
+            .chars()
+            .take(1024)
+            .collect(),
+    })
 }
 
 async fn ensure_success_response(response: reqwest::Response) -> Result<reqwest::Response, Error> {
@@ -340,6 +466,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     #[derive(Debug)]
@@ -449,6 +576,84 @@ mod tests {
         assert_eq!(json["accessKey"], "key");
         assert_eq!(json["endpointUrl"], "https://s3.example");
         assert_eq!(serde_json::from_value::<S3Config>(json).unwrap(), config);
+    }
+
+    #[derive(Clone)]
+    struct CaptureTransport {
+        requests: Arc<Mutex<Vec<S3Request>>>,
+    }
+
+    impl S3Transport for CaptureTransport {
+        fn execute<'a>(&'a self, request: S3Request) -> BoxFuture<'a, Result<S3Response, Error>> {
+            let requests = Arc::clone(&self.requests);
+            Box::pin(async move {
+                let is_get = request.method == "GET";
+                requests.lock().unwrap().push(request);
+                Ok(S3Response {
+                    status: 200,
+                    body: if is_get {
+                        b"transport-body".to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_transport_receives_signed_request_and_returns_body() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = S3Client::with_transport(
+            S3Config {
+                enabled: true,
+                access_key: "access".to_owned(),
+                secret_key: "secret".to_owned(),
+                bucket: "bucket".to_owned(),
+                region: "us-east-1".to_owned(),
+                endpoint_url: "http://s3.example/base".to_owned(),
+                use_path_style: true,
+                storage_class: "STANDARD".to_owned(),
+            },
+            Arc::new(CaptureTransport {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .unwrap();
+
+        client.put("instance-state.db", b"snapshot").await.unwrap();
+        assert_eq!(
+            client.get("instance-state.db").await.unwrap(),
+            b"transport-body"
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "PUT");
+        assert_eq!(requests[0].path_and_query, "/base/bucket/instance-state.db");
+        assert_eq!(requests[0].host, "s3.example");
+        assert_eq!(requests[0].body, b"snapshot");
+        assert!(
+            requests[0]
+                .headers
+                .iter()
+                .any(|(name, value)| name == "authorization"
+                    && value.starts_with("AWS4-HMAC-SHA256 "))
+        );
+        assert_eq!(requests[1].method, "GET");
+        assert!(requests[1].body.is_empty());
+    }
+
+    #[test]
+    fn injected_transport_errors_keep_s3_status_and_body() {
+        let error = ensure_transport_success(S3Response {
+            status: 503,
+            body: b"temporarily unavailable".to_vec(),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Response { status, body } if status == StatusCode::SERVICE_UNAVAILABLE && body == "temporarily unavailable")
+        );
     }
 
     #[tokio::test]

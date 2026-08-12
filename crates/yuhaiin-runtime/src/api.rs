@@ -44,8 +44,9 @@ use yuhaiin_store::{
 use crate::update::UpdateService;
 use crate::{
     ProxyRouteListTransport, RouteListTransport, RuntimeController,
-    download_route_url_with_transport, interfaces::discover_interfaces, latency::LatencyRequest,
-    log::log_batch_value, refresh_route_list_caches_with_transport,
+    backup_transport::ProxyS3Transport, download_route_url_with_transport,
+    interfaces::discover_interfaces, latency::LatencyRequest, log::log_batch_value,
+    refresh_route_list_caches_with_transport,
 };
 
 // Go keeps TCP and UDP node selection independently in metadata.  Keep the
@@ -2898,7 +2899,7 @@ async fn run_backup_value(state: &ApiState) -> ApiResult {
     if !s3.enabled {
         return Err(ApiError::bad("backup.run requires enabled S3 backup"));
     }
-    let client = S3Client::new(s3.clone()).map_err(|error| ApiError::bad(error.to_string()))?;
+    let client = backup_s3_client(state, s3.clone()).await?;
     let object = backup_object_name(&config)?;
     let destination = backup_destination()?;
     let result = async {
@@ -2939,7 +2940,7 @@ async fn restore_backup_value(state: &ApiState, value: &Value) -> ApiResult {
                 "backup restore requires path/source/file or enabled S3 backup",
             ));
         }
-        let client = S3Client::new(s3).map_err(|error| ApiError::bad(error.to_string()))?;
+        let client = backup_s3_client(state, s3).await?;
         let object = backup_object_name(&config)?;
         let bytes = client
             .get(&object)
@@ -3387,6 +3388,22 @@ fn default_backup_config() -> Value {
 fn backup_s3_config(value: &Value) -> Result<S3Config, ApiError> {
     serde_json::from_value(value.get("s3").cloned().unwrap_or_else(|| json!({})))
         .map_err(|error| ApiError::bad(format!("invalid backup S3 configuration: {error}")))
+}
+
+async fn backup_s3_client(state: &ApiState, config: S3Config) -> Result<S3Client, ApiError> {
+    let selected = crate::inbound::selected_proxy_id(&state.controller)
+        .await
+        .map_err(|error| ApiError::unavailable(format!("select S3 outbound proxy: {error}")))?;
+    let proxy = state
+        .controller
+        .build_management_proxy(&selected, Duration::from_secs(30))
+        .await
+        .map_err(|error| ApiError::unavailable(format!("build S3 outbound proxy: {error}")))?;
+    S3Client::with_transport(
+        config,
+        Arc::new(ProxyS3Transport::new(proxy, Duration::from_secs(30))),
+    )
+    .map_err(|error| ApiError::bad(error.to_string()))
 }
 
 fn backup_object_name(value: &Value) -> Result<String, ApiError> {
