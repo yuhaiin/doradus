@@ -73,6 +73,23 @@ fn is_supported_inbound_transport(transport: &str) -> bool {
         || transport.eq_ignore_ascii_case("tls_auto")
 }
 
+/// Return whether a transport can be applied before the transparent protocol
+/// without losing the original destination address.
+///
+/// TLS, TLS-auto and AEAD are stream wrappers handled by
+/// `prepare_inbound_stream`; `http_mock` is a transparent Go listener
+/// wrapper. HTTP/2, WebSocket and PROXY protocol create logical or decoded
+/// streams whose local address is no longer the TPROXY/REDIRECT destination,
+/// so they remain rejected for this protocol path instead of silently routing
+/// to the listen address.
+pub(crate) fn is_supported_transparent_transport(transport: &str) -> bool {
+    transport.eq_ignore_ascii_case("normal")
+        || transport.eq_ignore_ascii_case("tls")
+        || transport.eq_ignore_ascii_case("tls_auto")
+        || transport.eq_ignore_ascii_case("aead")
+        || transport.eq_ignore_ascii_case("http_mock")
+}
+
 fn supports_socks5_udp(protocol: &str, protocol_udp: bool) -> bool {
     let protocol = protocol.trim();
     (protocol.eq_ignore_ascii_case("mixed") || protocol.eq_ignore_ascii_case("mix"))
@@ -567,9 +584,11 @@ async fn start_listeners(
                     spec.id
                 ));
             }
-            if spec.transports.iter().any(|transport| {
-                !transport.eq_ignore_ascii_case("normal") && !transport.eq_ignore_ascii_case("tls")
-            }) {
+            if spec
+                .transports
+                .iter()
+                .any(|transport| !is_supported_transparent_transport(transport))
+            {
                 monitor.warn(format!(
                     "skip inbound {}: transparent listener transport is not implemented",
                     spec.id
@@ -1145,11 +1164,9 @@ impl InboundSpec {
         if context.local_addr.is_none() {
             context.local_addr = Some(Endpoint::ip(context.network, self.listen));
         }
-        if self
-            .transports
-            .iter()
-            .any(|transport| transport.eq_ignore_ascii_case("tls"))
-        {
+        if self.transports.iter().any(|transport| {
+            transport.eq_ignore_ascii_case("tls") || transport.eq_ignore_ascii_case("tls_auto")
+        }) {
             // Go's inbound sniffer observes the raw connection before the
             // TLS listener unwraps it, so TLS has precedence over the
             // application protocol carried inside the encrypted stream.
@@ -2972,6 +2989,33 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         assert_eq!(context.process.as_deref(), Some("/usr/bin/inbound-client"));
         assert_eq!(context.process_id, Some(4242));
         assert_eq!(context.user_id, Some(1000));
+    }
+
+    #[test]
+    fn inbound_context_marks_tls_auto_as_tls_before_protocol_sniffing() {
+        let spec = InboundSpec {
+            id: "tls-auto-inbound".to_owned(),
+            name: "tls-auto-inbound".to_owned(),
+            protocol: "http".to_owned(),
+            listen: "127.0.0.1:18081".parse().unwrap(),
+            username: String::new(),
+            password: String::new(),
+            auth: None,
+            udp_mode: UdpMode::Disabled,
+            protocol_udp: false,
+            transports: vec!["tls_auto".to_owned()],
+            aead_password: None,
+            aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
+            outbound_id: "direct".to_owned(),
+            reverse_target: None,
+            reverse_http: None,
+        };
+        let mut context = FlowContext::new(Endpoint::ip(
+            Network::Tcp,
+            "198.51.100.12:443".parse().unwrap(),
+        ));
+        spec.annotate_context_with_process_resolver(&mut context, None);
+        assert_eq!(context.protocol.as_deref(), Some("tls"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

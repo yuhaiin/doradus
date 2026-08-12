@@ -544,6 +544,10 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_store::{ConfigStore, GoNodeRecord};
+
     #[cfg(feature = "doh-tls")]
     use std::io::Cursor;
 
@@ -552,13 +556,7 @@ mod tests {
     #[cfg(feature = "doh-tls")]
     use rustls::{ClientConfig, RootCertStore, ServerConfig};
     #[cfg(feature = "doh-tls")]
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    #[cfg(feature = "doh-tls")]
     use tokio_rustls::{TlsAcceptor, TlsConnector};
-    #[cfg(feature = "doh-tls")]
-    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
-    #[cfg(feature = "doh-tls")]
-    use yuhaiin_store::{ConfigStore, GoNodeRecord};
 
     #[cfg(feature = "doh-tls")]
     const CA_CERTIFICATE_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
@@ -632,7 +630,6 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         TlsConnector::from(Arc::new(config))
     }
 
-    #[cfg(feature = "doh-tls")]
     async fn direct_test_runtime() -> (Arc<RuntimeProxySelector>, Arc<ConnectionMonitor>) {
         use crate::{RuntimeBuilder, RuntimeController};
 
@@ -664,6 +661,80 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             .await
             .unwrap();
         (selector, controller.monitor())
+    }
+
+    #[test]
+    fn transparent_transport_allowlist_preserves_original_destination() {
+        for transport in ["normal", "tls", "tls_auto", "aead", "http_mock"] {
+            assert!(
+                crate::inbound::is_supported_transparent_transport(transport),
+                "transparent transport {transport} should be accepted"
+            );
+        }
+        for transport in ["http2", "websocket", "proxy", "mux", "reality", "quic"] {
+            assert!(
+                !crate::inbound::is_supported_transparent_transport(transport),
+                "transparent transport {transport} must not lose the original destination"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transparent_aead_transport_is_unwrapped_before_relay() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = target_listener.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let mut payload = Vec::new();
+            stream.read_to_end(&mut payload).await.unwrap();
+            stream.write_all(&payload).await.unwrap();
+        });
+
+        let inbound_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let inbound = inbound_listener.local_addr().unwrap();
+        let (selector, monitor) = direct_test_runtime().await;
+        let server_task = tokio::spawn(async move {
+            let (stream, peer) = inbound_listener.accept().await.unwrap();
+            let spec = InboundSpec {
+                id: "transparent-aead".to_owned(),
+                name: "transparent-aead".to_owned(),
+                protocol: "redir".to_owned(),
+                listen: inbound,
+                username: String::new(),
+                password: String::new(),
+                auth: None,
+                udp_mode: crate::inbound::UdpMode::Disabled,
+                protocol_udp: false,
+                transports: vec!["aead".to_owned()],
+                aead_password: Some("secret".to_owned()),
+                aead_method: yuhaiin_protocol::aead::CryptoMethod::XChacha20Poly1305,
+                outbound_id: "direct".to_owned(),
+                reverse_target: None,
+                reverse_http: None,
+            };
+            let stream = prepare_inbound_stream(stream, &spec, None, false)
+                .await
+                .unwrap();
+            handle_transparent_stream(stream, peer, "redir", spec, selector, monitor, target)
+                .await
+                .unwrap();
+        });
+
+        let mut client = yuhaiin_protocol::aead::client(
+            Box::new(TcpStream::connect(inbound).await.unwrap()),
+            b"secret",
+            yuhaiin_protocol::aead::CryptoMethod::XChacha20Poly1305,
+        )
+        .await
+        .unwrap();
+        client.write_all(b"transparent-aead-payload").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        client.read_to_end(&mut echoed).await.unwrap();
+        assert_eq!(echoed, b"transparent-aead-payload");
+
+        server_task.await.unwrap();
+        target_task.await.unwrap();
     }
 
     #[cfg(feature = "doh-tls")]

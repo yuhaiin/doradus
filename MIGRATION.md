@@ -4338,3 +4338,16 @@ router/outbound relay。Rust 之前在 `start_listeners` 看到 TLS acceptor 时
 同时重新执行 `make transparent-service-smoke`，Podman REDIRECT TCP `2 flows`、流量统计和关闭
 流程通过；当前 rootless capability policy 仍明确跳过 TPROXY UDP，rootful firewall matrix 的
 `[~]` 状态不变。
+
+## 161. 2026-08-12 透明 TCP transport allow-list 对齐 Go
+
+继续核对 Go `contractTransport` 后，透明 `redir`/`tproxy` 的 transport 不再只允许
+`normal`/`tls`：`tls_auto` 与普通 TLS 一样复用 `prepare_inbound_stream`，AEAD 也会在进入
+transparent relay 前完成 server handshake；Go 的 `http_mock` listener 不改变连接，因此同样
+可以安全复用。新增 transparent allow-list 单测和真实 AEAD→relay→direct→echo Podman 单测。
+
+`proxy`（PROXY protocol）、HTTP/2 和 WebSocket 没有被误标为支持：它们会消费或改变原始连接
+语义，当前仍显式拒绝，避免把 TPROXY/REDIRECT 的原始目的地址静默替换成 listener 地址。
+同时，`tls_auto` inbound 的 connection metadata 现在与 TLS 一样标记为 `protocol=tls`，避免
+TLS 握手后的协议嗅探覆盖 transport 级信息。当前轮 runtime 全量单测 `280/280`、透明
+transport focused `5/5`、`make transparent-service-smoke` 均在 Podman 通过。
