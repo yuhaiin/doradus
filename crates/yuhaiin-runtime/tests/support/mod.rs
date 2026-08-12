@@ -1209,6 +1209,17 @@ pub async fn configure_http_chain(
     inbound: SocketAddr,
     outbound: SocketAddr,
 ) {
+    configure_http_chain_with_transport(service, inbound, outbound, "http-chain-in", "normal")
+        .await;
+}
+
+pub async fn configure_http_chain_with_transport(
+    service: &ServiceProcess,
+    inbound: SocketAddr,
+    outbound: SocketAddr,
+    inbound_id: &str,
+    transport_type: &str,
+) {
     let node = json!({
         "id":"http-out",
         "name":"HTTP test outbound",
@@ -1262,12 +1273,14 @@ pub async fn configure_http_chain(
     )
     .await;
 
+    let mut transport = json!({"type":transport_type});
+    transport[transport_type] = json!({});
     let inbound = json!({
-        "id":"http-chain-in",
+        "id":inbound_id,
         "name":"HTTP chain inbound",
         "enabled":true,
         "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
-        "transports":[{"type":"normal","normal":{}}],
+        "transports":[transport],
         "protocol":{"type":"http","http":{"username":"","password":""}}
     });
     api_json(

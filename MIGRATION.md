@@ -4221,3 +4221,24 @@ runner 上先挡住产物契约回归；本轮在 Podman bash 中通过，action
 
 这仍不能替代首次 GitHub Actions 的 macOS SDK、Windows MSVC/ARM64 runner 和真实发布权限现场，
 所以清单中的远程 runner/原生权限 `[~]` 保持不变。验证没有使用宿主 `/tmp`。
+
+## 156. 2026-08-12 inbound 透明 transport 兼容
+
+对照 Go `pkg/inbound/contract_listener.go` 与 `pkg/net/proxy/{proxy,mock}` 后确认，
+`proxy` 和 `http_mock` 的 server `NewServer` 都只是返回传入的 listener；它们不会增加 TLS、
+HTTP/2、WebSocket 或其他 wire framing。Rust 此前把这两个 transport 当成未实现而跳过整个 inbound，
+这会让旧配置出现“配置存在但端口没有 listener”的兼容性缺口。
+
+本轮将 transport allow-list 集中到
+`crates/yuhaiin-runtime/src/inbounds/mod.rs::is_supported_inbound_transport`，让这两个类型
+进入已有的普通 TCP listener 分支；明确仍未实现的 `mux`、`reality`、`tls_auto`、QUIC 等不会被
+误放行。单元测试覆盖大小写、透明 wrapper 和 deferred 类型。新增的
+`transparent_go_inbound_transports_route_http` 通过 API 持久化配置，在同一个前台 runtime 中分别
+验证 `proxy`、`http_mock` 的 HTTP inbound → router → HTTP outbound → TCP echo，连接关闭后再进入
+下一种 transport，避免只测 parser。
+
+验证：Podman `service-chain-smoke` 18/18；包含新增透明 transport 2/2，以及原有 HTTP/2、TLS、
+Yuubinsya、mixed UDP、VLESS/VMess/Trojan、reverse 和 connections/traffic 链路。Rust allow-list
+单测在 Podman 通过 1/1。容器镜像未安装 rustfmt component，所以本轮没有把宿主或容器外的 fmt
+工具链问题冒充为源码失败；运行时、编译和测试仍全部在 Podman，临时状态继续位于
+`~/.cache/yuhaiin-rust`，未使用 `/tmp`。

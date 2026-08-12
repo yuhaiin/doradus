@@ -50,6 +50,25 @@ fn has_transport(transports: &[String], kind: &str) -> bool {
         .any(|transport| transport.eq_ignore_ascii_case(kind))
 }
 
+/// Return whether the listener supervisor can apply the Go inbound transport
+/// contract without adding another wire layer.
+///
+/// Go's `proxy` and `http_mock` server transports are transparent listener
+/// wrappers: their `NewServer` functions return the supplied listener and do
+/// not alter accepted connections.  They therefore deliberately share the
+/// normal TCP listener path here.  Keeping the allow-list in one function
+/// prevents the compatibility check in `start_listeners` from drifting away
+/// from the actual dispatch branches below.
+fn is_supported_inbound_transport(transport: &str) -> bool {
+    transport.eq_ignore_ascii_case("normal")
+        || transport.eq_ignore_ascii_case("tls")
+        || transport.eq_ignore_ascii_case("http2")
+        || transport.eq_ignore_ascii_case("websocket")
+        || transport.eq_ignore_ascii_case("aead")
+        || transport.eq_ignore_ascii_case("proxy")
+        || transport.eq_ignore_ascii_case("http_mock")
+}
+
 fn supports_socks5_udp(protocol: &str, protocol_udp: bool) -> bool {
     let protocol = protocol.trim();
     (protocol.eq_ignore_ascii_case("mixed") || protocol.eq_ignore_ascii_case("mix"))
@@ -511,13 +530,10 @@ async fn start_listeners(
             continue;
         }
         if !spec.transports.is_empty()
-            && spec.transports.iter().any(|transport| {
-                !transport.eq_ignore_ascii_case("normal")
-                    && !transport.eq_ignore_ascii_case("tls")
-                    && !transport.eq_ignore_ascii_case("http2")
-                    && !transport.eq_ignore_ascii_case("websocket")
-                    && !transport.eq_ignore_ascii_case("aead")
-            })
+            && spec
+                .transports
+                .iter()
+                .any(|transport| !is_supported_inbound_transport(transport))
         {
             monitor.warn(format!(
                 "skip inbound {}: configured transport is not implemented",
@@ -2205,6 +2221,31 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             .build()
             .unwrap();
         runtime.block_on(future)
+    }
+
+    #[test]
+    fn inbound_transport_allowlist_matches_go_transparent_wrappers() {
+        for transport in [
+            "normal",
+            "TLS",
+            "http2",
+            "websocket",
+            "aead",
+            "proxy",
+            "HTTP_MOCK",
+        ] {
+            assert!(
+                is_supported_inbound_transport(transport),
+                "transport {transport} should use the shared listener path"
+            );
+        }
+
+        for transport in ["mux", "reality", "tls_auto", "quic", "unknown"] {
+            assert!(
+                !is_supported_inbound_transport(transport),
+                "transport {transport} must remain explicitly deferred"
+            );
+        }
     }
 
     async fn direct_runtime() -> (Arc<RuntimeProxySelector>, Arc<ConnectionMonitor>) {

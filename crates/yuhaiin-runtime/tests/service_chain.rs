@@ -19,9 +19,10 @@ use support::{
     Socks5Fixture, YUUBINSYA_PASSWORD, add_mixed_udp_inbound, add_reverse_inbounds,
     add_socks5_inbound, add_yuubinsya_inbound, api_json, configure_h2_http_chain,
     configure_h2_http_inbound, configure_h2_socks5_chain, configure_http_chain,
-    configure_socks5_chain, configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain,
-    configure_tls_http_inbound, connect_loopback, connect_tls_h2_loopback, connect_tls_loopback,
-    integration_dir, seed_empty_database, tls_server_acceptor, wait_for_connection,
+    configure_http_chain_with_transport, configure_socks5_chain, configure_tls_h2_http_inbound,
+    configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound, connect_loopback,
+    connect_tls_h2_loopback, connect_tls_loopback, integration_dir, seed_empty_database,
+    tls_server_acceptor, wait_for_connection,
 };
 
 #[cfg(target_os = "linux")]
@@ -1381,6 +1382,52 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
     }
 
     service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_go_inbound_transports_route_http() {
+    let fixture = ConnectFixture::start().await;
+    let _default_mixed_blocker = tokio::net::TcpListener::bind("127.0.0.1:1080").await.ok();
+
+    for transport in ["proxy", "http_mock"] {
+        let inbound_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let inbound = inbound_listener.local_addr().unwrap();
+        drop(inbound_listener);
+
+        let root = integration_dir(&format!("service-http-transport-{transport}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("state.sqlite");
+        seed_empty_database(&database).await;
+        let service = ServiceProcess::start(&database).await;
+        let inbound_id = format!("http-{transport}-in");
+        configure_http_chain_with_transport(
+            &service,
+            inbound,
+            fixture.outbound,
+            &inbound_id,
+            transport,
+        )
+        .await;
+
+        let authority = format!("example.test:{}", fixture.target.port());
+        let (mut client, headers) = http_connect_with_auth(inbound, &authority, None)
+            .await
+            .unwrap();
+        assert!(
+            headers.starts_with("HTTP/1.1 200"),
+            "{transport} inbound response: {headers}"
+        );
+        let payload = format!("{transport}-inbound-transport");
+        client.write_all(payload.as_bytes()).await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, payload.as_bytes(), "transport {transport}");
+        client.shutdown().await.unwrap();
+
+        service.shutdown().await;
+    }
+
     fixture.shutdown().await;
 }
 
