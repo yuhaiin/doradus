@@ -95,6 +95,7 @@ impl LoopbackDetector {
         let Some(process) = context.process.as_deref() else {
             return false;
         };
+        let process = process.strip_suffix(" (deleted)").unwrap_or(process);
         if Path::new(process) != expected_path {
             return false;
         }
@@ -217,6 +218,9 @@ mod tests {
         let mut resolved = context("192.0.2.1:443");
         resolved.process = Some(path.to_string_lossy().into_owned());
         resolved.process_id = Some(42);
+        assert_eq!(detector.reason(&resolved), Some("loopback process"));
+
+        resolved.process = Some(format!("{} (deleted)", path.display()));
         assert_eq!(detector.reason(&resolved), Some("loopback process"));
 
         let mut domain = FlowContext::new(Endpoint::domain(

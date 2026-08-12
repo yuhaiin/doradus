@@ -3856,3 +3856,14 @@ TLS+WebSocket、Trojan 普通/TLS+WebSocket。`make clippy`、Rust/Go 格式检�
 这只扩展了 wire/transport 的真实 Go 兼容性证据，不把测试证书或 loopback fixture 外推为生产
 远端证书、HTTP/2 listener、地址族、UDP+TLS/WebSocket 或第三方节点的完整矩阵；这些边界继续由
 checklist 中的 `[~]` 项跟踪。
+
+## 134. 2026-08-12 前台启动、TUN API 和进程替换路径复验
+
+本轮没有重复修改已经闭合的启动/TUN supervisor 逻辑，而是按用户实际入口重新在 Podman 复验：
+
+- `make startup-logs-smoke` 不传命令，也不注入 `YUHAIIN_DB`、`YUHAIIN_HTTP` 或 `YUHAIIN_QUIET`，真实前台二进制依次输出 database、HTTP bind、runtime ready、shutdown 和 stopped；因此默认 `./yuhaiin` 不是无输出等待。只有显式 `YUHAIIN_QUIET=1` 才关闭前台进度。
+- `make tun-api-process-smoke` 通过真实 `/dev/net/tun` 和 `/proc/net/dev` 复验新增 TUN 的 disabled → enabled → disabled → enabled → disabled，确认 API 写入会唤醒 owner、创建并关闭设备，而不是只保存 SQLite 配置。
+- 完整 `make workspace-tests` 仍在 Podman 通过 48 个 harness：core 145、runtime 254、store 128、service-chain 16、WireGuard 7（1 个 benchmark ignored）、WireGuard runtime chain 2，0 失败；运行状态仍位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+- Linux `/proc/<pid>/exe` 在进程被替换后可能带有 ` (deleted)` 后缀；route-list process membership 和 loopback process guard 现在统一按去除该后缀后的路径比较，并由 route/loopback 单元回归覆盖。
+
+本轮仍没有把 rootful firewall/IPv6 extension-header 现场、第三方 WARP peer、真实 AWS、跨平台权限和远程 Actions 误报为完成；它们继续保持 checklist 的 `[~]`。

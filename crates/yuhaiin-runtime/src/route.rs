@@ -39,6 +39,14 @@ pub struct RouteListSnapshot {
     errors: BTreeMap<String, String>,
 }
 
+fn process_path_matches(actual: &str, expected: &str) -> bool {
+    fn without_deleted_suffix(path: &str) -> &str {
+        path.strip_suffix(" (deleted)").unwrap_or(path)
+    }
+
+    without_deleted_suffix(actual) == without_deleted_suffix(expected)
+}
+
 impl RouteListSnapshot {
     pub fn values(&self, name: &str) -> Option<&[String]> {
         self.values.get(name).map(Vec::as_slice)
@@ -65,10 +73,11 @@ impl RouteListSnapshot {
         for (name, values) in &self.values {
             let kind = self.kinds.get(name).map(String::as_str).unwrap_or_default();
             let matched = if kind == "process" || kind == "processes" {
-                context
-                    .process
-                    .as_deref()
-                    .is_some_and(|process| values.iter().any(|value| value == process))
+                context.process.as_deref().is_some_and(|process| {
+                    values
+                        .iter()
+                        .any(|value| process_path_matches(process, value))
+                })
             } else {
                 self.host_indexes
                     .get(name)
@@ -1923,6 +1932,28 @@ mod tests {
 
         context.process = Some("/usr/bin/other-app".to_owned());
         assert_eq!(lists.matching_names(&context), vec!["domains"]);
+    }
+
+    #[test]
+    fn route_list_snapshot_accepts_deleted_process_executable_suffix() {
+        let lists = load_route_lists(&[GoRouteListRecord {
+            name: "apps".to_owned(),
+            list_type: "process".to_owned(),
+            source_type: "local".to_owned(),
+            updated_at: 1,
+            data_json: br#"{
+                "type":"process",
+                "source":{"type":"local","local":{"lists":["/usr/bin/example-app"]}}
+            }"#
+            .to_vec(),
+        }]);
+        let mut context = FlowContext::new(Endpoint::domain(
+            Network::Tcp,
+            DomainName::new("example.com").unwrap(),
+            443,
+        ));
+        context.process = Some("/usr/bin/example-app (deleted)".to_owned());
+        assert_eq!(lists.matching_names(&context), vec!["apps"]);
     }
 
     #[test]
