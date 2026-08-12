@@ -4,6 +4,11 @@ CARGO ?= cargo
 RUSTC ?= rustc
 CACHE_ROOT ?= $(HOME)/.cache/yuhaiin-rust
 CARGO_TARGET_DIR ?= $(CACHE_ROOT)/cargo-target
+PODMAN_CARGO ?= ./scripts/integration/podman-cargo.sh
+PODMAN_CARGO_STATE_DIR ?= $(CACHE_ROOT)/integration/make-cargo
+# Cargo/rustc commands are containerized by default. Set HOST_CARGO=1 only for
+# local toolchain debugging; integration tests remain Podman-owned either way.
+HOST_CARGO ?= 0
 ANDROID_NDK ?= /opt/android-ndk
 ANDROID_API ?= 35
 ANDROID_TARGET ?= aarch64-linux-android
@@ -11,9 +16,15 @@ ANDROID_CLANG ?= $(ANDROID_NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin/$(ANDR
 ANDROID_LLVM_AR ?= $(ANDROID_NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
 MUSL ?= 0
 MUSL_TARGET ?= x86_64-unknown-linux-musl
+ifeq ($(HOST_CARGO),1)
 RUST_SYSROOT ?= $(shell $(RUSTC) --print sysroot)
 RUST_HOST ?= $(shell $(RUSTC) -vV | sed -n 's/^host: //p')
 MUSL_LINKER ?= $(RUST_SYSROOT)/lib/rustlib/$(RUST_HOST)/bin/rust-lld
+else
+# The container owns rustc/rust-lld in the default path; avoid invoking a
+# host compiler merely while Make expands variables.
+MUSL_LINKER ?= rust-lld
+endif
 
 # FEATURES is additive to the package's default features. Set
 # NO_DEFAULT_FEATURES=1 when a smaller feature set is required.
@@ -31,6 +42,33 @@ CARGO_TARGET_ARGS :=
 CARGO_BUILD_ENV :=
 DEBUG_BINARY_DIR := $(CARGO_TARGET_DIR)/debug
 RELEASE_BINARY_DIR := $(CARGO_TARGET_DIR)/release
+endif
+ifeq ($(HOST_CARGO),1)
+CARGO_EXEC := $(CARGO)
+CARGO_EXEC_COMMON_ARGS := $(CARGO_COMMON_ARGS)
+CARGO_EXEC_TARGET_ARGS := $(CARGO_TARGET_ARGS)
+CARGO_EXEC_BUILD_ENV := $(CARGO_BUILD_ENV)
+else
+CARGO_EXEC_COMMON_ARGS := --target-dir /target
+CARGO_EXEC_TARGET_ARGS := $(CARGO_TARGET_ARGS)
+ifeq ($(MUSL),1)
+CARGO_EXEC_BUILD_ENV :=
+CARGO_EXEC_PODMAN_ENV := --env "RUSTFLAGS=$(strip $(RUSTFLAGS)) -C linker=rust-lld"
+CARGO_EXEC_PODMAN_TARGET := --install-target "$(MUSL_TARGET)"
+CARGO_EXEC_PODMAN_MUSL := --install-musl-toolchain
+else
+CARGO_EXEC_BUILD_ENV :=
+CARGO_EXEC_PODMAN_ENV :=
+CARGO_EXEC_PODMAN_TARGET :=
+CARGO_EXEC_PODMAN_MUSL :=
+endif
+CARGO_EXEC := $(PODMAN_CARGO) --target-dir "$(CARGO_TARGET_DIR)" --state-dir "$(PODMAN_CARGO_STATE_DIR)" $(CARGO_EXEC_PODMAN_ENV) $(CARGO_EXEC_PODMAN_TARGET) $(CARGO_EXEC_PODMAN_MUSL) -- cargo
+CARGO_CLIPPY_EXEC := $(PODMAN_CARGO) --target-dir "$(CARGO_TARGET_DIR)" --state-dir "$(PODMAN_CARGO_STATE_DIR)" $(CARGO_EXEC_PODMAN_ENV) $(CARGO_EXEC_PODMAN_TARGET) $(CARGO_EXEC_PODMAN_MUSL) --install-component clippy -- cargo
+CARGO_FMT_CHECK_EXEC := $(PODMAN_CARGO) --target-dir "$(CARGO_TARGET_DIR)" --state-dir "$(PODMAN_CARGO_STATE_DIR)" --install-component rustfmt -- cargo
+endif
+ifeq ($(HOST_CARGO),1)
+CARGO_CLIPPY_EXEC := $(CARGO)
+CARGO_FMT_CHECK_EXEC := $(CARGO)
 endif
 ifeq ($(NO_DEFAULT_FEATURES),1)
 FEATURE_ARGS := --no-default-features
@@ -51,9 +89,9 @@ help:
 	@printf '%s\n' \
 		'make cache-usage        show generated Rust cache usage' \
 		'make cache-prune        remove stale integration outputs; preserve cargo-target/fixtures' \
-		'make build              build the yuhaiin runtime binary (debug)' \
-		'make build-release      build the yuhaiin runtime binary (release)' \
-		'make build MUSL=1       build a static musl debug binary' \
+		'make build              build the yuhaiin runtime binary in Podman (debug)' \
+		'make build-release      build the yuhaiin runtime binary in Podman (release)' \
+		'make build MUSL=1       build a static musl debug binary in Podman' \
 		'make build-musl         alias for make build MUSL=1' \
 		'make build-release-musl build a static musl release binary' \
 		'make build-all-bins     build every workspace binary' \
@@ -108,6 +146,7 @@ help:
 		'make test               run the full workspace test suite' \
 		'make fmt-check          verify Rust formatting' \
 		'make clippy             run workspace Clippy checks' \
+		'HOST_CARGO=1           opt into host Cargo only for local toolchain debugging' \
 		'make android-aarch64   cross-build for Android arm64' \
 		'' \
 		'CARGO_TARGET_DIR=$(CARGO_TARGET_DIR)' \
@@ -124,11 +163,11 @@ cache-prune:
 build: build-debug
 
 build-debug:
-	$(CARGO_BUILD_ENV) $(CARGO) build $(CARGO_COMMON_ARGS) $(CARGO_TARGET_ARGS) -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
 	@printf 'binary: %s/%s\n' "$(DEBUG_BINARY_DIR)" "$(RUNTIME_BIN)"
 
 build-release:
-	$(CARGO_BUILD_ENV) $(CARGO) build $(CARGO_COMMON_ARGS) $(CARGO_TARGET_ARGS) --release -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) --release -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
 	@printf 'binary: %s/%s\n' "$(RELEASE_BINARY_DIR)" "$(RUNTIME_BIN)"
 
 build-musl:
@@ -138,14 +177,14 @@ build-release-musl:
 	$(MAKE) MUSL=1 build-release
 
 build-all-bins:
-	$(CARGO) build $(CARGO_COMMON_ARGS) --workspace --bins --all-features
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) --workspace --bins --all-features
 
 build-tun-smoke:
-	$(CARGO) build $(CARGO_COMMON_ARGS) -p yuhaiin-core --bin tun-smoke --features tun
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p yuhaiin-core --bin tun-smoke --features tun
 	@printf 'binary: %s/debug/tun-smoke\n' "$(CARGO_TARGET_DIR)"
 
 build-tun-service-smoke:
-	$(CARGO) build $(CARGO_COMMON_ARGS) -p $(RUNTIME_PACKAGE) --bin tun-service-smoke --all-features
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p $(RUNTIME_PACKAGE) --bin tun-service-smoke --all-features
 	@printf 'binary: %s/debug/tun-service-smoke\n' "$(CARGO_TARGET_DIR)"
 
 tun-service-smoke:
@@ -200,7 +239,7 @@ s3-minio-smoke:
 	./scripts/integration/s3-minio.sh
 
 build-transparent-service-smoke:
-	$(CARGO) build $(CARGO_COMMON_ARGS) -p $(RUNTIME_PACKAGE) --bin transparent-service-smoke --all-features
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p $(RUNTIME_PACKAGE) --bin transparent-service-smoke --all-features
 	@printf 'binary: %s/debug/transparent-service-smoke\n' "$(CARGO_TARGET_DIR)"
 
 transparent-service-smoke:
@@ -287,17 +326,17 @@ startup-logs-smoke:
 	./scripts/integration/startup-logs.sh
 
 build-chain-smoke:
-	$(CARGO) build $(CARGO_COMMON_ARGS) -p yuhaiin-chain --bin chain-smoke
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p yuhaiin-chain --bin chain-smoke
 	@printf 'binary: %s/debug/chain-smoke\n' "$(CARGO_TARGET_DIR)"
 
 run:
-	$(CARGO) run $(CARGO_COMMON_ARGS) -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS) -- $(ARGS)
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) run $(CARGO_EXEC_COMMON_ARGS) -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS) -- $(ARGS)
 
 version: build-debug
 	"$(DEBUG_BINARY_DIR)/$(RUNTIME_BIN)" version
 
 check:
-	$(CARGO) check $(CARGO_COMMON_ARGS) --workspace --all-features
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) check $(CARGO_EXEC_COMMON_ARGS) --workspace --all-features
 
 workspace-tests:
 	./scripts/integration/workspace-tests.sh
@@ -308,12 +347,16 @@ fmt:
 	$(CARGO) fmt --all
 
 fmt-check:
-	$(CARGO) fmt --all -- --check
+	$(CARGO_FMT_CHECK_EXEC) fmt --all -- --check
 
 clippy:
-	$(CARGO) clippy $(CARGO_COMMON_ARGS) --workspace --all-targets --all-features -- -D warnings
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_CLIPPY_EXEC) clippy $(CARGO_EXEC_COMMON_ARGS) --workspace --all-targets --all-features -- -D warnings
 
 android-aarch64:
+	@test "$(HOST_CARGO)" = 1 || { \
+		echo "android-aarch64 requires HOST_CARGO=1 because the NDK is host-owned; Android is outside the desktop container path." >&2; \
+		exit 1; \
+	}
 	@test -x "$(ANDROID_CLANG)" || { \
 		echo "Android linker not found: $(ANDROID_CLANG)" >&2; \
 		echo "Set ANDROID_NDK, ANDROID_API, or ANDROID_CLANG to override it." >&2; \

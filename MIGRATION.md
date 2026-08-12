@@ -7,6 +7,12 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
+> 2026-08-13 构建入口容器化：Makefile 的 `build`、`build-release`、`check`、`clippy` 及各类 smoke binary build 默认经由
+> `scripts/integration/podman-cargo.sh` 执行，宿主只负责调度，target/state/cache 位于
+> `~/.cache/yuhaiin-rust`。`make build MUSL=1` 会在容器内按需安装 musl Rust target、Debian
+> `musl-tools` 和 `rust-lld`，已通过 x86_64 static debug binary；只有显式 `HOST_CARGO=1` 才使用宿主 Cargo，Android
+> 仍需显式使用宿主 NDK 工具链。Podman 构建入口将 `TMPDIR` 固定在缓存挂载的 `/state/cache/tmp`，不使用宿主 `/tmp`。
+
 > 2026-08-11 启动可诊断性与 checklist 重排：foreground binary 默认把启动、API bind、runtime ready、shutdown/stopped 写到 stderr；
 > `YUHAIIN_QUIET` 只有 `1/true/yes/on` 才会关闭这些 console notice，避免环境中设置 `YUHAIIN_QUIET=0` 时误以为没有日志。
 > `IMPLEMENTATION_CHECKLIST.md` 现在按 crate 模块树、协议矩阵、未完成项和验收命令组织；rootful TUN route lease、RST/reconnect 与 TPROXY UDP delivery/idle/force-stop 已有独立 VM 现场证据，但 TUN kernel fragment、Android/macOS 和生产/发布现场仍保留为 `[~]`，不能从单元测试覆盖率推导为完整替换。
