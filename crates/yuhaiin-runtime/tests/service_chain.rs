@@ -21,7 +21,7 @@ use support::{
     configure_h2_socks5_chain, configure_http_chain, configure_socks5_chain,
     configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound,
     connect_loopback, connect_tls_h2_loopback, connect_tls_loopback, integration_dir,
-    seed_empty_database, wait_for_connection,
+    seed_empty_database, tls_server_acceptor, wait_for_connection,
 };
 
 #[cfg(target_os = "linux")]
@@ -119,6 +119,7 @@ enum ProtocolOutboundKind {
     Vmess,
     Trojan,
     TrojanWebsocket,
+    TrojanTlsWebsocket,
 }
 
 impl ProtocolOutboundKind {
@@ -128,6 +129,7 @@ impl ProtocolOutboundKind {
             Self::Vmess => "vmess",
             Self::Trojan => "trojan",
             Self::TrojanWebsocket => "trojan-websocket",
+            Self::TrojanTlsWebsocket => "trojan-tls-websocket",
         }
     }
 
@@ -188,6 +190,18 @@ async fn protocol_outbound_server(
                 let mut stream = WebSocketIo::new(websocket);
                 serve_trojan_connection(&mut stream, connection, destination, expected_payload)
                     .await;
+                // Keep the WebSocket peer alive long enough for the runtime
+                // monitor to publish the connection before the fixture drops
+                // the close event.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            ProtocolOutboundKind::TrojanTlsWebsocket => {
+                let stream = tls_server_acceptor().accept(stream).await.unwrap();
+                let websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut stream = WebSocketIo::new(websocket);
+                serve_trojan_connection(&mut stream, connection, destination, expected_payload)
+                    .await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
             ProtocolOutboundKind::Vmess => {
                 const UUID: [u8; 16] = [
@@ -270,9 +284,7 @@ async fn serve_trojan_connection<S>(
         let request = read_http_headers(stream).await;
         assert!(request.starts_with(b"GET /health HTTP/1.1\r\n"));
         stream
-            .write_all(
-                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
     }
@@ -355,7 +367,7 @@ async fn protocol_udp_outbound_server(
             .await
             .unwrap();
         }
-        ProtocolOutboundKind::TrojanWebsocket => {
+        ProtocolOutboundKind::TrojanWebsocket | ProtocolOutboundKind::TrojanTlsWebsocket => {
             panic!("Trojan WebSocket does not expose a datagram transport");
         }
     }
@@ -411,12 +423,31 @@ async fn configure_protocol_outbound_chain(
             "type":"trojan",
             "trojan":{"password":"runtime-protocol-password"}
         }),
+        ProtocolOutboundKind::TrojanTlsWebsocket => json!({
+            "type":"trojan",
+            "trojan":{"password":"runtime-protocol-password"}
+        }),
     };
     let mut chain = vec![json!({
         "type":"fixed",
         "fixed":{"host":"127.0.0.1","port":server.port()}
     })];
-    if matches!(kind, ProtocolOutboundKind::TrojanWebsocket) {
+    if matches!(kind, ProtocolOutboundKind::TrojanTlsWebsocket) {
+        chain.push(json!({
+            "type":"tls",
+            "tls":{
+                "enable":true,
+                "insecure_skip_verify":true,
+                "servernames":["localhost"],
+                "next_protos":["http/1.1"],
+                "ca_cert":[]
+            }
+        }));
+    }
+    if matches!(
+        kind,
+        ProtocolOutboundKind::TrojanWebsocket | ProtocolOutboundKind::TrojanTlsWebsocket
+    ) {
         chain.push(json!({
             "type":"websocket",
             "websocket":{"host":"localhost","path":"/trojan"}
@@ -487,11 +518,13 @@ async fn configure_protocol_outbound_chain(
 }
 
 async fn run_protocol_outbound_chain(kind: ProtocolOutboundKind) {
+    eprintln!("starting protocol outbound integration: {}", kind.name());
     let expected_payload: &'static [u8] = match kind {
         ProtocolOutboundKind::Vless => b"runtime-vless-outbound",
         ProtocolOutboundKind::Vmess => b"runtime-vmess-outbound",
         ProtocolOutboundKind::Trojan => b"runtime-trojan-outbound",
         ProtocolOutboundKind::TrojanWebsocket => b"runtime-trojan-websocket-outbound",
+        ProtocolOutboundKind::TrojanTlsWebsocket => b"runtime-trojan-tls-websocket-outbound",
     };
     let protocol_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let protocol_server = protocol_listener.local_addr().unwrap();
@@ -530,7 +563,32 @@ async fn run_protocol_outbound_chain(kind: ProtocolOutboundKind) {
     client.read_exact(&mut echoed).await.unwrap();
     assert_eq!(&echoed, expected_payload);
 
-    let connections = wait_for_connection(&service.client, &service.base_url).await;
+    let mut connections = json!({});
+    let mut visible = false;
+    for _ in 0..500 {
+        connections = api_json(
+            &service.client,
+            &service.base_url,
+            reqwest::Method::GET,
+            "/api/v2/connections",
+            None,
+        )
+        .await;
+        if connections["connections"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+        {
+            visible = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        visible,
+        "{} connection did not become visible; connections={connections}; diagnostics={}",
+        kind.name(),
+        service.diagnostics()
+    );
     let inbound_id = kind.inbound_id();
     let node_id = kind.node_id();
     let item = connections["connections"]
@@ -588,7 +646,7 @@ async fn run_protocol_udp_outbound_chain(kind: ProtocolOutboundKind) {
         ProtocolOutboundKind::Vless => b"runtime-vless-udp-outbound",
         ProtocolOutboundKind::Vmess => b"runtime-vmess-udp-outbound",
         ProtocolOutboundKind::Trojan => b"runtime-trojan-udp-outbound",
-        ProtocolOutboundKind::TrojanWebsocket => {
+        ProtocolOutboundKind::TrojanWebsocket | ProtocolOutboundKind::TrojanTlsWebsocket => {
             panic!("Trojan WebSocket does not expose a datagram transport")
         }
     };
@@ -668,6 +726,7 @@ async fn runtime_protocol_outbounds_round_trip_through_http_router() {
         ProtocolOutboundKind::Vmess,
         ProtocolOutboundKind::Trojan,
         ProtocolOutboundKind::TrojanWebsocket,
+        ProtocolOutboundKind::TrojanTlsWebsocket,
     ] {
         run_protocol_outbound_chain(kind).await;
     }

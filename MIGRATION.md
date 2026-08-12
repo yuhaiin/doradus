@@ -3783,3 +3783,22 @@ core 145、runtime 253、store 128、service-chain 16、WireGuard 7、WireGuard 
 这只证明 Trojan WebSocket builder 和现有协议边界已经接通，不把单元 builder 证据外推为
 真实远端 Trojan WebSocket listener/UDP/地址族完整矩阵；VLESS/VMess/Trojan 总项继续保持
 `[~]`，下一步仍是更广 runtime listener/outbound 与远端组合现场。
+
+## 130. 2026-08-12 TLS + WebSocket + Trojan runtime 组合
+
+在上一轮只覆盖明文 WebSocket transport 的基础上，继续把 Go 允许的
+`fixedv2 -> tls -> websocket -> trojan` 组合接入同一个真实 service-chain matrix。测试 fixture
+使用 RustCrypto TLS server acceptor（只用于测试证书，client 侧明确 `insecure_skip_verify`），然后
+接受 HTTP/1.1 WebSocket upgrade，再由同一 Trojan framing handler 校验两条连接的目标地址、payload
+和 health request。runtime builder 复用已经存在的 stream transport 顺序：fixed endpoint → TLS →
+WebSocket → Trojan，不复制协议实现，也不改变普通 Trojan/VLESS/VMess 的选择逻辑。
+
+`make service-chain-smoke` 在 Podman host-network 中通过 16/16；protocol matrix 现在包含
+Trojan→WebSocket 和 TLS→WebSocket→Trojan 两条 TCP 真实链路。随后完整 `make workspace-tests`
+再次通过 48 个 harness：core 145、runtime 253、store 128、service-chain 16、WireGuard 7（1 个
+benchmark ignored）、WireGuard runtime chain 2，0 失败。workspace 编排也固定让共享持久化状态的
+`api_reload_flow` harness 使用 `--test-threads=1`，避免两个 reload case 互相覆盖端口和配置名。
+工作区状态和日志仍位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
+这补齐了当前主要 transport builder 的本地组合证据，但不把它外推为真实远端证书、地址族、UDP
+或更广 listener/HTTP2 组合的完整 Go 兼容性；VLESS/VMess/Trojan 总项继续保持 `[~]`。

@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
-use tokio_rustls::{TlsConnector, client::TlsStream};
+use tokio_rustls::{TlsAcceptor, TlsConnector, client::TlsStream};
 use yuhaiin_chain::{YuubinsyaH2Server, YuubinsyaServerProxy};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, DirectAsyncProxy};
 use yuhaiin_core::yuubinsya::derive_salt;
@@ -455,7 +455,7 @@ impl H2YuubinsyaFixture {
     }
 }
 
-fn yuubinsya_server_config() -> Arc<ServerConfig> {
+fn build_tls_server_config(alpn_protocols: Vec<Vec<u8>>) -> Arc<ServerConfig> {
     let certificate = rustls_pemfile::certs(&mut Cursor::new(LEAF_CERTIFICATE_PEM))
         .next()
         .unwrap()
@@ -475,8 +475,16 @@ fn yuubinsya_server_config() -> Arc<ServerConfig> {
             key,
         )
         .unwrap();
-    config.alpn_protocols = vec![b"h2".to_vec()];
+    config.alpn_protocols = alpn_protocols;
     Arc::new(config)
+}
+
+pub fn tls_server_acceptor() -> TlsAcceptor {
+    TlsAcceptor::from(build_tls_server_config(Vec::new()))
+}
+
+fn yuubinsya_server_config() -> Arc<ServerConfig> {
+    build_tls_server_config(vec![b"h2".to_vec()])
 }
 
 // Keep the proxy fixture's receiver independent from the target receiver. The

@@ -86,6 +86,7 @@ run_in_podman() {
         echo "[workspace-tests] ${test_binary}"
         case "${test_binary##*/}" in
           service_chain-*) "${test_binary}" --nocapture --test-threads=1 ;;
+          api_reload_flow-*) "${test_binary}" --nocapture --test-threads=1 ;;
           *) "${test_binary}" --nocapture ;;
         esac
       done
@@ -99,8 +100,9 @@ run_in_podman() {
 # Rootless `--network=none` has a known loopback/HTTP2 discrepancy in this
 # environment. Keep ordinary harnesses isolated, give the process-level stats
 # harness its own disposable namespace because it force-stops child services,
-# and run the process-chain harnesses in their own Podman host-network mode.
-# Every path still executes only inside containers.
+# serialize the API reload harness because its two cases intentionally share a
+# persistent state directory, and run the process-chain harnesses in their own
+# Podman host-network mode. Every path still executes only inside containers.
 run_in_podman none "${scenario_dir}/podman-isolated.log" "${isolated_binaries[@]}"
 run_in_podman none "${scenario_dir}/podman-stats.log" "${stats_binaries[@]}"
 run_in_podman host "${scenario_dir}/podman-service-chain.log" "${host_network_binaries[@]}"
