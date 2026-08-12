@@ -46,6 +46,9 @@ echo "[go-protocol-interop] compiling Rust harnesses in Podman"
   --no-run \
   >"${scenario_dir}/protocol-build.log" 2>&1
 
+# podman-cargo compiles with CARGO_MANIFEST_DIR=/workspace. Each runtime
+# container therefore mounts the repository at that path as well as at its
+# host path, so Go helper sources used by ignored tests resolve correctly.
 tests=(go_yuubinsya_interop go_websocket_interop standalone_http2)
 for test_name in "${tests[@]}"; do
   harness_path="$(sed -n "s#^  Executable tests/${test_name}\.rs (\(.*\))\$#\1#p" "${scenario_dir}/build.log" | tail -n 1)"
@@ -61,6 +64,7 @@ for test_name in "${tests[@]}"; do
   podman run --rm --network=host \
     -v "${target_dir}:/target:ro" \
     -v "${scenario_dir}:/state:Z" \
+    -v "${repo_root}:/workspace:ro" \
     -v "${repo_root}:${repo_root}:ro" \
     -v "${go_checkout}:${go_checkout}:ro" \
     -v "${go_root}:/go-root:ro" \
@@ -97,6 +101,7 @@ for test_name in "${protocol_tests[@]}"; do
   podman run --rm --network=host \
     -v "${target_dir}:/target:ro" \
     -v "${scenario_dir}:/state:Z" \
+    -v "${repo_root}:/workspace:ro" \
     -v "${repo_root}:${repo_root}:ro" \
     -v "${go_checkout}:${go_checkout}:ro" \
     -v "${go_root}:/go-root:ro" \
