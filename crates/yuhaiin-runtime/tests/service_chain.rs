@@ -754,7 +754,7 @@ async fn configure_protocol_h2_outbound_chain(
         "group":"integration",
         "enabled":true,
         "chain":[
-            {"type":"fixed","fixed":{"host":"127.0.0.1","port":server.port()}},
+            {"type":"fixed","fixed":{"host":server.ip().to_string(),"port":server.port()}},
             {"type":"http2","http2":{"concurrency":1,"max_streams":8,"idle_timeout_secs":30}},
             protocol_layer
         ]
@@ -814,9 +814,13 @@ async fn configure_protocol_h2_outbound_chain(
 }
 
 async fn run_protocol_h2_outbound_chain(kind: ProtocolOutboundKind) {
+    run_protocol_h2_outbound_chain_on_host(kind, "127.0.0.1").await;
+}
+
+async fn run_protocol_h2_outbound_chain_on_host(kind: ProtocolOutboundKind, bind_host: &str) {
     eprintln!(
-        "starting HTTP/2 protocol outbound integration: {}",
-        kind.name()
+        "starting HTTP/2 protocol outbound integration: {} host={bind_host}",
+        kind.name(),
     );
     let expected_payload: &'static [u8] = match kind {
         ProtocolOutboundKind::Vless => b"runtime-vless-http2-outbound",
@@ -829,7 +833,7 @@ async fn run_protocol_h2_outbound_chain(kind: ProtocolOutboundKind) {
             panic!("TLS/WebSocket protocol variants are not part of this H2 fixture")
         }
     };
-    let protocol_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let protocol_listener = TcpListener::bind((bind_host, 0)).await.unwrap();
     let protocol_server = protocol_listener.local_addr().unwrap();
     let server_task = tokio::spawn(protocol_h2_outbound_server(
         kind,
@@ -1212,6 +1216,17 @@ async fn runtime_protocol_outbounds_round_trip_through_http2_transport() {
         ProtocolOutboundKind::Trojan,
     ] {
         run_protocol_h2_outbound_chain(kind).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_protocol_outbounds_round_trip_through_ipv6_http2_transport() {
+    for kind in [
+        ProtocolOutboundKind::Vless,
+        ProtocolOutboundKind::Vmess,
+        ProtocolOutboundKind::Trojan,
+    ] {
+        run_protocol_h2_outbound_chain_on_host(kind, "::1").await;
     }
 }
 

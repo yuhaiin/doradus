@@ -4383,3 +4383,22 @@ nameserver 并走 UDP；runtime DNS handler 对未建模 QTYPE 走这个 packet 
 新增 UDP/TCP raw TXT query unit、runtime raw DNS unit；Podman 中 core
 `--all-features` 为 `150 passed, 0 failed`，runtime raw DNS focused 为
 `1 passed, 0 failed`。宿主只执行了 `cargo fmt`/diff 检查，未使用 `/tmp`。
+
+## 163. 2026-08-13 协议 outbound 的 IPv6/HTTP2 地址族回归
+
+此前 VLESS、VMess、Trojan 经 HTTP/2 的 runtime service-chain 只在 IPv4
+loopback 上验证。这样不能证明 fixed transport、resolver endpoint 和 HTTP/2
+pool 在 IPv6 地址上仍按同一条入站→router→outbound 流程工作。
+
+本轮将 HTTP/2 protocol fixture 的 fixed host 改为使用 listener 的实际 IP，
+并新增 `runtime_protocol_outbounds_round_trip_through_ipv6_http2_transport`：
+服务端监听 `::1`，Rust 前台 runtime 通过 HTTP inbound、domain router、HTTP/2
+transport 依次跑 VLESS、VMess、Trojan，逐条校验 payload echo、connections
+metadata、selected node 和 proxy mode。Podman focused 结果为 `1 passed`，
+测试内部覆盖 3 个 IPv6 protocol chain；原有 IPv4 HTTP/2 test 仍保留，避免
+地址族参数化掩盖 IPv4 回归。
+
+本轮只改 integration fixture，不把 IPv6 loopback 证据扩大解释为公网 IPv6、
+远端 UDP 或所有发行版 firewall 兼容；这些仍按 `IMPLEMENTATION_CHECKLIST.md`
+的 `[~]` 范围处理。构建和运行均在 Podman，缓存位于
+`~/.cache/yuhaiin-rust`，未使用 `/tmp`。
