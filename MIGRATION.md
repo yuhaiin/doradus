@@ -4206,3 +4206,18 @@ helper；Go live/stats/refact-user 的 Go binary 也通过 Go helper 构建。ru
 通过。Go 首次完整依赖编译后缓存约 49G，其中 `go-cache` 约 1.9G、主 `cargo-target` 约 25G；
 没有删除缓存，也没有使用宿主 `/tmp`。现有历史记录中“宿主只编译”的描述保留为历史证据，
 当前脚本执行边界以本节和清单顶部为准。
+
+## 155. 2026-08-12 发布矩阵契约与 actionlint 回归
+
+审计六平台发布 workflow 时，Podman 中的 actionlint 发现两个不会影响 Linux 本地构建、但会让
+CI shell 检查变脆的问题：多个 `GITHUB_ENV` 重定向触发 SC2129，以及 `sha256sum *` 在文件名
+以 `-` 开头时触发 SC2035。现在将环境变量写入合并为单次重定向，并使用 `sha256sum -- *`。
+
+新增 `scripts/maintenance/check-release-contract.sh` 和 `make release-contract-smoke`。它不访问
+GitHub，而是逐项检查 workflow 中的 Linux musl、Darwin、Windows 六个 target/runner 映射，Rust
+release 命令、`--all-features`、artifact upload/download、六个最终文件名、checksum、tag 发布和
+`main` rolling tag 更新条件。该检查已加入 `checks` job，因此以后每次 PR/push 都会在真正的远程
+runner 上先挡住产物契约回归；本轮在 Podman bash 中通过，actionlint 输出为空。
+
+这仍不能替代首次 GitHub Actions 的 macOS SDK、Windows MSVC/ARM64 runner 和真实发布权限现场，
+所以清单中的远程 runner/原生权限 `[~]` 保持不变。验证没有使用宿主 `/tmp`。

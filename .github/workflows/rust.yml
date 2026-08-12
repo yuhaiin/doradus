@@ -40,6 +40,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check release artifact contract
+        run: make release-contract-smoke
+
       - name: Run Clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
@@ -128,9 +131,11 @@ jobs:
           test -x "${archiver}"
 
           echo "${toolchain_root}/bin" >> "${GITHUB_PATH}"
-          echo "CARGO_TARGET_${target_env}_LINKER=${compiler}" >> "${GITHUB_ENV}"
-          echo "CC_${target_env}=${compiler}" >> "${GITHUB_ENV}"
-          echo "AR_${target_env}=${archiver}" >> "${GITHUB_ENV}"
+          {
+            echo "CARGO_TARGET_${target_env}_LINKER=${compiler}"
+            echo "CC_${target_env}=${compiler}"
+            echo "AR_${target_env}=${archiver}"
+          } >> "${GITHUB_ENV}"
 
       - name: Build release binary
         shell: bash
@@ -193,7 +198,7 @@ jobs:
 
           (
             cd release
-            sha256sum * | sort -k2
+            sha256sum -- * | sort -k2
           ) > checksums.txt
 
           if [[ "${{ github.ref_type }}" == "tag" ]]; then
