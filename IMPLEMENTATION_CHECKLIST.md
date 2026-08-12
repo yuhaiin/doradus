@@ -213,6 +213,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `make production-parity-smoke`（2026-08-12 当前轮） | 3 份停止态 Go v5/v6/AWS-shaped snapshot；每份在 Podman 独立运行 Go/Rust | 3/3 API read、core mutation、error matrix identical |
 | `make refact-user-parity-smoke`（2026-08-12 当前轮） | Go refact-user、Rust、prepared SQLite 均在 Podman；宿主只编译 binary | basic/UUID/token users API、node reference conflict、missing-user error 全部 parity，通过；运行目录为 `~/.cache/yuhaiin-rust` |
 | `make production-parity-smoke` 端口复用修复（2026-08-12 当前轮） | 每份快照自动使用 `YUHAIIN_PRODUCTION_PORT_BASE + 3×index` 的独立三端口窗口 | 连续快照不再固定争用 pasta 端口；`YUHAIIN_PRODUCTION_PORT_BASE` 可显式调整 |
+| `make api-route-parity-smoke`（2026-08-12 当前轮） | 读取 Go `pkg/httpapi/v2_routes.go` 与 Rust `api.rs`；不启动服务 | 82 个 Go v2 operation 全部由 Rust RPC dispatch 或流式直路由覆盖；`connections.events`/`tools.logs.v2` 明确按直路由处理 |
 | `make tun-chain-service-smoke`（2026-08-12 当前轮） | disposable user/network Podman namespace、真实 TUN inbound | TUN→fixed→TLS→HTTP/2→Yuubinsya→echo 通过；`runtime-tun-chain-ready`、traffic、close 全部通过 |
 | `make go-live-flow-parity-smoke` + `make go-rust-stats-smoke`（2026-08-12 当前轮） | Podman Go/Rust live mixed inbound，共享 SQLite 统计接管 | Go/Rust 真实流量、connections/total/traffic/history 和 reload 后统计均通过 |
 | `make go-protocol-interop-smoke`（2026-08-12 当前轮） | Podman host network；真实 Go checkout/client/server | 14/14 个测试用例：Yuubinsya TCP/UOT/native UDP/Ping、WebSocket→H2（普通/TLS）、H2 v1、VLESS 双向普通/TLS/TLS+WebSocket、VLESS UDP、VMess 普通/TLS+WebSocket、Trojan 普通/TLS+WebSocket |

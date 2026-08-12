@@ -4069,3 +4069,14 @@ missing-user 错误对照。
 避免 pasta namespace 的短暂释放延迟污染下一份 fixture；默认 base 仍为 55250，可通过环境变量
 调整。三份停止态 Go v5/v6/AWS-shaped snapshot 均已分别在 Podman 中通过全量 API read、mutation
 和 error matrix。
+
+## 147. 2026-08-12 Go/Rust v2 route contract checker
+
+新增 `scripts/maintenance/check-api-route-parity.sh` 和 `make api-route-parity-smoke`，直接读取
+Go `pkg/httpapi/v2_routes.go` 的公开 operation inventory，并检查 Rust `rpc` dispatch 或流式直
+路由是否覆盖。它不会把 `/api/v2/connections/events`、`/api/v2/tools/logs` 和
+`/api/v2/tools/logs/v2` 错当作普通 RPC；这三个 endpoint 按 Go 的 stream contract 单独检查直路由。
+
+当前 Go v2 的 82 个 operation 全部通过检查。Rust 额外保留的 users、TUN config 和
+`subscriptions.delete_preview` 属于当前前端/运行时扩展，不会被静态检查误报为 Go 缺失；订阅更新
+本身仍按本轮范围返回 deferred contract。
