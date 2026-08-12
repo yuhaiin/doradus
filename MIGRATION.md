@@ -3909,3 +3909,14 @@ service-chain 16、WireGuard 7、WireGuard runtime chain 2，0 失败）。
 - 64 MiB release benchmark：HTTP CONNECT 169.06 MiB/s、peak RSS 18,432 KiB；TLS/H2/Yuubinsya 47.00 MiB/s、peak RSS 20,424 KiB；BoringTun packet 579.19 MiB/s、peak RSS 3,500 KiB。结果仅作为同机回归基线，原始输出位于 `~/.cache/yuhaiin-rust/benchmarks/`。
 
 本轮构建、运行和结果文件均没有使用 `/tmp`。剩余 `[~]` 仍是需要外部现场或更大样本的项目：真实 WARP/AWS、生产 firewall matrix、跨平台权限和远程 GitHub Actions 首次运行，不把本地 Podman 结果外推为已完成。
+
+## 139. 2026-08-12 DNS、统计、备份与透明入口回归
+
+继续用可复用的 Podman fixture 补齐非协议主链路现场：
+
+- `make stats-soak-smoke` 通过 12 个并发 reader、每个 160 rounds、256 次写入，并在 force-stop/reopen 后保持统计可读；`make go-rust-stats-smoke` 通过 Go/Rust 共享 SQLite 接管。
+- `make dns-source-smoke` 的 UDP/TCP resolver、`make doh-source-smoke` 的 DoH/DoT 加密 resolver，以及 `make maxmind-smoke` 的真实 `Country-without-asn.mmdb` 查询均通过。
+- `make s3-minio-smoke` 通过 MinIO Podman fixture 的 SigV4 backup/restore；`make socks5-udp-associate-smoke` 通过真实 SOCKS5 UDP association。
+- `make transparent-service-smoke` 通过 REDIRECT TCP 两 flow；rootless 容器对 TPROXY UDP 和 IPv6 REDIRECT 按能力显式报告 skip，rootful iptables/nft TPROXY 证据仍以 Debian VM 结果为准。
+
+这些检查均使用 `~/.cache/yuhaiin-rust` 下的可复用状态和日志，没有使用 `/tmp`。统计的更长生产时段、真实 firewall 组合和外部权限现场仍不标记为完成。
