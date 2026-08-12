@@ -3706,6 +3706,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "yuhaiin-backup"
+version = "0.1.0"
+dependencies = [
+ "hmac",
+ "reqwest",
+ "rustls-rustcrypto",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha2 0.11.0",
+ "time",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "yuhaiin-chain"
 version = "0.1.0"
 dependencies = [
@@ -3803,6 +3819,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "blake2",
  "bytes",
  "futures-util",
  "h2",
@@ -3830,6 +3847,7 @@ dependencies = [
  "tower-http",
  "webpki-roots",
  "windows-service",
+ "yuhaiin-backup",
  "yuhaiin-chain",
  "yuhaiin-core",
  "yuhaiin-geo",

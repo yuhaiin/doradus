@@ -3540,3 +3540,30 @@ reload 出现或消失，结果为 `1 passed, 0 failed`。因此当前代码不�
 `~/.cache/yuhaiin-rust/cargo-target/x86_64-unknown-linux-musl/debug/yuhaiin`。这只证明
 target/linker 构建门禁，不替代 Podman 内的 runtime 运行测试；所有集成测试状态仍留在
 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
+## 121. 2026-08-12 S3 backup object contract
+
+对照 Go `pkg/app/backup.go`、`pkg/s3/s3.go` 和 `pkg/contract/backup/types.go` 后，补上了此前
+Rust API 的真实功能缺口：`backup.run` 过去无论配置如何都只创建本地 SQLite 文件，
+`backup.restore` 也只接受本地路径；这会让前端配置了 S3 后得到错误的“成功”语义。
+
+新增 `crates/yuhaiin-backup`，使用纯 Rust 的 `reqwest + rustls-rustcrypto + HMAC/SHA-256`
+实现 S3 Signature V4，并保留 Go 的 camelCase 配置字段、path-style endpoint、storage class、
+`{instanceName}-state.db` object name 和 BLAKE2b-256(`state.db || json(S3)`) 的
+`lastBackupHash` 语义。运行流程现在是：
+
+- `backup.run` 先用 SQLite `VACUUM INTO` 得到一致快照；S3 未启用时直接报错，hash 未变化时跳过上传，
+  上传成功后才把 `lastBackupHash` 写回同一份 Go backup config；上传失败不会返回成功；
+- `backup.restore` 仍兼容显式本地 `path/source/file`，空请求则按 backup config 下载同名 S3
+  object 到 `~/.cache/yuhaiin-rust/backups/`，随后沿用 managed-service restore/restart 边界；
+- backup crate 的单元测试固定 SigV4 signing key、路径编码和 camelCase；local compatible
+  endpoint wire test 覆盖真实 HTTP PUT/GET、Authorization、payload hash 和 storage class；
+  runtime API test 覆盖 `backup.run` 上传、`lastBackupHash` 持久化和空参数 restore 下载。
+
+当前仍明确标为 `[~]`：真实 AWS/MinIO 权限现场，以及将 S3 HTTP 连接接入 Go 所用的选中
+outbound proxy。这个缺口不会再被本地备份的成功响应掩盖，后续应通过可注入的 async connector
+补齐，而不是在 API 层复制 proxy 选择逻辑。
+
+本轮 `make workspace-tests` 在 Podman 中最终执行 45 个 harness：core 145、runtime 246、
+store 128、WireGuard 7（1 个 benchmark ignored）、service-chain 15，0 失败；S3 backup
+新增测试没有改变其它 inbound→router→outbound 链路的通过状态。

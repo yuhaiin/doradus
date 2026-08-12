@@ -9,6 +9,7 @@ members = [
     "crates/yuhaiin-store",
     "crates/yuhaiin-trie",
     "crates/yuhaiin-wireguard",
+    "crates/yuhaiin-backup",
     "crates/yuhaiin-runtime",
 ]
 

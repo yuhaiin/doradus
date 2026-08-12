@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::Engine;
+use blake2::{Blake2bVar, digest::Update as BlakeUpdate, digest::VariableOutput};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -29,6 +30,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
+use yuhaiin_backup::{S3Client, S3Config};
 use yuhaiin_core::proxy::{AsyncProxy, DirectAsyncProxy};
 use yuhaiin_core::{BoxFuture, DomainName, Endpoint, FlowContext, Network, ResolveStrategy};
 use yuhaiin_geo::{GeoDatabaseManager, GeoDownloadTransport, GeoRefreshRequest};
@@ -62,6 +64,7 @@ pub struct ApiState {
     auth: Option<ApiAuth>,
     web_root: Option<PathBuf>,
     route_list_refreshing: Arc<AtomicBool>,
+    backup_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Optional management API credentials. The stored values are SHA-256
@@ -110,6 +113,7 @@ impl ApiState {
             auth: None,
             web_root: None,
             route_list_refreshing: Arc::new(AtomicBool::new(false)),
+            backup_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -918,6 +922,10 @@ async fn backup_config_put(State(state): State<ApiState>, Json(value): Json<Valu
 }
 
 async fn backup_config_get_value(state: &ApiState) -> ApiResult {
+    json_value(load_backup_config_value(state).await?)
+}
+
+async fn load_backup_config_value(state: &ApiState) -> Result<Value, ApiError> {
     if let Some(record) = state
         .controller
         .store()
@@ -925,9 +933,13 @@ async fn backup_config_get_value(state: &ApiState) -> ApiResult {
         .get_go_backup_settings()
         .await?
     {
-        return json_value(raw_json(&record.data_json, default_backup_config()));
+        return Ok(raw_json(&record.data_json, default_backup_config()));
     }
-    read_config_json(state, "backup.config", default_backup_config()).await
+    let value = state.controller.store().get_config("backup.config").await?;
+    Ok(value
+        .as_deref()
+        .map(|bytes| raw_json(bytes, default_backup_config()))
+        .unwrap_or_else(default_backup_config))
 }
 
 async fn backup_config_put_value(state: &ApiState, value: Value) -> ApiResult {
@@ -2880,22 +2892,66 @@ async fn node_latency_value(state: &ApiState, value: &Value) -> ApiResult {
 }
 
 async fn run_backup_value(state: &ApiState) -> ApiResult {
+    let _backup_guard = state.backup_lock.lock().await;
+    let config = load_backup_config_value(state).await?;
+    let s3 = backup_s3_config(&config)?;
+    if !s3.enabled {
+        return Err(ApiError::bad("backup.run requires enabled S3 backup"));
+    }
+    let client = S3Client::new(s3.clone()).map_err(|error| ApiError::bad(error.to_string()))?;
+    let object = backup_object_name(&config)?;
     let destination = backup_destination()?;
-    state
-        .controller
-        .store()
-        .backup_to(&destination)
-        .await
-        .map_err(ApiError::from)?;
-    Ok(Json(json!({})))
+    let result = async {
+        state
+            .controller
+            .store()
+            .backup_to(&destination)
+            .await
+            .map_err(ApiError::from)?;
+        let state_bytes = std::fs::read(&destination)
+            .map_err(|error| ApiError::internal(format!("read SQLite backup: {error}")))?;
+        let hash = backup_hash(&state_bytes, &s3)?;
+        let previous = string_or(&config, "lastBackupHash", "");
+        if previous != hash {
+            client
+                .put(&object, &state_bytes)
+                .await
+                .map_err(|error| ApiError::unavailable(format!("S3 backup upload: {error}")))?;
+            let mut updated = config;
+            set_string(&mut updated, "lastBackupHash", hash);
+            persist_backup_config_value(state, updated).await?;
+        }
+        Ok::<(), ApiError>(())
+    }
+    .await;
+    let _ = std::fs::remove_file(&destination);
+    result.map(|()| Json(json!({})))
 }
 
 async fn restore_backup_value(state: &ApiState, value: &Value) -> ApiResult {
+    let _backup_guard = state.backup_lock.lock().await;
     let source = string_or_any(value, &["path", "source", "file"]);
-    if source.trim().is_empty() {
-        return Err(ApiError::bad("backup restore requires path/source/file"));
-    }
-    let source = PathBuf::from(source);
+    let source = if source.trim().is_empty() {
+        let config = load_backup_config_value(state).await?;
+        let s3 = backup_s3_config(&config)?;
+        if !s3.enabled {
+            return Err(ApiError::bad(
+                "backup restore requires path/source/file or enabled S3 backup",
+            ));
+        }
+        let client = S3Client::new(s3).map_err(|error| ApiError::bad(error.to_string()))?;
+        let object = backup_object_name(&config)?;
+        let bytes = client
+            .get(&object)
+            .await
+            .map_err(|error| ApiError::unavailable(format!("S3 backup download: {error}")))?;
+        let destination = backup_download_destination()?;
+        std::fs::write(&destination, bytes)
+            .map_err(|error| ApiError::internal(format!("write downloaded backup: {error}")))?;
+        destination
+    } else {
+        PathBuf::from(source)
+    };
     if !source.is_file() {
         return Err(ApiError::not_found(format!(
             "backup does not exist: {}",
@@ -3328,7 +3384,62 @@ fn default_backup_config() -> Value {
     })
 }
 
+fn backup_s3_config(value: &Value) -> Result<S3Config, ApiError> {
+    serde_json::from_value(value.get("s3").cloned().unwrap_or_else(|| json!({})))
+        .map_err(|error| ApiError::bad(format!("invalid backup S3 configuration: {error}")))
+}
+
+fn backup_object_name(value: &Value) -> Result<String, ApiError> {
+    let instance = string_or(value, "instanceName", "").trim().to_owned();
+    if instance.is_empty() {
+        return Err(ApiError::bad(
+            "backup instanceName is required for S3 backup",
+        ));
+    }
+    Ok(format!("{instance}-state.db"))
+}
+
+fn backup_hash(bytes: &[u8], s3: &S3Config) -> Result<String, ApiError> {
+    let s3_bytes = serde_json::to_vec(s3)
+        .map_err(|error| ApiError::internal(format!("serialize backup S3 config: {error}")))?;
+    let mut hash = Blake2bVar::new(32)
+        .map_err(|error| ApiError::internal(format!("create backup hash: {error}")))?;
+    BlakeUpdate::update(&mut hash, bytes);
+    BlakeUpdate::update(&mut hash, &s3_bytes);
+    let mut output = [0_u8; 32];
+    hash.finalize_variable(&mut output)
+        .map_err(|error| ApiError::internal(format!("finalize backup hash: {error}")))?;
+    Ok(output.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+async fn persist_backup_config_value(state: &ApiState, value: Value) -> Result<(), ApiError> {
+    let bytes = serde_json::to_vec(&value)?;
+    let record = GoBackupSettingsRecord {
+        updated_at: unix_seconds(),
+        data_json: bytes.clone(),
+    };
+    state
+        .controller
+        .mutate_and_reload(move |store| async move {
+            store.put_config("backup.config", &bytes).await?;
+            store.repository().put_go_backup_settings(&record).await
+        })
+        .await
+        .map(|_| ())
+        .map_err(ApiError::from)
+}
+
 fn backup_destination() -> Result<PathBuf, ApiError> {
+    let directory = backup_directory()?;
+    let unique = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    Ok(directory.join(format!("state-{unique}.sqlite")))
+}
+
+fn backup_download_destination() -> Result<PathBuf, ApiError> {
+    Ok(backup_directory()?.join("remote-state.sqlite"))
+}
+
+fn backup_directory() -> Result<PathBuf, ApiError> {
     let root = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
@@ -3336,7 +3447,7 @@ fn backup_destination() -> Result<PathBuf, ApiError> {
     let directory = root.join("yuhaiin-rust").join("backups");
     std::fs::create_dir_all(&directory)
         .map_err(|error| ApiError::internal(format!("create backup directory: {error}")))?;
-    Ok(directory.join(format!("state-{}.sqlite", unix_seconds())))
+    Ok(directory)
 }
 
 async fn route_lists_config_get_value(state: &ApiState) -> ApiResult {
@@ -4243,6 +4354,8 @@ mod tests {
     use base64::Engine;
     use http_body_util::BodyExt;
     use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tokio::net::UdpSocket;
     use tower::ServiceExt;
     use yuhaiin_core::dns::{DnsResponse, encode_response};
@@ -4352,6 +4465,134 @@ mod tests {
                 .unwrap();
         assert_eq!(persisted["instanceName"], "rust-instance");
         assert_eq!(persisted["s3"]["bucket"], "bucket");
+    }
+
+    async fn read_s3_test_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 1024];
+            let length = stream.read(&mut chunk).await.unwrap();
+            assert!(length > 0);
+            bytes.extend_from_slice(&chunk[..length]);
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]).to_ascii_lowercase();
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_length {
+            let mut chunk = [0_u8; 1024];
+            let length = stream.read(&mut chunk).await.unwrap();
+            assert!(length > 0);
+            bytes.extend_from_slice(&chunk[..length]);
+        }
+        bytes
+    }
+
+    #[tokio::test]
+    async fn backup_run_rejects_disabled_s3_before_creating_a_snapshot() {
+        let error = run_backup_value(&state().await)
+            .await
+            .expect_err("disabled S3 backup must not report success");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.code, "bad_request");
+        assert_eq!(error.message, "backup.run requires enabled S3 backup");
+    }
+
+    #[tokio::test]
+    async fn backup_run_and_empty_restore_use_the_go_s3_object_contract() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let uploaded = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let uploaded_server = Arc::clone(&uploaded);
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_s3_test_request(&mut stream).await;
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .unwrap()
+                    + 4;
+                let is_put = request.starts_with(b"PUT ");
+                let body = if is_put {
+                    request[header_end..].to_vec()
+                } else {
+                    uploaded_server.lock().await.clone()
+                };
+                if is_put {
+                    *uploaded_server.lock().await = body.clone();
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    if is_put { 0 } else { body.len() }
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                if !is_put {
+                    stream.write_all(&body).await.unwrap();
+                }
+            }
+        });
+
+        let (shutdown, _shutdown_rx) = watch::channel(false);
+        let state = state().await.with_shutdown(shutdown);
+        let _ = backup_config_put_value(
+            &state,
+            json!({
+                "instanceName":"api-test",
+                "s3":{
+                    "enabled":true,
+                    "accessKey":"access",
+                    "secretKey":"secret",
+                    "bucket":"bucket",
+                    "region":"us-east-1",
+                    "endpointUrl":endpoint,
+                    "usePathStyle":true,
+                    "storageClass":"STANDARD"
+                },
+                "interval":0,
+                "lastBackupHash":""
+            }),
+        )
+        .await
+        .unwrap();
+
+        let _ = run_backup_value(&state).await.unwrap();
+        let config = load_backup_config_value(&state).await.unwrap();
+        assert!(string_or(&config, "lastBackupHash", "").len() == 64);
+        assert!(!uploaded.lock().await.is_empty());
+
+        let response = restore_backup_value(&state, &json!({})).await.unwrap();
+        assert_eq!(response.0["accepted"], true);
+        assert_eq!(response.0["restart"], true);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn backup_hash_matches_go_blake2b_and_object_name_contract() {
+        let s3 = S3Config {
+            enabled: true,
+            access_key: "a".to_owned(),
+            secret_key: "b".to_owned(),
+            bucket: "bucket".to_owned(),
+            region: "us-east-1".to_owned(),
+            endpoint_url: String::new(),
+            use_path_style: false,
+            storage_class: String::new(),
+        };
+        assert_eq!(
+            backup_hash(b"state", &s3).unwrap(),
+            "47a09b4d4dcab1042d455793b5ea98a8cc8a4175ee526ae276b5e63ce2b3dc1d"
+        );
+        assert_eq!(
+            backup_object_name(&json!({"instanceName":"desktop"})).unwrap(),
+            "desktop-state.db"
+        );
+        assert!(backup_object_name(&json!({"instanceName":""})).is_err());
     }
 
     #[tokio::test]

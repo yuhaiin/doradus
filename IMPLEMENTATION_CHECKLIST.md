@@ -11,10 +11,10 @@
 | 指标 | 当前值 |
 | --- | ---: |
 | 纳入统计的验收项 | 48 |
-| 已完成 `[x]` | 34 |
-| 主路径可用但仍有现场/样本缺口 `[~]` | 14 |
+| 已完成 `[x]` | 33 |
+| 主路径可用但仍有现场/样本缺口 `[~]` | 15 |
 | 有实际功能缺口 `[ ]` | 0 |
-| 加权覆盖率 | **85.4%** = `(34 + 14 × 0.5) / 48` |
+| 加权覆盖率 | **84.4%** = `(33 + 15 × 0.5) / 48` |
 | 主目标 | Linux desktop：Rust 可启动、管理前端可接入、普通 inbound/outbound 可串联 |
 | 当前结论 | **主路径已可在 Linux desktop 进行替换前验收**；rootful TUN 多路由 lease、RST/reconnect、graceful/SIGKILL teardown 和 TPROXY UDP delivery/idle/force-stop 已闭环，生产异常快照、真实 firewall 组合和第三方 WireGuard 仍是 `[~]` |
 
@@ -33,6 +33,7 @@ flowchart LR
     ROUTER --> OUTBOUND[Outbound\ndirect / fixed / HTTP / SOCKS5 / TLS / HTTP2 / Yuubinsya / WireGuard]
     OUTBOUND --> STATS[monitor\nconnections / traffic / history / SSE]
     STATS --> STORE
+    STORE --> BACKUP[yuhaiin-backup\nS3 SigV4 / SQLite object]
     PLATFORM[yuhaiin-platform\nTUN fd / Linux service boundary] --> INBOUND
 ```
 
@@ -99,7 +100,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | Go 权威入口 | Rust 位置 | 状态 | 证据 | 下一动作 |
 | --- | --- | :---: | --- | --- |
 | `pkg/storage/sqlite/{sqlite,migrations,compact}.go` | `crates/yuhaiin-store/src/sqlite.rs`、`schema.rs`、`migration.rs` | `[x]` | `rusqlite + bundled SQLite`、WAL、busy timeout、quick check、rollback、backup/restore、force-stop | — |
-| `pkg/store/{node,inbound,resolver,route_*,settings,backup}.go` | `crates/yuhaiin-store/src/repository.rs`、`compat_runtime.rs`、`tests/*` | `[x]` | typed repository、Go v1/v5/v6/schema-7、unknown JSON、users/routes/tags/settings/NAT | 更多真实未知表和异常快照逐表 diff |
+| `pkg/store/{node,inbound,resolver,route_*,settings,backup}.go`、`pkg/app/backup.go`、`pkg/s3/*` | `crates/yuhaiin-store/src/repository.rs`、`compat_runtime.rs`、`crates/yuhaiin-backup/src/lib.rs`、`tests/*` | `[~]` | typed repository、Go v1/v5/v6/schema-7、unknown JSON、users/routes/tags/settings/NAT；S3 SigV4 PUT/GET、Go camelCase 配置和 BLAKE2b `lastBackupHash` 已接入 API，并由本地兼容端点 wire test 覆盖 | 真实 AWS/MinIO 现场、通过选中 outbound proxy 的 S3 连接，以及更多异常快照逐表 diff |
 | `pkg/net/dns/fakeip/sqlite.go`、`pool.go` | `crates/yuhaiin-store/src/fakeip.rs` | `[x]` | reopen、cursor、release、capacity、dual-stack 和 legacy import | 更多生产容量/TTL 样本 |
 | `pkg/statistics/{sqlite,statistic,telemetry,conn}.go` | `crates/yuhaiin-store/src/statistics.rs`、`crates/yuhaiin-runtime/src/monitor.rs` | `[~]` | traffic/history/telemetry、Go projection、SSE、并发 reader/writer、force-stop recovery；Go/Rust live-flow parity 与 API history UTC 已验证；`make stats-soak-smoke` 在 Podman 中以 12 readers×160 rounds、256 writes 通过 | 更长 production projection、升级期间 lock contention |
 
@@ -167,6 +168,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[~]` 对更多停止态 Go SQLite 做逐表 schema/未知表/异常快照 diff；当前 3 份停止态 snapshot 的 API read/mutation/error parity 已通过，源库只读，副本和结果放 `~/.cache/yuhaiin-rust`。
 - `[~]` 增加长时间 telemetry/history、升级中 lock contention、强停和 reload 组合样本。
 - `[x]` 使用缓存中的停止态 Go `state.db` 做 Go/Rust API read + core mutation parity；包括 `connections.history` 的 UTC 时间格式、节点/入站/解析器/路由/发布/订阅 deferred 错误 contract。
+- `[~]` S3 backup 已不再静默退化为本地备份：`backup.run` 按 Go object name 上传，`backup.restore` 空请求按配置下载，失败返回 unavailable；SigV4、本地兼容端点和 Go BLAKE2b hash 已测试，但真实对象存储与“经选中 outbound proxy 访问 S3”仍待补。
 - `[x]` 统计公开契约已逐字段对齐：connections 的完整 metadata/matchHistory、total 的 string counters、traffic 的 UTC bucket、telemetry 的固定九维/失败计数、history/failed-history/block-history 的 process、count、time、dumpProcessEnabled 和 API 1000 条边界均有单测或 Podman parity；失败项按 `(protocol, host, process)` 分组，阻断历史不再丢失进程标志，同时保留 Go failed-history 全量 SQLite 语义。
 - `[x]` route list `refreshInterval` 已由 RuntimeService 持有后台 timer：配置 reload 立即重读，刷新产生的 reload 不会忙循环，服务 shutdown 会停止任务；定时刷新夹具验证 `lastRefreshTime` 和 reload 生命周期。
 - `[~]` 补完整 API response 字段、更多生产 route/resolver projection 和 MaxMind country projection 样本；Go 当前 MaxMind 接口只暴露 country，不额外把 ASN 当作迁移缺口；remote route refresh 的持久化错误字段已补齐。
@@ -193,7 +195,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 | 命令 | Podman 场景 | 结果 |
 | --- | --- | --- |
-| `make workspace-tests` | 43 个 harness；isolated/stats/host-network 分组 | 0 失败；预计 ignored 项保持 ignored |
+| `make workspace-tests` | 45 个 harness；isolated/stats/host-network 分组 | 0 失败；预计 ignored 项保持 ignored |
 | `make production-parity-smoke` | 3 份停止态 Go `state.db`，每份 Go/Rust 均在 Podman 中运行 | 3/3：read、core mutation、error matrix identical；日志存 `~/.cache/yuhaiin-rust/production-parity/` |
 | `make service-chain-smoke` | host-network | 15/15：多个 inbound→router→outbound chain，含普通 VLESS/VMess/Trojan outbound |
 | `make go-protocol-interop-smoke` | 挂载 Go checkout、GOROOT、module cache；所有 Go scratch 位于 `~/.cache` | 6/6：Go Yuubinsya TCP/UOT/native UDP/Ping、Go WS→H2、Go H2 v1、VLESS、VMess、Trojan |
@@ -218,7 +220,8 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `make maxmind-smoke` | 缓存真实 `Country-without-asn.mmdb`、Podman `--network=none` | 固定 SHA-256；IPv4 与 IPv4-mapped IPv6 查询通过 |
 | `make tun-ipv6-extension-smoke` | Podman `--network=none`、core test harness | Hop-by-Hop/Routing/后置 Destination Options 分片重组通过；已有 Fragment Header fail-closed |
 | `make stats-soak-smoke` | `--network=none` Podman、可复用 SQLite fixture | 12 个并发 readers 各 160 轮、256 个流量写入，force-stop/restart、connections/traffic/telemetry/history 全部通过 |
-| `make workspace-tests`（当前最新回归） | Podman；宿主机只编译 harness | 43 个 harness；core 145、runtime 243、store 128、WireGuard 7、service-chain 15 全部通过；外部 WireGuard harness 的 2 个公网测试显式 ignored；另有 Debian VM rootful TUN/TPROXY 现场复核 |
+| `cargo test --offline -p yuhaiin-backup`、runtime API S3 test | Podman workspace 会执行 local compatible endpoint；本地测试包含 SigV4 PUT/GET、API upload/download | 4 个 backup crate tests、runtime S3 run/restore、Go hash/object contract 通过；状态位于 `~/.cache/yuhaiin-rust` |
+| `make workspace-tests`（当前最新回归） | Podman；宿主机只编译 harness | 45 个 harness；core 145、runtime 246、store 128、WireGuard 7、service-chain 15 全部通过；外部 WireGuard harness 的 2 个公网测试显式 ignored；另有 Debian VM rootful TUN/TPROXY 现场复核 |
 | `make tun-api-process-smoke`（2026-08-12 当前轮） | Podman disposable user/network namespace、前台 runtime、`/dev/net/tun` | 1/1 通过；真实设备按 disabled→enabled→disabled→enabled→disabled 出现/消失，排除“API 已保存但 TUN supervisor 未切换” |
 | `make build MUSL=1`（2026-08-12 当前轮） | 宿主只做 target 编译，产物留在 `~/.cache/yuhaiin-rust` | `x86_64-unknown-linux-musl` debug runtime 构建通过；未把宿主编译当作容器运行时证据 |
 | `make startup-logs-smoke` | foreground Podman | 默认 stderr 输出 database、API bind、runtime ready、shutdown/stopped |
