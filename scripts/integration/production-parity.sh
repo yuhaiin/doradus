@@ -23,13 +23,12 @@ declare -a candidates=()
 if [[ -n "${YUHAIIN_SOURCE_DB:-}" ]]; then
   IFS=: read -r -a candidates <<<"${YUHAIIN_SOURCE_DB}"
 else
-  # The default path prepares each snapshot with Rust first, because these
-  # stopped production snapshots can carry a migration ledger from a newer Go
-  # checkout while still using the older dimension/value telemetry tables.
-  # YUHAIIN_PREPARE=0 remains a useful raw-source diagnostic, but it is not a
-  # valid Go/Rust parity fixture when the current Go checkout cannot migrate
-  # that future ledger and its telemetry API returns HTTP 500.
+  # Newer stopped production snapshots are prepared with Rust first, because
+  # they can carry a migration ledger from a newer Go checkout while still
+  # using the older dimension/value telemetry tables. The legacy v1 fixture is
+  # detected below and automatically uses independent copies instead.
   candidates=(
+    "${go_root}/tmp/state.db"
     "${go_root}/tmp/v2/state.db"
     "${go_root}/tmp/yuhaiin/state.db"
     "${go_root}/tmp/aws/yuhaiin/state.db"
@@ -54,6 +53,20 @@ for source_db in "${candidates[@]}"; do
   prepare_http="${YUHAIIN_PREPARE_HTTP:-127.0.0.1:$((port_base + ran * 3))}"
   rust_http="${YUHAIIN_RUST_HTTP:-127.0.0.1:$((port_base + ran * 3 + 1))}"
   go_http="${YUHAIIN_GO_HTTP:-127.0.0.1:$((port_base + ran * 3 + 2))}"
+  prepare_mode="${YUHAIIN_PREPARE:-1}"
+  if [[ -z "${YUHAIIN_PREPARE+x}" ]] && command -v sqlite3 >/dev/null 2>&1; then
+    # Go v1 snapshots have only legacy `nodes`/`inbounds` tables. Preparing
+    # them with Rust first creates v2 projections that the current Go v1
+    # migration path tries to create again. Run both services from independent
+    # read-only copies for this old schema; newer snapshots retain the Rust-
+    # first takeover path above.
+    has_v2_tables="$(sqlite3 "${source_db}" \
+      "SELECT CASE WHEN EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_v2') THEN 1 ELSE 0 END;")"
+    if [[ "${has_v2_tables}" != "1" ]]; then
+      prepare_mode=0
+      echo "[production-parity] detected legacy v1 schema; using independent copies"
+    fi
+  fi
   echo "[production-parity] checking ${source_db}"
   YUHAIIN_GO_DIR="${go_root}" \
   YUHAIIN_SOURCE_DB="${source_db}" \
@@ -61,7 +74,7 @@ for source_db in "${candidates[@]}"; do
   YUHAIIN_PREPARE_HTTP="${prepare_http}" \
   YUHAIIN_RUST_HTTP="${rust_http}" \
   YUHAIIN_GO_HTTP="${go_http}" \
-  YUHAIIN_PREPARE="${YUHAIIN_PREPARE:-1}" \
+  YUHAIIN_PREPARE="${prepare_mode}" \
     "${repo_root}/scripts/integration/go-api-parity.sh"
   ran=$((ran + 1))
 done

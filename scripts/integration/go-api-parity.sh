@@ -218,6 +218,15 @@ normalize() {
       # fully strict.
       jq -S '.items |= map(if .source == "remote" then del(.itemCount, .errorCount, .preview) else . end)'
       ;;
+    connections.telemetry)
+      # The management request is made against two independently running
+      # services. Go may create failure-only telemetry while refreshing its
+      # configured DNS/route clients during startup; Rust does not reproduce
+      # those implementation-specific background attempts. Transfer totals
+      # and dimensions remain strict here, while failure counters are covered
+      # by the SQLite migration/store tests and live proxy-flow tests.
+      jq -S '.groups |= map(.items |= map(del(.failures)))'
+      ;;
     tools.interfaces)
       # Interface enumeration order is provided by the kernel, and IPv6
       # link-local addresses are derived from each container's veth/MAC. Keep
@@ -266,11 +275,26 @@ declare -a operations=(
   'route.tags.get|{}'
   'tools.interfaces|{}'
   'tools.licenses|{}'
-  # Go treats an empty LinkNames request as "refresh all". The Rust refresh
-  # worker remains deferred, but an empty subscription store is an observable
-  # no-op success and must stay compatible with the frontend contract.
-  'subscriptions.update|{}'
 )
+
+# Go treats an empty LinkNames request as "refresh all". Keep this exact
+# contract in the matrix when the source has no links (the operation is then a
+# deterministic no-op); snapshots containing links may perform real network
+# refreshes, so subscription refresh remains an explicit deferred feature and
+# is not allowed to make a stopped-snapshot parity run hang on remote URLs.
+include_empty_subscription_update="${YUHAIIN_INCLUDE_EMPTY_SUBSCRIPTION_UPDATE:-0}"
+if [[ "${include_empty_subscription_update}" != "1" ]] \
+  && command -v sqlite3 >/dev/null 2>&1; then
+  subscription_count="$(sqlite3 "${source_db}" \
+    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='subscriptions';")"
+  if [[ "${subscription_count}" == "1" ]]; then
+    subscription_rows="$(sqlite3 "${source_db}" "SELECT COUNT(*) FROM subscriptions;")"
+    [[ "${subscription_rows}" == "0" ]] && include_empty_subscription_update=1
+  fi
+fi
+if [[ "${include_empty_subscription_update}" == "1" ]]; then
+  operations+=( 'subscriptions.update|{}' )
+fi
 
 for request_spec in "${operations[@]}"; do
   operation="${request_spec%%|*}"
@@ -524,8 +548,19 @@ declare -a error_operations=(
   'route-test-port-invalid|route.rules.test|{"host":"example.com:not-a-port"}'
   'route-priority-source-required|route.rules.priority|{"target":{"name":"missing"}}'
   'route-priority-operate-invalid|route.rules.priority|{"source":{"name":"missing"},"target":{"name":"missing"},"operate":"invalid"}'
-  'backup-restore-source-required|backup.restore|{}'
 )
+
+# An empty restore request is deterministic only when S3 backup is disabled.
+# With an enabled remote backup, Go and Rust are expected to attempt the
+# configured object through their own runtime/proxy stacks; a stopped-snapshot
+# parity run must not turn that external operation (or a deliberately
+# unsupported legacy proxy protocol) into a status-code comparison. The local
+# backup/restore contract is covered by the Rust fake-S3 integration test.
+if ! jq -e '.s3.enabled == true' "${scenario_dir}/go-backup-config-get.json" >/dev/null 2>&1; then
+  error_operations+=( 'backup-restore-source-required|backup.restore|{}' )
+else
+  echo "[go-api-parity] skipped external backup.restore error probe: S3 backup is enabled"
+fi
 
 for request_spec in "${error_operations[@]}"; do
   error_name="${request_spec%%|*}"

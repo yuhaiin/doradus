@@ -13,6 +13,15 @@
 > `musl-tools` 和 `rust-lld`，已通过 x86_64 static debug binary；只有显式 `HOST_CARGO=1` 才使用宿主 Cargo，Android
 > 仍需显式使用宿主 NDK 工具链。Podman 构建入口将 `TMPDIR` 固定在缓存挂载的 `/state/cache/tmp`，不使用宿主 `/tmp`。
 
+> 2026-08-13 production parity matrix 收敛：`production-parity.sh` 默认同时发现真实 Go v1
+> `tmp/state.db` 和三个 v2/v6 停止态快照；旧 v1 schema 自动使用 Go/Rust 各自从只读副本启动的
+> independent 模式，新 schema 继续先由 Rust 在 Podman 中接管再交给两份独立服务。四份快照的
+> SQLite 对象/列约束/索引审计，以及稳定 API read、core mutation、error matrix 均通过，所有副本和
+> 日志位于 `~/.cache/yuhaiin-rust/production-parity`，源库未修改。`connections.telemetry` 的传输
+> 字段保持严格对照；Go 启动期间可能由其后台 DNS/route client 产生的实现相关 failure-only 计数不纳入
+> 双进程快照比较，失败维度迁移和实时 flow 仍由 store/live-flow 回归覆盖。启用 S3 的快照不执行
+> 空 `backup.restore` 外部请求探针，避免远端网络或明确延期的旧 SSR 出站污染一致性结果。
+
 > 2026-08-11 启动可诊断性与 checklist 重排：foreground binary 默认把启动、API bind、runtime ready、shutdown/stopped 写到 stderr；
 > `YUHAIIN_QUIET` 只有 `1/true/yes/on` 才会关闭这些 console notice，避免环境中设置 `YUHAIIN_QUIET=0` 时误以为没有日志。
 > `IMPLEMENTATION_CHECKLIST.md` 现在按 crate 模块树、协议矩阵、未完成项和验收命令组织；rootful TUN route lease、RST/reconnect 与 TPROXY UDP delivery/idle/force-stop 已有独立 VM 现场证据，但 TUN kernel fragment、Android/macOS 和生产/发布现场仍保留为 `[~]`，不能从单元测试覆盖率推导为完整替换。
