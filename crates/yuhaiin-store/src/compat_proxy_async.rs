@@ -249,6 +249,7 @@ impl GoProxyRuntimeConfig {
             }
             GoProxyTransport::NetworkSplit
             | GoProxyTransport::Tls
+            | GoProxyTransport::TlsTermination
             | GoProxyTransport::Http2
             | GoProxyTransport::Unknown { .. } => {
                 return Err(Error::new(
@@ -282,6 +283,7 @@ fn transport_name(transport: &GoProxyTransport) -> &str {
         GoProxyTransport::Aead => "aead",
         GoProxyTransport::NetworkSplit => "network_split",
         GoProxyTransport::Tls => "tls",
+        GoProxyTransport::TlsTermination => "tls_termination",
         GoProxyTransport::Http2 => "http2",
         GoProxyTransport::Unknown { name } => name,
     }

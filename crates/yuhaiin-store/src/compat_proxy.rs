@@ -52,6 +52,7 @@ pub enum GoProxyTransport {
     Aead,
     NetworkSplit,
     Tls,
+    TlsTermination,
     Http2,
     Unknown { name: String },
 }
@@ -325,6 +326,7 @@ fn parse_proxy_transport(value: &str) -> GoProxyTransport {
         "bootstrap_dns_warp" | "bootstrapdnswarp" | "proxy" => GoProxyTransport::Direct,
         "network_split" | "networksplit" => GoProxyTransport::NetworkSplit,
         "tls" => GoProxyTransport::Tls,
+        "tls_termination" | "tlstermination" => GoProxyTransport::TlsTermination,
         "http2" => GoProxyTransport::Http2,
         other => GoProxyTransport::Unknown {
             name: other.to_owned(),
@@ -354,6 +356,7 @@ fn select_proxy_transport(chain_types: &[String], layers: &[GoProxyLayer]) -> Go
     for preferred in [
         "http_mock",
         "network_split",
+        "tls_termination",
         "yuubinsya",
         "wireguard",
         "aead",

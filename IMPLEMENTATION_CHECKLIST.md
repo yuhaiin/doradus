@@ -19,11 +19,11 @@ debug 二进制。所有临时状态仍放在 `~/.cache/yuhaiin-rust`，不使�
 
 | 指标 | 当前值 |
 | --- | ---: |
-| 纳入统计的验收项 | 49 |
+| 纳入统计的验收项 | 50 |
 | 已完成 `[x]` | 41 |
-| 主路径可用但仍有现场/样本缺口 `[~]` | 8 |
+| 主路径可用但仍有现场/样本缺口 `[~]` | 9 |
 | 有实际功能缺口 `[ ]` | 0 |
-| 加权覆盖率 | **91.8%** = `(41 + 8 × 0.5) / 49` |
+| 加权覆盖率 | **91.0%** = `(41 + 9 × 0.5) / 50` |
 | 主目标 | Linux desktop：Rust 可启动、管理前端可接入、普通 inbound/outbound 可串联 |
 | 当前结论 | **主路径已可在 Linux desktop 进行替换前验收**；rootful TUN 多路由 lease、RST/reconnect、graceful/SIGKILL teardown、Debian rootful firewall matrix 和 TPROXY UDP delivery/idle/force-stop 已闭环，生产异常快照、更多平台现场和第三方 WireGuard 仍是 `[~]` |
 
@@ -87,6 +87,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `pkg/net/proxy/socks5/client.go`、`server.go` | `crates/yuhaiin-protocol/src/socks5.rs`、`socks5_server.rs`、`crates/yuhaiin-runtime/src/inbounds/socks5.rs` | `[x]` | TCP auth/request、UDP ASSOCIATE、IPv4/IPv6/domain framing、inbound/outbound chain | — |
 | `pkg/net/proxy/socks4a/server.go`、`mixed/*` | `crates/yuhaiin-runtime/src/proxy/socks4a.rs`、`inbounds/mod.rs` | `[x]` | mixed inbound dispatches SOCKS4A/SOCKS5/HTTP | — |
 | `pkg/net/proxy/tls/*` | `crates/yuhaiin-protocol/src/tls.rs`、`crates/yuhaiin-runtime/src/proxy/*` | `[x]` | RustCrypto TLS inbound/outbound、SNI、CA、insecureSkipVerify contract | — |
+| `pkg/net/proxy/tls/unwrap.go` (`tls_termination`) | `crates/yuhaiin-runtime/src/proxy.rs`、`crates/yuhaiin-store/src/compat_proxy.rs` | `[~]` | Go contract point 已注册并由 Rust 导入/runtime 分发；TLS server 解包 wrapper 支持默认证书、`serverNameCertificate` wildcard、ALPN、Go JSON byte array/base64 和 cert/key file path；Podman focused parser/build rejection tests 2/2，workspace 291 runtime tests 通过 | 增加带真实证书的进程级 `tls_termination → inbound/router/outbound` wire smoke，并与 Go 对比命名证书选择 |
 | Go `pkg/net/proxy/tls.NewTlsAutoServer`、`pkg/cert.GenerateServerCert` | `crates/yuhaiin-runtime/src/inbounds/tls_auto.rs` | `[~]` | 动态 SNI 叶子证书、精确/单标签 wildcard、DNS/IP SAN、ALPN、按配置域名共享证书缓存；RustCrypto X.509 builder 已兼容 Go 的 ECDSA P-256、Ed25519、RSA CA/PKCS#8，6 个 Podman focused tests 通过 | rustls server-side ECH 尚未有等价公开 API；补 Go/Rust live config 和 ECH 现场后再升为 `[x]` |
 | `pkg/net/proxy/http2/v1/*`、`v2/*` | `crates/yuhaiin-chain/src/h2_tunnel.rs`、`h2_server.rs`、`crates/yuhaiin-core/src/http2.rs` | `[x]` | prior-knowledge、TLS ALPN、pool/drain/GOAWAY、HTTP CONNECT/SOCKS5 bridge | — |
 | `pkg/net/proxy/yuubinsya/*`、`yuubinsya2/*` | `crates/yuhaiin-core/src/yuubinsya.rs`、`crates/yuhaiin-chain/src/session.rs`、`direct_uot.rs` | `[x]` | TCP、native UDP、UOT/dup-over-TCP、Ping、migration/reconnect、Go client interop | — |
@@ -188,7 +189,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` refact-user 分支的 users API parity harness 现在也完全在 Podman 中运行；先在容器内让 Rust 接管 prepared SQLite，再用独立 Go/Rust 容器对 basic/UUID/token 的 create/update/get/list/delete、node reference conflict 和 missing-user 错误做对照。
 - `[~]` S3 backup 已不再静默退化为本地备份：`backup.run` 按 Go object name 上传，`backup.restore` 空请求按配置下载，失败返回 unavailable；SigV4、本地兼容端点、Go BLAKE2b hash 和“经选中 outbound proxy 访问 S3”的 HTTP/HTTPS transport 已测试。`make s3-minio-smoke` 已在 Podman 通过真实 MinIO 完成 bucket 创建、SigV4 PUT/GET、object 校验和 restore 下载；真实 AWS 权限现场及更多异常快照逐表 diff 仍待补。
 - `[x]` 统计公开契约已逐字段对齐：connections 的完整 metadata/matchHistory、total 的 string counters、traffic 的 UTC bucket、telemetry 的固定九维/失败计数、history/failed-history/block-history 的 process、count、time、dumpProcessEnabled 和 API 1000 条边界均有单测或 Podman parity；失败项按 `(protocol, host, process)` 分组，阻断历史不再丢失进程标志，同时保留 Go failed-history 全量 SQLite 语义。
-- `[x]` 2026-08-13 在 Podman 重跑 `make go-live-flow-parity-smoke` 和 `make workspace-tests`：Go/Rust 真实 live flow 的 connections、total、traffic、telemetry、history 对照通过；workspace 49 个 harness 全部通过（chain 56、289 个 runtime tests、132 个 store tests、24 个 service-chain tests、3 个 WireGuard chain tests）。结果保存在 `~/.cache/yuhaiin-rust/integration/go-live-flow-parity/20260813034332-2381346` 与 `~/.cache/yuhaiin-rust/integration/workspace-tests`。
+- `[x]` 2026-08-13 在 Podman 重跑 `make go-live-flow-parity-smoke` 和 `make workspace-tests`：Go/Rust 真实 live flow 的 connections、total、traffic、telemetry、history 对照通过；workspace 49 个 harness 全部通过（chain 56、291 个 runtime tests、132 个 store tests、24 个 service-chain tests、3 个 WireGuard chain tests）。结果保存在 `~/.cache/yuhaiin-rust/integration/go-live-flow-parity/20260813034332-2381346` 与 `~/.cache/yuhaiin-rust/integration/workspace-tests`。
 - `[x]` 2026-08-13 在 Podman 重跑 `make api-contract-smoke service-chain-smoke`：管理 API/SSE/connections/statistics/路由测试 4/4 通过；多协议真实 inbound → router → outbound 主链 24/24 通过，覆盖 HTTP、SOCKS5、Yuubinsya、mixed、TLS、AEAD、HTTP/2、reverse、network_split、VLESS/VMess/Trojan TCP/UDP、IPv6 和中心用户认证。
 - `[x]` route list `refreshInterval` 已由 RuntimeService 持有后台 timer：配置 reload 立即重读，刷新产生的 reload 不会忙循环，服务 shutdown 会停止任务；定时刷新夹具验证 `lastRefreshTime` 和 reload 生命周期。
 - `[x]` API response 字段、生产 route/resolver projection 和 MaxMind country projection 已补齐证据：四份停止态 Go SQLite 的完整 API read/mutation/error parity、runtime route-list GeoIP metadata 持久化测试，以及 `make maxmind-smoke` 对用户指定 Country-without-asn 数据库的真实查询均通过；Go 当前 MaxMind 接口只暴露 country，不额外把 ASN 当作迁移缺口。
@@ -226,7 +227,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 | 类别 | 命令 | Podman 验证结果 |
 | --- | --- | --- |
-| 全 workspace | `make workspace-tests` | 49 个 harness，0 失败；chain 56、core 154、runtime 289、store 132（5 ignored）、trie 27、service-chain 24、WireGuard 11（1 benchmark ignored）、WireGuard runtime chain 3、stats concurrency 2；外部 WARP 测试显式 ignored；新增 RuntimeDnsHandler→UDP/TCP server/client 原始 QTYPE 回归与 Go no-op contract point chain 回归 |
+| 全 workspace | `make workspace-tests` | 49 个 harness，0 失败；chain 56、core 154、runtime 291、store 132（5 ignored）、trie 27、service-chain 24、WireGuard 11（1 benchmark ignored）、WireGuard runtime chain 3、stats concurrency 2；外部 WARP 测试显式 ignored；新增 RuntimeDnsHandler→UDP/TCP server/client 原始 QTYPE 回归与 Go no-op contract point chain 回归 |
 | NetworkSplit 兼容 | `podman-cargo.sh -- cargo test -p yuhaiin-runtime --all-features network_split`；`podman-cargo.sh -- cargo test -p yuhaiin-store --all-features go_network_split_runtime_keeps_branch_layers_and_prefix_transport` | runtime TCP/UDP dispatch、HTTP/2 branch wrapping parent 与 Go-shaped config/prefix transport 均通过；测试状态和构建缓存位于 `~/.cache/yuhaiin-rust/integration/network-split/`、`~/.cache/yuhaiin-rust/cargo-target/` |
 | Go API / SQLite | `make production-parity-smoke` | 4 份停止态 Go SQLite 的 info/settings/nodes/inbounds/resolvers/routes/publishes/connections/统计稳定投影、核心 mutation 和错误矩阵逐项 identical；Rust takeover 结构审计逐表保留源对象/列约束/索引，已知 projection migration 单独记录 |
 | Go live flow | `make go-live-flow-parity-smoke` | Go/Rust 真实 HTTP inbound → router → HTTP outbound 流量、connections、total、traffic、history、telemetry 和 reload 后统计 parity |

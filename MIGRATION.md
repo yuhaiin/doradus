@@ -4812,3 +4812,17 @@ Go 的 `pkg/net/proxy/proxy/proxy.go` 注册了 `proxy` contract point，但它�
 `network_split` 分支中透传 parent；chain parser 会在校验真实 fixed/TLS/WebSocket/H2/最终
 协议形状前移除 `none`、`proxy`、`bootstrap_dns_warp` 这些无行为 wrapper。新增 store、runtime
 和 chain regression tests，均在 Podman focused run 中验证。
+
+## 190. 2026-08-13 tls_termination contract point
+
+Go 的 `pkg/net/proxy/tls/unwrap.go` 注册 `tls_termination`：它保留已经构造的父代理，
+对 `Conn` 返回的字节流执行 TLS server handshake，`PacketConn` 继续继承父代理。Rust
+现在在 store 的协议选择和 runtime builder 中保留该 contract point；它会先按 chain
+prefix 构造 parent，再用 RustCrypto/rustls `TlsAcceptor` 解包 TCP stream，UDP、ping 和
+close 继续委托 parent。
+
+证书配置兼容 Go 的 `cert`/`key` JSON byte arrays、base64 字符串和
+`certFilePath`/`keyFilePath`，支持默认 certificates、`serverNameCertificate`（包含 Go
+的单标签 wildcard 规则）和 `nextProtos`/`next_protos`。新增 store/runtime 分支回归和
+2 个 Podman focused tests；完整 `make workspace-tests` 也通过。当前清单仍标为 `[~]`，
+因为还需要带真实证书的进程级 TLS termination chain 以及 Go 命名证书选择对照。

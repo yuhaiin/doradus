@@ -37,6 +37,44 @@ struct NetworkSplitProxy {
     parent: Arc<dyn AsyncProxy>,
 }
 
+#[cfg(feature = "doh-tls")]
+struct TlsTerminationProxy {
+    upstream: Arc<dyn AsyncProxy>,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+#[cfg(feature = "doh-tls")]
+impl AsyncProxy for TlsTerminationProxy {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        Box::pin(async move {
+            let upstream = self.upstream.connect(context).await?;
+            let local_addr = stream_local_addr(&*upstream);
+            let stream = self.acceptor.accept(upstream).await.map_err(|error| {
+                Error::new(
+                    ErrorKind::Protocol,
+                    format!("TLS termination handshake: {error}"),
+                )
+            })?;
+            Ok(with_stream_local_addr(Box::new(stream), local_addr))
+        })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+        self.upstream.open_datagram(context)
+    }
+
+    fn ping<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<Duration>> {
+        self.upstream.ping(context)
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        self.upstream.close()
+    }
+}
+
 impl AsyncProxy for NetworkSplitProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         self.tcp.connect(context)
@@ -1008,10 +1046,18 @@ impl RuntimeSnapshot {
 
     pub async fn build_proxy(&self, id: &str, timeout: Duration) -> Result<ProxyBuild> {
         let config = self.require_proxy_config(id)?.clone();
+        self.build_proxy_config(config, timeout).await
+    }
+
+    async fn build_proxy_config(
+        &self,
+        config: GoProxyRuntimeConfig,
+        timeout: Duration,
+    ) -> Result<ProxyBuild> {
         if !config.enabled {
             return Err(Error::new(
                 ErrorKind::Closed,
-                format!("proxy runtime config {id:?} is disabled"),
+                format!("proxy runtime config {:?} is disabled", config.id),
             ));
         }
 
@@ -1045,11 +1091,32 @@ impl RuntimeSnapshot {
             Arc::new(yuhaiin_protocol::http_mock::HttpMockProxy::new(
                 base.build()?,
             )) as Arc<dyn AsyncProxy>
+        } else if config.transport == yuhaiin_store::GoProxyTransport::TlsTermination {
+            let index = config
+                .layers
+                .iter()
+                .position(|layer| layer.kind.eq_ignore_ascii_case("tls_termination"))
+                .ok_or_else(|| Error::invalid("TLS termination layer is missing"))?;
+            let parent = Box::pin(self.build_proxy_config(config.chain_prefix(index)?, timeout))
+                .await?
+                .proxy;
+            #[cfg(feature = "doh-tls")]
+            {
+                build_tls_termination_proxy(&config, parent)?
+            }
+            #[cfg(not(feature = "doh-tls"))]
+            {
+                let _ = parent;
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "TLS termination requires the doh-tls feature",
+                ));
+            }
         } else if is_chain_config(&config) {
             let json = std::str::from_utf8(&config.data_json).map_err(|error| {
                 Error::new(
                     ErrorKind::InvalidInput,
-                    format!("proxy {id:?} data_json is not UTF-8: {error}"),
+                    format!("proxy {:?} data_json is not UTF-8: {error}", config.id),
                 )
             })?;
             Arc::new(ChainProxy::from_go_json_with_resolver(
@@ -2611,6 +2678,226 @@ fn build_protocol_tls_proxy(
     ))
 }
 
+#[cfg(feature = "doh-tls")]
+fn build_tls_termination_proxy(
+    config: &GoProxyRuntimeConfig,
+    upstream: Arc<dyn AsyncProxy>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::sign::CertifiedKey;
+    use tokio_rustls::TlsAcceptor;
+
+    let layer = config
+        .layers
+        .iter()
+        .find(|layer| layer.kind.eq_ignore_ascii_case("tls_termination"))
+        .ok_or_else(|| Error::invalid("TLS termination layer is missing"))?;
+    let tls = layer.config.get("tls").unwrap_or(&layer.config);
+    let certificates = tls
+        .get("certificates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::invalid("TLS termination certificates are missing"))?;
+
+    let mut entries = Vec::new();
+    for certificate in certificates {
+        let certificate = certificate
+            .as_object()
+            .ok_or_else(|| Error::invalid("TLS termination certificate must be an object"))?;
+        entries.push((certificate, None));
+    }
+    if let Some(named_certificates) = tls
+        .get("serverNameCertificate")
+        .or_else(|| tls.get("server_name_certificate"))
+        .and_then(serde_json::Value::as_object)
+    {
+        for (name, certificate) in named_certificates {
+            let certificate = certificate.as_object().ok_or_else(|| {
+                Error::invalid("TLS termination named certificate must be an object")
+            })?;
+            entries.push((certificate, Some(name.as_str())));
+        }
+    }
+
+    let mut default = Vec::new();
+    let mut named = BTreeMap::new();
+    for (certificate, name) in entries {
+        let cert_bytes = tls_termination_bytes(
+            certificate,
+            &["cert", "certBase64"],
+            &["certFilePath", "cert_file_path"],
+            "TLS termination certificate",
+        )?;
+        let key_bytes = tls_termination_bytes(
+            certificate,
+            &["key", "keyBase64"],
+            &["keyFilePath", "key_file_path"],
+            "TLS termination private key",
+        )?;
+        let cert_chain = if cert_bytes.starts_with(b"-----BEGIN") {
+            rustls_pemfile::certs(&mut std::io::Cursor::new(cert_bytes))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::Protocol,
+                        format!("TLS termination certificate PEM: {error}"),
+                    )
+                })?
+        } else {
+            vec![CertificateDer::from(cert_bytes)]
+        };
+        if cert_chain.is_empty() {
+            return Err(Error::invalid("TLS termination certificate chain is empty"));
+        }
+        let key = if key_bytes.starts_with(b"-----BEGIN") {
+            rustls_pemfile::private_key(&mut std::io::Cursor::new(key_bytes))
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::Protocol,
+                        format!("TLS termination private key PEM: {error}"),
+                    )
+                })?
+                .ok_or_else(|| Error::invalid("TLS termination private key is empty"))?
+        } else {
+            PrivateKeyDer::try_from(key_bytes).map_err(|error| {
+                Error::new(
+                    ErrorKind::Protocol,
+                    format!("TLS termination private key DER: {error}"),
+                )
+            })?
+        };
+        let signer = rustls_rustcrypto::sign::any_supported_type(&key).map_err(|error| {
+            Error::new(
+                ErrorKind::Protocol,
+                format!("TLS termination signing key: {error:?}"),
+            )
+        })?;
+        let certified = Arc::new(CertifiedKey::new(cert_chain, signer));
+        if let Some(name) = name {
+            let name = tls_termination_name(name);
+            if !name.is_empty() {
+                named.insert(name, Arc::clone(&certified));
+            }
+        } else {
+            default.push(Arc::clone(&certified));
+        }
+    }
+    if default.is_empty() && named.is_empty() {
+        return Err(Error::invalid("TLS termination has no usable certificates"));
+    }
+    let resolver = StaticTlsTerminationResolver { default, named };
+    let mut server =
+        rustls::ServerConfig::builder_with_provider(Arc::new(rustls_rustcrypto::provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Protocol,
+                    format!("TLS termination provider: {error}"),
+                )
+            })?
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(resolver));
+    server.alpn_protocols = tls
+        .get("nextProtos")
+        .or_else(|| tls.get("next_protos"))
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::as_bytes)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(Arc::new(TlsTerminationProxy {
+        upstream,
+        acceptor: TlsAcceptor::from(Arc::new(server)),
+    }))
+}
+
+#[cfg(feature = "doh-tls")]
+fn tls_termination_name(name: &str) -> String {
+    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    if name.is_empty() || name.starts_with("*.") || name.parse::<std::net::IpAddr>().is_ok() {
+        name
+    } else {
+        format!("*.{name}")
+    }
+}
+
+#[cfg(feature = "doh-tls")]
+fn tls_termination_bytes(
+    value: &serde_json::Map<String, serde_json::Value>,
+    encoded_keys: &[&str],
+    file_keys: &[&str],
+    label: &str,
+) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+
+    for key in encoded_keys {
+        if let Some(bytes) = value.get(*key).and_then(serde_json::Value::as_array) {
+            return bytes
+                .iter()
+                .map(|byte| {
+                    byte.as_u64()
+                        .and_then(|byte| u8::try_from(byte).ok())
+                        .ok_or_else(|| Error::invalid(format!("{label} byte is invalid")))
+                })
+                .collect();
+        }
+        if let Some(encoded) = value.get(*key).and_then(serde_json::Value::as_str) {
+            if encoded.starts_with("-----BEGIN") {
+                return Ok(encoded.as_bytes().to_vec());
+            }
+            return base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|error| Error::invalid(format!("{label} base64: {error}")));
+        }
+    }
+    for key in file_keys {
+        if let Some(path) = value
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|path| !path.trim().is_empty())
+        {
+            return std::fs::read(path)
+                .map_err(|error| Error::invalid(format!("read {label} {path:?}: {error}")));
+        }
+    }
+    Err(Error::invalid(format!("{label} is missing")))
+}
+
+#[cfg(feature = "doh-tls")]
+#[derive(Debug)]
+struct StaticTlsTerminationResolver {
+    default: Vec<Arc<rustls::sign::CertifiedKey>>,
+    named: BTreeMap<String, Arc<rustls::sign::CertifiedKey>>,
+}
+
+#[cfg(feature = "doh-tls")]
+impl rustls::server::ResolvesServerCert for StaticTlsTerminationResolver {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let name = client_hello
+            .server_name()?
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if let Some(certificate) = self.named.get(&name) {
+            return Some(Arc::clone(certificate));
+        }
+        let mut labels = name.split('.');
+        labels.next()?;
+        let wildcard = format!("*.{}", labels.collect::<Vec<_>>().join("."));
+        self.named
+            .get(&wildcard)
+            .cloned()
+            .or_else(|| self.default.first().cloned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2739,6 +3026,55 @@ mod tests {
             resolve_node_tag_targets("edge", &definitions, &mut BTreeSet::new()),
             ["node-a", "node-b"]
         );
+    }
+
+    #[cfg(feature = "doh-tls")]
+    #[test]
+    fn tls_termination_preserves_go_certificate_name_and_byte_shapes() {
+        assert_eq!(tls_termination_name("example.com"), "*.example.com");
+        assert_eq!(tls_termination_name("*.Example.COM."), "*.example.com");
+        assert_eq!(tls_termination_name("127.0.0.1"), "127.0.0.1");
+
+        let value = serde_json::json!({
+            "cert": [1, 2, 255],
+            "keyBase64": base64::engine::general_purpose::STANDARD.encode([3u8, 4, 5]),
+        });
+        let object = value.as_object().unwrap();
+        assert_eq!(
+            tls_termination_bytes(object, &["cert"], &[], "cert").unwrap(),
+            [1, 2, 255]
+        );
+        assert_eq!(
+            tls_termination_bytes(object, &["keyBase64"], &[], "key").unwrap(),
+            [3, 4, 5]
+        );
+    }
+
+    #[cfg(feature = "doh-tls")]
+    #[test]
+    fn tls_termination_rejects_empty_certificate_set_before_runtime_use() {
+        let config = GoProxyRuntimeConfig {
+            id: "tls-termination-empty".to_owned(),
+            name: "tls-termination-empty".to_owned(),
+            group_name: String::new(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["tls_termination".to_owned()],
+            layers: vec![GoProxyLayer {
+                kind: "tls_termination".to_owned(),
+                config: serde_json::json!({"tls": {"certificates": []}}),
+            }],
+            transport: GoProxyTransport::TlsTermination,
+            data_json: br#"{"chain":[]}"#.to_vec(),
+        };
+        let parent = Arc::new(DirectAsyncProxy {
+            timeout: Duration::from_secs(1),
+        });
+        let error = match build_tls_termination_proxy(&config, parent) {
+            Ok(_) => panic!("empty TLS termination certificate set must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("TLS termination"));
     }
 
     #[tokio::test]
