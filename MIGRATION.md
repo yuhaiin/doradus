@@ -4741,3 +4741,30 @@ make stats-concurrency-smoke
 flow 写入，再执行 restart persistence 校验。结果和日志保存在
 `~/.cache/yuhaiin-rust/integration/stats-concurrency/`；这加强了运行时统计的进程级证据，
 但仍不冒充真实生产长时段样本。
+
+## 186. 2026-08-13 network_split HTTP/2 分支兼容
+
+Go 的 `pkg/register/point.go` 会把 `network_split` 的 TCP/UDP 分支通过
+`ContractWrap` 包装到已经构造好的父代理；Go HTTP/2 client 只改写 TCP `Conn`，其
+`PacketConn` 继续继承父代理。Rust 原先把 HTTP/2 分支直接拒绝，导致这一组合比 Go
+少了一条可用路径。
+
+现已复用 `yuhaiin-chain::H2Connection`，新增运行时 `NetworkSplitHttp2Proxy`：TCP 通过父代理
+建立 plaintext prior-knowledge H2，复用 H2 connection 的 CONNECT stream 和流槽位；UDP、
+ping 和关闭仍委托/联动父代理。`concurrency` 与 `max_streams` 支持 snake/camel 配置，
+连接会按活动流容量复用，失效连接被清理；nested split 和 WireGuard 仍保持显式拒绝，避免
+把不可组合的 userspace tunnel 错误地套在另一个 proxy 上。
+
+Podman 验证命令：
+
+```bash
+./scripts/integration/podman-cargo.sh \
+  -- cargo test --target-dir /target -p yuhaiin-runtime --all-features \
+  runtime_network_split_wraps_http2_tcp_branch_over_parent -- --nocapture
+make service-chain-smoke
+```
+
+结果为 focused H2 parent-wrapper `1 passed`，完整 service-chain `24 passed`；后者继续覆盖
+HTTP/SOCKS5/Yuubinsya、TLS/HTTP/2、VLESS/VMess/Trojan TCP/UDP、IPv6、认证和已有
+network_split HTTP branch。所有构建、测试和状态仍位于 Podman 与 `~/.cache/yuhaiin-rust`，
+未使用 `/tmp`。

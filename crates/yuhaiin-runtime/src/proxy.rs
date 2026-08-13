@@ -84,6 +84,87 @@ struct NetworkSplitYuubinsyaProxy {
     udp_server: Option<Endpoint>,
 }
 
+/// Go's HTTP/2 contract wraps the already-built parent proxy and uses that
+/// proxy only as the dialer for plaintext prior-knowledge HTTP/2.  Its UDP
+/// method is inherited from the parent, so this adapter deliberately applies
+/// HTTP/2 only to TCP streams as well.
+struct NetworkSplitHttp2Proxy {
+    upstream: Arc<dyn AsyncProxy>,
+    connections: tokio::sync::Mutex<Vec<Arc<yuhaiin_chain::H2Connection>>>,
+    concurrency: usize,
+    max_streams: usize,
+}
+
+impl NetworkSplitHttp2Proxy {
+    async fn connect_stream(
+        &self,
+        context: &FlowContext,
+    ) -> Result<(tokio::io::DuplexStream, Option<SocketAddr>)> {
+        let mut connections = self.connections.lock().await;
+        connections.retain(|connection| !connection.is_closed());
+
+        for connection in connections.iter() {
+            if connection.at_capacity() {
+                continue;
+            }
+            match connection
+                .open_connect_stream_with_local_addr(self.concurrency)
+                .await
+            {
+                Ok(stream) => return Ok(stream),
+                Err(_) if connection.is_closed() => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        let upstream = self.upstream.connect(context).await?;
+        let local_addr = stream_local_addr(&*upstream);
+        let connection = yuhaiin_chain::H2Connection::handshake_with_limits_and_local_addr(
+            upstream,
+            self.max_streams,
+            local_addr,
+        )
+        .await?;
+        let stream = connection
+            .open_connect_stream_with_local_addr(self.concurrency)
+            .await?;
+        connections.push(connection);
+        Ok(stream)
+    }
+}
+
+impl AsyncProxy for NetworkSplitHttp2Proxy {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        Box::pin(async move {
+            let (stream, local_addr) = self.connect_stream(context).await?;
+            Ok(with_stream_local_addr(Box::new(stream), local_addr))
+        })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+        self.upstream.open_datagram(context)
+    }
+
+    fn ping<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<Duration>> {
+        self.upstream.ping(context)
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        let upstream = Arc::clone(&self.upstream);
+        let connections = &self.connections;
+        Box::pin(async move {
+            let connections = connections.lock().await.drain(..).collect::<Vec<_>>();
+            for connection in connections {
+                connection.close().await;
+            }
+            upstream.close().await
+        })
+    }
+}
+
 impl AsyncProxy for NetworkSplitYuubinsyaProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         Box::pin(async move {
@@ -873,10 +954,30 @@ impl RuntimeSnapshot {
                     udp_server,
                 }))
             }
-            "http2" => Err(Error::new(
-                ErrorKind::Unsupported,
-                "network_split HTTP/2 branch requires a complete fixed/TLS/HTTP2 chain",
-            )),
+            "http2" => {
+                let concurrency = layer
+                    .config
+                    .get("concurrency")
+                    .or_else(|| layer.config.get("max_concurrency"))
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|value| *value >= 7)
+                    .unwrap_or(10);
+                let max_streams = layer
+                    .config
+                    .get("max_streams")
+                    .or_else(|| layer.config.get("maxStreams"))
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(128)
+                    .max(1);
+                Ok(Arc::new(NetworkSplitHttp2Proxy {
+                    upstream: parent,
+                    connections: tokio::sync::Mutex::new(Vec::new()),
+                    concurrency,
+                    max_streams,
+                }))
+            }
             "wireguard" | "wire_guard" | "wg" => Err(Error::new(
                 ErrorKind::Unsupported,
                 "network_split WireGuard branch is not composable with a parent proxy",
@@ -2857,6 +2958,87 @@ mod tests {
         assert_eq!(error.kind, ErrorKind::Closed);
 
         datagram.close().await.unwrap();
+        proxy.close().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_network_split_wraps_http2_tcp_branch_over_parent() {
+        use bytes::Bytes;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            while let Some(result) = connection.accept().await {
+                let (request, mut respond) = result.unwrap();
+                assert_eq!(request.method(), ::http::Method::CONNECT);
+                assert_eq!(request.uri().host(), Some("localhost"));
+                tokio::spawn(async move {
+                    let mut body = request.into_body();
+                    let mut send = respond
+                        .send_response(::http::Response::new(()), false)
+                        .unwrap();
+                    while let Some(data) = body.data().await {
+                        let Ok(data) = data else { break };
+                        if body.flow_control().release_capacity(data.len()).is_err()
+                            || send.send_data(data, false).is_err()
+                        {
+                            break;
+                        }
+                    }
+                    let _ = send.send_data(Bytes::new(), true);
+                });
+            }
+        });
+        let config = GoProxyRuntimeConfig {
+            id: "network-split-http2".to_owned(),
+            name: "network split HTTP/2".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned(), "network_split".to_owned()],
+            layers: vec![
+                GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({
+                        "addresses": [{
+                            "host": target.ip().to_string(),
+                            "port": target.port()
+                        }]
+                    }),
+                },
+                GoProxyLayer {
+                    kind: "network_split".to_owned(),
+                    config: serde_json::json!({
+                        "tcp": {
+                            "type": "http2",
+                            "http2": {"concurrency": 1, "max_streams": 1}
+                        },
+                        "udp": {"type": "direct", "direct": {}}
+                    }),
+                },
+            ],
+            transport: GoProxyTransport::NetworkSplit,
+            data_json: Vec::new(),
+        };
+        let proxy = snapshot(config)
+            .build_proxy("network-split-http2", Duration::from_secs(1))
+            .await
+            .unwrap()
+            .proxy;
+        let context = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        let mut stream = proxy.connect(&context).await.unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"ping");
+
         proxy.close().await.unwrap();
         server.await.unwrap();
     }

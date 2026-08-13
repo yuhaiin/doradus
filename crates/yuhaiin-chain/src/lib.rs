@@ -24,7 +24,7 @@ pub use config::{
 };
 pub use go_node::parse_go_node;
 pub use h2_server::YuubinsyaH2Server;
-pub use h2_tunnel::H2PoolStats;
+pub use h2_tunnel::{H2Connection, H2PoolStats};
 pub use session::{
     AsyncYuubinsyaPingServerSession, AsyncYuubinsyaPingSession, AsyncYuubinsyaTcpSession,
     AsyncYuubinsyaUotServerSession, AsyncYuubinsyaUotSession, YuubinsyaDnsHandler,
@@ -55,7 +55,7 @@ use yuhaiin_core::{
 };
 
 use crate::direct_uot::{DirectUotProxy, parse_go_direct_uot};
-use crate::h2_tunnel::{H2Connection, H2Pool, H2PoolEndpoint};
+use crate::h2_tunnel::{H2Pool, H2PoolEndpoint};
 use crate::session::{MAX_UOT_COALESCE_BYTES, MAX_UOT_COALESCE_FRAMES, read_uot_frame};
 
 /// A single best-effort runtime observation for the reusable chain client.
