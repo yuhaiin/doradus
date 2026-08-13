@@ -4900,3 +4900,24 @@ reply 为 `wireguard-tcp`，UDP payload 为 `wireguard-udp`；结果为 `externa
 这证明了标准 Go userspace peer 与 Rust BoringTun 的 TCP/UDP wire compatibility，但不把
 单台 Debian VM 冒充 Cloudflare WARP/public peer：真实 WARP credentials、NAT endpoint
 变化、keepalive、roaming 和公网策略仍保持 checklist 的 `[~]`。
+
+## 195. 2026-08-14 Go/Rust termination live parity
+
+对照 Go 的 `pkg/register.ContractDialer`、`pkg/net/proxy/reverse` 和
+`pkg/net/proxy/reverse/unwrap.go` 调用图，确认 termination chain 的边界：proxy wrapper
+按声明顺序构造，`tls_termination` 保留 parent stream，`http_termination` 使用同一个
+parent 访问目标；前置 TLS marker 会让 HTTP termination 选择 HTTPS upstream，并避免
+二次 TLS。Rust 的 chain builder、后台 TLS pipe 和 Hyper request relay 已按这个边界实现。
+
+新增 `make go-termination-parity-smoke`，在 Podman 中分别编译并启动 Go/Rust 前台服务，
+使用相同语义配置验证 `reverse_http → tls_termination → http_termination → HTTP target`
+的 raw TLS 请求。两端都检查目标收到的 path/Host、`200` 和
+`termination-parity-ok` body，并通过 connections API 检查 inbound/proxy 记录，结果为
+Go 1/1、Rust 1/1（合计 2/2）。Go 的默认 LAN route 会优先匹配 loopback/private 目标，
+所以测试明确将 parity rule 移到 LAN rule 前；Rust 使用等价的 route priority。目标 readiness、
+编译产物、运行日志和副本均位于 `~/.cache/yuhaiin-rust/integration/go-termination-parity/`，
+未使用 `/tmp`。
+
+该证据只覆盖当前最重要的组合链，不把 termination 全部标为完成：独立 standalone、
+命名证书选择、请求错误、HTTPS upstream 以及更广的 Go live 矩阵仍保留在 checklist 的
+`[~]`。

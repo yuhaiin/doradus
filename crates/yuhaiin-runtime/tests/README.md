@@ -124,6 +124,14 @@ The current scenarios cover:
   H2 v1, VLESS, VMess, and Trojan. The Go checkout and all scratch state are
   mounted from `~/.cache/yuhaiin-rust`; the normal workspace test run does not
   start external Go processes.
+- `make go-termination-parity-smoke` starts the Go and Rust services with the
+  same semantic API configuration and sends raw TLS `reverse_http` traffic
+  through `http_termination` and `tls_termination` to one-shot HTTP targets.
+  It checks the request path/Host, response body, and live `connections` entry
+  in both services. The Go test moves its proxy rule before the built-in LAN
+  rule; the Rust test uses the equivalent route priority. Build/runtime logs
+  remain under
+  `~/.cache/yuhaiin-rust/integration/go-termination-parity`.
 - `make service-chain-smoke` includes a process-level 3-case protocol matrix:
   the API writes a Go-shaped fixed+VLESS/VMess/Trojan node, an HTTP inbound
   routes `example.test` through it, and the Podman test checks payload echo,
