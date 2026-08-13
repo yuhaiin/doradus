@@ -5002,3 +5002,22 @@ termination，完整 Go/Rust matrix 为 10/10。默认 `make go-termination-pari
 `~/.cache/yuhaiin-rust/integration/go-termination-parity/`，没有使用 `/tmp`。HTTP
 inbound absolute-form HTTPS 的 Go 错误语义和更多外网/error 矩阵仍保留在 checklist 的
 `[~]`。
+
+## 202. 2026-08-14 TUN distro override and desktop boundary audit
+
+这次审计发现 `scripts/integration/tun-distro.sh` 只读取专用的
+`YUHAIIN_TUN_DISTRO_IMAGE`，会覆盖调用者传入的其他 TUN harness 通用变量，导致传入
+`YUHAIIN_TEST_IMAGE=ubuntu:24.04` 时实际仍运行默认 Alpine。现在它保留专用变量优先级，
+同时接受 `YUHAIIN_TEST_IMAGE`，并在启动日志中打印最终镜像，避免多发行版验证出现假象。
+
+修复后在 Podman 用户/network namespace 中实际重跑：Alpine、Ubuntu 24.04、Fedora 三种
+镜像均通过 reload、无路由窗口、真实 packet traffic、close 和 MTU
+`576/1280/1500/9000/9216` 五档的 65507-byte UDP 回环；另外 `make tun-ipv6-extension-smoke`
+通过真实 TUN 的 Hop-by-Hop + Destination Options IPv6/UDP round-trip，
+`make tun-chain-service-smoke` 通过真实 `TUN → fixed → TLS → HTTP/2 → Yuubinsya`，
+`make tun-api-process-smoke` 通过真实前台 API 的单/双 TUN disable-enable。
+
+当前宿主没有 rootful Podman，`make tun-route-matrix-smoke` 按设计返回 77 并明确跳过，不能
+把这次结果误写成 rootful route/firewall 通过；该项继续使用 Debian VM/具备
+`CAP_NET_ADMIN` 的 runner 现场证据。所有日志和构建状态仍位于
+`~/.cache/yuhaiin-rust`，没有使用 `/tmp`。

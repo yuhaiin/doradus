@@ -5,7 +5,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 scenario_dir="${YUHAIIN_TUN_DISTRO_DIR:-${cache_root}/integration/tun-distro}"
 target_dir="${YUHAIIN_TUN_DISTRO_TARGET_DIR:-${cache_root}/tun-distro-target}"
-image="${YUHAIIN_TUN_DISTRO_IMAGE:-docker.io/library/alpine:latest}"
+# Keep the distro-specific knob for callers that need separate scenarios, but
+# honor the shared integration override used by the other TUN harnesses too.
+image="${YUHAIIN_TUN_DISTRO_IMAGE:-${YUHAIIN_TEST_IMAGE:-docker.io/library/alpine:latest}}"
 target="${YUHAIIN_TUN_DISTRO_TARGET:-x86_64-unknown-linux-musl}"
 binary="${target_dir}/${target}/release/tun-service-smoke"
 namespace_mode="${YUHAIIN_TUN_USER_NAMESPACE:-1}"
