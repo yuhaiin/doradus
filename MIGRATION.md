@@ -4582,13 +4582,10 @@ launchd/SCM 权限以及外部 WARP peer 仍是待验收项。
 `YUHAIIN_TEST_IMAGE` 约定不一致。现已统一为可通过该环境变量替换镜像，默认行为保持不变；
 `make help` 也列出这个入口，后续 CI 可以在不复制 harness 的情况下增加发行版矩阵。
 
-为验证不是只改了字符串，本轮用 Podman 编译 `x86_64-unknown-linux-musl` 的静态 PIE
-`tun-service-smoke`，并以 `YUHAIIN_TEST_IMAGE=docker.io/library/alpine:latest`、
-`YUHAIIN_TUN_USER_NAMESPACE=1` 执行 `make tun-reload-traffic-smoke`。Alpine 中真实 TUN
-创建、disable/enable reload、关闭期间无路由、32 字节 packet traffic 和 close 全部通过；
-结果位于 `~/.cache/yuhaiin-rust/integration/tun-alpine/`，没有使用系统 `/tmp`。
-随后用同一个 Alpine 镜像和静态 binary 执行 `make tun-mtu-smoke`，576、1280、1500、9000、
-9216 五档全部通过，每档都回环 65507 字节 UDP，并观察到 `runtime-tun-udp-traffic-ok`、
-`runtime-tun-closed` 和 `tun-mtu-case-passed`。结果位于
-`~/.cache/yuhaiin-rust/integration/tun-alpine-mtu/`；这扩展了用户态发行版证据，但不替代
-rootful 宿主 route takeover 和不同发行版 kernel/firewall 的现场矩阵。
+为验证不是只改了字符串，新增可复用的 `make tun-distro-smoke`：它在 Podman 编译
+`x86_64-unknown-linux-musl` 静态 PIE，并在 `docker.io/library/alpine:latest` 中自动执行
+reload/traffic 和 MTU 两组测试。Alpine 中真实 TUN 创建、disable/enable reload、关闭期间
+无路由、32 字节 packet traffic 和 close 全部通过；576、1280、1500、9000、9216 五档也全部
+通过，每档回环 65507 字节 UDP。结果位于
+`~/.cache/yuhaiin-rust/integration/tun-distro/`，没有使用系统 `/tmp`；这扩展了用户态发行版
+证据，但不替代 rootful 宿主 route takeover 和不同发行版 kernel/firewall 的现场矩阵。
