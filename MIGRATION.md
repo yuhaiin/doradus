@@ -4678,3 +4678,20 @@ Windows cfg/依赖门禁。该检查只负责 Linux 容器中的 GNU/MinGW 源�
 结果证明 Linux amd64 musl 产物可以脱离 Cargo 在最小用户态中启动和优雅退出；不替代
 Darwin/Windows 原生 runner、真实 launchd/SCM 权限和外部 WARP peer 验收。构建、状态和日志
 全部位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
+## 182. 2026-08-13 API 与多协议主链回归
+
+为确认当前实现仍然满足“前端不变、Rust 进程直接替换 Go 后端”的主路径，在 Podman 中
+重新执行了两组可复用的进程级测试：
+
+- `make api-contract-smoke`：4/4 通过，覆盖管理 API、真实 HTTP flow、SSE、connections、
+  statistics、嵌套路由测试和 direct-node latency。
+- `make service-chain-smoke`：24/24 通过，覆盖 HTTP、SOCKS5、Yuubinsya、mixed、TLS、
+  AEAD、HTTP/2、reverse、network_split、VLESS/VMess/Trojan 的 TCP/UDP、IPv6、中心用户
+  认证以及 TLS+HTTP/2+Yuubinsya 组合；每项都通过真实 inbound → router → outbound →
+  echo/状态断言，而不是只调用协议单元函数。
+
+结果日志分别位于 `~/.cache/yuhaiin-rust/integration/api-contract/` 和
+`~/.cache/yuhaiin-rust/integration-reusable/`，本轮未使用宿主机 Cargo/test，也没有使用
+`/tmp`。剩余 `[~]` 仍是 ECH API、真实 AWS/WARP、原生 Darwin/Windows runner/权限及更长
+生产样本等外部边界，不能用这组 Linux Podman 回归冒充完成。
