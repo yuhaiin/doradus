@@ -4901,6 +4901,20 @@ reply 为 `wireguard-tcp`，UDP payload 为 `wireguard-udp`；结果为 `externa
 单台 Debian VM 冒充 Cloudflare WARP/public peer：真实 WARP credentials、NAT endpoint
 变化、keepalive、roaming 和公网策略仍保持 checklist 的 `[~]`。
 
+## 206. 2026-08-14 stopped SQLite parity recheck
+
+在扩展 statistics soak 后重新执行 `make production-parity-smoke`，当前可用的四份停止态
+Go 数据库全部通过：`tmp/state.db`（legacy v1，独立副本模式）、`tmp/v2/state.db`、
+`tmp/yuhaiin/state.db` 和 `tmp/aws/yuhaiin/state.db`。每份都完成 Rust takeover/schema
+审计、info/settings/nodes/inbounds/resolvers/routes/publishes/connections/统计读取、核心
+mutation、错误矩阵和服务启动；终端结果为 `passed 4 fixture(s)`。
+
+这次仍只读取源库，副本、schema 报告和进程日志位于
+`~/.cache/yuhaiin-rust/production-parity/`；没有发现新的停止态生产快照，因此不虚增样本
+数量，也不把旧快照重复计为新覆盖。运行后发现此前被强制中断的 termination smoke 遗留
+59 个 `yuhaiin-(go|rust)-termination-*` Podman 服务容器，已按精确测试前缀定向删除；所有
+缓存日志和 SQLite 副本均保留。
+
 ## 195. 2026-08-14 Go/Rust termination live parity
 
 对照 Go 的 `pkg/register.ContractDialer`、`pkg/net/proxy/reverse` 和
