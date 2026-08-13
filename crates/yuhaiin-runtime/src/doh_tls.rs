@@ -13,7 +13,9 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use yuhaiin_core::http2::H2DohConnector;
-use yuhaiin_core::proxy::{BoxAsyncStream, connect_tokio_tcp};
+use yuhaiin_core::proxy::{
+    BoxAsyncStream, connect_tokio_tcp, stream_local_addr, with_stream_local_addr,
+};
 use yuhaiin_core::{BoxFuture, Error, ErrorKind, Result};
 
 pub type RustCryptoTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
@@ -106,6 +108,23 @@ impl RustCryptoTlsDialer {
             .map_err(|_| Error::new(ErrorKind::Timeout, "TLS handshake timed out"))?
             .map_err(tls_error)
     }
+}
+
+/// Wrap an already-routed stream in client TLS using the same public root set
+/// as the runtime's HTTPS management and reverse-proxy paths.  Keeping this
+/// at the shared TLS boundary is important: an HTTP inbound must perform the
+/// origin handshake *after* its selected outbound proxy has connected, rather
+/// than opening a second direct socket and bypassing routing.
+pub(crate) async fn wrap_system_tls_stream(
+    server_name: &str,
+    stream: BoxAsyncStream,
+) -> Result<BoxAsyncStream> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let dialer = RustCryptoTlsDialer::from_root_store(roots, Duration::from_secs(10))?;
+    let local_addr = stream_local_addr(&*stream);
+    let stream = dialer.connect_boxed_stream(server_name, stream).await?;
+    Ok(with_stream_local_addr(Box::new(stream), local_addr))
 }
 
 /// A reusable direct TLS connector for one DoH endpoint.

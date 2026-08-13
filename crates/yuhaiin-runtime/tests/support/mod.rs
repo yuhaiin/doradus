@@ -1317,6 +1317,54 @@ pub async fn configure_http_chain(
         .await;
 }
 
+/// Configure an HTTP proxy inbound whose selected outbound is the runtime's
+/// direct connector. This is intentionally separate from the local HTTP
+/// CONNECT fixture: absolute-form HTTPS requests must perform origin TLS
+/// after this selected outbound has connected.
+pub async fn configure_direct_http_inbound(service: &ServiceProcess, inbound: SocketAddr) {
+    let node = json!({
+        "id":"direct-http-out",
+        "name":"Direct HTTP inbound outbound",
+        "group":"integration",
+        "enabled":true,
+        "chain":[{"type":"direct","direct":{}}]
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes",
+        Some(&node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes/direct-http-out/use",
+        None,
+    )
+    .await;
+
+    let inbound = json!({
+        "id":"direct-http-in",
+        "name":"Direct HTTP inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":{"type":"http","http":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+    settle_runtime_reload().await;
+}
+
 pub async fn configure_http_chain_with_transport(
     service: &ServiceProcess,
     inbound: SocketAddr,

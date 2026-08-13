@@ -109,7 +109,7 @@ where
         .await
         .map_err(io_error);
     }
-    let (destination, origin_target) = parse_forward_target(target, &headers)?;
+    let (destination, origin_target, https) = parse_forward_target(target, &headers)?;
     let source = Endpoint::ip(Network::Tcp, peer);
     let mut context = FlowContext::new(destination.clone());
     context.source = Some(source);
@@ -129,6 +129,37 @@ where
             );
             return Err(error);
         }
+    };
+    let outbound = if https {
+        #[cfg(feature = "doh-tls")]
+        {
+            let server_name = destination
+                .host()
+                .map(|host| host.as_str().to_owned())
+                .or_else(|| destination.addr().map(|addr| addr.ip().to_string()))
+                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "HTTPS target has no host"))?;
+            match crate::doh_tls::wrap_system_tls_stream(&server_name, outbound).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    monitor.record_failure_with_process(
+                        "http",
+                        &destination.to_string(),
+                        &format!("HTTPS handshake: {error}"),
+                        process.as_deref(),
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        #[cfg(not(feature = "doh-tls"))]
+        {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "HTTP proxy HTTPS requests require the doh-tls feature",
+            ));
+        }
+    } else {
+        outbound
     };
     record_outbound_stream(&mut context, &outbound);
     let request = rewrite_forward_request(method, &origin_target, &headers)?;
@@ -220,22 +251,31 @@ pub(crate) fn parse_authority_with_default(
     }
 }
 
-fn parse_forward_target(target: &str, headers: &str) -> Result<(Endpoint, String)> {
-    if let Some(rest) = target.strip_prefix("http://") {
+fn parse_forward_target(target: &str, headers: &str) -> Result<(Endpoint, String, bool)> {
+    if let Some((scheme, rest)) = target.split_once("://") {
+        let https = if scheme.eq_ignore_ascii_case("https") {
+            true
+        } else if scheme.eq_ignore_ascii_case("http") {
+            false
+        } else {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!("HTTP proxy URI scheme is unsupported: {scheme}"),
+            ));
+        };
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
         return Ok((
-            parse_authority_with_default(authority, Network::Tcp, Some(80))?,
+            parse_authority_with_default(
+                authority,
+                Network::Tcp,
+                Some(if https { 443 } else { 80 }),
+            )?,
             if path.is_empty() {
                 "/".to_owned()
             } else {
                 format!("/{path}")
             },
-        ));
-    }
-    if target.starts_with("https://") {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            "HTTPS proxy requests must use CONNECT",
+            https,
         ));
     }
     let host = header_value(headers, "host")
@@ -246,7 +286,7 @@ fn parse_forward_target(target: &str, headers: &str) -> Result<(Endpoint, String
     } else {
         format!("/{target}")
     };
-    Ok((destination, path))
+    Ok((destination, path, false))
 }
 
 fn rewrite_forward_request(method: &str, target: &str, headers: &str) -> Result<String> {
@@ -337,7 +377,7 @@ mod tests {
 
     #[test]
     fn forward_target_accepts_absolute_and_origin_form() {
-        let (absolute, absolute_path) = parse_forward_target(
+        let (absolute, absolute_path, absolute_https) = parse_forward_target(
             "http://example.com:8080/a?b=1",
             "GET http://example.com:8080/a?b=1 HTTP/1.1\r\nHost: ignored\r\n\r\n",
         )
@@ -347,8 +387,21 @@ mod tests {
             Endpoint::domain(Network::Tcp, DomainName::new("example.com").unwrap(), 8080)
         );
         assert_eq!(absolute_path, "/a?b=1");
+        assert!(!absolute_https);
 
-        let (origin, origin_path) = parse_forward_target(
+        let (secure, secure_path, secure_https) = parse_forward_target(
+            "HTTPS://example.com/secure",
+            "GET HTTPS://example.com/secure HTTP/1.1\r\nHost: ignored\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            secure,
+            Endpoint::domain(Network::Tcp, DomainName::new("example.com").unwrap(), 443)
+        );
+        assert_eq!(secure_path, "/secure");
+        assert!(secure_https);
+
+        let (origin, origin_path, origin_https) = parse_forward_target(
             "/health",
             "GET /health HTTP/1.1\r\nHost: example.com\r\n\r\n",
         )
@@ -358,6 +411,17 @@ mod tests {
             Endpoint::domain(Network::Tcp, DomainName::new("example.com").unwrap(), 80)
         );
         assert_eq!(origin_path, "/health");
+        assert!(!origin_https);
+    }
+
+    #[test]
+    fn forward_target_rejects_non_http_absolute_schemes() {
+        let error = parse_forward_target(
+            "ftp://example.com/file",
+            "GET ftp://example.com/file HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Unsupported);
     }
 
     #[test]

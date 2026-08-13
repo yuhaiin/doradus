@@ -5074,3 +5074,25 @@ Podman `network=none` 场景最终为 `2 passed, 0 failed`，耗时 433.71 秒�
 本轮 `make release-contract-smoke` 和清理缓存后的 `make release-windows-cross-smoke` 均通过；
 后者再次完成 `x86_64-pc-windows-gnu` 的 MinGW/Cargo dependency check，证明它不依赖先前
 残留的 debug 依赖中间产物。
+
+## 206. 2026-08-14 HTTP inbound absolute-form HTTPS
+
+核对 Go `pkg/net/proxy/http/server.go` 后确认，HTTP inbound 的非 CONNECT 请求会交给
+`net/http/httputil.ReverseProxy`；因此 `GET https://host/path` 不是“必须改成 CONNECT”
+的拒绝路径，而是应在已选 outbound 建链后由 HTTP transport 完成目标 TLS，再发送重写后的
+origin-form 请求。Rust 原实现直接返回 `Unsupported`，这是一个真实的数据面差距。
+
+Rust 现在把 absolute-form 的 `http://`/`https://` 统一解析为
+`(destination, origin_target, use_tls)`：HTTPS 默认端口为 443，HTTP 默认端口为 80，
+未知 scheme 仍 fail-closed。路由选择和 outbound `connect` 先完成，随后在同一已路由的
+stream 上使用共享 RustCrypto TLS/root-store boundary 完成 SNI、证书校验和握手；不会为
+HTTPS origin 另开一个绕过 router 的 direct socket。TLS layer 仍保留 outbound local
+endpoint metadata。
+
+新增 parser/unit coverage（HTTPS 大小写、默认端口、origin-form、未知 scheme）和一个
+可复用的 direct HTTP process fixture。Podman focused unit 为 14/14，`make service-chain-smoke`
+为 28/28；`make http-inbound-https-smoke` 是显式外网 smoke，实际执行
+`HTTP inbound → direct outbound → example.com TLS → HTTP response` 为 1/1，日志位于
+`~/.cache/yuhaiin-rust/integration/http-inbound-https/`，未使用 `/tmp`。Go/Rust 双端
+HTTP inbound 的 live 对照、私有 CA/证书异常矩阵仍保留在 checklist 的 `[~]`，所以整体覆盖率
+仍为 91.5%。

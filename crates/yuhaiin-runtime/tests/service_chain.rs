@@ -18,13 +18,14 @@ use support::{
     ConnectFixture, H2FinalProtocol, H2ProtocolFixture, H2YuubinsyaFixture, ServiceProcess,
     Socks5Fixture, YUUBINSYA_PASSWORD, add_mixed_udp_inbound, add_reverse_inbounds,
     add_socks5_inbound, add_yuubinsya_inbound, api_json, configure_aead_h2_http_inbound,
-    configure_h2_http_chain, configure_h2_http_inbound, configure_h2_socks5_chain,
-    configure_http_chain, configure_http_chain_with_transport, configure_network_split_http_chain,
-    configure_socks5_chain, configure_tls_aead_h2_http_inbound, configure_tls_auto_http_inbound,
-    configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound,
-    connect_loopback, connect_tls_h2_loopback, connect_tls_loopback,
-    connect_tls_loopback_without_sni, integration_dir, seed_empty_database, tls_server_acceptor,
-    tls_termination_certificate, wait_for_connection,
+    configure_direct_http_inbound, configure_h2_http_chain, configure_h2_http_inbound,
+    configure_h2_socks5_chain, configure_http_chain, configure_http_chain_with_transport,
+    configure_network_split_http_chain, configure_socks5_chain, configure_tls_aead_h2_http_inbound,
+    configure_tls_auto_http_inbound, configure_tls_h2_http_inbound,
+    configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound, connect_loopback,
+    connect_tls_h2_loopback, connect_tls_loopback, connect_tls_loopback_without_sni,
+    integration_dir, seed_empty_database, tls_server_acceptor, tls_termination_certificate,
+    wait_for_connection,
 };
 
 #[cfg(target_os = "linux")]
@@ -2637,6 +2638,52 @@ async fn http_inbound_routes_through_socks5_outbound() {
     client.shutdown().await.unwrap();
     service.shutdown().await;
     fixture.shutdown().await;
+}
+
+/// Go's httputil.ReverseProxy also accepts absolute-form HTTPS requests on an
+/// HTTP proxy inbound. Keep this opt-in because it reaches a public endpoint,
+/// but exercise the complete path when requested: HTTP inbound -> selected
+/// direct outbound -> origin TLS -> HTTP/1.1 response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires external network access"]
+async fn http_inbound_forwards_absolute_https_request() {
+    let inbound = support::reserve_loopback().await;
+    let root = integration_dir("service-http-absolute-https");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_direct_http_inbound(&service, inbound).await;
+
+    let mut client = connect_loopback(inbound).await;
+    client
+        .write_all(
+            b"GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), client.read_to_end(&mut response))
+        .await
+        .expect("absolute HTTPS proxy request timed out")
+        .unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 "),
+        "absolute HTTPS proxy response: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(
+        !response.starts_with(b"HTTP/1.1 501") && !response.starts_with(b"HTTP/1.1 502"),
+        "absolute HTTPS proxy request was rejected: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    let connections = wait_for_connection(&service.client, &service.base_url).await;
+    assert!(connections["connections"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["inboundName"] == "Direct HTTP inbound")
+    }));
+    service.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
