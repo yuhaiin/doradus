@@ -53,6 +53,7 @@ pub enum GoProxyTransport {
     NetworkSplit,
     Tls,
     TlsTermination,
+    HttpTermination,
     Http2,
     Unknown { name: String },
 }
@@ -327,6 +328,7 @@ fn parse_proxy_transport(value: &str) -> GoProxyTransport {
         "network_split" | "networksplit" => GoProxyTransport::NetworkSplit,
         "tls" => GoProxyTransport::Tls,
         "tls_termination" | "tlstermination" => GoProxyTransport::TlsTermination,
+        "http_termination" | "httptermination" => GoProxyTransport::HttpTermination,
         "http2" => GoProxyTransport::Http2,
         other => GoProxyTransport::Unknown {
             name: other.to_owned(),
@@ -351,12 +353,22 @@ fn select_proxy_transport(chain_types: &[String], layers: &[GoProxyLayer]) -> Go
     {
         return GoProxyTransport::Direct;
     }
+    // Prefer the last transparent termination layer. Go folds contract points
+    // from left to right, so the last one is the outer wrapper when a node
+    // combines TLS and HTTP termination.
+    if let Some(layer) = layers.iter().rev().find(|layer| {
+        layer.kind.eq_ignore_ascii_case("http_termination")
+            || layer.kind.eq_ignore_ascii_case("tls_termination")
+    }) {
+        return parse_proxy_transport(&layer.kind);
+    }
     // The outer protocol is the effective runtime proxy: HTTP/SOCKS5 wraps a
     // fixed dialer, and Yuubinsya wraps the full fixed/TLS/HTTP2 chain.
     for preferred in [
         "http_mock",
         "network_split",
         "tls_termination",
+        "http_termination",
         "yuubinsya",
         "wireguard",
         "aead",

@@ -4826,3 +4826,23 @@ close 继续委托 parent。
 的单标签 wildcard 规则）和 `nextProtos`/`next_protos`。新增 store/runtime 分支回归和
 2 个 Podman focused tests；完整 `make workspace-tests` 也通过。当前清单仍标为 `[~]`，
 因为还需要带真实证书的进程级 TLS termination chain 以及 Go 命名证书选择对照。
+
+## 191. 2026-08-13 http_termination contract point
+
+Go 的 `pkg/net/proxy/reverse/unwrap.go` 将 `http_termination` 实现为一个 parent-preserving
+reverse HTTP contract point：上层通过 channel stream 提供普通 HTTP 请求，ReverseProxy
+再使用已经构造好的 parent `Proxy.Conn` 访问目标；如果外层是 `tls_termination`，Go 会把
+HTTPS 作为 upstream scheme，同时绕过第二次 TLS。Rust 现在将它放在 runtime proxy owner
+中，而不是 inbound owner：`yuhaiin-runtime/src/proxy/http_termination.rs` 以 Hyper
+server-auto 处理 HTTP/1 与 HTTP/2 request stream，复用 `AsyncProxy` parent 连接 HTTP/1
+upstream，按 domain trie 注入 Go-shaped headers，清理 hop-by-hop headers，并保留
+streaming request/response body。`tls_terminated` marker 与 Go 的 context value 对齐，HTTPS
+目标只在需要时执行 RustCrypto/rustls client handshake；UDP、ping 和 close 继续委托 parent。
+
+这次同时把 `http_termination` 加入 store transport 解析、chain prefix 构造和默认
+`http-termination` feature。每次建立新连接前会回收已结束的 Hyper `JoinHandle`，因此长期
+运行不会按请求数无限积累 shutdown handle。Podman 验证结果：fmt、全 workspace Clippy、
+runtime focused 4/4、store focused 1/1、runtime `--no-default-features --lib` 和完整
+`make service-chain-smoke` 24/24 均通过。当前仍标为 `[~]`，因为还需要真实 reverse HTTP
+inbound → router → `http_termination` → HTTP/HTTPS target 进程链及 Go live 对照；这不是把
+unit test 当作完整替换证据。

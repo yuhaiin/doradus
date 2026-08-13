@@ -94,6 +94,8 @@ impl GoProxyRuntimeConfig {
                             | GoProxyTransport::Vless
                             | GoProxyTransport::Vmess
                     ))
+                || kind.eq_ignore_ascii_case("http_termination")
+                || kind.eq_ignore_ascii_case("tls_termination")
         }) {
             return Err(Error::new(
                 ErrorKind::Unsupported,
@@ -250,6 +252,7 @@ impl GoProxyRuntimeConfig {
             GoProxyTransport::NetworkSplit
             | GoProxyTransport::Tls
             | GoProxyTransport::TlsTermination
+            | GoProxyTransport::HttpTermination
             | GoProxyTransport::Http2
             | GoProxyTransport::Unknown { .. } => {
                 return Err(Error::new(
@@ -284,6 +287,7 @@ fn transport_name(transport: &GoProxyTransport) -> &str {
         GoProxyTransport::NetworkSplit => "network_split",
         GoProxyTransport::Tls => "tls",
         GoProxyTransport::TlsTermination => "tls_termination",
+        GoProxyTransport::HttpTermination => "http_termination",
         GoProxyTransport::Http2 => "http2",
         GoProxyTransport::Unknown { name } => name,
     }

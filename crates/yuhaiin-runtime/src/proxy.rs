@@ -686,6 +686,9 @@ impl AsyncProxy for LoopbackTrackingProxy {
 pub(crate) mod common;
 #[path = "proxy/http.rs"]
 pub(crate) mod http;
+#[cfg(feature = "http-termination")]
+#[path = "proxy/http_termination.rs"]
+pub(crate) mod http_termination;
 #[path = "proxy/reverse.rs"]
 pub(crate) mod reverse;
 #[path = "proxy/socks4a.rs"]
@@ -1054,6 +1057,16 @@ impl RuntimeSnapshot {
         config: GoProxyRuntimeConfig,
         timeout: Duration,
     ) -> Result<ProxyBuild> {
+        self.build_proxy_config_with_tls_marker(config, timeout, false)
+            .await
+    }
+
+    async fn build_proxy_config_with_tls_marker(
+        &self,
+        config: GoProxyRuntimeConfig,
+        timeout: Duration,
+        tls_terminated: bool,
+    ) -> Result<ProxyBuild> {
         if !config.enabled {
             return Err(Error::new(
                 ErrorKind::Closed,
@@ -1091,15 +1104,52 @@ impl RuntimeSnapshot {
             Arc::new(yuhaiin_protocol::http_mock::HttpMockProxy::new(
                 base.build()?,
             )) as Arc<dyn AsyncProxy>
+        } else if config.transport == yuhaiin_store::GoProxyTransport::HttpTermination {
+            let index = config
+                .layers
+                .iter()
+                .rposition(|layer| layer.kind.eq_ignore_ascii_case("http_termination"))
+                .ok_or_else(|| Error::invalid("HTTP termination layer is missing"))?;
+            let parent = if index == 0 {
+                self.resolve_proxy(Arc::new(DirectAsyncProxy { timeout }))
+            } else {
+                Box::pin(self.build_proxy_config(config.chain_prefix(index)?, timeout))
+                    .await?
+                    .proxy
+            };
+            #[cfg(feature = "http-termination")]
+            {
+                crate::proxy::http_termination::build(&config, parent, tls_terminated)?
+            }
+            #[cfg(not(feature = "http-termination"))]
+            {
+                let _ = parent;
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "HTTP termination requires the http-termination feature",
+                ));
+            }
         } else if config.transport == yuhaiin_store::GoProxyTransport::TlsTermination {
             let index = config
                 .layers
                 .iter()
-                .position(|layer| layer.kind.eq_ignore_ascii_case("tls_termination"))
+                .rposition(|layer| layer.kind.eq_ignore_ascii_case("tls_termination"))
                 .ok_or_else(|| Error::invalid("TLS termination layer is missing"))?;
-            let parent = Box::pin(self.build_proxy_config(config.chain_prefix(index)?, timeout))
+            // The Go TLS unwrap point marks its parent HTTP-termination
+            // connection before putting the TLS server on top. Propagate that
+            // per-chain fact into the recursive prefix build so the reverse
+            // proxy can choose the same upstream wire mode.
+            let parent = if index == 0 {
+                self.resolve_proxy(Arc::new(DirectAsyncProxy { timeout }))
+            } else {
+                Box::pin(self.build_proxy_config_with_tls_marker(
+                    config.chain_prefix(index)?,
+                    timeout,
+                    true,
+                ))
                 .await?
-                .proxy;
+                .proxy
+            };
             #[cfg(feature = "doh-tls")]
             {
                 build_tls_termination_proxy(&config, parent)?
@@ -3242,6 +3292,96 @@ mod tests {
         let mut response = [0u8; 4];
         stream.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"pong");
+        server.await.unwrap();
+    }
+
+    #[cfg(feature = "http-termination")]
+    #[tokio::test]
+    async fn runtime_builds_go_http_termination_around_a_fixed_parent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(
+                request.starts_with("get /runtime http/1.1\r\n"),
+                "request={request:?}"
+            );
+            assert!(
+                request.contains("host: runtime.example:80\r\n"),
+                "request={request:?}"
+            );
+            assert!(
+                request.contains("x-runtime: http-termination\r\n"),
+                "request={request:?}"
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nruntime",
+                )
+                .await
+                .unwrap();
+        });
+        let config = GoProxyRuntimeConfig {
+            id: "http-termination".to_owned(),
+            name: "HTTP termination".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "go".to_owned(),
+            enabled: true,
+            chain_types: vec!["fixedv2".to_owned(), "http_termination".to_owned()],
+            layers: vec![
+                GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({
+                        "addresses": [{
+                            "host": address.ip().to_string(),
+                            "port": address.port()
+                        }]
+                    }),
+                },
+                GoProxyLayer {
+                    kind: "http_termination".to_owned(),
+                    config: serde_json::json!({
+                        "headers": {
+                            "runtime.example": {
+                                "headers": [{"key": "X-Runtime", "value": "http-termination"}]
+                            }
+                        }
+                    }),
+                },
+            ],
+            transport: GoProxyTransport::HttpTermination,
+            data_json: Vec::new(),
+        };
+        let proxy = snapshot(config)
+            .build_proxy("http-termination", Duration::from_secs(1))
+            .await
+            .unwrap()
+            .proxy;
+        let context = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        let mut stream = proxy.connect(&context).await.unwrap();
+        stream
+            .write_all(
+                b"GET /runtime HTTP/1.1\r\nHost: runtime.example:80\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(b"runtime"));
+        proxy.close().await.unwrap();
         server.await.unwrap();
     }
 

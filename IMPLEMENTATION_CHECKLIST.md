@@ -19,15 +19,15 @@ debug 二进制。所有临时状态仍放在 `~/.cache/yuhaiin-rust`，不使�
 
 | 指标 | 当前值 |
 | --- | ---: |
-| 纳入统计的验收项 | 50 |
+| 纳入统计的验收项 | 51 |
 | 已完成 `[x]` | 41 |
-| 主路径可用但仍有现场/样本缺口 `[~]` | 9 |
+| 主路径可用但仍有现场/样本缺口 `[~]` | 10 |
 | 有实际功能缺口 `[ ]` | 0 |
-| 加权覆盖率 | **91.0%** = `(41 + 9 × 0.5) / 50` |
+| 加权覆盖率 | **90.2%** = `(41 + 10 × 0.5) / 51` |
 | 主目标 | Linux desktop：Rust 可启动、管理前端可接入、普通 inbound/outbound 可串联 |
 | 当前结论 | **主路径已可在 Linux desktop 进行替换前验收**；rootful TUN 多路由 lease、RST/reconnect、graceful/SIGKILL teardown、Debian rootful firewall matrix 和 TPROXY UDP delivery/idle/force-stop 已闭环，生产异常快照、更多平台现场和第三方 WireGuard 仍是 `[~]` |
 
-`[x]` 表示代码和对应测试/进程证据都存在；`[~]` 表示主路径已经能运行，但验证范围还不足以称为 Go 的完整替换；`[ ]` 表示仍有明确功能或现场证据缺口；`延期` 不计入 49 项统计。
+`[x]` 表示代码和对应测试/进程证据都存在；`[~]` 表示主路径已经能运行，但验证范围还不足以称为 Go 的完整替换；`[ ]` 表示仍有明确功能或现场证据缺口；`延期` 不计入 51 项统计。
 
 ## 架构边界
 
@@ -88,6 +88,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | `pkg/net/proxy/socks4a/server.go`、`mixed/*` | `crates/yuhaiin-runtime/src/proxy/socks4a.rs`、`inbounds/mod.rs` | `[x]` | mixed inbound dispatches SOCKS4A/SOCKS5/HTTP | — |
 | `pkg/net/proxy/tls/*` | `crates/yuhaiin-protocol/src/tls.rs`、`crates/yuhaiin-runtime/src/proxy/*` | `[x]` | RustCrypto TLS inbound/outbound、SNI、CA、insecureSkipVerify contract | — |
 | `pkg/net/proxy/tls/unwrap.go` (`tls_termination`) | `crates/yuhaiin-runtime/src/proxy.rs`、`crates/yuhaiin-store/src/compat_proxy.rs` | `[~]` | Go contract point 已注册并由 Rust 导入/runtime 分发；TLS server 解包 wrapper 支持默认证书、`serverNameCertificate` wildcard、ALPN、Go JSON byte array/base64 和 cert/key file path；Podman focused parser/build rejection tests 2/2，workspace 291 runtime tests 通过 | 增加带真实证书的进程级 `tls_termination → inbound/router/outbound` wire smoke，并与 Go 对比命名证书选择 |
+| `pkg/net/proxy/reverse/unwrap.go` (`http_termination`) | `crates/yuhaiin-runtime/src/proxy/http_termination.rs`、`crates/yuhaiin-runtime/src/proxy.rs`、`crates/yuhaiin-store/src/compat_proxy.rs` | `[~]` | Go contract point 的 parent-preserving reverse HTTP 行为已接入；Hyper HTTP/1+HTTP/2 server、HTTP/HTTPS upstream、域名 header trie、hop-by-hop 清理、streaming body、TLS termination marker、TCP/UDP/ping/close 委托均有 Rust focused tests；Podman runtime 4/4、store 1/1、service-chain 24/24、no-default library check 均通过；活跃 Hyper task 会在新连接时回收 | 增加真实 `reverse HTTP inbound → router → http_termination → HTTP target` 进程链，并与 Go 的请求/错误/HTTPS 语义做 live 对照 |
 | Go `pkg/net/proxy/tls.NewTlsAutoServer`、`pkg/cert.GenerateServerCert` | `crates/yuhaiin-runtime/src/inbounds/tls_auto.rs` | `[~]` | 动态 SNI 叶子证书、精确/单标签 wildcard、DNS/IP SAN、ALPN、按配置域名共享证书缓存；RustCrypto X.509 builder 已兼容 Go 的 ECDSA P-256、Ed25519、RSA CA/PKCS#8，6 个 Podman focused tests 通过 | rustls server-side ECH 尚未有等价公开 API；补 Go/Rust live config 和 ECH 现场后再升为 `[x]` |
 | `pkg/net/proxy/http2/v1/*`、`v2/*` | `crates/yuhaiin-chain/src/h2_tunnel.rs`、`h2_server.rs`、`crates/yuhaiin-core/src/http2.rs` | `[x]` | prior-knowledge、TLS ALPN、pool/drain/GOAWAY、HTTP CONNECT/SOCKS5 bridge | — |
 | `pkg/net/proxy/yuubinsya/*`、`yuubinsya2/*` | `crates/yuhaiin-core/src/yuubinsya.rs`、`crates/yuhaiin-chain/src/session.rs`、`direct_uot.rs` | `[x]` | TCP、native UDP、UOT/dup-over-TCP、Ping、migration/reconnect、Go client interop | — |
@@ -204,7 +205,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[~]` 使用真实第三方/WARP peer 验证 reserved、handshake、keepalive 和 NAT endpoint 变化；本地 authenticated roaming 及 TCP/UDP userspace session 已由双 peer 单测覆盖。`make wireguard-external-smoke` 已提供用户配置驱动的 Podman host-network 入口，现在可直接读取 Go JSON 或标准 WARP/`wg-quick` INI；仍需第三方现场确认 endpoint roaming 和真实链路行为。
 - `[x]` 保持本地双 peer smoke 和 release packet benchmark；两者只证明协议/适配器正确性和同机趋势，不宣称公网性能。
 
-### CI 与发布（不计入上面的 49 项功能覆盖率）
+### CI 与发布（不计入上面的 51 项功能覆盖率）
 
 - `[~]` `.github/workflows/rust.yml` 已加入 Rust/Podman 检查、Linux `x86_64/aarch64-unknown-linux-musl`、Darwin `x86_64/aarch64`、Windows `x86_64/aarch64` 六项 release matrix；checks job 现在先运行 `make release-windows-cross-smoke`，并由 `make release-contract-smoke` 锁定该门禁、六个 target、产物名、`release/checksums.txt` 和 rolling-main 发布条件，且会拒绝误引用仓库根 checksum；Windows GNU `x86_64` cfg/依赖检查已通过，Darwin 检查因缺少 Apple clang/SDK 在 C 依赖阶段停止；仍需第一次 GitHub Actions 远程运行确认原生 runner/SDK 的现场差异。
 - `[x]` 新增 `make release-linux-cross-smoke`，使用与 workflow 相同的 SHA 固定 `cross-tools/musl-cross` toolchain；Podman 中 `x86_64-unknown-linux-musl` 与 `aarch64-unknown-linux-musl` 的 runtime `--all-features` target check 均通过，验证了 Linux 两个架构的 linker、ring、SQLite 和完整 workspace 依赖。Darwin/Windows 的正式 release 仍必须由各自原生 runner 验证。
@@ -235,6 +236,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | Go wire interop | `make go-protocol-interop-smoke` | 14 passed，覆盖 Yuubinsya、WebSocket/H2、H2 v1、VLESS TCP/UDP、VMess、Trojan 的 Go↔Rust wire tests |
 | HTTP/2 protocol layering | `podman-cargo.sh -- cargo test -p yuhaiin-chain --test http2_protocol_layers` | 1 passed；同一 harness 循环验证 VLESS/VMess/Trojan 在 Go-compatible H2 CONNECT transport 上完成 TCP 握手、响应头和 payload echo；runtime service-chain 又以 1 个 TCP + 1 个 UDP 测试分别循环覆盖三种协议 |
 | service chains | `make service-chain-smoke` | 24 passed；HTTP/SOCKS5/mixed/TLS/H2/Yuubinsya、NetworkSplit TCP branch、VLESS/VMess/Trojan TCP/UDP、VLESS/VMess/Trojan over HTTP/2 TCP/UDP、reverse、透明 wrapper 和实时状态链通过 |
+| HTTP termination focused | `podman-cargo.sh -- cargo test -p yuhaiin-runtime --all-features http_termination`；`podman-cargo.sh -- cargo test -p yuhaiin-store --all-features go_node_runtime_preserves_proxy_layers_and_selects_supported_base` | runtime 4 passed、store 1 passed；`make service-chain-smoke` 24/24 及 runtime `--no-default-features --lib` 检查通过；当前还没有 reverse HTTP 进程级 target chain |
 | statistics soak | `YUHAIIN_STATS_READER_COUNT=32 YUHAIIN_STATS_READER_ROUNDS=2000 YUHAIIN_STATS_WRITE_ROUNDS=5000 make stats-concurrency-smoke` | Podman 真实前台进程 32 readers×2000 rounds、5000 writes，含强停恢复与 restart persistence：2 passed，217.62s；此前 32×1200、3000 writes 和更小矩阵也通过 |
 | API / SSE | `make api-contract-smoke` | 4 passed；管理 API、嵌套路由 history、domain latency、SSE 初始/新增/移除、连接字段、close、total/traffic/telemetry/history 通过 |
 | TUN lifecycle | `make tun-api-process-smoke` | 真实前台 runtime 通过 API 独立开关单个及两个 TUN，验证设备出现/消失和反复 disable→enable→disable |

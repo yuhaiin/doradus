@@ -414,6 +414,7 @@ fn go_node_runtime_preserves_proxy_layers_and_selects_supported_base() {
         ("network_split", GoProxyTransport::NetworkSplit),
         ("tls", GoProxyTransport::Tls),
         ("tls_termination", GoProxyTransport::TlsTermination),
+        ("http_termination", GoProxyTransport::HttpTermination),
         ("http2", GoProxyTransport::Http2),
         // Go's `none` point is a no-op wrapper around the zero/direct proxy.
         ("none", GoProxyTransport::Direct),
