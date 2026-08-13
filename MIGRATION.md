@@ -5032,3 +5032,19 @@ VM 现场观察到 3 条路由在 TUN owner 存活期间存在：`198.18.0.0/15`
 `203.0.113.0/24 metric 42424`；owner graceful exit 后路由消失，owner `SIGKILL` 后也
 消失。最终为 `tun-route-matrix-passed routes=3 graceful=1 sigkill=1`，补齐了 TUN
 inbound 的 rootful route lease/异常退出证据；本机 rootless skip 不再被记录为通过。
+
+## 204. 2026-08-14 statistics high-pressure Podman soak
+
+在已有 32 readers×2000 rounds、5000 writes 和 24 readers×1000 rounds、2000 writes 之外，
+再次使用真实前台 Rust runtime 进程和同一 SQLite-backed API 做更高压力回归：
+`YUHAIIN_STATS_READER_COUNT=48`、`YUHAIIN_STATS_READER_ROUNDS=3000`、
+`YUHAIIN_STATS_WRITE_ROUNDS=10000 make stats-concurrency-smoke`。
+
+Podman `network=none` 场景最终为 `2 passed, 0 failed`，耗时 433.71 秒。第一项同时运行
+48 个 reader，轮询 connections、total、traffic、telemetry、history 和 failed-history，
+并在流量写入后重启同一数据库检查持久化；第二项在 reader 活跃时强停 runtime，再重新打开
+同一数据库检查 total、connections 和 history。日志保存在
+`~/.cache/yuhaiin-rust/integration/stats-concurrency/`，没有使用 `/tmp`。
+
+这扩大了并发和异常退出覆盖范围，但仍不是数小时/数天真实生产流量，所以 statistics
+条目继续保持 `[~]`，不把压力测试误报成长期生产 projection 证据。
