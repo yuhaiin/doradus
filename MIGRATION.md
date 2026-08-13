@@ -4842,7 +4842,8 @@ streaming request/response body。`tls_terminated` marker 与 Go 的 context val
 这次同时把 `http_termination` 加入 store transport 解析、chain prefix 构造和默认
 `http-termination` feature。每次建立新连接前会回收已结束的 Hyper `JoinHandle`，因此长期
 运行不会按请求数无限积累 shutdown handle。Podman 验证结果：fmt、全 workspace Clippy、
-runtime focused 4/4、store focused 1/1、runtime `--no-default-features --lib` 和完整
-`make service-chain-smoke` 24/24 均通过。当前仍标为 `[~]`，因为还需要真实 reverse HTTP
-inbound → router → `http_termination` → HTTP/HTTPS target 进程链及 Go live 对照；这不是把
-unit test 当作完整替换证据。
+runtime focused 4/4、store focused 1/1、真实 reverse HTTP inbound → selector/router →
+`http_termination` → HTTP target 进程链 1/1、runtime `--no-default-features --lib` 和完整
+`make service-chain-smoke` 25/25 均通过。外层 reverse connection 是内存 duplex，而目标
+authority 可随每个 HTTP request 改变，因此 monitor 不填充一个伪造的单一 outbound 地址；
+当前仍标为 `[~]`，剩余工作是 Go live 对照以及 HTTPS/error 语义矩阵。

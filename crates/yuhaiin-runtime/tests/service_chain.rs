@@ -3359,3 +3359,113 @@ async fn reverse_inbounds_route_through_the_runtime_process() {
         .unwrap();
     service.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reverse_http_inbound_routes_through_http_termination_outbound() {
+    let reverse_http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let reverse_http_inbound = reverse_http_listener.local_addr().unwrap();
+    drop(reverse_http_listener);
+
+    let http_target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_target = http_target_listener.local_addr().unwrap();
+    let http_target_task = tokio::spawn(async move {
+        let (mut stream, _) = http_target_listener.accept().await.unwrap();
+        let request = read_http_headers(&mut stream).await;
+        let request = String::from_utf8(request).unwrap();
+        assert!(request.starts_with("GET /base/health HTTP/1.1\r\n"));
+        assert!(request.contains(&format!("Host: localhost:{}\r\n", http_target.port())));
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\ntermination-ok!",
+            )
+            .await
+            .unwrap();
+    });
+
+    let root = integration_dir("service-reverse-http-termination");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+
+    let node = json!({
+        "id":"reverse-http-termination",
+        "name":"Reverse HTTP termination outbound",
+        "group":"integration",
+        "enabled":true,
+        "chain":[
+            {"type":"direct","direct":{}},
+            {"type":"http_termination","http_termination":{
+                "headers":{}
+            }}
+        ]
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes",
+        Some(&node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes/reverse-http-termination/use",
+        None,
+    )
+    .await;
+
+    let inbound = json!({
+        "id":"reverse-http-termination-in",
+        "name":"Reverse HTTP termination inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":reverse_http_inbound.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":{"type":"reverse_http","reverse_http":{"url":format!("http://localhost:{}/base", http_target.port())}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut client = connect_loopback(reverse_http_inbound).await;
+    client
+        .write_all(b"GET /health HTTP/1.1\r\nHost: public.example\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK"),
+        "response={response:?}"
+    );
+    assert!(
+        response.ends_with(b"termination-ok!"),
+        "response={response:?}"
+    );
+
+    let connections = wait_for_connection(&service.client, &service.base_url).await;
+    let connection = connections["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inboundName"] == "Reverse HTTP termination inbound")
+        .expect("HTTP termination reverse connection must be visible");
+    assert_eq!(connection["inbound"], reverse_http_inbound.to_string());
+    // The integration database uses the Go-compatible direct fallback route;
+    // the selected direct slot itself contains the HTTP termination chain.
+    assert_eq!(connection["mode"], "direct");
+
+    tokio::time::timeout(Duration::from_secs(2), http_target_task)
+        .await
+        .unwrap()
+        .unwrap();
+    service.shutdown().await;
+}
