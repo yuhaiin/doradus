@@ -4752,8 +4752,9 @@ Go 的 `pkg/register/point.go` 会把 `network_split` 的 TCP/UDP 分支通过
 现已复用 `yuhaiin-chain::H2Connection`，新增运行时 `NetworkSplitHttp2Proxy`：TCP 通过父代理
 建立 plaintext prior-knowledge H2，复用 H2 connection 的 CONNECT stream 和流槽位；UDP、
 ping 和关闭仍委托/联动父代理。`concurrency` 与 `max_streams` 支持 snake/camel 配置，
-连接会按活动流容量复用，失效连接被清理；nested split 和 WireGuard 仍保持显式拒绝，避免
-把不可组合的 userspace tunnel 错误地套在另一个 proxy 上。
+连接会按活动流容量复用，失效连接被清理；nested split 仍保持显式拒绝。WireGuard 则按 Go
+的 contract registry 语义作为独立 userspace outbound branch 构造：它使用 Cloudflare
+BoringTun 的直接 UDP underlay，不把父 proxy 错误地套入 WireGuard 握手。
 
 Podman 验证命令：
 
@@ -4768,3 +4769,22 @@ make service-chain-smoke
 HTTP/SOCKS5/Yuubinsya、TLS/HTTP/2、VLESS/VMess/Trojan TCP/UDP、IPv6、认证和已有
 network_split HTTP branch。所有构建、测试和状态仍位于 Podman 与 `~/.cache/yuhaiin-rust`，
 未使用 `/tmp`。
+
+## 187. 2026-08-13 network_split WireGuard 分支兼容
+
+Go 的 `pkg/register/point.go` 在 `ContractProtocolConfig` 中明确注册 `wireguard`，所以
+`network_split` 的 TCP 或 UDP branch 可以是 WireGuard；Go WireGuard client 自己创建
+userspace virtual TUN 和 underlay bind，传入的父 proxy 不参与 WireGuard peer 握手。Rust
+现在复用同一边界：`build_wireguard_proxy` 统一服务普通 WireGuard node 和
+`network_split` branch，resolver、network interface、timeout 和 BoringTun readiness 逻辑
+只有一份。
+
+Podman `make wireguard-chain-smoke` 现在运行 3 个真实进程链：
+
+1. HTTP inbound → CIDR router → `network_split(tcp=wireguard)` → BoringTun TCP peer；
+2. SOCKS5 UDP inbound → CIDR router → `network_split(udp=wireguard)` → BoringTun UDP peer；
+3. 原有普通 WireGuard TCP/UDP outbound 回归。
+
+结果为 `3 passed`。这关闭了 Rust 原先错误返回
+`network_split WireGuard branch is not composable` 的 parity gap；第三方/WARP 公网 peer、
+真实 NAT roaming 和 keepalive 仍属于外部现场验收项。

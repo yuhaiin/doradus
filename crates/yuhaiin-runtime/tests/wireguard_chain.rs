@@ -365,16 +365,16 @@ fn key(value: [u8; 32]) -> String {
     base64::engine::general_purpose::STANDARD.encode(value)
 }
 
-async fn configure_wireguard_chain(
+async fn configure_wireguard_network_split_chain(
     service: &ServiceProcess,
     inbound: SocketAddr,
     peer: &WireGuardPeer,
 ) {
-    configure_wireguard_node_and_route(service, peer).await;
+    configure_wireguard_network_split_node_and_route(service, peer).await;
 
     let inbound_config = json!({
-        "id":"wireguard-runtime-in",
-        "name":"WireGuard runtime inbound",
+        "id":"wireguard-network-split-in",
+        "name":"WireGuard network split inbound",
         "enabled":true,
         "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
         "transports":[{"type":"normal","normal":{}}],
@@ -391,24 +391,59 @@ async fn configure_wireguard_chain(
 }
 
 async fn configure_wireguard_node_and_route(service: &ServiceProcess, peer: &WireGuardPeer) {
+    configure_wireguard_node_and_route_with_network_split(service, peer, false).await;
+}
+
+async fn configure_wireguard_network_split_node_and_route(
+    service: &ServiceProcess,
+    peer: &WireGuardPeer,
+) {
+    configure_wireguard_node_and_route_with_network_split(service, peer, true).await;
+}
+
+async fn configure_wireguard_node_and_route_with_network_split(
+    service: &ServiceProcess,
+    peer: &WireGuardPeer,
+    network_split: bool,
+) {
+    let wireguard = json!({
+        "secretKey":key(RUNTIME_PRIVATE_KEY),
+        "endpoint":["10.0.0.2/32"],
+        "mtu":1420,
+        "peers":[{
+            "publicKey":key(peer.public_key),
+            "endpoint":peer.endpoint.to_string(),
+            "allowedIps":["0.0.0.0/0"]
+        }]
+    });
+    let chain = if network_split {
+        json!([
+            {
+                "type":"fixedv2",
+                "fixedv2":{
+                    "addresses":[{
+                        "host":peer.endpoint.ip().to_string(),
+                        "port":peer.endpoint.port()
+                    }]
+                }
+            },
+            {
+                "type":"network_split",
+                "network_split":{
+                    "tcp":{"type":"wireguard","wireguard":wireguard.clone()},
+                    "udp":{"type":"wireguard","wireguard":wireguard}
+                }
+            }
+        ])
+    } else {
+        json!([{"type":"wireguard","wireguard":wireguard}])
+    };
     let node = json!({
         "id":"wireguard-runtime-out",
         "name":"WireGuard runtime outbound",
         "group":"integration",
         "enabled":true,
-        "chain":[{
-            "type":"wireguard",
-            "wireguard":{
-                "secretKey":key(RUNTIME_PRIVATE_KEY),
-                "endpoint":["10.0.0.2/32"],
-                "mtu":1420,
-                "peers":[{
-                    "publicKey":key(peer.public_key),
-                    "endpoint":peer.endpoint.to_string(),
-                    "allowedIps":["0.0.0.0/0"]
-                }]
-            }
-        }]
+        "chain":chain
     });
     api_json(
         &service.client,
@@ -452,6 +487,15 @@ async fn configure_wireguard_udp_chain(
     add_socks5_inbound(service, "wireguard-runtime-udp-in", inbound, "", "").await;
 }
 
+async fn configure_wireguard_network_split_udp_chain(
+    service: &ServiceProcess,
+    inbound: SocketAddr,
+    peer: &WireGuardPeer,
+) {
+    configure_wireguard_network_split_node_and_route(service, peer).await;
+    add_socks5_inbound(service, "wireguard-network-split-udp-in", inbound, "", "").await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_inbound_routes_through_wireguard_userspace_outbound() {
     let peer = WireGuardPeer::start().await;
@@ -464,7 +508,7 @@ async fn http_inbound_routes_through_wireguard_userspace_outbound() {
     let database = root.join("state.sqlite");
     seed_empty_database(&database).await;
     let service = ServiceProcess::start(&database).await;
-    configure_wireguard_chain(&service, inbound, &peer).await;
+    configure_wireguard_network_split_chain(&service, inbound, &peer).await;
 
     let mut client = connect_loopback(inbound).await;
     client
@@ -605,8 +649,8 @@ async fn http_inbound_routes_through_wireguard_userspace_outbound() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inboundName"] == "WireGuard runtime inbound")
-        .expect("WireGuard runtime chain connection must be visible");
+        .find(|item| item["inboundName"] == "WireGuard network split inbound")
+        .expect("WireGuard network split chain connection must be visible");
     assert_eq!(item["inbound"], inbound.to_string());
     assert_eq!(item["nodeId"], "wireguard-runtime-out");
     assert_eq!(item["mode"], "proxy");
@@ -748,6 +792,62 @@ async fn socks5_udp_inbound_routes_through_wireguard_userspace_outbound() {
     .await;
     assert!(total["download"].is_string());
     assert!(total["upload"].is_string());
+
+    control.shutdown().await.unwrap();
+    service.shutdown().await;
+    peer.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socks5_udp_inbound_routes_through_wireguard_network_split_branch() {
+    let peer = WireGuardPeer::start().await;
+    let inbound_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let inbound = inbound_listener.local_addr().unwrap();
+    drop(inbound_listener);
+
+    let root = integration_dir("service-wireguard-network-split-udp-chain");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_wireguard_network_split_udp_chain(&service, inbound, &peer).await;
+
+    let mut control = connect_loopback(inbound).await;
+    control.write_all(&[5, 1, 0]).await.unwrap();
+    let mut method = [0_u8; 2];
+    control.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [5, 0]);
+    control
+        .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut bind_reply = [0_u8; 10];
+    control.read_exact(&mut bind_reply).await.unwrap();
+    assert_eq!(&bind_reply[..4], &[5, 0, 0, 1]);
+    let relay_address = SocketAddr::new(
+        std::net::Ipv4Addr::new(bind_reply[4], bind_reply[5], bind_reply[6], bind_reply[7]).into(),
+        u16::from_be_bytes([bind_reply[8], bind_reply[9]]),
+    );
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let payload = b"wireguard-network-split-udp-payload";
+    let mut packet = vec![0, 0, 0, 1, 192, 0, 2, 1];
+    packet.extend_from_slice(&PEER_UDP_PORT.to_be_bytes());
+    packet.extend_from_slice(payload);
+    client.send_to(&packet, relay_address).await.unwrap();
+
+    let mut response = [0_u8; 2048];
+    let (length, source) =
+        tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(source, relay_address);
+    assert!(length >= 10);
+    assert_eq!(&response[..10], &packet[..10]);
+    assert_eq!(&response[10..length], payload);
+    assert!(peer.stats.udp_reads.load(Ordering::Relaxed) > 0);
+    assert!(peer.stats.udp_writes.load(Ordering::Relaxed) > 0);
 
     control.shutdown().await.unwrap();
     service.shutdown().await;

@@ -978,10 +978,16 @@ impl RuntimeSnapshot {
                     max_streams,
                 }))
             }
-            "wireguard" | "wire_guard" | "wg" => Err(Error::new(
-                ErrorKind::Unsupported,
-                "network_split WireGuard branch is not composable with a parent proxy",
-            )),
+            "wireguard" | "wire_guard" | "wg" => {
+                let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Wireguard);
+                build_wireguard_proxy(
+                    layer,
+                    timeout,
+                    self.resolver.clone(),
+                    child.network_interface(),
+                )
+                .await
+            }
             "network_split" | "networksplit" => {
                 Err(Error::invalid("nested network_split is not supported"))
             }
@@ -1017,23 +1023,13 @@ impl RuntimeSnapshot {
                 .iter()
                 .find(|layer| layer.kind.eq_ignore_ascii_case("wireguard"))
                 .ok_or_else(|| Error::invalid("WireGuard protocol layer is missing"))?;
-            let wireguard: yuhaiin_wireguard::WireGuardConfig =
-                serde_json::from_value(layer.config.clone()).map_err(|error| {
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        format!("invalid WireGuard node configuration: {error}"),
-                    )
-                })?;
-            let bind_interface = config.network_interface();
-            Arc::new(
-                yuhaiin_wireguard::build_proxy_with_interface_and_resolver(
-                    wireguard,
-                    timeout,
-                    bind_interface.as_deref(),
-                    Some(self.resolver.clone()),
-                )
-                .await?,
-            ) as Arc<dyn AsyncProxy>
+            build_wireguard_proxy(
+                layer,
+                timeout,
+                self.resolver.clone(),
+                config.network_interface(),
+            )
+            .await?
         } else if config.transport == yuhaiin_store::GoProxyTransport::HttpMock {
             let base = config
                 .to_base_proxy_config_with_resolver(timeout, self.resolver.clone())
@@ -2317,6 +2313,30 @@ async fn build_stream_transport_upstream(
         upstream = build_protocol_websocket_proxy(config, upstream)?;
     }
     Ok(upstream)
+}
+
+async fn build_wireguard_proxy(
+    layer: &GoProxyLayer,
+    timeout: Duration,
+    resolver: Arc<dyn AsyncIpResolver>,
+    bind_interface: Option<String>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let wireguard: yuhaiin_wireguard::WireGuardConfig =
+        serde_json::from_value(layer.config.clone()).map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid WireGuard node configuration: {error}"),
+            )
+        })?;
+    Ok(Arc::new(
+        yuhaiin_wireguard::build_proxy_with_interface_and_resolver(
+            wireguard,
+            timeout,
+            bind_interface.as_deref(),
+            Some(resolver),
+        )
+        .await?,
+    ))
 }
 
 async fn build_protocol_h2_proxy(
