@@ -4649,3 +4649,9 @@ Podman 完成，临时状态位于 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
 Windows 检查已整理为 `make release-windows-cross-smoke`，默认使用
 `~/.cache/yuhaiin-rust/integration/release-windows-cross/` 和
 `~/.cache/yuhaiin-rust/release-windows-target/`，也可通过对应环境变量替换路径。
+
+同一批次还用 `YUHAIIN_RELEASE_LINUX_TARGET=x86_64-unknown-linux-musl make
+release-linux-cross-smoke` 完成了 Linux amd64 检查；此前的 aarch64 检查和本次 amd64
+检查都通过，均复用 workflow 的 SHA 固定 musl-cross 工具链。这样 Linux 两个 release
+target 已有独立的容器源码/linker 证据，仍不把 Darwin/Windows 原生 runner 结果提前视为
+完成。
