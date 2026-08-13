@@ -19,8 +19,8 @@ use support::{
     Socks5Fixture, YUUBINSYA_PASSWORD, add_mixed_udp_inbound, add_reverse_inbounds,
     add_socks5_inbound, add_yuubinsya_inbound, api_json, configure_aead_h2_http_inbound,
     configure_h2_http_chain, configure_h2_http_inbound, configure_h2_socks5_chain,
-    configure_http_chain, configure_http_chain_with_transport, configure_socks5_chain,
-    configure_tls_aead_h2_http_inbound, configure_tls_h2_http_inbound,
+    configure_http_chain, configure_http_chain_with_transport, configure_network_split_http_chain,
+    configure_socks5_chain, configure_tls_aead_h2_http_inbound, configure_tls_h2_http_inbound,
     configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound, connect_loopback,
     connect_tls_h2_loopback, connect_tls_loopback, integration_dir, seed_empty_database,
     tls_server_acceptor, wait_for_connection,
@@ -1395,6 +1395,58 @@ async fn http2_inbound_routes_through_http_outbound() {
 
     connection_task.abort();
     let _ = connection_task.await;
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_inbound_routes_through_network_split_http_tcp_branch() {
+    let fixture = ConnectFixture::start().await;
+    let _default_mixed_blocker = tokio::net::TcpListener::bind("127.0.0.1:1080").await.ok();
+    let inbound = support::reserve_loopback().await;
+
+    let root = integration_dir("service-network-split-http");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_network_split_http_chain(&service, inbound, fixture.outbound).await;
+
+    let authority = format!("example.test:{}", fixture.target.port());
+    let (mut client, headers) = http_connect_with_auth(inbound, &authority, None)
+        .await
+        .unwrap();
+    assert!(
+        headers.starts_with("HTTP/1.1 200"),
+        "HTTP response: {headers}"
+    );
+    let payload = b"network-split-http-tcp-branch";
+    client.write_all(payload).await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(echoed, payload);
+
+    let connections = wait_for_connection(&service.client, &service.base_url).await;
+    let item = connections["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["inboundName"] == "NetworkSplit HTTP inbound")
+        .expect("network_split connection must be visible");
+    assert_eq!(item["nodeId"], "network-split-http-out");
+    assert_eq!(item["outbound"], fixture.outbound.to_string());
+
+    let authorities = fixture
+        .connect_authorities
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert!(
+        authorities.iter().any(|value| value == &authority),
+        "network_split HTTP branch authorities: {authorities:?}"
+    );
+
+    client.shutdown().await.unwrap();
     service.shutdown().await;
     fixture.shutdown().await;
 }

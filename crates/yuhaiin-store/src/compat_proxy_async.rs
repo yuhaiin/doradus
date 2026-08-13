@@ -133,6 +133,25 @@ impl GoProxyRuntimeConfig {
             | GoProxyTransport::Vmess
             | GoProxyTransport::Yuubinsya
             | GoProxyTransport::Aead => fixed_endpoints(&self.layers),
+            GoProxyTransport::NetworkSplit => {
+                // `network_split` wraps the proxy assembled from the chain
+                // prefix.  The branch payload is a protocol point, not a
+                // second node-level fixed endpoint, so observability must
+                // resolve only the parent prefix just like the runtime
+                // builder does.
+                let Some(split_index) = self
+                    .layers
+                    .iter()
+                    .position(|layer| layer.kind.eq_ignore_ascii_case("network_split"))
+                else {
+                    return Ok(Vec::new());
+                };
+                if split_index == 0 {
+                    Ok(Vec::new())
+                } else {
+                    fixed_endpoints(&self.layers[..split_index])
+                }
+            }
             _ => Ok(Vec::new()),
         }
     }

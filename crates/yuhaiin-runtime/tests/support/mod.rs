@@ -1338,6 +1338,79 @@ pub async fn configure_http_chain_with_transport(
     settle_runtime_reload().await;
 }
 
+/// Configure the Go `network_split` shape with a real HTTP proxy on the TCP
+/// branch.  The fixed parent is intentional: Go builds the split branches
+/// around the already-built prefix, so this helper exercises both the store
+/// parser and the runtime parent/branch composition.
+pub async fn configure_network_split_http_chain(
+    service: &ServiceProcess,
+    inbound: SocketAddr,
+    outbound: SocketAddr,
+) {
+    let node = json!({
+        "id":"network-split-http-out",
+        "name":"Network split HTTP outbound",
+        "group":"integration",
+        "enabled":true,
+        "chain":[
+            {"type":"fixed","fixed":{"host":"127.0.0.1","port":outbound.port()}},
+            {"type":"network_split","network_split":{
+                "tcp":{"type":"http","http":{"user":"","password":""}},
+                "udp":{"type":"drop","drop":{}}
+            }}
+        ]
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes",
+        Some(&node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::PUT,
+        "/api/v2/route/tags/integration",
+        Some(&json!({"type":"node","hash":"network-split-http-out"})),
+    )
+    .await;
+
+    let inbound = json!({
+        "id":"network-split-http-in",
+        "name":"NetworkSplit HTTP inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":{"type":"http","http":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+
+    let rule = json!({
+        "name":"network-split-http-rule",
+        "mode":"proxy",
+        "match":{"domain":"example.test"},
+        "tag":"integration"
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/route/rules",
+        Some(&rule),
+    )
+    .await;
+    settle_runtime_reload().await;
+}
+
 /// Configure an HTTP inbound whose route is selected only when the runtime
 /// can recover both the real client process and the inbound name. This keeps
 /// the integration test on the persisted Go-shaped route-list/rule contract.
