@@ -75,7 +75,10 @@ async fn foreground_service_emits_startup_progress_by_default() {
     {
         #[cfg(target_os = "linux")]
         {
-            kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).unwrap();
+            // Go's foreground entrypoint treats SIGHUP as a graceful stop;
+            // keep that compatibility covered separately from the shared
+            // SIGTERM shutdown used by the other process fixtures.
+            kill(Pid::from_raw(child.id() as i32), Signal::SIGHUP).unwrap();
         }
         #[cfg(not(target_os = "linux"))]
         {

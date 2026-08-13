@@ -312,14 +312,21 @@ mod tests {
 async fn wait_for_process_shutdown() {
     #[cfg(unix)]
     {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sigterm) => {
+        let signals = (
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()),
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit()),
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()),
+        );
+        match signals {
+            (Ok(mut sighup), Ok(mut sigquit), Ok(mut sigterm)) => {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {},
+                    _ = sighup.recv() => {},
+                    _ = sigquit.recv() => {},
                     _ = sigterm.recv() => {},
                 }
             }
-            Err(_) => {
+            _ => {
                 let _ = tokio::signal::ctrl_c().await;
             }
         }

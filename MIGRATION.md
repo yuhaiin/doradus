@@ -4604,3 +4604,13 @@ x86_64。这个失败不是 Rust 源码失败，也不能代表 release workflow
 toolchain 缓存位于 `~/.cache/yuhaiin-rust/integration/release-linux-cross/`，没有使用系统
 `/tmp`。这闭环了 Linux arm64 的源码/linker 证据；Darwin/Windows 的原生 SDK、runner 和
 服务权限仍不能由 Linux 容器替代。
+
+## 177. 2026-08-13 前台 service signal parity
+
+对照 Go `cmd/yuhaiin.run` 的 `signal.NotifyContext` 后补齐 Rust 前台进程的退出信号集合：
+Unix 下现在将 `SIGHUP`、`SIGINT`、`SIGTERM` 和 `SIGQUIT` 都转成 runtime 的 graceful
+shutdown；平台不支持注册 Unix signal 时仍回退到 `ctrl_c`。这保持 systemd/launchd/SCM
+之外直接运行二进制时的生命周期语义一致。
+
+进程级 startup harness 在 Podman 中实际发送 `SIGHUP` 并确认退出状态成功；其它 runtime
+service fixtures 继续实际发送 `SIGTERM`。本轮没有运行宿主机测试，也没有使用 `/tmp`。
