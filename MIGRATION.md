@@ -4870,3 +4870,12 @@ echo target，并检查 connections 的 inbound/outbound/protocol 元数据。Po
 这只证明未启用 ECH 的普通 `tls_auto` 已进入真实 inbound → outbound 主路径；rustls 没有
 等价的 server-side ECH key API，因此 ECH、Go live 对照和更广的错误/ALPN 矩阵仍保持清单
 中的 `[~]`，不会被这次 SNI 现场误报为完成。
+
+## 193. 2026-08-14 S3 backup error matrix
+
+在已有本地兼容端点和 MinIO 的真实 SigV4 PUT/GET 之外，`yuhaiin-backup` 新增 8 个
+Podman unit cases：禁用或缺少 access key/secret/bucket 时在发起网络请求前 fail-fast，
+拒绝空 object key 和绝对路径，保留非 2xx 的 status/body，并把超长错误 body 截断到
+1024 字符；已有注入 transport 签名请求和本地 HTTP endpoint `s3_local` 1/1 继续通过。
+这些测试补足了可重复的异常行为，但没有把本地 MinIO 的兼容性证据冒充真实 AWS IAM、
+region、ACL 或网络策略现场，因此该条目仍保持 `[~]`。

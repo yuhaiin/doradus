@@ -578,6 +578,53 @@ mod tests {
         assert_eq!(serde_json::from_value::<S3Config>(json).unwrap(), config);
     }
 
+    #[test]
+    fn rejects_disabled_or_incomplete_s3_config_before_network_use() {
+        let mut config = S3Config::default();
+        assert!(matches!(
+            S3Client::new(config.clone()),
+            Err(Error::Invalid(message)) if message == "S3 backup is disabled"
+        ));
+
+        config.enabled = true;
+        assert!(matches!(
+            S3Client::new(config.clone()),
+            Err(Error::Invalid(message)) if message == "S3 backup requires accessKey and secretKey"
+        ));
+
+        config.access_key = "access".to_owned();
+        config.secret_key = "secret".to_owned();
+        assert!(matches!(
+            S3Client::new(config.clone()),
+            Err(Error::Invalid(message)) if message == "S3 backup requires bucket"
+        ));
+
+        config.bucket = "bucket".to_owned();
+        config.endpoint_url = "not a URL".to_owned();
+        assert!(matches!(S3Client::new(config), Err(Error::Url(_))));
+    }
+
+    #[test]
+    fn rejects_empty_or_absolute_object_keys_before_signing() {
+        let client = S3Client::new(S3Config {
+            enabled: true,
+            access_key: "access".to_owned(),
+            secret_key: "secret".to_owned(),
+            bucket: "bucket".to_owned(),
+            region: "us-east-1".to_owned(),
+            endpoint_url: "http://s3.example".to_owned(),
+            use_path_style: true,
+            storage_class: String::new(),
+        })
+        .unwrap();
+        for object in ["", "/absolute.db"] {
+            assert!(matches!(
+                client.signed_request(Method::GET, object, &[]),
+                Err(Error::Invalid(message)) if message == "S3 object key is invalid"
+            ));
+        }
+    }
+
     #[derive(Clone)]
     struct CaptureTransport {
         requests: Arc<Mutex<Vec<S3Request>>>,
@@ -653,6 +700,15 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(error, Error::Response { status, body } if status == StatusCode::SERVICE_UNAVAILABLE && body == "temporarily unavailable")
+        );
+
+        let error = ensure_transport_success(S3Response {
+            status: 500,
+            body: vec![b'x'; 2048],
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Response { body, .. } if body.len() == 1024 && body.chars().all(|value| value == 'x'))
         );
     }
 
