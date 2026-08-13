@@ -4631,3 +4631,18 @@ service fixtures 继续实际发送 `SIGTERM`。本轮没有运行宿主机测�
 `1.53 GiB`；默认 prune 没有可回收的过期场景目录，也没有自动删除可复用构建产物。
 后续若磁盘压力持续，应显式选择清理可重建的 target 根目录。本轮所有运行时验证仍通过
 Podman 完成，临时状态位于 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+
+## 179. 2026-08-13 发布 target 源码检查
+
+为补强 release workflow 的结构检查，本轮在 Podman 中分别检查了非 Linux target：
+
+- Windows `x86_64-pc-windows-gnu`：临时容器安装 MinGW，设置 target linker/CC 后执行
+  `cargo check --locked --target x86_64-pc-windows-gnu -p yuhaiin-runtime --bin yuhaiin
+  --all-features`，完整通过，包含 `windows-service`、BoringTun、SQLite 和 runtime/API
+  依赖。这是 Windows `cfg`/依赖图证据，不替代 workflow 的 MSVC 原生 release。
+- Darwin `x86_64-apple-darwin`：Rust target 安装成功，但容器没有 Apple clang/SDK；`ring`
+  与 bundled SQLite 的 C 构建被 Linux `cc` 拒绝 `-arch`、`-mmacosx-version-min` 参数。因此
+  该结果分类为工具链限制，不是源码通过，也不把 Darwin `[~]` 提前关闭；最终仍由
+  `macos-14` runner 的原生 SDK 编译确认。
+
+两次检查均在 Podman 中执行，构建状态复用 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
