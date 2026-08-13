@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use base64::Engine;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use yuhaiin_core::proxy::AsyncProxy;
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 use yuhaiin_wireguard::{WireGuardConfig, build_proxy};
@@ -62,6 +62,11 @@ async fn external_peer_tcp_connects() {
         .unwrap();
     if let Ok(request) = std::env::var("YUHAIIN_WIREGUARD_EXTERNAL_TCP_REQUEST") {
         stream.write_all(request.as_bytes()).await.unwrap();
+    }
+    if let Ok(expected) = std::env::var("YUHAIIN_WIREGUARD_EXTERNAL_TCP_EXPECT") {
+        let mut response = vec![0; expected.len()];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected.as_bytes());
     }
     proxy.close().await.unwrap();
 }

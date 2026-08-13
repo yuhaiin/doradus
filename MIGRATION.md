@@ -4879,3 +4879,24 @@ Podman unit cases：禁用或缺少 access key/secret/bucket 时在发起网络�
 1024 字符；已有注入 transport 签名请求和本地 HTTP endpoint `s3_local` 1/1 继续通过。
 这些测试补足了可重复的异常行为，但没有把本地 MinIO 的兼容性证据冒充真实 AWS IAM、
 region、ACL 或网络策略现场，因此该条目仍保持 `[~]`。
+
+## 194. 2026-08-14 WireGuard 第三方 userspace 互操作
+
+为验证 Rust 的 Cloudflare BoringTun adapter 不只是在本地双 peer 内自洽，本轮使用一台
+Debian 6.5 VM 启动标准 Go `wireguard-go` 作为第三方 peer。VM 通过 `10.77.0.1/24`
+提供 TCP 和 UDP echo，Rust 端使用 `10.77.0.2/32`，两端经 VM 的 UDP endpoint 完成
+真实 WireGuard handshake 和数据包交换。
+
+VM 的 apt 状态已有与本任务无关的未配置包，直接安装 `wireguard-tools` 会进入 GTK 依赖
+冲突；为避免修改 VM 的系统包状态，本次只下载 Debian 包并解包到 `/root/yuhaiin-wg-tools`
+后运行 `wireguard-go`/`wg`，测试结束已确认 `wg-yuhaiin` interface 和临时状态清理。
+
+Podman 中执行 `make wireguard-external-smoke`，配置使用 Go JSON，TCP request/expected
+reply 为 `wireguard-tcp`，UDP payload 为 `wireguard-udp`；结果为 `external_peer_tcp_connects`
+和 `external_peer_udp_round_trips` 2/2。外部 harness 新增可选的
+`YUHAIIN_WIREGUARD_EXTERNAL_TCP_EXPECT`，因此 TCP 测试不再只验证 connect 成功，也能验证
+第三方 peer 后端返回的 payload。
+
+这证明了标准 Go userspace peer 与 Rust BoringTun 的 TCP/UDP wire compatibility，但不把
+单台 Debian VM 冒充 Cloudflare WARP/public peer：真实 WARP credentials、NAT endpoint
+变化、keepalive、roaming 和公网策略仍保持 checklist 的 `[~]`。

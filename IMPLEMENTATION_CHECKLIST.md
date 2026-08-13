@@ -125,7 +125,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 | Go 权威入口 | Rust 位置 | 状态 | 证据 | 下一动作 |
 | --- | --- | :---: | --- | --- |
-| `pkg/net/proxy/wireguard/{wireguard,bind,device}.go` | `crates/yuhaiin-wireguard/src/lib.rs`、`crates/yuhaiin-runtime/tests/wireguard_chain.rs` | `[x]` | Cloudflare `boringtun 0.7.1`、reserved/base64/PSK/keepalive/AllowedIPs、smoltcp TCP/UDP adapter；本地双 peer 已验证 authenticated endpoint roaming 和完整 UDP session；runtime WireGuard 让 peer endpoint 和最终目标都使用配置 resolver，驱动初始化也在构建返回前完成 ready/error 握手；外部验证入口同时接受 Go JSON 与标准 WARP/`wg-quick` INI；`make wireguard-chain-smoke` 在 Podman 通过真实 runtime HTTP/TCP 与 SOCKS5/UDP inbound→CIDR router→WireGuard outbound→BoringTun peer 的 TCP/UDP echo、连接元数据和 latency；最新 64 MiB packet benchmark 为 584.26 MiB/s、peak RSS 3,540 KiB | 真实第三方/WARP peer、真实链路 keepalive/NAT endpoint 变化归入下方外部兼容项 |
+| `pkg/net/proxy/wireguard/{wireguard,bind,device}.go` | `crates/yuhaiin-wireguard/src/lib.rs`、`crates/yuhaiin-runtime/tests/wireguard_chain.rs` | `[x]` | Cloudflare `boringtun 0.7.1`、reserved/base64/PSK/keepalive/AllowedIPs、smoltcp TCP/UDP adapter；本地双 peer 已验证 authenticated endpoint roaming 和完整 UDP session；runtime WireGuard 让 peer endpoint 和最终目标都使用配置 resolver，驱动初始化也在构建返回前完成 ready/error 握手；外部验证入口同时接受 Go JSON 与标准 WARP/`wg-quick` INI；`make wireguard-chain-smoke` 在 Podman 通过真实 runtime HTTP/TCP 与 SOCKS5/UDP inbound→CIDR router→WireGuard outbound→BoringTun peer 的 TCP/UDP echo、连接元数据和 latency；2026-08-14 Debian VM 标准 Go `wireguard-go` peer 与 Rust 端实际完成 TCP+UDP echo 2/2；最新 64 MiB packet benchmark 为 584.26 MiB/s、peak RSS 3,540 KiB | 真实 WARP/public peer、真实链路 keepalive/NAT endpoint 变化归入下方外部兼容项 |
 | Go `WireGuard` node config | `crates/yuhaiin-store/src/compat_proxy*.rs`、`crates/yuhaiin-runtime/src/proxy.rs` | `[x]` | `make wireguard-smoke`：Podman `--network=none` 双 userspace peer，11/11（另 1 个 benchmark ignored），并覆盖 WARP/`wg-quick` INI 解析和不完整配置拒绝 | — |
 | Go packet path | `scripts/benchmark/wireguard.sh` | `[x]` | release BoringTun packet benchmark，结果只作同机回归基线 | 公网/第三方链路性能不能由本地 benchmark 推断 |
 
@@ -226,7 +226,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 ### WireGuard 外部兼容
 
-- `[~]` 使用真实第三方/WARP peer 验证 reserved、handshake、keepalive 和 NAT endpoint 变化；本地 authenticated roaming 及 TCP/UDP userspace session 已由双 peer 单测覆盖。`make wireguard-external-smoke` 已提供用户配置驱动的 Podman host-network 入口，现在可直接读取 Go JSON 或标准 WARP/`wg-quick` INI；仍需第三方现场确认 endpoint roaming 和真实链路行为。
+- `[~]` 使用真实第三方/WARP peer 验证 reserved、handshake、keepalive 和 NAT endpoint 变化；本地 authenticated roaming 及 TCP/UDP userspace session 已由双 peer 单测覆盖。2026-08-14 在 Debian 6.5 VM 上用标准 Go `wireguard-go` 作为第三方 userspace peer，Rust BoringTun 端通过真实 UDP underlay 完成 TCP echo 与 UDP echo，`make wireguard-external-smoke` 结果为 2/2；入口现在可直接读取 Go JSON 或标准 WARP/`wg-quick` INI，并支持 TCP request/expected-reply 检查。仍需真实 WARP/public peer 的 endpoint roaming、keepalive、NAT 变化和网络策略现场确认。
 - `[x]` 保持本地双 peer smoke 和 release packet benchmark；两者只证明协议/适配器正确性和同机趋势，不宣称公网性能。
 
 ### CI 与发布（不计入上面的 41 项功能覆盖率）
