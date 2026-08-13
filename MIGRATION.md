@@ -4646,3 +4646,6 @@ Podman 完成，临时状态位于 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
   `macos-14` runner 的原生 SDK 编译确认。
 
 两次检查均在 Podman 中执行，构建状态复用 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+Windows 检查已整理为 `make release-windows-cross-smoke`，默认使用
+`~/.cache/yuhaiin-rust/integration/release-windows-cross/` 和
+`~/.cache/yuhaiin-rust/release-windows-target/`，也可通过对应环境变量替换路径。

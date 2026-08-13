@@ -204,7 +204,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 ### CI 与发布（不计入上面的 49 项功能覆盖率）
 
-- `[~]` `.github/workflows/rust.yml` 已加入 Rust/Podman 检查、Linux `x86_64/aarch64-unknown-linux-musl`、Darwin `x86_64/aarch64`、Windows `x86_64/aarch64` 六项 release matrix；`make release-contract-smoke` 会在 CI checks 阶段锁定六个 target、产物名、`release/checksums.txt` 和 rolling-main 发布条件，且会拒绝误引用仓库根 checksum；Podman 中 Windows GNU `x86_64` all-features 源码检查已通过，Darwin 检查因缺少 Apple clang/SDK 在 C 依赖阶段停止；仍需第一次 GitHub Actions 远程运行确认原生 runner/SDK 的现场差异。
+- `[~]` `.github/workflows/rust.yml` 已加入 Rust/Podman 检查、Linux `x86_64/aarch64-unknown-linux-musl`、Darwin `x86_64/aarch64`、Windows `x86_64/aarch64` 六项 release matrix；`make release-contract-smoke` 会在 CI checks 阶段锁定六个 target、产物名、`release/checksums.txt` 和 rolling-main 发布条件，且会拒绝误引用仓库根 checksum；`make release-windows-cross-smoke` 可在 Podman 复用 MinGW 检查 Windows GNU `x86_64` cfg/依赖，Darwin 检查因缺少 Apple clang/SDK 在 C 依赖阶段停止；仍需第一次 GitHub Actions 远程运行确认原生 runner/SDK 的现场差异。
 - `[x]` 新增 `make release-linux-cross-smoke`，使用与 workflow 相同的 SHA 固定 `cross-tools/musl-cross` toolchain；Podman 中 `aarch64-unknown-linux-musl` 的 runtime `--all-features` target check 通过，验证了 Linux arm64 的 linker、ring、SQLite 和完整 workspace 依赖。Darwin/Windows 仍必须由各自原生 runner 验证。
 - `[x]` 旧 Actions 的 `trojan.rs` `clippy::byte-char-slices` 已通过 `*b"\r\n"` 修复，`rusqlite 0.39.0` / `libsqlite3-sys 0.37.0` 锁定；Rust 1.97.1 Podman 中 fmt、全 workspace Clippy 和 workspace tests 均通过。HTTP/2 pool 的 key 还纳入 endpoint `network_interface`，避免相同地址的不同网卡策略复用连接。
 - `[x]` 发布资产名称与运行时 update contract 对齐：`yuhaiin-{linux,darwin,windows}-{amd64,arm64}`，Windows 保留 `.exe`；`v*` tag 发布稳定 release，`main` 生成可覆盖的 rolling prerelease 并更新 `main` tag。
