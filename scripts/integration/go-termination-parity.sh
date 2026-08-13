@@ -135,7 +135,7 @@ podman run -d \
   -v "${target_script}:/usr/local/bin/http-termination-target.py:ro" \
   --entrypoint python3 \
   "${proxy_image}" \
-  /usr/local/bin/http-termination-target.py "${target_port}" /health "${target_host}:${target_port}" \
+  /usr/local/bin/http-termination-target.py "${target_port}" /health "${target_host}:${target_port}" 2 \
   >"${run_dir}/go-target-id"
 podman run -d \
   --name "${rust_target_container}" \
@@ -144,7 +144,7 @@ podman run -d \
   -v "${target_script}:/usr/local/bin/http-termination-target.py:ro" \
   --entrypoint python3 \
   "${proxy_image}" \
-  /usr/local/bin/http-termination-target.py "${rust_target_port}" /health "${rust_target_host}:${rust_target_port}" \
+  /usr/local/bin/http-termination-target.py "${rust_target_port}" /health "${rust_target_host}:${rust_target_port}" 2 \
   >"${run_dir}/rust-target-id"
 
 wait_target() {
@@ -212,6 +212,7 @@ PY
 configure_service() {
   local address="$1"
   local prefix="$2"
+  local mode="${3:-combo}"
   local node_body inbound_body rule_body service_target_host service_target_ip service_target_port
   service_target_host="${target_host}"
   service_target_ip="${host_ip}"
@@ -226,21 +227,39 @@ configure_service() {
     # themselves represented as base64 strings by encoding/json.  Rust also
     # accepts this shape, while its compatibility API additionally accepts
     # the inbound-style certBase64/keyBase64 names.
-    node_body="$(jq -cn \
-      --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
-      '{id:($prefix+"-termination-out"),name:"termination parity outbound",group:"parity",enabled:true,chain:[
-        {type:"direct",direct:{}},
-        {type:"http_termination",http_termination:{headers:{}}},
-        {type:"tls_termination",tls_termination:{tls:{certificates:[{cert:$cert,key:$key}],nextProtos:[]}}}
-      ]}')"
+    if [[ "${mode}" == standalone ]]; then
+      node_body="$(jq -cn \
+        --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
+        '{id:($prefix+"-termination-out"),name:"termination parity outbound",group:"parity",enabled:true,chain:[
+          {type:"direct",direct:{}},
+          {type:"tls_termination",tls_termination:{tls:{certificates:[{cert:$cert,key:$key}],nextProtos:[]}}}
+        ]}')"
+    else
+      node_body="$(jq -cn \
+        --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
+        '{id:($prefix+"-termination-out"),name:"termination parity outbound",group:"parity",enabled:true,chain:[
+          {type:"direct",direct:{}},
+          {type:"http_termination",http_termination:{headers:{}}},
+          {type:"tls_termination",tls_termination:{tls:{certificates:[{cert:$cert,key:$key}],nextProtos:[]}}}
+        ]}')"
+    fi
   else
-    node_body="$(jq -cn \
-      --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
-      '{id:($prefix+"-termination-out"),name:"termination parity outbound",group:"parity",enabled:true,chain:[
-        {type:"direct",direct:{}},
-        {type:"http_termination",http_termination:{headers:{}}},
-        {type:"tls_termination",tls_termination:{tls:{certificates:[{certBase64:$cert,keyBase64:$key}],nextProtos:[]}}}
-      ]}')"
+    if [[ "${mode}" == standalone ]]; then
+      node_body="$(jq -cn \
+        --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
+        '{id:($prefix+"-termination-out"),name:"termination parity outbound",group:"parity",enabled:true,chain:[
+          {type:"direct",direct:{}},
+          {type:"tls_termination",tls_termination:{tls:{certificates:[{certBase64:$cert,keyBase64:$key}],nextProtos:[]}}}
+        ]}')"
+    else
+      node_body="$(jq -cn \
+        --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
+        '{id:($prefix+"-termination-out"),name:"termination parity outbound",group:"parity",enabled:true,chain:[
+          {type:"direct",direct:{}},
+          {type:"http_termination",http_termination:{headers:{}}},
+          {type:"tls_termination",tls_termination:{tls:{certificates:[{certBase64:$cert,keyBase64:$key}],nextProtos:[]}}}
+        ]}')"
+    fi
   fi
   inbound_body="$(jq -cn --arg prefix "${prefix}" --arg host "${container_inbound}" --arg target_host "${service_target_host}" --arg target_port "${service_target_port}" \
     '{id:($prefix+"-termination-in"),name:"termination parity inbound",enabled:true,
@@ -256,22 +275,28 @@ configure_service() {
     rule_body="$(jq -cn --arg ip "${service_target_ip}" \
       '{name:"termination-parity-route",mode:"proxy",match:{cidr:($ip+"/32")}}')"
   fi
-  rpc "${address}" nodes.post "${node_body}" >"${run_dir}/${prefix}-node.json"
-  rpc "${address}" node.use "$(jq -cn --arg prefix "${prefix}" '{id:($prefix+"-termination-out")}')" >/dev/null
-  if [[ "${prefix}" == go ]]; then
-    rpc "${address}" nodes.selected '{}' >"${run_dir}/${prefix}-selected.json"
+  if [[ "${mode}" == combo ]]; then
+    rpc "${address}" nodes.post "${node_body}" >"${run_dir}/${prefix}-${mode}-node.json"
+  else
+    rpc "${address}" node.put "${node_body}" >"${run_dir}/${prefix}-${mode}-node.json"
   fi
-  rpc "${address}" inbounds.post "${inbound_body}" >"${run_dir}/${prefix}-inbound.json"
-  rpc "${address}" route.rules.post "${rule_body}" >"${run_dir}/${prefix}-route.json"
-  rpc "${address}" route.rules.priority \
-    '{"source":{"name":"termination-parity-route"},"target":{"name":"LAN"},"operate":"insert_before"}' \
-    >"${run_dir}/${prefix}-route-priority.json"
-  rpc "${address}" route.apply '{}' >/dev/null
-  rpc "${address}" route.rules.test "{\"host\":\"${service_target_host}:${service_target_port}\"}" >"${run_dir}/${prefix}-route-test.json"
+  rpc "${address}" node.use "$(jq -cn --arg prefix "${prefix}" '{id:($prefix+"-termination-out")}')" >/dev/null
+  if [[ "${mode}" == combo ]]; then
+    if [[ "${prefix}" == go ]]; then
+      rpc "${address}" nodes.selected '{}' >"${run_dir}/${prefix}-selected.json"
+    fi
+    rpc "${address}" inbounds.post "${inbound_body}" >"${run_dir}/${prefix}-inbound.json"
+    rpc "${address}" route.rules.post "${rule_body}" >"${run_dir}/${prefix}-route.json"
+    rpc "${address}" route.rules.priority \
+      '{"source":{"name":"termination-parity-route"},"target":{"name":"LAN"},"operate":"insert_before"}' \
+      >"${run_dir}/${prefix}-route-priority.json"
+    rpc "${address}" route.apply '{}' >/dev/null
+    rpc "${address}" route.rules.test "{\"host\":\"${service_target_host}:${service_target_port}\"}" >"${run_dir}/${prefix}-route-test.json"
+  fi
 }
 
-configure_service "${go_address}" go "${go_inbound}"
-configure_service "${rust_address}" rust "${rust_inbound}"
+configure_service "${go_address}" go combo
+configure_service "${rust_address}" rust combo
 
 wait_tcp() {
   local port="$1"
@@ -345,37 +370,47 @@ with context.wrap_socket(raw) as stream:
 PY
 }
 
-echo "[go-termination-parity] sending identical raw-TLS reverse requests"
-send_tls_request "${go_inbound}" "${run_dir}/go-client.log" "${target_host}:${target_port}" &
-go_client_pid=$!
-send_tls_request "${rust_inbound}" "${run_dir}/rust-client.log" "${rust_target_host}:${rust_target_port}" &
-rust_client_pid=$!
+run_case() {
+  local case_name="$1"
+  echo "[go-termination-parity] sending ${case_name} raw-TLS reverse requests"
+  send_tls_request "${go_inbound}" "${run_dir}/go-${case_name}-client.log" "${target_host}:${target_port}" &
+  go_client_pid=$!
+  send_tls_request "${rust_inbound}" "${run_dir}/rust-${case_name}-client.log" "${rust_target_host}:${rust_target_port}" &
+  rust_client_pid=$!
 
-for service in go rust; do
-  address="${go_address}"
-  [[ "${service}" == rust ]] && address="${rust_address}"
-  for _ in $(seq 1 120); do
-    rpc "${address}" connections '{}' >"${run_dir}/${service}-connections.json"
-    if jq -e '.connections | any(.[]; .inboundName == "termination parity inbound" and .mode == "proxy")' \
-      "${run_dir}/${service}-connections.json" >/dev/null; then
-      break
-    fi
-    sleep 0.05
+  for service in go rust; do
+    address="${go_address}"
+    [[ "${service}" == rust ]] && address="${rust_address}"
+    for _ in $(seq 1 120); do
+      rpc "${address}" connections '{}' >"${run_dir}/${service}-${case_name}-connections.json"
+      if jq -e '.connections | any(.[]; .inboundName == "termination parity inbound" and .mode == "proxy")' \
+        "${run_dir}/${service}-${case_name}-connections.json" >/dev/null; then
+        break
+      fi
+      sleep 0.05
+    done
+    jq -e '.connections | any(.[]; .inboundName == "termination parity inbound" and .mode == "proxy")' \
+      "${run_dir}/${service}-${case_name}-connections.json" >/dev/null
   done
-  jq -e '.connections | any(.[]; .inboundName == "termination parity inbound" and .mode == "proxy")' \
-    "${run_dir}/${service}-connections.json" >/dev/null
-done
-wait "${go_client_pid}"
-go_client_pid=""
-wait "${rust_client_pid}"
-rust_client_pid=""
+  wait "${go_client_pid}"
+  go_client_pid=""
+  wait "${rust_client_pid}"
+  rust_client_pid=""
 
-for service in go rust; do
-  grep -q 'HTTP/1.1 200 OK' "${run_dir}/${service}-client.log"
-  grep -q 'termination-parity-ok' "${run_dir}/${service}-client.log"
-  target_container="${rust_target_container}"
-  [[ "${service}" == go ]] && target_container="${go_target_container}"
+  for service in go rust; do
+    grep -q 'HTTP/1.1 200 OK' "${run_dir}/${service}-${case_name}-client.log"
+    grep -q 'termination-parity-ok' "${run_dir}/${service}-${case_name}-client.log"
+  done
+}
+
+run_case combo
+configure_service "${go_address}" go standalone
+configure_service "${rust_address}" rust standalone
+sleep 0.2
+run_case standalone
+
+for target_container in "${go_target_container}" "${rust_target_container}"; do
   podman wait "${target_container}" >/dev/null
 done
 
-echo "[go-termination-parity] passed; logs=${run_dir}"
+echo "[go-termination-parity] passed; Go/Rust cases=4; logs=${run_dir}"

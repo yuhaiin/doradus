@@ -4918,6 +4918,17 @@ Go 1/1、Rust 1/1（合计 2/2）。Go 的默认 LAN route 会优先匹配 loopb
 编译产物、运行日志和副本均位于 `~/.cache/yuhaiin-rust/integration/go-termination-parity/`，
 未使用 `/tmp`。
 
-该证据只覆盖当前最重要的组合链，不把 termination 全部标为完成：独立 standalone、
+该证据最初只覆盖组合链；standalone 已由下一条记录补齐。termination 仍不整体标为完成：
 命名证书选择、请求错误、HTTPS upstream 以及更广的 Go live 矩阵仍保留在 checklist 的
 `[~]`。
+
+## 196. 2026-08-14 termination standalone live parity
+
+在同一 `go-termination-parity-smoke` 进程测试中，复用已启动的 Go/Rust service、inbound
+和目标 listener，通过 `node.put`/`node.use` 热切换 outbound chain，依次验证
+`direct → http_termination → tls_termination` 与 `direct → tls_termination`。每个目标
+服务处理两次请求，Go/Rust 各自都检查 raw TLS response、目标 path/Host 和 live
+`connections`，结果为 4/4；没有只用 Rust-only unit 或假 target 代替 Go live 对照。
+
+这次补齐 standalone live 证据，但不把剩余边界误报为完成：命名证书选择、upstream
+请求错误和 HTTPS upstream 的 Go/Rust live 矩阵仍在 checklist 的 `[~]`。

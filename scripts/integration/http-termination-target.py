@@ -22,11 +22,15 @@ def main() -> int:
     port = int(sys.argv[1])
     expected_path = sys.argv[2]
     expected_host = sys.argv[3]
+    expected_requests = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+    if expected_requests < 1:
+        raise SystemExit("expected request count must be positive")
+    served = 0
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("0.0.0.0", port))
         listener.listen(1)
-        while True:
+        while served < expected_requests:
             conn, _ = listener.accept()
             with conn:
                 request = read_headers(conn)
@@ -50,8 +54,10 @@ def main() -> int:
                     b"Connection: keep-alive\r\n\r\n"
                     b"termination-parity-ok"
                 )
-                time.sleep(5)
-                break
+                served += 1
+                # Keep the target-side connection visible briefly so the
+                # integration driver can inspect the live connections entry.
+                time.sleep(0.5)
     return 0
 
 
