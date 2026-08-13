@@ -2785,13 +2785,13 @@ fn build_tls_termination_proxy(
         let cert_bytes = tls_termination_bytes(
             certificate,
             &["cert", "certBase64"],
-            &["certFilePath", "cert_file_path"],
+            &["certFile", "certFilePath", "cert_file_path"],
             "TLS termination certificate",
         )?;
         let key_bytes = tls_termination_bytes(
             certificate,
             &["key", "keyBase64"],
-            &["keyFilePath", "key_file_path"],
+            &["keyFile", "keyFilePath", "key_file_path"],
             "TLS termination private key",
         )?;
         let cert_chain = if cert_bytes.starts_with(b"-----BEGIN") {
@@ -3119,6 +3119,26 @@ mod tests {
         assert_eq!(
             tls_termination_bytes(object, &["keyBase64"], &[], "key").unwrap(),
             [3, 4, 5]
+        );
+
+        // Workspace tests execute the compiled harness in a minimal Podman
+        // image that only mounts `/target`; use the harness itself as a
+        // portable readable file instead of assuming the source tree exists.
+        let harness = std::env::current_exe().unwrap();
+        let file_value = serde_json::json!({
+            "certFile": harness,
+            "keyFile": harness,
+        });
+        let file_object = file_value.as_object().unwrap();
+        assert!(
+            !tls_termination_bytes(file_object, &[], &["certFile"], "cert")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !tls_termination_bytes(file_object, &[], &["keyFile"], "key")
+                .unwrap()
+                .is_empty()
         );
     }
 

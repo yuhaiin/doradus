@@ -45,6 +45,9 @@ podman run --rm --network=host \
     export CARGO_HOME=/cargo-home
     export CARGO_TARGET_DIR=/target
     export TMPDIR=/state/cache/tmp
+    # Do not let a runner-level Cargo setting turn this online bootstrap into
+    # an unexplained sparse-index miss. `--locked` still enforces the lockfile.
+    unset CARGO_NET_OFFLINE
 
     apt-get update >/state/apt-update.log
     DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends "$mingw_package" \

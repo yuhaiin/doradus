@@ -4958,8 +4958,16 @@ GitHub Actions 的 Windows dependency gate 在 Podman 中使用 Rust image、Min
 `no matching package named bytes found`。这不是 Windows cfg 或 `libsqlite3-sys` 的源码
 失败。
 
-脚本现在默认使用 `~/.cache/yuhaiin-rust/release-windows-cargo-home` 可写缓存，保留
-`cargo check --locked`，允许容器在线补齐锁定依赖并把失败日志写入同一 cache state；不使用
-`/tmp`。Podman `make release-windows-cross-smoke` 已通过 `yuhaiin-runtime --bin yuhaiin
+脚本现在默认使用 `~/.cache/yuhaiin-rust/release-windows-cargo-home` 可写缓存，显式清除
+runner 可能注入的 `CARGO_NET_OFFLINE`，保留 `cargo check --locked`，允许容器在线补齐锁定依赖并把失败日志写入同一 cache state；不使用 `/tmp`。Podman `make release-windows-cross-smoke` 已通过 `yuhaiin-runtime --bin yuhaiin
 --all-features` 的 `x86_64-pc-windows-gnu` check；这仍只验证 Linux 下的 GNU cfg/依赖边界，
 不替代 Windows runner 上的 MSVC、Windows SDK 和 ARM64 原生 release。
+
+## 199. 2026-08-14 tls_termination certificate file contract aliases
+
+Go 的 `contract.Certificate` 对 TLS termination 使用 `certFile`/`keyFile`，而部分旧 Rust
+配置和内部测试使用 `certFilePath`/`keyFilePath` 或 snake_case 变体。Rust runtime 现在按
+优先级同时读取三组字段，并继续支持 JSON byte array、base64 和 PEM/DER；这样 frontend
+直接提交 Go contract 时不会出现“配置保存成功、启动时证书缺失”。新增 focused test 使用
+仓库内文件路径验证 Go 字段名，`tls_termination` 过滤测试 4/4、Go/Rust termination
+live parity 6/6、Windows GNU dependency smoke、workspace Clippy 均通过。
