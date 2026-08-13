@@ -5,6 +5,8 @@
 //! trait, keeping async UDP/DoH connection details out of the composition
 //! layer and avoiding blocking work in the TUN event loop.
 
+#[cfg(target_os = "windows")]
+use crate::dns::decode_response;
 use crate::dns::{
     AsyncDnsHandler, DnsCache, DnsRecordType, DnsResponse, decode_query, encode_response,
 };
@@ -105,58 +107,220 @@ impl AsyncIpResolver for SystemAsyncIpResolver {
         })
     }
 
+    fn query<'a>(
+        &'a self,
+        domain: &'a DomainName,
+        record_type: DnsRecordType,
+    ) -> BoxFuture<'a, Result<DnsResponse>> {
+        Box::pin(async move {
+            #[cfg(unix)]
+            {
+                let client = system_dns_client().await?;
+                return query_system_server(&client, domain, record_type).await;
+            }
+            #[cfg(target_os = "windows")]
+            {
+                return query_windows_system_resolver(domain, record_type).await;
+            }
+            #[cfg(not(any(unix, target_os = "windows")))]
+            {
+                let _ = (domain, record_type);
+                Err(crate::Error::new(
+                    crate::ErrorKind::Unsupported,
+                    "system DNS queries are unsupported on this platform",
+                ))
+            }
+        })
+    }
+
     fn query_packet<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
-            let server = tokio::task::spawn_blocking(read_system_dns_server)
-                .await
-                .map_err(|error| {
-                    crate::Error::new(
-                        crate::ErrorKind::Io,
-                        format!("read system DNS server task: {error}"),
-                    )
-                })??;
-            AsyncUdpDnsClient {
-                server,
-                timeout: std::time::Duration::from_secs(5),
-                max_packet_size: 65535,
-                local_bind_addresses: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+            #[cfg(unix)]
+            {
+                return system_dns_client().await?.query_packet(packet).await;
             }
-            .query_packet(packet)
-            .await
+            #[cfg(target_os = "windows")]
+            {
+                return query_windows_system_packet(packet).await;
+            }
+            #[cfg(not(any(unix, target_os = "windows")))]
+            {
+                let _ = packet;
+                Err(crate::Error::new(
+                    crate::ErrorKind::Unsupported,
+                    "system DNS packet queries are unsupported on this platform",
+                ))
+            }
         })
     }
 }
 
-fn read_system_dns_server() -> Result<std::net::SocketAddr> {
-    #[cfg(unix)]
-    {
-        let contents = std::fs::read_to_string("/etc/resolv.conf").map_err(|error| {
+#[cfg(unix)]
+async fn system_dns_client() -> Result<AsyncUdpDnsClient> {
+    let server = tokio::task::spawn_blocking(read_system_dns_server)
+        .await
+        .map_err(|error| {
             crate::Error::new(
                 crate::ErrorKind::Io,
-                format!("read /etc/resolv.conf: {error}"),
+                format!("read system DNS server task: {error}"),
+            )
+        })??;
+    Ok(AsyncUdpDnsClient {
+        server,
+        timeout: std::time::Duration::from_secs(5),
+        max_packet_size: 65535,
+        local_bind_addresses: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+    })
+}
+
+#[cfg(unix)]
+async fn query_system_server(
+    client: &AsyncUdpDnsClient,
+    domain: &DomainName,
+    record_type: DnsRecordType,
+) -> Result<DnsResponse> {
+    client.query(domain, record_type).await
+}
+
+#[cfg(unix)]
+fn read_system_dns_server() -> Result<std::net::SocketAddr> {
+    let contents = std::fs::read_to_string("/etc/resolv.conf").map_err(|error| {
+        crate::Error::new(
+            crate::ErrorKind::Io,
+            format!("read /etc/resolv.conf: {error}"),
+        )
+    })?;
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("nameserver") {
+            continue;
+        }
+        if let Some(address) = fields.next().and_then(|value| value.parse().ok()) {
+            return Ok(std::net::SocketAddr::new(address, 53));
+        }
+    }
+    Err(crate::Error::new(
+        crate::ErrorKind::NotFound,
+        "system DNS configuration has no nameserver",
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_system_resolver() -> Result<std::sync::Arc<hickory_resolver::TokioResolver>> {
+    use std::sync::{Arc, OnceLock};
+
+    static RESOLVER: OnceLock<Arc<hickory_resolver::TokioResolver>> = OnceLock::new();
+    if let Some(resolver) = RESOLVER.get() {
+        return Ok(Arc::clone(resolver));
+    }
+
+    let resolver = Arc::new(
+        hickory_resolver::TokioResolver::builder_tokio()
+            .map_err(|error| {
+                crate::Error::new(
+                    crate::ErrorKind::Io,
+                    format!("read Windows DNS configuration: {error}"),
+                )
+            })?
+            .build()
+            .map_err(|error| {
+                crate::Error::new(
+                    crate::ErrorKind::Io,
+                    format!("build Windows system DNS resolver: {error}"),
+                )
+            })?,
+    );
+    let _ = RESOLVER.set(Arc::clone(&resolver));
+    Ok(RESOLVER.get().cloned().unwrap_or(resolver))
+}
+
+#[cfg(target_os = "windows")]
+fn hickory_record_type(record_type: DnsRecordType) -> hickory_proto::rr::RecordType {
+    match record_type {
+        DnsRecordType::A => hickory_proto::rr::RecordType::A,
+        DnsRecordType::Aaaa => hickory_proto::rr::RecordType::AAAA,
+        DnsRecordType::Ptr => hickory_proto::rr::RecordType::PTR,
+        DnsRecordType::Https => hickory_proto::rr::RecordType::HTTPS,
+        DnsRecordType::Svcb => hickory_proto::rr::RecordType::SVCB,
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn query_windows_system_resolver(
+    domain: &DomainName,
+    record_type: DnsRecordType,
+) -> Result<DnsResponse> {
+    let resolver = windows_system_resolver()?;
+    let lookup = resolver
+        .lookup(
+            format!("{}.", domain.as_str()),
+            hickory_record_type(record_type),
+        )
+        .await
+        .map_err(|error| {
+            crate::Error::new(
+                crate::ErrorKind::Io,
+                format!("query Windows system DNS for {}: {error}", domain.as_str()),
             )
         })?;
-        for line in contents.lines() {
-            let mut fields = line.split_whitespace();
-            if fields.next() != Some("nameserver") {
-                continue;
-            }
-            if let Some(address) = fields.next().and_then(|value| value.parse().ok()) {
-                return Ok(std::net::SocketAddr::new(address, 53));
-            }
-        }
-        Err(crate::Error::new(
-            crate::ErrorKind::NotFound,
-            "system DNS configuration has no nameserver",
-        ))
-    }
-    #[cfg(not(unix))]
-    {
-        Err(crate::Error::new(
-            crate::ErrorKind::Unsupported,
-            "raw system DNS queries are only supported on Unix hosts",
-        ))
-    }
+    let packet = lookup.message().to_vec().map_err(|error| {
+        crate::Error::new(
+            crate::ErrorKind::Protocol,
+            format!("encode Windows system DNS response: {error}"),
+        )
+    })?;
+    let id = dns_transaction_id(&packet)?;
+    decode_response(&packet, id, record_type)
+}
+
+#[cfg(target_os = "windows")]
+async fn query_windows_system_packet(packet: &[u8]) -> Result<Vec<u8>> {
+    use hickory_proto::op::Message;
+
+    let message = Message::from_vec(packet).map_err(|error| {
+        crate::Error::new(
+            crate::ErrorKind::Protocol,
+            format!("decode Windows system DNS request: {error}"),
+        )
+    })?;
+    let query = message.queries.first().ok_or_else(|| {
+        crate::Error::new(crate::ErrorKind::Protocol, "DNS request has no question")
+    })?;
+    let resolver = windows_system_resolver()?;
+    let lookup = resolver
+        .lookup(query.name().clone(), query.query_type())
+        .await
+        .map_err(|error| {
+            crate::Error::new(
+                crate::ErrorKind::Io,
+                format!("query Windows system DNS packet: {error}"),
+            )
+        })?;
+    let response = lookup.message().to_vec().map_err(|error| {
+        crate::Error::new(
+            crate::ErrorKind::Protocol,
+            format!("encode Windows system DNS packet response: {error}"),
+        )
+    })?;
+    rewrite_dns_transaction_id(response, message.metadata.id)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn dns_transaction_id(packet: &[u8]) -> Result<u16> {
+    let bytes = packet.get(..2).ok_or_else(|| {
+        crate::Error::new(
+            crate::ErrorKind::Protocol,
+            "DNS response is shorter than its transaction id",
+        )
+    })?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn rewrite_dns_transaction_id(mut packet: Vec<u8>, id: u16) -> Result<Vec<u8>> {
+    let _ = dns_transaction_id(&packet)?;
+    packet[..2].copy_from_slice(&id.to_be_bytes());
+    Ok(packet)
 }
 
 /// Query-level variant whose future can safely cross a Tokio task boundary.
@@ -460,7 +624,9 @@ impl<Q: AsyncDnsQuery> AsyncDnsHandler for AsyncDnsResolver<Q> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::{DnsResponse, decode_response, encode_query};
+    use crate::dns::{
+        AsyncDnsHandler, DnsResponse, decode_response, encode_query, encode_response,
+    };
     use crate::{Error, ErrorKind};
     use std::net::Ipv4Addr;
     use std::sync::{Arc, Mutex};
@@ -514,5 +680,59 @@ mod tests {
             assert_eq!(first, second);
             assert_eq!(*calls.lock().unwrap(), 1);
         });
+    }
+
+    #[tokio::test]
+    async fn system_query_preserves_non_address_records() {
+        struct PtrHandler;
+
+        impl AsyncDnsHandler for PtrHandler {
+            fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+                Box::pin(async move {
+                    encode_response(
+                        packet,
+                        &DnsResponse {
+                            addresses: IpSet::default(),
+                            ptr_names: vec![DomainName::new("ptr.example").unwrap()],
+                            service_bindings: Vec::new(),
+                            minimum_ttl: Some(30),
+                        },
+                    )
+                })
+            }
+        }
+
+        let server = crate::dns_udp_async::AsyncUdpDnsServer::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            PtrHandler,
+            4096,
+        )
+        .await
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let client = AsyncUdpDnsClient {
+            server: address,
+            timeout: std::time::Duration::from_secs(1),
+            max_packet_size: 4096,
+            local_bind_addresses: Arc::from(Vec::new().into_boxed_slice()),
+        };
+        let domain = DomainName::new("4.3.2.1.in-addr.arpa").unwrap();
+        let (server_result, response) = tokio::join!(
+            server.serve_once(),
+            query_system_server(&client, &domain, DnsRecordType::Ptr)
+        );
+        server_result.unwrap();
+        let response = response.unwrap();
+        assert_eq!(
+            response.ptr_names,
+            vec![DomainName::new("ptr.example").unwrap()]
+        );
+    }
+
+    #[test]
+    fn rewrite_dns_transaction_id_preserves_dns_payload() {
+        let packet = rewrite_dns_transaction_id(vec![0x00, 0x01, 0xaa, 0xbb], 0xcafe).unwrap();
+        assert_eq!(packet, vec![0xca, 0xfe, 0xaa, 0xbb]);
+        assert!(rewrite_dns_transaction_id(vec![0x00], 0xcafe).is_err());
     }
 }

@@ -365,7 +365,7 @@ version: build-debug
 	"$(DEBUG_BINARY_DIR)/$(RUNTIME_BIN)" version
 
 check:
-	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) check $(CARGO_EXEC_COMMON_ARGS) --workspace --all-features
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) check --locked $(CARGO_EXEC_COMMON_ARGS) --workspace --all-features
 
 workspace-tests:
 	./scripts/integration/workspace-tests.sh
@@ -379,7 +379,7 @@ fmt-check:
 	$(CARGO_FMT_CHECK_EXEC) fmt --all -- --check
 
 clippy:
-	$(CARGO_EXEC_BUILD_ENV) $(CARGO_CLIPPY_EXEC) clippy $(CARGO_EXEC_COMMON_ARGS) --workspace --all-targets --all-features -- -D warnings
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_CLIPPY_EXEC) clippy --locked $(CARGO_EXEC_COMMON_ARGS) --workspace --all-targets --all-features -- -D warnings
 
 android-aarch64:
 	@test "$(HOST_CARGO)" = 1 || { \

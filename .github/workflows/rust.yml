@@ -47,7 +47,7 @@ jobs:
         run: make release-windows-cross-smoke
 
       - name: Run Clippy
-        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+        run: make clippy
 
       - name: Run workspace tests in Podman
         run: make workspace-tests

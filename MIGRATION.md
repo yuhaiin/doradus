@@ -7,9 +7,19 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
+> 2026-08-14 system DNS typed-query parity：`SystemAsyncIpResolver` 不再让默认 trait
+> 实现把 PTR/HTTPS/SVCB 查询转换成 address-only 的 A/AAAA 查询。Unix/macOS 继续使用
+> 原始 UDP system resolver，以保留完整 DNS packet forwarding；Windows desktop 使用纯 Rust
+> Hickory `TokioResolver` 读取系统 DNS 配置并缓存 resolver，typed response 仍复用 core
+> DNS codec，packet path 会恢复原始 transaction ID。新增 transaction-id 边界单测和 PTR
+> loopback query，Linux focused test 3/3；`make release-windows-cross-smoke` 已实际编译
+> Windows cfg/依赖/运行时代码路径。Hickory 只挂在 Windows target dependency，不增加 Linux
+> 数据面的运行时依赖。
+
 > 2026-08-13 构建入口容器化：Makefile 的 `build`、`build-release`、`check`、`clippy` 及各类 smoke binary build 默认经由
-> `scripts/integration/podman-cargo.sh` 执行，宿主只负责调度，target/state/cache 位于
-> `~/.cache/yuhaiin-rust`。`make build MUSL=1` 会在容器内按需安装 musl Rust target、Debian
+> `scripts/integration/podman-cargo.sh` 执行，宿主只负责调度，target/state/Cargo registry cache 位于
+> `~/.cache/yuhaiin-rust` 的独立目录。默认允许 Cargo 在线补齐新锁定依赖，`check/clippy/workspace-tests`
+> 均使用 `--locked`；需要离线复用时可显式传入 `--env CARGO_NET_OFFLINE=true`。`make build MUSL=1` 会在容器内按需安装 musl Rust target、Debian
 > `musl-tools` 和 `rust-lld`，已通过 x86_64 static debug binary；只有显式 `HOST_CARGO=1` 才使用宿主 Cargo，Android
 > 仍需显式使用宿主 NDK 工具链。Podman 构建入口将 `TMPDIR` 固定在缓存挂载的 `/state/cache/tmp`，不使用宿主 `/tmp`。
 

@@ -8,6 +8,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 state_dir="${YUHAIIN_PODMAN_BUILD_STATE:-${cache_root}/integration/podman-build}"
+cargo_home="${YUHAIIN_CARGO_HOME:-${cache_root}/cargo-home}"
 image="${YUHAIIN_BUILD_IMAGE:-docker.io/library/rust:latest}"
 
 usage() {
@@ -68,14 +69,14 @@ while (($#)); do
 done
 
 (($# > 0)) || usage
-mkdir -p "${target_dir}" "${state_dir}"
+mkdir -p "${target_dir}" "${state_dir}" "${cargo_home}"
 
 podman run --rm --network=host \
   "${podman_env_args[@]}" \
   -v "${repo_root}:/workspace:ro" \
   -v "${target_dir}:/target:Z" \
   -v "${state_dir}:/state:Z" \
-  -v "${HOME}/.cargo:/cargo-home:ro" \
+  -v "${cargo_home}:/cargo-home:Z" \
   --entrypoint /bin/sh "${image}" \
   -ec '
     set -eu
@@ -88,7 +89,6 @@ podman run --rm --network=host \
     export CARGO_HOME=/cargo-home
     export CARGO_TARGET_DIR=/target
     export TMPDIR=/state/cache/tmp
-    export CARGO_NET_OFFLINE=true
     cd /workspace
     if [ "$install_musl_toolchain" = 1 ] && ! command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
       command -v apt-get >/dev/null 2>&1 || {
