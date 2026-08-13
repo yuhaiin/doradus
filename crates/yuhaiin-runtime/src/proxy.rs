@@ -2942,21 +2942,32 @@ impl rustls::server::ResolvesServerCert for StaticTlsTerminationResolver {
         &self,
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let name = client_hello
-            .server_name()?
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
-        if let Some(certificate) = self.named.get(&name) {
+        if let Some(certificate) =
+            tls_termination_match_name(client_hello.server_name(), &self.named)
+        {
             return Some(Arc::clone(certificate));
         }
-        let mut labels = name.split('.');
-        labels.next()?;
-        let wildcard = format!("*.{}", labels.collect::<Vec<_>>().join("."));
-        self.named
-            .get(&wildcard)
-            .cloned()
-            .or_else(|| self.default.first().cloned())
+        // Go's tls.Config.GetCertificate falls back to the first configured
+        // certificate when ClientHello has no SNI or does not match a named
+        // certificate. This is required for standalone termination and for
+        // clients that intentionally omit server_name.
+        self.default.first().cloned()
     }
+}
+
+#[cfg(feature = "doh-tls")]
+fn tls_termination_match_name<'a, T>(
+    server_name: Option<&str>,
+    named: &'a BTreeMap<String, T>,
+) -> Option<&'a T> {
+    let name = server_name?.trim_end_matches('.').to_ascii_lowercase();
+    if let Some(certificate) = named.get(&name) {
+        return Some(certificate);
+    }
+    let mut labels = name.split('.');
+    labels.next()?;
+    let wildcard = format!("*.{}", labels.collect::<Vec<_>>().join("."));
+    named.get(&wildcard)
 }
 
 #[cfg(test)]
@@ -3109,6 +3120,25 @@ mod tests {
             tls_termination_bytes(object, &["keyBase64"], &[], "key").unwrap(),
             [3, 4, 5]
         );
+    }
+
+    #[cfg(feature = "doh-tls")]
+    #[test]
+    fn tls_termination_selects_exact_then_single_label_wildcard_and_allows_default_fallback() {
+        let named = BTreeMap::from([
+            ("api.example.com".to_owned(), "exact"),
+            ("*.example.com".to_owned(), "wildcard"),
+        ]);
+        assert_eq!(
+            tls_termination_match_name(Some("API.EXAMPLE.COM."), &named),
+            Some(&"exact")
+        );
+        assert_eq!(
+            tls_termination_match_name(Some("cdn.example.com"), &named),
+            Some(&"wildcard")
+        );
+        assert!(tls_termination_match_name(Some("deep.cdn.example.com"), &named).is_none());
+        assert!(tls_termination_match_name(None, &named).is_none());
     }
 
     #[cfg(feature = "doh-tls")]

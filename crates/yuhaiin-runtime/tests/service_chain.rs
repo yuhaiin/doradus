@@ -22,8 +22,9 @@ use support::{
     configure_http_chain, configure_http_chain_with_transport, configure_network_split_http_chain,
     configure_socks5_chain, configure_tls_aead_h2_http_inbound, configure_tls_auto_http_inbound,
     configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound,
-    connect_loopback, connect_tls_h2_loopback, connect_tls_loopback, integration_dir,
-    seed_empty_database, tls_server_acceptor, tls_termination_certificate, wait_for_connection,
+    connect_loopback, connect_tls_h2_loopback, connect_tls_loopback,
+    connect_tls_loopback_without_sni, integration_dir, seed_empty_database, tls_server_acceptor,
+    tls_termination_certificate, wait_for_connection,
 };
 
 #[cfg(target_os = "linux")]
@@ -3405,15 +3406,21 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reverse_http_inbound_routes_through_http_termination_outbound() {
-    reverse_http_termination_service_chain(false).await;
+    reverse_http_termination_service_chain(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reverse_http_inbound_routes_through_tls_and_http_termination_outbound() {
-    reverse_http_termination_service_chain(true).await;
+    reverse_http_termination_service_chain(true, false).await;
 }
 
-async fn reverse_http_termination_service_chain(tls_termination: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reverse_http_inbound_routes_through_standalone_tls_termination_without_sni() {
+    reverse_http_termination_service_chain(true, true).await;
+}
+
+async fn reverse_http_termination_service_chain(tls_termination: bool, standalone_tls: bool) {
+    assert!(!standalone_tls || tls_termination);
     let reverse_http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let reverse_http_inbound = reverse_http_listener.local_addr().unwrap();
     drop(reverse_http_listener);
@@ -3446,10 +3453,13 @@ async fn reverse_http_termination_service_chain(tls_termination: bool) {
     seed_empty_database(&database).await;
     let service = ServiceProcess::start(&database).await;
 
-    let mut chain = vec![
-        json!({"type":"direct","direct":{}}),
-        json!({"type":"http_termination","http_termination":{"headers":{}}}),
-    ];
+    let mut chain = vec![json!({"type":"direct","direct":{}})];
+    if !standalone_tls {
+        chain.push(json!({
+            "type":"http_termination",
+            "http_termination":{"headers":{}}
+        }));
+    }
     if tls_termination {
         chain.push(json!({
             "type":"tls_termination",
@@ -3525,10 +3535,13 @@ async fn reverse_http_termination_service_chain(tls_termination: bool) {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let connections = if tls_termination {
-        let client = tokio::time::timeout(
-            Duration::from_secs(5),
-            connect_tls_loopback(reverse_http_inbound),
-        )
+        let client = tokio::time::timeout(Duration::from_secs(5), async {
+            if standalone_tls {
+                connect_tls_loopback_without_sni(reverse_http_inbound).await
+            } else {
+                connect_tls_loopback(reverse_http_inbound).await
+            }
+        })
         .await
         .unwrap_or_else(|_| {
             panic!(

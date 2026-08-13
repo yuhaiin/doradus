@@ -103,6 +103,14 @@ pub async fn connect_tls_loopback(address: SocketAddr) -> TlsStream<TcpStream> {
     connect_tls_loopback_with_alpn(address, &[]).await
 }
 
+/// Connect to an inbound TLS listener without sending SNI. Rustls omits the
+/// `server_name` extension for an IP literal, which exercises the same
+/// default-certificate path as clients that do not provide SNI at all.
+pub async fn connect_tls_loopback_without_sni(address: SocketAddr) -> TlsStream<TcpStream> {
+    connect_tls_loopback_with_server_name(address, ServerName::try_from("127.0.0.1").unwrap(), &[])
+        .await
+}
+
 /// Connect to an inbound TLS listener while advertising the given ALPN
 /// protocols. HTTP/2 inbound tests must negotiate `h2`; ordinary TLS/HTTP
 /// tests intentionally keep the list empty and exercise HTTP/1.1 fallback.
@@ -114,6 +122,19 @@ async fn connect_tls_loopback_with_alpn(
     address: SocketAddr,
     alpn_protocols: &[&[u8]],
 ) -> TlsStream<TcpStream> {
+    connect_tls_loopback_with_server_name(
+        address,
+        ServerName::try_from("localhost").unwrap(),
+        alpn_protocols,
+    )
+    .await
+}
+
+async fn connect_tls_loopback_with_server_name(
+    address: SocketAddr,
+    server_name: ServerName<'static>,
+    alpn_protocols: &[&[u8]],
+) -> TlsStream<TcpStream> {
     let provider = Arc::new(rustls_rustcrypto::provider());
     let mut config = ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
@@ -123,9 +144,8 @@ async fn connect_tls_loopback_with_alpn(
         .with_no_client_auth();
     config.alpn_protocols = alpn_protocols.iter().map(|value| value.to_vec()).collect();
     let connector = TlsConnector::from(Arc::new(config));
-    let server_name = ServerName::try_from("localhost").unwrap().to_owned();
     connector
-        .connect(server_name, connect_loopback(address).await)
+        .connect(server_name.to_owned(), connect_loopback(address).await)
         .await
         .unwrap()
 }

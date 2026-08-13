@@ -4827,9 +4827,11 @@ raw stream，后台完成 server handshake 后把解密流 relay 到 parent；�
 证书配置兼容 Go 的 `cert`/`key` JSON byte arrays、base64 字符串和
 `certFilePath`/`keyFilePath`，支持默认 certificates、`serverNameCertificate`（包含 Go
 的单标签 wildcard 规则）和 `nextProtos`/`next_protos`。新增 store/runtime 分支回归、
-2 个 Podman focused tests，以及真实 `reverse_http raw TLS → tls_termination →
-http_termination → HTTP target` 进程链 1/1。当前清单仍标为 `[~]`，因为还需要 Go 命名证书
-选择对照和 standalone/error 现场。
+TLS-specific resolver/parser/build focused tests 3/3，覆盖 exact、单标签 wildcard、大小写
+及末尾点归一化、无 SNI 默认回退和空证书 fail-fast；真实 `reverse_http raw TLS →
+tls_termination → http_termination → HTTP target` 与 standalone `reverse_http raw TLS →
+tls_termination → HTTP target` 进程链各 1/1。当前清单仍标为 `[~]`，因为还需要 Go live
+命名证书、standalone 和 error 对照。
 
 ## 191. 2026-08-13 http_termination contract point
 
@@ -4848,7 +4850,7 @@ streaming request/response body。`tls_terminated` marker 与 Go 的 context val
 运行不会按请求数无限积累 shutdown handle。Podman 验证结果：fmt、全 workspace Clippy、
 runtime focused 5/5、store focused 1/1、真实 reverse HTTP inbound → selector/router →
 `http_termination` → HTTP target 的 plain/raw-TLS 进程链 2/2、runtime
-`--no-default-features --lib` 和完整 `make service-chain-smoke` 27/27 均通过。新增 domain
+`--no-default-features --lib` 和完整 `make service-chain-smoke` 28/28 均通过。新增 domain
 Host → direct parent 回归，确认 HTTP termination 不要求调用方预先填充 resolved IP。reverse
 HTTP 的 55ms sniff 超时现在仍会依据已读 request line 保留 HTTP rewrite；TLS termination
 的后台 pipe 也避免了 handshake/relay deadlock。外层 reverse connection 是内存 duplex，
@@ -4861,7 +4863,7 @@ HTTP 的 55ms sniff 超时现在仍会依据已读 request line 保留 HTTP rewr
 runtime 进程测试：API 写入 `tls_auto` inbound、启动动态 SNI TLS listener，客户端以
 `localhost` SNI 完成握手，随后通过 HTTP protocol、router 和 direct outbound 到 loopback
 echo target，并检查 connections 的 inbound/outbound/protocol 元数据。Podman focused
-`tls_auto` 测试为 7/7，新增进程链为 1/1；完整 `make service-chain-smoke` 为 27/27。
+`tls_auto` 测试为 7/7，新增进程链为 1/1；完整 `make service-chain-smoke` 为 28/28。
 
 这只证明未启用 ECH 的普通 `tls_auto` 已进入真实 inbound → outbound 主路径；rustls 没有
 等价的 server-side ECH key API，因此 ECH、Go live 对照和更广的错误/ALPN 矩阵仍保持清单
