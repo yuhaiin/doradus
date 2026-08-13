@@ -53,6 +53,7 @@ done
 required_literals=(
   'fail-fast: false'
   'needs: checks'
+  'run: make release-windows-cross-smoke'
   'cargo build --locked --release --target'
   'matrix.target'
   '-p yuhaiin-runtime --bin yuhaiin --all-features'

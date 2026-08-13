@@ -43,6 +43,9 @@ jobs:
       - name: Check release artifact contract
         run: make release-contract-smoke
 
+      - name: Check Windows target dependencies in Podman
+        run: make release-windows-cross-smoke
+
       - name: Run Clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 

@@ -4655,3 +4655,11 @@ release-linux-cross-smoke` 完成了 Linux amd64 检查；此前的 aarch64 检�
 检查都通过，均复用 workflow 的 SHA 固定 musl-cross 工具链。这样 Linux 两个 release
 target 已有独立的容器源码/linker 证据，仍不把 Darwin/Windows 原生 runner 结果提前视为
 完成。
+
+## 180. 2026-08-13 Windows cross check 接入 CI checks
+
+`make release-windows-cross-smoke` 已接入 `.github/workflows/rust.yml` 的 `checks` job，
+位于格式和 release contract 检查之后、Clippy/workspace tests 之前；release contract
+脚本同时锁定 `run: make release-windows-cross-smoke`，避免后续只保留结构检查而丢掉
+Windows cfg/依赖门禁。该检查只负责 Linux 容器中的 GNU/MinGW 源码检查，正式的
+`x86_64/aarch64-pc-windows-msvc` 二进制仍由 Windows native matrix 生成。
