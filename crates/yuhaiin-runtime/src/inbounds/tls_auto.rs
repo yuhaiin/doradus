@@ -59,10 +59,14 @@ pub(crate) fn build(data_json: &[u8], transports: &[String]) -> Result<Option<Tl
 
     let ca_cert = binary_field(
         config,
-        &["ca_cert", "caCert"],
+        &["ca_cert", "caCert", "caCertBase64"],
         &["ca_cert_file", "caCertFile"],
     )?;
-    let ca_key = binary_field(config, &["ca_key", "caKey"], &["ca_key_file", "caKeyFile"])?;
+    let ca_key = binary_field(
+        config,
+        &["ca_key", "caKey", "caKeyBase64"],
+        &["ca_key_file", "caKeyFile"],
+    )?;
     let server_names = string_list(config, &["servernames", "serverNames", "server_names"])?;
     let next_protos = string_list_optional(config, &["next_protos", "nextProtos"])?;
     let authority = Arc::new(TlsAutoAuthority::parse(&ca_cert, &ca_key)?);
@@ -110,6 +114,48 @@ pub(crate) fn build(data_json: &[u8], transports: &[String]) -> Result<Option<Tl
     }
 
     Ok(Some(TlsAcceptor::from(Arc::new(server))))
+}
+
+/// Fill the generated TLS-auto CA fields at the same boundary as Go's
+/// `fillGeneratedContractFields`.  The generated values are written back to
+/// the contract before it is stored, so subsequent reloads keep issuing
+/// certificates from the same authority.
+pub(crate) fn fill_generated_fields(value: &mut serde_json::Value) -> Result<()> {
+    let Some(config) = transport_config_mut(value, "tls_auto") else {
+        return Ok(());
+    };
+
+    let ca_cert = optional_binary_field(
+        config,
+        &["ca_cert", "caCert", "caCertBase64"],
+        &["ca_cert_file", "caCertFile"],
+    )?;
+    let ca_key = optional_binary_field(
+        config,
+        &["ca_key", "caKey", "caKeyBase64"],
+        &["ca_key_file", "caKeyFile"],
+    )?;
+
+    if let (Some(ca_cert), Some(ca_key)) = (&ca_cert, &ca_key)
+        && !ca_cert.is_empty()
+        && !ca_key.is_empty()
+    {
+        TlsAutoAuthority::parse(ca_cert, ca_key).map_err(|error| {
+            Error::new(ErrorKind::Protocol, format!("parse ca failed: {error}"))
+        })?;
+        return Ok(());
+    }
+
+    let (ca_cert, ca_key) = generate_ca()?;
+    config.insert(
+        "caCertBase64".to_owned(),
+        serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(ca_cert)),
+    );
+    config.insert(
+        "caKeyBase64".to_owned(),
+        serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(ca_key)),
+    );
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -547,6 +593,51 @@ fn transport_config<'a>(
     candidate.as_object()
 }
 
+fn transport_config_mut<'a>(
+    value: &'a mut serde_json::Value,
+    kind: &str,
+) -> Option<&'a mut serde_json::Map<String, serde_json::Value>> {
+    let items = match value {
+        serde_json::Value::Object(object) => {
+            if object
+                .get("transport")
+                .and_then(serde_json::Value::as_array)
+                .is_some()
+            {
+                object
+                    .get_mut("transport")
+                    .and_then(serde_json::Value::as_array_mut)
+            } else {
+                object
+                    .get_mut("transports")
+                    .and_then(serde_json::Value::as_array_mut)
+            }
+        }
+        _ => None,
+    }?;
+    let item = items.iter_mut().find(|item| {
+        item.get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|configured| configured.eq_ignore_ascii_case(kind))
+            || item.get(kind).is_some()
+    })?;
+    let mut candidate = item;
+    for _ in 0..3 {
+        let next_key = if candidate.get(kind).is_some() {
+            Some(kind)
+        } else if candidate.get("config").is_some() {
+            Some("config")
+        } else {
+            None
+        };
+        let Some(next_key) = next_key else {
+            return candidate.as_object_mut();
+        };
+        candidate = candidate.get_mut(next_key)?;
+    }
+    candidate.as_object_mut()
+}
+
 fn string_list(
     config: &serde_json::Map<String, serde_json::Value>,
     fields: &[&str],
@@ -609,6 +700,33 @@ fn binary_field(
         "inbound TLS-auto requires {}",
         fields.join(" or ")
     )))
+}
+
+fn optional_binary_field(
+    config: &serde_json::Map<String, serde_json::Value>,
+    fields: &[&str],
+    file_fields: &[&str],
+) -> Result<Option<Vec<u8>>> {
+    if let Some(value) = fields.iter().find_map(|field| config.get(*field)) {
+        if value.is_null() {
+            return Ok(None);
+        }
+        return binary_value(value).map(Some);
+    }
+    if let Some(path) = file_fields.iter().find_map(|field| {
+        config
+            .get(*field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|path| !path.trim().is_empty())
+    }) {
+        return std::fs::read(path).map(Some).map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("read TLS-auto file {path:?}: {error}"),
+            )
+        });
+    }
+    Ok(None)
 }
 
 fn binary_value(value: &serde_json::Value) -> Result<Vec<u8>> {
@@ -677,6 +795,46 @@ fn pkcs8_key(bytes: &[u8]) -> Result<Vec<u8>> {
     } else {
         Ok(bytes.to_owned())
     }
+}
+
+fn generate_ca() -> Result<(Vec<u8>, Vec<u8>)> {
+    let signer = SigningKey::random(&mut OsRng);
+    let subject = Name::from_str("CN=yuhaiin TLS-auto CA").map_err(|error| {
+        Error::new(ErrorKind::Protocol, format!("TLS-auto CA subject: {error}"))
+    })?;
+    let builder = CertificateBuilder::new(
+        Profile::Root,
+        SerialNumber::from(1u64),
+        Validity::from_now(Duration::from_secs(100 * 365 * 24 * 60 * 60)).map_err(|error| {
+            Error::new(
+                ErrorKind::Protocol,
+                format!("TLS-auto CA validity: {error}"),
+            )
+        })?,
+        subject,
+        SubjectPublicKeyInfoOwned::from_key(PublicKey::from(signer.verifying_key())).map_err(
+            |error| {
+                Error::new(
+                    ErrorKind::Protocol,
+                    format!("TLS-auto CA public key: {error}"),
+                )
+            },
+        )?,
+        &signer,
+    )
+    .map_err(|error| Error::new(ErrorKind::Protocol, format!("TLS-auto CA: {error}")))?;
+    let certificate = builder
+        .build_with_rng::<DerSignature>(&mut OsRng)
+        .map_err(|error| Error::new(ErrorKind::Protocol, format!("TLS-auto CA signing: {error}")))?
+        .to_der()
+        .map_err(|error| Error::new(ErrorKind::Protocol, format!("TLS-auto CA DER: {error}")))?;
+    let key = SecretKey::from(&signer).to_pkcs8_der().map_err(|error| {
+        Error::new(
+            ErrorKind::Protocol,
+            format!("TLS-auto CA private key: {error}"),
+        )
+    })?;
+    Ok((certificate, key.as_bytes().to_vec()))
 }
 
 #[cfg(test)]
@@ -820,6 +978,80 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("do not match"));
+    }
+
+    #[test]
+    fn fills_missing_go_ca_fields_and_keeps_them_stable() {
+        let mut value = serde_json::json!({
+            "transports": [{
+                "type": "tls_auto",
+                "tls_auto": {
+                    "serverNames": ["localhost"],
+                    "nextProtos": []
+                }
+            }]
+        });
+        fill_generated_fields(&mut value).unwrap();
+
+        let first = value.clone();
+        let tls_auto = &value["transports"][0]["tls_auto"];
+        assert!(tls_auto["caCertBase64"].as_str().is_some());
+        assert!(tls_auto["caKeyBase64"].as_str().is_some());
+        assert!(
+            build(
+                &serde_json::to_vec(&value).unwrap(),
+                &["tls_auto".to_owned()]
+            )
+            .unwrap()
+            .is_some()
+        );
+
+        fill_generated_fields(&mut value).unwrap();
+        assert_eq!(value, first);
+    }
+
+    #[test]
+    fn replaces_a_partial_go_ca_instead_of_persisting_a_half_pair() {
+        let (ca_cert, _) = test_ca();
+        let mut value = serde_json::json!({
+            "transport": [{
+                "type": "tls_auto",
+                "tls_auto": {
+                    "serverNames": ["localhost"],
+                    "caCertBase64": base64::engine::general_purpose::STANDARD.encode(ca_cert)
+                }
+            }]
+        });
+        fill_generated_fields(&mut value).unwrap();
+        let tls_auto = &value["transport"][0]["tls_auto"];
+        assert!(tls_auto["caCertBase64"].as_str().is_some());
+        assert!(tls_auto["caKeyBase64"].as_str().is_some());
+        assert!(
+            build(
+                &serde_json::to_vec(&value).unwrap(),
+                &["tls_auto".to_owned()]
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn rejects_two_present_but_mismatched_go_ca_fields() {
+        let (ca_cert, _) = test_ca();
+        let (_, different_key) = test_ca();
+        let mut value = serde_json::json!({
+            "transport": [{
+                "type": "tls_auto",
+                "tls_auto": {
+                    "serverNames": ["localhost"],
+                    "caCertBase64": base64::engine::general_purpose::STANDARD.encode(ca_cert),
+                    "caKeyBase64": base64::engine::general_purpose::STANDARD.encode(different_key)
+                }
+            }]
+        });
+        let error = fill_generated_fields(&mut value).unwrap_err();
+        assert!(error.to_string().contains("parse ca failed"));
     }
 
     #[test]

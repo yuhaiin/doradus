@@ -4933,3 +4933,33 @@ unit 或假 target 代替 Go live 对照。
 
 这次补齐 standalone 和 upstream error live 证据，但不把剩余边界误报为完成：命名证书
 选择和 HTTPS upstream 的 Go/Rust live 矩阵仍在 checklist 的 `[~]`。
+
+## 197. 2026-08-14 tls_auto generated CA persistence
+
+Go 的 `ContractStore.Save` 会在保存 inbound 前执行 `fillGeneratedContractFields`：`tls_auto`
+的 CA cert/key 同时存在时校验二者匹配，缺任一项时重新生成 CA，并把结果通过 Go JSON
+canonical 字段 `caCertBase64`/`caKeyBase64` 持久化。Rust 之前只在 listener build 阶段要求
+调用方提供 CA，且只识别旧的 snake/camel 短字段，因此“只提交 serverNames 的 tls_auto
+配置”会在 API 保存后启动失败。
+
+本轮在 API → inbound store 边界加入同等 normalization：缺失或半套字段时使用 RustCrypto
+P-256 生成 100 年 CA，写回 canonical base64 字段；两个字段都存在时校验证书/PKCS#8 私钥
+匹配，错误配对 fail-closed；listener 同时识别 Go 的 `caCertBase64`/`caKeyBase64`，所以
+reload 使用的就是已持久化 CA，不会每次启动换根。10 个 Podman focused unit tests 覆盖
+缺失、半套、稳定重复保存、错误配对、动态 SNI 和 Go 生成的 ECDSA/Ed25519/RSA CA；现有
+真实 `tls_auto → HTTP → router → direct` 进程链仍为 1/1。rustls server-side ECH 仍是单独
+缺口，保持 checklist 的 `[~]`。
+
+## 198. 2026-08-14 Windows GNU cross dependency cache
+
+GitHub Actions 的 Windows dependency gate 在 Podman 中使用 Rust image、MinGW 和
+`x86_64-pc-windows-gnu`。原脚本把宿主 `~/.cargo` 只读挂载并强制 `CARGO_NET_OFFLINE=true`；
+当 Rust cache 没有新锁定依赖的 sparse-index/archive 时，Cargo 会在真正编译前报
+`no matching package named bytes found`。这不是 Windows cfg 或 `libsqlite3-sys` 的源码
+失败。
+
+脚本现在默认使用 `~/.cache/yuhaiin-rust/release-windows-cargo-home` 可写缓存，保留
+`cargo check --locked`，允许容器在线补齐锁定依赖并把失败日志写入同一 cache state；不使用
+`/tmp`。Podman `make release-windows-cross-smoke` 已通过 `yuhaiin-runtime --bin yuhaiin
+--all-features` 的 `x86_64-pc-windows-gnu` check；这仍只验证 Linux 下的 GNU cfg/依赖边界，
+不替代 Windows runner 上的 MSVC、Windows SDK 和 ARM64 原生 release。

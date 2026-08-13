@@ -2024,6 +2024,8 @@ async fn get_inbound_value(state: &ApiState, id: String) -> ApiResult {
 }
 
 async fn save_inbound_value(state: &ApiState, value: Value, _index: Option<usize>) -> ApiResult {
+    let mut value = value;
+    crate::inbound::fill_generated_fields(&mut value)?;
     let id = required_string(&value, "id")?;
     let record = GoInboundRecord {
         id: id.clone(),

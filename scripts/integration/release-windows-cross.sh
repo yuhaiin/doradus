@@ -4,10 +4,16 @@ set -euo pipefail
 # This is a source/cfg check for Windows from Linux.  The release workflow
 # still builds MSVC artifacts on native Windows runners; GNU is used here
 # because a Linux container can provide a reproducible MinGW linker.
+#
+# The cross check must be able to bootstrap a newly added locked dependency.
+# GitHub's Rust cache is not guaranteed to contain the sparse-index entry and
+# crate archive for every workspace feature, so this job deliberately uses a
+# writable Cargo cache and lets `--locked` enforce dependency reproducibility.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 scenario_dir="${YUHAIIN_RELEASE_WINDOWS_DIR:-${cache_root}/integration/release-windows-cross}"
 target_dir="${YUHAIIN_RELEASE_WINDOWS_TARGET_DIR:-${cache_root}/release-windows-target}"
+cargo_home="${YUHAIIN_RELEASE_WINDOWS_CARGO_HOME:-${cache_root}/release-windows-cargo-home}"
 target="${YUHAIIN_RELEASE_WINDOWS_TARGET:-x86_64-pc-windows-gnu}"
 
 case "${target}" in
@@ -22,13 +28,13 @@ case "${target}" in
     ;;
 esac
 
-mkdir -p "${scenario_dir}" "${target_dir}"
+mkdir -p "${scenario_dir}" "${target_dir}" "${cargo_home}"
 
 podman run --rm --network=host \
   -v "${repo_root}:/workspace:ro" \
   -v "${scenario_dir}:/state:Z" \
   -v "${target_dir}:/target:Z" \
-  -v "${HOME}/.cargo:/cargo-home:ro" \
+  -v "${cargo_home}:/cargo-home:Z" \
   docker.io/library/rust:latest sh -ec '
     set -eu
     target="$1"
@@ -44,12 +50,16 @@ podman run --rm --network=host \
     DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends "$mingw_package" \
       >/state/apt-install.log
     rustup target add "$target"
-    export CARGO_NET_OFFLINE=true
     target_env=$(printf "%s" "$target" | tr "[:lower:]-" "[:upper:]_")
     eval "export CARGO_TARGET_${target_env}_LINKER=$linker"
     eval "export CC_${target_env}=$linker"
     cd /workspace
-    cargo check --locked --target "$target" -p yuhaiin-runtime --bin yuhaiin --all-features
+    cargo check --locked --target "$target" -p yuhaiin-runtime --bin yuhaiin --all-features \
+      >/state/cargo-check.log 2>&1 || {
+        echo "[release-windows-cross] cargo check failed; see /state/cargo-check.log" >&2
+        cat /state/cargo-check.log >&2
+        exit 1
+      }
   ' -- "${target}" "${mingw_package}" "${linker}"
 
 echo "[release-windows-cross] passed; target=${target} state=${scenario_dir}"

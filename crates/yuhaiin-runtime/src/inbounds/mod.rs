@@ -53,6 +53,22 @@ fn has_transport(transports: &[String], kind: &str) -> bool {
         .any(|transport| transport.eq_ignore_ascii_case(kind))
 }
 
+/// Normalize generated fields that Go fills before persisting an inbound
+/// contract.  Keeping this at the API/storage boundary means a reload sees
+/// the same bytes that the listener used, instead of generating a new CA on
+/// every process start.
+pub(crate) fn fill_generated_fields(value: &mut serde_json::Value) -> Result<()> {
+    #[cfg(feature = "doh-tls")]
+    {
+        tls_auto::fill_generated_fields(value)
+    }
+    #[cfg(not(feature = "doh-tls"))]
+    {
+        let _ = value;
+        Ok(())
+    }
+}
+
 /// Return whether the listener supervisor can apply the Go inbound transport
 /// contract without adding another wire layer.
 ///
