@@ -20,7 +20,7 @@ cp --reflink=auto "${source_db}" "${scenario_dir}/input-state.db"
 echo "[legacy-v1-runtime] building ignored test binary in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
-  cargo test \
+  cargo test --locked \
   -p yuhaiin-runtime \
   --all-features \
   --test legacy_v1_runtime \

@@ -11,7 +11,7 @@ mkdir -p "${cache_dir}"
 echo "[socks5-protocol] building protocol unit-test binary in Podman"
 "${repo_dir}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${cache_dir}" -- \
-  cargo test \
+  cargo test --locked \
   -p yuhaiin-protocol \
   --all-features \
   --lib \

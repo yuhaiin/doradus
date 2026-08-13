@@ -14,7 +14,7 @@ mkdir -p "${state_dir}"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" \
   --state-dir "${state_dir}" \
-  -- cargo test -p yuhaiin-runtime --all-features --test service_chain \
+  -- cargo test --locked -p yuhaiin-runtime --all-features --test service_chain \
     http_inbound_forwards_absolute_https_request -- --ignored --nocapture
 
 echo "[http-inbound-https] passed; logs=${state_dir}"

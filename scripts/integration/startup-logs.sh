@@ -12,7 +12,7 @@ mkdir -p "${scenario_dir}"
 echo "[startup-logs] building runtime in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
-  cargo build \
+  cargo build --locked \
   -p yuhaiin-runtime \
   --all-features \
   --bin yuhaiin \

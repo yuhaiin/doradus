@@ -25,7 +25,7 @@ mkdir -p "${scenario_dir}/go-tmp"
 echo "[go-protocol-interop] compiling Rust harnesses in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
-  env CARGO_TERM_COLOR=never cargo test \
+  env CARGO_TERM_COLOR=never cargo test --locked \
   -p yuhaiin-chain \
   --test go_yuubinsya_interop \
   --test go_websocket_interop \
@@ -35,7 +35,7 @@ echo "[go-protocol-interop] compiling Rust harnesses in Podman"
 
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
-  env CARGO_TERM_COLOR=never cargo test \
+  env CARGO_TERM_COLOR=never cargo test --locked \
   -p yuhaiin-protocol \
   --all-features \
   --test go_vless_interop \

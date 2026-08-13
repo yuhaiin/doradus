@@ -46,7 +46,7 @@ trap cleanup EXIT INT TERM
 if [[ "${YUHAIIN_SKIP_BUILD:-0}" != 1 ]]; then
   "${repo_dir}/scripts/integration/podman-cargo.sh" \
     --target-dir "${target_dir}" --state-dir "${cache_dir}" -- \
-    cargo build -p yuhaiin-core --bin tun-smoke \
+    cargo build --locked -p yuhaiin-core --bin tun-smoke \
     --features tun-routes >"${cache_dir}/build.log" 2>&1
 fi
 test -x "${binary}"

@@ -12,7 +12,7 @@ mkdir -p "${scenario_dir}"
 echo "[dns-source-bind] building core test binary in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
-  cargo test \
+  cargo test --locked \
   -p yuhaiin-core \
   --all-features \
   --lib \

@@ -29,7 +29,7 @@ fi
 echo "[maxmind] compiling the fixture harness in Podman"
 "${repo_dir}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
-  cargo test \
+  cargo test --locked \
   -p yuhaiin-geo \
   --all-targets \
   --no-run \

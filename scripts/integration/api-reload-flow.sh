@@ -12,14 +12,14 @@ mkdir -p "${scenario_dir}"
 echo "[api-reload-flow] building runtime and process test in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
-  cargo build \
+  cargo build --locked \
   -p yuhaiin-runtime \
   --all-features \
   --bin yuhaiin \
   >"${scenario_dir}/runtime-build.log"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
-  cargo test \
+  cargo test --locked \
   -p yuhaiin-runtime \
   --all-features \
   --test api_reload_flow \

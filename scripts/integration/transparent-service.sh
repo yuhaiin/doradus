@@ -75,7 +75,7 @@ rm -f "${runtime_log}" "${client_log}" "${udp_client_log}" "${ipv6_client_log}" 
 if [[ "${YUHAIIN_SKIP_BUILD:-0}" != "1" ]]; then
   "${repo_dir}/scripts/integration/podman-cargo.sh" \
     --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
-    cargo build \
+    cargo build --locked \
     -p yuhaiin-runtime \
     --bin transparent-service-smoke \
     --all-features \

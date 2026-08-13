@@ -79,7 +79,7 @@ echo "[go-live-flow-parity] building Go and Rust services in Podman"
   env GOEXPERIMENT=jsonv2,greenteagc go build -o /state/yuhaiin-go ./cmd/yuhaiin
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${run_dir}" -- \
-  cargo build \
+  cargo build --locked \
   -p yuhaiin-runtime \
   --all-features \
   --bin yuhaiin \

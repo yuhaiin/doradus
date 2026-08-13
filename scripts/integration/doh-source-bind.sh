@@ -12,7 +12,7 @@ mkdir -p "${scenario_dir}"
 echo "[doh-source-bind] building runtime DoH/DoT test binary in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
-  cargo test \
+  cargo test --locked \
   -p yuhaiin-runtime \
   --all-features \
   --test doh_tls \

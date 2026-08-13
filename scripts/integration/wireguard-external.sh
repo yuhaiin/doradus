@@ -27,7 +27,7 @@ config_path="$(realpath "${config_path}")"
 echo "[wireguard-external] compiling the opt-in harness in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
-  cargo test \
+  cargo test --locked \
   -p yuhaiin-wireguard \
   --test external \
   --no-run \

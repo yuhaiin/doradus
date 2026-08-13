@@ -16,7 +16,7 @@ mkdir -p "${integration_dir}"
 echo "[wireguard] compiling the harness in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${integration_dir}" -- \
-  cargo test \
+  cargo test --locked \
   -p yuhaiin-wireguard \
   --all-targets \
   --no-run \
