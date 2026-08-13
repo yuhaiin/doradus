@@ -4707,3 +4707,20 @@ UDP payload（65507 字节）全部通过；结果位于
 
 这补充了 Debian rootful、Alpine 和 Ubuntu 三种用户态证据，但仍不宣称覆盖所有发行版的
 kernel、宿主防火墙和 route takeover 差异；这些继续保留在 TUN/platform `[~]` 项中。
+
+## 184. 2026-08-13 HTTP/TUN/WireGuard benchmark 复测
+
+在 Podman 中重跑三类 release benchmark，结果如下：
+
+| 场景 | 数据量 | 吞吐 | peak RSS | CPU ticks |
+| --- | ---: | ---: | ---: | ---: |
+| HTTP inbound → HTTP CONNECT outbound | 64 MiB | 138.24 MiB/s | 11,876 KiB | 39 |
+| HTTP inbound → TLS → HTTP/2 → Yuubinsya outbound | 64 MiB | 37.04 MiB/s | 20,276 KiB | 133 |
+| TUN inbound → fixed → loopback echo | 64 MiB | 49.39 MiB/s | 13,132 KiB | 239 |
+| BoringTun userspace packet | 64 MiB | 584.26 MiB/s | 3,540 KiB | — |
+
+四项均通过。HTTP/TLS/H2/Yuubinsya 与 BoringTun benchmark 使用 release harness；TUN 使用
+真实 `tun-rs + smoltcp` disposable user/network namespace。TUN 默认 4 MiB 短流连续两次为
+30.19/30.26 MiB/s，说明短流包含明显的启动/调度固定开销；因此表中使用 64 MiB 长流作为
+主基线。原始结果和日志位于 `~/.cache/yuhaiin-rust/benchmarks/`，这些数字只作为同一主机
+的回归趋势，不能替代跨机器性能承诺或真实公网 WARP 测量。
