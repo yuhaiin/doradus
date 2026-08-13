@@ -4695,3 +4695,15 @@ Darwin/Windows 原生 runner、真实 launchd/SCM 权限和外部 WARP peer 验�
 `~/.cache/yuhaiin-rust/integration-reusable/`，本轮未使用宿主机 Cargo/test，也没有使用
 `/tmp`。剩余 `[~]` 仍是 ECH API、真实 AWS/WARP、原生 Darwin/Windows runner/权限及更长
 生产样本等外部边界，不能用这组 Linux Podman 回归冒充完成。
+
+## 183. 2026-08-13 TUN Ubuntu 用户态发行版回归
+
+使用同一个 `x86_64-unknown-linux-musl` 静态 `tun-service-smoke`，将
+`YUHAIIN_TUN_DISTRO_IMAGE` 切换为 `docker.io/library/ubuntu:24.04`，在 Podman disposable
+user/network namespace 中重新执行 `make tun-distro-smoke`。reload/disable/enable、无路由
+窗口、32 字节 packet traffic、关闭，以及 MTU 576/1280/1500/9000/9216 的最大合法 IPv4
+UDP payload（65507 字节）全部通过；结果位于
+`~/.cache/yuhaiin-rust/integration/tun-distro-ubuntu/`。
+
+这补充了 Debian rootful、Alpine 和 Ubuntu 三种用户态证据，但仍不宣称覆盖所有发行版的
+kernel、宿主防火墙和 route takeover 差异；这些继续保留在 TUN/platform `[~]` 项中。

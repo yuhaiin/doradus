@@ -176,7 +176,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` rootful TUN connection metadata 已在 rootful fixture 中逐字段固定 endpoint/localAddr、selected node、process、PID 和 UID；本轮现场为 `/usr/local/bin/tun-service-smoke`、pid `7`、uid `0`。
 - `[x]` `make tun-api-process-smoke` 的编译和运行均在 Podman 中完成；disposable user/network namespace 验证默认 TUN、新增 TUN 和两个同时 enabled 的 TUN，rootful namespace 又验证了真实设备创建/销毁和 API 开关（本轮 rootless/rootful 各 1/1）。共享脚本的 rootful entrypoint 已改为使用调用者实际挂载的 harness，避免 API smoke 错误调用未挂载的 `tun-service-smoke`；rootful TUN → TLS/H2/Yuubinsya chain 也通过。
 - `[x]` 2026-08-13 在 Podman 重跑 `make tun-api-process-smoke`：真实前台二进制的 `foreground_binary_api_toggle_changes_real_tun_device` 为 `1 passed, 0 failed`；再次确认 API disable/enable 会唤醒 inbound owner，真实 TUN 设备会在 `/proc/net/dev` 出现/消失，两个 enabled 设备可独立关闭。
-- `[x]` TUN 集成脚本的主服务和 MTU 矩阵现在支持 `YUHAIIN_TEST_IMAGE` 覆盖容器发行版；`make tun-distro-smoke` 会在 Podman 编译 `x86_64-unknown-linux-musl` 静态 PIE，并在 Alpine 中完成 reload、无路由窗口、真实 packet traffic 和 close 回归，以及 576/1280/1500/9000/9216 五档 MTU 回环 65507 字节 UDP，证明 harness 不依赖 Debian 用户态。更广泛宿主 firewall/发行版 kernel 组合仍保留为 `[~]`。
+- `[x]` TUN 集成脚本的主服务和 MTU 矩阵现在支持 `YUHAIIN_TEST_IMAGE` 覆盖容器发行版；`make tun-distro-smoke` 已在 Alpine 和 Ubuntu 24.04 的 Podman 用户/network namespace 中完成 reload、无路由窗口、真实 packet traffic、close，以及 576/1280/1500/9000/9216 五档 MTU 回环 65507 字节 UDP，证明 harness 不依赖 Debian/Alpine 单一用户态。更广泛宿主 firewall/发行版 kernel 组合仍保留为 `[~]`。
 
 ### Go 生产兼容和统计
 
