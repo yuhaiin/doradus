@@ -5018,6 +5018,17 @@ inbound absolute-form HTTPS 的 Go 错误语义和更多外网/error 矩阵仍�
 `make tun-api-process-smoke` 通过真实前台 API 的单/双 TUN disable-enable。
 
 当前宿主没有 rootful Podman，`make tun-route-matrix-smoke` 按设计返回 77 并明确跳过，不能
-把这次结果误写成 rootful route/firewall 通过；该项继续使用 Debian VM/具备
-`CAP_NET_ADMIN` 的 runner 现场证据。所有日志和构建状态仍位于
-`~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+把本机结果误写成 rootful route/firewall 通过；rootful 现场由下一节的 Debian VM 复验。所有
+日志和构建状态仍位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
+## 203. 2026-08-14 Debian VM rootful TUN route lease parity
+
+使用用户提供的 Debian VM `192.168.122.2`（root、Podman 5.8.3、`rootless=false`、
+`/dev/net/tun` 可用）执行当前 `tun-route-matrix.sh`。构建仍在本地 Podman 完成，只把
+`tun-smoke` 二进制和当前 harness 放入 VM 的 `~/.cache/yuhaiin-rust/rootful-tun`，没有把
+整个 target 或 workspace 复制过去。
+
+VM 现场观察到 3 条路由在 TUN owner 存活期间存在：`198.18.0.0/15`、`192.0.2.0/24`、
+`203.0.113.0/24 metric 42424`；owner graceful exit 后路由消失，owner `SIGKILL` 后也
+消失。最终为 `tun-route-matrix-passed routes=3 graceful=1 sigkill=1`，补齐了 TUN
+inbound 的 rootful route lease/异常退出证据；本机 rootless skip 不再被记录为通过。
