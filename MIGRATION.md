@@ -5119,3 +5119,9 @@ target 验证 path、Host、`Connection` 和动态 `X-Remove` 都符合预期，
 `make service-chain-smoke` 重跑结果为 29/29，另有 1 项既有 ignored case。Go/Rust 更广泛的
 HTTPS、私有 CA、异常响应和生产浏览器矩阵继续保持 checklist 的 `[~]`，没有因此虚增总体
 91.5% 覆盖率。
+
+随后又补齐了请求体存在时的 `Expect: 100-continue` 边界：代理先向客户端发送本地
+`100 Continue`，避免客户端等待 body 时与上游形成死锁；转发给上游的 request 会移除
+`Expect`，而上游返回的 `103 Early Hints` 等其他 informational response 会在最终响应前
+按同样的 hop-by-hop 清理规则转发。该场景的 runtime focused tests 为 21/21，真实 Podman
+请求/响应链为 1/1；完整 `make service-chain-smoke` 为 30/30，另有 1 项既有 ignored case。

@@ -2709,6 +2709,69 @@ async fn http_inbound_reuses_client_connection_for_multiple_forward_requests() {
     target_task.await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_inbound_handles_expect_continue_and_upstream_informational_response() {
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = target_listener.local_addr().unwrap();
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target_listener.accept().await.unwrap();
+        let request = read_http_headers(&mut stream).await;
+        let request = String::from_utf8_lossy(&request);
+        assert!(request.starts_with("POST /upload HTTP/1.1\r\n"));
+        assert!(request.contains(&format!("Host: 127.0.0.1:{}\r\n", target.port())));
+        assert!(request.contains("Content-Length: 11\r\n"));
+        assert!(!request.contains("Expect:"));
+
+        let mut body = [0u8; 11];
+        stream.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"hello world");
+        stream
+            .write_all(b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n")
+            .await
+            .unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+
+    let inbound = support::reserve_loopback().await;
+    let root = integration_dir("service-http-expect-continue");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_direct_http_inbound(&service, inbound).await;
+
+    let mut client = connect_loopback(inbound).await;
+    client
+        .write_all(
+            format!(
+                "POST http://127.0.0.1:{}/upload HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nExpect: 100-continue\r\nContent-Length: 11\r\nConnection: close\r\n\r\n",
+                target.port(),
+                target.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response = read_http_headers(&mut client).await;
+    assert!(response.starts_with(b"HTTP/1.1 100 Continue\r\n"));
+    client.write_all(b"hello world").await.unwrap();
+
+    let response = read_http_headers(&mut client).await;
+    assert!(response.starts_with(b"HTTP/1.1 103 Early Hints\r\n"));
+    let response = read_http_headers(&mut client).await;
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    let mut body = [0u8; 2];
+    client.read_exact(&mut body).await.unwrap();
+    assert_eq!(&body, b"ok");
+
+    client.shutdown().await.unwrap();
+    service.shutdown().await;
+    target_task.await.unwrap();
+}
+
 /// Go's httputil.ReverseProxy also accepts absolute-form HTTPS requests on an
 /// HTTP proxy inbound. Keep this opt-in because it reaches a public endpoint,
 /// but exercise the complete path when requested: HTTP inbound -> selected

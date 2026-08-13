@@ -156,24 +156,51 @@ where
             &origin_target,
             &headers,
             matches!(request_body, BodyFraming::Chunked),
+            request_expects_continue(&headers) && !matches!(request_body, BodyFraming::None),
         )?;
         outbound
             .write_all(request.as_bytes())
             .await
             .map_err(io_error)?;
         monitor.bytes(flow, TunFlowDirection::Upload, request.len());
+        if request_expects_continue(&headers) && !matches!(request_body, BodyFraming::None) {
+            stream
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .await
+                .map_err(io_error)?;
+            monitor.bytes(flow, TunFlowDirection::Download, 25);
+        }
         let uploaded = relay_http_body(&mut stream, &mut outbound, request_body)
             .await
             .map_err(io_error)?;
         monitor.bytes(flow, TunFlowDirection::Upload, uploaded);
 
-        let Some(response_headers) = read_headers(&mut outbound).await? else {
-            return Err(Error::new(
-                ErrorKind::Protocol,
-                "HTTP proxy upstream closed before response headers",
-            ));
+        let (response_headers, response_body) = loop {
+            let Some(response_headers) = read_headers(&mut outbound).await? else {
+                return Err(Error::new(
+                    ErrorKind::Protocol,
+                    "HTTP proxy upstream closed before response headers",
+                ));
+            };
+            let status = response_status(&response_headers)?;
+            if status == 101 {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "HTTP proxy upstream upgrade responses are unsupported",
+                ));
+            }
+            let response_body = response_body_framing(method, &response_headers)?;
+            if (100..200).contains(&status) {
+                let response = rewrite_forward_response(&response_headers, BodyFraming::None)?;
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .map_err(io_error)?;
+                monitor.bytes(flow, TunFlowDirection::Download, response.len());
+                continue;
+            }
+            break (response_headers, response_body);
         };
-        let response_body = response_body_framing(method, &response_headers)?;
         let response_close = response_wants_close(&response_headers)
             || matches!(response_body, BodyFraming::CloseDelimited);
         let response = rewrite_forward_response(&response_headers, response_body)?;
@@ -298,8 +325,8 @@ fn body_framing(headers: &str) -> Result<BodyFraming> {
     Ok(BodyFraming::ContentLength(length))
 }
 
-fn response_body_framing(method: &str, headers: &str) -> Result<BodyFraming> {
-    let status = headers
+fn response_status(headers: &str) -> Result<u16> {
+    headers
         .split_once("\r\n")
         .and_then(|(line, _)| line.split_whitespace().nth(1))
         .ok_or_else(|| {
@@ -309,7 +336,11 @@ fn response_body_framing(method: &str, headers: &str) -> Result<BodyFraming> {
             )
         })?
         .parse::<u16>()
-        .map_err(|error| Error::new(ErrorKind::Protocol, format!("HTTP status: {error}")))?;
+        .map_err(|error| Error::new(ErrorKind::Protocol, format!("HTTP status: {error}")))
+}
+
+fn response_body_framing(method: &str, headers: &str) -> Result<BodyFraming> {
+    let status = response_status(headers)?;
     if method.eq_ignore_ascii_case("HEAD")
         || (100..200).contains(&status)
         || matches!(status, 204 | 304)
@@ -337,6 +368,10 @@ fn response_wants_close(headers: &str) -> bool {
         || headers
             .split_once("\r\n")
             .is_some_and(|(line, _)| line.split_whitespace().next() == Some("HTTP/1.0"))
+}
+
+fn request_expects_continue(headers: &str) -> bool {
+    header_value_contains_token_list(headers, "expect", "100-continue")
 }
 
 fn header_value_contains_token_list(headers: &str, name: &str, wanted: &str) -> bool {
@@ -575,7 +610,7 @@ fn parse_forward_target(target: &str, headers: &str) -> Result<(Endpoint, String
 
 #[cfg(test)]
 fn rewrite_forward_request(method: &str, target: &str, headers: &str) -> Result<String> {
-    rewrite_forward_request_with_options(method, target, headers, false)
+    rewrite_forward_request_with_options(method, target, headers, false, false)
 }
 
 fn rewrite_forward_request_with_options(
@@ -583,6 +618,7 @@ fn rewrite_forward_request_with_options(
     target: &str,
     headers: &str,
     preserve_chunked: bool,
+    strip_expect: bool,
 ) -> Result<String> {
     let version = headers
         .split_once("\r\n")
@@ -603,6 +639,9 @@ fn rewrite_forward_request_with_options(
             return Err(Error::new(ErrorKind::Protocol, "HTTP header name is empty"));
         }
         let lower_name = name.to_ascii_lowercase();
+        if strip_expect && lower_name == "expect" {
+            continue;
+        }
         if lower_name == "te" {
             te_trailers |= header_value_contains_token(value, "trailers");
         }
@@ -851,6 +890,28 @@ mod tests {
             line.split_once(':')
                 .is_some_and(|(name, _)| name.eq_ignore_ascii_case("te"))
         }));
+    }
+
+    #[test]
+    fn expect_continue_is_detected_and_not_forwarded_upstream() {
+        let headers = "POST http://example.com/upload HTTP/1.1\r\nHost: example.com\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n";
+        assert!(request_expects_continue(headers));
+        let rewritten =
+            rewrite_forward_request_with_options("POST", "/upload", headers, false, true).unwrap();
+        assert!(!rewritten.contains("Expect:"));
+        assert!(rewritten.contains("Content-Length: 4\r\n"));
+    }
+
+    #[test]
+    fn response_status_accepts_informational_responses() {
+        assert_eq!(
+            response_status("HTTP/1.1 103 Early Hints\r\nLink: </style.css>\r\n\r\n"),
+            Ok(103)
+        );
+        assert_eq!(
+            response_status("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
+            Ok(200)
+        );
     }
 
     #[test]
