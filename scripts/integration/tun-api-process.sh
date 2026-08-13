@@ -4,11 +4,12 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
+cargo_home="${YUHAIIN_CARGO_HOME:-${cache_root}/cargo-home}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/tun-api-process}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 build_image="${YUHAIIN_BUILD_IMAGE:-docker.io/library/rust:latest}"
 
-mkdir -p "${scenario_dir}"
+mkdir -p "${scenario_dir}" "${cargo_home}"
 if [[ ! -c /dev/net/tun ]]; then
   echo "[tun-api-process] /dev/net/tun is unavailable; skip with exit 77" >&2
   exit 77
@@ -22,7 +23,7 @@ podman run --rm --network=host \
   -v "${repo_dir}:/workspace:ro" \
   -v "${target_dir}:/target:Z" \
   -v "${scenario_dir}:/state:Z" \
-  -v "${HOME}/.cargo:/cargo-home:ro" \
+  -v "${cargo_home}:/cargo-home:Z" \
   --entrypoint /bin/sh \
   "${build_image}" \
   -ec '
@@ -32,15 +33,15 @@ podman run --rm --network=host \
     export CARGO_HOME=/cargo-home
     export CARGO_TARGET_DIR=/target
     export TMPDIR=/state/cache/tmp
-    export CARGO_NET_OFFLINE=true
+    unset CARGO_NET_OFFLINE
     cd /workspace
-    cargo build \
+    cargo build --locked \
       --manifest-path /workspace/Cargo.toml \
       -p yuhaiin-runtime \
       --all-features \
       --bin yuhaiin \
       >/state/runtime-build.log 2>&1
-    cargo test \
+    cargo test --locked \
       --manifest-path /workspace/Cargo.toml \
       -p yuhaiin-runtime \
       --all-features \

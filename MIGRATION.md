@@ -16,6 +16,15 @@
 > Windows cfg/依赖/运行时代码路径。Hickory 只挂在 Windows target dependency，不增加 Linux
 > 数据面的运行时依赖。
 
+> 2026-08-14 TUN owner 与 Podman 依赖 bootstrap 收口：桌面 TUN supervisor 现在保持每个
+> enabled inbound 独立的 device/route lease；单个 owner 打开或运行失败时只记录错误并保留
+> sibling owner，直到显式 inbound reload 或 shutdown，避免一个坏 TUN 拆掉全部设备。本次受
+> 影响的 Podman runtime 集成脚本统一使用 `~/.cache/yuhaiin-rust` 下可写的 Cargo home、
+> `--locked` 和在线依赖补齐；不再把只读宿主 Cargo registry 与强制 offline 绑定，Windows
+> cross smoke 额外用 `--config net.offline=false` 覆盖持久化 Cargo 配置，因此缺失的 locked
+> crate（例如 `bytes`）不会在新缓存上误报为依赖不存在。TUN API、service chain、WireGuard
+> chain、Linux musl cross、workspace check/clippy 均在 Podman 回归通过。
+
 > 2026-08-13 构建入口容器化：Makefile 的 `build`、`build-release`、`check`、`clippy` 及各类 smoke binary build 默认经由
 > `scripts/integration/podman-cargo.sh` 执行，宿主只负责调度，target/state/Cargo registry cache 位于
 > `~/.cache/yuhaiin-rust` 的独立目录。默认允许 Cargo 在线补齐新锁定依赖，`check/clippy/workspace-tests`

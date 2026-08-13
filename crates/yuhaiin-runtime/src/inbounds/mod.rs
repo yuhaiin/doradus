@@ -391,30 +391,61 @@ async fn run_desktop_tun_supervisor(
         if enabled_count == 0 {
             monitor.info("TUN inbound disabled");
         }
-        let mut load_after_wait = false;
+        let mut shutdown_requested = false;
+        let mut reload_requested = false;
         if tasks.is_empty() {
-            load_after_wait = wait_for_shutdown_or_reload(&mut reload, shutdown.clone()).await;
+            shutdown_requested = wait_for_shutdown_or_reload(&mut reload, shutdown.clone()).await;
+            reload_requested = !shutdown_requested;
         } else {
             let mut shutdown_wait = shutdown.clone();
             tokio::select! {
                 changed = shutdown_wait.changed() => {
-                    load_after_wait = changed.is_err() || *shutdown.borrow();
+                    shutdown_requested = changed.is_err() || *shutdown.borrow();
+                    reload_requested = !shutdown_requested;
                 }
                 changed = reload.recv() => {
-                    load_after_wait = changed.is_err() && *shutdown.borrow();
+                    if changed.is_err() {
+                        shutdown_requested = *shutdown.borrow();
+                        reload_requested = !shutdown_requested;
+                    } else {
+                        reload_requested = true;
+                    }
                 }
                 result = tasks.join_next() => {
                     if let Some(result) = result {
                         match result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(_)) | Err(_) => {
-                                // Preserve the existing single-supervisor
-                                // retry boundary: a failed device waits for
-                                // an explicit inbound reload instead of a
-                                // hot loop that repeatedly opens a broken TUN.
-                                load_after_wait =
+                            Ok(Ok(())) => {
+                                // A dispatcher normally returns when its own
+                                // inbound reload or global shutdown wakes it.
+                                // Rebuild the complete set only after that
+                                // explicit lifecycle event; a sibling TUN is
+                                // not an error merely because this owner
+                                // returned.
+                                shutdown_requested = *shutdown.borrow();
+                                reload_requested = !shutdown_requested;
+                            }
+                            Ok(Err(error)) => {
+                                monitor.error(format!(
+                                    "TUN inbound owner stopped; preserving sibling owners until reload: {error}"
+                                ));
+                                // Keep healthy sibling devices alive while a
+                                // failed owner waits for an explicit reload.
+                                // This matches Go's one-owner-per-inbound
+                                // lifecycle and avoids a failure in one TUN
+                                // tearing down all other devices.
+                                shutdown_requested =
                                     wait_for_shutdown_or_reload(&mut reload, shutdown.clone())
                                         .await;
+                                reload_requested = !shutdown_requested;
+                            }
+                            Err(error) => {
+                                monitor.error(format!(
+                                    "TUN inbound owner task failed; preserving sibling owners until reload: {error}"
+                                ));
+                                shutdown_requested =
+                                    wait_for_shutdown_or_reload(&mut reload, shutdown.clone())
+                                        .await;
+                                reload_requested = !shutdown_requested;
                             }
                         }
                     }
@@ -424,9 +455,10 @@ async fn run_desktop_tun_supervisor(
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
 
-        if load_after_wait {
+        if shutdown_requested {
             break;
         }
+        debug_assert!(reload_requested);
         configs = loop {
             match crate::data_plane::load_tun_configs_for_desktop(controller.store()).await {
                 Ok(configs) => break configs,

@@ -200,7 +200,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` `make tun-api-process-smoke` 的编译和运行均在 Podman 中完成；disposable user/network namespace 验证默认 TUN、新增 TUN 和两个同时 enabled 的 TUN，rootful namespace 又验证了真实设备创建/销毁和 API 开关（本轮 rootless/rootful 各 1/1）。共享脚本的 rootful entrypoint 已改为使用调用者实际挂载的 harness，避免 API smoke 错误调用未挂载的 `tun-service-smoke`；rootful TUN → TLS/H2/Yuubinsya chain 也通过。
 - `[x]` 2026-08-13 在 Podman 重跑 `make tun-api-process-smoke`：真实前台二进制的 `foreground_binary_api_toggle_changes_real_tun_device` 为 `1 passed, 0 failed`；再次确认 API disable/enable 会唤醒 inbound owner，真实 TUN 设备会在 `/proc/net/dev` 出现/消失，两个 enabled 设备可独立关闭。
 - `[x]` TUN 集成脚本的主服务和 MTU 矩阵现在支持 `YUHAIIN_TEST_IMAGE`（以及更具体的 `YUHAIIN_TUN_DISTRO_IMAGE`）覆盖容器发行版；2026-08-14 的 `make tun-distro-smoke` 已在 Alpine、Ubuntu 24.04、Fedora 三种 Podman 用户/network namespace 中完成 reload、无路由窗口、真实 packet traffic、close，以及 576/1280/1500/9000/9216 五档 MTU 回环 65507 字节 UDP，证明 harness 不依赖单一用户态；其他发行版/宿主 kernel 组合属于扩展回归，不再作为当前 Linux desktop 主路径缺口。
-
+- `[x]` 2026-08-14 修复桌面 TUN supervisor 的 owner 隔离：一个 enabled TUN 的 open/dispatcher task 失败时不再 `abort_all` 健康 sibling；失败 owner 保留错误状态并等待显式 inbound reload 或 shutdown，随后才统一重建。`make tun-api-process-smoke`、`make service-chain-smoke` 与 runtime TUN focused tests 在 Podman 通过；该行为与 Go 的“一 inbound 一 owner”生命周期一致。
 ### Go 生产兼容和统计
 
 - `[~]` 对更多停止态 Go SQLite 做逐表 schema/未知表/异常快照 diff；当前 4 份停止态 snapshot 的 API read/mutation/error parity 已通过，源库只读，副本和结果放 `~/.cache/yuhaiin-rust`。
@@ -216,6 +216,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` 2026-08-14 在 Podman 重跑 `make startup-logs-smoke`：真实前台二进制输出 database/API/supervisor startup progress、`runtime ready`、TUN disabled 和 clean shutdown；手动执行 `./yuhaiin` 不再是无输出的黑盒。
 - `[x]` 2026-08-14 在 Podman 重跑 `make tun-reload-traffic-smoke` 与 `make tun-reset-reconnect-smoke`：TUN disable→enable 后流量恢复，TCP reset 后重新连接并恢复流量，两个场景均 clean teardown。
 - `[x]` 2026-08-14 在 Podman 重跑 `make release-linux-cross-smoke` 和 `make release-windows-cross-smoke`：aarch64 Linux musl 与 x86_64 Windows GNU target 的 runtime `cargo check --all-features` 通过；`make release-contract-smoke` 继续锁定六平台 native release matrix。
+- `[x]` 2026-08-14 修复新 Podman Cargo 缓存的 Windows cross 依赖解析：可写 Cargo home 允许下载 `rust-std` 与 locked crates，`cargo check --config net.offline=false --locked` 覆盖持久化 offline 配置；release contract、Windows GNU smoke、Linux musl smoke 均通过。
 - `[x]` route list `refreshInterval` 已由 RuntimeService 持有后台 timer：配置 reload 立即重读，刷新产生的 reload 不会忙循环，服务 shutdown 会停止任务；定时刷新夹具验证 `lastRefreshTime` 和 reload 生命周期。
 - `[x]` API response 字段、生产 route/resolver projection 和 MaxMind country projection 已补齐证据：四份停止态 Go SQLite 的完整 API read/mutation/error parity、runtime route-list GeoIP metadata 持久化测试，以及 `make maxmind-smoke` 对用户指定 Country-without-asn 数据库的真实查询均通过；Go 当前 MaxMind 接口只暴露 country，不额外把 ASN 当作迁移缺口。
 - `[x]` Runtime DNS handler 在 socket/TUN 共用边界上恢复预加载 FakeIP 的 `in-addr.arpa`/`ip6.arpa` PTR 映射；未知 PTR 仍按上游 resolver 的现有能力处理。

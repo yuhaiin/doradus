@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 scenario_dir="${YUHAIIN_RELEASE_LINUX_DIR:-${cache_root}/integration/release-linux-cross}"
 target_dir="${YUHAIIN_RELEASE_LINUX_TARGET_DIR:-${cache_root}/release-linux-target}"
+cargo_home="${YUHAIIN_RELEASE_LINUX_CARGO_HOME:-${cache_root}/release-linux-cargo-home}"
 target="${YUHAIIN_RELEASE_LINUX_TARGET:-aarch64-unknown-linux-musl}"
 
 case "${target}" in
@@ -20,13 +21,13 @@ case "${target}" in
     ;;
 esac
 
-mkdir -p "${scenario_dir}" "${target_dir}"
+mkdir -p "${scenario_dir}" "${target_dir}" "${cargo_home}"
 
 podman run --rm --network=host \
   -v "${repo_root}:/workspace:ro" \
   -v "${scenario_dir}:/state:Z" \
   -v "${target_dir}:/target:Z" \
-  -v "${HOME}/.cargo:/cargo-home:ro" \
+  -v "${cargo_home}:/cargo-home:Z" \
   docker.io/library/rust:latest sh -ec '
     set -eu
     target="$1"
@@ -36,7 +37,7 @@ podman run --rm --network=host \
     export CARGO_HOME=/cargo-home
     export CARGO_TARGET_DIR=/target
     export TMPDIR=/state/cache/tmp
-    export CARGO_NET_OFFLINE=true
+    unset CARGO_NET_OFFLINE
 
     archive="/state/${target}.tar.xz"
     url="https://github.com/cross-tools/musl-cross/releases/download/20260515/${target}.tar.xz"
@@ -60,7 +61,8 @@ podman run --rm --network=host \
     eval "export CC_${target_env}=${toolchain_root}/bin/${target}-gcc"
     eval "export AR_${target_env}=${toolchain_root}/bin/${target}-ar"
     cd /workspace
-    cargo check --locked --target "${target}" -p yuhaiin-runtime --bin yuhaiin --all-features
+    cargo check --config net.offline=false --locked --target "${target}" \
+      -p yuhaiin-runtime --bin yuhaiin --all-features
   ' -- "${target}" "${sha256}"
 
 echo "[release-linux-cross] passed; target=${target} state=${scenario_dir}"

@@ -13,6 +13,7 @@ cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/go-api-parity}"
 go_cache_root="${YUHAIIN_GO_CACHE_DIR:-${cache_root}/go-cache}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
+cargo_home="${YUHAIIN_CARGO_HOME:-${cache_root}/cargo-home}"
 go_http="${YUHAIIN_GO_HTTP:-127.0.0.1:55252}"
 rust_http="${YUHAIIN_RUST_HTTP:-127.0.0.1:55251}"
 prepare_http="${YUHAIIN_PREPARE_HTTP:-127.0.0.1:55250}"
@@ -22,7 +23,7 @@ command -v curl >/dev/null
 command -v jq >/dev/null
 command -v podman >/dev/null
 test -f "${source_db}"
-mkdir -p "${scenario_dir}/go" "${scenario_dir}/rust" "${scenario_dir}/prepared"
+mkdir -p "${scenario_dir}/go" "${scenario_dir}/rust" "${scenario_dir}/prepared" "${cargo_home}"
 mkdir -p "${go_cache_root}"
 
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
@@ -55,7 +56,7 @@ podman run --rm --network=host \
   -v "${repo_root}:/workspace:ro" \
   -v "${target_dir}:/target:Z" \
   -v "${scenario_dir}:/state:Z" \
-  -v "${HOME}/.cargo:/cargo-home:ro" \
+  -v "${cargo_home}:/cargo-home:Z" \
   --entrypoint /bin/sh \
   "${rust_build_image}" \
   -ec '
@@ -65,9 +66,9 @@ podman run --rm --network=host \
     export CARGO_HOME=/cargo-home
     export CARGO_TARGET_DIR=/target
     export TMPDIR=/state/cache/tmp
-    export CARGO_NET_OFFLINE=true
+    unset CARGO_NET_OFFLINE
     cd /workspace
-    cargo build \
+    cargo build --locked \
       --manifest-path /workspace/Cargo.toml \
       -p yuhaiin-runtime \
       --all-features \
