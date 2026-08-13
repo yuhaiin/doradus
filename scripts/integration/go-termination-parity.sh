@@ -135,7 +135,7 @@ podman run -d \
   -v "${target_script}:/usr/local/bin/http-termination-target.py:ro" \
   --entrypoint python3 \
   "${proxy_image}" \
-  /usr/local/bin/http-termination-target.py "${target_port}" /health "${target_host}:${target_port}" 2 \
+  /usr/local/bin/http-termination-target.py "${target_port}" /health "${target_host}:${target_port}" 3 \
   >"${run_dir}/go-target-id"
 podman run -d \
   --name "${rust_target_container}" \
@@ -144,7 +144,7 @@ podman run -d \
   -v "${target_script}:/usr/local/bin/http-termination-target.py:ro" \
   --entrypoint python3 \
   "${proxy_image}" \
-  /usr/local/bin/http-termination-target.py "${rust_target_port}" /health "${rust_target_host}:${rust_target_port}" 2 \
+  /usr/local/bin/http-termination-target.py "${rust_target_port}" /health "${rust_target_host}:${rust_target_port}" 3 \
   >"${run_dir}/rust-target-id"
 
 wait_target() {
@@ -227,7 +227,15 @@ configure_service() {
     # themselves represented as base64 strings by encoding/json.  Rust also
     # accepts this shape, while its compatibility API additionally accepts
     # the inbound-style certBase64/keyBase64 names.
-    if [[ "${mode}" == standalone ]]; then
+    if [[ "${mode}" == named ]]; then
+      node_body="$(jq -cn \
+        --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
+        '{id:($prefix+"-termination-out"),name:"termination parity outbound",group:"parity",enabled:true,chain:[
+          {type:"direct",direct:{}},
+          {type:"http_termination",http_termination:{headers:{}}},
+          {type:"tls_termination",tls_termination:{tls:{certificates:[],serverNameCertificate:{"example.com":{cert:$cert,key:$key}},nextProtos:[]}}}
+        ]}')"
+    elif [[ "${mode}" == standalone ]]; then
       node_body="$(jq -cn \
         --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
         '{id:($prefix+"-termination-out"),name:"termination parity outbound",group:"parity",enabled:true,chain:[
@@ -244,7 +252,15 @@ configure_service() {
         ]}')"
     fi
   else
-    if [[ "${mode}" == standalone ]]; then
+    if [[ "${mode}" == named ]]; then
+      node_body="$(jq -cn \
+        --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
+        '{id:($prefix+"-termination-out"),name:"termination parity outbound",group:"parity",enabled:true,chain:[
+          {type:"direct",direct:{}},
+          {type:"http_termination",http_termination:{headers:{}}},
+          {type:"tls_termination",tls_termination:{tls:{certificates:[],serverNameCertificate:{"example.com":{certBase64:$cert,keyBase64:$key}},nextProtos:[]}}}
+        ]}')"
+    elif [[ "${mode}" == standalone ]]; then
       node_body="$(jq -cn \
         --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
         '{id:($prefix+"-termination-out"),name:"termination parity outbound",group:"parity",enabled:true,chain:[
@@ -319,7 +335,8 @@ send_tls_request() {
   local port="$1"
   local output="$2"
   local host="$3"
-  python3 - "${port}" "${host}" >"${output}" 2>&1 <<'PY'
+  local server_name="${4-}"
+  python3 - "${port}" "${host}" "${server_name}" >"${output}" 2>&1 <<'PY'
 import socket
 import ssl
 import sys
@@ -327,6 +344,7 @@ import time
 
 port = int(sys.argv[1])
 host = sys.argv[2]
+server_name = sys.argv[3] or None
 context = ssl._create_unverified_context()
 for _ in range(120):
     try:
@@ -336,7 +354,7 @@ for _ in range(120):
         time.sleep(0.05)
 else:
     raise SystemExit("termination inbound did not accept TCP")
-with context.wrap_socket(raw) as stream:
+with context.wrap_socket(raw, server_hostname=server_name) as stream:
     stream.sendall(
         b"GET /health HTTP/1.1\r\n"
         + f"Host: {host}\r\n".encode()
@@ -415,10 +433,11 @@ PY
 
 run_case() {
   local case_name="$1"
+  local server_name="${2-}"
   echo "[go-termination-parity] sending ${case_name} raw-TLS reverse requests"
-  send_tls_request "${go_inbound}" "${run_dir}/go-${case_name}-client.log" "${target_host}:${target_port}" &
+  send_tls_request "${go_inbound}" "${run_dir}/go-${case_name}-client.log" "${target_host}:${target_port}" "${server_name}" &
   go_client_pid=$!
-  send_tls_request "${rust_inbound}" "${run_dir}/rust-${case_name}-client.log" "${rust_target_host}:${rust_target_port}" &
+  send_tls_request "${rust_inbound}" "${run_dir}/rust-${case_name}-client.log" "${rust_target_host}:${rust_target_port}" "${server_name}" &
   rust_client_pid=$!
 
   for service in go rust; do
@@ -468,9 +487,13 @@ configure_service "${go_address}" go standalone
 configure_service "${rust_address}" rust standalone
 sleep 0.2
 run_case standalone
+configure_service "${go_address}" go named
+configure_service "${rust_address}" rust named
+sleep 0.2
+run_case named foo.example.com
 
 for target_container in "${go_target_container}" "${rust_target_container}"; do
   podman wait "${target_container}" >/dev/null
 done
 
-echo "[go-termination-parity] passed; Go/Rust cases=6; logs=${run_dir}"
+echo "[go-termination-parity] passed; Go/Rust cases=8; logs=${run_dir}"

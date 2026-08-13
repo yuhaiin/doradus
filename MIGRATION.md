@@ -4848,7 +4848,7 @@ streaming request/response body。`tls_terminated` marker 与 Go 的 context val
 这次同时把 `http_termination` 加入 store transport 解析、chain prefix 构造和默认
 `http-termination` feature。每次建立新连接前会回收已结束的 Hyper `JoinHandle`，因此长期
 运行不会按请求数无限积累 shutdown handle。Podman 验证结果：fmt、全 workspace Clippy、
-runtime `http_termination` focused 8/8、`tls_termination` filter 4/4（TLS-specific 3/3）、store focused 1/1、真实 reverse HTTP inbound → selector/router →
+runtime `http_termination` focused 8/8、`tls_termination` filter 4/4（TLS-specific 4/4）、store focused 1/1、真实 reverse HTTP inbound → selector/router →
 `http_termination` → HTTP target 的 plain/raw-TLS 进程链 2/2、runtime
 `--no-default-features --lib` 和完整 `make service-chain-smoke` 28/28 均通过。新增 domain
 Host → direct parent、explicit HTTPS target、CONNECT/malformed/unsupported scheme 和 TLS
@@ -4970,4 +4970,18 @@ Go 的 `contract.Certificate` 对 TLS termination 使用 `certFile`/`keyFile`，
 优先级同时读取三组字段，并继续支持 JSON byte array、base64 和 PEM/DER；这样 frontend
 直接提交 Go contract 时不会出现“配置保存成功、启动时证书缺失”。新增 focused test 使用
 仓库内文件路径验证 Go 字段名，`tls_termination` 过滤测试 4/4、Go/Rust termination
-live parity 6/6、Windows GNU dependency smoke、workspace Clippy 均通过。
+live parity 8/8、Windows GNU dependency smoke、workspace Clippy 均通过。
+
+## 200. 2026-08-14 tls_termination named certificate live parity
+
+Go 的 `parseServerNameCertificate` 会把非 IP 的 map key 规范化成单标签 wildcard；当没有
+默认证书时，带匹配 SNI 的 ClientHello 仍必须从 `serverNameCertificate` 取得证书。Rust
+的 `StaticTlsTerminationResolver` 现在由同一规则处理，不能因为 `certificates=[]` 就提前
+失败或回退到不存在的默认项。
+
+`make go-termination-parity-smoke` 新增 named case：Go/Rust 都使用空默认证书、
+`serverNameCertificate: {"example.com": ...}`，客户端以 `foo.example.com` SNI 发起 raw
+TLS 请求，随后经过 `http_termination`、router 和 target。组合、upstream 502、standalone
+无 SNI 和 named SNI 四种场景两端各通过，结果为 8/8；target 请求计数和日志仍保存在
+`~/.cache/yuhaiin-rust/integration/go-termination-parity/`，未使用 `/tmp`。剩余的
+termination live 缺口缩小为 HTTP termination 显式 HTTPS upstream 对照。
