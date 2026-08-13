@@ -128,8 +128,8 @@ The current scenarios cover:
   same semantic API configuration and sends raw TLS `reverse_http` traffic
   through both the `tls_termination → http_termination` chain and the
   standalone `tls_termination` chain to a reusable HTTP target. It checks the
-  request path/Host, response body, and live `connections` entry in both
-  services for 4/4 cases. The Go test moves its proxy rule before the built-in
+  request path/Host, response body, live `connections` entry, and upstream
+  `502` behavior in both services for 6/6 cases. The Go test moves its proxy rule before the built-in
   LAN rule; the Rust test uses the equivalent route priority. Build/runtime logs
   remain under
   `~/.cache/yuhaiin-rust/integration/go-termination-parity`.

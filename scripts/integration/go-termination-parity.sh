@@ -370,6 +370,49 @@ with context.wrap_socket(raw) as stream:
 PY
 }
 
+send_tls_error_request() {
+  local port="$1"
+  local output="$2"
+  local host="$3"
+  python3 - "${port}" "${host}" >"${output}" 2>&1 <<'PY'
+import socket
+import ssl
+import sys
+import time
+
+port = int(sys.argv[1])
+host = sys.argv[2]
+context = ssl._create_unverified_context()
+for _ in range(120):
+    try:
+        raw = socket.create_connection(("127.0.0.1", port), timeout=1)
+        break
+    except OSError:
+        time.sleep(0.05)
+else:
+    raise SystemExit("termination error inbound did not accept TCP")
+with context.wrap_socket(raw) as stream:
+    stream.settimeout(5)
+    stream.sendall(
+        b"GET /health HTTP/1.1\r\n"
+        + f"Host: {host}\r\n".encode()
+        + b"Connection: close\r\n\r\n"
+    )
+    response = bytearray()
+    while b"\r\n\r\n" not in response:
+        try:
+            chunk = stream.recv(4096)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        response.extend(chunk)
+    if not response.startswith(b"HTTP/1.1 502"):
+        raise SystemExit(f"unexpected termination error response: {bytes(response)!r}")
+    print(bytes(response).decode("latin1"), flush=True)
+PY
+}
+
 run_case() {
   local case_name="$1"
   echo "[go-termination-parity] sending ${case_name} raw-TLS reverse requests"
@@ -403,7 +446,24 @@ run_case() {
   done
 }
 
+run_error_case() {
+  local case_name="$1"
+  echo "[go-termination-parity] sending ${case_name} raw-TLS reverse requests"
+  send_tls_error_request "${go_inbound}" "${run_dir}/go-${case_name}-client.log" "${target_host}:1" &
+  go_client_pid=$!
+  send_tls_error_request "${rust_inbound}" "${run_dir}/rust-${case_name}-client.log" "${rust_target_host}:1" &
+  rust_client_pid=$!
+  wait "${go_client_pid}"
+  go_client_pid=""
+  wait "${rust_client_pid}"
+  rust_client_pid=""
+  for service in go rust; do
+    grep -q 'HTTP/1.1 502' "${run_dir}/${service}-${case_name}-client.log"
+  done
+}
+
 run_case combo
+run_error_case upstream-error
 configure_service "${go_address}" go standalone
 configure_service "${rust_address}" rust standalone
 sleep 0.2
@@ -413,4 +473,4 @@ for target_container in "${go_target_container}" "${rust_target_container}"; do
   podman wait "${target_container}" >/dev/null
 done
 
-echo "[go-termination-parity] passed; Go/Rust cases=4; logs=${run_dir}"
+echo "[go-termination-parity] passed; Go/Rust cases=6; logs=${run_dir}"
