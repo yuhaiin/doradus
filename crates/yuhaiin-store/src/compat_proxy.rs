@@ -318,6 +318,11 @@ fn parse_proxy_transport(value: &str) -> GoProxyTransport {
         "yuubinsya" => GoProxyTransport::Yuubinsya,
         "wireguard" | "wire_guard" | "wg" => GoProxyTransport::Wireguard,
         "aead" => GoProxyTransport::Aead,
+        // Go registers bootstrap_dns_warp as a no-op wrapper around the
+        // already-built proxy. At node level the zero/direct proxy is the
+        // equivalent base; network_split handles the parent-preserving case
+        // in the runtime builder.
+        "bootstrap_dns_warp" | "bootstrapdnswarp" => GoProxyTransport::Direct,
         "network_split" | "networksplit" => GoProxyTransport::NetworkSplit,
         "tls" => GoProxyTransport::Tls,
         "http2" => GoProxyTransport::Http2,

@@ -4788,3 +4788,15 @@ Podman `make wireguard-chain-smoke` 现在运行 3 个真实进程链：
 结果为 `3 passed`。这关闭了 Rust 原先错误返回
 `network_split WireGuard branch is not composable` 的 parity gap；第三方/WARP 公网 peer、
 真实 NAT roaming 和 keepalive 仍属于外部现场验收项。
+
+## 188. 2026-08-13 bootstrap_dns_warp no-op 兼容
+
+Go 的 `pkg/register/point.go` 将 `bootstrap_dns_warp` 注册为一个包裹父代理后直接返回的
+no-op point。它不会创建新的 socket、resolver 或传输层；因此 Rust 的 `network_split` 在该
+分支透传已经构造好的 parent，避免把父链误换成 direct socket。对于没有父链的独立 Go
+节点，兼容导入把它降为 direct/zero base，这与 Go 的有效数据面行为一致。
+
+新增 store/runtime 回归覆盖 Go-shaped 配置的导入和运行时分发：TCP
+`network_split(tcp=bootstrap_dns_warp)` 保留 fixed parent，UDP 分支仍按配置委托；Podman
+中 focused store test 和 focused runtime test 各 `1 passed`。构建、测试和缓存继续使用
+`~/.cache/yuhaiin-rust`，未使用 `/tmp`。

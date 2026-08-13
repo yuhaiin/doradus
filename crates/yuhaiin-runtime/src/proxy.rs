@@ -954,6 +954,11 @@ impl RuntimeSnapshot {
                     udp_server,
                 }))
             }
+            // Go's bootstrap_dns_warp point currently only embeds and returns
+            // its parent proxy. Keep that no-op behavior instead of treating
+            // it as an unknown protocol or accidentally replacing the parent
+            // with a direct socket.
+            "bootstrap_dns_warp" | "bootstrapdnswarp" => Ok(parent),
             "http2" => {
                 let concurrency = layer
                     .config
@@ -2934,7 +2939,10 @@ mod tests {
                 GoProxyLayer {
                     kind: "network_split".to_owned(),
                     config: serde_json::json!({
-                        "tcp": {"type": "direct", "direct": {}},
+                        "tcp": {
+                            "type": "bootstrap_dns_warp",
+                            "bootstrap_dns_warp": {}
+                        },
                         "udp": {"type": "drop", "drop": {}}
                     }),
                 },
