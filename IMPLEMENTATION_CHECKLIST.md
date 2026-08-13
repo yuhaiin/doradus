@@ -205,6 +205,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 ### CI 与发布（不计入上面的 49 项功能覆盖率）
 
 - `[~]` `.github/workflows/rust.yml` 已加入 Rust/Podman 检查、Linux `x86_64/aarch64-unknown-linux-musl`、Darwin `x86_64/aarch64`、Windows `x86_64/aarch64` 六项 release matrix；`make release-contract-smoke` 会在 CI checks 阶段锁定六个 target、产物名、`release/checksums.txt` 和 rolling-main 发布条件，且会拒绝误引用仓库根 checksum；仍需第一次 GitHub Actions 远程运行确认 runner/SDK 的现场差异。
+- `[x]` 新增 `make release-linux-cross-smoke`，使用与 workflow 相同的 SHA 固定 `cross-tools/musl-cross` toolchain；Podman 中 `aarch64-unknown-linux-musl` 的 runtime `--all-features` target check 通过，验证了 Linux arm64 的 linker、ring、SQLite 和完整 workspace 依赖。Darwin/Windows 仍必须由各自原生 runner 验证。
 - `[x]` 旧 Actions 的 `trojan.rs` `clippy::byte-char-slices` 已通过 `*b"\r\n"` 修复，`rusqlite 0.39.0` / `libsqlite3-sys 0.37.0` 锁定；Rust 1.97.1 Podman 中 fmt、全 workspace Clippy 和 workspace tests 均通过。HTTP/2 pool 的 key 还纳入 endpoint `network_interface`，避免相同地址的不同网卡策略复用连接。
 - `[x]` 发布资产名称与运行时 update contract 对齐：`yuhaiin-{linux,darwin,windows}-{amd64,arm64}`，Windows 保留 `.exe`；`v*` tag 发布稳定 release，`main` 生成可覆盖的 rolling prerelease 并更新 `main` tag。
 - `[~]` macOS launchd 与 Windows Service 的安装/更新/回滚代码、跨 target 编译和单测已完成；update helper 的替换事务已通过注入 platform hooks 覆盖成功与 restart failure rollback；真实 launchd/SCM 权限现场及远程 Actions 首次运行仍待验收。

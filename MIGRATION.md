@@ -4589,3 +4589,18 @@ reload/traffic 和 MTU 两组测试。Alpine 中真实 TUN 创建、disable/enab
 通过，每档回环 65507 字节 UDP。结果位于
 `~/.cache/yuhaiin-rust/integration/tun-distro/`，没有使用系统 `/tmp`；这扩展了用户态发行版
 证据，但不替代 rootful 宿主 route takeover 和不同发行版 kernel/firewall 的现场矩阵。
+
+## 176. 2026-08-13 Linux arm64 release cross-check
+
+直接使用通用 `podman-cargo.sh --install-musl-toolchain` 检查 `aarch64-unknown-linux-musl`
+时，`ring` 报告找不到 `aarch64-linux-musl-gcc`；原因是该 helper 的 musl 安装只覆盖宿主
+x86_64。这个失败不是 Rust 源码失败，也不能代表 release workflow 失败，因为 workflow
+本来就会下载对应架构的 cross-tools。
+
+为避免这条验证只能依赖远程 Actions，新增 `make release-linux-cross-smoke`，复用 workflow
+的 `cross-tools/musl-cross` 版本和 SHA 校验，在 Podman 中配置 linker、CC、AR 后执行
+`cargo check --locked --target aarch64-unknown-linux-musl -p yuhaiin-runtime --bin yuhaiin
+--all-features`。本轮结果为 `Finished dev profile`、`[release-linux-cross] passed`，状态和
+toolchain 缓存位于 `~/.cache/yuhaiin-rust/integration/release-linux-cross/`，没有使用系统
+`/tmp`。这闭环了 Linux arm64 的源码/linker 证据；Darwin/Windows 的原生 SDK、runner 和
+服务权限仍不能由 Linux 容器替代。
