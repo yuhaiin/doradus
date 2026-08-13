@@ -4724,3 +4724,20 @@ kernel、宿主防火墙和 route takeover 差异；这些继续保留在 TUN/pl
 30.19/30.26 MiB/s，说明短流包含明显的启动/调度固定开销；因此表中使用 64 MiB 长流作为
 主基线。原始结果和日志位于 `~/.cache/yuhaiin-rust/benchmarks/`，这些数字只作为同一主机
 的回归趋势，不能替代跨机器性能承诺或真实公网 WARP 测量。
+
+## 185. 2026-08-13 statistics 长压与异常终止回归
+
+在 Podman 中执行：
+
+```bash
+YUHAIIN_STATS_READER_COUNT=32 \
+YUHAIIN_STATS_READER_ROUNDS=2000 \
+YUHAIIN_STATS_WRITE_ROUNDS=5000 \
+make stats-concurrency-smoke
+```
+
+结果为 `2 passed`、217.62 秒：一项在统计读取期间 force-stop 后重新打开同一 SQLite，另一项
+让 32 个 reader 并发读取 connections/total/traffic/telemetry/history，同时进行 5000 次
+flow 写入，再执行 restart persistence 校验。结果和日志保存在
+`~/.cache/yuhaiin-rust/integration/stats-concurrency/`；这加强了运行时统计的进程级证据，
+但仍不冒充真实生产长时段样本。
