@@ -82,7 +82,7 @@ required_windows_cross_literals=(
   'cargo_home="${YUHAIIN_RELEASE_WINDOWS_CARGO_HOME:-${cache_root}/release-windows-cargo-home}"'
   '-v "${cargo_home}:/cargo-home:Z"'
   'unset CARGO_NET_OFFLINE'
-  'cargo check --locked --target'
+  'cargo check --config net.offline=false --locked --target'
 )
 
 for literal in "${required_windows_cross_literals[@]}"; do

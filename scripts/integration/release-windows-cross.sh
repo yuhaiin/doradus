@@ -45,8 +45,11 @@ podman run --rm --network=host \
     export CARGO_HOME=/cargo-home
     export CARGO_TARGET_DIR=/target
     export TMPDIR=/state/cache/tmp
-    # Do not let a runner-level Cargo setting turn this online bootstrap into
-    # an unexplained sparse-index miss. `--locked` still enforces the lockfile.
+    # Do not let a runner-level Cargo setting or a persisted CARGO_HOME config
+    # turn this online bootstrap into an unexplained sparse-index miss.
+    # `--locked` still enforces the lockfile; the command-line config is the
+    # highest-precedence Cargo setting and therefore also covers a reused cache
+    # containing `net.offline = true`.
     unset CARGO_NET_OFFLINE
 
     apt-get update >/state/apt-update.log
@@ -57,7 +60,8 @@ podman run --rm --network=host \
     eval "export CARGO_TARGET_${target_env}_LINKER=$linker"
     eval "export CC_${target_env}=$linker"
     cd /workspace
-    cargo check --locked --target "$target" -p yuhaiin-runtime --bin yuhaiin --all-features \
+    cargo check --config net.offline=false --locked --target "$target" \
+      -p yuhaiin-runtime --bin yuhaiin --all-features \
       >/state/cargo-check.log 2>&1 || {
         echo "[release-windows-cross] cargo check failed; see /state/cargo-check.log" >&2
         cat /state/cargo-check.log >&2
