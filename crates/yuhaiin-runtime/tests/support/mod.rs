@@ -484,6 +484,16 @@ pub fn tls_server_acceptor() -> TlsAcceptor {
     TlsAcceptor::from(build_tls_server_config(Vec::new()))
 }
 
+/// Return the Go-shaped certificate object used by a `tls_termination`
+/// contract point. Keeping this in the shared fixture avoids duplicating
+/// private test key material in every process-level chain test.
+pub fn tls_termination_certificate() -> Value {
+    json!({
+        "certBase64": base64::engine::general_purpose::STANDARD.encode(LEAF_CERTIFICATE_PEM),
+        "keyBase64": base64::engine::general_purpose::STANDARD.encode(PRIVATE_KEY_PEM),
+    })
+}
+
 fn yuubinsya_server_config() -> Arc<ServerConfig> {
     build_tls_server_config(vec![b"h2".to_vec()])
 }

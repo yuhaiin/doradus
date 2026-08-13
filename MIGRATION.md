@@ -4819,13 +4819,16 @@ Go 的 `pkg/net/proxy/tls/unwrap.go` 注册 `tls_termination`：它保留已经�
 对 `Conn` 返回的字节流执行 TLS server handshake，`PacketConn` 继续继承父代理。Rust
 现在在 store 的协议选择和 runtime builder 中保留该 contract point；它会先按 chain
 prefix 构造 parent，再用 RustCrypto/rustls `TlsAcceptor` 解包 TCP stream，UDP、ping 和
-close 继续委托 parent。
+close 继续委托 parent。为匹配 Go `unWrapConn` 的 pipe 语义，`connect` 会立即返回客户端侧
+raw stream，后台完成 server handshake 后把解密流 relay 到 parent；不能在 `connect` 内同步
+等待 handshake，否则 reverse listener 的输入尚未开始 relay，双方会互等。
 
 证书配置兼容 Go 的 `cert`/`key` JSON byte arrays、base64 字符串和
 `certFilePath`/`keyFilePath`，支持默认 certificates、`serverNameCertificate`（包含 Go
-的单标签 wildcard 规则）和 `nextProtos`/`next_protos`。新增 store/runtime 分支回归和
-2 个 Podman focused tests；完整 `make workspace-tests` 也通过。当前清单仍标为 `[~]`，
-因为还需要带真实证书的进程级 TLS termination chain 以及 Go 命名证书选择对照。
+的单标签 wildcard 规则）和 `nextProtos`/`next_protos`。新增 store/runtime 分支回归、
+2 个 Podman focused tests，以及真实 `reverse_http raw TLS → tls_termination →
+http_termination → HTTP target` 进程链 1/1。当前清单仍标为 `[~]`，因为还需要 Go 命名证书
+选择对照和 standalone/error 现场。
 
 ## 191. 2026-08-13 http_termination contract point
 
@@ -4843,7 +4846,9 @@ streaming request/response body。`tls_terminated` marker 与 Go 的 context val
 `http-termination` feature。每次建立新连接前会回收已结束的 Hyper `JoinHandle`，因此长期
 运行不会按请求数无限积累 shutdown handle。Podman 验证结果：fmt、全 workspace Clippy、
 runtime focused 4/4、store focused 1/1、真实 reverse HTTP inbound → selector/router →
-`http_termination` → HTTP target 进程链 1/1、runtime `--no-default-features --lib` 和完整
-`make service-chain-smoke` 25/25 均通过。外层 reverse connection 是内存 duplex，而目标
-authority 可随每个 HTTP request 改变，因此 monitor 不填充一个伪造的单一 outbound 地址；
-当前仍标为 `[~]`，剩余工作是 Go live 对照以及 HTTPS/error 语义矩阵。
+`http_termination` → HTTP target 的 plain/raw-TLS 进程链 2/2、runtime
+`--no-default-features --lib` 和完整 `make service-chain-smoke` 26/26 均通过。reverse
+HTTP 的 55ms sniff 超时现在仍会依据已读 request line 保留 HTTP rewrite；TLS termination
+的后台 pipe 也避免了 handshake/relay deadlock。外层 reverse connection 是内存 duplex，
+而目标 authority 可随每个 HTTP request 改变，因此 monitor 不填充一个伪造的单一 outbound
+地址；当前仍标为 `[~]`，剩余工作是 Go live 对照以及 HTTPS/error 语义矩阵。

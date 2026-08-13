@@ -266,7 +266,11 @@ where
     match result {
         Ok(Ok(())) => Ok((prefix.clone(), looks_like_http_request(&prefix))),
         Ok(Err(error)) => Err(error),
-        Err(_) => Ok((prefix, false)),
+        // A slow client can hit the Go-compatible sniff deadline after the
+        // complete request line (or even all headers) is already buffered.
+        // Preserve that evidence instead of routing a valid HTTP request as
+        // raw reverse TCP, which would skip path/Host rewriting.
+        Err(_) => Ok((prefix.clone(), looks_like_http_request(&prefix))),
     }
 }
 

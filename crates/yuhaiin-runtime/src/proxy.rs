@@ -44,18 +44,29 @@ struct TlsTerminationProxy {
 }
 
 #[cfg(feature = "doh-tls")]
+const TLS_TERMINATION_PIPE_BUFFER_SIZE: usize = 128 * 1024;
+
+#[cfg(feature = "doh-tls")]
 impl AsyncProxy for TlsTerminationProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         Box::pin(async move {
             let upstream = self.upstream.connect(context).await?;
             let local_addr = stream_local_addr(&*upstream);
-            let stream = self.acceptor.accept(upstream).await.map_err(|error| {
-                Error::new(
-                    ErrorKind::Protocol,
-                    format!("TLS termination handshake: {error}"),
-                )
-            })?;
-            Ok(with_stream_local_addr(Box::new(stream), local_addr))
+            // Go's unWrapConn returns the client-facing side of a pipe
+            // immediately. The TLS server handshake runs after the caller
+            // starts relaying bytes; awaiting `accept` here deadlocks reverse
+            // HTTP's non-HTTP path because its input cannot be copied until
+            // `connect` returns.
+            let (client, server) = tokio::io::duplex(TLS_TERMINATION_PIPE_BUFFER_SIZE);
+            let acceptor = self.acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(server).await else {
+                    return;
+                };
+                let mut upstream = upstream;
+                let _ = tokio::io::copy_bidirectional(&mut tls, &mut upstream).await;
+            });
+            Ok(with_stream_local_addr(Box::new(client), local_addr))
         })
     }
 

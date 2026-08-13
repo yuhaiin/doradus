@@ -23,7 +23,7 @@ use support::{
     configure_socks5_chain, configure_tls_aead_h2_http_inbound, configure_tls_h2_http_inbound,
     configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound, connect_loopback,
     connect_tls_h2_loopback, connect_tls_loopback, integration_dir, seed_empty_database,
-    tls_server_acceptor, wait_for_connection,
+    tls_server_acceptor, tls_termination_certificate, wait_for_connection,
 };
 
 #[cfg(target_os = "linux")]
@@ -3360,20 +3360,56 @@ async fn reverse_inbounds_route_through_the_runtime_process() {
     service.shutdown().await;
 }
 
+async fn write_reverse_http_request<S>(client: &mut S, host: &str)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    client
+        .write_all(
+            format!("GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn read_reverse_http_response<S>(client: &mut S) -> Vec<u8>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.unwrap();
+    response
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reverse_http_inbound_routes_through_http_termination_outbound() {
+    reverse_http_termination_service_chain(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reverse_http_inbound_routes_through_tls_and_http_termination_outbound() {
+    reverse_http_termination_service_chain(true).await;
+}
+
+async fn reverse_http_termination_service_chain(tls_termination: bool) {
     let reverse_http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let reverse_http_inbound = reverse_http_listener.local_addr().unwrap();
     drop(reverse_http_listener);
 
     let http_target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_target = http_target_listener.local_addr().unwrap();
+    let expected_path = if tls_termination {
+        "/health"
+    } else {
+        "/base/health"
+    };
     let http_target_task = tokio::spawn(async move {
         let (mut stream, _) = http_target_listener.accept().await.unwrap();
         let request = read_http_headers(&mut stream).await;
         let request = String::from_utf8(request).unwrap();
-        assert!(request.starts_with("GET /base/health HTTP/1.1\r\n"));
-        assert!(request.contains(&format!("Host: localhost:{}\r\n", http_target.port())));
+        assert!(request.starts_with(&format!("GET {expected_path} HTTP/1.1\r\n")));
+        let request_lower = request.to_ascii_lowercase();
+        assert!(request_lower.contains(&format!("host: 127.0.0.1:{}\r\n", http_target.port())));
         stream
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\ntermination-ok!",
@@ -3388,17 +3424,27 @@ async fn reverse_http_inbound_routes_through_http_termination_outbound() {
     seed_empty_database(&database).await;
     let service = ServiceProcess::start(&database).await;
 
+    let mut chain = vec![
+        json!({"type":"direct","direct":{}}),
+        json!({"type":"http_termination","http_termination":{"headers":{}}}),
+    ];
+    if tls_termination {
+        chain.push(json!({
+            "type":"tls_termination",
+            "tls_termination":{
+                "tls":{
+                    "certificates":[tls_termination_certificate()],
+                    "nextProtos":[]
+                }
+            }
+        }));
+    }
     let node = json!({
         "id":"reverse-http-termination",
         "name":"Reverse HTTP termination outbound",
         "group":"integration",
         "enabled":true,
-        "chain":[
-            {"type":"direct","direct":{}},
-            {"type":"http_termination","http_termination":{
-                "headers":{}
-            }}
-        ]
+        "chain":chain
     });
     api_json(
         &service.client,
@@ -3423,7 +3469,7 @@ async fn reverse_http_inbound_routes_through_http_termination_outbound() {
         "enabled":true,
         "network":{"type":"tcp_udp","tcp_udp":{"host":reverse_http_inbound.to_string(),"udp":"disabled"}},
         "transports":[{"type":"normal","normal":{}}],
-        "protocol":{"type":"reverse_http","reverse_http":{"url":format!("http://localhost:{}/base", http_target.port())}}
+        "protocol":{"type":"reverse_http","reverse_http":{"url":format!("http://127.0.0.1:{}/base", http_target.port())}}
     });
     api_json(
         &service.client,
@@ -3433,15 +3479,54 @@ async fn reverse_http_inbound_routes_through_http_termination_outbound() {
         Some(&inbound),
     )
     .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/route/rules",
+        Some(&json!({
+            "name":"reverse-http-termination-proxy",
+            "mode":"proxy",
+            "match":{"cidr":"127.0.0.1/32"}
+        })),
+    )
+    .await;
+    let route_test = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/route/rules/test",
+        Some(&json!({"host":format!("127.0.0.1:{}", http_target.port())})),
+    )
+    .await;
+    assert_eq!(route_test["mode"], "proxy", "reverse termination route");
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let mut client = connect_loopback(reverse_http_inbound).await;
-    client
-        .write_all(b"GET /health HTTP/1.1\r\nHost: public.example\r\nConnection: close\r\n\r\n")
+    let connections = if tls_termination {
+        let client = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_tls_loopback(reverse_http_inbound),
+        )
         .await
-        .unwrap();
-    let mut response = Vec::new();
-    client.read_to_end(&mut response).await.unwrap();
+        .unwrap_or_else(|_| {
+            panic!(
+                "TLS termination handshake timed out; runtime diagnostics: {}",
+                service.diagnostics()
+            )
+        });
+        let mut client = client;
+        write_reverse_http_request(&mut client, &format!("127.0.0.1:{}", http_target.port())).await;
+        let connections = wait_for_connection(&service.client, &service.base_url).await;
+        let response = read_reverse_http_response(&mut client).await;
+        (connections, response)
+    } else {
+        let mut client = connect_loopback(reverse_http_inbound).await;
+        write_reverse_http_request(&mut client, "public.example").await;
+        let connections = wait_for_connection(&service.client, &service.base_url).await;
+        let response = read_reverse_http_response(&mut client).await;
+        (connections, response)
+    };
+    let (connections, response) = connections;
     assert!(
         response.starts_with(b"HTTP/1.1 200 OK"),
         "response={response:?}"
@@ -3451,7 +3536,6 @@ async fn reverse_http_inbound_routes_through_http_termination_outbound() {
         "response={response:?}"
     );
 
-    let connections = wait_for_connection(&service.client, &service.base_url).await;
     let connection = connections["connections"]
         .as_array()
         .unwrap()
@@ -3459,9 +3543,7 @@ async fn reverse_http_inbound_routes_through_http_termination_outbound() {
         .find(|item| item["inboundName"] == "Reverse HTTP termination inbound")
         .expect("HTTP termination reverse connection must be visible");
     assert_eq!(connection["inbound"], reverse_http_inbound.to_string());
-    // The integration database uses the Go-compatible direct fallback route;
-    // the selected direct slot itself contains the HTTP termination chain.
-    assert_eq!(connection["mode"], "direct");
+    assert_eq!(connection["mode"], "proxy");
 
     tokio::time::timeout(Duration::from_secs(2), http_target_task)
         .await
