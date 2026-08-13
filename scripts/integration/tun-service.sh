@@ -7,6 +7,7 @@ target_dir="${CARGO_TARGET_DIR:-${HOME}/.cache/yuhaiin-rust/cargo-target}"
 binary="${YUHAIIN_TUN_BINARY:-${target_dir}/debug/tun-service-smoke}"
 database_dir="${cache_dir}/state"
 log_path="${cache_dir}/podman.log"
+image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 tun_name="yrtun0"
 chain_mode="${YUHAIIN_TUN_CHAIN:-}"
 container_name="yuhaiin-tun-service-$$"
@@ -83,7 +84,7 @@ common_args=(
   -v "${binary}:/usr/local/bin/tun-service-smoke:ro"
   -v "${database_dir}:/state:Z"
   --entrypoint "${TUN_CONTAINER_ENTRYPOINT}"
-  docker.io/library/debian:testing
+  "${image}"
 )
 run_args=(
   "${common_args[@]:0:${#common_args[@]}-1}"

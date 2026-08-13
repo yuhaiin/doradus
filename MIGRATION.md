@@ -4575,3 +4575,20 @@ case，全部 `identical`，源库保持只读，副本和日志在 `~/.cache/yu
 `release/checksums.txt` 和 rolling-main publication contract 均通过。它只验证工作流结构和
 资产契约，不冒充 GitHub Actions 的 Darwin/Windows 实际编译；远程首轮 Actions、真实
 launchd/SCM 权限以及外部 WARP peer 仍是待验收项。
+
+## 175. 2026-08-13 TUN harness 发行版可替换性
+
+审计 TUN 集成入口时发现主服务和 MTU 矩阵仍硬编码 `debian:testing`，与其它集成脚本的
+`YUHAIIN_TEST_IMAGE` 约定不一致。现已统一为可通过该环境变量替换镜像，默认行为保持不变；
+`make help` 也列出这个入口，后续 CI 可以在不复制 harness 的情况下增加发行版矩阵。
+
+为验证不是只改了字符串，本轮用 Podman 编译 `x86_64-unknown-linux-musl` 的静态 PIE
+`tun-service-smoke`，并以 `YUHAIIN_TEST_IMAGE=docker.io/library/alpine:latest`、
+`YUHAIIN_TUN_USER_NAMESPACE=1` 执行 `make tun-reload-traffic-smoke`。Alpine 中真实 TUN
+创建、disable/enable reload、关闭期间无路由、32 字节 packet traffic 和 close 全部通过；
+结果位于 `~/.cache/yuhaiin-rust/integration/tun-alpine/`，没有使用系统 `/tmp`。
+随后用同一个 Alpine 镜像和静态 binary 执行 `make tun-mtu-smoke`，576、1280、1500、9000、
+9216 五档全部通过，每档都回环 65507 字节 UDP，并观察到 `runtime-tun-udp-traffic-ok`、
+`runtime-tun-closed` 和 `tun-mtu-case-passed`。结果位于
+`~/.cache/yuhaiin-rust/integration/tun-alpine-mtu/`；这扩展了用户态发行版证据，但不替代
+rootful 宿主 route takeover 和不同发行版 kernel/firewall 的现场矩阵。

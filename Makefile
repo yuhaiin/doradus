@@ -147,6 +147,7 @@ help:
 		'make fmt-check          verify Rust formatting' \
 		'make clippy             run workspace Clippy checks' \
 		'HOST_CARGO=1           opt into host Cargo only for local toolchain debugging' \
+		'YUHAIIN_TEST_IMAGE=... override the Podman integration image (default Debian)' \
 		'make android-aarch64   cross-build for Android arm64' \
 		'' \
 		'CARGO_TARGET_DIR=$(CARGO_TARGET_DIR)' \

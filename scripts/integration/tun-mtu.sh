@@ -5,6 +5,7 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cache_dir="${YUHAIIN_TUN_MTU_DIR:-${HOME}/.cache/yuhaiin-rust/integration/tun-mtu}"
 target_dir="${CARGO_TARGET_DIR:-${HOME}/.cache/yuhaiin-rust/cargo-target}"
 binary="${YUHAIIN_TUN_BINARY:-${target_dir}/debug/tun-service-smoke}"
+image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 tun_device_args=()
 if [[ -c /dev/net/tun ]]; then
   tun_device_args=(--device=/dev/net/tun)
@@ -57,7 +58,7 @@ for mtu in 576 1280 1500 9000 9216; do
       -v "${binary}:/usr/local/bin/tun-service-smoke:ro" \
       -v "${database_dir}:/state:Z" \
       --entrypoint "${TUN_CONTAINER_ENTRYPOINT}" \
-      docker.io/library/debian:testing \
+      "${image}" \
       "${TUN_CONTAINER_COMMAND_ARGS[@]}" >"${log_path}" 2>&1; then
     cat "${log_path}"
     exit 1
