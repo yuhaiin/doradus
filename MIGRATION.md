@@ -4560,3 +4560,18 @@ case，全部 `identical`，源库保持只读，副本和日志在 `~/.cache/yu
 刷新 worker 仍延期的边界下对空列表返回相同的成功 no-op；指定订阅名称仍明确返回
 `unavailable`。单测和 parity harness 均已覆盖该行为。整个过程由 Podman 构建/运行，未使用
 `/tmp`。
+
+## 174. 2026-08-13 TUN 进程级 API 开关与 release contract 复验
+
+本轮没有修改 TUN 数据面代码，而是用 Podman 重新执行 `make tun-api-process-smoke`。真实
+前台 `yuhaiin` 进程的 `foreground_binary_api_toggle_changes_real_tun_device` 为 `1 passed,
+0 failed`：API disable/enable 能唤醒 inbound owner，真实设备在 `/proc/net/dev` 中按配置
+出现/消失，两个同时 enabled 的 TUN 仍可独立关闭。该证据确认此前的 runtime owner/reload
+实现没有被后续 WireGuard 和配置兼容改动破坏；TUN 更广发行版、宿主 firewall 和真实现场
+权限仍保留为 `[~]`。
+
+同时在 Podman `network=none` 中重跑 `make release-contract-smoke`，六个 native target
+（Linux musl、Darwin、Windows 的 amd64/arm64）、checks gate、artifact assembly、
+`release/checksums.txt` 和 rolling-main publication contract 均通过。它只验证工作流结构和
+资产契约，不冒充 GitHub Actions 的 Darwin/Windows 实际编译；远程首轮 Actions、真实
+launchd/SCM 权限以及外部 WARP peer 仍是待验收项。

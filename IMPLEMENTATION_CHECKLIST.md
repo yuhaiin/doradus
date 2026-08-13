@@ -175,6 +175,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` IPv6 扩展头已在 Podman 中完成两层回归：core `network=none` harness 覆盖 Hop-by-Hop、Routing、Routing 后 Destination Options、分片重组和重复分片拒绝；`make tun-ipv6-extension-smoke` 另外在 disposable user/network namespace 创建真实 TUN，发送 Hop-by-Hop + Destination Options 原始 IPv6/UDP 包，完成 fixed UDP 出站、echo 回写和设备关闭。smoltcp 地址容量与 ingress extension-header normalization 由单测固定；更广泛发行版/firewall 组合仍保留为 `[~]`。
 - `[x]` rootful TUN connection metadata 已在 rootful fixture 中逐字段固定 endpoint/localAddr、selected node、process、PID 和 UID；本轮现场为 `/usr/local/bin/tun-service-smoke`、pid `7`、uid `0`。
 - `[x]` `make tun-api-process-smoke` 的编译和运行均在 Podman 中完成；disposable user/network namespace 验证默认 TUN、新增 TUN 和两个同时 enabled 的 TUN，rootful namespace 又验证了真实设备创建/销毁和 API 开关（本轮 rootless/rootful 各 1/1）。共享脚本的 rootful entrypoint 已改为使用调用者实际挂载的 harness，避免 API smoke 错误调用未挂载的 `tun-service-smoke`；rootful TUN → TLS/H2/Yuubinsya chain 也通过。
+- `[x]` 2026-08-13 在 Podman 重跑 `make tun-api-process-smoke`：真实前台二进制的 `foreground_binary_api_toggle_changes_real_tun_device` 为 `1 passed, 0 failed`；再次确认 API disable/enable 会唤醒 inbound owner，真实 TUN 设备会在 `/proc/net/dev` 出现/消失，两个 enabled 设备可独立关闭。
 
 ### Go 生产兼容和统计
 
@@ -206,6 +207,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` 旧 Actions 的 `trojan.rs` `clippy::byte-char-slices` 已通过 `*b"\r\n"` 修复，`rusqlite 0.39.0` / `libsqlite3-sys 0.37.0` 锁定；Rust 1.97.1 Podman 中 fmt、全 workspace Clippy 和 workspace tests 均通过。HTTP/2 pool 的 key 还纳入 endpoint `network_interface`，避免相同地址的不同网卡策略复用连接。
 - `[x]` 发布资产名称与运行时 update contract 对齐：`yuhaiin-{linux,darwin,windows}-{amd64,arm64}`，Windows 保留 `.exe`；`v*` tag 发布稳定 release，`main` 生成可覆盖的 rolling prerelease 并更新 `main` tag。
 - `[~]` macOS launchd 与 Windows Service 的安装/更新/回滚代码、跨 target 编译和单测已完成；update helper 的替换事务已通过注入 platform hooks 覆盖成功与 restart failure rollback；真实 launchd/SCM 权限现场及远程 Actions 首次运行仍待验收。
+- `[x]` 2026-08-13 在 Podman `network=none` 中重跑 `make release-contract-smoke`；六个 native target、checks gate、release artifact assembly、`release/checksums.txt` 和 rolling-main publication contract 均通过。该项仍不等价于 GitHub-hosted Darwin/Windows runner 的真实编译。
 
 ### 主动延期（本轮不阻塞）
 
