@@ -4663,3 +4663,18 @@ target 已有独立的容器源码/linker 证据，仍不把 Darwin/Windows 原�
 脚本同时锁定 `run: make release-windows-cross-smoke`，避免后续只保留结构检查而丢掉
 Windows cfg/依赖门禁。该检查只负责 Linux 容器中的 GNU/MinGW 源码检查，正式的
 `x86_64/aarch64-pc-windows-msvc` 二进制仍由 Windows native matrix 生成。
+
+## 181. 2026-08-13 musl release 二进制生命周期
+
+在 Podman 中执行 `make build-release-musl`，使用
+`x86_64-unknown-linux-musl`、`RUSTFLAGS=-C linker=rust-lld` 和全 feature 完成优化版
+构建，产物为
+`~/.cache/yuhaiin-rust/cargo-target/x86_64-unknown-linux-musl/release/yuhaiin`，大小约
+31 MiB、可执行权限正常。
+
+随后把这个实际 release 产物挂载到 Alpine 容器，在 `--network=none` 环境下使用独立的
+`XDG_CACHE_HOME`、SQLite 状态和 API 端口启动服务；轮询 `/health` 成功后发送 `SIGTERM`，
+确认进程退出，并检查 `shutdown requested; stopping runtime tasks` 与 `stopped` 日志。该
+结果证明 Linux amd64 musl 产物可以脱离 Cargo 在最小用户态中启动和优雅退出；不替代
+Darwin/Windows 原生 runner、真实 launchd/SCM 权限和外部 WARP peer 验收。构建、状态和日志
+全部位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。

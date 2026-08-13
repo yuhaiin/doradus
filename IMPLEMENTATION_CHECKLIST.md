@@ -210,6 +210,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` 发布资产名称与运行时 update contract 对齐：`yuhaiin-{linux,darwin,windows}-{amd64,arm64}`，Windows 保留 `.exe`；`v*` tag 发布稳定 release，`main` 生成可覆盖的 rolling prerelease 并更新 `main` tag。
 - `[~]` macOS launchd 与 Windows Service 的安装/更新/回滚代码、跨 target 编译和单测已完成；update helper 的替换事务已通过注入 platform hooks 覆盖成功与 restart failure rollback；真实 launchd/SCM 权限现场及远程 Actions 首次运行仍待验收。
 - `[x]` 2026-08-13 在 Podman `network=none` 中重跑 `make release-contract-smoke`；六个 native target、checks gate、release artifact assembly、`release/checksums.txt` 和 rolling-main publication contract 均通过。该项仍不等价于 GitHub-hosted Darwin/Windows runner 的真实编译。
+- `[x]` 2026-08-13 在 Alpine Podman 容器中直接启动 `make build-release-musl` 生成的 Linux amd64 musl release 二进制，轮询 `/health` 后发送 `SIGTERM`，进程退出并记录 graceful shutdown；这补足了 release 产物的最小用户态生命周期证据，仍不替代原生 Darwin/Windows runner。
 
 ### 主动延期（本轮不阻塞）
 
@@ -244,6 +245,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | startup / service | `make startup-logs-smoke`、`make systemd-service-smoke` | 默认前台日志、runtime ready/shutdown、systemd install/health/自动 rollback/显式 rollback 通过 |
 | release contract | `make release-contract-smoke` | Linux musl、Darwin、Windows 的 amd64/arm64 六目标、产物名、checksum、checks gate、rolling-main contract 通过 |
 | musl release build | `make build-release-musl` | Podman 内成功完成 `x86_64-unknown-linux-musl` release 构建，产出 static PIE `yuhaiin` |
+| musl release lifecycle | Podman Alpine release process smoke | 直接运行上述 musl 产物，`/health`、`SIGTERM`、进程退出和 graceful shutdown 日志均通过 |
 | benchmark | `make benchmark-throughput`、`make benchmark-tun-throughput`、`make benchmark-wireguard-throughput` | HTTP CONNECT 158.39 MiB/s / 17,904 KiB；TLS/H2/Yuubinsya 33.38 MiB/s / 20,320 KiB；TUN 44.88 MiB/s / 13,224 KiB；BoringTun 595.89 MiB/s / 3,504 KiB（64 MiB run）。均为同机趋势基线 |
 | quality gate | `make check`、`make clippy` | Podman 中 workspace check 与 `clippy --workspace --all-targets --all-features -- -D warnings` 通过 |
 
