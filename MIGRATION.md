@@ -4985,3 +4985,20 @@ TLS 请求，随后经过 `http_termination`、router 和 target。组合、upst
 无 SNI 和 named SNI 四种场景两端各通过，结果为 8/8；target 请求计数和日志仍保存在
 `~/.cache/yuhaiin-rust/integration/go-termination-parity/`，未使用 `/tmp`。剩余的
 termination live 缺口缩小为 HTTP termination 显式 HTTPS upstream 对照。
+
+## 201. 2026-08-14 reverse_http HTTPS upstream live parity
+
+这次把 HTTPS upstream 对照放到了 Go 真正支持的 reverse HTTP 入口：Go 的
+`NewHTTPServer` 对 `reverse_http URL=https://...` 会由 transport 建立 TLS，再把请求交给
+相同的 parent proxy；Rust `serve_http` 使用同一 selector/parent stream 和 RustCrypto TLS
+client。HTTP inbound 本身收到 absolute-form `GET https://...` 时，Go server 会按自身语义把
+请求送入 TLS outbound，不能把这个错误模型当成 `http_termination` 成功路径。
+
+`make go-termination-https-smoke` 是显式 opt-in 的外网 smoke：在 Podman Go/Rust 服务中挂载
+宿主系统 CA，配置 `reverse_http URL=https://example.com/`，普通 HTTP client 请求 `/`，两端
+都返回 Example Domain 的 200；随后恢复本地 target，再执行 standalone 和 named TLS
+termination，完整 Go/Rust matrix 为 10/10。默认 `make go-termination-parity-smoke` 仍保持
+不依赖外网的稳定 8/8；目标域名可用 `YUHAIIN_TERMINATION_HTTPS_HOST` 覆盖。日志只保存在
+`~/.cache/yuhaiin-rust/integration/go-termination-parity/`，没有使用 `/tmp`。HTTP
+inbound absolute-form HTTPS 的 Go 错误语义和更多外网/error 矩阵仍保留在 checklist 的
+`[~]`。

@@ -48,6 +48,12 @@ target_host="$(ip -4 route get 192.168.2.1 | awk '{for (i = 1; i <= NF; i++) if 
 rust_target_host=127.0.0.1
 host_ip="${target_host}"
 test -n "${host_ip}"
+https_target_host="${YUHAIIN_TERMINATION_HTTPS_HOST:-example.com}"
+https_live="${YUHAIIN_TERMINATION_HTTPS_LIVE:-0}"
+case "${https_live}" in
+  0|1) ;;
+  *) echo "YUHAIIN_TERMINATION_HTTPS_LIVE must be 0 or 1" >&2; exit 2 ;;
+esac
 
 go_binary="${run_dir}/yuhaiin-go"
 rust_binary="${target_dir}/debug/yuhaiin"
@@ -107,6 +113,7 @@ podman run -d \
   --userns=keep-id \
   -v "${run_dir}:/data" \
   -v "${go_binary}:/usr/local/bin/yuhaiin:ro" \
+  -v "/etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro" \
   --entrypoint /usr/local/bin/yuhaiin \
   "${image}" \
   -host "${container_api}" -path /data/go \
@@ -119,6 +126,7 @@ podman run -d \
   --userns=keep-id \
   -v "${run_dir}:/data" \
   -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
+  -v "/etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro" \
   -e YUHAIIN_DB=/data/rust/state.sqlite \
   -e YUHAIIN_HTTP="${container_api}" \
   --entrypoint /usr/local/bin/yuhaiin \
@@ -227,7 +235,9 @@ configure_service() {
     # themselves represented as base64 strings by encoding/json.  Rust also
     # accepts this shape, while its compatibility API additionally accepts
     # the inbound-style certBase64/keyBase64 names.
-    if [[ "${mode}" == named ]]; then
+    if [[ "${mode}" == reverse_https ]]; then
+      node_body='{"id":"go-termination-out","name":"termination parity outbound","group":"parity","enabled":true,"chain":[{"type":"direct","direct":{}}]}'
+    elif [[ "${mode}" == named ]]; then
       node_body="$(jq -cn \
         --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
         '{id:($prefix+"-termination-out"),name:"termination parity outbound",group:"parity",enabled:true,chain:[
@@ -252,7 +262,9 @@ configure_service() {
         ]}')"
     fi
   else
-    if [[ "${mode}" == named ]]; then
+    if [[ "${mode}" == reverse_https ]]; then
+      node_body='{"id":"rust-termination-out","name":"termination parity outbound","group":"parity","enabled":true,"chain":[{"type":"direct","direct":{}}]}'
+    elif [[ "${mode}" == named ]]; then
       node_body="$(jq -cn \
         --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
         '{id:($prefix+"-termination-out"),name:"termination parity outbound",group:"parity",enabled:true,chain:[
@@ -277,11 +289,19 @@ configure_service() {
         ]}')"
     fi
   fi
-  inbound_body="$(jq -cn --arg prefix "${prefix}" --arg host "${container_inbound}" --arg target_host "${service_target_host}" --arg target_port "${service_target_port}" \
-    '{id:($prefix+"-termination-in"),name:"termination parity inbound",enabled:true,
-      network:{type:"tcp_udp",tcp_udp:{host:$host,udp:"disabled"}},
-      transports:[{type:"normal",normal:{}}],
-      protocol:{type:"reverse_http",reverse_http:{url:("http://"+$target_host+":"+$target_port+"/base")}}}')"
+  if [[ "${mode}" == reverse_https ]]; then
+    inbound_body="$(jq -cn --arg prefix "${prefix}" --arg host "${container_inbound}" --arg target_host "${https_target_host}" \
+      '{id:($prefix+"-termination-in"),name:"termination parity inbound",enabled:true,
+        network:{type:"tcp_udp",tcp_udp:{host:$host,udp:"disabled"}},
+        transports:[{type:"normal",normal:{}}],
+        protocol:{type:"reverse_http",reverse_http:{url:("https://"+$target_host+"/")}}}')"
+  else
+    inbound_body="$(jq -cn --arg prefix "${prefix}" --arg host "${container_inbound}" --arg target_host "${service_target_host}" --arg target_port "${service_target_port}" \
+      '{id:($prefix+"-termination-in"),name:"termination parity inbound",enabled:true,
+        network:{type:"tcp_udp",tcp_udp:{host:$host,udp:"disabled"}},
+        transports:[{type:"normal",normal:{}}],
+        protocol:{type:"reverse_http",reverse_http:{url:("http://"+$target_host+":"+$target_port+"/base")}}}')"
+  fi
   if [[ "${prefix}" == go ]]; then
     # Go's built-in LAN rule also covers the pasta-visible/private target
     # address. Match TCP explicitly, then move this rule before LAN below so
@@ -308,6 +328,8 @@ configure_service() {
       >"${run_dir}/${prefix}-route-priority.json"
     rpc "${address}" route.apply '{}' >/dev/null
     rpc "${address}" route.rules.test "{\"host\":\"${service_target_host}:${service_target_port}\"}" >"${run_dir}/${prefix}-route-test.json"
+  elif [[ "${mode}" == reverse_https ]]; then
+    rpc "${address}" inbound.put "${inbound_body}" >"${run_dir}/${prefix}-${mode}-inbound.json"
   fi
 }
 
@@ -481,8 +503,85 @@ run_error_case() {
   done
 }
 
+restore_reverse_http_inbound() {
+  local address="$1"
+  local prefix="$2"
+  local target_host_value="$3"
+  local target_port_value="$4"
+  local inbound_body
+  inbound_body="$(jq -cn --arg prefix "${prefix}" --arg host "${container_inbound}" --arg target_host "${target_host_value}" --arg target_port "${target_port_value}" \
+    '{id:($prefix+"-termination-in"),name:"termination parity inbound",enabled:true,
+      network:{type:"tcp_udp",tcp_udp:{host:$host,udp:"disabled"}},
+      transports:[{type:"normal",normal:{}}],
+      protocol:{type:"reverse_http",reverse_http:{url:("http://"+$target_host+":"+$target_port+"/base")}}}')"
+  rpc "${address}" inbound.put "${inbound_body}" >/dev/null
+}
+
 run_case combo
 run_error_case upstream-error
+
+case_count=8
+if [[ "${https_live}" == 1 ]]; then
+  case_count=10
+  configure_service "${go_address}" go reverse_https
+  configure_service "${rust_address}" rust reverse_https
+  sleep 0.2
+
+send_reverse_https_request() {
+  local port="$1"
+  local output="$2"
+  python3 - "${port}" "${https_target_host}" >"${output}" 2>&1 <<'PY'
+import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+host = sys.argv[2]
+for _ in range(120):
+    try:
+        stream = socket.create_connection(("127.0.0.1", port), timeout=1)
+        break
+    except OSError:
+        time.sleep(0.05)
+else:
+    raise SystemExit("reverse HTTPS inbound did not accept TCP")
+with stream:
+    stream.settimeout(15)
+    stream.sendall(
+        f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode()
+    )
+    response = bytearray()
+    while True:
+        chunk = stream.recv(8192)
+        if not chunk:
+            break
+        response.extend(chunk)
+    if not response.startswith(b"HTTP/1.1 200"):
+        raise SystemExit(f"unexpected reverse HTTPS response: {bytes(response)!r}")
+    if b"Example Domain" not in response and b"example domain" not in response.lower():
+        raise SystemExit(f"reverse HTTPS body marker missing: {bytes(response)!r}")
+    print(bytes(response).decode("latin1"), flush=True)
+PY
+}
+
+  echo "[go-termination-parity] sending reverse HTTPS upstream requests to ${https_target_host}"
+  send_reverse_https_request "${go_inbound}" "${run_dir}/go-reverse-https-client.log" &
+  go_client_pid=$!
+  send_reverse_https_request "${rust_inbound}" "${run_dir}/rust-reverse-https-client.log" &
+  rust_client_pid=$!
+  wait "${go_client_pid}"
+  go_client_pid=""
+  wait "${rust_client_pid}"
+  rust_client_pid=""
+  for service in go rust; do
+    grep -q 'HTTP/1.1 200' "${run_dir}/${service}-reverse-https-client.log"
+    grep -qi 'example domain' "${run_dir}/${service}-reverse-https-client.log"
+  done
+fi
+
+restore_reverse_http_inbound "${go_address}" go "${target_host}" "${target_port}"
+restore_reverse_http_inbound "${rust_address}" rust "${rust_target_host}" "${rust_target_port}"
+sleep 0.2
 configure_service "${go_address}" go standalone
 configure_service "${rust_address}" rust standalone
 sleep 0.2
@@ -496,4 +595,4 @@ for target_container in "${go_target_container}" "${rust_target_container}"; do
   podman wait "${target_container}" >/dev/null
 done
 
-echo "[go-termination-parity] passed; Go/Rust cases=8; logs=${run_dir}"
+echo "[go-termination-parity] passed; Go/Rust cases=${case_count}; logs=${run_dir}"
