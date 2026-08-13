@@ -5096,3 +5096,26 @@ endpoint metadata。
 `~/.cache/yuhaiin-rust/integration/http-inbound-https/`，未使用 `/tmp`。Go/Rust 双端
 HTTP inbound 的 live 对照、私有 CA/证书异常矩阵仍保留在 checklist 的 `[~]`，所以整体覆盖率
 仍为 91.5%。
+
+## 207. 2026-08-14 HTTP inbound persistent requests and framing
+
+Go 的 HTTP inbound 非 CONNECT 路径实际由 `net/http/httputil.ReverseProxy` 处理；它不是把
+一条 TCP 连接读成一段原始字节后永久 relay。Rust 原实现只读取第一个 request header，且
+没有解析请求/响应 body framing，也只删除 `Proxy-Authorization`/`Proxy-Connection`，会在
+浏览器复用连接、chunked request 或带自定义 `Connection` token 时偏离 Go 行为。
+
+Rust 现在在 `crates/yuhaiin-runtime/src/proxy/http.rs` 中按 HTTP/1.1 request/response
+边界循环处理普通 HTTP proxy 请求：
+
+- Content-Length、chunked（含 chunk extensions 和 trailers）以及 close-delimited response；
+- 同一客户端连接上的多个 absolute-form/origin-form 请求；CONNECT 仍保持原始 tunnel 路径；
+- Go ReverseProxy 的固定 hop-by-hop 列表，以及 `Connection` header 中动态声明的字段；
+- 合法的 `TE: trailers` 保留和 chunked wire framing 重写；
+- 每个实际请求的 upload/download bytes 仍进入同一 ConnectionMonitor boundary。
+
+证据：HTTP runtime focused tests 为 19/19；Podman 中真实前台服务执行
+`HTTP inbound → direct outbound → 本地 HTTP target`，同一 inbound client 连续发送两个请求，
+target 验证 path、Host、`Connection` 和动态 `X-Remove` 都符合预期，结果为 1/1；完整
+`make service-chain-smoke` 重跑结果为 29/29，另有 1 项既有 ignored case。Go/Rust 更广泛的
+HTTPS、私有 CA、异常响应和生产浏览器矩阵继续保持 checklist 的 `[~]`，没有因此虚增总体
+91.5% 覆盖率。

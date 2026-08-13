@@ -2640,6 +2640,75 @@ async fn http_inbound_routes_through_socks5_outbound() {
     fixture.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_inbound_reuses_client_connection_for_multiple_forward_requests() {
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = target_listener.local_addr().unwrap();
+    let target_task = tokio::spawn(async move {
+        for (path, body) in [
+            ("/first", b"one".as_slice()),
+            ("/second", b"two".as_slice()),
+        ] {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let request = read_http_headers(&mut stream).await;
+            assert!(
+                String::from_utf8_lossy(&request).starts_with(&format!("GET {path} HTTP/1.1\r\n"))
+            );
+            assert!(
+                String::from_utf8_lossy(&request)
+                    .contains(&format!("Host: 127.0.0.1:{}\r\n", target.port()))
+            );
+            assert!(!String::from_utf8_lossy(&request).contains("Connection:"));
+            assert!(!String::from_utf8_lossy(&request).contains("X-Remove:"));
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(body).await.unwrap();
+        }
+    });
+
+    let inbound = support::reserve_loopback().await;
+    let root = integration_dir("service-http-persistent-client");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    configure_direct_http_inbound(&service, inbound).await;
+
+    let mut client = connect_loopback(inbound).await;
+    for (path, expected) in [
+        ("/first", b"one".as_slice()),
+        ("/second", b"two".as_slice()),
+    ] {
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{}{path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: keep-alive, X-Remove\r\nX-Remove: client-hop\r\n\r\n",
+                    target.port(),
+                    target.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_http_headers(&mut client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let mut body = vec![0u8; expected.len()];
+        client.read_exact(&mut body).await.unwrap();
+        assert_eq!(body, expected);
+    }
+    client.shutdown().await.unwrap();
+    service.shutdown().await;
+    target_task.await.unwrap();
+}
+
 /// Go's httputil.ReverseProxy also accepts absolute-form HTTPS requests on an
 /// HTTP proxy inbound. Keep this opt-in because it reaches a public endpoint,
 /// but exercise the complete path when requested: HTTP inbound -> selected
