@@ -481,6 +481,93 @@ mod tests {
         assert!(!https);
     }
 
+    #[test]
+    fn request_target_uses_https_scheme_for_plain_http_termination() {
+        let request = Request::builder()
+            .uri("https://example.com/hello")
+            .body(())
+            .unwrap();
+        let (destination, authority, uri, https) = request_target(&request, false).unwrap();
+        assert_eq!(authority, "example.com");
+        assert_eq!(destination.port(), Some(443));
+        assert_eq!(uri, "/hello".parse::<Uri>().unwrap());
+        assert!(https);
+    }
+
+    async fn proxy_response(request: &str) -> Vec<u8> {
+        let parent: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy {
+            timeout: Duration::from_secs(1),
+        });
+        let proxy = HttpTerminationProxy::new(parent, rules(serde_json::json!({})), false);
+        let context = FlowContext::new(Endpoint::ip(
+            Network::Tcp,
+            SocketAddr::from(([192, 0, 2, 1], 443)),
+        ));
+        let mut client = proxy.connect(&context).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        proxy.close().await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn rejects_connect_missing_host_and_unsupported_scheme_requests() {
+        let response = proxy_response(
+            "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with(b"HTTP/1.1 501 Not Implemented\r\n"));
+
+        let response = proxy_response("GET / HTTP/1.1\r\nConnection: close\r\n\r\n").await;
+        assert!(response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(String::from_utf8_lossy(&response).contains("no Host header"));
+
+        let response = proxy_response(
+            "GET ftp://example.com/file HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(String::from_utf8_lossy(&response).contains("does not support URI scheme"));
+    }
+
+    #[tokio::test]
+    async fn returns_bad_gateway_when_https_target_handshake_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let target = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut byte = [0u8; 1];
+            let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte)).await;
+        });
+        let parent: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy {
+            timeout: Duration::from_secs(1),
+        });
+        let proxy = HttpTerminationProxy::new(parent, rules(serde_json::json!({})), false);
+        let context = FlowContext::new(Endpoint::ip(
+            Network::Tcp,
+            SocketAddr::from(([192, 0, 2, 1], 443)),
+        ));
+        let mut client = proxy.connect(&context).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET https://127.0.0.1:{}/secure HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                    address.port(),
+                    address.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(String::from_utf8_lossy(&response).contains("HTTPS handshake"));
+        proxy.close().await.unwrap();
+        target.await.unwrap();
+    }
+
     #[tokio::test]
     async fn forwards_streaming_http_through_parent_and_injects_domain_headers() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
