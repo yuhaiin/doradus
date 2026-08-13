@@ -80,7 +80,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help cache-usage cache-prune build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-udp-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-reset-reconnect-smoke tun-mtu-smoke tun-distro-smoke release-linux-cross-smoke release-windows-cross-smoke tun-ipv6-extension-smoke tun-route-matrix-smoke tun-api-process-smoke wireguard-smoke wireguard-chain-smoke wireguard-external-smoke maxmind-smoke s3-minio-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke go-protocol-interop-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput benchmark-wireguard-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke socks5-protocol-smoke node-latency-dns-smoke stats-concurrency-smoke stats-soak-smoke startup-logs-smoke workspace-tests \
+.PHONY: help cache-usage cache-prune checklist-check build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-udp-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-reset-reconnect-smoke tun-mtu-smoke tun-distro-smoke release-linux-cross-smoke release-windows-cross-smoke tun-ipv6-extension-smoke tun-route-matrix-smoke tun-api-process-smoke wireguard-smoke wireguard-chain-smoke wireguard-external-smoke maxmind-smoke s3-minio-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke go-protocol-interop-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput benchmark-wireguard-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke socks5-protocol-smoke node-latency-dns-smoke stats-concurrency-smoke stats-soak-smoke startup-logs-smoke workspace-tests \
 	api-route-parity-smoke release-contract-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
@@ -89,6 +89,7 @@ help:
 	@printf '%s\n' \
 		'make cache-usage        show generated Rust cache usage' \
 		'make cache-prune        remove stale integration outputs; preserve cargo-target/fixtures' \
+		'make checklist-check    verify module coverage counts in IMPLEMENTATION_CHECKLIST.md' \
 		'make build              build the yuhaiin runtime binary in Podman (debug)' \
 		'make build-release      build the yuhaiin runtime binary in Podman (release)' \
 		'make build MUSL=1       build a static musl debug binary in Podman' \
@@ -163,6 +164,9 @@ cache-usage:
 
 cache-prune:
 	YUHAIIN_CACHE_DIR="$(CACHE_ROOT)" ./scripts/maintenance/cache-prune.sh
+
+checklist-check:
+	./scripts/maintenance/checklist-stats.sh
 
 build: build-debug
 

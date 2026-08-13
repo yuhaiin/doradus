@@ -1,6 +1,6 @@
 # yuhaiin Go → Rust 迁移清单
 
-更新时间：2026-08-13
+更新时间：2026-08-14
 
 这是一份面向“Rust 二进制直接替换 Go 后端、前端不改”的活清单。它按模块记录 Go 的权威入口、Rust 的实现位置、可复现证据和剩余动作；不再使用 P1/P2。
 
@@ -19,15 +19,36 @@ debug 二进制。所有临时状态仍放在 `~/.cache/yuhaiin-rust`，不使�
 
 | 指标 | 当前值 |
 | --- | ---: |
-| 纳入统计的验收项 | 51 |
-| 已完成 `[x]` | 41 |
+| 纳入统计的模块验收项 | 41 |
+| 已完成 `[x]` | 31 |
 | 主路径可用但仍有现场/样本缺口 `[~]` | 10 |
 | 有实际功能缺口 `[ ]` | 0 |
-| 加权覆盖率 | **90.2%** = `(41 + 10 × 0.5) / 51` |
+| 加权覆盖率 | **87.8%** = `(31 + 10 × 0.5) / 41` |
 | 主目标 | Linux desktop：Rust 可启动、管理前端可接入、普通 inbound/outbound 可串联 |
 | 当前结论 | **主路径已可在 Linux desktop 进行替换前验收**；rootful TUN 多路由 lease、RST/reconnect、graceful/SIGKILL teardown、Debian rootful firewall matrix 和 TPROXY UDP delivery/idle/force-stop 已闭环，生产异常快照、更多平台现场和第三方 WireGuard 仍是 `[~]` |
 
-`[x]` 表示代码和对应测试/进程证据都存在；`[~]` 表示主路径已经能运行，但验证范围还不足以称为 Go 的完整替换；`[ ]` 表示仍有明确功能或现场证据缺口；`延期` 不计入 51 项统计。
+`[x]` 表示代码和对应测试/进程证据都存在；`[~]` 表示主路径已经能运行，但验证范围还不足以称为 Go 的完整替换；`[ ]` 表示仍有明确功能或现场证据缺口；`延期` 不计入 41 项统计。
+
+### 一眼速览
+
+下面只统计 8 个实现模块的功能条目；Android、macOS、QUIC/DoH3、Reality、Mux、Tailscale、
+Shadowsocks 等明确延期项不计入覆盖率。模块内的 `[~]` 是“主路径已运行、现场或样本仍不足”，
+不是未实现。
+
+| 模块 | 已完成 | 主路径可用但待补现场/样本 | 纳入条目 | 加权覆盖率 |
+| --- | ---: | ---: | ---: | ---: |
+| 公共数据面、NAT、TUN | 3 | 1 | 4 | 87.5% |
+| DNS、FakeIP、MaxMindDB | 5 | 0 | 5 | 100% |
+| Router、Trie、GeoIP | 4 | 0 | 4 | 100% |
+| Protocol、transport、proxy chain | 10 | 4 | 14 | 85.7% |
+| WireGuard outbound | 3 | 0 | 3 | 100% |
+| SQLite、配置、FakeIP persistence、统计 | 2 | 2 | 4 | 75.0% |
+| Runtime、inbound owner、API、观察面 | 4 | 2 | 6 | 83.3% |
+| Platform boundary（仅 Linux desktop 条目） | 0 | 1 | 1 | 50.0% |
+| **合计** | **31** | **10** | **41** | **87.8%** |
+
+计算方式：`(已完成 + 主路径可用但待补现场/样本 × 0.5) / 纳入条目`；功能总览中的
+Inbound/outbound 能力矩阵是交叉索引，不重复计入上表。
 
 ## 架构边界
 
@@ -192,6 +213,9 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` 统计公开契约已逐字段对齐：connections 的完整 metadata/matchHistory、total 的 string counters、traffic 的 UTC bucket、telemetry 的固定九维/失败计数、history/failed-history/block-history 的 process、count、time、dumpProcessEnabled 和 API 1000 条边界均有单测或 Podman parity；失败项按 `(protocol, host, process)` 分组，阻断历史不再丢失进程标志，同时保留 Go failed-history 全量 SQLite 语义。
 - `[x]` 2026-08-13 在 Podman 重跑 `make go-live-flow-parity-smoke` 和 `make workspace-tests`：Go/Rust 真实 live flow 的 connections、total、traffic、telemetry、history 对照通过；该次 workspace 49 个 harness 全部通过（chain 56、291 个 runtime tests、132 个 store tests、24 个 service-chain tests、3 个 WireGuard chain tests）。最新新增的 service-chain 项目由下方独立命令验证。结果保存在 `~/.cache/yuhaiin-rust/integration/go-live-flow-parity/20260813034332-2381346` 与 `~/.cache/yuhaiin-rust/integration/workspace-tests`。
 - `[x]` 2026-08-14 在 Podman 重跑 `make service-chain-smoke`：多协议真实 inbound → router → outbound 主链 28/28 通过，覆盖 HTTP、SOCKS5、Yuubinsya、mixed、TLS、`tls_auto`、AEAD、HTTP/2、reverse、`http_termination`、standalone `tls_termination`、`tls_termination → http_termination`、network_split、VLESS/VMess/Trojan TCP/UDP、IPv6 和中心用户认证。
+- `[x]` 2026-08-14 在 Podman 重跑 `make startup-logs-smoke`：真实前台二进制输出 database/API/supervisor startup progress、`runtime ready`、TUN disabled 和 clean shutdown；手动执行 `./yuhaiin` 不再是无输出的黑盒。
+- `[x]` 2026-08-14 在 Podman 重跑 `make tun-reload-traffic-smoke` 与 `make tun-reset-reconnect-smoke`：TUN disable→enable 后流量恢复，TCP reset 后重新连接并恢复流量，两个场景均 clean teardown。
+- `[x]` 2026-08-14 在 Podman 重跑 `make release-linux-cross-smoke` 和 `make release-windows-cross-smoke`：aarch64 Linux musl 与 x86_64 Windows GNU target 的 runtime `cargo check --all-features` 通过；`make release-contract-smoke` 继续锁定六平台 native release matrix。
 - `[x]` route list `refreshInterval` 已由 RuntimeService 持有后台 timer：配置 reload 立即重读，刷新产生的 reload 不会忙循环，服务 shutdown 会停止任务；定时刷新夹具验证 `lastRefreshTime` 和 reload 生命周期。
 - `[x]` API response 字段、生产 route/resolver projection 和 MaxMind country projection 已补齐证据：四份停止态 Go SQLite 的完整 API read/mutation/error parity、runtime route-list GeoIP metadata 持久化测试，以及 `make maxmind-smoke` 对用户指定 Country-without-asn 数据库的真实查询均通过；Go 当前 MaxMind 接口只暴露 country，不额外把 ASN 当作迁移缺口。
 - `[x]` Runtime DNS handler 在 socket/TUN 共用边界上恢复预加载 FakeIP 的 `in-addr.arpa`/`ip6.arpa` PTR 映射；未知 PTR 仍按上游 resolver 的现有能力处理。
@@ -205,7 +229,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[~]` 使用真实第三方/WARP peer 验证 reserved、handshake、keepalive 和 NAT endpoint 变化；本地 authenticated roaming 及 TCP/UDP userspace session 已由双 peer 单测覆盖。`make wireguard-external-smoke` 已提供用户配置驱动的 Podman host-network 入口，现在可直接读取 Go JSON 或标准 WARP/`wg-quick` INI；仍需第三方现场确认 endpoint roaming 和真实链路行为。
 - `[x]` 保持本地双 peer smoke 和 release packet benchmark；两者只证明协议/适配器正确性和同机趋势，不宣称公网性能。
 
-### CI 与发布（不计入上面的 51 项功能覆盖率）
+### CI 与发布（不计入上面的 41 项功能覆盖率）
 
 - `[~]` `.github/workflows/rust.yml` 已加入 Rust/Podman 检查、Linux `x86_64/aarch64-unknown-linux-musl`、Darwin `x86_64/aarch64`、Windows `x86_64/aarch64` 六项 release matrix；checks job 现在先运行 `make release-windows-cross-smoke`，并由 `make release-contract-smoke` 锁定该门禁、六个 target、产物名、`release/checksums.txt` 和 rolling-main 发布条件，且会拒绝误引用仓库根 checksum；Windows GNU `x86_64` cfg/依赖检查已通过，Darwin 检查因缺少 Apple clang/SDK 在 C 依赖阶段停止；仍需第一次 GitHub Actions 远程运行确认原生 runner/SDK 的现场差异。
 - `[x]` 新增 `make release-linux-cross-smoke`，使用与 workflow 相同的 SHA 固定 `cross-tools/musl-cross` toolchain；Podman 中 `x86_64-unknown-linux-musl` 与 `aarch64-unknown-linux-musl` 的 runtime `--all-features` target check 均通过，验证了 Linux 两个架构的 linker、ring、SQLite 和完整 workspace 依赖。Darwin/Windows 的正式 release 仍必须由各自原生 runner 验证。
