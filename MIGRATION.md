@@ -4614,3 +4614,20 @@ shutdown；平台不支持注册 Unix signal 时仍回退到 `ctrl_c`。这保�
 
 进程级 startup harness 在 Podman 中实际发送 `SIGHUP` 并确认退出状态成功；其它 runtime
 service fixtures 继续实际发送 `SIGTERM`。本轮没有运行宿主机测试，也没有使用 `/tmp`。
+
+## 178. 2026-08-13 主路径回归与缓存复核
+
+本轮没有发现新的主路径代码缺口，改用可复用的进程级链路做回归确认：
+
+- `make tun-api-process-smoke`：Podman 中真实前台二进制通过 API 独立启停两个 TUN inbound，
+  设备按配置出现/消失且互不影响，`1 passed`。
+- `make tun-chain-service-smoke`：真实 `TUN → fixed → TLS → HTTP/2 → Yuubinsya → echo`
+  通过，收到 32 字节回环数据并正常关闭 TUN。
+- `make api-reload-flow-smoke`：普通 inbound 与 TUN inbound 的 mutation、live reload、
+  shutdown/restart persistence 均通过，`2 passed`。
+- `make clippy`：Podman 中 workspace all-targets/all-features、`-D warnings` 通过。
+
+本轮缓存复核为 `54.53 GiB`，其中 `cargo-target` 为 `40.37 GiB`、integration 为
+`1.53 GiB`；默认 prune 没有可回收的过期场景目录，也没有自动删除可复用构建产物。
+后续若磁盘压力持续，应显式选择清理可重建的 target 根目录。本轮所有运行时验证仍通过
+Podman 完成，临时状态位于 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
