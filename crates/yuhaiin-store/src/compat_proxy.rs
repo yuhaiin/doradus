@@ -322,7 +322,7 @@ fn parse_proxy_transport(value: &str) -> GoProxyTransport {
         // already-built proxy. At node level the zero/direct proxy is the
         // equivalent base; network_split handles the parent-preserving case
         // in the runtime builder.
-        "bootstrap_dns_warp" | "bootstrapdnswarp" => GoProxyTransport::Direct,
+        "bootstrap_dns_warp" | "bootstrapdnswarp" | "proxy" => GoProxyTransport::Direct,
         "network_split" | "networksplit" => GoProxyTransport::NetworkSplit,
         "tls" => GoProxyTransport::Tls,
         "http2" => GoProxyTransport::Http2,

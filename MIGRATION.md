@@ -4800,3 +4800,15 @@ no-op point。它不会创建新的 socket、resolver 或传输层；因此 Rust
 `network_split(tcp=bootstrap_dns_warp)` 保留 fixed parent，UDP 分支仍按配置委托；Podman
 中 focused store test 和 focused runtime test 各 `1 passed`。构建、测试和缓存继续使用
 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+
+## 189. 2026-08-13 proxy no-op contract point 兼容
+
+Go 的 `pkg/net/proxy/proxy/proxy.go` 注册了 `proxy` contract point，但它的
+`NewClient` 只返回传入的 parent proxy。此前 Rust 已覆盖 `none` 和
+`bootstrap_dns_warp`，却会把 `proxy` 当成 unknown；这会影响 Go 节点导入、
+`network_split` 分支以及带该 wrapper 的 HTTP/2 chain。
+
+现在 `proxy` 在 store 导入中映射到 direct/zero base，在 runtime 的
+`network_split` 分支中透传 parent；chain parser 会在校验真实 fixed/TLS/WebSocket/H2/最终
+协议形状前移除 `none`、`proxy`、`bootstrap_dns_warp` 这些无行为 wrapper。新增 store、runtime
+和 chain regression tests，均在 Podman focused run 中验证。

@@ -41,6 +41,8 @@ async fn run_chain(protocol: FinalProtocol) {
             "id":"h2-protocol",
             "chain":[
                 {{"type":"fixedv2","fixedv2":{{"addresses":[{{"host":"127.0.0.1","port":{}}}]}}}},
+                {{"type":"proxy","proxy":{{}}}},
+                {{"type":"none","none":{{}}}},
                 {{"type":"http2","http2":{{"concurrency":1,"max_streams":8,"idle_timeout_secs":30}}}},
                 {}
             ]

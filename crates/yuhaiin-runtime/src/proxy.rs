@@ -841,7 +841,10 @@ impl RuntimeSnapshot {
     ) -> Result<Arc<dyn AsyncProxy>> {
         let kind = layer.kind.to_ascii_lowercase();
         match kind.as_str() {
-            "none" => Ok(parent),
+            // Go registers `none` and `proxy` as parent-preserving no-op
+            // wrappers. Neither may replace the already-built prefix with a
+            // fresh direct socket.
+            "none" | "proxy" => Ok(parent),
             "direct" => {
                 let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Direct);
                 let proxy: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy { timeout });
@@ -2940,8 +2943,8 @@ mod tests {
                     kind: "network_split".to_owned(),
                     config: serde_json::json!({
                         "tcp": {
-                            "type": "bootstrap_dns_warp",
-                            "bootstrap_dns_warp": {}
+                            "type": "proxy",
+                            "proxy": {}
                         },
                         "udp": {"type": "drop", "drop": {}}
                     }),

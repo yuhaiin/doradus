@@ -409,6 +409,8 @@ fn go_node_runtime_preserves_proxy_layers_and_selects_supported_base() {
         // Go's bootstrap_dns_warp point is a no-op wrapper; without a
         // network_split parent its zero/direct proxy is the effective base.
         ("bootstrap_dns_warp", GoProxyTransport::Direct),
+        // Go's proxy point is the same parent-preserving no-op wrapper.
+        ("proxy", GoProxyTransport::Direct),
         ("network_split", GoProxyTransport::NetworkSplit),
         ("tls", GoProxyTransport::Tls),
         ("http2", GoProxyTransport::Http2),

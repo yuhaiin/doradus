@@ -211,14 +211,31 @@ pub fn parse_config(json: &str) -> Result<ValidatedChain> {
 
 impl ChainConfig {
     pub fn validate(self) -> Result<ValidatedChain> {
-        if !(2..=5).contains(&self.chain.len()) {
+        let ChainConfig {
+            id,
+            name,
+            chain: original_chain,
+        } = self;
+        // Go's `none`, `proxy` and `bootstrap_dns_warp` contract points are
+        // no-op wrappers around the already-built parent. Remove them before
+        // validating the runnable transport shape so persisted Go chains can
+        // retain those layers without changing the wire path.
+        let chain: Vec<ChainNode> = original_chain
+            .into_iter()
+            .filter(|node| {
+                !matches!(
+                    node.kind.to_ascii_lowercase().as_str(),
+                    "none" | "proxy" | "bootstrap_dns_warp" | "bootstrapdnswarp"
+                )
+            })
+            .collect();
+        if !(2..=5).contains(&chain.len()) {
             return Err(Error::invalid(
                 "the runnable chain supports fixedv2, optional tls/websocket, http2, and final yuubinsya/http/socks5",
             ));
         }
-        let fixed = require_node(&self.chain[0], "fixedv2", |node| node.fixedv2.clone())?;
-        let final_kind = self
-            .chain
+        let fixed = require_node(&chain[0], "fixedv2", |node| node.fixedv2.clone())?;
+        let final_kind = chain
             .last()
             .map(|node| node.kind.to_ascii_lowercase())
             .ok_or_else(|| Error::invalid("chain has no final node"))?;
@@ -228,7 +245,7 @@ impl ChainConfig {
         );
         let yuubinsya = if final_kind == "yuubinsya" {
             Some(require_node(
-                self.chain.last().expect("chain length validated"),
+                chain.last().expect("chain length validated"),
                 "yuubinsya",
                 |node| node.yuubinsya.clone(),
             )?)
@@ -242,7 +259,7 @@ impl ChainConfig {
                 "http"
             };
             Some(require_node(
-                self.chain.last().expect("chain length validated"),
+                chain.last().expect("chain length validated"),
                 expected,
                 |node| node.http.clone().or_else(|| node.http_proxy.clone()),
             )?)
@@ -251,7 +268,7 @@ impl ChainConfig {
         };
         let socks5 = if final_kind == "socks5" {
             Some(require_node(
-                self.chain.last().expect("chain length validated"),
+                chain.last().expect("chain length validated"),
                 "socks5",
                 |node| node.socks5.clone(),
             )?)
@@ -265,11 +282,11 @@ impl ChainConfig {
         }
 
         let middle_end = if has_destination_protocol {
-            self.chain.len() - 1
+            chain.len() - 1
         } else {
-            self.chain.len()
+            chain.len()
         };
-        let middle = &self.chain[1..middle_end];
+        let middle = &chain[1..middle_end];
         let mut tls = None;
         let mut websocket = None;
         let mut http2 = None;
@@ -410,8 +427,8 @@ impl ChainConfig {
             return Err(Error::invalid("SOCKS5 override_port is out of range"));
         }
         Ok(ValidatedChain {
-            id: self.id,
-            name: self.name,
+            id,
+            name,
             fixed_addresses,
             tls,
             websocket,
@@ -680,6 +697,25 @@ mod tests {
         assert_eq!(socks5.hostname, "relay.example");
         assert_eq!(socks5.override_port, 8443);
         assert!(parsed.http.is_none());
+    }
+
+    #[test]
+    fn ignores_go_parent_preserving_contract_points() {
+        let config = r#"
+        {
+          "chain": [
+            {"type":"fixedv2","fixedv2":{"addresses":[{"host":"127.0.0.1:443"}]}},
+            {"type":"proxy","proxy":{}},
+            {"type":"none","none":{}},
+            {"type":"bootstrap_dns_warp","bootstrap_dns_warp":{}},
+            {"type":"http2","http2":{}},
+            {"type":"http","http":{}}
+          ]
+        }
+        "#;
+        let parsed = parse_config(config).unwrap();
+        assert!(parsed.tls.servernames.is_empty());
+        assert_eq!(parsed.http.as_ref().unwrap().user, "");
     }
 
     #[test]
