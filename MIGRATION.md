@@ -4272,7 +4272,7 @@ HTTP/2、WebSocket 或其他 wire framing。Rust 此前把这两个 transport �
 
 本轮将 transport allow-list 集中到
 `crates/yuhaiin-runtime/src/inbounds/mod.rs::is_supported_inbound_transport`，让这两个类型
-进入已有的普通 TCP listener 分支；明确仍未实现的 `mux`、`reality`、`tls_auto`、QUIC 等不会被
+进入已有的普通 TCP listener 分支；当时仍未实现的 `mux`、`reality`、`tls_auto`、QUIC 等不会被
 误放行。单元测试覆盖大小写、透明 wrapper 和 deferred 类型。新增的
 `transparent_go_inbound_transports_route_http` 通过 API 持久化配置，在同一个前台 runtime 中分别
 验证 `proxy`、`http_mock` 的 HTTP inbound → router → HTTP outbound → TCP echo，连接关闭后再进入
@@ -4326,9 +4326,10 @@ HTTP/HTTP2 listener 和 router 复用同一条入站路径。
 `[~]`，下一步是用 Go/Rust live config 和真实 ECH client/server 现场确认替代方案；这不影响
 未启用 ECH 的普通 `tls_auto` 配置。
 
-验证：Podman focused runtime tests 6/6 通过，覆盖 Go-shaped nested contract、base64/byte
-输入、wildcard/规范化、动态 SNI TLS echo、CA/key mismatch，以及 ECDSA/Ed25519/RSA CA；全程
-使用 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
+验证：Podman focused runtime tests 7/7 通过，覆盖 Go-shaped nested contract、base64/byte
+输入、wildcard/规范化、动态 SNI TLS echo、CA/key mismatch，以及 ECDSA/Ed25519/RSA CA；另有
+真实 `tls_auto → HTTP inbound → router → direct outbound → echo` 进程链 1/1。全程使用
+`~/.cache/yuhaiin-rust`，未使用 `/tmp`。
 
 ## 159. 2026-08-12 TLS/AEAD/HTTP2 入站组合回归
 
@@ -4846,10 +4847,22 @@ streaming request/response body。`tls_terminated` marker 与 Go 的 context val
 `http-termination` feature。每次建立新连接前会回收已结束的 Hyper `JoinHandle`，因此长期
 运行不会按请求数无限积累 shutdown handle。Podman 验证结果：fmt、全 workspace Clippy、
 runtime focused 5/5、store focused 1/1、真实 reverse HTTP inbound → selector/router →
-`http_termination` → HTTP target 的 plain/raw-TLS 进程链 2/2、runtime focused 5/5、runtime
-`--no-default-features --lib` 和完整 `make service-chain-smoke` 26/26 均通过。新增 domain
+`http_termination` → HTTP target 的 plain/raw-TLS 进程链 2/2、runtime
+`--no-default-features --lib` 和完整 `make service-chain-smoke` 27/27 均通过。新增 domain
 Host → direct parent 回归，确认 HTTP termination 不要求调用方预先填充 resolved IP。reverse
 HTTP 的 55ms sniff 超时现在仍会依据已读 request line 保留 HTTP rewrite；TLS termination
 的后台 pipe 也避免了 handshake/relay deadlock。外层 reverse connection 是内存 duplex，
 而目标 authority 可随每个 HTTP request 改变，因此 monitor 不填充一个伪造的单一 outbound
 地址；当前仍标为 `[~]`，剩余工作是 Go live 对照以及 HTTPS/error 语义矩阵。
+
+## 192. 2026-08-14 tls_auto inbound process chain
+
+在已有 `tls_auto` 动态证书单测之外，新增可复用的 P-256 Go-shaped CA fixture 和真实前台
+runtime 进程测试：API 写入 `tls_auto` inbound、启动动态 SNI TLS listener，客户端以
+`localhost` SNI 完成握手，随后通过 HTTP protocol、router 和 direct outbound 到 loopback
+echo target，并检查 connections 的 inbound/outbound/protocol 元数据。Podman focused
+`tls_auto` 测试为 7/7，新增进程链为 1/1；完整 `make service-chain-smoke` 为 27/27。
+
+这只证明未启用 ECH 的普通 `tls_auto` 已进入真实 inbound → outbound 主路径；rustls 没有
+等价的 server-side ECH key API，因此 ECH、Go live 对照和更广的错误/ALPN 矩阵仍保持清单
+中的 `[~]`，不会被这次 SNI 现场误报为完成。

@@ -10,6 +10,7 @@ use std::io::{BufRead, BufReader, Cursor};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -24,11 +25,22 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 use tokio_rustls::{TlsAcceptor, TlsConnector, client::TlsStream};
+use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+use x509_cert::der::Encode;
+use x509_cert::name::Name;
+use x509_cert::serial_number::SerialNumber;
+use x509_cert::spki::SubjectPublicKeyInfoOwned;
+use x509_cert::time::Validity;
 use yuhaiin_chain::{YuubinsyaH2Server, YuubinsyaServerProxy};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, DirectAsyncProxy};
 use yuhaiin_core::yuubinsya::derive_salt;
 use yuhaiin_core::{BoxFuture, Endpoint, FlowContext, Result};
 use yuhaiin_store::ConfigStore;
+
+use p256_tls_auto::ecdsa::{DerSignature, SigningKey};
+use p256_tls_auto::elliptic_curve::rand_core::OsRng;
+use p256_tls_auto::pkcs8::EncodePrivateKey;
+use p256_tls_auto::{PublicKey, SecretKey};
 
 pub const YUUBINSYA_PASSWORD: &str = "runtime-integration-yuubinsya";
 const LEAF_CERTIFICATE_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
@@ -491,6 +503,39 @@ pub fn tls_termination_certificate() -> Value {
     json!({
         "certBase64": base64::engine::general_purpose::STANDARD.encode(LEAF_CERTIFICATE_PEM),
         "keyBase64": base64::engine::general_purpose::STANDARD.encode(PRIVATE_KEY_PEM),
+    })
+}
+
+/// Build a fresh Go-shaped TLS-auto transport using a P-256 root fixture.
+/// The generated certificate is only used to sign the ephemeral SNI leaf in
+/// this process test; the client deliberately skips chain validation just as
+/// the other local TLS fixtures do.
+pub fn tls_auto_transport() -> Value {
+    let signer = SigningKey::random(&mut OsRng);
+    let subject = Name::from_str("CN=TLS-auto integration CA").unwrap();
+    let builder = CertificateBuilder::new(
+        Profile::Root,
+        SerialNumber::from(1u64),
+        Validity::from_now(Duration::from_secs(86400)).unwrap(),
+        subject,
+        SubjectPublicKeyInfoOwned::from_key(PublicKey::from(signer.verifying_key())).unwrap(),
+        &signer,
+    )
+    .unwrap();
+    let certificate = builder
+        .build_with_rng::<DerSignature>(&mut OsRng)
+        .unwrap()
+        .to_der()
+        .unwrap();
+    let key = SecretKey::from(&signer).to_pkcs8_der().unwrap();
+    json!({
+        "type":"tls_auto",
+        "tls_auto":{
+            "ca_cert":base64::engine::general_purpose::STANDARD.encode(certificate),
+            "ca_key":base64::engine::general_purpose::STANDARD.encode(key.as_bytes()),
+            "servernames":["localhost"],
+            "next_protos":[]
+        }
     })
 }
 
@@ -1552,6 +1597,54 @@ pub async fn configure_tls_http_inbound(service: &ServiceProcess, inbound: Socke
                 "nextProtos":[]
             }}
         }],
+        "protocol":{"type":"http","http":{"username":"","password":""}}
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+    settle_runtime_reload().await;
+}
+
+/// Configure the dynamic-SNI TLS-auto variant of the smallest real TLS/HTTP
+/// inbound. The node and protocol remain identical to the static TLS helper;
+/// only the listener transport is replaced so the process test isolates the
+/// certificate resolver boundary.
+pub async fn configure_tls_auto_http_inbound(service: &ServiceProcess, inbound: SocketAddr) {
+    let node = json!({
+        "id":"tls-auto-inbound-direct",
+        "name":"TLS-auto inbound direct outbound",
+        "group":"integration",
+        "enabled":true,
+        "chain":[{"type":"direct","direct":{}}]
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes",
+        Some(&node),
+    )
+    .await;
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/nodes/tls-auto-inbound-direct/use",
+        None,
+    )
+    .await;
+
+    let inbound = json!({
+        "id":"tls-auto-http-in",
+        "name":"TLS-auto HTTP inbound",
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":inbound.to_string(),"udp":"disabled"}},
+        "transports":[tls_auto_transport()],
         "protocol":{"type":"http","http":{"username":"","password":""}}
     });
     api_json(

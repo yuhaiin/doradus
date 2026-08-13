@@ -20,10 +20,10 @@ use support::{
     add_socks5_inbound, add_yuubinsya_inbound, api_json, configure_aead_h2_http_inbound,
     configure_h2_http_chain, configure_h2_http_inbound, configure_h2_socks5_chain,
     configure_http_chain, configure_http_chain_with_transport, configure_network_split_http_chain,
-    configure_socks5_chain, configure_tls_aead_h2_http_inbound, configure_tls_h2_http_inbound,
-    configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound, connect_loopback,
-    connect_tls_h2_loopback, connect_tls_loopback, integration_dir, seed_empty_database,
-    tls_server_acceptor, tls_termination_certificate, wait_for_connection,
+    configure_socks5_chain, configure_tls_aead_h2_http_inbound, configure_tls_auto_http_inbound,
+    configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound,
+    connect_loopback, connect_tls_h2_loopback, connect_tls_loopback, integration_dir,
+    seed_empty_database, tls_server_acceptor, tls_termination_certificate, wait_for_connection,
 };
 
 #[cfg(target_os = "linux")]
@@ -1564,17 +1564,34 @@ async fn http_inbound_routes_through_http2_socks5_outbound() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_http_inbound_terminates_tls_and_routes_through_direct_outbound() {
+    run_tls_http_inbound(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_auto_http_inbound_issues_sni_certificate_and_routes_through_direct_outbound() {
+    run_tls_http_inbound(true).await;
+}
+
+async fn run_tls_http_inbound(tls_auto: bool) {
     let fixture = ConnectFixture::start().await;
     let inbound_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let inbound = inbound_listener.local_addr().unwrap();
     drop(inbound_listener);
 
-    let root = integration_dir("service-tls-http-inbound");
+    let root = integration_dir(if tls_auto {
+        "service-tls-auto-http-inbound"
+    } else {
+        "service-tls-http-inbound"
+    });
     std::fs::create_dir_all(&root).unwrap();
     let database = root.join("state.sqlite");
     seed_empty_database(&database).await;
     let service = ServiceProcess::start(&database).await;
-    configure_tls_http_inbound(&service, inbound).await;
+    if tls_auto {
+        configure_tls_auto_http_inbound(&service, inbound).await;
+    } else {
+        configure_tls_http_inbound(&service, inbound).await;
+    }
 
     let mut client = connect_tls_loopback(inbound).await;
     let authority = fixture.target.to_string();
@@ -1601,12 +1618,17 @@ async fn tls_http_inbound_terminates_tls_and_routes_through_direct_outbound() {
     assert_eq!(&echoed, payload);
 
     let connection = wait_for_connection(&service.client, &service.base_url).await;
+    let inbound_name = if tls_auto {
+        "TLS-auto HTTP inbound"
+    } else {
+        "TLS HTTP inbound"
+    };
     let item = connection["connections"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["inboundName"] == "TLS HTTP inbound")
-        .expect("TLS HTTP inbound connection must be visible");
+        .find(|item| item["inboundName"] == inbound_name)
+        .expect("TLS/TLS-auto HTTP inbound connection must be visible");
     assert_eq!(item["inbound"], inbound.to_string());
     assert_eq!(item["outbound"], fixture.target.to_string());
     assert_eq!(item["protocol"], "tls");
