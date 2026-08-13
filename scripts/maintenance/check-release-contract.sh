@@ -7,8 +7,10 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 workflow="${repo_root}/.github/workflows/rust.yml"
+windows_cross="${repo_root}/scripts/integration/release-windows-cross.sh"
 
 test -f "${workflow}"
+test -f "${windows_cross}"
 
 matrix_entry_exists() {
   local platform="$1"
@@ -74,6 +76,25 @@ for literal in "${required_literals[@]}"; do
     exit 1
   fi
 done
+
+required_windows_cross_literals=(
+  'cargo_home="${YUHAIIN_RELEASE_WINDOWS_CARGO_HOME:-${cache_root}/release-windows-cargo-home}"'
+  '-v "${cargo_home}:/cargo-home:Z"'
+  'unset CARGO_NET_OFFLINE'
+  'cargo check --locked --target'
+)
+
+for literal in "${required_windows_cross_literals[@]}"; do
+  if ! grep -Fq -- "${literal}" "${windows_cross}"; then
+    echo "[release-contract] missing Windows cross literal: ${literal}" >&2
+    exit 1
+  fi
+done
+
+if grep -Fq -- 'export CARGO_NET_OFFLINE=true' "${windows_cross}"; then
+  echo "[release-contract] Windows cross dependency check must not force Cargo offline" >&2
+  exit 1
+fi
 
 if grep -Fq -- $'            checksums.txt' "${workflow}"; then
   echo "[release-contract] checksum must be published from release/checksums.txt" >&2

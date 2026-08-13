@@ -5048,3 +5048,15 @@ Podman `network=none` 场景最终为 `2 passed, 0 failed`，耗时 433.71 秒�
 
 这扩大了并发和异常退出覆盖范围，但仍不是数小时/数天真实生产流量，所以 statistics
 条目继续保持 `[~]`，不把压力测试误报成长期生产 projection 证据。
+
+## 205. 2026-08-14 Windows cross cache regression guard
+
+为避免 Windows dependency gate 将来回退到旧的 offline cache 逻辑，
+`scripts/maintenance/check-release-contract.sh` 现在除了检查 workflow 的六目标和产物契约，
+还检查 `release-windows-cross.sh` 使用独立可写的
+`release-windows-cargo-home`、`/cargo-home:Z`、`unset CARGO_NET_OFFLINE` 和
+`cargo check --locked`，并明确拒绝 `export CARGO_NET_OFFLINE=true`。
+
+本轮 `make release-contract-smoke` 和清理缓存后的 `make release-windows-cross-smoke` 均通过；
+后者再次完成 `x86_64-pc-windows-gnu` 的 MinGW/Cargo dependency check，证明它不依赖先前
+残留的 debug 依赖中间产物。
