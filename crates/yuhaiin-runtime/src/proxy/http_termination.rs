@@ -438,7 +438,7 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use yuhaiin_core::proxy::FixedAsyncProxy;
+    use yuhaiin_core::proxy::{DirectAsyncProxy, FixedAsyncProxy};
     use yuhaiin_core::{DomainName, Network};
 
     fn rules(value: serde_json::Value) -> HeaderRules {
@@ -531,6 +531,59 @@ mod tests {
         client.read_to_end(&mut response).await.unwrap();
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert!(response.ends_with(b"hello"));
+        proxy.close().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forwards_domain_http_through_direct_parent_without_pre_resolved_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET /domain HTTP/1.1\r\n"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains(&format!("host: localhost:{}\r\n", address.port()))
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndomain",
+                )
+                .await
+                .unwrap();
+        });
+        let parent: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy {
+            timeout: Duration::from_secs(1),
+        });
+        let proxy = HttpTerminationProxy::new(parent, rules(serde_json::json!({})), false);
+        let context = FlowContext::new(Endpoint::ip(
+            Network::Tcp,
+            SocketAddr::from(([192, 0, 2, 1], 443)),
+        ));
+        let mut client = proxy.connect(&context).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET /domain HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+                    address.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(b"domain"));
         proxy.close().await.unwrap();
         server.await.unwrap();
     }
