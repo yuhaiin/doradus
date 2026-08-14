@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use yuhaiin_chain::AsyncYuubinsyaTcpSession;
+use yuhaiin_chain::{AsyncYuubinsyaTcpSession, AsyncYuubinsyaUotSession};
+use yuhaiin_core::proxy::{AsyncDatagram, YuubinsyaUdpDatagram};
 use yuhaiin_core::{DomainName, Endpoint, Network, websocket::WebSocketIo};
 use yuhaiin_protocol::{trojan, vless, vmess};
 
@@ -18,15 +19,15 @@ use support::{
     ConnectFixture, H2FinalProtocol, H2ProtocolFixture, H2YuubinsyaFixture, ServiceProcess,
     Socks5Fixture, YUUBINSYA_PASSWORD, add_mixed_udp_inbound, add_reverse_inbounds,
     add_socks5_inbound, add_trojan_inbound, add_trojan_udp_inbound, add_vless_inbound,
-    add_vless_udp_inbound, add_yuubinsya_inbound, api_json, configure_aead_h2_http_inbound,
-    configure_direct_http_inbound, configure_h2_http_chain, configure_h2_http_inbound,
-    configure_h2_socks5_chain, configure_http_chain, configure_http_chain_with_transport,
-    configure_network_split_http_chain, configure_socks5_chain, configure_tls_aead_h2_http_inbound,
-    configure_tls_auto_http_inbound, configure_tls_h2_http_inbound,
-    configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound, connect_loopback,
-    connect_tls_h2_loopback, connect_tls_loopback, connect_tls_loopback_without_sni,
-    integration_dir, seed_empty_database, tls_server_acceptor, tls_termination_certificate,
-    wait_for_connection,
+    add_vless_udp_inbound, add_yuubinsya_inbound, add_yuubinsya_udp_inbound, api_json,
+    configure_aead_h2_http_inbound, configure_direct_http_inbound, configure_h2_http_chain,
+    configure_h2_http_inbound, configure_h2_socks5_chain, configure_http_chain,
+    configure_http_chain_with_transport, configure_network_split_http_chain,
+    configure_socks5_chain, configure_tls_aead_h2_http_inbound, configure_tls_auto_http_inbound,
+    configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound,
+    connect_loopback, connect_tls_h2_loopback, connect_tls_loopback,
+    connect_tls_loopback_without_sni, integration_dir, seed_empty_database, tls_server_acceptor,
+    tls_termination_certificate, wait_for_connection,
 };
 
 #[cfg(target_os = "linux")]
@@ -3459,6 +3460,135 @@ async fn socks5_and_yuubinsya_inbounds_route_through_the_runtime_process() {
     socks5.shutdown().await.unwrap();
     service.shutdown().await;
     fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn yuubinsya_native_udp_and_uot_inbounds_route_through_the_runtime_process() {
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_address = echo.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        let mut packet = [0u8; 2048];
+        for _ in 0..2 {
+            let (length, peer) = echo.recv_from(&mut packet).await.unwrap();
+            echo.send_to(&packet[..length], peer).await.unwrap();
+        }
+    });
+
+    let _default_mixed_blocker = TcpListener::bind("127.0.0.1:1080").await.ok();
+    let (tcp_listener, udp_listener) = loop {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp_listener.local_addr().unwrap();
+        match UdpSocket::bind(address).await {
+            Ok(udp_listener) => break (tcp_listener, udp_listener),
+            Err(_) => drop(tcp_listener),
+        }
+    };
+    let inbound = tcp_listener.local_addr().unwrap();
+    drop(tcp_listener);
+    drop(udp_listener);
+
+    let root = integration_dir("service-yuubinsya-udp-uot-inbounds");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    add_yuubinsya_udp_inbound(&service, "yuubinsya-udp-uot-in", inbound).await;
+
+    let password_hash = yuhaiin_core::yuubinsya::derive_salt(YUUBINSYA_PASSWORD.as_bytes());
+    let destination = Endpoint::ip(Network::Udp, echo_address);
+
+    let native = YuubinsyaUdpDatagram::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        password_hash,
+        Endpoint::ip(Network::Udp, inbound),
+        false,
+    )
+    .await
+    .unwrap();
+    let native_payload = b"yuubinsya-native-udp-inbound-payload";
+    native
+        .send_to(native_payload, destination.clone())
+        .await
+        .unwrap();
+    let mut native_response = [0u8; 2048];
+    let (native_length, native_target) = tokio::time::timeout(
+        Duration::from_secs(2),
+        native.recv_from(&mut native_response),
+    )
+    .await
+    .expect("native Yuubinsya UDP inbound did not respond")
+    .unwrap();
+    assert_eq!(&native_response[..native_length], native_payload);
+    assert_eq!(native_target, destination);
+
+    let uot_stream = connect_loopback(inbound).await;
+    let mut uot = AsyncYuubinsyaUotSession::connect(uot_stream, password_hash, 0, false)
+        .await
+        .unwrap();
+    let uot_payload = b"yuubinsya-uot-inbound-payload";
+    uot.send_to(&destination, uot_payload).await.unwrap();
+    let (uot_target, uot_response) = tokio::time::timeout(Duration::from_secs(2), uot.recv_from())
+        .await
+        .expect("Yuubinsya UOT inbound did not respond")
+        .unwrap();
+    assert_eq!(uot_target, destination);
+    assert_eq!(&uot_response, uot_payload);
+
+    let mut snapshot = Value::Null;
+    for _ in 0..100 {
+        snapshot = api_json(
+            &service.client,
+            &service.base_url,
+            reqwest::Method::GET,
+            "/api/v2/connections",
+            None,
+        )
+        .await;
+        let items = snapshot["connections"].as_array().unwrap();
+        let yuubinsya_items = items
+            .iter()
+            .filter(|item| item["inboundName"] == "Yuubinsya UDP integration inbound");
+        let has_native = yuubinsya_items
+            .clone()
+            .any(|item| item["network"]["underlyingType"] == "udp" && item["udpMigrateId"] == "");
+        let has_uot = yuubinsya_items.clone().any(|item| {
+            item["network"]["underlyingType"] == "udp"
+                && item["udpMigrateId"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+        });
+        if has_native && has_uot {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let items = snapshot["connections"].as_array().unwrap();
+    let yuubinsya_items: Vec<_> = items
+        .iter()
+        .filter(|item| item["inboundName"] == "Yuubinsya UDP integration inbound")
+        .collect();
+    assert!(yuubinsya_items.iter().any(|item| {
+        item["inbound"] == inbound.to_string()
+            && item["outbound"] == echo_address.to_string()
+            && item["network"]["underlyingType"] == "udp"
+            && item["udpMigrateId"] == ""
+    }));
+    assert!(
+        yuubinsya_items.iter().any(|item| {
+            item["inbound"] == inbound.to_string()
+                && item["outbound"] == echo_address.to_string()
+                && item["network"]["underlyingType"] == "udp"
+                && item["udpMigrateId"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+        }),
+        "Yuubinsya UDP/UOT connection metadata: {yuubinsya_items:?}"
+    );
+
+    native.close().await.unwrap();
+    uot.shutdown().await.unwrap();
+    service.shutdown().await;
+    echo_task.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

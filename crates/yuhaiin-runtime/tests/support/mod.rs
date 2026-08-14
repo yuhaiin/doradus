@@ -2324,6 +2324,21 @@ pub async fn add_yuubinsya_inbound(service: &ServiceProcess, id: &str, listen: S
     settle_runtime_reload().await;
 }
 
+pub async fn add_yuubinsya_udp_inbound(service: &ServiceProcess, id: &str, listen: SocketAddr) {
+    add_protocol_inbound(
+        service,
+        id,
+        "Yuubinsya UDP integration inbound",
+        listen,
+        json!({
+            "type":"yuubinsya",
+            "yuubinsya":{"password":YUUBINSYA_PASSWORD,"udp":true}
+        }),
+        true,
+    )
+    .await;
+}
+
 pub async fn add_vless_inbound(service: &ServiceProcess, id: &str, listen: SocketAddr, uuid: &str) {
     add_protocol_inbound(
         service,

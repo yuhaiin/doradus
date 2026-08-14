@@ -395,6 +395,10 @@ impl ServerUdpSession {
         self.datagram.send_to(payload, target).await
     }
 
+    fn local_addr(&self) -> Result<Endpoint> {
+        self.datagram.local_addr()
+    }
+
     async fn close(&self) {
         let _ = self.datagram.close().await;
         self.notify_closed().await;
@@ -664,17 +668,25 @@ impl YuubinsyaServerProxy {
             session.send_to(&destination, &response).await?;
             (destination, payload) = session.recv_from().await?;
         }
-        let shared = self
-            .udp_session(session.migrate_id, destination.clone())
-            .await?;
+        let mut context = FlowContext::new(destination.clone());
+        context
+            .udp_migrate_id
+            .store(session.migrate_id, Ordering::Release);
+        if let Some(observed) = observed {
+            context.source = Some(Endpoint::ip(yuhaiin_core::Network::Udp, observed.source));
+            (observed.annotate)(&mut context);
+        }
+        let shared = self.udp_session(session.migrate_id, &context).await?;
+        if context.outbound_local_addr.is_none()
+            && let Ok(local_addr) = shared.local_addr()
+            && local_addr.addr().is_some()
+        {
+            context.outbound_local_addr = Some(local_addr);
+        }
         let (sender, mut responses) = shared.register(destination.clone()).await;
         let mut observed_flows = HashMap::<Endpoint, ObservedFlow>::new();
         let result: Result<()> = async {
             if let Some(observed) = observed {
-                let mut context = FlowContext::new(destination.clone());
-                context.source = Some(Endpoint::ip(yuhaiin_core::Network::Udp, observed.source));
-                context.udp_migrate_id.store(session.migrate_id, Ordering::Release);
-                (observed.annotate)(&mut context);
                 let flow = FlowKey {
                     network: yuhaiin_core::Network::Udp,
                     source: observed.source,
@@ -714,6 +726,11 @@ impl YuubinsyaServerProxy {
                                 context.source = Some(Endpoint::ip(yuhaiin_core::Network::Udp, observed.source));
                                 context.udp_migrate_id.store(session.migrate_id, Ordering::Release);
                                 (observed.annotate)(&mut context);
+                                if let Ok(local_addr) = shared.local_addr()
+                                    && local_addr.addr().is_some()
+                                {
+                                    context.outbound_local_addr = Some(local_addr);
+                                }
                                 let flow = FlowKey {
                                     network: yuhaiin_core::Network::Udp,
                                     source: observed.source,
@@ -773,7 +790,7 @@ impl YuubinsyaServerProxy {
     async fn udp_session(
         &self,
         migrate_id: u64,
-        destination: Endpoint,
+        context: &FlowContext,
     ) -> Result<Arc<ServerUdpSession>> {
         let _open_guard = self.udp_open_lock.lock().await;
         let now = Instant::now();
@@ -797,9 +814,7 @@ impl YuubinsyaServerProxy {
             session.touch();
             return Ok(Arc::clone(session));
         }
-        let context = FlowContext::new(destination);
-        context.udp_migrate_id.store(migrate_id, Ordering::Release);
-        let datagram = self.upstream.open_datagram(&context).await?;
+        let datagram = self.upstream.open_datagram(context).await?;
         let session = ServerUdpSession::spawn(datagram).await;
         self.udp_sessions
             .lock()
