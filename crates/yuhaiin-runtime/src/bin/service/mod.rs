@@ -109,6 +109,24 @@ fn required_value(args: &[OsString], index: &mut usize, flag: &str) -> Result<St
         .ok_or_else(|| Error::invalid(format!("service option {flag} requires a value")))
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn parse_launchd_pid(data: &[u8]) -> Option<i32> {
+    for line in String::from_utf8_lossy(data).lines() {
+        let line = line.trim().trim_end_matches(';');
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !key.trim().trim_matches('"').eq_ignore_ascii_case("pid") {
+            continue;
+        }
+        let value = value.trim().trim_matches('"');
+        if let Ok(pid) = value.parse::<i32>() {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn default_service_path() -> PathBuf {
     if cfg!(target_os = "windows") {
@@ -303,7 +321,7 @@ fn check_http_health(host: &str) -> Result<()> {
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 mod tests {
-    use super::{ServiceOptions, parse_options};
+    use super::{ServiceOptions, parse_launchd_pid, parse_options};
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -336,6 +354,22 @@ mod tests {
         assert!(parse_options(&args(&["--host"])).is_err());
         assert!(parse_options(&args(&["--unknown", "value"])).is_err());
         assert!(parse_options(&args(&["unexpected"])).is_err());
+    }
+
+    #[test]
+    fn parses_launchd_pid_without_trusting_field_order_or_case() {
+        let output = br#"
+            "Label" = "com.asutorufa.yuhaiin";
+            "LastExitStatus" = 0;
+            "pId" = "4312";
+        "#;
+        assert_eq!(parse_launchd_pid(output), Some(4312));
+    }
+
+    #[test]
+    fn ignores_invalid_launchd_pid_entries() {
+        assert_eq!(parse_launchd_pid(br#""PID" = "not-a-pid";"#), None);
+        assert_eq!(parse_launchd_pid(br#""Other" = 4312;"#), None);
     }
 }
 
@@ -712,9 +746,13 @@ mod macos {
             "stop" => command_output("launchctl", &["kill", "TERM", &format!("system/{SERVICE}")])
                 .map(|_| ()),
             "restart" => {
-                let _ = Command::new("launchctl")
-                    .args(["bootout", "system/", PLIST_PATH])
-                    .status();
+                let pid = command_output("launchctl", &["list", SERVICE])
+                    .map(|output| super::parse_launchd_pid(&output))?
+                    .filter(|pid| *pid > 0);
+                command_output("launchctl", &["bootout", "system/", PLIST_PATH])?;
+                if let Some(pid) = pid {
+                    wait_for_process_exit(pid)?;
+                }
                 command_output("launchctl", &["bootstrap", "system", PLIST_PATH])?;
                 command_output(
                     "launchctl",
@@ -723,6 +761,34 @@ mod macos {
                 .map(|_| ())
             }
             _ => Err(Error::invalid(format!("unknown service action {action:?}"))),
+        }
+    }
+
+    fn wait_for_process_exit(pid: i32) -> Result<()> {
+        let deadline = SystemTime::now()
+            .checked_add(Duration::from_secs(30))
+            .ok_or_else(|| service_error("service process exit deadline overflow"))?;
+        loop {
+            let probe = Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .output()
+                .map_err(service_error)?;
+            if !probe.status.success() {
+                let stderr = String::from_utf8_lossy(&probe.stderr);
+                if stderr.to_ascii_lowercase().contains("no such process") {
+                    return Ok(());
+                }
+                return Err(service_error(format!(
+                    "check stopped service process {pid} failed: {}",
+                    stderr.trim()
+                )));
+            }
+            if SystemTime::now() >= deadline {
+                return Err(service_error(format!(
+                    "timeout waiting for service process {pid} to stop"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
 

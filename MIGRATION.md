@@ -5315,3 +5315,24 @@ Podman 验证结果：`cargo test --locked -p yuhaiin-runtime --all-features htt
 go-termination-parity-smoke` 为 Go/Rust 10/10；所有状态、日志和 cargo target 继续位于
 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。HTTP termination 仍保留 `[~]`，因为 Go live
 HTTPS/error/证书矩阵以及更广现场对照尚未全部完成。
+
+## 216. 2026-08-14 macOS launchd restart 生命周期收口
+
+继续对照 Go `cmd/yuhaiin/main_darwin.go` 与 `update_installer_unix.go` 的 service restart
+流程。Rust 原先会忽略 `launchctl bootout` 的失败结果，也不会等待旧服务进程退出，就直接
+`bootstrap`/`kickstart`；在二进制更新、端口仍被旧进程占用或 launchd 尚未完成 teardown 时，
+这可能导致新服务启动失败或新旧版本短暂并存。
+
+现在 macOS native service 的 `restart` 会先执行 `launchctl list SERVICE` 并解析大小写不敏感的
+`PID` 字段，严格检查 `bootout`，对旧 PID 使用 `kill -0` 轮询等待进程消失（最多 30 秒），
+然后才 bootstrap/kickstart。缺少 PID 时保留 launchd 自身负责拉起的兼容路径；bootout、进程探测、
+超时和 bootstrap/kickstart 错误都会向调用方返回。PID parser 新增有效、大小写、字段顺序和坏值
+单测，Podman 中 `cargo test -p yuhaiin-runtime --bin yuhaiin --all-features service::tests`
+结果为 4/4，`make clippy` 通过，`make release-windows-cross-smoke` 也通过。
+
+Linux Podman 容器可以安装 Darwin rust-std 并进入 macOS cfg，但不能代替真实 Darwin 链接：当前
+容器没有 Apple clang/SDK，`libsqlite3-sys` 和 `ring` 在 `x86_64-apple-darwin` check 阶段因
+`cc` 不认识 `-arch`/`-mmacosx-version-min` 而停止。这项证据明确保留为 toolchain 限制，最终
+仍由 GitHub Actions macOS native-service runner 验证真实 launchd 权限、安装、更新和回滚；状态
+继续标为 `[~]`，没有把跨目标 cfg check 冒充原生验收。所有状态和构建缓存写入
+`~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
