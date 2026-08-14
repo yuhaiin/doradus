@@ -1432,7 +1432,25 @@ fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -> Value {
         "fakeIp": context.fake_ip.as_deref().unwrap_or_default(),
         "hosts": context.hosts.as_deref().unwrap_or_default(),
         "domain": domain,
-        "ip": context.destination.addr().map(|addr| addr.ip().to_string()).unwrap_or_default(),
+        // TUN's packet tuple is the synthetic FakeIP. Once a direct/bypass
+        // socket has connected, `resolved_destination` contains the real
+        // resolver-selected peer; keep `fakeIp` as the synthetic address for
+        // diagnostics, but expose the real IP in the Go-compatible `ip`
+        // field. Before that socket exists, Go leaves `IP` empty rather than
+        // reporting the synthetic address as if it were real.
+        "ip": context
+            .resolved_destination
+            .as_ref()
+            .and_then(Endpoint::addr)
+            .or_else(|| {
+                context
+                    .fake_ip
+                    .is_none()
+                    .then(|| context.destination.addr())
+                    .flatten()
+            })
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_default(),
         "tag": context.tag.as_deref().unwrap_or_default(),
         "nodeId": context.outbound.as_deref().unwrap_or_default(),
         "nodeName": context.outbound_name.as_deref().unwrap_or_default(),
@@ -1988,6 +2006,33 @@ mod tests {
         assert_eq!(connection["uid"], "1000");
         assert_eq!(connection["fakeIp"], "198.18.0.1");
         assert_eq!(connection["component"], "");
+    }
+
+    #[test]
+    fn monitor_reports_resolved_ip_separately_from_fakeip() {
+        let monitor = ConnectionMonitor::new();
+        let (flow, mut context) = flow();
+        let fake_ip = "fc00::1".parse().unwrap();
+        let real_ip = "142.250.72.4".parse().unwrap();
+        context.destination = Endpoint::ip(Network::Tcp, std::net::SocketAddr::new(fake_ip, 443));
+        context.original_domain = Some(yuhaiin_core::DomainName::new("www.google.com").unwrap());
+        context.fake_ip = Some(fake_ip.to_string());
+
+        monitor.opened(flow, context.clone());
+        let pending = &monitor.connections_value()["connections"][0];
+        assert_eq!(pending["ip"], "");
+
+        context.resolved_destination = Some(Endpoint::ip(
+            Network::Tcp,
+            std::net::SocketAddr::new(real_ip, 443),
+        ));
+
+        monitor.opened(flow, context);
+
+        let connection = &monitor.connections_value()["connections"][0];
+        assert_eq!(connection["domain"], "www.google.com");
+        assert_eq!(connection["fakeIp"], "fc00::1");
+        assert_eq!(connection["ip"], "142.250.72.4");
     }
 
     #[test]

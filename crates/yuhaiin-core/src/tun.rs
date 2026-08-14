@@ -48,7 +48,7 @@ use crate::LocalBoxFuture;
 use crate::nat::{NatKey, NatTable};
 #[cfg(feature = "async-proxy")]
 use crate::process::{ProcessResolver, default_process_resolver};
-use crate::{Error, ErrorKind, Network, Result};
+use crate::{Error, ErrorKind, Network, Result, RouteMode};
 
 pub use crate::flow::{Flow as TunFlow, FlowKey as TunFlowKey};
 #[cfg(feature = "async-proxy")]
@@ -1987,7 +1987,13 @@ async fn run_tcp_proxy(
     }
     if let Some(remote_addr) = stream_remote_addr(&*stream) {
         context.outbound_addr = Some(Endpoint::ip(context.network, remote_addr));
-        context.resolved_destination = Some(Endpoint::ip(context.network, remote_addr));
+        // For direct/bypass flows the stream peer is the actual resolved
+        // destination.  A proxy-mode stream peer is the proxy node itself,
+        // not the user's target, so exposing it as `resolved_destination`
+        // would make connection metadata lie in the opposite direction.
+        if matches!(context.route_mode, RouteMode::Direct | RouteMode::Bypass) {
+            context.resolved_destination = Some(Endpoint::ip(context.network, remote_addr));
+        }
     }
     if let Some(observer) = observer {
         // TUN opens are published before the async connect so the management

@@ -70,6 +70,12 @@ impl RouteListSnapshot {
     /// matched list, including lists used only by a later rule.
     pub fn matching_names(&self, context: &FlowContext) -> Vec<String> {
         let mut names = Vec::new();
+        // Go's FakeDNS wrapper reverse-resolves a known synthetic address
+        // before it calls HostTrie.Search.  `effective_destination` is the
+        // equivalent view here: keep `destination` for packet/telemetry
+        // metadata, but never let the FakeIP range itself make a flow match
+        // the default LAN list.
+        let destination = context.effective_destination();
         for (name, values) in &self.values {
             let kind = self.kinds.get(name).map(String::as_str).unwrap_or_default();
             let matched = if kind == "process" || kind == "processes" {
@@ -81,7 +87,7 @@ impl RouteListSnapshot {
             } else {
                 self.host_indexes
                     .get(name)
-                    .is_some_and(|index| index.search(&context.destination).is_some())
+                    .is_some_and(|index| index.search(&destination).is_some())
             };
             if matched {
                 names.push(name.clone());
@@ -1954,6 +1960,31 @@ mod tests {
         ));
         context.process = Some("/usr/bin/example-app (deleted)".to_owned());
         assert_eq!(lists.matching_names(&context), vec!["apps"]);
+    }
+
+    #[test]
+    fn route_list_snapshot_matches_fakeip_flows_by_restored_domain() {
+        let lists = load_route_lists(&[GoRouteListRecord {
+            name: "LAN".to_owned(),
+            list_type: "host".to_owned(),
+            source_type: "local".to_owned(),
+            updated_at: 1,
+            data_json: br#"{
+                "type":"host",
+                "source":{"type":"local","local":{"lists":["198.18.0.0/15","example.com"]}}
+            }"#
+            .to_vec(),
+        }]);
+        let mut context = FlowContext::new(Endpoint::ip(
+            Network::Tcp,
+            "198.18.0.1:443".parse().unwrap(),
+        ));
+        context.original_domain = Some(DomainName::new("not-lan.example").unwrap());
+
+        assert!(lists.matching_names(&context).is_empty());
+
+        context.original_domain = Some(DomainName::new("example.com").unwrap());
+        assert_eq!(lists.matching_names(&context), vec!["LAN"]);
     }
 
     #[test]
