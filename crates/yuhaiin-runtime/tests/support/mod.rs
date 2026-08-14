@@ -2324,6 +2324,59 @@ pub async fn add_yuubinsya_inbound(service: &ServiceProcess, id: &str, listen: S
     settle_runtime_reload().await;
 }
 
+pub async fn add_vless_inbound(service: &ServiceProcess, id: &str, listen: SocketAddr, uuid: &str) {
+    add_protocol_inbound(
+        service,
+        id,
+        "VLESS integration inbound",
+        listen,
+        json!({"type":"vless","vless":{"uuid":uuid}}),
+    )
+    .await;
+}
+
+pub async fn add_trojan_inbound(
+    service: &ServiceProcess,
+    id: &str,
+    listen: SocketAddr,
+    password: &str,
+) {
+    add_protocol_inbound(
+        service,
+        id,
+        "Trojan integration inbound",
+        listen,
+        json!({"type":"trojan","trojan":{"password":password}}),
+    )
+    .await;
+}
+
+async fn add_protocol_inbound(
+    service: &ServiceProcess,
+    id: &str,
+    name: &str,
+    listen: SocketAddr,
+    protocol: Value,
+) {
+    let inbound = json!({
+        "id":id,
+        "name":name,
+        "enabled":true,
+        "network":{"type":"tcp_udp","tcp_udp":{"host":listen.to_string(),"udp":"disabled"}},
+        "transports":[{"type":"normal","normal":{}}],
+        "protocol":protocol
+    });
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        "/api/v2/inbounds",
+        Some(&inbound),
+    )
+    .await;
+    settle_runtime_reload().await;
+}
+
 /// Configure both Go-compatible reverse inbound forms against the built-in
 /// direct outbound. Keeping the pair in one process fixture exercises the
 /// persisted inbound contract and the shared listener supervisor together.

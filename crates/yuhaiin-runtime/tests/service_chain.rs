@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::Request;
-use serde_json::json;
+use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -17,15 +17,15 @@ use yuhaiin_protocol::{trojan, vless, vmess};
 use support::{
     ConnectFixture, H2FinalProtocol, H2ProtocolFixture, H2YuubinsyaFixture, ServiceProcess,
     Socks5Fixture, YUUBINSYA_PASSWORD, add_mixed_udp_inbound, add_reverse_inbounds,
-    add_socks5_inbound, add_yuubinsya_inbound, api_json, configure_aead_h2_http_inbound,
-    configure_direct_http_inbound, configure_h2_http_chain, configure_h2_http_inbound,
-    configure_h2_socks5_chain, configure_http_chain, configure_http_chain_with_transport,
-    configure_network_split_http_chain, configure_socks5_chain, configure_tls_aead_h2_http_inbound,
-    configure_tls_auto_http_inbound, configure_tls_h2_http_inbound,
-    configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound, connect_loopback,
-    connect_tls_h2_loopback, connect_tls_loopback, connect_tls_loopback_without_sni,
-    integration_dir, seed_empty_database, tls_server_acceptor, tls_termination_certificate,
-    wait_for_connection,
+    add_socks5_inbound, add_trojan_inbound, add_vless_inbound, add_yuubinsya_inbound, api_json,
+    configure_aead_h2_http_inbound, configure_direct_http_inbound, configure_h2_http_chain,
+    configure_h2_http_inbound, configure_h2_socks5_chain, configure_http_chain,
+    configure_http_chain_with_transport, configure_network_split_http_chain,
+    configure_socks5_chain, configure_tls_aead_h2_http_inbound, configure_tls_auto_http_inbound,
+    configure_tls_h2_http_inbound, configure_tls_h2_yuubinsya_chain, configure_tls_http_inbound,
+    connect_loopback, connect_tls_h2_loopback, connect_tls_loopback,
+    connect_tls_loopback_without_sni, integration_dir, seed_empty_database, tls_server_acceptor,
+    tls_termination_certificate, wait_for_connection,
 };
 
 #[cfg(target_os = "linux")]
@@ -3412,6 +3412,105 @@ async fn socks5_and_yuubinsya_inbounds_route_through_the_runtime_process() {
 
     yuubinsya.shutdown().await.unwrap();
     socks5.shutdown().await.unwrap();
+    service.shutdown().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vless_and_trojan_inbounds_route_through_the_runtime_process() {
+    const VLESS_UUID: &str = "00112233-4455-6677-8899-aabbccddeeff";
+    const TROJAN_PASSWORD: &str = "runtime-integration-trojan";
+
+    let fixture = ConnectFixture::start().await;
+    let _default_mixed_blocker = tokio::net::TcpListener::bind("127.0.0.1:1080").await.ok();
+    let vless_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let vless_inbound = vless_listener.local_addr().unwrap();
+    drop(vless_listener);
+    let trojan_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let trojan_inbound = trojan_listener.local_addr().unwrap();
+    drop(trojan_listener);
+
+    let root = integration_dir("service-vless-trojan-inbounds");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+    let service = ServiceProcess::start(&database).await;
+    add_vless_inbound(&service, "vless-required-in", vless_inbound, VLESS_UUID).await;
+    add_trojan_inbound(
+        &service,
+        "trojan-required-in",
+        trojan_inbound,
+        TROJAN_PASSWORD,
+    )
+    .await;
+
+    let destination = Endpoint::ip(Network::Tcp, fixture.target);
+    let uuid = vless::parse_uuid(VLESS_UUID).unwrap();
+    let mut vless_client = connect_loopback(vless_inbound).await;
+    vless::write_request(&mut vless_client, &uuid, vless::Command::Tcp, &destination)
+        .await
+        .unwrap();
+    vless::read_response(&mut vless_client).await.unwrap();
+    let vless_payload = b"vless-runtime-inbound-payload";
+    vless_client.write_all(vless_payload).await.unwrap();
+    let mut vless_echo = vec![0u8; vless_payload.len()];
+    vless_client.read_exact(&mut vless_echo).await.unwrap();
+    assert_eq!(vless_echo, vless_payload);
+
+    let hash = trojan::password_hash(TROJAN_PASSWORD.as_bytes());
+    let mut trojan_client = connect_loopback(trojan_inbound).await;
+    trojan::write_request(
+        &mut trojan_client,
+        &hash,
+        trojan::Command::Connect,
+        &destination,
+    )
+    .await
+    .unwrap();
+    let trojan_payload = b"trojan-runtime-inbound-payload";
+    trojan_client.write_all(trojan_payload).await.unwrap();
+    let mut trojan_echo = vec![0u8; trojan_payload.len()];
+    trojan_client.read_exact(&mut trojan_echo).await.unwrap();
+    assert_eq!(trojan_echo, trojan_payload);
+
+    let mut snapshot = Value::Null;
+    for _ in 0..100 {
+        snapshot = api_json(
+            &service.client,
+            &service.base_url,
+            reqwest::Method::GET,
+            "/api/v2/connections",
+            None,
+        )
+        .await;
+        let items = snapshot["connections"].as_array().unwrap();
+        if items.iter().any(|item| {
+            item["inboundName"] == "VLESS integration inbound"
+                && item["inbound"] == vless_inbound.to_string()
+        }) && items.iter().any(|item| {
+            item["inboundName"] == "Trojan integration inbound"
+                && item["inbound"] == trojan_inbound.to_string()
+        }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let items = snapshot["connections"].as_array().unwrap();
+    let vless_connection = items
+        .iter()
+        .find(|item| item["inboundName"] == "VLESS integration inbound")
+        .expect("VLESS inbound connection must be visible");
+    assert_eq!(vless_connection["inbound"], vless_inbound.to_string());
+    assert_eq!(vless_connection["outbound"], fixture.target.to_string());
+    let trojan_connection = items
+        .iter()
+        .find(|item| item["inboundName"] == "Trojan integration inbound")
+        .expect("Trojan inbound connection must be visible");
+    assert_eq!(trojan_connection["inbound"], trojan_inbound.to_string());
+    assert_eq!(trojan_connection["outbound"], fixture.target.to_string());
+
+    vless_client.shutdown().await.unwrap();
+    trojan_client.shutdown().await.unwrap();
     service.shutdown().await;
     fixture.shutdown().await;
 }
