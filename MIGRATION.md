@@ -5372,3 +5372,17 @@ Linux Podman 容器可以安装 Darwin rust-std 并进入 macOS cfg，但不能�
 仍由 GitHub Actions macOS native-service runner 验证真实 launchd 权限、安装、更新和回滚；状态
 继续标为 `[~]`，没有把跨目标 cfg check 冒充原生验收。所有状态和构建缓存写入
 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
+## 219. 2026-08-14 statistics 长压测与 WAL 持久化复验
+
+在默认 `stats-soak-smoke` 的 12 readers × 160 rounds × 256 writes、force-stop/reopen
+2/2 通过后，本轮把同一可复用 Podman harness 提升到 48 readers × 3000 rounds × 10000 writes。
+两个测试仍全部通过，第二个并发 flow update / API reader / restart persistence 场景耗时
+442.04 秒；没有出现 SQLite lock failure、projection error、数据断言失败或 restart 后读不到
+状态的问题。
+
+本轮复用并持续写入 `~/.cache/yuhaiin-rust/integration/stats-concurrency`，最终报告 SQLite
+文件 929792 bytes、WAL 239024 bytes。该结果证明当前 SQLite/WAL、实时 connections/traffic
+读取、projection retry 和 force-stop reopen 在长时间压力下保持一致；它仍不能替代真实生产时段
+的长期运行样本，因此 statistics 继续保留 `[~]`。高强度 442 秒矩阵不纳入默认 CI 时长，默认
+smoke 仍保持短矩阵。没有使用 `/tmp`。
