@@ -273,6 +273,80 @@ fn sqlite_backup_rejects_non_object_backup_settings_before_installing() {
 }
 
 #[test]
+fn sqlite_backup_rejects_existing_destination_sidecar_without_overwriting() {
+    let source = test_database_path();
+    let backup = source.with_file_name(format!(
+        "{}-sidecar-backup",
+        source.file_name().unwrap().to_string_lossy()
+    ));
+    let sidecar = PathBuf::from(format!("{}-wal", backup.display()));
+
+    let store = block_on(ConfigStore::open(&source)).unwrap();
+    block_on(store.put_config("backup.sidecar.guard", b"source-preserved")).unwrap();
+    fs::write(&sidecar, b"caller-owned sidecar").unwrap();
+
+    let error = block_on(store.backup_to(&backup)).unwrap_err();
+    assert!(error.message.contains("sidecar"));
+    assert_eq!(fs::read(&sidecar).unwrap(), b"caller-owned sidecar");
+    assert!(!backup.exists());
+    assert_eq!(
+        block_on(store.get_config("backup.sidecar.guard")).unwrap(),
+        Some(b"source-preserved".to_vec())
+    );
+
+    store.close().unwrap();
+    remove_database_artifacts(&source);
+    remove_database_artifacts(&backup);
+}
+
+#[test]
+fn sqlite_backup_failure_removes_sanitization_staging_files() {
+    let source = test_database_path();
+    let backup = source.with_file_name(format!(
+        "{}-staging-cleanup-backup",
+        source.file_name().unwrap().to_string_lossy()
+    ));
+    let backup_name = backup.file_name().unwrap().to_string_lossy().into_owned();
+    let staging_prefix = format!(".{backup_name}.yuhaiin-backup-");
+
+    let store = block_on(ConfigStore::open(&source)).unwrap();
+    block_on(
+        store
+            .repository()
+            .put_go_backup_settings(&GoBackupSettingsRecord {
+                updated_at: 1,
+                data_json: br#"{"lastBackupHash":"bad"}"#.to_vec(),
+            }),
+    )
+    .unwrap();
+    store
+        .with_write_transaction(|connection| {
+            connection
+                .execute("UPDATE backup_settings SET data_json = '[1,2,3]' WHERE id = 1")
+                .map_err(storage_error)
+        })
+        .unwrap();
+
+    let error = block_on(store.backup_to(&backup)).unwrap_err();
+    assert!(error.message.contains("JSON object"));
+    assert!(!backup.exists());
+    let staging_files = fs::read_dir(backup.parent().unwrap())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&staging_prefix))
+        .collect::<Vec<_>>();
+    assert!(
+        staging_files.is_empty(),
+        "leftover staging files: {staging_files:?}"
+    );
+
+    store.close().unwrap();
+    remove_database_artifacts(&source);
+    remove_database_artifacts(&backup);
+}
+
+#[test]
 fn sqlite_compact_is_thresholded_and_preserves_state() {
     let path = test_database_path();
     let store = block_on(ConfigStore::open(&path)).unwrap();
