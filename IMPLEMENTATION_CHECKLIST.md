@@ -188,7 +188,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 ### Protocol、transport 和 proxy chain
 
 - `[~]` **tls_auto / ECH**：普通动态 SNI、证书缓存、Go-shaped CA 字段和真实 TCP 链已通过；rustls 当前没有可直接使用的 server-side ECH API。下一步确认上游 API 或可维护的纯 Rust 实现；若仍无稳定实现，保留明确降级行为并将 ECH 记为延期能力。
-- `[~]` **VLESS / VMess / Trojan 更宽运行矩阵**：TCP、UDP、TLS、WebSocket、HTTP/2、Go wire interop 和真实 router chain 已通过；下一步把更多独立 listener、IPv4/IPv6、远端 UDP fixture 和 latency 场景固化到可复用 harness。
+- `[~]` **VLESS / VMess / Trojan 更宽运行矩阵**：TCP、UDP、TLS、WebSocket、HTTP/2、Go wire interop 和真实 router chain 已通过；Go 侧 `pkg/net/proxy/{vless,vmess,trojan}` 目前注册的是 outbound contract point，并没有对应 inbound listener，因此 Rust 的 VLESS/Trojan inbound 属于扩展能力，不把缺少 VMess inbound 当作 Go parity 缺口；下一步只补更多独立 outbound listener、IPv4/IPv6、远端 UDP fixture 和 latency 场景。
 
 ### SQLite、配置兼容和统计
 
@@ -259,6 +259,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` 2026-08-14 同一 Podman service-chain 新增 `vless_and_trojan_udp_inbounds_route_through_the_runtime_process`：VLESS 长度帧、Trojan Associate frame、真实 UDP echo、`underlyingType=udp` 和两条 connections 元数据均通过 2/2；新增 `yuubinsya_native_udp_and_uot_inbounds_route_through_the_runtime_process`，覆盖 Yuubinsya native UDP、UOT/dup-over-TCP、真实 UDP echo 和 native/UOT connections 元数据；协议入站的 TCP/UDP 运行时覆盖现在都不再只依赖内部 unit test。
 - `[x]` 2026-08-14 扩展 HTTP/2 协议 outbound fixture：VLESS/VMess/Trojan 的 IPv4 和 IPv6 H2 TCP 链均先完成 payload，再通过 `/api/v2/nodes/{id}/latency` 发起第二条健康连接；3/3 latency 通过，fixture 固定数据目标 443 与健康目标 80 的端口语义。
 - `[x]` 2026-08-14 重新运行 `make go-live-flow-parity-smoke` 和 `make go-rust-stats-smoke`：Go/Rust 真实 HTTP inbound → router → HTTP outbound 的 connections、total、traffic、history、telemetry、reload 后状态，以及共享 state 下的实时统计均通过；结果位于 `~/.cache/yuhaiin-rust/integration/go-live-flow-parity/20260814102414-127082` 和 `~/.cache/yuhaiin-rust/integration/go-rust-stats/20260814102414-126953`。
+- `[x]` 2026-08-14 对照 Go `pkg/net/proxy` 注册点确认：VLESS、VMess、Trojan 在 Go 版本只有 outbound contract point，没有 inbound server；Rust 当前新增的 VLESS/Trojan inbound 进程链作为扩展能力保留，Go parity 仍以 outbound wire/transport、UDP framing 和 router chain 为准。
 - `[x]` 2026-08-14 `make api-route-parity-smoke` 通过，82 个 Go v2 RPC operation 均有 Rust RPC 或 direct route 覆盖；本轮不把 route 数量覆盖误当作 handler 行为 parity，行为仍由上面的 API/production harness 验证。
 - `[x]` 2026-08-14 在 Podman 重跑 `make startup-logs-smoke`：真实前台二进制输出 database/API/supervisor startup progress、`runtime ready`、TUN disabled 和 clean shutdown；手动执行 `./yuhaiin` 不再是无输出的黑盒。
 - `[x]` 2026-08-14 在 Podman 重跑 `make tun-reload-traffic-smoke` 与 `make tun-reset-reconnect-smoke`：TUN disable→enable 后流量恢复，TCP reset 后重新连接并恢复流量，两个场景均 clean teardown。
