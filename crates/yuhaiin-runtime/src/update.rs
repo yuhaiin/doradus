@@ -587,10 +587,18 @@ where
         let _ = std::fs::remove_file(&replacement);
         return Err(format!("set staged executable permissions: {error}"));
     }
-    stop_service()?;
+    if let Err(error) = stop_service() {
+        // The replacement is only a temporary copy until the service has
+        // stopped. Do not leave it beside the executable when the service
+        // manager rejects the stop request; a later retry should start from
+        // the original target/staged pair.
+        let _ = std::fs::remove_file(&replacement);
+        return Err(format!("stop updated service: {error}"));
+    }
     let backup = target.with_extension("update-backup");
     let _ = std::fs::remove_file(&backup);
     std::fs::rename(&target, &backup).map_err(|error| {
+        let _ = std::fs::remove_file(&replacement);
         let _ = restart_service();
         format!("backup current executable: {error}")
     })?;
@@ -640,16 +648,18 @@ fn stop_platform_service() -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     {
-        // bootout is allowed to fail when the binary is being used in the
-        // foreground; bootstrap below remains the authoritative check.
-        let _ = std::process::Command::new("launchctl")
-            .args([
+        // The helper is detached from the service process. A failed bootout
+        // therefore means the old image may still be running; fail closed
+        // instead of replacing the executable under an active launchd job.
+        return run_command(
+            "launchctl",
+            &[
                 "bootout",
-                "system/",
+                "system",
                 "/Library/LaunchDaemons/com.asutorufa.yuhaiin.plist",
-            ])
-            .status();
-        return Ok(());
+            ],
+            "stop updated launchd service",
+        );
     }
     #[cfg(target_os = "linux")]
     {
@@ -966,6 +976,26 @@ mod tests {
         assert!(!target.with_extension("update-backup").exists());
         assert!(staged.exists(), "failed update remains staged for retry");
         assert_eq!(restart_calls.load(AtomicOrdering::Relaxed), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_helper_cleans_replacement_when_service_stop_fails() {
+        let (root, target, staged) = write_update_fixture("stop-failure");
+
+        let error = run_update_helper_with_hooks(
+            &target,
+            &staged,
+            || Err("fixture stop failure".to_owned()),
+            || panic!("restart must not run when stop fails"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "stop updated service: fixture stop failure");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old executable\n");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new executable\n");
+        assert!(!target.with_extension("update-stage").exists());
+        assert!(!target.with_extension("update-backup").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
