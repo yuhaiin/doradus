@@ -732,12 +732,29 @@ pub struct ProxyBuild {
 /// the direct transport reads `FlowContext::proxy_destination`.
 struct ResolvingProxy {
     inner: Arc<dyn AsyncProxy>,
-    resolver: Arc<dyn AsyncIpResolver>,
+    direct_resolver: Arc<dyn AsyncIpResolver>,
+    proxy_resolver: Arc<dyn AsyncIpResolver>,
 }
 
 impl ResolvingProxy {
     fn new(inner: Arc<dyn AsyncProxy>, resolver: Arc<dyn AsyncIpResolver>) -> Self {
-        Self { inner, resolver }
+        Self {
+            inner,
+            direct_resolver: Arc::clone(&resolver),
+            proxy_resolver: resolver,
+        }
+    }
+
+    fn with_route_resolvers(
+        inner: Arc<dyn AsyncProxy>,
+        direct_resolver: Arc<dyn AsyncIpResolver>,
+        proxy_resolver: Arc<dyn AsyncIpResolver>,
+    ) -> Self {
+        Self {
+            inner,
+            direct_resolver,
+            proxy_resolver,
+        }
     }
 
     fn resolve_context<'a>(
@@ -754,7 +771,12 @@ impl ResolvingProxy {
         else {
             return Box::pin(async move { Ok(resolved) });
         };
-        let resolver = Arc::clone(&self.resolver);
+        let resolver = match context.route_mode {
+            RouteMode::Proxy => Arc::clone(&self.proxy_resolver),
+            RouteMode::Direct | RouteMode::Bypass | RouteMode::Block => {
+                Arc::clone(&self.direct_resolver)
+            }
+        };
         let strategy = resolved.resolver_policy.strategy;
         Box::pin(async move {
             let addresses = resolver.resolve(&host, strategy).await?;
@@ -907,7 +929,7 @@ impl RuntimeSnapshot {
                     bind_interface: child.network_interface(),
                     global_bind_interface: self.socket_bind_interface.clone(),
                 }) as Arc<dyn AsyncProxy>;
-                Ok(self.resolve_proxy(proxy))
+                Ok(self.resolve_proxy_with_route_resolvers(proxy)?)
             }
             "reject" | "block" => Ok(Arc::new(DropAsyncProxy)),
             "drop" => Ok(Arc::new(DelayedDropAsyncProxy::new())),
@@ -1388,7 +1410,7 @@ impl RuntimeSnapshot {
             // endpoint before opening their final socket. Keep their lookup
             // on the runtime resolver boundary so route resolver policy,
             // hosts and FakeIP are not silently replaced by getaddrinfo.
-            self.resolve_proxy(proxy)
+            self.resolve_proxy_with_route_resolvers(proxy)?
         } else {
             proxy
         };
@@ -1506,6 +1528,22 @@ impl RuntimeSnapshot {
         Arc::new(ResolvingProxy::new(proxy, resolver))
     }
 
+    fn resolve_proxy_with_route_resolvers(
+        &self,
+        proxy: Arc<dyn AsyncProxy>,
+    ) -> Result<Arc<dyn AsyncProxy>> {
+        // A tagged direct node does not change the flow's route mode. Keep
+        // the resolver selection attached to that mode, as in Go: a direct
+        // node selected by Proxy mode still uses the Proxy resolver.
+        let direct_resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
+        let proxy_resolver = self.dns_resolver_for_route_mode(RouteMode::Proxy)?;
+        Ok(Arc::new(ResolvingProxy::with_route_resolvers(
+            proxy,
+            direct_resolver,
+            proxy_resolver,
+        )))
+    }
+
     pub(crate) fn resolve_proxy(&self, proxy: Arc<dyn AsyncProxy>) -> Arc<dyn AsyncProxy> {
         self.resolve_proxy_with_resolver(proxy, self.dns_resolver.clone())
     }
@@ -1533,8 +1571,7 @@ impl RuntimeSnapshot {
                 semaphore: self.connect_semaphore.clone(),
             }) as Arc<dyn AsyncProxy>;
             return Ok(if is_direct {
-                let resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
-                self.resolve_proxy_with_resolver(proxy, resolver)
+                self.resolve_proxy_with_route_resolvers(proxy)?
             } else {
                 proxy
             });
@@ -4112,6 +4149,101 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .as_slice(),
             ["ip.sb"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tagged_direct_node_uses_proxy_resolver_for_proxy_mode_tun_fakeip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut payload = [0u8; 16];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut payload)
+                .await
+                .unwrap();
+            payload
+        });
+
+        let fake_queries = Arc::new(Mutex::new(Vec::new()));
+        let fake_resolver: Arc<dyn AsyncIpResolver> = Arc::new(MappingResolver {
+            address: "198.18.0.1".parse().unwrap(),
+            queries: Arc::clone(&fake_queries),
+        });
+        let real_queries = Arc::new(Mutex::new(Vec::new()));
+        let real_resolver: Arc<dyn AsyncIpResolver> = Arc::new(MappingResolver {
+            address: address.ip().to_string().parse().unwrap(),
+            queries: Arc::clone(&real_queries),
+        });
+        let config = GoProxyRuntimeConfig {
+            id: "direct-node".to_owned(),
+            name: "Direct node".to_owned(),
+            group_name: String::new(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["direct".to_owned()],
+            layers: Vec::new(),
+            transport: GoProxyTransport::Direct,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        };
+        let mut snapshot = snapshot_with_resolver(config, Arc::clone(&fake_resolver));
+        snapshot.route = Some(yuhaiin_store::GoRouteRuntimeConfig {
+            direct_resolver: "direct".to_owned(),
+            proxy_resolver: "proxy".to_owned(),
+            resolve_locally: false,
+            udp_proxy_fqdn: yuhaiin_store::GoUdpProxyFqdnStrategy::Resolve,
+        });
+        snapshot
+            .dns_resolver_by_id
+            .insert("direct".to_owned(), Arc::clone(&fake_resolver));
+        snapshot
+            .dns_resolver_by_id
+            .insert("proxy".to_owned(), real_resolver);
+        snapshot.resolver_registry_enabled = true;
+        snapshot.node_tags.push(yuhaiin_store::GoNodeTagRecord {
+            id: "edge".to_owned(),
+            name: "edge".to_owned(),
+            members_json: br#"{"type":"node","hash":["direct-node"]}"#.to_vec(),
+            updated_at: 1,
+        });
+
+        let selector = snapshot
+            .build_proxy_selector("", "", "", "", Duration::from_secs(1))
+            .await
+            .unwrap();
+        let fake_ip = "198.18.0.1".parse().unwrap();
+        let domain = yuhaiin_core::DomainName::new("www.baidu.com").unwrap();
+        let mut context = FlowContext::new(Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            SocketAddr::new(fake_ip, address.port()),
+        ));
+        context.original_domain = Some(domain);
+        context.fake_ip = Some(fake_ip.to_string());
+        // A node tag is selected in Proxy mode, while the selected node's
+        // protocol is direct. This is the exact TUN route shape reported by
+        // the UI and must still use the non-FakeIP Proxy resolver.
+        context.route_mode = RouteMode::Proxy;
+        context.tag = Some("edge".to_owned());
+
+        let proxy = selector.select(&context);
+        let mut stream = proxy.connect(&context).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"tagged-direct-ok")
+            .await
+            .unwrap();
+
+        assert_eq!(server.await.unwrap(), *b"tagged-direct-ok");
+        assert!(
+            fake_queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
+        assert_eq!(
+            real_queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            ["www.baidu.com"]
         );
     }
 
