@@ -192,23 +192,29 @@ YUHAIIN_BENCH_BYTES=$((256 * 1024 * 1024)) make benchmark-throughput
 ```
 
 The result is only comparable when the machine, profile, payload, network
-namespace, and fixture are held constant. The benchmark matrix currently
-covers HTTP inbound → route → HTTP CONNECT outbound and HTTP inbound → route →
-TLS → HTTP/2 → Yuubinsya TCP-over-stream outbound. TUN currently has a privileged
-Podman packet benchmark (`make benchmark-tun-throughput`) in addition to the
-device/lifecycle smoke (`scripts/integration/tun-service.sh`). The TUN runner
-uses one real `tun-rs + smoltcp + fixed proxy + loopback echo` stream and
-defaults to a stable 4 MiB transfer; increase `YUHAIIN_TUN_BENCH_BYTES` only
-when investigating long-stream behavior. The Cloudflare BoringTun userspace
-adapter has its own Podman packet benchmark (`make benchmark-wireguard-throughput`)
-and is kept separate from this runtime relay benchmark; the current 64 MiB
-same-host baseline is 595.89 MiB/s with 3,504 KiB peak RSS.
+namespace, and fixture are held constant. The benchmark matrix covers HTTP
+inbound → route → HTTP CONNECT outbound, HTTP inbound → route → TLS → HTTP/2 →
+Yuubinsya TCP-over-stream outbound, a real TUN packet path, and the Cloudflare
+BoringTun userspace packet path. The TUN runner uses one real
+`tun-rs + smoltcp + fixed proxy + loopback echo` stream. The WireGuard runner is
+kept separate from the runtime relay benchmark and measures BoringTun packet
+encryption/decryption without a public peer.
 
-The 2026-08-10 Linux verification completed the lifecycle smoke and the
-default 4 MiB benchmark. The Podman run created and removed `yrtun0`, relayed
-the fixed-proxy loopback echo, and reported `55.769740794235275 MiB/s`,
-`12440 KiB` peak RSS, and `12` CPU ticks. These numbers are a baseline for
-this host, not a cross-machine performance promise.
+The latest Podman release run was completed on 2026-08-14 with a single 64 MiB
+loopback payload. It recorded the following same-host regression baseline:
+
+| Scenario | Throughput | Peak RSS | CPU ticks | Samples |
+| --- | ---: | ---: | ---: | ---: |
+| HTTP inbound → HTTP CONNECT | 152.08 MiB/s | 19,616 KiB | 35 | 21 |
+| HTTP inbound → TLS/H2/Yuubinsya | 54.26 MiB/s | 21,804 KiB | 98 | 57 |
+| TUN inbound → fixed → loopback | 47.82 MiB/s | 13,280 KiB | 241 | 35,591 |
+| BoringTun userspace packet | 542.52 MiB/s | 3,732 KiB | 11 | 190 |
+
+The raw `BENCHMARK {...}` lines are kept in
+`~/.cache/yuhaiin-rust/benchmarks/{http-throughput,tun-throughput,wireguard}/podman.log`.
+These figures are intended for regression tracking on the same host with the
+same profile, payload, namespace, and fixture. They are not a cross-machine,
+public-network, or WARP performance guarantee.
 
 Run the tests from the repository root:
 

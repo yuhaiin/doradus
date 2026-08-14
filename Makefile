@@ -15,7 +15,10 @@ ANDROID_TARGET ?= aarch64-linux-android
 ANDROID_CLANG ?= $(ANDROID_NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin/$(ANDROID_TARGET)$(ANDROID_API)-clang
 ANDROID_LLVM_AR ?= $(ANDROID_NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
 MUSL ?= 0
-MUSL_TARGET ?= x86_64-unknown-linux-musl
+MUSL_HOST_ARCH ?= $(shell uname -m)
+# Build a native musl binary by default.  Keep MUSL_TARGET overridable for
+# deliberate cross builds, which must also provide a matching C toolchain.
+MUSL_TARGET ?= $(if $(filter aarch64 arm64,$(MUSL_HOST_ARCH)),aarch64-unknown-linux-musl,x86_64-unknown-linux-musl)
 ifeq ($(HOST_CARGO),1)
 RUST_SYSROOT ?= $(shell $(RUSTC) --print sysroot)
 RUST_HOST ?= $(shell $(RUSTC) -vV | sed -n 's/^host: //p')
@@ -94,7 +97,7 @@ help:
 		'make build-release      build the yuhaiin runtime binary in Podman (release)' \
 		'make build MUSL=1       build a static musl debug binary in Podman' \
 		'make build-musl         alias for make build MUSL=1' \
-		'make build-release-musl build a static musl release binary' \
+		'make build-release-musl build a static musl release binary (native arch by default)' \
 		'make build-all-bins     build every workspace binary' \
 		'make build-tun-smoke    build the privileged TUN smoke binary' \
 		'make build-tun-service-smoke build the runtime-owned TUN smoke binary' \
