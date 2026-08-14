@@ -62,6 +62,7 @@ impl RustCryptoResolverFactory {
     }
 
     pub fn with_proxy_bridge(mut self, bridge: Arc<ResolverProxyBridge>) -> Self {
+        self.builtin = self.builtin.with_proxy_bridge(bridge.clone());
         self.doh = self.doh.with_proxy_bridge(bridge.clone());
         self.dot = self.dot.with_proxy_bridge(bridge);
         self

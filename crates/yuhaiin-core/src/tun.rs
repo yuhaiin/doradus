@@ -58,7 +58,7 @@ pub use crate::flow::{FlowDirection as TunFlowDirection, FlowObserver as TunFlow
 use crate::dns::{AsyncDnsHandler, DnsHandler, answer_query};
 
 #[cfg(feature = "async-proxy")]
-use crate::proxy::{AsyncProxy, AsyncProxySelector, stream_local_addr};
+use crate::proxy::{AsyncProxy, AsyncProxySelector, stream_local_addr, stream_remote_addr};
 
 fn tun_debug(message: impl std::fmt::Display) {
     if std::env::var_os("YUHAIIN_TUN_DEBUG").is_some() {
@@ -1984,6 +1984,10 @@ async fn run_tcp_proxy(
     };
     if let Some(local_addr) = stream_local_addr(&*stream) {
         context.outbound_local_addr = Some(Endpoint::ip(context.network, local_addr));
+    }
+    if let Some(remote_addr) = stream_remote_addr(&*stream) {
+        context.outbound_addr = Some(Endpoint::ip(context.network, remote_addr));
+        context.resolved_destination = Some(Endpoint::ip(context.network, remote_addr));
     }
     if let Some(observer) = observer {
         // TUN opens are published before the async connect so the management

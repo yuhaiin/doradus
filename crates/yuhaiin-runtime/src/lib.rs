@@ -423,6 +423,8 @@ impl RuntimeBuilder {
         let resolvers = repository.list_go_resolver_runtime_configs().await?;
         let route = repository.load_go_route_runtime_config().await?;
         if let Some(bridge) = &self.resolver_proxy_bridge {
+            bridge
+                .set_configured_resolver_ids(resolvers.iter().map(|resolver| resolver.id.as_str()));
             bridge.set_proxy_resolver_id(route.as_ref().map(|route| route.proxy_resolver.as_str()));
         }
         let route_rules = repository.list_go_route_rules().await?;

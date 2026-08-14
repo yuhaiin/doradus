@@ -19,6 +19,7 @@ use yuhaiin_core::proxy::{
 use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyKind};
 use yuhaiin_core::{
     BoxFuture, Endpoint, Error, ErrorKind, FlowContext, GeoLookup, IpSet, ResolveStrategy, Result,
+    RouteMode,
 };
 use yuhaiin_store::{GoProxyLayer, GoProxyRuntimeConfig, GoProxyTransport};
 use yuhaiin_trie::router::RuntimeRoutedProxySelector;
@@ -1491,8 +1492,22 @@ impl RuntimeSnapshot {
         })
     }
 
+    /// Wrap a proxy with the resolver used for final outbound sockets.
+    ///
+    /// `self.resolver` may include the FakeIP answer policy because it is also
+    /// used for DNS responses.  A proxy that is already handling a restored
+    /// FakeIP domain must never use that policy for its final dial, otherwise
+    /// resolving `example.com` can produce the same synthetic address again.
+    fn resolve_proxy_with_resolver(
+        &self,
+        proxy: Arc<dyn AsyncProxy>,
+        resolver: Arc<dyn AsyncIpResolver>,
+    ) -> Arc<dyn AsyncProxy> {
+        Arc::new(ResolvingProxy::new(proxy, resolver))
+    }
+
     pub(crate) fn resolve_proxy(&self, proxy: Arc<dyn AsyncProxy>) -> Arc<dyn AsyncProxy> {
-        Arc::new(ResolvingProxy::new(proxy, self.resolver.clone()))
+        self.resolve_proxy_with_resolver(proxy, self.dns_resolver.clone())
     }
 
     async fn build_proxy_slot(
@@ -1518,7 +1533,8 @@ impl RuntimeSnapshot {
                 semaphore: self.connect_semaphore.clone(),
             }) as Arc<dyn AsyncProxy>;
             return Ok(if is_direct {
-                self.resolve_proxy(proxy)
+                let resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
+                self.resolve_proxy_with_resolver(proxy, resolver)
             } else {
                 proxy
             });
@@ -4025,6 +4041,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(server.await.unwrap(), *b"resolved-domain");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tun_fakeip_domain_uses_non_fakeip_resolver_for_direct_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut payload = [0u8; 18];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut payload)
+                .await
+                .unwrap();
+            payload
+        });
+
+        let fake_queries = Arc::new(Mutex::new(Vec::new()));
+        let fake_resolver = Arc::new(MappingResolver {
+            address: "198.18.0.1".parse().unwrap(),
+            queries: Arc::clone(&fake_queries),
+        });
+        let real_queries = Arc::new(Mutex::new(Vec::new()));
+        let real_resolver = Arc::new(MappingResolver {
+            address: address.ip().to_string().parse().unwrap(),
+            queries: Arc::clone(&real_queries),
+        });
+        let config = GoProxyRuntimeConfig {
+            id: "direct".to_owned(),
+            name: "Direct".to_owned(),
+            group_name: String::new(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec!["direct".to_owned()],
+            layers: Vec::new(),
+            transport: GoProxyTransport::Direct,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        };
+        let mut snapshot = snapshot_with_resolver(config, fake_resolver);
+        snapshot.dns_resolver = real_resolver;
+        let selector = snapshot
+            .build_proxy_selector("", "", "", "", Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let fake_ip = "198.18.0.1".parse().unwrap();
+        let domain = yuhaiin_core::DomainName::new("ip.sb").unwrap();
+        let mut context = FlowContext::new(Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            SocketAddr::new(fake_ip, address.port()),
+        ));
+        context.original_domain = Some(domain);
+        context.fake_ip = Some(fake_ip.to_string());
+        context.route_mode = RouteMode::Direct;
+        let proxy = selector.select(&context);
+        let mut stream = proxy.connect(&context).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"fakeip-real-target")
+            .await
+            .unwrap();
+
+        assert_eq!(server.await.unwrap(), *b"fakeip-real-target");
+        assert!(
+            fake_queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
+        assert_eq!(
+            real_queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            ["ip.sb"]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

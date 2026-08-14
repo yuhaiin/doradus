@@ -797,17 +797,38 @@ pub type BoxAsyncStream = Box<dyn AsyncStream>;
 #[cfg(feature = "async-proxy")]
 pub struct LocalAddrStream {
     inner: BoxAsyncStream,
-    local_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
+    remote_addr: Option<SocketAddr>,
 }
 
 #[cfg(feature = "async-proxy")]
 impl LocalAddrStream {
     pub fn new(inner: BoxAsyncStream, local_addr: SocketAddr) -> Self {
-        Self { inner, local_addr }
+        Self {
+            inner,
+            local_addr: Some(local_addr),
+            remote_addr: None,
+        }
     }
 
-    pub fn local_addr(&self) -> SocketAddr {
+    fn with_socket_addrs(
+        inner: BoxAsyncStream,
+        local_addr: Option<SocketAddr>,
+        remote_addr: Option<SocketAddr>,
+    ) -> Self {
+        Self {
+            inner,
+            local_addr,
+            remote_addr,
+        }
+    }
+
+    pub fn local_addr(&self) -> Option<SocketAddr> {
         self.local_addr
+    }
+
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.remote_addr
     }
 }
 
@@ -846,7 +867,15 @@ pub fn stream_local_addr(stream: &dyn AsyncStream) -> Option<SocketAddr> {
     stream
         .as_any()
         .downcast_ref::<LocalAddrStream>()
-        .map(LocalAddrStream::local_addr)
+        .and_then(LocalAddrStream::local_addr)
+}
+
+#[cfg(feature = "async-proxy")]
+pub fn stream_remote_addr(stream: &dyn AsyncStream) -> Option<SocketAddr> {
+    stream
+        .as_any()
+        .downcast_ref::<LocalAddrStream>()
+        .and_then(LocalAddrStream::remote_addr)
 }
 
 #[cfg(feature = "async-proxy")]
@@ -854,12 +883,25 @@ pub fn with_stream_local_addr(
     stream: BoxAsyncStream,
     local_addr: Option<SocketAddr>,
 ) -> BoxAsyncStream {
-    match local_addr {
-        Some(local_addr) if stream_local_addr(&*stream).is_none() => {
-            Box::new(LocalAddrStream::new(stream, local_addr))
-        }
-        _ => stream,
+    with_stream_socket_addrs(stream, local_addr, None)
+}
+
+#[cfg(feature = "async-proxy")]
+pub fn with_stream_socket_addrs(
+    stream: BoxAsyncStream,
+    local_addr: Option<SocketAddr>,
+    remote_addr: Option<SocketAddr>,
+) -> BoxAsyncStream {
+    if (local_addr.is_none() || stream_local_addr(&*stream).is_some())
+        && (remote_addr.is_none() || stream_remote_addr(&*stream).is_some())
+    {
+        return stream;
     }
+    Box::new(LocalAddrStream::with_socket_addrs(
+        stream,
+        local_addr,
+        remote_addr,
+    ))
 }
 
 #[cfg(feature = "async-proxy")]
@@ -947,9 +989,10 @@ impl AsyncProxy for DirectAsyncProxy {
                 {
                     Ok(stream) => {
                         let local_addr = stream.local_addr().ok();
-                        return Ok(with_stream_local_addr(
+                        return Ok(with_stream_socket_addrs(
                             Box::new(stream) as BoxAsyncStream,
                             local_addr,
+                            Some(address),
                         ));
                     }
                     Err(error) => last_error = Some(error),
@@ -1469,9 +1512,10 @@ impl AsyncProxy for FixedAsyncProxy {
             )
             .await?;
             let local_addr = stream.local_addr().ok();
-            Ok(with_stream_local_addr(
+            Ok(with_stream_socket_addrs(
                 Box::new(stream) as BoxAsyncStream,
                 local_addr,
+                Some(self.address),
             ))
         })
     }
