@@ -160,20 +160,57 @@ async fn run_with_shutdown(
 }
 
 fn default_database_path() -> PathBuf {
-    let config_root = std::env::var_os("XDG_CONFIG_HOME")
+    let config_root = default_config_root();
+    let data_root = default_data_root();
+    let go_path = config_root.join("yuhaiin/state.db");
+    let rust_path = data_root.join("yuhaiin-rust/state.sqlite");
+    choose_database_path(&go_path, &rust_path, go_path.exists(), rust_path.exists())
+}
+
+fn default_config_root() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join("Library/Application Support");
+    }
+
+    #[cfg(windows)]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        return PathBuf::from(appdata);
+    }
+
+    std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let go_path = config_root.join("yuhaiin/state.db");
-    let rust_path = std::env::var_os("XDG_DATA_HOME")
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn default_data_root() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join("Library/Application Support");
+    }
+
+    #[cfg(windows)]
+    if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local_appdata);
+    }
+
+    std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("yuhaiin-rust/state.sqlite");
-    if go_path.exists() || !rust_path.exists() {
-        go_path
+}
+
+fn choose_database_path(
+    go_path: &std::path::Path,
+    rust_path: &std::path::Path,
+    go_exists: bool,
+    rust_exists: bool,
+) -> PathBuf {
+    if go_exists || !rust_exists {
+        go_path.to_owned()
     } else {
-        rust_path
+        rust_path.to_owned()
     }
 }
 
@@ -251,7 +288,7 @@ fn console_notice(message: impl std::fmt::Display) {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{RunOptions, parse_run_options, quiet_env_value_enabled};
+    use super::{RunOptions, choose_database_path, parse_run_options, quiet_env_value_enabled};
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -296,6 +333,30 @@ mod tests {
     #[test]
     fn empty_arguments_mean_default_run() {
         assert_eq!(parse_run_options(&[]), Ok(RunOptions::default()));
+    }
+
+    #[test]
+    fn prefers_existing_go_state_for_backend_replacement() {
+        let go_path = PathBuf::from("config/yuhaiin/state.db");
+        let rust_path = PathBuf::from("data/yuhaiin-rust/state.sqlite");
+        assert_eq!(
+            choose_database_path(&go_path, &rust_path, true, true),
+            go_path
+        );
+    }
+
+    #[test]
+    fn reuses_existing_rust_state_only_when_go_state_is_absent() {
+        let go_path = PathBuf::from("config/yuhaiin/state.db");
+        let rust_path = PathBuf::from("data/yuhaiin-rust/state.sqlite");
+        assert_eq!(
+            choose_database_path(&go_path, &rust_path, false, true),
+            rust_path
+        );
+        assert_eq!(
+            choose_database_path(&go_path, &rust_path, false, false),
+            go_path
+        );
     }
 
     #[test]
