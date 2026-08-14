@@ -235,6 +235,7 @@ async fn forward_request(
         Ok(target) => target,
         Err(error) => return error_response(StatusCode::BAD_GATEWAY, error.to_string()),
     };
+    let forwards_trailers = has_header_token(request.headers(), header::TE, "trailers");
     let context = target_context(&base_context, destination);
     let (mut parts, body) = request.into_parts();
     if let Some(rules) = lookup_headers(&headers, &context.destination) {
@@ -248,6 +249,19 @@ async fn forward_request(
         parts.headers.insert(header::HOST, value);
     }
     remove_hop_by_hop(&mut parts.headers);
+    if forwards_trailers {
+        parts
+            .headers
+            .insert(header::TE, HeaderValue::from_static("trailers"));
+    }
+    add_go_forwarded_for(&mut parts.headers, &base_context);
+    if !parts.headers.contains_key(header::USER_AGENT) {
+        // net/http/httputil deliberately suppresses the Go transport's
+        // default User-Agent when the Director did not supply one.
+        parts
+            .headers
+            .insert(header::USER_AGENT, HeaderValue::from_static(""));
+    }
     parts.uri = target_uri;
     parts.version = Version::HTTP_11;
     let request = Request::from_parts(parts, body);
@@ -413,9 +427,47 @@ fn remove_hop_by_hop(headers: &mut HeaderMap) {
         header::PROXY_AUTHORIZATION,
         header::TE,
         header::TRAILER,
+        header::TRANSFER_ENCODING,
         header::UPGRADE,
     ] {
         headers.remove(name);
+    }
+}
+
+fn has_header_token(headers: &HeaderMap, name: HeaderName, expected: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case(expected))
+        })
+}
+
+fn add_go_forwarded_for(headers: &mut HeaderMap, context: &FlowContext) {
+    let forwarded_for = HeaderName::from_static("x-forwarded-for");
+    let Some(client_ip) = context
+        .source
+        .as_ref()
+        .and_then(Endpoint::addr)
+        .map(|address| address.ip().to_string())
+    else {
+        return;
+    };
+
+    let prior = headers
+        .get_all(&forwarded_for)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>();
+    let value = if prior.is_empty() {
+        client_ip
+    } else {
+        format!("{}, {client_ip}", prior.join(", "))
+    };
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        headers.insert(forwarded_for, value);
     }
 }
 
@@ -618,6 +670,61 @@ mod tests {
         client.read_to_end(&mut response).await.unwrap();
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert!(response.ends_with(b"hello"));
+        proxy.close().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preserves_go_director_forwarding_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            let request_lower = request.to_ascii_lowercase();
+            assert!(request_lower.contains("x-forwarded-for: 203.0.113.5, 198.51.100.10\r\n"));
+            assert!(request_lower.contains("te: trailers\r\n"));
+            assert!(request_lower.contains("user-agent: \r\n"));
+            assert!(!request_lower.contains("x-remove-me:"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        let parent: Arc<dyn AsyncProxy> = Arc::new(FixedAsyncProxy {
+            address,
+            timeout: Duration::from_secs(1),
+        });
+        let proxy = HttpTerminationProxy::new(parent, rules(serde_json::json!({})), false);
+        let mut context = FlowContext::new(Endpoint::ip(
+            Network::Tcp,
+            SocketAddr::from(([192, 0, 2, 1], 443)),
+        ));
+        context.source = Some(Endpoint::ip(
+            Network::Tcp,
+            SocketAddr::from(([198, 51, 100, 10], 12345)),
+        ));
+        let mut client = proxy.connect(&context).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET /headers HTTP/1.1\r\nHost: localhost:{}\r\nX-Forwarded-For: 203.0.113.5\r\nConnection: close, X-Remove-Me\r\nX-Remove-Me: remove\r\nTE: gzip, trailers\r\n\r\n",
+                    address.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(b"ok"));
         proxy.close().await.unwrap();
         server.await.unwrap();
     }

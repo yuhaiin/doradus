@@ -5264,3 +5264,23 @@ connections 流程。
 Podman 验证结果：`make go-termination-parity-smoke` Go/Rust 共 10/10（新增坏文件回退场景
 2/2），`cargo test -p yuhaiin-runtime --all-features tls_termination` 为 4/4；所有状态、
 日志和构建缓存位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
+## 213. 2026-08-14 http_termination forwarding headers parity
+
+继续对照 Go `net/http/httputil.ReverseProxy.ServeHTTP` 的 Director 后处理。Rust 的
+`http_termination` 之前已经清理固定 hop-by-hop headers，但没有完整覆盖 Go transport 前的
+三个细节：由入站 `RemoteAddr` 追加 `X-Forwarded-For`、当入站 `TE` token 包含 `trailers`
+时重新保留 `TE: trailers`，以及 Director 没有提供 `User-Agent` 时用空 header 抑制默认
+transport UA。与此同时显式移除 `Transfer-Encoding`，避免把客户端 framing 元数据带到新的
+上游 HTTP/1 请求。
+
+Rust 现在从 `FlowContext.source` 取得 client IP，按 Go 的既有 XFF 值加上逗号分隔的新地址；
+`Connection` token 声明的自定义 header、`TE` 的非 trailers 值和其他 hop-by-hop header 仍会
+被清理。新增 focused test 检查 XFF、TE、空 UA 和 token header 清理，并使用真实 parent
+stream 验证 200 response/body，不把纯函数断言当成链路证据。
+
+Podman 验证结果：`cargo test --locked -p yuhaiin-runtime --all-features http_termination`
+过滤集 9/9，`make service-chain-smoke` 为 33 passed、1 ignored，`make
+go-termination-parity-smoke` 为 Go/Rust 10/10；所有状态、日志和 cargo target 继续位于
+`~/.cache/yuhaiin-rust`，没有使用 `/tmp`。HTTP termination 仍保留 `[~]`，因为 Go live
+HTTPS/error/证书矩阵以及更广现场对照尚未全部完成。
