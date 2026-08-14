@@ -80,7 +80,7 @@ endif
 RUNTIME_PACKAGE := yuhaiin-runtime
 RUNTIME_BIN := yuhaiin
 
-.PHONY: help cache-usage cache-prune checklist-check build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-udp-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-reset-reconnect-smoke tun-mtu-smoke tun-distro-smoke release-linux-cross-smoke release-windows-cross-smoke tun-ipv6-extension-smoke tun-route-matrix-smoke tun-api-process-smoke wireguard-smoke wireguard-chain-smoke wireguard-external-smoke maxmind-smoke s3-minio-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke go-termination-parity-smoke go-termination-https-smoke http-inbound-https-smoke go-protocol-interop-smoke refact-user-parity-smoke production-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput benchmark-wireguard-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke socks5-protocol-smoke node-latency-dns-smoke stats-concurrency-smoke stats-soak-smoke startup-logs-smoke workspace-tests \
+.PHONY: help cache-usage cache-prune checklist-check build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-udp-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-reset-reconnect-smoke tun-mtu-smoke tun-distro-smoke release-linux-cross-smoke release-windows-cross-smoke tun-ipv6-extension-smoke tun-route-matrix-smoke tun-api-process-smoke wireguard-smoke wireguard-chain-smoke wireguard-external-smoke maxmind-smoke s3-minio-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke go-termination-parity-smoke go-termination-https-smoke http-inbound-https-smoke go-protocol-interop-smoke refact-user-parity-smoke production-parity-smoke production-abnormal-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput benchmark-wireguard-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke socks5-protocol-smoke node-latency-dns-smoke stats-concurrency-smoke stats-soak-smoke startup-logs-smoke workspace-tests \
 	api-route-parity-smoke release-contract-smoke \
 	build-chain-smoke run version check test fmt fmt-check clippy \
 	android-aarch64
@@ -123,6 +123,7 @@ help:
 		'make api-contract-smoke run the frontend management API process contract in Podman' \
 		'make api-reload-flow-smoke verify mutation reloads the real data plane and survives restart' \
 		'make go-api-parity-smoke compare read and core mutation API responses against a Go state snapshot' \
+		'make production-abnormal-parity-smoke force-stop Go/Rust services and replay stable API reads' \
 		'make go-live-flow-parity-smoke compare Go/Rust live inbound-router-outbound connections and statistics' \
 		'make go-termination-parity-smoke compare Go/Rust reverse HTTP termination TLS flow' \
 		'make go-termination-https-smoke compare Go/Rust reverse HTTPS upstream (external)' \
@@ -297,6 +298,9 @@ refact-user-parity-smoke:
 
 production-parity-smoke:
 	./scripts/integration/production-parity.sh
+
+production-abnormal-parity-smoke:
+	YUHAIIN_FORCE_STOP_REOPEN=1 ./scripts/integration/production-parity.sh
 
 api-route-parity-smoke:
 	./scripts/maintenance/check-api-route-parity.sh

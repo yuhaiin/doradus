@@ -139,26 +139,30 @@ else
   cp --reflink=auto "${source_db}" "${scenario_dir}/rust/state.sqlite"
 fi
 
-echo "[go-api-parity] starting Go and Rust services in Podman"
-podman run -d \
-  --name "${go_container}" \
-  -p "${go_http}:50051" \
-  -v "${scenario_dir}/go:/data:Z" \
-  -v "${go_binary}:/usr/local/bin/yuhaiin:ro" \
-  --entrypoint /usr/local/bin/yuhaiin \
-  "${image}" \
-  -host 0.0.0.0:50051 -path /data \
-  >"${scenario_dir}/go-container-id"
-podman run -d \
-  --name "${rust_container}" \
-  -p "${rust_http}:50051" \
-  -v "${scenario_dir}/rust:/data:Z" \
-  -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
-  -e YUHAIIN_DB=/data/state.sqlite \
-  -e YUHAIIN_HTTP=0.0.0.0:50051 \
-  --entrypoint /usr/local/bin/yuhaiin \
-  "${image}" \
-  >"${scenario_dir}/rust-container-id"
+start_services() {
+  echo "[go-api-parity] starting Go and Rust services in Podman"
+  podman run -d \
+    --name "${go_container}" \
+    -p "${go_http}:50051" \
+    -v "${scenario_dir}/go:/data:Z" \
+    -v "${go_binary}:/usr/local/bin/yuhaiin:ro" \
+    --entrypoint /usr/local/bin/yuhaiin \
+    "${image}" \
+    -host 0.0.0.0:50051 -path /data \
+    >"${scenario_dir}/go-container-id"
+  podman run -d \
+    --name "${rust_container}" \
+    -p "${rust_http}:50051" \
+    -v "${scenario_dir}/rust:/data:Z" \
+    -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
+    -e YUHAIIN_DB=/data/state.sqlite \
+    -e YUHAIIN_HTTP=0.0.0.0:50051 \
+    --entrypoint /usr/local/bin/yuhaiin \
+    "${image}" \
+    >"${scenario_dir}/rust-container-id"
+}
+
+start_services
 
 wait_ready "${go_http}"
 wait_ready "${rust_http}"
@@ -193,6 +197,7 @@ request() {
 
 normalize() {
   local operation="$1"
+  local stage="${2:-initial}"
   case "${operation}" in
     info)
       # Version/compiler/build metadata are intentionally implementation
@@ -226,7 +231,43 @@ normalize() {
       # those implementation-specific background attempts. Transfer totals
       # and dimensions remain strict here, while failure counters are covered
       # by the SQLite migration/store tests and live proxy-flow tests.
-      jq -S '.groups |= map(.items |= map(del(.failures)))'
+      if [[ "${stage}" == "force-stop-reopen" ]]; then
+        # The mutation matrix deliberately tests route.rules.test against a
+        # domain while the legacy fixture has no selected TCP node. Go's
+        # resolver records that failed-only probe as zero-byte telemetry;
+        # Rust's management route test does not open a proxy connection.
+        # Drop only zero-byte entries in this replay stage. Any traffic-bearing
+        # dimension remains strict, as do all other stages.
+        jq -S '.groups |= map(.items |= map(select((.download != "0") or (.upload != "0"))) | .items |= map(del(.failures)))'
+      else
+        jq -S '.groups |= map(.items |= map(del(.failures)))'
+      fi
+      ;;
+    connections.failed_history)
+      if [[ "${stage}" == "force-stop-reopen" ]]; then
+        # Match the same known Go-only failed resolver probe described above;
+        # preserve unrelated failures for strict comparison.
+        jq -S '.items |= map(select((.host != "dns.google:443") or ((.error // "") | contains("selected tcp node not found") | not)))'
+      else
+        jq -S .
+      fi
+      ;;
+    route.activation)
+      if [[ "${stage}" == "force-stop-reopen" ]]; then
+        # Rule/list activation timestamps describe the in-memory runtime
+        # rebuild. Go resets them after a hard restart while Rust reports the
+        # rebuild time; neither value is persisted user configuration.
+        jq -S '.hostIndexRefreshAt = 0 | .ruleApplyAt = 0'
+      else
+        jq -S .
+      fi
+      ;;
+    route.lists.activation)
+      if [[ "${stage}" == "force-stop-reopen" ]]; then
+        jq -S '.hostIndexRefreshAt = 0'
+      else
+        jq -S .
+      fi
       ;;
     tools.interfaces)
       # Interface enumeration order is provided by the kernel, and IPv6
@@ -297,20 +338,30 @@ if [[ "${include_empty_subscription_update}" == "1" ]]; then
   operations+=( 'subscriptions.update|{}' )
 fi
 
-for request_spec in "${operations[@]}"; do
-  operation="${request_spec%%|*}"
-  body="${request_spec#*|}"
-  safe_name="${operation//./-}"
-  request "${go_http}" "${operation}" "${body}" | normalize "${operation}" >"${scenario_dir}/go-${safe_name}.json"
-  request "${rust_http}" "${operation}" "${body}" | normalize "${operation}" >"${scenario_dir}/rust-${safe_name}.json"
-  if ! diff -u "${scenario_dir}/go-${safe_name}.json" "${scenario_dir}/rust-${safe_name}.json" \
-    >"${scenario_dir}/${safe_name}.diff"; then
-    echo "[go-api-parity] response mismatch: ${operation}" >&2
-    sed -n '1,160p' "${scenario_dir}/${safe_name}.diff" >&2
-    exit 1
+compare_read_operations() {
+  local stage="${1:-initial}"
+  local file_prefix=""
+  if [[ "${stage}" != "initial" ]]; then
+    file_prefix="${stage}-"
   fi
-  echo "[go-api-parity] identical: ${operation}"
-done
+  for request_spec in "${operations[@]}"; do
+    local operation="${request_spec%%|*}"
+    local body="${request_spec#*|}"
+    local safe_name="${operation//./-}"
+    request "${go_http}" "${operation}" "${body}" | normalize "${operation}" "${stage}" >"${scenario_dir}/${file_prefix}go-${safe_name}.json"
+    request "${rust_http}" "${operation}" "${body}" | normalize "${operation}" "${stage}" >"${scenario_dir}/${file_prefix}rust-${safe_name}.json"
+    if ! diff -u "${scenario_dir}/${file_prefix}go-${safe_name}.json" \
+      "${scenario_dir}/${file_prefix}rust-${safe_name}.json" \
+      >"${scenario_dir}/${file_prefix}${safe_name}.diff"; then
+      echo "[go-api-parity] response mismatch: ${operation} (${stage})" >&2
+      sed -n '1,160p' "${scenario_dir}/${file_prefix}${safe_name}.diff" >&2
+      exit 1
+    fi
+    echo "[go-api-parity] identical: ${operation} (${stage})"
+  done
+}
+
+compare_read_operations
 
 compare_mutation() {
   local name="$1"
@@ -570,5 +621,20 @@ for request_spec in "${error_operations[@]}"; do
   error_body="${remainder#*|}"
   compare_error "${error_name}" "${error_operation}" "${error_body}"
 done
+
+if [[ "${YUHAIIN_FORCE_STOP_REOPEN:-0}" == "1" ]]; then
+  echo "[go-api-parity] force-stopping both services before persistence replay"
+  podman kill --signal KILL "${go_container}" "${rust_container}" \
+    >"${scenario_dir}/force-stop-status.log" 2>&1 || true
+  podman logs "${go_container}" >"${scenario_dir}/go-force-stop.log" 2>&1 || true
+  podman logs "${rust_container}" >"${scenario_dir}/rust-force-stop.log" 2>&1 || true
+  podman rm -f --ignore "${go_container}" "${rust_container}" \
+    >"${scenario_dir}/force-stop-rm.log" 2>&1
+  start_services
+  wait_ready "${go_http}"
+  wait_ready "${rust_http}"
+  compare_read_operations force-stop-reopen
+  echo "[go-api-parity] force-stop persistence replay passed"
+fi
 
 echo "[go-api-parity] passed; logs=${scenario_dir}"

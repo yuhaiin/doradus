@@ -5144,3 +5144,22 @@ HTTPS、私有 CA、异常响应和生产浏览器矩阵继续保持 checklist �
 `Expect`，而上游返回的 `103 Early Hints` 等其他 informational response 会在最终响应前
 按同样的 hop-by-hop 清理规则转发。该场景的 runtime focused tests 为 21/21，真实 Podman
 请求/响应链为 1/1；完整 `make service-chain-smoke` 为 30/30，另有 1 项既有 ignored case。
+
+## 208. 2026-08-14 Go/Rust force-stop API replay
+
+为验证异常终止后 SQLite checkpoint、Go projection 和管理面是否仍能稳定读取，
+`scripts/integration/go-api-parity.sh` 增加了可选的 `YUHAIIN_FORCE_STOP_REOPEN=1` 阶段：两端
+先在独立 Podman 容器中完成全套 read、mutation 和错误矩阵，再同时发送 `SIGKILL`，移除旧容器，
+用同一份各自的 SQLite 副本重启，并重新执行全部稳定 read operations。新入口为
+`make production-abnormal-parity-smoke`；Go v1 `/home/asutorufa/Documents/Programming/yuhaiin/tmp/state.db`
+仅作为只读 source，构建产物、容器日志、副本和 diff 全部留在
+`~/.cache/yuhaiin-rust/production-parity/`，没有使用 `/tmp`。
+
+2026-08-14 的 Podman 结果为初始 read、全 mutation、错误矩阵和 force-stop replay 全部
+`identical`，最终 `passed 1 fixture(s)`。诊断期间确认 Go 的 `route.rules.test` 会经代理 DNS
+对 `dns.google:443` 做失败探测，在没有 selected TCP node 的停止态 fixture 中记录
+`selected tcp node not found` 的零字节 telemetry；Rust 的管理 route test 只执行路由与解析，
+不建立该 proxy connection。这不是 SQLite 丢失，因此 replay 只对这个已确认的 Go-only
+failure-only probe 做阶段限定的窄化，traffic-bearing telemetry、其他 failed-history 和其余
+管理面字段仍保持严格 diff。更广的 resolver failure telemetry parity 仍属于后续运行矩阵，
+不能用该归一化冒充已完成。
