@@ -5194,3 +5194,37 @@ history 和 v2 SQLite `LIMIT 1000` tie；其他字段、错误和统计仍严格
 当前缓存用量为 36.16 GiB，其中 `cargo-target` 占 23.90 GiB；脚本只发出超过 20 GiB 的
 告警，没有自动删除任何内容。更长 production-like statistics/reload 样本、未知异常字段
 以及真实 Windows/macOS runner 现场仍属于后续验收项。
+
+## 210. 2026-08-14 service-chain、live inbound reload 与 release benchmark 复验
+
+本轮重新在 Podman 执行 `make service-chain-smoke`，34 个测试中 33 passed、1 个明确需要
+外网的 HTTPS case ignored、0 failed。真实链路覆盖了 HTTP、SOCKS5、mixed、TLS、TLS-auto、
+HTTP/2、Yuubinsya native UDP/UOT、VLESS/VMess/Trojan TCP/UDP、reverse、TLS/HTTP
+termination、透明 transport 和实时连接状态；重点链路
+`SOCKS5/Yuubinsya inbound → TLS → HTTP/2 → Yuubinsya outbound` 通过。
+
+随后执行 `make api-reload-flow-smoke tun-api-process-smoke`：API mutation/reload/restart
+2/2，通过真实前台二进制 API 开关并持久化 TUN 设备 1/1。该结果确认 TUN 是 inbound
+supervisor 的一部分，普通 inbound 和 TUN 共用最新配置 reload 边界，不需要单独启动第二个
+服务。
+
+同一轮 `make workspace-tests` 在 Podman 完成 51 个 harness，0 个失败；关键汇总为 backup
+9、chain 56、core 157、runtime 314、store 136（5 ignored）、trie 27、service-chain
+33（1 ignored）、WireGuard 11（1 benchmark ignored）、WireGuard runtime chain 3 和
+stats concurrency 2。需要 Go 工具链、外网或用户提供 WARP 配置的用例继续显式 ignored，
+不把缺少外部条件误报为通过。
+
+64 MiB、release、Podman benchmark 最新结果如下：
+
+| 场景 | 吞吐 | peak RSS | CPU ticks | samples |
+| --- | ---: | ---: | ---: | ---: |
+| HTTP inbound → HTTP CONNECT | 152.08 MiB/s | 19,616 KiB | 35 | 21 |
+| HTTP inbound → TLS/H2/Yuubinsya | 54.26 MiB/s | 21,804 KiB | 98 | 57 |
+| TUN inbound → fixed → loopback | 47.82 MiB/s | 13,280 KiB | 241 | 35,591 |
+| BoringTun userspace packet | 542.52 MiB/s | 3,732 KiB | 11 | 190 |
+
+这些数字只用于同一主机、同一 profile、同一 payload 和同一 namespace 的趋势回归，不代表
+公网性能承诺；JSON 和日志保存在
+`~/.cache/yuhaiin-rust/benchmarks/{http-throughput,tun-throughput,wireguard}`。
+本轮缓存检查为 36.33 GiB，其中 `cargo-target` 为 24.06 GiB；脚本只发出超过 20 GiB 的
+告警，没有自动删除内容，也没有使用 `/tmp`。
