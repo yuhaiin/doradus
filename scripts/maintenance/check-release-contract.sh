@@ -85,6 +85,9 @@ done
 required_windows_cross_literals=(
   'cargo_home="${YUHAIIN_RELEASE_WINDOWS_CARGO_HOME:-${cache_root}/release-windows-cargo-home}"'
   '-v "${cargo_home}:/cargo-home:Z"'
+  'export CARGO_HOME=/cargo-home'
+  'export CARGO_TARGET_DIR=/target'
+  'export TMPDIR=/state/cache/tmp'
   'unset CARGO_NET_OFFLINE'
   'cargo check --config net.offline=false --locked --target'
 )
