@@ -5246,3 +5246,21 @@ stats concurrency 2。需要 Go 工具链、外网或用户提供 WARP 配置的
 
 测试状态和日志继续写入 `~/.cache/yuhaiin-rust/integration/api-reload-flow/`，没有使用
 `/tmp`。
+
+## 212. 2026-08-14 tls_termination file-pair fallback parity
+
+继续对照 Go `pkg/net/proxy/tls/unwrap.go` 的 `x509KeyPair`：Go 只有在
+`CertFilePath` 和 `KeyFilePath` 同时存在时才优先加载文件；文件读取或证书/私钥解析失败后，
+会回退到内嵌的 `Cert`/`Key`。Rust 之前只要选中了文件字段就会直接返回错误，这会让旧配置中
+已经失效的路径阻止服务启动，即使内嵌证书仍然有效。
+
+现在 `yuhaiin-runtime` 的 TLS termination builder 把完整文件对作为第一候选，支持
+`certFile`/`keyFile`、`certFilePath`/`keyFilePath` 和 snake_case 别名；文件对不可读或解析失败
+时再使用内嵌 byte array、base64 或 PEM/DER。新增的 `file-fallback` 真实场景把 Go/Rust
+服务都配置为“坏文件路径 + 有效内嵌证书”，请求仍经过
+`reverse_http → http_termination → tls_termination → target` 完成 TLS、router 和
+connections 流程。
+
+Podman 验证结果：`make go-termination-parity-smoke` Go/Rust 共 10/10（新增坏文件回退场景
+2/2），`cargo test -p yuhaiin-runtime --all-features tls_termination` 为 4/4；所有状态、
+日志和构建缓存位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。

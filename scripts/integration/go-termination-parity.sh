@@ -143,7 +143,7 @@ podman run -d \
   -v "${target_script}:/usr/local/bin/http-termination-target.py:ro" \
   --entrypoint python3 \
   "${proxy_image}" \
-  /usr/local/bin/http-termination-target.py "${target_port}" /health "${target_host}:${target_port}" 3 \
+  /usr/local/bin/http-termination-target.py "${target_port}" /health "${target_host}:${target_port}" 4 \
   >"${run_dir}/go-target-id"
 podman run -d \
   --name "${rust_target_container}" \
@@ -152,7 +152,7 @@ podman run -d \
   -v "${target_script}:/usr/local/bin/http-termination-target.py:ro" \
   --entrypoint python3 \
   "${proxy_image}" \
-  /usr/local/bin/http-termination-target.py "${rust_target_port}" /health "${rust_target_host}:${rust_target_port}" 3 \
+  /usr/local/bin/http-termination-target.py "${rust_target_port}" /health "${rust_target_host}:${rust_target_port}" 4 \
   >"${run_dir}/rust-target-id"
 
 wait_target() {
@@ -237,6 +237,14 @@ configure_service() {
     # the inbound-style certBase64/keyBase64 names.
     if [[ "${mode}" == reverse_https ]]; then
       node_body='{"id":"go-termination-out","name":"termination parity outbound","group":"parity","enabled":true,"chain":[{"type":"direct","direct":{}}]}'
+    elif [[ "${mode}" == file_fallback ]]; then
+      node_body="$(jq -cn \
+        --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
+        '{id:($prefix+"-termination-out"),name:"termination parity outbound",group:"parity",enabled:true,chain:[
+          {type:"direct",direct:{}},
+          {type:"http_termination",http_termination:{headers:{}}},
+          {type:"tls_termination",tls_termination:{tls:{certificates:[{cert:$cert,key:$key,certFilePath:"/data/termination-invalid.pem",keyFilePath:"/data/termination-invalid.pem"}],nextProtos:[]}}}
+        ]}')"
     elif [[ "${mode}" == named ]]; then
       node_body="$(jq -cn \
         --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
@@ -264,6 +272,14 @@ configure_service() {
   else
     if [[ "${mode}" == reverse_https ]]; then
       node_body='{"id":"rust-termination-out","name":"termination parity outbound","group":"parity","enabled":true,"chain":[{"type":"direct","direct":{}}]}'
+    elif [[ "${mode}" == file_fallback ]]; then
+      node_body="$(jq -cn \
+        --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
+        '{id:($prefix+"-termination-out"),name:"termination parity outbound",group:"parity",enabled:true,chain:[
+          {type:"direct",direct:{}},
+          {type:"http_termination",http_termination:{headers:{}}},
+          {type:"tls_termination",tls_termination:{tls:{certificates:[{certBase64:$cert,keyBase64:$key,certFilePath:"/data/termination-invalid.pem",keyFilePath:"/data/termination-invalid.pem"}],nextProtos:[]}}}
+        ]}')"
     elif [[ "${mode}" == named ]]; then
       node_body="$(jq -cn \
         --arg cert "${certificate_base64}" --arg key "${private_key_base64}" --arg prefix "${prefix}" \
@@ -517,12 +533,14 @@ restore_reverse_http_inbound() {
   rpc "${address}" inbound.put "${inbound_body}" >/dev/null
 }
 
+printf '%s\n' 'not a certificate' >"${run_dir}/termination-invalid.pem"
+
 run_case combo
 run_error_case upstream-error
 
-case_count=8
+case_count=10
 if [[ "${https_live}" == 1 ]]; then
-  case_count=10
+  case_count=12
   configure_service "${go_address}" go reverse_https
   configure_service "${rust_address}" rust reverse_https
   sleep 0.2
@@ -586,6 +604,10 @@ configure_service "${go_address}" go standalone
 configure_service "${rust_address}" rust standalone
 sleep 0.2
 run_case standalone
+configure_service "${go_address}" go file_fallback
+configure_service "${rust_address}" rust file_fallback
+sleep 0.2
+run_case file-fallback
 configure_service "${go_address}" go named
 configure_service "${rust_address}" rust named
 sleep 0.2

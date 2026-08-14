@@ -2744,8 +2744,6 @@ fn build_tls_termination_proxy(
     config: &GoProxyRuntimeConfig,
     upstream: Arc<dyn AsyncProxy>,
 ) -> Result<Arc<dyn AsyncProxy>> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use rustls::sign::CertifiedKey;
     use tokio_rustls::TlsAcceptor;
 
     let layer = config
@@ -2782,57 +2780,7 @@ fn build_tls_termination_proxy(
     let mut default = Vec::new();
     let mut named = BTreeMap::new();
     for (certificate, name) in entries {
-        let cert_bytes = tls_termination_bytes(
-            certificate,
-            &["cert", "certBase64"],
-            &["certFile", "certFilePath", "cert_file_path"],
-            "TLS termination certificate",
-        )?;
-        let key_bytes = tls_termination_bytes(
-            certificate,
-            &["key", "keyBase64"],
-            &["keyFile", "keyFilePath", "key_file_path"],
-            "TLS termination private key",
-        )?;
-        let cert_chain = if cert_bytes.starts_with(b"-----BEGIN") {
-            rustls_pemfile::certs(&mut std::io::Cursor::new(cert_bytes))
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|error| {
-                    Error::new(
-                        ErrorKind::Protocol,
-                        format!("TLS termination certificate PEM: {error}"),
-                    )
-                })?
-        } else {
-            vec![CertificateDer::from(cert_bytes)]
-        };
-        if cert_chain.is_empty() {
-            return Err(Error::invalid("TLS termination certificate chain is empty"));
-        }
-        let key = if key_bytes.starts_with(b"-----BEGIN") {
-            rustls_pemfile::private_key(&mut std::io::Cursor::new(key_bytes))
-                .map_err(|error| {
-                    Error::new(
-                        ErrorKind::Protocol,
-                        format!("TLS termination private key PEM: {error}"),
-                    )
-                })?
-                .ok_or_else(|| Error::invalid("TLS termination private key is empty"))?
-        } else {
-            PrivateKeyDer::try_from(key_bytes).map_err(|error| {
-                Error::new(
-                    ErrorKind::Protocol,
-                    format!("TLS termination private key DER: {error}"),
-                )
-            })?
-        };
-        let signer = rustls_rustcrypto::sign::any_supported_type(&key).map_err(|error| {
-            Error::new(
-                ErrorKind::Protocol,
-                format!("TLS termination signing key: {error:?}"),
-            )
-        })?;
-        let certified = Arc::new(CertifiedKey::new(cert_chain, signer));
+        let certified = tls_termination_certified_key(certificate)?;
         if let Some(name) = name {
             let name = tls_termination_name(name);
             if !name.is_empty() {
@@ -2875,6 +2823,106 @@ fn build_tls_termination_proxy(
         upstream,
         acceptor: TlsAcceptor::from(Arc::new(server)),
     }))
+}
+
+#[cfg(feature = "doh-tls")]
+fn tls_termination_certified_key(
+    value: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Arc<rustls::sign::CertifiedKey>> {
+    // Go's x509KeyPair tries a complete file-path pair first, then falls back
+    // to the inline cert/key fields when either file is unavailable or the
+    // file pair cannot be parsed. Keep that precedence for mixed legacy and
+    // current JSON contracts instead of failing startup on a stale path.
+    if let Some((cert_bytes, key_bytes)) = tls_termination_file_pair(value)
+        && let Ok(certified) = tls_termination_certified_key_from_bytes(cert_bytes, key_bytes)
+    {
+        return Ok(certified);
+    }
+
+    let cert_bytes = tls_termination_bytes(
+        value,
+        &["cert", "certBase64"],
+        &[],
+        "TLS termination certificate",
+    )?;
+    let key_bytes = tls_termination_bytes(
+        value,
+        &["key", "keyBase64"],
+        &[],
+        "TLS termination private key",
+    )?;
+    tls_termination_certified_key_from_bytes(cert_bytes, key_bytes)
+}
+
+#[cfg(feature = "doh-tls")]
+fn tls_termination_file_pair(
+    value: &serde_json::Map<String, serde_json::Value>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let cert_path = value
+        .get("certFile")
+        .or_else(|| value.get("certFilePath"))
+        .or_else(|| value.get("cert_file_path"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.trim().is_empty())?;
+    let key_path = value
+        .get("keyFile")
+        .or_else(|| value.get("keyFilePath"))
+        .or_else(|| value.get("key_file_path"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.trim().is_empty())?;
+    Some((
+        std::fs::read(cert_path).ok()?,
+        std::fs::read(key_path).ok()?,
+    ))
+}
+
+#[cfg(feature = "doh-tls")]
+fn tls_termination_certified_key_from_bytes(
+    cert_bytes: Vec<u8>,
+    key_bytes: Vec<u8>,
+) -> Result<Arc<rustls::sign::CertifiedKey>> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::sign::CertifiedKey;
+
+    let cert_chain = if cert_bytes.starts_with(b"-----BEGIN") {
+        rustls_pemfile::certs(&mut std::io::Cursor::new(cert_bytes))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Protocol,
+                    format!("TLS termination certificate PEM: {error}"),
+                )
+            })?
+    } else {
+        vec![CertificateDer::from(cert_bytes)]
+    };
+    if cert_chain.is_empty() {
+        return Err(Error::invalid("TLS termination certificate chain is empty"));
+    }
+    let key = if key_bytes.starts_with(b"-----BEGIN") {
+        rustls_pemfile::private_key(&mut std::io::Cursor::new(key_bytes))
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Protocol,
+                    format!("TLS termination private key PEM: {error}"),
+                )
+            })?
+            .ok_or_else(|| Error::invalid("TLS termination private key is empty"))?
+    } else {
+        PrivateKeyDer::try_from(key_bytes).map_err(|error| {
+            Error::new(
+                ErrorKind::Protocol,
+                format!("TLS termination private key DER: {error}"),
+            )
+        })?
+    };
+    let signer = rustls_rustcrypto::sign::any_supported_type(&key).map_err(|error| {
+        Error::new(
+            ErrorKind::Protocol,
+            format!("TLS termination signing key: {error:?}"),
+        )
+    })?;
+    Ok(Arc::new(CertifiedKey::new(cert_chain, signer)))
 }
 
 #[cfg(feature = "doh-tls")]
