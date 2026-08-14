@@ -56,7 +56,7 @@ fi
 if [[ -n "${YUHAIIN_TUN_DEBUG:-}" ]]; then
   chain_env+=( -e "YUHAIIN_TUN_DEBUG=${YUHAIIN_TUN_DEBUG}" )
 fi
-for tun_fixture_env in YUHAIIN_TUN_PORTAL YUHAIIN_TUN_PORTAL_V6 YUHAIIN_TUN_ROUTE YUHAIIN_TUN_SOURCE YUHAIIN_TUN_IPV6_SOURCE YUHAIIN_TUN_TARGET YUHAIIN_TUN_IPV6_TARGET YUHAIIN_TUN_UDP_TARGET YUHAIIN_TUN_UDP_FIRST YUHAIIN_TUN_IPV6_EXTENSION; do
+for tun_fixture_env in YUHAIIN_TUN_PORTAL YUHAIIN_TUN_PORTAL_V6 YUHAIIN_TUN_ROUTE YUHAIIN_TUN_SOURCE YUHAIIN_TUN_IPV6_SOURCE YUHAIIN_TUN_TARGET YUHAIIN_TUN_IPV6_TARGET YUHAIIN_TUN_UDP_TARGET YUHAIIN_TUN_UDP_FIRST YUHAIIN_TUN_IPV6_EXTENSION YUHAIIN_TUN_DNS_TEST YUHAIIN_TUN_DNS_TARGET; do
   if [[ -n "${!tun_fixture_env:-}" ]]; then
     chain_env+=( -e "${tun_fixture_env}=${!tun_fixture_env}" )
   fi
@@ -176,6 +176,10 @@ if [[ -n "${YUHAIIN_TUN_RELOAD:-}" ]]; then
 fi
 if [[ "${YUHAIIN_TUN_RELOAD_ONLY:-0}" != "1" ]]; then
   grep -Fq "runtime-tun-traffic-ok" <<<"${output}"
+fi
+if [[ -n "${YUHAIIN_TUN_DNS_TEST:-}" ]]; then
+  grep -Fq "runtime-tun-dns-ok" <<<"${output}"
+  grep -Eq "runtime-tun-dns-address=198\.18\." <<<"${output}"
 fi
 if [[ "${YUHAIIN_TUN_RESET_RECONNECT:-0}" == "1" ]]; then
   grep -Fq "runtime-tun-reset-ok" <<<"${output}"

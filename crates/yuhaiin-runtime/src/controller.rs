@@ -315,7 +315,11 @@ impl RuntimeController {
                 .await?,
         );
         let (nat, idle_timeout) = snapshot.new_full_cone_nat()?;
-        let fakeip_view = match &snapshot.fakeip {
+        let fakeip_view = match snapshot
+            .inbound_fakeip
+            .as_ref()
+            .or(snapshot.fakeip.as_ref())
+        {
             Some(pools) => {
                 pools.snapshot().await;
                 Some(pools.view_store())

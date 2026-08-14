@@ -15,20 +15,27 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
 use yuhaiin_chain::{YuubinsyaH2Server, YuubinsyaServerProxy};
+use yuhaiin_core::dns::{
+    DnsRecordType, DnsResponse, decode_response, encode_query, encode_response,
+};
 use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, DirectAsyncProxy};
 use yuhaiin_core::{
-    BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result, RouteMode,
+    BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, IpSet, Network, Result,
+    RouteMode,
 };
 use yuhaiin_runtime::{
-    RuntimeBuildOptions, RuntimeBuilder, RuntimeController, inbound, load_tun_config,
+    BuiltinResolverFactory, RuntimeBuildOptions, RuntimeBuilder, RuntimeController, inbound,
+    load_tun_config,
 };
-use yuhaiin_store::{ConfigStore, GoInboundRecord, GoNodeRecord};
+use yuhaiin_store::{
+    ConfigStore, GoInboundRecord, GoNodeRecord, GoResolverRecord, GoRouteSettingsRecord,
+};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -60,6 +67,13 @@ async fn main() {
             .unwrap_or(32);
         if let Err(error) = run_tun_udp_traffic_client(total_bytes) {
             eprintln!("tun-service-smoke: UDP traffic client: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--dns-client") {
+        if let Err(error) = run_tun_dns_client() {
+            eprintln!("tun-service-smoke: DNS client: {error}");
             std::process::exit(1);
         }
         return;
@@ -113,6 +127,7 @@ async fn run() -> Result<()> {
         )));
     }
     let traffic = std::env::var_os("YUHAIIN_TUN_TRAFFIC").is_some();
+    let dns_test = std::env::var_os("YUHAIIN_TUN_DNS_TEST").is_some();
     let udp_traffic = std::env::var_os("YUHAIIN_TUN_UDP_TRAFFIC").is_some();
     let ipv6_extension = std::env::var_os("YUHAIIN_TUN_IPV6_EXTENSION").is_some();
     let udp_first = udp_traffic && std::env::var_os("YUHAIIN_TUN_UDP_FIRST").is_some();
@@ -201,11 +216,17 @@ async fn run() -> Result<()> {
         ));
     }
 
+    if dns_test && chain_mode.is_some() {
+        return Err(Error::invalid(
+            "YUHAIIN_TUN_DNS_TEST is only supported by the direct TUN fixture",
+        ));
+    }
+
     // `--network=none` creates the loopback device in a down state.  The
     // fixture's fixed outbound intentionally targets a local echo listener,
     // so bring only this disposable namespace's loopback interface up before
     // opening the TUN.  Production does not need this test-only setup.
-    if traffic {
+    if traffic || dns_test {
         yuhaiin_platform::enable_loopback().map_err(io_error)?;
     }
 
@@ -281,6 +302,34 @@ async fn run() -> Result<()> {
         std::fs::create_dir_all(parent).map_err(io_error)?;
     }
     let store = ConfigStore::open(&database).await?;
+    let (dns_upstream, dns_upstream_task) = if dns_test {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.map_err(io_error)?;
+        let address = socket.local_addr().map_err(io_error)?;
+        let task = tokio::spawn(async move {
+            let answer = DnsResponse {
+                addresses: IpSet {
+                    v4: vec!["203.0.113.7".parse().expect("fixture IPv4")],
+                    v6: Vec::new(),
+                },
+                ptr_names: Vec::new(),
+                service_bindings: Vec::new(),
+                minimum_ttl: Some(60),
+            };
+            let mut packet = vec![0u8; 4096];
+            loop {
+                let Ok((length, peer)) = socket.recv_from(&mut packet).await else {
+                    break;
+                };
+                let Ok(response) = encode_response(&packet[..length], &answer) else {
+                    continue;
+                };
+                let _ = socket.send_to(&response, peer).await;
+            }
+        });
+        (Some(address), Some(task))
+    } else {
+        (None, None)
+    };
     seed_runtime_fixture(
         &store,
         &name,
@@ -290,14 +339,63 @@ async fn run() -> Result<()> {
         mtu,
     )
     .await?;
+    if let Some(address) = dns_upstream {
+        // The fixture resolver is intentionally loopback-only. Keep this
+        // local test independent from the host's physical interface while
+        // the production default-interface policy is exercised by real
+        // outbound endpoints.
+        store
+            .put_config("settings", br#"{"useDefaultInterface":false}"#)
+            .await?;
+        let resolver = GoResolverRecord {
+            id: "bootstrap".to_owned(),
+            resolver_type: "udp".to_owned(),
+            host: address.to_string(),
+            updated_at: 1,
+            data_json: serde_json::to_vec(&json!({
+                "id": "bootstrap",
+                "type": "udp",
+                "host": address.to_string(),
+                "system": false
+            }))
+            .map_err(io_error)?,
+        };
+        store.repository().put_go_resolver(&resolver).await?;
+        store
+            .repository()
+            .put_go_route_settings(&GoRouteSettingsRecord {
+                id: 1,
+                direct_resolver: "bootstrap".to_owned(),
+                proxy_resolver: "bootstrap".to_owned(),
+                resolve_locally: false,
+                udp_proxy_fqdn: 0,
+            })
+            .await?;
+        store
+            .put_config(
+                "resolver.fakedns",
+                br#"{"enabled":true,"ipv4Range":"198.18.0.0/15","ipv6Range":"fc00::/18"}"#,
+            )
+            .await?;
+        store
+            .put_config(
+                "inbounds.config",
+                br#"{"hijackDns":true,"hijackDnsFakeIp":true,"sniff":true}"#,
+            )
+            .await?;
+    }
 
     let mut build_options = RuntimeBuildOptions::default();
     build_options.route_fallback.mode = RouteMode::Proxy;
-    let controller = RuntimeController::from_builder(
-        RuntimeBuilder::new(store.clone(), Arc::new(SystemAsyncIpResolver))
-            .with_options(build_options),
-    )
-    .await?;
+    let mut builder = RuntimeBuilder::new(store.clone(), Arc::new(SystemAsyncIpResolver))
+        .with_options(build_options);
+    if dns_test {
+        builder = builder.with_resolver_factory(Arc::new(BuiltinResolverFactory::new(
+            Duration::from_secs(2),
+            4096,
+        )));
+    }
+    let controller = RuntimeController::from_builder(builder).await?;
     if let Some(mode) = chain_mode.as_deref() {
         println!("runtime-tun-chain-ready mode={mode}");
     }
@@ -362,6 +460,27 @@ async fn run() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     println!("runtime-tun-opened name={device_name}");
+
+    if dns_test {
+        eprintln!("runtime-tun-dns-client-start");
+        let executable = std::env::current_exe().map_err(io_error)?;
+        let mut dns_client = std::process::Command::new(executable)
+            .arg("--dns-client")
+            .spawn()
+            .map_err(io_error)?;
+        let status = tokio::task::spawn_blocking(move || dns_client.wait())
+            .await
+            .map_err(join_error)?
+            .map_err(io_error)?;
+        if !status.success() {
+            let _ = shutdown_tx.send(true);
+            let _ = inbound_task.await;
+            return Err(io_error(std::io::Error::other(format!(
+                "TUN DNS client exited with {status}"
+            ))));
+        }
+        println!("runtime-tun-dns-ok");
+    }
 
     if ipv6_extension {
         eprintln!("runtime-tun-ipv6-extension-client-start bytes={udp_traffic_bytes}");
@@ -569,6 +688,10 @@ async fn run() -> Result<()> {
     }
     controller.persist_monitor().await?;
 
+    if let Some(task) = dns_upstream_task {
+        task.abort();
+    }
+
     if device_is_present(&device_name) {
         return Err(Error::new(
             ErrorKind::Io,
@@ -576,6 +699,46 @@ async fn run() -> Result<()> {
         ));
     }
     println!("runtime-tun-closed name={device_name}");
+    Ok(())
+}
+
+fn run_tun_dns_client() -> std::io::Result<()> {
+    use std::net::UdpSocket;
+
+    let target: std::net::SocketAddr = std::env::var("YUHAIIN_TUN_DNS_TARGET")
+        .unwrap_or_else(|_| "1.1.1.1:53".to_owned())
+        .parse()
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid YUHAIIN_TUN_DNS_TARGET: {error}"),
+            )
+        })?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let domain = DomainName::new("tun-fakeip.example.test")
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let query = encode_query(0x5455, &domain, DnsRecordType::A)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    socket.send_to(&query, target)?;
+    let mut response = vec![0u8; 4096];
+    let length = socket.recv(&mut response)?;
+    let response = decode_response(&response[..length], 0x5455, DnsRecordType::A)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let address = response.addresses.v4.first().copied().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "TUN DNS response did not contain an IPv4 address",
+        )
+    })?;
+    let octets = address.octets();
+    if octets[0] != 198 || octets[1] != 18 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("TUN DNS response was not FakeIP: {address}"),
+        ));
+    }
+    println!("runtime-tun-dns-address={address}");
     Ok(())
 }
 

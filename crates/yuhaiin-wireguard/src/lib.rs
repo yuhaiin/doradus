@@ -37,13 +37,14 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{
     HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address,
 };
-use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
+use yuhaiin_core::proxy::{
+    AsyncDatagram, AsyncProxy, BoxAsyncStream, DEFAULT_INTERFACE, bind_socket_to_interface,
+};
 use yuhaiin_core::{
     BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, ResolveStrategy,
     Result,
@@ -863,6 +864,7 @@ impl WireGuardProxy {
         } else {
             "0.0.0.0:0"
         };
+        let bind_interface = underlay_interface_for_peers(bind_interface, &config.peers);
         let underlay = bind_udp_underlay(bind_address, bind_interface).await?;
         let (command_tx, command_rx) = mpsc::channel(64);
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -883,6 +885,18 @@ impl WireGuardProxy {
     }
 }
 
+fn underlay_interface_for_peers<'a>(
+    bind_interface: Option<&'a str>,
+    peers: &[ParsedPeer],
+) -> Option<&'a str> {
+    if bind_interface == Some(DEFAULT_INTERFACE)
+        && peers.iter().any(|peer| peer.endpoint.ip().is_loopback())
+    {
+        return None;
+    }
+    bind_interface
+}
+
 async fn bind_udp_underlay(
     bind_address: &str,
     bind_interface: Option<&str>,
@@ -899,40 +913,20 @@ async fn bind_udp_underlay(
             format!("invalid WireGuard bind address: {error}"),
         )
     })?;
-    let socket = Socket::new(
+    let socket = socket2::Socket::new(
         if address.is_ipv4() {
-            Domain::IPV4
+            socket2::Domain::IPV4
         } else {
-            Domain::IPV6
+            socket2::Domain::IPV6
         },
-        Type::DGRAM,
-        Some(Protocol::UDP),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
     )
     .map_err(error_io)?;
-    bind_udp_socket_to_interface(&socket, interface)?;
+    bind_socket_to_interface(&socket, Some(interface))?;
     socket.bind(&address.into()).map_err(error_io)?;
     socket.set_nonblocking(true).map_err(error_io)?;
     TokioUdpSocket::from_std(socket.into()).map_err(error_io)
-}
-
-#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-fn bind_udp_socket_to_interface(socket: &Socket, interface: &str) -> Result<()> {
-    socket
-        .bind_device(Some(interface.as_bytes()))
-        .map_err(|error| {
-            Error::new(
-                ErrorKind::Io,
-                format!("bind WireGuard UDP underlay to interface {interface:?}: {error}"),
-            )
-        })
-}
-
-#[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
-fn bind_udp_socket_to_interface(_socket: &Socket, _interface: &str) -> Result<()> {
-    // Other desktop platforms use the source-address snapshot fallback. Their
-    // native interface-index socket options are intentionally not pulled into
-    // this shared WireGuard crate.
-    Ok(())
 }
 
 impl AsyncProxy for WireGuardProxy {
@@ -1771,6 +1765,23 @@ mod tests {
             socket.local_addr().unwrap().ip(),
             "0.0.0.0".parse::<IpAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn dynamic_interface_does_not_exclude_loopback_wireguard_peers() {
+        let peer = ParsedPeer {
+            endpoint: "127.0.0.1:51820".parse().unwrap(),
+            allowed_ips: Vec::new(),
+            public_key: [0; 32],
+            pre_shared_key: None,
+            keep_alive: None,
+        };
+        let peers = [peer];
+        assert_eq!(
+            underlay_interface_for_peers(Some(DEFAULT_INTERFACE), &peers),
+            None
+        );
+        assert_eq!(underlay_interface_for_peers(Some("lo"), &peers), Some("lo"));
     }
 
     #[test]

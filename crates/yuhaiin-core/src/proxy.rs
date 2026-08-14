@@ -38,6 +38,12 @@ use tokio::sync::Notify;
 #[cfg(feature = "async-proxy")]
 use tokio::time::Sleep;
 
+/// Internal marker used by the runtime for Go's `useDefaultInterface` mode.
+/// It is resolved to the current physical default-route interface immediately
+/// before each outbound socket is bound, rather than when a runtime snapshot
+/// is built.
+pub const DEFAULT_INTERFACE: &str = "__yuhaiin_default_interface__";
+
 pub trait StreamConnector: Send + Sync {
     fn connect(&self, destination: &Endpoint) -> Result<TcpStream>;
 
@@ -108,7 +114,7 @@ fn connect_std_tcp_with_interface(
             Some(Protocol::TCP),
         )
         .map_err(|error| Error::new(ErrorKind::Io, format!("create TCP socket: {error}")))?;
-        bind_socket_to_interface(&socket, bind_interface)?;
+        bind_socket_to_interface(&socket, interface_for_address(address, bind_interface))?;
         socket
             .connect_timeout(&address.into(), timeout)
             .map_err(|error| Error::new(ErrorKind::Io, format!("connect TCP socket: {error}")))?;
@@ -130,7 +136,7 @@ fn connect_std_tcp_with_interface(
         Some(Protocol::TCP),
     )
     .map_err(|error| Error::new(ErrorKind::Io, format!("create TCP socket: {error}")))?;
-    bind_socket_to_interface(&socket, bind_interface)?;
+    bind_socket_to_interface(&socket, interface_for_address(address, bind_interface))?;
     socket
         .bind(&local_bind.into())
         .map_err(|error| Error::new(ErrorKind::Io, format!("bind TCP socket: {error}")))?;
@@ -235,7 +241,7 @@ pub async fn connect_tokio_tcp_with_interface(
         tokio::net::TcpSocket::new_v6()
     }
     .map_err(|error| Error::new(ErrorKind::Io, format!("create TCP socket: {error}")))?;
-    bind_tokio_tcp_socket_to_interface(&socket, bind_interface)?;
+    bind_tokio_tcp_socket_to_interface(&socket, interface_for_address(address, bind_interface))?;
     if let Some(local_bind) = local_bind {
         socket
             .bind(local_bind)
@@ -247,14 +253,87 @@ pub async fn connect_tokio_tcp_with_interface(
         .map_err(|error| Error::new(ErrorKind::Io, format!("TCP connect: {error}")))
 }
 
-fn bind_socket_to_interface(socket: &Socket, bind_interface: Option<&str>) -> Result<()> {
-    let Some(interface) = bind_interface
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+pub fn bind_socket_to_interface(socket: &Socket, bind_interface: Option<&str>) -> Result<()> {
+    let Some(interface) = bind_interface.and_then(resolve_bind_interface) else {
         return Ok(());
     };
-    bind_socket_to_interface_platform(socket, interface)
+    bind_socket_to_interface_platform(socket, &interface)
+}
+
+fn resolve_bind_interface(bind_interface: &str) -> Option<String> {
+    let bind_interface = bind_interface.trim();
+    if bind_interface.is_empty() {
+        return None;
+    }
+    if bind_interface == DEFAULT_INTERFACE {
+        return default_route_interface();
+    }
+    Some(bind_interface.to_owned())
+}
+
+fn interface_for_address(address: SocketAddr, bind_interface: Option<&str>) -> Option<&str> {
+    if address.ip().is_loopback()
+        && bind_interface.is_some_and(|interface| interface.trim() == DEFAULT_INTERFACE)
+    {
+        None
+    } else {
+        bind_interface
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn default_route_interface() -> Option<String> {
+    std::fs::read_to_string("/proc/net/route")
+        .ok()
+        .and_then(|content| default_route_interface_v4(&content))
+        .or_else(|| {
+            std::fs::read_to_string("/proc/net/ipv6_route")
+                .ok()
+                .and_then(|content| default_route_interface_v6(&content))
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn default_route_interface() -> Option<String> {
+    // Non-Linux platforms use the OS route and the source-address fallback.
+    // Keeping the marker unresolved is preferable to binding to a stale or
+    // guessed interface name.
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn default_route_interface_v4(content: &str) -> Option<String> {
+    content.lines().skip(1).find_map(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 8 || fields[1] != "00000000" || fields[7] != "00000000" {
+            return None;
+        }
+        let interface = fields[0];
+        (!ignored_default_interface(interface)).then(|| interface.to_owned())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn default_route_interface_v6(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 10
+            || fields[0].len() != 32
+            || !fields[0].bytes().all(|byte| byte == b'0')
+            || fields[1] != "00000000"
+        {
+            return None;
+        }
+        let interface = fields[9];
+        (!ignored_default_interface(interface)).then(|| interface.to_owned())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn ignored_default_interface(interface: &str) -> bool {
+    ["tailscale", "wg", "tun", "yuhaiin"]
+        .iter()
+        .any(|prefix| interface.starts_with(prefix))
 }
 
 #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
@@ -282,13 +361,10 @@ fn bind_tokio_tcp_socket_to_interface(
     socket: &tokio::net::TcpSocket,
     bind_interface: Option<&str>,
 ) -> Result<()> {
-    let Some(interface) = bind_interface
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+    let Some(interface) = bind_interface.and_then(resolve_bind_interface) else {
         return Ok(());
     };
-    bind_tokio_tcp_socket_to_interface_platform(socket, interface)
+    bind_tokio_tcp_socket_to_interface_platform(socket, &interface)
 }
 
 #[cfg(all(
@@ -320,22 +396,31 @@ fn bind_tokio_tcp_socket_to_interface_platform(
     Ok(())
 }
 
-#[cfg(feature = "async-proxy")]
-async fn bind_tokio_udp_socket(
+pub(crate) async fn bind_tokio_udp_socket_for_target(
     bind_address: SocketAddr,
+    target: SocketAddr,
+    bind_interface: Option<&str>,
+    label: &str,
+) -> Result<tokio::net::UdpSocket> {
+    bind_tokio_udp_socket_with_target(bind_address, Some(target), bind_interface, label).await
+}
+
+async fn bind_tokio_udp_socket_with_target(
+    bind_address: SocketAddr,
+    target: Option<SocketAddr>,
     bind_interface: Option<&str>,
     label: &str,
 ) -> Result<tokio::net::UdpSocket> {
     let socket = tokio::net::UdpSocket::bind(bind_address)
         .await
         .map_err(|error| Error::new(ErrorKind::Io, format!("{label} UDP bind: {error}")))?;
-    let Some(interface) = bind_interface
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+    let bind_interface = target.map_or(bind_interface, |target| {
+        interface_for_address(target, bind_interface)
+    });
+    let Some(interface) = bind_interface.and_then(resolve_bind_interface) else {
         return Ok(socket);
     };
-    bind_tokio_udp_socket_to_interface(&socket, interface, label)?;
+    bind_tokio_udp_socket_to_interface(&socket, &interface, label)?;
     Ok(socket)
 }
 
@@ -895,8 +980,13 @@ impl AsyncProxy for DirectAsyncProxy {
                 std::net::SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
             };
             let bind_address = context.local_bind_for(address).unwrap_or(bind_address);
-            let socket =
-                bind_tokio_udp_socket(bind_address, bind_interface.as_deref(), "direct").await?;
+            let socket = bind_tokio_udp_socket_for_target(
+                bind_address,
+                address,
+                bind_interface.as_deref(),
+                "direct",
+            )
+            .await?;
             Ok(Box::new(TokioDatagram { socket }) as Box<dyn AsyncDatagram>)
         })
     }
@@ -1399,8 +1489,13 @@ impl AsyncProxy for FixedAsyncProxy {
         let bind_address = context.local_bind_for(target).unwrap_or(fallback);
         let bind_interface = context.bind_interface.clone();
         Box::pin(async move {
-            let socket =
-                bind_tokio_udp_socket(bind_address, bind_interface.as_deref(), "fixed").await?;
+            let socket = bind_tokio_udp_socket_for_target(
+                bind_address,
+                target,
+                bind_interface.as_deref(),
+                "fixed",
+            )
+            .await?;
             Ok(Box::new(FixedDatagram { socket, target }) as Box<dyn AsyncDatagram>)
         })
     }
@@ -1562,8 +1657,13 @@ impl AsyncProxy for Socks5AsyncProxy {
                         "SOCKS5 UDP relay and local bind use different address families",
                     ));
                 }
-                let socket =
-                    bind_tokio_udp_socket(local_bind, bind_interface.as_deref(), "SOCKS5").await?;
+                let socket = bind_tokio_udp_socket_for_target(
+                    local_bind,
+                    proxy.proxy,
+                    bind_interface.as_deref(),
+                    "SOCKS5",
+                )
+                .await?;
                 Ok::<_, Error>(Socks5UdpDatagram {
                     socket,
                     relay,
@@ -2157,7 +2257,16 @@ impl YuubinsyaUdpDatagram {
         socks5_prefix: bool,
         bind_interface: Option<&str>,
     ) -> Result<Self> {
-        let socket = bind_tokio_udp_socket(address, bind_interface, "Yuubinsya client").await?;
+        let server_address = server
+            .addr()
+            .ok_or_else(|| Error::invalid("Yuubinsya native UDP server has no address"))?;
+        let socket = bind_tokio_udp_socket_for_target(
+            address,
+            server_address,
+            bind_interface,
+            "Yuubinsya client",
+        )
+        .await?;
         Self::new(
             Box::new(TokioDatagram { socket }),
             password_hash,
@@ -2431,6 +2540,30 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(&buffer[..length], b"interface-udp");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_route_parser_skips_virtual_interfaces() {
+        let routes = r#"Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+tun0 00000000 00000000 0001 0 0 0 00000000 0 0 0
+wg0 00000000 00000000 0001 0 0 0 00000000 0 0 0
+enp0s5 00000000 0100370A 0001 0 0 100 00000000 0 0 0"#;
+        assert_eq!(
+            default_route_interface_v4(routes).as_deref(),
+            Some("enp0s5")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_ipv6_route_parser_skips_virtual_interfaces() {
+        let routes = r#"00000000000000000000000000000000 00000000 00000000000000000000000000000000 00000000 00000000000000000000000000000000 00000000 00000000 00000000 00000000 tun0
+00000000000000000000000000000000 00000000 00000000000000000000000000000000 00000000 00000000000000000000000000000000 00000000 00000000 00000000 00000000 enp0s5"#;
+        assert_eq!(
+            default_route_interface_v6(routes).as_deref(),
+            Some("enp0s5")
+        );
     }
 
     #[test]

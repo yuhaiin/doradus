@@ -100,10 +100,19 @@ impl RuntimeService {
             let inbound_shutdown = shutdown_rx.clone();
             let api_shutdown = shutdown_rx.clone();
             let route_refresh_shutdown = shutdown_rx.clone();
-            let dns_task = tokio::task::spawn_local(crate::run_dns_supervisor(
-                task_controller.clone(),
-                dns_shutdown,
-            ));
+            let dns_logs = logs.clone();
+            let dns_controller = task_controller.clone();
+            let dns_task = tokio::task::spawn_local(async move {
+                let result = crate::run_dns_supervisor(dns_controller, dns_shutdown).await;
+                if let Err(error) = &result {
+                    // Report bind/configuration failures when they happen. The
+                    // service intentionally keeps the API and other inbound
+                    // tasks alive, so waiting until shutdown hides the real
+                    // time and cause of this failure.
+                    dns_logs.error(format!("DNS task stopped: {error}"));
+                }
+                result
+            });
             let route_refresh_task =
                 tokio::task::spawn_local(crate::api::run_route_list_refresh_loop(
                     route_refresh_state,
@@ -133,9 +142,7 @@ impl RuntimeService {
                 .await
                 .map_err(|error| Error::new(ErrorKind::Io, format!("HTTP API task: {error}")))?;
             let _ = task_shutdown.send(true);
-            if let Err(error) = dns_task.await.map_err(join_error)? {
-                logs.error(format!("DNS task stopped: {error}"));
-            }
+            let _ = dns_task.await.map_err(join_error)?;
             if let Err(error) = inbound_task.await.map_err(join_error)? {
                 logs.error(format!("inbound task stopped: {error}"));
             }

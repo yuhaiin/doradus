@@ -18,6 +18,7 @@ use crate::dns::{
     validate_query_packet, validate_response_packet,
 };
 use crate::dns_resolver_async::{AsyncDnsQuery, SendAsyncDnsQuery};
+use crate::proxy::connect_tokio_tcp_with_interface;
 use crate::{
     BoxFuture, DomainName, Error, ErrorKind, IpSet, LocalBoxFuture, ResolveStrategy, Result,
 };
@@ -30,6 +31,7 @@ pub struct AsyncTcpDnsClient {
     pub timeout: Duration,
     pub max_packet_size: usize,
     pub local_bind_addresses: Arc<[IpAddr]>,
+    pub bind_interface: Option<String>,
 }
 
 impl AsyncTcpDnsClient {
@@ -44,32 +46,17 @@ impl AsyncTcpDnsClient {
             .copied()
             .find(|address| address.is_ipv4() == self.server.is_ipv4())
             .map(|address| SocketAddr::new(address, 0));
-        let connect = async {
-            if let Some(local_bind) = local_bind {
-                let socket = if self.server.is_ipv4() {
-                    tokio::net::TcpSocket::new_v4()
-                } else {
-                    tokio::net::TcpSocket::new_v6()
-                }
-                .map_err(|error| {
-                    Error::new(ErrorKind::Io, format!("create DNS TCP socket: {error}"))
-                })?;
-                socket.bind(local_bind).map_err(|error| {
-                    Error::new(ErrorKind::Io, format!("bind DNS TCP socket: {error}"))
-                })?;
-                socket
-                    .connect(self.server)
-                    .await
-                    .map_err(|error| Error::new(ErrorKind::Io, format!("connect DNS TCP: {error}")))
-            } else {
-                TcpStream::connect(self.server)
-                    .await
-                    .map_err(|error| Error::new(ErrorKind::Io, format!("connect DNS TCP: {error}")))
-            }
-        };
-        let mut stream = tokio::time::timeout(self.timeout, connect)
-            .await
-            .map_err(|_| Error::new(ErrorKind::Timeout, "connect DNS TCP timed out"))??;
+        let mut stream = tokio::time::timeout(
+            self.timeout,
+            connect_tokio_tcp_with_interface(
+                self.server,
+                local_bind,
+                self.bind_interface.as_deref(),
+                self.timeout,
+            ),
+        )
+        .await
+        .map_err(|_| Error::new(ErrorKind::Timeout, "connect DNS TCP timed out"))??;
         stream
             .set_nodelay(true)
             .map_err(|error| Error::new(ErrorKind::Io, format!("configure DNS TCP: {error}")))?;
@@ -94,33 +81,17 @@ impl AsyncTcpDnsClient {
             .copied()
             .find(|address| address.is_ipv4() == self.server.is_ipv4())
             .map(|address| SocketAddr::new(address, 0));
-        let connect = async {
-            if let Some(local_bind) = local_bind {
-                let socket = if self.server.is_ipv4() {
-                    tokio::net::TcpSocket::new_v4()
-                } else {
-                    tokio::net::TcpSocket::new_v6()
-                }
-                .map_err(|error| {
-                    Error::new(ErrorKind::Io, format!("create DNS TCP socket: {error}"))
-                })?;
-                socket.bind(local_bind).map_err(|error| {
-                    Error::new(ErrorKind::Io, format!("bind DNS TCP socket: {error}"))
-                })?;
-                socket
-                    .connect(self.server)
-                    .await
-                    .map_err(|error| Error::new(ErrorKind::Io, format!("connect DNS TCP: {error}")))
-            } else {
-                TcpStream::connect(self.server)
-                    .await
-                    .map_err(|error| Error::new(ErrorKind::Io, format!("connect DNS TCP: {error}")))
-            }
-        };
-        let mut stream = tokio::time::timeout(self.timeout, connect)
-            .await
-            .map_err(|_| Error::new(ErrorKind::Timeout, "connect DNS TCP timed out"))?
-            .map_err(|error| Error::new(ErrorKind::Io, format!("connect DNS TCP: {error}")))?;
+        let mut stream = tokio::time::timeout(
+            self.timeout,
+            connect_tokio_tcp_with_interface(
+                self.server,
+                local_bind,
+                self.bind_interface.as_deref(),
+                self.timeout,
+            ),
+        )
+        .await
+        .map_err(|_| Error::new(ErrorKind::Timeout, "connect DNS TCP timed out"))??;
         stream
             .set_nodelay(true)
             .map_err(|error| Error::new(ErrorKind::Io, format!("configure DNS TCP: {error}")))?;
@@ -451,6 +422,7 @@ mod tests {
                 local_bind_addresses: Arc::from(
                     vec!["127.0.0.2".parse::<IpAddr>().unwrap()].into_boxed_slice(),
                 ),
+                bind_interface: None,
             };
             let domain = DomainName::new("example.com").unwrap();
             let (server_result, client_result) = tokio::join!(
@@ -494,6 +466,7 @@ mod tests {
                     timeout: Duration::from_secs(1),
                     max_packet_size: 2048,
                     local_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
+                    bind_interface: None,
                 };
                 let query = encode_raw_query(0x6b6b, &DomainName::new("example.com").unwrap(), 16)?;
                 let response = client.query_packet(&query).await?;
@@ -564,6 +537,7 @@ mod tests {
                     timeout: Duration::from_secs(1),
                     max_packet_size: 2048,
                     local_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
+                    bind_interface: None,
                 };
                 let second = first.clone();
                 let domain = DomainName::new("example.com").unwrap();

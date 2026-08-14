@@ -78,9 +78,26 @@ impl ResolverTransportFactory for RustCryptoResolverFactory {
         config: &GoResolverRuntimeConfig,
         local_bind_addresses: &[IpAddr],
     ) -> Result<Arc<dyn AsyncIpResolver>> {
+        self.build_with_policy_and_interface(config, local_bind_addresses, None)
+    }
+
+    fn build_with_policy_and_interface(
+        &self,
+        config: &GoResolverRuntimeConfig,
+        local_bind_addresses: &[IpAddr],
+        bind_interface: Option<&str>,
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
         match config.transport {
-            GoResolverTransport::Doh => self.doh.build_with_policy(config, local_bind_addresses),
-            GoResolverTransport::Dot => self.dot.build_with_policy(config, local_bind_addresses),
+            GoResolverTransport::Doh => self.doh.build_with_policy_and_interface(
+                config,
+                local_bind_addresses,
+                bind_interface,
+            ),
+            GoResolverTransport::Dot => self.dot.build_with_policy_and_interface(
+                config,
+                local_bind_addresses,
+                bind_interface,
+            ),
             GoResolverTransport::Doq | GoResolverTransport::Doh3 => Err(Error::new(
                 ErrorKind::Unsupported,
                 format!(
@@ -89,7 +106,11 @@ impl ResolverTransportFactory for RustCryptoResolverFactory {
                 ),
             )),
             GoResolverTransport::System | GoResolverTransport::Udp | GoResolverTransport::Tcp => {
-                self.builtin.build_with_policy(config, local_bind_addresses)
+                self.builtin.build_with_policy_and_interface(
+                    config,
+                    local_bind_addresses,
+                    bind_interface,
+                )
             }
         }
     }

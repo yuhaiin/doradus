@@ -140,8 +140,21 @@ impl ResolverTransportFactory for RustCryptoDotResolverFactory {
         config: &GoResolverRuntimeConfig,
         local_bind_addresses: &[IpAddr],
     ) -> Result<Arc<dyn AsyncIpResolver>> {
+        self.build_with_policy_and_interface(config, local_bind_addresses, None)
+    }
+
+    fn build_with_policy_and_interface(
+        &self,
+        config: &GoResolverRuntimeConfig,
+        local_bind_addresses: &[IpAddr],
+        bind_interface: Option<&str>,
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
         if config.transport != GoResolverTransport::Dot {
-            return self.builtin.build_with_policy(config, local_bind_addresses);
+            return self.builtin.build_with_policy_and_interface(
+                config,
+                local_bind_addresses,
+                bind_interface,
+            );
         }
         let (host, port) = split_dot_endpoint(&config.host, &config.id)?;
         let server_name = config
@@ -155,7 +168,8 @@ impl ResolverTransportFactory for RustCryptoDotResolverFactory {
                 self.client_config.clone(),
                 self.builtin.timeout,
             )
-            .with_local_bind_addresses(local_bind_addresses),
+            .with_local_bind_addresses(local_bind_addresses)
+            .with_bind_interface(bind_interface),
             host,
             port,
             server_name,

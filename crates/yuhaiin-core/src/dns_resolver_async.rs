@@ -170,6 +170,7 @@ async fn system_dns_client() -> Result<AsyncUdpDnsClient> {
         timeout: std::time::Duration::from_secs(5),
         max_packet_size: 65535,
         local_bind_addresses: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+        bind_interface: None,
     })
 }
 
@@ -806,6 +807,7 @@ mod tests {
             timeout: std::time::Duration::from_secs(1),
             max_packet_size: 4096,
             local_bind_addresses: Arc::from(Vec::new().into_boxed_slice()),
+            bind_interface: None,
         };
         let domain = DomainName::new("4.3.2.1.in-addr.arpa").unwrap();
         let (server_result, response) = tokio::join!(

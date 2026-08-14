@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use yuhaiin_core::http2::H2DohConnector;
 use yuhaiin_core::proxy::{
-    BoxAsyncStream, connect_tokio_tcp, stream_local_addr, with_stream_local_addr,
+    BoxAsyncStream, connect_tokio_tcp_with_interface, stream_local_addr, with_stream_local_addr,
 };
 use yuhaiin_core::{BoxFuture, Error, ErrorKind, Result};
 
@@ -27,6 +27,7 @@ pub struct RustCryptoTlsDialer {
     tls: TlsConnector,
     timeout: Duration,
     local_bind_addresses: Arc<[IpAddr]>,
+    bind_interface: Option<String>,
 }
 
 impl RustCryptoTlsDialer {
@@ -39,11 +40,17 @@ impl RustCryptoTlsDialer {
             tls: TlsConnector::from(config),
             timeout,
             local_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
+            bind_interface: None,
         }
     }
 
     pub fn with_local_bind_addresses(mut self, addresses: &[IpAddr]) -> Self {
         self.local_bind_addresses = Arc::from(addresses.to_vec().into_boxed_slice());
+        self
+    }
+
+    pub fn with_bind_interface(mut self, interface: Option<&str>) -> Self {
+        self.bind_interface = interface.map(str::to_owned);
         self
     }
 
@@ -68,7 +75,14 @@ impl RustCryptoTlsDialer {
                 .copied()
                 .find(|address| address.is_ipv4() == remote.ip().is_ipv4())
                 .map(|address| std::net::SocketAddr::new(address, 0));
-            match connect_tokio_tcp(remote, local_bind, self.timeout).await {
+            match connect_tokio_tcp_with_interface(
+                remote,
+                local_bind,
+                self.bind_interface.as_deref(),
+                self.timeout,
+            )
+            .await
+            {
                 Ok(stream) => break stream,
                 Err(error) => last_error = Some(error),
             }
@@ -179,6 +193,11 @@ impl RustCryptoH2Connector {
         self.dialer = self.dialer.with_local_bind_addresses(addresses);
         self
     }
+
+    pub fn with_bind_interface(mut self, interface: Option<&str>) -> Self {
+        self.dialer = self.dialer.with_bind_interface(interface);
+        self
+    }
 }
 
 impl H2DohConnector for RustCryptoH2Connector {
@@ -249,6 +268,11 @@ impl RoutedRustCryptoH2Connector {
 
     pub(crate) fn with_local_bind_addresses(mut self, addresses: &[IpAddr]) -> Self {
         self.dialer = self.dialer.with_local_bind_addresses(addresses);
+        self
+    }
+
+    pub(crate) fn with_bind_interface(mut self, interface: Option<&str>) -> Self {
+        self.dialer = self.dialer.with_bind_interface(interface);
         self
     }
 }

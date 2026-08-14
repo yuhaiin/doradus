@@ -43,6 +43,19 @@ pub trait ResolverTransportFactory: Send + Sync {
     ) -> Result<Arc<dyn AsyncIpResolver>> {
         self.build(config)
     }
+
+    /// Build a resolver with both the source-address fallback and the
+    /// interface policy used by runtime-owned outbound sockets. The default
+    /// keeps third-party factories source-compatible; built-in transports
+    /// override it because they own their sockets.
+    fn build_with_policy_and_interface(
+        &self,
+        config: &GoResolverRuntimeConfig,
+        local_bind_addresses: &[IpAddr],
+        _bind_interface: Option<&str>,
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
+        self.build_with_policy(config, local_bind_addresses)
+    }
 }
 
 /// Late-bound outbound path used by resolver transports that are configured to
@@ -448,8 +461,21 @@ impl ResolverTransportFactory for RustCryptoDohResolverFactory {
         config: &GoResolverRuntimeConfig,
         local_bind_addresses: &[IpAddr],
     ) -> Result<Arc<dyn AsyncIpResolver>> {
+        self.build_with_policy_and_interface(config, local_bind_addresses, None)
+    }
+
+    fn build_with_policy_and_interface(
+        &self,
+        config: &GoResolverRuntimeConfig,
+        local_bind_addresses: &[IpAddr],
+        bind_interface: Option<&str>,
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
         if config.transport != GoResolverTransport::Doh {
-            return self.builtin.build_with_policy(config, local_bind_addresses);
+            return self.builtin.build_with_policy_and_interface(
+                config,
+                local_bind_addresses,
+                bind_interface,
+            );
         }
         let endpoint = doh_endpoint(&config.host, &config.id)?;
         let connector = RoutedRustCryptoH2Connector::from_config(
@@ -464,7 +490,8 @@ impl ResolverTransportFactory for RustCryptoDohResolverFactory {
                 .as_ref()
                 .is_some_and(|bridge| bridge.is_proxy_resolver(&config.id)),
         )
-        .with_local_bind_addresses(local_bind_addresses);
+        .with_local_bind_addresses(local_bind_addresses)
+        .with_bind_interface(bind_interface);
         let client = H2DohClient {
             endpoint,
             connector,
@@ -504,7 +531,17 @@ impl ResolverTransportFactory for BuiltinResolverFactory {
         config: &GoResolverRuntimeConfig,
         local_bind_addresses: &[IpAddr],
     ) -> Result<Arc<dyn AsyncIpResolver>> {
+        self.build_with_policy_and_interface(config, local_bind_addresses, None)
+    }
+
+    fn build_with_policy_and_interface(
+        &self,
+        config: &GoResolverRuntimeConfig,
+        local_bind_addresses: &[IpAddr],
+        bind_interface: Option<&str>,
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
         let local_bind_addresses = Arc::from(local_bind_addresses.to_vec().into_boxed_slice());
+        let bind_interface = bind_interface.map(str::to_owned);
         match config.transport {
             GoResolverTransport::System => Ok(Arc::new(SystemAsyncIpResolver)),
             GoResolverTransport::Udp => {
@@ -513,6 +550,7 @@ impl ResolverTransportFactory for BuiltinResolverFactory {
                     timeout: self.timeout,
                     max_packet_size: self.max_packet_size,
                     local_bind_addresses,
+                    bind_interface: bind_interface.clone(),
                 };
                 let resolver = AsyncDnsResolver::new(client)
                     .with_cache(DnsCache::new(self.cache_capacity.max(1))?);
@@ -524,6 +562,7 @@ impl ResolverTransportFactory for BuiltinResolverFactory {
                     timeout: self.timeout,
                     max_packet_size: self.max_packet_size,
                     local_bind_addresses,
+                    bind_interface,
                 };
                 let resolver = AsyncDnsResolver::new(client)
                     .with_cache(DnsCache::new(self.cache_capacity.max(1))?);

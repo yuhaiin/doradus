@@ -120,5 +120,16 @@ run_in_podman() {
 # Podman host-network mode. Every path still executes only inside containers.
 run_in_podman none "${scenario_dir}/podman-isolated.log" "${isolated_binaries[@]}"
 run_in_podman none "${scenario_dir}/podman-stats.log" "${stats_binaries[@]}"
-run_in_podman host "${scenario_dir}/podman-service-chain.log" "${host_network_binaries[@]}"
+
+# Process-level harnesses can leave child services behind until their test
+# process exits. Run each host-network harness in its own disposable
+# container, otherwise a fixed listener from one harness can collide with the
+# next harness while the parent container is still alive.
+host_network_index=0
+for test_binary in "${host_network_binaries[@]}"; do
+  host_network_index=$((host_network_index + 1))
+  run_in_podman host \
+    "${scenario_dir}/podman-host-${host_network_index}.log" \
+    "${test_binary}"
+done
 echo "[workspace-tests] passed; logs=${scenario_dir}"

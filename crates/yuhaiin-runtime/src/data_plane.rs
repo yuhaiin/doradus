@@ -18,7 +18,7 @@ use yuhaiin_core::dns::{
 };
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::dns_tcp_async::AsyncTcpDnsServer;
-use yuhaiin_core::{BoxFuture, LocalBoxFuture, Result};
+use yuhaiin_core::{BoxFuture, LocalBoxFuture, Result, RouteMode};
 #[cfg(feature = "tun")]
 use yuhaiin_core::{Error, ErrorKind};
 #[cfg(feature = "tun")]
@@ -133,11 +133,15 @@ pub(crate) fn inbound_dns_handler(snapshot: &RuntimeSnapshot) -> Option<Arc<Runt
     snapshot.inbound_settings.hijack_dns.then(|| {
         Arc::new(RuntimeDnsHandler {
             resolver: if snapshot.inbound_settings.hijack_dns_fakeip {
-                snapshot.resolver.clone()
+                snapshot
+                    .inbound_resolver_for_route_mode(RouteMode::Proxy)
+                    .unwrap_or_else(|_| snapshot.inbound_resolver.clone())
             } else {
-                snapshot.dns_resolver.clone()
+                snapshot
+                    .dns_resolver_for_route_mode(RouteMode::Proxy)
+                    .unwrap_or_else(|_| snapshot.dns_resolver.clone())
             },
-            fakeip: snapshot.fakeip.clone(),
+            fakeip: snapshot.inbound_fakeip.clone(),
         })
     })
 }
@@ -609,6 +613,11 @@ pub async fn run_dns_supervisor(
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     loop {
+        // A reload and process shutdown can become ready at the same time.
+        // Do not start another bind cycle after shutdown has already won.
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         let server = configured_dns_server(controller.store()).await?;
         let Some(server) = server else {
             if wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
@@ -616,6 +625,9 @@ pub async fn run_dns_supervisor(
             }
             continue;
         };
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         let address = parse_dns_server(&server, 53, "api-dns")?;
         let snapshot = controller.handle().load();
         let handler = RuntimeDnsHandler {
@@ -748,7 +760,7 @@ mod tests {
     use yuhaiin_core::dns_udp_async::{AsyncUdpDnsClient, AsyncUdpDnsServer};
     use yuhaiin_core::{BoxFuture, DomainName, ErrorKind, IpSet, ResolveStrategy};
     use yuhaiin_store::fakeip::{FakeIpConfig, FakeIpPool, FakeIpV6Config, FakeIpV6Pool};
-    use yuhaiin_store::{ConfigStore, FakeIpPools};
+    use yuhaiin_store::{ConfigStore, FakeIpPools, FakeIpResolver};
 
     fn platform_tun_config(enabled: bool) -> TunRuntimeConfig {
         TunRuntimeConfig {
@@ -863,6 +875,108 @@ mod tests {
 
         let error = load_tun_configs_for_desktop(&store).await.unwrap_err();
         assert!(error.to_string().contains("same device name"));
+    }
+
+    #[tokio::test]
+    async fn inbound_dns_handler_uses_the_route_resolver_for_hijacked_queries() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let mut snapshot = RuntimeBuilder::new(store, Arc::new(SystemAsyncIpResolver))
+            .build()
+            .await
+            .unwrap();
+        snapshot.resolver = Arc::new(FixedAddressResolver {
+            address: Ipv4Addr::new(192, 0, 2, 1),
+        });
+        snapshot.dns_resolver = Arc::new(FixedAddressResolver {
+            address: Ipv4Addr::new(192, 0, 2, 2),
+        });
+        snapshot.inbound_resolver = Arc::new(FixedAddressResolver {
+            address: Ipv4Addr::new(192, 0, 2, 3),
+        });
+        snapshot.resolver_by_id.insert(
+            "bootstrap".to_owned(),
+            Arc::new(FixedAddressResolver {
+                address: Ipv4Addr::new(192, 0, 2, 53),
+            }),
+        );
+        snapshot.dns_resolver_by_id.insert(
+            "bootstrap".to_owned(),
+            Arc::new(FixedAddressResolver {
+                address: Ipv4Addr::new(192, 0, 2, 54),
+            }),
+        );
+        snapshot.inbound_resolver_by_id.insert(
+            "bootstrap".to_owned(),
+            Arc::new(FixedAddressResolver {
+                address: Ipv4Addr::new(192, 0, 2, 53),
+            }),
+        );
+        snapshot.resolver_registry_enabled = true;
+        snapshot.route.as_mut().unwrap().proxy_resolver = "bootstrap".to_owned();
+        snapshot.inbound_settings.hijack_dns = true;
+
+        let domain = DomainName::new("route-selected.example.test").unwrap();
+        let packet = encode_query(0x5353, &domain, DnsRecordType::A).unwrap();
+
+        snapshot.inbound_settings.hijack_dns_fakeip = true;
+        let handler = inbound_dns_handler(&snapshot).unwrap();
+        let response = handler.answer(&packet).await.unwrap();
+        assert_eq!(
+            decode_response(&response, 0x5353, DnsRecordType::A)
+                .unwrap()
+                .addresses
+                .v4,
+            vec![Ipv4Addr::new(192, 0, 2, 53)]
+        );
+
+        snapshot.inbound_settings.hijack_dns_fakeip = false;
+        let handler = inbound_dns_handler(&snapshot).unwrap();
+        let response = handler.answer(&packet).await.unwrap();
+        assert_eq!(
+            decode_response(&response, 0x5353, DnsRecordType::A)
+                .unwrap()
+                .addresses
+                .v4,
+            vec![Ipv4Addr::new(192, 0, 2, 54)]
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_fakeip_is_available_when_global_fakedns_is_disabled() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let mut snapshot = RuntimeBuilder::new(store, Arc::new(SystemAsyncIpResolver))
+            .build()
+            .await
+            .unwrap();
+        assert!(snapshot.fakeip.is_none());
+        let pools = snapshot
+            .inbound_fakeip
+            .clone()
+            .expect("inbound FakeIP should not depend on global FakeDNS");
+        snapshot.inbound_settings.hijack_dns = true;
+        snapshot.inbound_settings.hijack_dns_fakeip = true;
+        snapshot.inbound_resolver = Arc::new(FakeIpResolver::new(
+            Arc::new(FixedAddressResolver {
+                address: Ipv4Addr::new(192, 0, 2, 7),
+            }),
+            pools.clone(),
+            false,
+        ));
+
+        let domain = DomainName::new("inbound-only-fakeip.example.test").unwrap();
+        let packet = encode_query(0x5454, &domain, DnsRecordType::A).unwrap();
+        let handler = inbound_dns_handler(&snapshot).unwrap();
+        let response = handler.answer(&packet).await.unwrap();
+        let address = decode_response(&response, 0x5454, DnsRecordType::A)
+            .unwrap()
+            .addresses
+            .v4[0];
+        assert_eq!(address.octets()[0], 198);
+        assert_eq!(address.octets()[1], 18);
+        assert_eq!(
+            pools.view_store().lookup_domain_ip(address.into()),
+            Some(domain)
+        );
     }
 
     struct ServiceBindingResolver;
@@ -1195,6 +1309,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_packet_size: 2048,
             local_bind_addresses: Arc::from(Vec::new().into_boxed_slice()),
+            bind_interface: None,
         };
         let (udp_server_result, udp_response) =
             tokio::join!(udp_server.serve_once(), udp_client.query_packet(&query));
@@ -1216,6 +1331,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_packet_size: 2048,
             local_bind_addresses: Arc::from(Vec::new().into_boxed_slice()),
+            bind_interface: None,
         };
         let (tcp_server_result, tcp_response) =
             tokio::join!(tcp_server.serve_once(), tcp_client.query_packet(&query));

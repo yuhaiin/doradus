@@ -143,12 +143,21 @@ pub struct RuntimeSnapshot {
     /// Source addresses used when settings request a named/default network
     /// interface. An empty list preserves the OS default route.
     pub(crate) socket_bind_addresses: Arc<[IpAddr]>,
+    /// Interface policy applied to every runtime-owned outbound socket. The
+    /// automatic value is a dynamic core marker, not a cached interface name.
+    pub(crate) socket_bind_interface: Option<String>,
     pub resolver: Arc<dyn AsyncIpResolver>,
+    /// Resolver used by inbound DNS hijacking when the inbound FakeIP switch
+    /// is enabled. It is independent from the global FakeDNS resolver.
+    pub(crate) inbound_resolver: Arc<dyn AsyncIpResolver>,
     /// Resolver without FakeIP transformation, used when DNS hijacking is
     /// enabled but the `hijackDnsFakeIp` switch is disabled.
     pub(crate) dns_resolver: Arc<dyn AsyncIpResolver>,
     pub hosts: HostsTable,
     pub fakeip: Option<FakeIpPools>,
+    /// FakeIP pool owned by inbound DNS hijacking. It may exist while the
+    /// global `resolver.fakedns` pool is disabled.
+    pub(crate) inbound_fakeip: Option<FakeIpPools>,
     pub resolvers: Vec<GoResolverRuntimeConfig>,
     pub route: Option<GoRouteRuntimeConfig>,
     pub route_rules: Vec<GoRouteRuleRecord>,
@@ -158,6 +167,12 @@ pub struct RuntimeSnapshot {
     pub route_lists: RouteListSnapshot,
     pub router: RouterRuntime,
     pub resolver_by_id: BTreeMap<String, Arc<dyn AsyncIpResolver>>,
+    /// Configured resolvers wrapped with the inbound FakeIP policy.
+    pub(crate) inbound_resolver_by_id: BTreeMap<String, Arc<dyn AsyncIpResolver>>,
+    /// Configured resolvers without FakeIP transformation. DNS listeners use
+    /// this parallel registry when inbound FakeIP responses are disabled,
+    /// while `resolver_by_id` remains the flow-resolution registry.
+    pub(crate) dns_resolver_by_id: BTreeMap<String, Arc<dyn AsyncIpResolver>>,
     pub resolver_errors: BTreeMap<String, String>,
     pub resolver_registry_enabled: bool,
     pub geo_metadata: Vec<MaxMindMetadataRecord>,
@@ -187,8 +202,48 @@ impl RuntimeSnapshot {
         self.resolver_by_id.get(id).cloned()
     }
 
+    fn inbound_resolver_for(&self, id: &str) -> Option<Arc<dyn AsyncIpResolver>> {
+        self.inbound_resolver_by_id.get(id).cloned()
+    }
+
+    pub fn dns_resolver_for(&self, id: &str) -> Option<Arc<dyn AsyncIpResolver>> {
+        self.dns_resolver_by_id.get(id).cloned()
+    }
+
     pub fn require_resolver(&self, id: &str) -> Result<Arc<dyn AsyncIpResolver>> {
         if let Some(resolver) = self.resolver_for(id) {
+            return Ok(resolver);
+        }
+        if let Some(error) = self.resolver_errors.get(id) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!("resolver {id:?} is unavailable: {error}"),
+            ));
+        }
+        Err(Error::new(
+            ErrorKind::NotFound,
+            format!("resolver {id:?} is not present in the runtime registry"),
+        ))
+    }
+
+    fn require_dns_resolver(&self, id: &str) -> Result<Arc<dyn AsyncIpResolver>> {
+        if let Some(resolver) = self.dns_resolver_for(id) {
+            return Ok(resolver);
+        }
+        if let Some(error) = self.resolver_errors.get(id) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!("resolver {id:?} is unavailable: {error}"),
+            ));
+        }
+        Err(Error::new(
+            ErrorKind::NotFound,
+            format!("resolver {id:?} is not present in the runtime registry"),
+        ))
+    }
+
+    fn require_inbound_resolver(&self, id: &str) -> Result<Arc<dyn AsyncIpResolver>> {
+        if let Some(resolver) = self.inbound_resolver_for(id) {
             return Ok(resolver);
         }
         if let Some(error) = self.resolver_errors.get(id) {
@@ -220,6 +275,43 @@ impl RuntimeSnapshot {
             return Ok(self.resolver.clone());
         }
         self.require_resolver(id)
+    }
+
+    /// Select the configured resolver for an inbound DNS query without
+    /// changing its answer into a FakeIP. The route ID is deliberately the
+    /// same one used by `resolver_for_route_mode`, so toggling FakeIP cannot
+    /// silently switch DNS back to the process/system resolver.
+    pub fn dns_resolver_for_route_mode(&self, mode: RouteMode) -> Result<Arc<dyn AsyncIpResolver>> {
+        let Some(route) = &self.route else {
+            return Ok(self.dns_resolver.clone());
+        };
+        let id = match mode {
+            RouteMode::Proxy => route.proxy_resolver.trim(),
+            RouteMode::Direct | RouteMode::Bypass => route.direct_resolver.trim(),
+            RouteMode::Block => "",
+        };
+        if id.is_empty() || !self.resolver_registry_enabled {
+            return Ok(self.dns_resolver.clone());
+        }
+        self.require_dns_resolver(id)
+    }
+
+    pub(crate) fn inbound_resolver_for_route_mode(
+        &self,
+        mode: RouteMode,
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
+        let Some(route) = &self.route else {
+            return Ok(self.inbound_resolver.clone());
+        };
+        let id = match mode {
+            RouteMode::Proxy => route.proxy_resolver.trim(),
+            RouteMode::Direct | RouteMode::Bypass => route.direct_resolver.trim(),
+            RouteMode::Block => "",
+        };
+        if id.is_empty() || !self.resolver_registry_enabled {
+            return Ok(self.inbound_resolver.clone());
+        }
+        self.require_inbound_resolver(id)
     }
 
     /// Apply route mode/policy and return the resolver selected by the same
@@ -325,6 +417,7 @@ impl RuntimeBuilder {
         let inbound_settings = repository.get_inbound_settings().await?;
         let socket_bind_addresses =
             Arc::from(interfaces::bind_addresses_for_settings(&settings).into_boxed_slice());
+        let socket_bind_interface = interfaces::bind_interface_for_settings(&settings);
         let nat = repository.get_nat_config_or_default("default").await?;
         let hosts = load_hosts(&repository, &self.store).await?;
         let resolvers = repository.list_go_resolver_runtime_configs().await?;
@@ -366,27 +459,28 @@ impl RuntimeBuilder {
             None => repository.load_go_fakeip_runtime_config().await?,
         };
         let fakeip_policy = load_fakeip_policy(&self.store, &repository).await?;
-        let fakeip = match fakeip_config {
+        let fakeip = match fakeip_config.as_ref() {
             Some(config) if config.enabled => {
-                let options = self.options.fakeip_options;
-                let ipv4 = Arc::new(match options {
-                    Some(options) => {
-                        FakeIpPool::open_with_options(self.store.clone(), config.ipv4, options)
-                            .await?
-                    }
-                    None => FakeIpPool::open(self.store.clone(), config.ipv4).await?,
-                });
-                let ipv6 = Arc::new(match options {
-                    Some(options) => {
-                        FakeIpV6Pool::open_with_options(self.store.clone(), config.ipv6, options)
-                            .await?
-                    }
-                    None => FakeIpV6Pool::open(self.store.clone(), config.ipv6).await?,
-                });
-                let pools = FakeIpPools::new(ipv4, ipv6);
-                Some(pools)
+                Some(open_fakeip_pools(&self.store, config, self.options.fakeip_options).await?)
             }
             _ => None,
+        };
+        let inbound_fakeip = if inbound_settings.hijack_dns_fakeip {
+            match fakeip.clone() {
+                Some(pools) => Some(pools),
+                None => {
+                    let config = match fakeip_config.as_ref() {
+                        Some(config) => config.clone(),
+                        None => default_fakeip_runtime_config()?,
+                    };
+                    Some(
+                        open_fakeip_pools(&self.store, &config, self.options.fakeip_options)
+                            .await?,
+                    )
+                }
+            }
+        } else {
+            None
         };
 
         let resolver = wrap_resolver(
@@ -405,15 +499,29 @@ impl RuntimeBuilder {
             &fakeip_policy,
             settings.ipv6,
         );
+        let inbound_resolver = wrap_resolver(
+            self.upstream.clone(),
+            &hosts,
+            inbound_fakeip.as_ref(),
+            self.options.fakeip_skip_check_upstream,
+            &fakeip_policy,
+            settings.ipv6,
+        );
         let mut resolver_by_id = BTreeMap::new();
+        let mut inbound_resolver_by_id = BTreeMap::new();
+        let mut dns_resolver_by_id = BTreeMap::new();
         let mut resolver_errors = BTreeMap::new();
         let resolver_registry_enabled = self.resolver_factory.is_some();
         if let Some(factory) = &self.resolver_factory {
             for config in &resolvers {
-                match factory.build_with_policy(config, &socket_bind_addresses) {
+                match factory.build_with_policy_and_interface(
+                    config,
+                    &socket_bind_addresses,
+                    socket_bind_interface.as_deref(),
+                ) {
                     Ok(raw) => {
                         let wrapped = wrap_resolver(
-                            raw,
+                            raw.clone(),
                             &hosts,
                             fakeip.as_ref(),
                             self.options.fakeip_skip_check_upstream,
@@ -427,6 +535,40 @@ impl RuntimeBuilder {
                             wrapped
                         };
                         resolver_by_id.insert(config.id.clone(), wrapped);
+
+                        let inbound_wrapped = wrap_resolver(
+                            raw.clone(),
+                            &hosts,
+                            inbound_fakeip.as_ref(),
+                            self.options.fakeip_skip_check_upstream,
+                            &fakeip_policy,
+                            settings.ipv6,
+                        );
+                        let inbound_wrapped = if self.options.resolver_query_fallback {
+                            Arc::new(FallbackResolver::new(
+                                inbound_wrapped,
+                                inbound_resolver.clone(),
+                            )) as Arc<dyn AsyncIpResolver>
+                        } else {
+                            inbound_wrapped
+                        };
+                        inbound_resolver_by_id.insert(config.id.clone(), inbound_wrapped);
+
+                        let dns_wrapped = wrap_resolver(
+                            raw,
+                            &hosts,
+                            None,
+                            self.options.fakeip_skip_check_upstream,
+                            &fakeip_policy,
+                            settings.ipv6,
+                        );
+                        let dns_wrapped = if self.options.resolver_query_fallback {
+                            Arc::new(FallbackResolver::new(dns_wrapped, dns_resolver.clone()))
+                                as Arc<dyn AsyncIpResolver>
+                        } else {
+                            dns_wrapped
+                        };
+                        dns_resolver_by_id.insert(config.id.clone(), dns_wrapped);
                     }
                     Err(error) => match self.options.resolver_failure_policy {
                         ResolverFailurePolicy::FailBuild => return Err(error),
@@ -446,13 +588,16 @@ impl RuntimeBuilder {
         let connect_semaphore = Arc::new(Semaphore::new(settings.happy_eyeballs_semaphore));
         Ok(RuntimeSnapshot {
             resolver,
+            inbound_resolver,
             dns_resolver,
             settings,
             inbound_settings,
             connect_semaphore,
             socket_bind_addresses,
+            socket_bind_interface,
             hosts,
             fakeip,
+            inbound_fakeip,
             resolvers,
             route,
             route_rules,
@@ -460,6 +605,8 @@ impl RuntimeBuilder {
             route_lists,
             router,
             resolver_by_id,
+            inbound_resolver_by_id,
+            dns_resolver_by_id,
             resolver_errors,
             resolver_registry_enabled,
             geo_metadata,
@@ -494,6 +641,35 @@ fn wrap_resolver(
     let upstream =
         Arc::new(AsyncHostsResolver::new(hosts.clone(), upstream)) as Arc<dyn AsyncIpResolver>;
     Arc::new(Ipv6PolicyResolver::new(upstream, ipv6_enabled))
+}
+
+async fn open_fakeip_pools(
+    store: &ConfigStore,
+    config: &yuhaiin_store::GoFakeIpRuntimeConfig,
+    options: Option<FakeIpPoolOptions>,
+) -> Result<FakeIpPools> {
+    let ipv4 = Arc::new(match options {
+        Some(options) => FakeIpPool::open_with_options(store.clone(), config.ipv4, options).await?,
+        None => FakeIpPool::open(store.clone(), config.ipv4).await?,
+    });
+    let ipv6 = Arc::new(match options {
+        Some(options) => {
+            FakeIpV6Pool::open_with_options(store.clone(), config.ipv6, options).await?
+        }
+        None => FakeIpV6Pool::open(store.clone(), config.ipv6).await?,
+    });
+    Ok(FakeIpPools::new(ipv4, ipv6))
+}
+
+fn default_fakeip_runtime_config() -> Result<yuhaiin_store::GoFakeIpRuntimeConfig> {
+    yuhaiin_store::GoDnsSettingsRecord {
+        id: 0,
+        server: String::new(),
+        fakedns_enabled: false,
+        fakedns_ipv4_range: "198.18.0.0/15".to_owned(),
+        fakedns_ipv6_range: "fc00::/18".to_owned(),
+    }
+    .to_fakeip_runtime_config()
 }
 
 async fn load_hosts(
@@ -1071,6 +1247,8 @@ mod tests {
         .unwrap();
         assert_eq!(snapshot.resolver_by_id.len(), 1);
         assert!(snapshot.resolver_by_id.contains_key("bootstrap"));
+        assert_eq!(snapshot.dns_resolver_by_id.len(), 1);
+        assert!(snapshot.dns_resolver_by_id.contains_key("bootstrap"));
     }
 
     #[test]
@@ -1087,6 +1265,19 @@ mod tests {
         let mut resolver_by_id = BTreeMap::new();
         resolver_by_id.insert("direct".to_owned(), direct);
         resolver_by_id.insert("proxy".to_owned(), proxy);
+        let mut dns_resolver_by_id = BTreeMap::new();
+        dns_resolver_by_id.insert(
+            "direct".to_owned(),
+            Arc::new(StaticResolver {
+                address: Ipv4Addr::new(192, 0, 2, 12),
+            }) as Arc<dyn AsyncIpResolver>,
+        );
+        dns_resolver_by_id.insert(
+            "proxy".to_owned(),
+            Arc::new(StaticResolver {
+                address: Ipv4Addr::new(192, 0, 2, 13),
+            }) as Arc<dyn AsyncIpResolver>,
+        );
         let router = RouterRuntime::new(
             Router::compile(
                 Vec::new(),
@@ -1102,10 +1293,13 @@ mod tests {
             settings: RuntimeSettings::default(),
             connect_semaphore: Arc::new(Semaphore::new(250)),
             socket_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
+            socket_bind_interface: None,
             resolver: main,
+            inbound_resolver: Arc::new(SystemAsyncIpResolver),
             dns_resolver: Arc::new(SystemAsyncIpResolver),
             hosts: HostsTable::new(),
             fakeip: None,
+            inbound_fakeip: None,
             inbound_settings: yuhaiin_store::InboundSettings::default(),
             resolvers: Vec::new(),
             route: Some(GoRouteRuntimeConfig {
@@ -1119,6 +1313,8 @@ mod tests {
             route_lists: RouteListSnapshot::default(),
             router,
             resolver_by_id,
+            inbound_resolver_by_id: BTreeMap::new(),
+            dns_resolver_by_id,
             resolver_errors: BTreeMap::new(),
             resolver_registry_enabled: true,
             geo_metadata: Vec::new(),
@@ -1152,6 +1348,17 @@ mod tests {
             .unwrap()
             .v4,
             vec![Ipv4Addr::new(192, 0, 2, 2)]
+        );
+        assert_eq!(
+            block_on(
+                snapshot
+                    .dns_resolver_for_route_mode(RouteMode::Proxy)
+                    .unwrap()
+                    .resolve(&domain, ResolveStrategy::OnlyIpv4,)
+            )
+            .unwrap()
+            .v4,
+            vec![Ipv4Addr::new(192, 0, 2, 13)]
         );
     }
 

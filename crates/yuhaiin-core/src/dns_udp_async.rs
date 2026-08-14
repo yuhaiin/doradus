@@ -15,6 +15,7 @@ use crate::dns::{
     AsyncDnsHandler, DnsRecordType, DnsResponse, decode_response, encode_query,
     validate_query_packet, validate_response_packet,
 };
+use crate::proxy::bind_tokio_udp_socket_for_target;
 use crate::{DomainName, Error, ErrorKind, IpSet, LocalBoxFuture, ResolveStrategy, Result};
 
 #[derive(Debug, Clone)]
@@ -23,6 +24,7 @@ pub struct AsyncUdpDnsClient {
     pub timeout: Duration,
     pub max_packet_size: usize,
     pub local_bind_addresses: Arc<[IpAddr]>,
+    pub bind_interface: Option<String>,
 }
 
 impl AsyncUdpDnsClient {
@@ -43,9 +45,13 @@ impl AsyncUdpDnsClient {
             .find(|address| address.is_ipv4() == self.server.is_ipv4())
             .map(|address| SocketAddr::new(address, 0))
             .unwrap_or(default_bind);
-        let socket = UdpSocket::bind(bind_address)
-            .await
-            .map_err(|error| Error::new(ErrorKind::Io, format!("bind DNS UDP socket: {error}")))?;
+        let socket = bind_tokio_udp_socket_for_target(
+            bind_address,
+            self.server,
+            self.bind_interface.as_deref(),
+            "DNS",
+        )
+        .await?;
         let max_packet_size = self.max_packet_size.max(512);
         let server = self.server;
         tokio::time::timeout(self.timeout, async move {
@@ -86,9 +92,13 @@ impl AsyncUdpDnsClient {
             .find(|address| address.is_ipv4() == self.server.is_ipv4())
             .map(|address| SocketAddr::new(address, 0))
             .unwrap_or(default_bind);
-        let socket = UdpSocket::bind(bind_address)
-            .await
-            .map_err(|error| Error::new(ErrorKind::Io, format!("bind DNS UDP socket: {error}")))?;
+        let socket = bind_tokio_udp_socket_for_target(
+            bind_address,
+            self.server,
+            self.bind_interface.as_deref(),
+            "DNS",
+        )
+        .await?;
         let id = next_transaction_id();
         let request = encode_query(id, domain, record_type)?;
         let max_packet_size = self.max_packet_size.max(512);
@@ -273,6 +283,7 @@ mod tests {
                 local_bind_addresses: Arc::from(
                     vec!["127.0.0.2".parse::<IpAddr>().unwrap()].into_boxed_slice(),
                 ),
+                bind_interface: None,
             };
             let domain = DomainName::new("example.com").unwrap();
             let client_future = async move {
@@ -323,6 +334,7 @@ mod tests {
                     timeout: Duration::from_secs(1),
                     max_packet_size: 2048,
                     local_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
+                    bind_interface: None,
                 };
                 let query = encode_raw_query(0x5a5a, &DomainName::new("example.com").unwrap(), 16)?;
                 let response = client.query_packet(&query).await?;
@@ -379,6 +391,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 max_packet_size: 4096,
                 local_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
+                bind_interface: None,
             };
             let client_future = async {
                 let answer = client

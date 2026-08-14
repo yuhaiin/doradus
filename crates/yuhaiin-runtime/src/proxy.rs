@@ -904,6 +904,7 @@ impl RuntimeSnapshot {
                     inner: proxy,
                     bind_addresses: self.socket_bind_addresses.clone(),
                     bind_interface: child.network_interface(),
+                    global_bind_interface: self.socket_bind_interface.clone(),
                 }) as Arc<dyn AsyncProxy>;
                 Ok(self.resolve_proxy(proxy))
             }
@@ -1044,7 +1045,9 @@ impl RuntimeSnapshot {
                     layer,
                     timeout,
                     self.resolver.clone(),
-                    child.network_interface(),
+                    child
+                        .network_interface()
+                        .or_else(|| self.socket_bind_interface.clone()),
                 )
                 .await
             }
@@ -1105,7 +1108,9 @@ impl RuntimeSnapshot {
                 layer,
                 timeout,
                 self.resolver.clone(),
-                config.network_interface(),
+                config
+                    .network_interface()
+                    .or_else(|| self.socket_bind_interface.clone()),
             )
             .await?
         } else if config.transport == yuhaiin_store::GoProxyTransport::HttpMock {
@@ -1370,6 +1375,7 @@ impl RuntimeSnapshot {
                 inner: proxy,
                 bind_addresses: self.socket_bind_addresses.clone(),
                 bind_interface: config.network_interface(),
+                global_bind_interface: self.socket_bind_interface.clone(),
             }),
             semaphore: self.connect_semaphore.clone(),
         }) as Arc<dyn AsyncProxy>;
@@ -1507,6 +1513,7 @@ impl RuntimeSnapshot {
                     inner: proxy,
                     bind_addresses: self.socket_bind_addresses.clone(),
                     bind_interface: None,
+                    global_bind_interface: self.socket_bind_interface.clone(),
                 }),
                 semaphore: self.connect_semaphore.clone(),
             }) as Arc<dyn AsyncProxy>;
@@ -1527,6 +1534,7 @@ struct SocketPolicyProxy {
     inner: Arc<dyn AsyncProxy>,
     bind_addresses: Arc<[std::net::IpAddr]>,
     bind_interface: Option<String>,
+    global_bind_interface: Option<String>,
 }
 
 impl AsyncProxy for SocketPolicyProxy {
@@ -1536,9 +1544,10 @@ impl AsyncProxy for SocketPolicyProxy {
     ) -> yuhaiin_core::BoxFuture<'a, Result<yuhaiin_core::proxy::BoxAsyncStream>> {
         let mut context = context.clone();
         context.local_bind_addresses = self.bind_addresses.to_vec();
-        if self.bind_interface.is_some() {
-            context.bind_interface = self.bind_interface.clone();
-        }
+        context.bind_interface = self
+            .bind_interface
+            .clone()
+            .or_else(|| self.global_bind_interface.clone());
         let inner = Arc::clone(&self.inner);
         Box::pin(async move { inner.connect(&context).await })
     }
@@ -1549,9 +1558,10 @@ impl AsyncProxy for SocketPolicyProxy {
     ) -> yuhaiin_core::BoxFuture<'a, Result<Box<dyn yuhaiin_core::proxy::AsyncDatagram>>> {
         let mut context = context.clone();
         context.local_bind_addresses = self.bind_addresses.to_vec();
-        if self.bind_interface.is_some() {
-            context.bind_interface = self.bind_interface.clone();
-        }
+        context.bind_interface = self
+            .bind_interface
+            .clone()
+            .or_else(|| self.global_bind_interface.clone());
         let inner = Arc::clone(&self.inner);
         Box::pin(async move { inner.open_datagram(&context).await })
     }
@@ -1562,9 +1572,10 @@ impl AsyncProxy for SocketPolicyProxy {
     ) -> yuhaiin_core::BoxFuture<'a, Result<Duration>> {
         let mut context = context.clone();
         context.local_bind_addresses = self.bind_addresses.to_vec();
-        if self.bind_interface.is_some() {
-            context.bind_interface = self.bind_interface.clone();
-        }
+        context.bind_interface = self
+            .bind_interface
+            .clone()
+            .or_else(|| self.global_bind_interface.clone());
         let inner = Arc::clone(&self.inner);
         Box::pin(async move { inner.ping(&context).await })
     }
@@ -3046,10 +3057,13 @@ mod tests {
             settings: crate::RuntimeSettings::default(),
             connect_semaphore: Arc::new(tokio::sync::Semaphore::new(250)),
             socket_bind_addresses: Arc::from(Vec::<std::net::IpAddr>::new().into_boxed_slice()),
+            socket_bind_interface: None,
             resolver: Arc::clone(&resolver),
+            inbound_resolver: Arc::clone(&resolver),
             dns_resolver: resolver,
             hosts: yuhaiin_core::dns_hosts::HostsTable::new(),
             fakeip: None,
+            inbound_fakeip: None,
             inbound_settings: yuhaiin_store::InboundSettings::default(),
             resolvers: Vec::new(),
             route: None,
@@ -3068,6 +3082,8 @@ mod tests {
                 .unwrap(),
             ),
             resolver_by_id: std::collections::BTreeMap::new(),
+            inbound_resolver_by_id: std::collections::BTreeMap::new(),
+            dns_resolver_by_id: std::collections::BTreeMap::new(),
             resolver_errors: std::collections::BTreeMap::new(),
             resolver_registry_enabled: false,
             geo_metadata: Vec::new(),

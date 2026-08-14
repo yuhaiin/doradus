@@ -51,16 +51,11 @@ pub(crate) fn interface_for_ip(ip: std::net::IpAddr) -> Option<String> {
     })
 }
 
-/// Resolve the Go-compatible interface settings into concrete source
-/// addresses. Desktop Go leaves the OS route untouched when
-/// `useDefaultInterface` is true; an explicit interface (or `default`) binds
-/// each TCP/UDP socket to the matching address family.
+/// Resolve the explicit interface setting into concrete source addresses.
+/// This remains the fallback for platforms without an interface-level socket
+/// binding API. The automatic default-interface mode is represented by the
+/// dynamic marker below and is resolved by core for every new socket.
 pub(crate) fn bind_addresses_for_settings(settings: &RuntimeSettings) -> Vec<IpAddr> {
-    #[cfg(target_os = "android")]
-    if settings.use_default_interface {
-        return Vec::new();
-    }
-    #[cfg(not(target_os = "android"))]
     if settings.use_default_interface {
         return Vec::new();
     }
@@ -94,6 +89,21 @@ pub(crate) fn bind_addresses_for_settings(settings: &RuntimeSettings) -> Vec<IpA
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Resolve the global outbound interface policy without taking a snapshot of
+/// the current default route. The marker is intentionally passed through the
+/// runtime and resolved by core immediately before each socket is created, so
+/// a network change does not require rebuilding every proxy.
+pub(crate) fn bind_interface_for_settings(settings: &RuntimeSettings) -> Option<String> {
+    if settings.use_default_interface {
+        return Some(yuhaiin_core::proxy::DEFAULT_INTERFACE.to_owned());
+    }
+    let requested = settings.net_interface.trim();
+    if requested.eq_ignore_ascii_case("default") {
+        return Some(yuhaiin_core::proxy::DEFAULT_INTERFACE.to_owned());
+    }
+    (!requested.is_empty()).then(|| requested.to_owned())
 }
 
 #[cfg(any(feature = "http-api", test))]
@@ -474,5 +484,27 @@ mod tests {
                     .is_some_and(|(_, prefix)| !prefix.is_empty())
             })
         }));
+    }
+
+    #[test]
+    fn default_interface_setting_keeps_dynamic_marker() {
+        let settings = RuntimeSettings::default();
+        assert_eq!(
+            bind_interface_for_settings(&settings).as_deref(),
+            Some(yuhaiin_core::proxy::DEFAULT_INTERFACE)
+        );
+    }
+
+    #[test]
+    fn explicit_interface_setting_is_not_replaced_by_default_marker() {
+        let settings = RuntimeSettings {
+            use_default_interface: false,
+            net_interface: "enp0s5".to_owned(),
+            ..RuntimeSettings::default()
+        };
+        assert_eq!(
+            bind_interface_for_settings(&settings).as_deref(),
+            Some("enp0s5")
+        );
     }
 }
