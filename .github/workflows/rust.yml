@@ -160,6 +160,41 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  native-service:
+    name: Native service lifecycle ${{ matrix.platform }}
+    needs: checks
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            runner: macos-14
+          - platform: windows
+            runner: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: native-service-${{ matrix.platform }}
+
+      - name: Run native macOS launchd lifecycle
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: ./scripts/integration/native-service-macos.sh
+
+      - name: Run native Windows Service lifecycle
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: ./scripts/integration/native-service-windows.ps1
+
   release:
     name: Publish release
     if: github.ref_type == 'tag' || (github.ref_type == 'branch' && github.ref_name == 'main')
