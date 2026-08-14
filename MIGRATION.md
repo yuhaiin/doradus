@@ -5335,6 +5335,23 @@ recovery policy 的精确延迟断言；Linux Podman 无法执行 Windows SCM，
 Windows native-service runner 验证；本轮没有把 GNU cross check 当成真实 Windows service
 验收。状态和构建缓存继续位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
 
+## 218. 2026-08-14 HTTP inbound absolute-form HTTPS observability 回归
+
+本轮主动运行了两个此前属于 opt-in 的真实外网场景。`make go-termination-https-smoke` 在
+Podman 中访问 `reverse_http URL=https://example.com/`，Go/Rust 200 响应 2/2，完整 termination
+矩阵扩大为 12/12。`make service-chain-smoke` 随后保持 33 passed、1 ignored。
+
+`make http-inbound-https-smoke` 首次运行暴露了测试观察时序问题：请求虽然已经收到成功响应，
+但测试先 `read_to_end` 等待 public origin 连接关闭，再查询 `/api/v2/connections`；HTTP inbound
+正常结束 flow 后，live connections 当然可能为空，于是测试误报 `connection did not become
+visible`。这不是给 production 代码加延迟的理由，而是测试必须在请求仍在途时观察 runtime 状态。
+
+测试现在发送 keep-alive absolute-form HTTPS 请求，在读取 response header 前先轮询 live connection，
+然后再校验 HTTP status；连续两次 `make http-inbound-https-smoke` 均为 1/1。这样同时证明了
+HTTP inbound → direct outbound → origin TLS → response 和实时 connections 观察，不把已经关闭的
+历史 flow 错当成 live flow。测试修正位于 `crates/yuhaiin-runtime/tests/service_chain.rs`，所有
+构建、状态和日志继续使用 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
 ## 216. 2026-08-14 macOS launchd restart 生命周期收口
 
 继续对照 Go `cmd/yuhaiin/main_darwin.go` 与 `update_installer_unix.go` 的 service restart

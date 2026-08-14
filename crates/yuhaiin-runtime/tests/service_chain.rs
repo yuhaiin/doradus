@@ -2836,15 +2836,17 @@ async fn http_inbound_forwards_absolute_https_request() {
     let mut client = connect_loopback(inbound).await;
     client
         .write_all(
-            b"GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+            b"GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n",
         )
         .await
         .unwrap();
-    let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_secs(20), client.read_to_end(&mut response))
+    // Observe the flow while the origin request is still in flight. Reading
+    // the complete public response first makes this assertion race with the
+    // HTTP proxy's normal close path, which removes the live connection.
+    let connections = wait_for_connection(&service.client, &service.base_url).await;
+    let response = tokio::time::timeout(Duration::from_secs(20), read_http_headers(&mut client))
         .await
-        .expect("absolute HTTPS proxy request timed out")
-        .unwrap();
+        .expect("absolute HTTPS proxy response timed out");
     assert!(
         response.starts_with(b"HTTP/1.1 "),
         "absolute HTTPS proxy response: {:?}",
@@ -2855,7 +2857,6 @@ async fn http_inbound_forwards_absolute_https_request() {
         "absolute HTTPS proxy request was rejected: {:?}",
         String::from_utf8_lossy(&response)
     );
-    let connections = wait_for_connection(&service.client, &service.base_url).await;
     assert!(connections["connections"].as_array().is_some_and(|items| {
         items
             .iter()
