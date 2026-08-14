@@ -94,6 +94,185 @@ fn sqlite_backup_restore_is_consistent_and_atomic() {
 }
 
 #[test]
+fn sqlite_backup_sanitizes_runtime_state_like_go() {
+    let source = test_database_path();
+    let backup = source.with_file_name(format!(
+        "{}-sanitized-backup",
+        source.file_name().unwrap().to_string_lossy()
+    ));
+    let source_store = block_on(ConfigStore::open(&source)).unwrap();
+
+    source_store
+        .replace_go_statistics(&GoStatisticsSnapshot {
+            total_download: 10,
+            total_upload: 20,
+            traffic: vec![GoTrafficBucketRecord {
+                bucket: 1_700_000_000,
+                upload: 2,
+                download: 3,
+            }],
+            history: vec![GoConnectionHistoryRecord {
+                protocol: "http".to_owned(),
+                addr: "example.com:443".to_owned(),
+                process: "test".to_owned(),
+                count: 1,
+                last_seen: 1_700_000_001,
+                connection_json: br#"{}"#.to_vec(),
+            }],
+            failed_history: vec![GoFailedHistoryRecord {
+                protocol: "http".to_owned(),
+                host: "failed.example".to_owned(),
+                process: "test".to_owned(),
+                count: 1,
+                last_seen: 1_700_000_002,
+                error: "connection refused".to_owned(),
+            }],
+            telemetry: vec![GoTelemetryBucketRecord {
+                bucket: 1_700_000_000,
+                span_seconds: TELEMETRY_HOURLY_BUCKET_SECONDS,
+                dimension: "outbound".to_owned(),
+                value: "direct".to_owned(),
+                download: 4,
+                upload: 5,
+                failures: 1,
+            }],
+        })
+        .unwrap();
+
+    source_store
+        .with_write_transaction(|connection| {
+            connection
+                .execute_batch(
+                    "INSERT INTO connection_sessions
+                         (id, opened_at, last_seen_at, state, protocol, summary_json)
+                     VALUES (7, 1, 2, 'open', 1, '{}');
+                     INSERT INTO fakeip_entries
+                         (family, prefix, domain, ip, created_at, last_used_at)
+                     VALUES (4, '198.18.0.0/15', 'runtime.example', X'C6120001', 1, 2);
+                     INSERT INTO fakeip_cursors
+                         (family, prefix, cursor_ip, cursor_idx, updated_at)
+                     VALUES (4, '198.18.0.0/15', X'C6120002', 1, 2);
+                     INSERT INTO route_lists(name, kind, updated_at, data_json)
+                     VALUES ('runtime-list', 'host', 3, '{}');
+                     INSERT INTO route_list_refresh
+                         (name, refresh_interval, last_refresh_time, last_error)
+                     VALUES ('runtime-list', 60, 123, 'stale');
+                     INSERT INTO backup_settings(id, updated_at, data_json)
+                     VALUES (1, 456,
+                         '{\"instanceName\":\"demo\",\"interval\":60,\"lastBackupHash\":\"old\",\"unknown\":true}');",
+                )
+                .map_err(storage_error)
+        })
+        .unwrap();
+
+    let report = block_on(source_store.backup_to(&backup)).unwrap();
+    assert_eq!(report.source_bytes, report.destination_bytes);
+
+    {
+        let backup_store = block_on(ConfigStore::open(&backup)).unwrap();
+        let connection = backup_store.lock_connection().unwrap();
+        for table in BACKUP_RUNTIME_TABLES {
+            if table_exists(&connection, table) {
+                let rows = connection
+                    .query(&format!("SELECT COUNT(*) FROM {table}"))
+                    .unwrap();
+                assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(0)), "{table}");
+            }
+        }
+        let refresh = connection
+            .query(
+                "SELECT last_refresh_time, last_error
+                 FROM route_list_refresh WHERE name = 'runtime-list'",
+            )
+            .unwrap();
+        assert_eq!(refresh[0].get(0), Some(&SqliteValue::Integer(0)));
+        assert_eq!(refresh[0].get(1), Some(&SqliteValue::Text(Arc::from(""))));
+
+        let settings = connection
+            .query("SELECT updated_at, data_json FROM backup_settings WHERE id = 1")
+            .unwrap();
+        assert_eq!(settings[0].get(0), Some(&SqliteValue::Integer(0)));
+        let data = row_blob_or_text(&settings[0], 1, "backup_settings.data_json").unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(data["lastBackupHash"], "");
+        assert_eq!(data["unknown"], true);
+        drop(connection);
+        backup_store.close().unwrap();
+    }
+
+    {
+        let connection = source_store.lock_connection().unwrap();
+        for table in [
+            "statistics_kv",
+            "traffic_hourly",
+            "connection_sessions",
+            "connection_history",
+            "failed_connection_history",
+            "fakeip_entries",
+            "fakeip_cursors",
+            "traffic_dimension_daily",
+            "failure_dimension_daily",
+            "telemetry_dimension_values",
+        ] {
+            let rows = connection
+                .query(&format!("SELECT COUNT(*) FROM {table}"))
+                .unwrap();
+            assert_ne!(rows[0].get(0), Some(&SqliteValue::Integer(0)), "{table}");
+        }
+        let refresh = connection
+            .query(
+                "SELECT last_refresh_time, last_error
+                 FROM route_list_refresh WHERE name = 'runtime-list'",
+            )
+            .unwrap();
+        assert_eq!(refresh[0].get(0), Some(&SqliteValue::Integer(123)));
+        assert_eq!(
+            refresh[0].get(1),
+            Some(&SqliteValue::Text(Arc::from("stale")))
+        );
+        let settings = connection
+            .query("SELECT updated_at, data_json FROM backup_settings WHERE id = 1")
+            .unwrap();
+        assert_eq!(settings[0].get(0), Some(&SqliteValue::Integer(456)));
+        let data = row_blob_or_text(&settings[0], 1, "backup_settings.data_json").unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(data["lastBackupHash"], "old");
+        drop(connection);
+    }
+
+    source_store.close().unwrap();
+    remove_database_artifacts(&source);
+    remove_database_artifacts(&backup);
+}
+
+#[test]
+fn sqlite_backup_rejects_non_object_backup_settings_before_installing() {
+    let source = test_database_path();
+    let backup = source.with_file_name(format!(
+        "{}-invalid-settings-backup",
+        source.file_name().unwrap().to_string_lossy()
+    ));
+    let store = block_on(ConfigStore::open(&source)).unwrap();
+    block_on(
+        store
+            .repository()
+            .put_go_backup_settings(&GoBackupSettingsRecord {
+                updated_at: 1,
+                data_json: b"[]".to_vec(),
+            }),
+    )
+    .unwrap();
+
+    let error = block_on(store.backup_to(&backup)).unwrap_err();
+    assert!(error.message.contains("JSON object"));
+    assert!(!backup.exists());
+
+    store.close().unwrap();
+    remove_database_artifacts(&source);
+    remove_database_artifacts(&backup);
+}
+
+#[test]
 fn sqlite_compact_is_thresholded_and_preserves_state() {
     let path = test_database_path();
     let store = block_on(ConfigStore::open(&path)).unwrap();
