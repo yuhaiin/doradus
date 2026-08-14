@@ -5386,3 +5386,11 @@ Linux Podman 容器可以安装 Darwin rust-std 并进入 macOS cfg，但不能�
 读取、projection retry 和 force-stop reopen 在长时间压力下保持一致；它仍不能替代真实生产时段
 的长期运行样本，因此 statistics 继续保留 `[~]`。高强度 442 秒矩阵不纳入默认 CI 时长，默认
 smoke 仍保持短矩阵。没有使用 `/tmp`。
+
+## 220. 2026-08-14 macOS launchd install 事务与失败恢复
+
+继续审计 Go `cmd/yuhaiin/main_darwin.go` 和 `update_installer_unix.go` 的安装/更新生命周期。Rust 原先的 macOS `install` 会先替换 binary、写入 plist，再忽略 `launchctl bootout` 的结果；如果 bootstrap、kickstart 或 health 失败，旧 binary/plist 和旧服务没有自动恢复，且首次安装时无法区分“服务不存在”和真实的 launchctl 错误。
+
+现在 macOS install 会先通过 `launchctl list SERVICE` 识别已加载 job，明确识别 absent-service 错误；已有 job 会严格 bootout，并等待旧 PID 退出。随后按 install transaction 备份 binary/plist（包括缺失项和 symlink 形态），执行 binary、数据目录、plist、bootstrap、kickstart 和 health。任一步失败都会先卸载失败 job，再恢复文件并尝试 bootstrap/kickstart 旧服务；如果失败 job 无法卸载，则不会继续覆盖文件，而是返回“files left untouched”的错误，避免把正在运行的 job 与新文件继续混用。成功后才清理带 PID/时间戳的备份。
+
+新增 launchctl absent-service 判定单测；Podman 中运行 `service::tests` 为 5/5，`make clippy` 通过，`git diff --check` 通过。Linux 容器只能验证共享 parser、编译和错误路径，不能替代 macOS launchd 权限现场；因此 service lifecycle 仍保持 `[~]`，最终 install/update/rollback 由 GitHub Actions macOS native runner 验证。所有测试状态继续写入 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。

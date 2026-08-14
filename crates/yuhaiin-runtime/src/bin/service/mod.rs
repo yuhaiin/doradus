@@ -127,6 +127,14 @@ fn parse_launchd_pid(data: &[u8]) -> Option<i32> {
     None
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn is_missing_launchd_service(data: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(data).to_ascii_lowercase();
+    text.contains("could not find service")
+        || text.contains("service not found")
+        || text.contains("no such process")
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn default_service_path() -> PathBuf {
     if cfg!(target_os = "windows") {
@@ -321,7 +329,7 @@ fn check_http_health(host: &str) -> Result<()> {
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 mod tests {
-    use super::{ServiceOptions, parse_launchd_pid, parse_options};
+    use super::{ServiceOptions, is_missing_launchd_service, parse_launchd_pid, parse_options};
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -370,6 +378,15 @@ mod tests {
     fn ignores_invalid_launchd_pid_entries() {
         assert_eq!(parse_launchd_pid(br#""PID" = "not-a-pid";"#), None);
         assert_eq!(parse_launchd_pid(br#""Other" = 4312;"#), None);
+    }
+
+    #[test]
+    fn recognizes_launchctl_missing_service_errors() {
+        assert!(is_missing_launchd_service(
+            br#"Could not find service "com.asutorufa.yuhaiin" in domain for system"#
+        ));
+        assert!(is_missing_launchd_service(b"No such process"));
+        assert!(!is_missing_launchd_service(b"launchctl: permission denied"));
     }
 }
 
@@ -732,6 +749,32 @@ mod macos {
     const PLIST_PATH: &str = "/Library/LaunchDaemons/com.asutorufa.yuhaiin.plist";
     const SERVICE: &str = "com.asutorufa.yuhaiin";
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct LaunchdServiceState {
+        pid: Option<i32>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BackupKind {
+        Missing,
+        File,
+        Symlink,
+    }
+
+    #[derive(Debug)]
+    struct BackupEntry {
+        original: PathBuf,
+        backup: PathBuf,
+        kind: BackupKind,
+        mode: u32,
+    }
+
+    #[derive(Debug)]
+    struct InstallBackup {
+        target: Option<BackupEntry>,
+        plist: BackupEntry,
+    }
+
     pub fn run(action: &str, args: &[OsString]) -> Result<()> {
         match action {
             "install" => install(args),
@@ -792,29 +835,275 @@ mod macos {
         }
     }
 
-    fn install(args: &[OsString]) -> Result<()> {
-        require_root("install")?;
-        let options = parse_options(args)?;
-        let executable = current_executable()?;
-        let target = Path::new(TARGET_BIN);
-        if !same_file(&executable, target) {
-            copy_binary(&executable, target)?;
+    fn launchd_service_state() -> Result<Option<LaunchdServiceState>> {
+        let output = Command::new("launchctl")
+            .args(["list", SERVICE])
+            .output()
+            .map_err(service_error)?;
+        if output.status.success() {
+            return Ok(Some(LaunchdServiceState {
+                pid: super::parse_launchd_pid(&output.stdout).filter(|pid| *pid > 0),
+            }));
         }
-        fs::create_dir_all(&options.path).map_err(service_error)?;
-        write_atomic(
-            Path::new(PLIST_PATH),
-            render_plist(&options).as_bytes(),
-            0o700,
-        )?;
-        let _ = Command::new("launchctl")
-            .args(["bootout", "system/", PLIST_PATH])
-            .status();
+        let mut details = output.stdout;
+        details.extend_from_slice(&output.stderr);
+        if super::is_missing_launchd_service(&details) {
+            return Ok(None);
+        }
+        Err(service_error(format!(
+            "launchctl list {SERVICE} failed: {}",
+            String::from_utf8_lossy(&details).trim()
+        )))
+    }
+
+    fn unload_service(state: LaunchdServiceState) -> Result<()> {
+        command_output("launchctl", &["bootout", "system/", PLIST_PATH])?;
+        if let Some(pid) = state.pid {
+            wait_for_process_exit(pid)?;
+        }
+        Ok(())
+    }
+
+    fn bootout_loaded_service() -> Result<Option<LaunchdServiceState>> {
+        let state = launchd_service_state()?;
+        if let Some(state) = state {
+            unload_service(state)?;
+        }
+        Ok(state)
+    }
+
+    fn restore_service(state: Option<LaunchdServiceState>) -> Result<()> {
+        if state.is_none() {
+            return Ok(());
+        }
         command_output("launchctl", &["bootstrap", "system", PLIST_PATH])?;
         command_output(
             "launchctl",
             &["kickstart", "-kp", &format!("system/{SERVICE}")],
         )
-        .and_then(|_| wait_for_health(&options.host))
+        .map(|_| ())
+    }
+
+    fn backup_path(path: &Path, kind: &str) -> Result<PathBuf> {
+        Ok(path.with_extension(format!(
+            "install-{kind}-{}-{}",
+            std::process::id(),
+            unix_timestamp()?
+        )))
+    }
+
+    fn capture_entry(path: &Path, backup: PathBuf, mode: u32) -> Result<BackupEntry> {
+        if fs::symlink_metadata(&backup).is_ok() {
+            return Err(service_error(format!(
+                "refusing to overwrite stale install backup {}",
+                backup.display()
+            )));
+        }
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BackupEntry {
+                    original: path.to_path_buf(),
+                    backup,
+                    kind: BackupKind::Missing,
+                    mode,
+                });
+            }
+            Err(error) => return Err(service_error(error)),
+        };
+        if metadata.is_dir() {
+            return Err(service_error(format!(
+                "refusing to back up service directory {}",
+                path.display()
+            )));
+        }
+        let kind = if metadata.file_type().is_symlink() {
+            let link = fs::read_link(path).map_err(service_error)?;
+            if let Some(parent) = backup.parent() {
+                fs::create_dir_all(parent).map_err(service_error)?;
+            }
+            std::os::unix::fs::symlink(link, &backup).map_err(service_error)?;
+            BackupKind::Symlink
+        } else {
+            fs::copy(path, &backup).map_err(service_error)?;
+            BackupKind::File
+        };
+        Ok(BackupEntry {
+            original: path.to_path_buf(),
+            backup,
+            kind,
+            mode,
+        })
+    }
+
+    fn remove_backup(entry: &BackupEntry) -> Result<()> {
+        if entry.kind == BackupKind::Missing {
+            return Ok(());
+        }
+        match fs::remove_file(&entry.backup) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(service_error(error)),
+        }
+    }
+
+    fn restore_entry(entry: &BackupEntry) -> Result<()> {
+        remove_entry(&entry.original)?;
+        match entry.kind {
+            BackupKind::Missing => Ok(()),
+            BackupKind::File => {
+                let contents = fs::read(&entry.backup).map_err(service_error)?;
+                write_atomic(&entry.original, &contents, entry.mode)
+            }
+            BackupKind::Symlink => {
+                let link = fs::read_link(&entry.backup).map_err(service_error)?;
+                if let Some(parent) = entry.original.parent() {
+                    fs::create_dir_all(parent).map_err(service_error)?;
+                }
+                std::os::unix::fs::symlink(link, &entry.original).map_err(service_error)
+            }
+        }
+    }
+
+    impl InstallBackup {
+        fn capture(target: &Path, plist: &Path, target_changed: bool) -> Result<Self> {
+            let target = if target_changed {
+                Some(capture_entry(
+                    target,
+                    backup_path(target, "target")?,
+                    0o755,
+                )?)
+            } else {
+                None
+            };
+            let plist = match capture_entry(plist, backup_path(plist, "plist")?, 0o700) {
+                Ok(plist) => plist,
+                Err(error) => {
+                    if let Some(target) = &target {
+                        let _ = restore_entry(target);
+                        let _ = remove_backup(target);
+                    }
+                    return Err(error);
+                }
+            };
+            Ok(Self { target, plist })
+        }
+
+        fn restore(&self) -> Result<()> {
+            let mut errors = Vec::new();
+            if let Some(target) = &self.target {
+                if let Err(error) = restore_entry(target) {
+                    errors.push(format!("restore binary: {error}"));
+                }
+            }
+            if let Err(error) = restore_entry(&self.plist) {
+                errors.push(format!("restore plist: {error}"));
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(service_error(errors.join("; ")))
+            }
+        }
+
+        fn cleanup(&self) -> Result<()> {
+            let mut errors = Vec::new();
+            if let Some(target) = &self.target {
+                if let Err(error) = remove_backup(target) {
+                    errors.push(format!("remove binary backup: {error}"));
+                }
+            }
+            if let Err(error) = remove_backup(&self.plist) {
+                errors.push(format!("remove plist backup: {error}"));
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(service_error(errors.join("; ")))
+            }
+        }
+    }
+
+    fn install(args: &[OsString]) -> Result<()> {
+        require_root("install")?;
+        let options = parse_options(args)?;
+        let executable = current_executable()?;
+        let target = Path::new(TARGET_BIN);
+        if is_symlink(target) && !same_file(&executable, target) {
+            return Err(service_error(format!(
+                "refusing to replace non-owned symlink {}",
+                target.display()
+            )));
+        }
+        let target_changed = !same_file(&executable, target);
+        let previous_state = launchd_service_state()?;
+        if let Some(state) = previous_state {
+            if let Err(error) = unload_service(state) {
+                let restore_error = restore_service(Some(state)).err();
+                return Err(service_error(match restore_error {
+                    Some(restore_error) => {
+                        format!(
+                            "stop existing launchd service failed: {error}; restore failed: {restore_error}"
+                        )
+                    }
+                    None => format!("stop existing launchd service failed: {error}"),
+                }));
+            }
+        }
+        let backup = match InstallBackup::capture(target, Path::new(PLIST_PATH), target_changed) {
+            Ok(backup) => backup,
+            Err(error) => {
+                let restore_error = restore_service(previous_state).err();
+                return Err(service_error(match restore_error {
+                    Some(restore_error) => {
+                        format!(
+                            "prepare launchd install failed: {error}; restore service failed: {restore_error}"
+                        )
+                    }
+                    None => format!("prepare launchd install failed: {error}"),
+                }));
+            }
+        };
+        let result = (|| {
+            if target_changed {
+                copy_binary(&executable, target)?;
+            }
+            fs::create_dir_all(&options.path).map_err(service_error)?;
+            write_atomic(
+                Path::new(PLIST_PATH),
+                render_plist(&options).as_bytes(),
+                0o700,
+            )?;
+            command_output("launchctl", &["bootstrap", "system", PLIST_PATH])?;
+            command_output(
+                "launchctl",
+                &["kickstart", "-kp", &format!("system/{SERVICE}")],
+            )?;
+            wait_for_health(&options.host)
+        })();
+        if let Err(error) = result {
+            let mut details = vec![format!("launchd install failed: {error}")];
+            match bootout_loaded_service() {
+                Ok(_) => {
+                    if let Err(restore_error) = backup.restore() {
+                        details.push(format!("restore files failed: {restore_error}"));
+                    }
+                    if let Err(restore_error) = restore_service(previous_state) {
+                        details.push(format!("restore previous service failed: {restore_error}"));
+                    }
+                }
+                Err(teardown_error) => details.push(format!(
+                    "cannot unload failed launchd service; files left untouched: {teardown_error}"
+                )),
+            }
+            return Err(service_error(details.join("; ")));
+        }
+        if let Err(error) = backup.cleanup() {
+            return Err(service_error(format!(
+                "launchd install succeeded but cleanup of install backups failed: {error}"
+            )));
+        }
+        Ok(())
     }
 
     fn uninstall(args: &[OsString]) -> Result<()> {
@@ -944,6 +1233,44 @@ mod macos {
             assert!(plist.contains("com.asutorufa.yuhaiin"));
             assert!(plist.contains("<string>-nfs-mode</string>"));
             assert!(plist.contains("Application Support/yuhaiin"));
+        }
+
+        #[test]
+        fn install_backup_restores_changed_and_missing_entries() {
+            let root = std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+                .unwrap_or_else(|| PathBuf::from(".cache"))
+                .join("yuhaiin-rust/service-unit-tests")
+                .join(format!(
+                    "macos-{}-{}",
+                    std::process::id(),
+                    unix_timestamp().unwrap()
+                ));
+            fs::create_dir_all(&root).unwrap();
+            let target = root.join("target");
+            let plist = root.join("plist");
+
+            fs::write(&target, b"old-binary").unwrap();
+            fs::write(&plist, b"old-plist").unwrap();
+            let backup = InstallBackup::capture(&target, &plist, true).unwrap();
+            fs::write(&target, b"new-binary").unwrap();
+            fs::write(&plist, b"new-plist").unwrap();
+            backup.restore().unwrap();
+            assert_eq!(fs::read(&target).unwrap(), b"old-binary");
+            assert_eq!(fs::read(&plist).unwrap(), b"old-plist");
+            backup.cleanup().unwrap();
+
+            fs::remove_file(&target).unwrap();
+            fs::remove_file(&plist).unwrap();
+            let missing = InstallBackup::capture(&target, &plist, true).unwrap();
+            fs::write(&target, b"new-binary").unwrap();
+            fs::write(&plist, b"new-plist").unwrap();
+            missing.restore().unwrap();
+            assert!(!target.exists());
+            assert!(!plist.exists());
+            missing.cleanup().unwrap();
+            fs::remove_dir_all(root).unwrap();
         }
     }
 }

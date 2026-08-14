@@ -8,9 +8,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 workflow="${repo_root}/.github/workflows/rust.yml"
 windows_cross="${repo_root}/scripts/integration/release-windows-cross.sh"
+native_macos="${repo_root}/scripts/integration/native-service-macos.sh"
 
 test -f "${workflow}"
 test -f "${windows_cross}"
+test -f "${native_macos}"
 
 matrix_entry_exists() {
   local platform="$1"
@@ -95,6 +97,19 @@ required_windows_cross_literals=(
 for literal in "${required_windows_cross_literals[@]}"; do
   if ! grep -Fq -- "${literal}" "${windows_cross}"; then
     echo "[release-contract] missing Windows cross literal: ${literal}" >&2
+    exit 1
+  fi
+done
+
+required_native_macos_literals=(
+  'cargo test --locked'
+  'service::macos::tests'
+  'unit-tests.log'
+)
+
+for literal in "${required_native_macos_literals[@]}"; do
+  if ! grep -Fq -- "${literal}" "${native_macos}"; then
+    echo "[release-contract] missing macOS native service literal: ${literal}" >&2
     exit 1
   fi
 done
