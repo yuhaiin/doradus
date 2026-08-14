@@ -228,105 +228,131 @@ async fn protocol_h2_outbound_server(
     expected_payload: &'static [u8],
     udp: bool,
 ) {
-    let (socket, _) = listener.accept().await.unwrap();
-    let mut connection = h2::server::handshake(socket).await.unwrap();
-    let (request, mut respond) = connection.accept().await.unwrap().unwrap();
-    assert_eq!(request.method(), http::Method::CONNECT);
-    assert_eq!(request.uri().host(), Some("localhost"));
-    let mut body = request.into_body();
-    let mut send = respond
-        .send_response(http::Response::new(()), false)
-        .unwrap();
-    let (application, relay) = tokio::io::duplex(64 * 1024);
-    let (mut relay_read, mut relay_write) = tokio::io::split(relay);
-    let body_to_relay = tokio::spawn(async move {
-        while let Some(data) = body.data().await {
-            let Ok(data) = data else { break };
-            if body.flow_control().release_capacity(data.len()).is_err() {
-                break;
-            }
-            if relay_write.write_all(&data).await.is_err() {
-                break;
-            }
-        }
-        let _ = relay_write.shutdown().await;
-    });
-    let relay_to_body = tokio::spawn(async move {
-        let mut buffer = [0u8; 4096];
-        while let Ok(length) = relay_read.read(&mut buffer).await {
-            if length == 0 {
-                break;
-            }
-            if send
-                .send_data(Bytes::copy_from_slice(&buffer[..length]), false)
-                .is_err()
-            {
-                break;
-            }
-        }
-        let _ = send.send_data(Bytes::new(), true);
-    });
-    let destination = if udp {
-        Endpoint::ip(Network::Udp, "8.8.8.8:5353".parse().unwrap())
-    } else {
-        Endpoint::domain(Network::Tcp, DomainName::new("example.test").unwrap(), 443)
-    };
-    let protocol_task = tokio::spawn(async move {
-        match kind {
-            ProtocolOutboundKind::Vless => {
-                let mut application = application;
-                if udp {
-                    serve_vless_udp_connection(&mut application, destination, expected_payload)
-                        .await;
-                } else {
-                    serve_vless_connection(&mut application, 0, destination, expected_payload)
-                        .await;
+    let connection_count = if udp { 1 } else { 2 };
+    for connection_index in 0..connection_count {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(socket).await.unwrap();
+        let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+        assert_eq!(request.method(), http::Method::CONNECT);
+        assert_eq!(request.uri().host(), Some("localhost"));
+        let mut body = request.into_body();
+        let mut send = respond
+            .send_response(http::Response::new(()), false)
+            .unwrap();
+        let (application, relay) = tokio::io::duplex(64 * 1024);
+        let (mut relay_read, mut relay_write) = tokio::io::split(relay);
+        let body_to_relay = tokio::spawn(async move {
+            while let Some(data) = body.data().await {
+                let Ok(data) = data else { break };
+                if body.flow_control().release_capacity(data.len()).is_err() {
+                    break;
+                }
+                if relay_write.write_all(&data).await.is_err() {
+                    break;
                 }
             }
-            ProtocolOutboundKind::Vmess => {
-                let mut application = application;
-                if udp {
-                    serve_vmess_udp_connection(&mut application, destination, expected_payload)
-                        .await;
-                } else {
-                    serve_vmess_connection(&mut application, 0, destination, expected_payload)
-                        .await;
+            let _ = relay_write.shutdown().await;
+        });
+        let relay_to_body = tokio::spawn(async move {
+            let mut buffer = [0u8; 4096];
+            while let Ok(length) = relay_read.read(&mut buffer).await {
+                if length == 0 {
+                    break;
+                }
+                if send
+                    .send_data(Bytes::copy_from_slice(&buffer[..length]), false)
+                    .is_err()
+                {
+                    break;
                 }
             }
-            ProtocolOutboundKind::Trojan => {
-                let mut application = application;
-                if udp {
-                    serve_trojan_udp_connection(&mut application, destination, expected_payload)
+            let _ = send.send_data(Bytes::new(), true);
+        });
+        let destination = if udp {
+            Endpoint::ip(Network::Udp, "8.8.8.8:5353".parse().unwrap())
+        } else {
+            Endpoint::domain(
+                Network::Tcp,
+                DomainName::new("example.test").unwrap(),
+                if connection_index == 0 { 443 } else { 80 },
+            )
+        };
+        let protocol_task = tokio::spawn(async move {
+            match kind {
+                ProtocolOutboundKind::Vless => {
+                    let mut application = application;
+                    if udp {
+                        serve_vless_udp_connection(&mut application, destination, expected_payload)
+                            .await;
+                    } else {
+                        serve_vless_connection(
+                            &mut application,
+                            connection_index,
+                            destination,
+                            expected_payload,
+                        )
                         .await;
-                } else {
-                    serve_trojan_connection(&mut application, 0, destination, expected_payload)
+                    }
+                }
+                ProtocolOutboundKind::Vmess => {
+                    let mut application = application;
+                    if udp {
+                        serve_vmess_udp_connection(&mut application, destination, expected_payload)
+                            .await;
+                    } else {
+                        serve_vmess_connection(
+                            &mut application,
+                            connection_index,
+                            destination,
+                            expected_payload,
+                        )
                         .await;
+                    }
+                }
+                ProtocolOutboundKind::Trojan => {
+                    let mut application = application;
+                    if udp {
+                        serve_trojan_udp_connection(
+                            &mut application,
+                            destination,
+                            expected_payload,
+                        )
+                        .await;
+                    } else {
+                        serve_trojan_connection(
+                            &mut application,
+                            connection_index,
+                            destination,
+                            expected_payload,
+                        )
+                        .await;
+                    }
+                }
+                ProtocolOutboundKind::VlessTlsWebsocket
+                | ProtocolOutboundKind::VmessTlsWebsocket
+                | ProtocolOutboundKind::TrojanWebsocket
+                | ProtocolOutboundKind::TrojanTlsWebsocket => {
+                    panic!("TLS/WebSocket protocol variants are not part of this H2 fixture")
                 }
             }
-            ProtocolOutboundKind::VlessTlsWebsocket
-            | ProtocolOutboundKind::VmessTlsWebsocket
-            | ProtocolOutboundKind::TrojanWebsocket
-            | ProtocolOutboundKind::TrojanTlsWebsocket => {
-                panic!("TLS/WebSocket protocol variants are not part of this H2 fixture")
-            }
-        }
-    });
+        });
 
-    // Keep polling the H2 connection while the protocol task exchanges bytes.
-    let driver = tokio::spawn(async move {
-        while let Some(result) = connection.accept().await {
-            let Ok((request, mut respond)) = result else {
-                break;
-            };
-            let _ = request.into_body();
-            let _ = respond.send_response(http::Response::new(()), true);
-        }
-    });
-    protocol_task.await.unwrap();
-    body_to_relay.await.unwrap();
-    relay_to_body.await.unwrap();
-    driver.abort();
-    let _ = driver.await;
+        // Keep polling the H2 connection while the protocol task exchanges bytes.
+        let driver = tokio::spawn(async move {
+            while let Some(result) = connection.accept().await {
+                let Ok((request, mut respond)) = result else {
+                    break;
+                };
+                let _ = request.into_body();
+                let _ = respond.send_response(http::Response::new(()), true);
+            }
+        });
+        protocol_task.await.unwrap();
+        body_to_relay.await.unwrap();
+        relay_to_body.await.unwrap();
+        driver.abort();
+        let _ = driver.await;
+    }
 }
 
 async fn serve_vless_connection<S>(
@@ -883,6 +909,24 @@ async fn run_protocol_h2_outbound_chain_on_host(kind: ProtocolOutboundKind, bind
     assert_eq!(item["mode"], "proxy");
 
     client.shutdown().await.unwrap();
+    let node_id = kind.node_id();
+    let latency = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::POST,
+        &format!("/api/v2/nodes/{node_id}/latency"),
+        Some(&json!({
+            "id": node_id,
+            "type": "http",
+            "url": "http://example.test/health",
+            "timeoutMs": 5_000
+        })),
+    )
+    .await;
+    assert_eq!(
+        latency["ok"], true,
+        "HTTP/2 protocol node latency failed: {latency}"
+    );
     service.shutdown().await;
     server_task.await.unwrap();
 }
