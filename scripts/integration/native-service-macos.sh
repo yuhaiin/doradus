@@ -30,6 +30,19 @@ PY
 host="127.0.0.1:${port}"
 installed=0
 
+wait_for_health() {
+  local log_path="$1"
+  local attempts=0
+  while ! sudo -n "${binary}" health --host "${host}" --path "${data_dir}" \
+    >"${log_path}" 2>&1; do
+    attempts=$((attempts + 1))
+    if (( attempts >= 30 )); then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 cleanup() {
   if [[ "${installed}" == 1 ]]; then
     sudo -n "${binary}" uninstall >"${run_dir}/uninstall.log" 2>&1 || true
@@ -51,22 +64,18 @@ echo "[native-service-macos] installing launchd service on ${host}"
 installed=1
 sudo -n "${binary}" install --host "${host}" --path "${data_dir}" \
   >"${run_dir}/install.log" 2>&1
-sudo -n "${binary}" health --host "${host}" --path "${data_dir}" \
-  >"${run_dir}/health-install.log" 2>&1
+wait_for_health "${run_dir}/health-install.log"
 sudo -n "${binary}" restart --host "${host}" --path "${data_dir}" \
   >"${run_dir}/restart.log" 2>&1
-sudo -n "${binary}" health --host "${host}" --path "${data_dir}" \
-  >"${run_dir}/health-restart.log" 2>&1
+wait_for_health "${run_dir}/health-restart.log"
 
 echo "[native-service-macos] applying a staged update and checking rollback"
 cp "${binary}" "${staged}"
 sudo -n "${binary}" update-helper /usr/local/bin/yuhaiin "${staged}" \
   >"${run_dir}/update.log" 2>&1
-sudo -n "${binary}" health --host "${host}" --path "${data_dir}" \
-  >"${run_dir}/health-update.log" 2>&1
+wait_for_health "${run_dir}/health-update.log"
 sudo -n "${binary}" rollback --host "${host}" --path "${data_dir}" \
   >"${run_dir}/rollback.log" 2>&1
-sudo -n "${binary}" health --host "${host}" --path "${data_dir}" \
-  >"${run_dir}/health-rollback.log" 2>&1
+wait_for_health "${run_dir}/health-rollback.log"
 
 echo "[native-service-macos] passed; logs=${run_dir}"

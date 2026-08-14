@@ -14,6 +14,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 
 const DEFAULT_RELEASES_URL: &str = "https://api.github.com/repos/yuhaiin/yuhaiin/releases";
@@ -651,7 +653,8 @@ fn stop_platform_service() -> Result<(), String> {
         // The helper is detached from the service process. A failed bootout
         // therefore means the old image may still be running; fail closed
         // instead of replacing the executable under an active launchd job.
-        return run_command(
+        let pid = macos_launchd_pid()?;
+        run_command(
             "launchctl",
             &[
                 "bootout",
@@ -659,7 +662,11 @@ fn stop_platform_service() -> Result<(), String> {
                 "/Library/LaunchDaemons/com.asutorufa.yuhaiin.plist",
             ],
             "stop updated launchd service",
-        );
+        )?;
+        if let Some(pid) = pid {
+            wait_for_macos_process_exit(pid)?;
+        }
+        return Ok(());
     }
     #[cfg(target_os = "linux")]
     {
@@ -667,6 +674,70 @@ fn stop_platform_service() -> Result<(), String> {
     }
     #[allow(unreachable_code)]
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_launchd_pid(data: &[u8]) -> Option<i32> {
+    for field in String::from_utf8_lossy(data).split(';') {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        if !key.trim().trim_matches('"').eq_ignore_ascii_case("pid") {
+            continue;
+        }
+        let value = value.trim().trim_matches('"');
+        if let Ok(pid) = value.parse::<i32>() {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launchd_pid() -> Result<Option<i32>, String> {
+    let output = std::process::Command::new("launchctl")
+        .args(["list", "com.asutorufa.yuhaiin"])
+        .output()
+        .map_err(|error| format!("query updated launchd service: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "query updated launchd service exited with {}; {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(parse_macos_launchd_pid(&output.stdout))
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_macos_process_exit(pid: i32) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let probe = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map_err(|error| format!("check stopped launchd process {pid}: {error}"))?;
+        if !probe.status.success() {
+            let details = format!(
+                "{}{}",
+                String::from_utf8_lossy(&probe.stdout),
+                String::from_utf8_lossy(&probe.stderr)
+            );
+            if details.to_ascii_lowercase().contains("no such process") {
+                return Ok(());
+            }
+            return Err(format!(
+                "check stopped launchd process {pid} exited with {}: {}",
+                probe.status,
+                details.trim()
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timeout waiting for launchd process {pid} to stop"));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn restart_platform_service() -> Result<(), String> {
@@ -919,6 +990,15 @@ mod tests {
         assert_eq!(normalized_version("v1.2.3+build"), Some("1.2.3".to_owned()));
         assert_eq!(compare_versions("1.2.4", "1.2.3"), Ordering::Greater);
         assert_eq!(compare_versions("1.2", "1.2.0"), Ordering::Equal);
+    }
+
+    #[test]
+    fn parses_macos_launchd_pid_without_trusting_field_order_or_case() {
+        assert_eq!(
+            parse_macos_launchd_pid(br#""LastExitStatus" = 0; "PID" = 10287;"#),
+            Some(10287)
+        );
+        assert_eq!(parse_macos_launchd_pid(br#""PID" = "not-a-pid";"#), None);
     }
 
     #[test]

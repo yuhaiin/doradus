@@ -36,7 +36,7 @@ function Invoke-Yuhaiin {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
     & $binary @Arguments
     if ($LASTEXITCODE -ne 0) {
-        throw "yuhaiin failed with exit code $LASTEXITCODE: $($Arguments -join ' ')"
+        throw "yuhaiin failed with exit code ${LASTEXITCODE}: $($Arguments -join ' ')"
     }
 }
 

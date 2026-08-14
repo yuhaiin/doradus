@@ -948,10 +948,9 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
         sent_targets: Arc::clone(&sent_targets),
     });
     let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_core::proxy::DropAsyncProxy);
-    let mut fake_ip_rule = route_rule("198.18.0.0/15");
-    fake_ip_rule.port = Some((443, 444));
+    let domain_rule = route_rule("example.com");
     let fallback = RouteDecision {
-        mode: RouteMode::Block,
+        mode: RouteMode::Proxy,
         resolver_policy: ResolverPolicy::default(),
         priority: 0,
     };
@@ -1012,12 +1011,13 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
     assert_eq!(view.lookup_domain(fake_ip).unwrap().as_str(), "example.com");
     // The route is published after the selector/runtime has already been
     // installed.  This models a config reload between DNS answer and the
-    // first FakeIP flow: new flows must see the proxy rule, while any flow
-    // that had already selected a proxy keeps its own session.
+    // first FakeIP flow: the restored domain matches the explicit proxy rule;
+    // the later flow uses an unrelated domain and verifies that no-match
+    // routing still follows Go's proxy fallback.
     router
-        .compile_and_publish(vec![fake_ip_rule], fallback)
+        .compile_and_publish(vec![domain_rule], fallback)
         .unwrap();
-    let second_domain = DomainName::new("second.example.com").unwrap();
+    let second_domain = DomainName::new("second.example.net").unwrap();
     let second_domain_for_context = second_domain.clone();
     runtime.set_context_provider(move |flow| {
         let mut context = flow.context();

@@ -308,35 +308,18 @@ impl Router {
     }
 
     fn selected_rule<'a>(&'a self, context: &FlowContext) -> Option<&'a RouteRule> {
-        let packet = self.matched_rule(&context.destination, Some(context));
-        let Some(_) = context.original_domain else {
-            return packet;
-        };
-        let domain = self.matched_rule(&context.effective_destination(), Some(context));
-        match (packet, domain) {
-            (Some(packet), Some(domain)) if domain.priority <= packet.priority => Some(domain),
-            (Some(packet), _) => Some(packet),
-            (None, Some(domain)) => Some(domain),
-            (None, None) => None,
-        }
+        let endpoint = context.effective_destination();
+        self.matched_rule(&endpoint, Some(context))
     }
 
-    /// Evaluate both the packet tuple and a FakeIP-restored hostname.  A
-    /// CIDR rule on the virtual address must keep working, while an explicit
-    /// domain rule must also be able to override the fallback.  The normal
-    /// rule priority decides when both forms match.
+    /// Route using the effective destination. For a FakeIP flow this is the
+    /// hostname restored from the pool; the synthetic packet address must not
+    /// match LAN/CIDR rules before the hostname gets a chance to use the
+    /// normal rule set or the proxy fallback.
     pub fn decide_context(&self, context: &yuhaiin_core::FlowContext) -> RouteDecision {
-        let packet = self.matched_decision(&context.destination, Some(context));
-        let Some(_) = context.original_domain else {
-            return packet.unwrap_or_else(|| self.fallback.clone());
-        };
-        let domain = self.matched_decision(&context.effective_destination(), Some(context));
-        match (packet, domain) {
-            (Some(packet), Some(domain)) if domain.priority <= packet.priority => domain,
-            (Some(packet), _) => packet,
-            (None, Some(domain)) => domain,
-            (None, None) => self.fallback.clone(),
-        }
+        let endpoint = context.effective_destination();
+        self.matched_decision(&endpoint, Some(context))
+            .unwrap_or_else(|| self.fallback.clone())
     }
 
     /// Apply the same route decision as `decide_context` and retain the
@@ -411,9 +394,7 @@ impl Router {
             {
                 let rule = &self.all_rules[offset];
                 let endpoint = context.effective_destination();
-                matched |= self.rule_matches(rule, &context.destination, context)
-                    || (context.original_domain.is_some()
-                        && self.rule_matches(rule, &endpoint, context));
+                matched |= self.rule_matches(rule, &endpoint, context);
                 append_rule_history(&mut history, rule, context, &endpoint);
                 offset += 1;
             }
@@ -967,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn fakeip_context_uses_the_first_priority_of_ip_and_domain_rules() {
+    fn fakeip_context_routes_using_the_restored_domain() {
         let mut cidr = rule("198.18.0.0/15", RuleAction::Proxy, 10);
         cidr.network = Some(Network::Udp);
         cidr.port = Some((443, 443));
@@ -988,18 +969,18 @@ mod tests {
             "198.18.0.1:443".parse().unwrap(),
         ));
         context.original_domain = Some(DomainName::new("example.com").unwrap());
-        assert_eq!(router.decide_context(&context).mode, RouteMode::Proxy);
+        assert_eq!(router.decide_context(&context).mode, RouteMode::Direct);
     }
 
     #[test]
-    fn fakeip_context_does_not_let_domain_fallback_override_a_cidr_match() {
-        let mut cidr = rule("198.18.0.0/15", RuleAction::Proxy, 10);
+    fn fakeip_context_uses_proxy_fallback_when_only_virtual_cidr_matches() {
+        let mut cidr = rule("198.18.0.0/15", RuleAction::Direct, 10);
         cidr.network = Some(Network::Udp);
         cidr.port = Some((443, 443));
         let router = Router::compile(
             vec![cidr],
             RouteDecision {
-                mode: RouteMode::Block,
+                mode: RouteMode::Proxy,
                 resolver_policy: ResolverPolicy::default(),
                 priority: 0,
             },
