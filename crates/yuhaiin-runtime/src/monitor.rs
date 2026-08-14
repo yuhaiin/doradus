@@ -37,6 +37,10 @@ const GO_STATISTICS_PROJECTION_RETRY_INITIAL: Duration = Duration::from_secs(2);
 const GO_STATISTICS_PROJECTION_RETRY_MAX: Duration = Duration::from_secs(60);
 const PERSISTENCE_KEY: &str = "statistics.runtime";
 const PERSISTENCE_VERSION: u32 = 1;
+// Go stores the history key's protocol in a separate SQLite column, while
+// the public history JSON may only contain the network metadata. Keep the
+// exact storage value across a Rust checkpoint without changing that JSON.
+const INTERNAL_GO_PROTOCOL_KEY: &str = "__yuhaiin_go_protocol";
 // The Go API always returns this complete, stable dimension list. Empty
 // groups are part of the public response contract even though new telemetry
 // entries are only recorded for non-empty dimensions.
@@ -601,14 +605,16 @@ impl ConnectionMonitor {
                 .then_with(|| history_key(left).cmp(&history_key(right)))
         });
         items.truncate(GO_HISTORY_SIZE);
+        let dump_process_enabled = items.iter().any(|item| {
+            item.get("connection")
+                .and_then(|connection| connection.get("process"))
+                .and_then(Value::as_str)
+                .is_some_and(|process| !process.is_empty())
+        });
+        let public_items = items.iter().map(public_history_item).collect::<Vec<_>>();
         json!({
-            "items": items,
-            "dumpProcessEnabled": items.iter().any(|item| {
-                item.get("connection")
-                    .and_then(|connection| connection.get("process"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|process| !process.is_empty())
-            }),
+            "items": public_items,
+            "dumpProcessEnabled": dump_process_enabled,
         })
     }
 
@@ -1118,7 +1124,12 @@ impl ConnectionMonitor {
             .history
             .into_iter()
             .filter_map(|history| {
-                let connection = serde_json::from_slice::<Value>(&history.connection_json).ok()?;
+                let mut connection =
+                    serde_json::from_slice::<Value>(&history.connection_json).ok()?;
+                connection.as_object_mut()?.insert(
+                    INTERNAL_GO_PROTOCOL_KEY.to_owned(),
+                    Value::String(history.protocol),
+                );
                 Some(json!({
                     "connection": connection,
                     "count": history.count.to_string(),
@@ -1198,12 +1209,12 @@ impl ConnectionMonitor {
                 .iter()
                 .filter_map(|item| {
                     let connection = item.get("connection")?;
+                    let mut public_connection = connection.clone();
+                    public_connection
+                        .as_object_mut()?
+                        .remove(INTERNAL_GO_PROTOCOL_KEY);
                     Some(GoConnectionHistoryRecord {
-                        protocol: connection
-                            .get("protocol")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
+                        protocol: history_protocol(connection),
                         addr: connection
                             .get("addr")
                             .and_then(Value::as_str)
@@ -1216,7 +1227,7 @@ impl ConnectionMonitor {
                             .to_owned(),
                         count: history_count(item),
                         last_seen: history_time(item),
-                        connection_json: serde_json::to_vec(connection).ok()?,
+                        connection_json: serde_json::to_vec(&public_connection).ok()?,
                     })
                 })
                 .collect(),
@@ -1669,11 +1680,7 @@ fn parse_time(value: Option<&str>) -> Option<i64> {
 fn history_key(item: &Value) -> (String, String, String) {
     let connection = item.get("connection").unwrap_or(item);
     (
-        connection
-            .get("protocol")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
+        history_protocol(connection),
         connection
             .get("addr")
             .and_then(Value::as_str)
@@ -1685,6 +1692,23 @@ fn history_key(item: &Value) -> (String, String, String) {
             .unwrap_or_default()
             .to_owned(),
     )
+}
+
+fn history_protocol(connection: &Value) -> String {
+    connection
+        .get(INTERNAL_GO_PROTOCOL_KEY)
+        .and_then(Value::as_str)
+        .or_else(|| connection.get("protocol").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn public_history_item(item: &Value) -> Value {
+    let mut item = item.clone();
+    if let Some(connection) = item.get_mut("connection").and_then(Value::as_object_mut) {
+        connection.remove(INTERNAL_GO_PROTOCOL_KEY);
+    }
+    item
 }
 
 fn history_count(item: &Value) -> u64 {
@@ -2597,6 +2621,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let store = ConfigStore::open_memory().await.unwrap();
+            let observed_store = store.clone();
             store
                 .replace_go_statistics(&GoStatisticsSnapshot {
                     total_download: 23,
@@ -2608,7 +2633,7 @@ mod tests {
                         count: 4,
                         last_seen: 1_700_000_000,
                         connection_json: br#"{
-                            "protocol":"tcp",
+                            "network":{"connType":"tcp"},
                             "addr":"203.0.113.10:443",
                             "process":"/usr/bin/browser"
                         }"#
@@ -2623,7 +2648,21 @@ mod tests {
             assert_eq!(monitor.total_flow_value()["upload"], "19");
             assert_eq!(monitor.all_history_value()["items"][0]["count"], "4");
             assert_eq!(monitor.all_history_value()["dumpProcessEnabled"], true);
+            assert!(
+                monitor.all_history_value()["items"][0]["connection"]
+                    .get(INTERNAL_GO_PROTOCOL_KEY)
+                    .is_none()
+            );
+            assert!(
+                monitor.all_history_value()["items"][0]["connection"]
+                    .get("protocol")
+                    .is_none()
+            );
             monitor.shutdown().await.unwrap();
+            assert_eq!(
+                observed_store.load_go_statistics().unwrap().history[0].protocol,
+                "tcp"
+            );
         });
     }
 }

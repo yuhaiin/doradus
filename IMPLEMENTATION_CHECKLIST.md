@@ -192,7 +192,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 ### SQLite、配置兼容和统计
 
-- `[~]` **Go 停止态 SQLite 快照**：4 份快照的 API read/mutation/error parity 和 schema audit 已通过；下一步增加逐表异常/未知对象 diff，报告只写入 `~/.cache/yuhaiin-rust`。
+- `[~]` **Go 停止态 SQLite 快照**：4 份快照的 API read/mutation/error parity 和 schema audit 已通过；当前重跑的 3 份缓存快照又通过逐表语义 SHA-256 row digest，`row_count_diffs` 为空，digest 会规范化投影时间、telemetry surrogate id 和 connection JSON key order；当前唯一的非 migration 内容差异是 v2 `metadata.schema_version` 的 7→6 兼容迁移。审计期间发现并修复 Rust checkpoint 会丢失 Go `connection_history.protocol` 的真实兼容问题，下一步仍需更多异常中断/未知字段样本，报告只写入 `~/.cache/yuhaiin-rust`。
 - `[~]` **S3 backup**：SigV4、MinIO、restore、proxy transport 和失败语义已通过；下一步在拥有 AWS 权限的环境执行一次真实 S3 PUT/GET/restore，或保留 AWS 现场为外部验收项。
 - `[~]` **statistics projection**：实时 connections、SSE、traffic、history、telemetry、force-stop 和 48-reader soak 已通过；下一步增加更长的 production-like projection/reload 样本，检查长时运行的 SQLite/WAL 增长。
 
@@ -244,9 +244,9 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` 2026-08-14 修复桌面 TUN supervisor 的 owner 隔离：一个 enabled TUN 的 open/dispatcher task 失败时不再 `abort_all` 健康 sibling；失败 owner 保留错误状态并等待显式 inbound reload 或 shutdown，随后才统一重建。`make tun-api-process-smoke`、`make service-chain-smoke` 与 runtime TUN focused tests 在 Podman 通过；该行为与 Go 的“一 inbound 一 owner”生命周期一致。
 ### Go 生产兼容和统计
 
-- `[~]` 对更多停止态 Go SQLite 做逐表 schema/未知表/异常快照 diff；当前 4 份停止态 snapshot 的 API read/mutation/error parity 已通过，源库只读，副本和结果放 `~/.cache/yuhaiin-rust`。
-- `[x]` `production-parity-smoke` 现在额外在 Podman 中审计四份停止态快照的 SQLite 对象、逐表列约束和索引保留；Rust 允许的 `dns_resolvers`、`route_rules`、小时级 traffic/failure projection schema migration 被显式列出，其余源表/对象缺失会直接失败，行数变化会保留在 JSON 报告中供 projection 复核。
-- `[x]` 2026-08-14 使用 `~/.cache/yuhaiin-rust` 中三份停止态 Go 数据库副本重新运行 `make production-parity-smoke`；每份均在 Podman 完成 Rust takeover、SQLite 对象审计、info/settings/nodes/inbounds/resolvers/routes/publishes/connections/统计读取、核心 mutation 和错误矩阵，全部 `identical`，源副本未被修改。
+- `[~]` 对更多停止态 Go SQLite 做逐表 schema/未知表/异常快照 diff；当前 4 份停止态 snapshot 的 API read/mutation/error parity 已通过，当前重跑的 3 份副本还完成了逐表语义 SHA-256 row digest，源库只读，副本和结果放 `~/.cache/yuhaiin-rust`。
+- `[x]` `production-parity-smoke` 现在额外在 Podman 中审计四份停止态快照的 SQLite 对象、逐表列约束、索引保留和语义行内容；Rust 允许的 `dns_resolvers`、`route_rules`、小时级 traffic/failure projection schema migration 被显式列出，projection 时间、telemetry surrogate id 和 connection JSON key order 的已知差异被规范化，其余源表/对象缺失会直接失败。
+- `[x]` 2026-08-14 使用 `~/.cache/yuhaiin-rust` 中三份停止态 Go 数据库副本重新运行 `make production-parity-smoke`；每份均在 Podman 完成 Rust takeover、SQLite 对象/语义行审计、info/settings/nodes/inbounds/resolvers/routes/publishes/connections/统计读取、核心 mutation 和错误矩阵，全部 `identical`，源副本未被修改；审计发现的 Go `connection_history.protocol` checkpoint 丢失已修复，并由 runtime 回归锁定。
 - `[~]` 增加更长时间 telemetry/history、强停和 reload 组合样本；2026-08-14 已补充 Podman 真实前台进程的 48 readers×3000 rounds、10000 writes 压力回归（2/2 passed，433.71s），覆盖 force-stop reopen 与 restart persistence；此前 32×2000/5000、32×1200/3000 和更小矩阵也通过。容器压力不能替代真实生产时段的长期 projection 样本，因此仍保留 `[~]`。
 - `[x]` SQLite 升级/启动与统计投影的锁竞争已有跨进程 Podman 回归：真实持有 `<db>-yuhaiin-write-lock` 时，另一个 `ConfigStore::open` 会等待并在释放后完成；真实 `BEGIN IMMEDIATE` 持有者释放后，`replace_go_statistics` 会通过生产 busy-retry 路径完成，6 个 cross-process tests 通过（另 1 个长压 test 显式 ignored）。
 - `[x]` 使用缓存中的停止态 Go `state.db` 做 Go/Rust API read + core mutation parity；包括 `connections.history` 的 UTC 时间格式、节点/入站/解析器/路由/发布，以及订阅更新空请求的 Go “refresh all” 成功 contract。另用真实 Go v1 `/home/asutorufa/Documents/Programming/yuhaiin/tmp/state.db` 的独立副本完成同一读/写/错误矩阵 parity；源库保持只读，所有副本和日志位于 `~/.cache/yuhaiin-rust`。
