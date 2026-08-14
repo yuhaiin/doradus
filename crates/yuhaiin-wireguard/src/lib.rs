@@ -2209,6 +2209,43 @@ mod tests {
         packet[9] = 17;
         packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
         packet[16..20].copy_from_slice(&[1, 1, 1, 1]);
+
+        let read_rss_kib = || {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|status| {
+                    status.lines().find_map(|line| {
+                        line.strip_prefix("VmRSS:")
+                            .and_then(|value| value.split_whitespace().next())
+                            .and_then(|value| value.parse::<u64>().ok())
+                    })
+                })
+        };
+        let read_cpu_ticks = || {
+            std::fs::read_to_string("/proc/self/stat")
+                .ok()
+                .and_then(|stat| {
+                    let (_, fields) = stat.rsplit_once(") ")?;
+                    let mut fields = fields.split_whitespace();
+                    let user = fields.nth(11)?.parse::<u64>().ok()?;
+                    let system = fields.next()?.parse::<u64>().ok()?;
+                    Some(user.saturating_add(system))
+                })
+        };
+        let mut peak_rss_kib = None;
+        let mut proc_samples = 0u64;
+        let mut sample_usage = || {
+            let rss_kib = read_rss_kib();
+            if let Some(rss_kib) = rss_kib {
+                peak_rss_kib = Some(peak_rss_kib.unwrap_or(0).max(rss_kib));
+            }
+            let cpu_ticks = read_cpu_ticks();
+            if rss_kib.is_some() || cpu_ticks.is_some() {
+                proc_samples += 1;
+            }
+            cpu_ticks
+        };
+        let cpu_start = sample_usage();
         let started = Instant::now();
         let mut transferred = 0usize;
         while transferred < bytes {
@@ -2223,18 +2260,16 @@ mod tests {
             }
             transferred += length;
             packet.resize(20 + payload_size, 0);
+            if transferred % (payload_size * 256) < length || transferred == bytes {
+                let _ = sample_usage();
+            }
         }
         let elapsed = started.elapsed();
         let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
-        let rss_kib = std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|status| {
-                status.lines().find_map(|line| {
-                    line.strip_prefix("VmRSS:")
-                        .and_then(|value| value.split_whitespace().next())
-                        .and_then(|value| value.parse::<u64>().ok())
-                })
-            });
+        let cpu_end = sample_usage();
+        let cpu_ticks = cpu_start
+            .zip(cpu_end)
+            .map(|(start, end)| end.saturating_sub(start));
         println!(
             "BENCHMARK {}",
             serde_json::json!({
@@ -2242,7 +2277,9 @@ mod tests {
                 "bytes": bytes,
                 "seconds": seconds,
                 "mib_per_sec": bytes as f64 / seconds / (1024.0 * 1024.0),
-                "peak_rss_kib": rss_kib,
+                "peak_rss_kib": peak_rss_kib,
+                "cpu_ticks": cpu_ticks,
+                "proc_samples": proc_samples,
             })
         );
     }
