@@ -5316,6 +5316,25 @@ go-termination-parity-smoke` 为 Go/Rust 10/10；所有状态、日志和 cargo 
 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。HTTP termination 仍保留 `[~]`，因为 Go live
 HTTPS/error/证书矩阵以及更广现场对照尚未全部完成。
 
+## 217. 2026-08-14 Windows Service 安装事务与 recovery policy parity
+
+继续审计 Go `cmd/yuhaiin/main_windows.go` 与 Rust native service。Rust 之前在 Windows
+安装过程中如果创建 service、设置 recovery actions、启动或 health 失败，可能留下已注册的
+service 或已经替换的新二进制；同时 recovery policy 只有 4 个 restart action、24 小时 reset，
+与 Go 的 9 段退避和 60 秒 reset 不一致。
+
+现在 Windows install 会拒绝替换非自有 symlink；替换 Program Files 二进制前先把旧文件移到
+带 PID 的 install backup，数据目录创建、SCM service 创建、配置、启动或 health 任一步失败时
+都会清理新建 service 并尝试恢复旧文件，成功后清理 backup。Service recovery actions 改为与 Go
+一致的 `1/2/4/9/16/25/36/49/64` 秒 Restart 序列和 60 秒 reset。Windows-only 单测增加了
+recovery policy 的精确延迟断言；Linux Podman 无法执行 Windows SCM，但
+`make release-windows-cross-smoke` 已通过 `x86_64-pc-windows-gnu` cfg/依赖编译，确保该模块
+实际进入 Windows 条件编译路径。
+
+真实 SCM 权限、Program Files ACL、失败安装清理和 update-helper 组合仍由 GitHub Actions
+Windows native-service runner 验证；本轮没有把 GNU cross check 当成真实 Windows service
+验收。状态和构建缓存继续位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
+
 ## 216. 2026-08-14 macOS launchd restart 生命周期收口
 
 继续对照 Go `cmd/yuhaiin/main_darwin.go` 与 `update_installer_unix.go` 的 service restart

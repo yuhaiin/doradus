@@ -1012,37 +1012,128 @@ mod windows {
         }
         let executable = current_executable()?;
         let target = Path::new(TARGET_BIN);
-        if !same_file(&executable, target) {
-            copy_binary(&executable, target)?;
+        if is_symlink(target) && !same_file(&executable, target) {
+            return Err(service_error(format!(
+                "refusing to replace non-owned symlink {}",
+                target.display()
+            )));
         }
-        fs::create_dir_all(&options.path).map_err(service_error)?;
-        let service = manager
+        let binary_backup = if same_file(&executable, target) {
+            None
+        } else {
+            Some(prepare_binary_install(&executable, target)?)
+        };
+        if let Err(error) = fs::create_dir_all(&options.path).map_err(service_error) {
+            if let Err(restore_error) = restore_binary_install(target, binary_backup.as_deref()) {
+                return Err(service_error(format!(
+                    "create service data directory failed: {error}; restore binary failed: {restore_error}"
+                )));
+            }
+            return Err(error);
+        }
+        let service = match manager
             .create_service(&service_info(&options, target), service_access())
-            .map_err(service_error)?;
-        service
-            .set_description("yuhaiin transparent proxy")
-            .map_err(service_error)?;
-        service
-            .update_failure_actions(ServiceFailureActions {
-                reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
-                reboot_msg: None,
-                command: None,
-                actions: Some(
-                    [1_u64, 2, 4, 9]
-                        .into_iter()
-                        .map(|seconds| ServiceAction {
-                            action_type: ServiceActionType::Restart,
-                            delay: Duration::from_secs(seconds),
-                        })
-                        .collect(),
-                ),
+        {
+            Ok(service) => service,
+            Err(error) => {
+                let error = service_error(error);
+                if let Err(restore_error) = restore_binary_install(target, binary_backup.as_deref())
+                {
+                    return Err(service_error(format!(
+                        "create Windows service failed: {error}; restore binary failed: {restore_error}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
+        let result = (|| {
+            service
+                .set_description("yuhaiin transparent proxy")
+                .map_err(service_error)?;
+            service
+                .update_failure_actions(ServiceFailureActions {
+                    reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(60)),
+                    reboot_msg: None,
+                    command: None,
+                    actions: Some(recovery_actions()),
+                })
+                .map_err(service_error)?;
+            service
+                .set_failure_actions_on_non_crash_failures(true)
+                .map_err(service_error)?;
+            start_service(&service)?;
+            wait_for_health(&options.host)
+        })();
+        if let Err(error) = result {
+            let cleanup_error = cleanup_created_service(&manager, &service).err();
+            drop(service);
+            let restore_error = restore_binary_install(target, binary_backup.as_deref()).err();
+            let mut message = format!("install Windows service failed: {error}");
+            if let Some(cleanup_error) = cleanup_error {
+                message.push_str(&format!("; cleanup failed: {cleanup_error}"));
+            }
+            if let Some(restore_error) = restore_error {
+                message.push_str(&format!("; restore binary failed: {restore_error}"));
+            }
+            return Err(service_error(message));
+        }
+        drop(service);
+        if let Some(backup) = binary_backup {
+            let _ = fs::remove_file(backup);
+        }
+        Ok(())
+    }
+
+    fn prepare_binary_install(source: &Path, target: &Path) -> Result<PathBuf> {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(service_error)?;
+        }
+        let backup = target.with_extension(format!("install-backup-{}", std::process::id()));
+        if target.exists() {
+            fs::rename(target, &backup).map_err(service_error)?;
+        }
+        if let Err(error) = copy_binary(source, target) {
+            let _ = fs::remove_file(target);
+            return match fs::rename(&backup, target) {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(service_error(format!(
+                    "install service binary failed: {error}; restore previous binary failed: {restore_error}"
+                ))),
+            };
+        }
+        Ok(backup)
+    }
+
+    fn restore_binary_install(target: &Path, backup: Option<&Path>) -> Result<()> {
+        if target.exists() || is_symlink(target) {
+            fs::remove_file(target).map_err(service_error)?;
+        }
+        if let Some(backup) = backup {
+            if backup.exists() {
+                fs::rename(backup, target).map_err(service_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup_created_service(
+        manager: &ServiceManager,
+        service: &windows_service::service::Service,
+    ) -> Result<()> {
+        let _ = stop_service(service);
+        service.delete().map_err(service_error)?;
+        wait_for_deleted(manager);
+        Ok(())
+    }
+
+    fn recovery_actions() -> Vec<ServiceAction> {
+        [1_u64, 2, 4, 9, 16, 25, 36, 49, 64]
+            .into_iter()
+            .map(|seconds| ServiceAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(seconds),
             })
-            .map_err(service_error)?;
-        service
-            .set_failure_actions_on_non_crash_failures(true)
-            .map_err(service_error)?;
-        start_service(&service)?;
-        wait_for_health(&options.host)
+            .collect()
     }
 
     fn service_info(options: &ServiceOptions, target: &Path) -> ServiceInfo {
@@ -1337,6 +1428,21 @@ mod windows {
             assert_eq!(info.start_type, ServiceStartType::AutoStart);
             assert_eq!(info.launch_arguments[0], "--windows-service");
             assert!(info.launch_arguments.contains(&OsString::from("-nfs-mode")));
+        }
+
+        #[test]
+        fn recovery_actions_match_go_service_policy() {
+            let delays = recovery_actions()
+                .into_iter()
+                .map(|action| action.delay)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                delays,
+                [1_u64, 2, 4, 9, 16, 25, 36, 49, 64]
+                    .into_iter()
+                    .map(Duration::from_secs)
+                    .collect::<Vec<_>>()
+            );
         }
     }
 }
