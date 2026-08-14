@@ -59,6 +59,7 @@ fn main() -> std::io::Result<()> {
         ipv6: ipv6.iter().copied().collect(),
         mtu: 1500,
         queue_capacity,
+        skip_multicast: false,
     })?;
     if route_smoke {
         #[cfg(all(feature = "tun-routes", target_os = "linux"))]

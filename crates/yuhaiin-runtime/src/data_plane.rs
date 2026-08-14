@@ -200,6 +200,11 @@ pub async fn load_tun_config(store: &yuhaiin_store::ConfigStore) -> Result<TunRu
             .get("queueCapacity")
             .and_then(Value::as_u64)
             .unwrap_or(256) as usize,
+        skip_multicast: value
+            .get("skipMulticast")
+            .or_else(|| value.get("skip_multicast"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     };
     let mut config = TunRuntimeConfig {
         enabled,
@@ -415,6 +420,11 @@ fn parse_go_tun_config(record: &GoInboundRecord) -> Result<TunRuntimeConfig> {
                 .map(str::to_owned)
         })
         .collect();
+    let skip_multicast = protocol
+        .get("skipMulticast")
+        .or_else(|| protocol.get("skip_multicast"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Ok(TunRuntimeConfig {
         enabled: record.enabled,
         tun: yuhaiin_core::tun::TunConfig {
@@ -423,6 +433,7 @@ fn parse_go_tun_config(record: &GoInboundRecord) -> Result<TunRuntimeConfig> {
             ipv6,
             mtu,
             queue_capacity: 256,
+            skip_multicast,
         },
         routes,
         direct_id: String::new(),
@@ -587,7 +598,8 @@ pub async fn run_tun_device_until_ref(
         )
         .await?;
     controller.monitor().info("TUN inbound ready");
-    let mut dispatcher = yuhaiin_core::tun::TunDispatcher::new(64 * 1024, 64 * 1024, 2048)?;
+    let mut dispatcher = yuhaiin_core::tun::TunDispatcher::new(64 * 1024, 64 * 1024, 2048)?
+        .with_skip_multicast(config.tun.skip_multicast);
     tun.run_dispatcher_until(
         &mut dispatcher,
         &mut proxy_runtime,
@@ -1108,6 +1120,7 @@ mod tests {
                     "mtu": 1400,
                     "portal": "10.24.0.1/24",
                     "portalV6": "fd24::1/64",
+                    "skipMulticast": true,
                     "routes": ["198.18.0.0/15"],
                     "excludes": ["10.0.0.0/8"]
                 }
@@ -1137,6 +1150,7 @@ mod tests {
         assert_eq!(config.tun.name.as_deref(), Some("yuhaiin0"));
         assert_eq!(config.tun.ipv4, Some((Ipv4Addr::new(10, 24, 0, 1), 24)));
         assert_eq!(config.tun.ipv6, vec![("fd24::1".parse().unwrap(), 64)]);
+        assert!(config.tun.skip_multicast);
         assert_eq!(config.tun.mtu, 1400);
         assert_eq!(config.routes, ["198.18.0.0/15", "10.0.0.0/8"]);
     }

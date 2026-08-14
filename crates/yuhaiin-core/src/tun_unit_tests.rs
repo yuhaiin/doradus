@@ -93,6 +93,121 @@ fn queue_device_exposes_ip_medium_and_bounded_rx() {
 }
 
 #[test]
+fn dispatcher_skips_ipv4_and_ipv6_multicast_before_smoltcp_dispatch() {
+    let local = Ipv4Address::new(10, 0, 0, 1);
+    let remote = Ipv4Address::new(10, 0, 0, 2);
+    let mut device = SmoltcpTunDevice::new(1500, 8).unwrap();
+    let mut interface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    interface.set_any_ip(true);
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(IpAddress::Ipv4(local), 24))
+            .unwrap();
+        addresses
+            .push(IpCidr::new(IpAddress::Ipv6("fe80::1".parse().unwrap()), 64))
+            .unwrap();
+    });
+    let mut dispatcher = TunDispatcher::new(2048, 2048, 4)
+        .unwrap()
+        .with_skip_multicast(true);
+
+    device
+        .enqueue_rx(udp_packet(remote, local, 41000, 1900, b"ordinary"))
+        .unwrap();
+    device
+        .enqueue_rx(udp_packet(
+            remote,
+            Ipv4Address::new(239, 255, 255, 250),
+            41000,
+            1900,
+            b"ssdp",
+        ))
+        .unwrap();
+    device
+        .enqueue_rx(ipv6_udp_packet(
+            "fe80::2".parse().unwrap(),
+            "ff02::c".parse().unwrap(),
+            41000,
+            1900,
+            b"ssdp6",
+        ))
+        .unwrap();
+
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(1))
+        .unwrap();
+
+    let events: Vec<_> = dispatcher.events().collect();
+    let [TunEvent::UdpDatagram { payload, .. }] = events.as_slice() else {
+        panic!("expected only the ordinary UDP packet, got {events:?}");
+    };
+    assert_eq!(payload, b"ordinary");
+    assert_eq!(device.queued_rx().unwrap(), 0);
+}
+
+#[test]
+fn dispatcher_drops_cross_family_multicast_socket_matches_without_panicking() {
+    let local = Ipv4Address::new(239, 255, 255, 250);
+    let remote = Ipv4Address::new(10, 0, 0, 2);
+    let mut device = SmoltcpTunDevice::new(1500, 8).unwrap();
+    let mut interface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    interface.set_any_ip(true);
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(
+                IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)),
+                24,
+            ))
+            .unwrap();
+        addresses
+            .push(IpCidr::new(IpAddress::Ipv6("fe80::1".parse().unwrap()), 64))
+            .unwrap();
+    });
+    let mut dispatcher = TunDispatcher::new(2048, 2048, 4).unwrap();
+
+    // Create the IPv4 multicast-bound socket first. smoltcp 0.13 permits a
+    // multicast-bound socket to accept a packet from the other IP family.
+    device
+        .enqueue_rx(udp_packet(remote, local, 41000, 1900, b"ssdp"))
+        .unwrap();
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(1))
+        .unwrap();
+    assert_eq!(dispatcher.events().count(), 1);
+
+    let mixed_flow = TunFlowKey {
+        network: Network::Udp,
+        source: "[fe80::2]:41000".parse().unwrap(),
+        destination: "239.255.255.250:1900".parse().unwrap(),
+    };
+    let error = dispatcher.write_udp(mixed_flow, b"reply").unwrap_err();
+    assert_eq!(error.kind, ErrorKind::InvalidInput);
+
+    device
+        .enqueue_rx(ipv6_udp_packet(
+            "fe80::2".parse().unwrap(),
+            "ff02::c".parse().unwrap(),
+            41000,
+            1900,
+            b"ssdp6",
+        ))
+        .unwrap();
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(2))
+        .unwrap();
+
+    assert_eq!(dispatcher.events().count(), 0);
+}
+
+#[test]
 fn fragmented_packets_are_preserved_but_each_fragment_must_fit_mtu() {
     let mut packet = vec![
         0x45, 0, 0, 24, 0, 1, 0x20, 0, 64, 17, 0, 0, 10, 0, 0, 1, 8, 8, 8, 8, 1, 2, 3, 4,

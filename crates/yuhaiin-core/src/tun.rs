@@ -89,6 +89,10 @@ pub struct TunConfig {
     pub ipv6: Vec<(Ipv6Addr, u8)>,
     pub mtu: usize,
     pub queue_capacity: usize,
+    /// Drop IP multicast packets before smoltcp dispatches them.  This keeps
+    /// the default desktop TUN behavior aligned with Go's `skipMulticast`
+    /// setting and avoids treating discovery traffic as proxy flows.
+    pub skip_multicast: bool,
 }
 impl Default for TunConfig {
     fn default() -> Self {
@@ -98,6 +102,7 @@ impl Default for TunConfig {
             ipv6: Vec::new(),
             mtu: DEFAULT_MTU,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            skip_multicast: false,
         }
     }
 }
@@ -515,6 +520,7 @@ pub struct TunDispatcher {
     rx_buffer_size: usize,
     tx_buffer_size: usize,
     udp_packet_capacity: usize,
+    skip_multicast: bool,
 }
 
 impl TunDispatcher {
@@ -536,7 +542,21 @@ impl TunDispatcher {
             rx_buffer_size,
             tx_buffer_size,
             udp_packet_capacity,
+            skip_multicast: false,
         })
+    }
+
+    /// Configure whether IP multicast packets should be discarded before
+    /// smoltcp sees them.  The setting is intentionally applied at the
+    /// dispatcher boundary so it also covers packets already buffered by an
+    /// injected/mobile TUN device.
+    pub fn with_skip_multicast(mut self, skip_multicast: bool) -> Self {
+        self.skip_multicast = skip_multicast;
+        self
+    }
+
+    pub fn set_skip_multicast(&mut self, skip_multicast: bool) {
+        self.skip_multicast = skip_multicast;
     }
 
     pub fn events(&mut self) -> impl Iterator<Item = TunEvent> + '_ {
@@ -561,10 +581,22 @@ impl TunDispatcher {
         device: &mut SmoltcpTunDevice,
         timestamp: Instant,
     ) -> Result<smoltcp::iface::PollResult> {
+        self.drop_skipped_multicast(device)?;
         self.prepare_rx(device)?;
         let result = interface.poll(timestamp, device, &mut self.sockets);
         self.collect_events()?;
         Ok(result)
+    }
+
+    fn drop_skipped_multicast(&self, device: &SmoltcpTunDevice) -> Result<()> {
+        if !self.skip_multicast {
+            return Ok(());
+        }
+        let dropped = device.drop_multicast_rx_packets()?;
+        if dropped != 0 {
+            tun_debug(format!("TUN multicast packets skipped count={dropped}"));
+        }
+        Ok(())
     }
 
     /// Create a socket for the packet at the head of the TUN RX queue before
@@ -636,6 +668,15 @@ impl TunDispatcher {
     }
 
     pub fn write_udp(&mut self, flow: TunFlowKey, payload: &[u8]) -> Result<()> {
+        if flow.source.is_ipv4() != flow.destination.is_ipv4() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "TUN UDP flow has mixed IP versions: source={} destination={}",
+                    flow.source, flow.destination
+                ),
+            ));
+        }
         let handle = self
             .udp_by_local
             .get(&flow.destination)
@@ -812,6 +853,22 @@ impl TunDispatcher {
                 let (payload, metadata) = socket.recv().map_err(|error| {
                     Error::new(ErrorKind::Protocol, format!("TUN UDP read: {error:?}"))
                 })?;
+                // smoltcp intentionally lets a socket bound to a multicast
+                // address accept multicast packets without comparing the
+                // exact destination.  With both IP families enabled that can
+                // deliver an IPv6 multicast datagram to an IPv4 socket (or
+                // vice versa).  Never expose that as a mixed-family flow;
+                // doing so would make smoltcp panic while constructing the
+                // response IP header.
+                if metadata.local_address.is_some_and(|address| {
+                    matches!(address, IpAddress::Ipv4(_)) != local.ip().is_ipv4()
+                }) {
+                    tun_debug(format!(
+                        "TUN UDP packet dropped for IP family mismatch socket={} packet_destination={:?}",
+                        local, metadata.local_address
+                    ));
+                    continue;
+                }
                 let flow = TunFlow {
                     key: TunFlowKey {
                         network: Network::Udp,
@@ -852,6 +909,23 @@ fn is_non_initial_fragment(packet: &[u8]) -> Result<bool> {
             Ok(packet.frag_offset() != 0)
         }
         IpVersion::Ipv6 => Ok(ipv6_has_fragment_header(packet)),
+    }
+}
+
+fn ip_packet_has_multicast_destination(packet: &[u8]) -> Result<bool> {
+    match IpVersion::of_packet(packet)
+        .map_err(|_| Error::invalid("TUN packet is not IPv4 or IPv6"))?
+    {
+        IpVersion::Ipv4 => {
+            let packet = smoltcp::wire::Ipv4Packet::new_checked(packet)
+                .map_err(|_| Error::invalid("malformed IPv4 packet"))?;
+            Ok(packet.dst_addr().is_multicast())
+        }
+        IpVersion::Ipv6 => {
+            let packet = smoltcp::wire::Ipv6Packet::new_checked(packet)
+                .map_err(|_| Error::invalid("malformed IPv6 packet"))?;
+            Ok(packet.dst_addr().is_multicast())
+        }
     }
 }
 
@@ -3024,6 +3098,36 @@ impl SmoltcpTunDevice {
             .lock()
             .map(|queue| queue.tx.len())
             .map_err(|_| Error::new(crate::ErrorKind::Io, "TUN packet queue poisoned"))
+    }
+
+    fn drop_multicast_rx_packets(&self) -> Result<usize> {
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|_| Error::new(crate::ErrorKind::Io, "TUN packet queue poisoned"))?;
+        let packets: Vec<_> = queue.rx.drain(..).collect();
+        let mut keep = Vec::with_capacity(packets.len());
+        let mut dropped = 0;
+        for packet in &packets {
+            match ip_packet_has_multicast_destination(packet) {
+                Ok(true) => {
+                    dropped += 1;
+                    keep.push(false);
+                }
+                Ok(false) => keep.push(true),
+                Err(error) => {
+                    queue.rx.extend(packets);
+                    return Err(error);
+                }
+            }
+        }
+        queue.rx.extend(
+            packets
+                .into_iter()
+                .zip(keep)
+                .filter_map(|(packet, keep)| keep.then_some(packet)),
+        );
+        Ok(dropped)
     }
 }
 

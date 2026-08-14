@@ -62,6 +62,7 @@ mod linux {
             ipv6: Vec::new(),
             mtu: 1500,
             queue_capacity: 8,
+            skip_multicast: false,
         });
         match result {
             Ok(runtime) => {
@@ -103,6 +104,7 @@ mod linux {
             ipv6: Vec::new(),
             mtu: 1500,
             queue_capacity: 8,
+            skip_multicast: false,
         })
         .unwrap();
         assert_eq!(runtime.name().unwrap(), name);
@@ -155,6 +157,7 @@ mod linux {
             ipv6: Vec::new(),
             mtu: 1500,
             queue_capacity: 8,
+            skip_multicast: false,
         })
         .unwrap();
         let name = runtime.name().unwrap();
@@ -195,6 +198,7 @@ mod linux {
             ipv6: Vec::new(),
             mtu: 1500,
             queue_capacity: 8,
+            skip_multicast: false,
         })
         .unwrap();
         let name = runtime.name().unwrap();
@@ -245,6 +249,7 @@ mod linux {
             ipv6: Vec::new(),
             mtu: 1500,
             queue_capacity: 8,
+            skip_multicast: false,
         };
         let route = TunRoute::new("198.18.0.0".parse().unwrap(), 15).unwrap();
         let backend = LinuxTunRouteBackend::new("yuhaiin-route-does-not-exist").unwrap();
@@ -263,6 +268,7 @@ mod linux {
             ipv6: Vec::new(),
             mtu: 1500,
             queue_capacity: 8,
+            skip_multicast: false,
         })
         .unwrap();
         assert_eq!(runtime.name().unwrap(), name);

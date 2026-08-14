@@ -218,6 +218,7 @@ async fn async_main() -> io::Result<()> {
         ipv6: Vec::new(),
         mtu: 1500,
         queue_capacity: 16,
+        skip_multicast: false,
     })?;
     tun.replace_ip_addresses(&[
         smoltcp::wire::IpCidr::new(
