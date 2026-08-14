@@ -2330,7 +2330,25 @@ pub async fn add_vless_inbound(service: &ServiceProcess, id: &str, listen: Socke
         id,
         "VLESS integration inbound",
         listen,
-        json!({"type":"vless","vless":{"uuid":uuid}}),
+        json!({"type":"vless","vless":{"uuid":uuid,"udp":false}}),
+        false,
+    )
+    .await;
+}
+
+pub async fn add_vless_udp_inbound(
+    service: &ServiceProcess,
+    id: &str,
+    listen: SocketAddr,
+    uuid: &str,
+) {
+    add_protocol_inbound(
+        service,
+        id,
+        "VLESS UDP integration inbound",
+        listen,
+        json!({"type":"vless","vless":{"uuid":uuid,"udp":true}}),
+        true,
     )
     .await;
 }
@@ -2346,7 +2364,25 @@ pub async fn add_trojan_inbound(
         id,
         "Trojan integration inbound",
         listen,
-        json!({"type":"trojan","trojan":{"password":password}}),
+        json!({"type":"trojan","trojan":{"password":password,"udp":false}}),
+        false,
+    )
+    .await;
+}
+
+pub async fn add_trojan_udp_inbound(
+    service: &ServiceProcess,
+    id: &str,
+    listen: SocketAddr,
+    password: &str,
+) {
+    add_protocol_inbound(
+        service,
+        id,
+        "Trojan UDP integration inbound",
+        listen,
+        json!({"type":"trojan","trojan":{"password":password,"udp":true}}),
+        true,
     )
     .await;
 }
@@ -2357,12 +2393,13 @@ async fn add_protocol_inbound(
     name: &str,
     listen: SocketAddr,
     protocol: Value,
+    udp: bool,
 ) {
     let inbound = json!({
         "id":id,
         "name":name,
         "enabled":true,
-        "network":{"type":"tcp_udp","tcp_udp":{"host":listen.to_string(),"udp":"disabled"}},
+        "network":{"type":"tcp_udp","tcp_udp":{"host":listen.to_string(),"udp":if udp { "enabled" } else { "disabled" }}},
         "transports":[{"type":"normal","normal":{}}],
         "protocol":protocol
     });
