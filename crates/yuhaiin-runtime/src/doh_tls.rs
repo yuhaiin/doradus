@@ -18,6 +18,8 @@ use yuhaiin_core::proxy::{
 };
 use yuhaiin_core::{BoxFuture, Error, ErrorKind, Result};
 
+use crate::resolver::ResolverProxyBridge;
+
 pub type RustCryptoTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 
 #[derive(Clone)]
@@ -49,12 +51,7 @@ impl RustCryptoTlsDialer {
         self.timeout
     }
 
-    pub async fn connect(
-        &self,
-        host: &str,
-        port: u16,
-        server_name: &str,
-    ) -> Result<RustCryptoTlsStream> {
+    pub async fn connect_tcp(&self, host: &str, port: u16) -> Result<TcpStream> {
         let mut addresses = tokio::net::lookup_host((host, port))
             .await
             .map_err(|error| Error::new(ErrorKind::Io, format!("resolve TLS endpoint: {error}")))?;
@@ -79,6 +76,16 @@ impl RustCryptoTlsDialer {
         stream
             .set_nodelay(true)
             .map_err(|error| Error::new(ErrorKind::Io, format!("TLS TCP_NODELAY: {error}")))?;
+        Ok(stream)
+    }
+
+    pub async fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        server_name: &str,
+    ) -> Result<RustCryptoTlsStream> {
+        let stream = self.connect_tcp(host, port).await?;
         self.connect_stream(server_name, stream).await
     }
 
@@ -201,6 +208,98 @@ impl H2DohConnector for RustCryptoH2Connector {
                 ));
             }
             Ok(stream)
+        })
+    }
+}
+
+/// DoH connector whose underlying TCP stream can be supplied by the runtime
+/// proxy selector. The TLS layer remains identical to the direct connector;
+/// only the stream acquisition boundary differs.
+#[derive(Clone)]
+pub(crate) struct RoutedRustCryptoH2Connector {
+    dialer: RustCryptoTlsDialer,
+    server_name: Option<String>,
+    proxy_bridge: Option<Arc<ResolverProxyBridge>>,
+    use_proxy: bool,
+}
+
+impl RoutedRustCryptoH2Connector {
+    pub(crate) fn from_config(
+        config: Arc<ClientConfig>,
+        server_name: Option<String>,
+        timeout: Duration,
+        proxy_bridge: Option<Arc<ResolverProxyBridge>>,
+        use_proxy: bool,
+    ) -> Self {
+        let mut config = (*config).clone();
+        if !config
+            .alpn_protocols
+            .iter()
+            .any(|protocol| protocol == b"h2")
+        {
+            config.alpn_protocols.push(b"h2".to_vec());
+        }
+        Self {
+            dialer: RustCryptoTlsDialer::from_config(Arc::new(config), timeout),
+            server_name,
+            proxy_bridge,
+            use_proxy,
+        }
+    }
+
+    pub(crate) fn with_local_bind_addresses(mut self, addresses: &[IpAddr]) -> Self {
+        self.dialer = self.dialer.with_local_bind_addresses(addresses);
+        self
+    }
+}
+
+impl H2DohConnector for RoutedRustCryptoH2Connector {
+    type Stream = tokio_rustls::client::TlsStream<BoxAsyncStream>;
+
+    fn connect<'a>(&'a self, uri: &'a http::Uri) -> BoxFuture<'a, Result<Self::Stream>> {
+        Box::pin(async move {
+            if uri.scheme_str() != Some("https") {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "DoH TLS connector requires an https URI",
+                ));
+            }
+            let host = uri
+                .host()
+                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "DoH URI has no host"))?;
+            let port = uri.port_u16().unwrap_or(443);
+            let server_name = self.server_name.as_deref().unwrap_or(host);
+            let proxied = match &self.proxy_bridge {
+                Some(bridge) => match bridge.connect(host, port, self.use_proxy).await {
+                    Ok(stream) => stream,
+                    Err(error) => return Err(error),
+                },
+                None => None,
+            };
+            let result = async {
+                let raw = match proxied {
+                    Some(stream) => stream,
+                    None => Box::new(self.dialer.connect_tcp(host, port).await?) as BoxAsyncStream,
+                };
+                let stream = self.dialer.connect_boxed_stream(server_name, raw).await?;
+                if stream.get_ref().1.alpn_protocol() != Some(b"h2") {
+                    return Err(Error::new(
+                        ErrorKind::Protocol,
+                        format!(
+                            "DoH TLS negotiated {:?}, expected h2",
+                            stream.get_ref().1.alpn_protocol()
+                        ),
+                    ));
+                }
+                Ok(stream)
+            }
+            .await;
+            if let Err(error) = &result
+                && let Some(bridge) = &self.proxy_bridge
+            {
+                bridge.record_failure(host, port, error);
+            }
+            result
         })
     }
 }

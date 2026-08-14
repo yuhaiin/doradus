@@ -15,8 +15,8 @@ use yuhaiin_core::{Error, ErrorKind, Result};
 use yuhaiin_store::{GoResolverRuntimeConfig, GoResolverTransport};
 
 use crate::{
-    BuiltinResolverFactory, ResolverTransportFactory, RustCryptoDohResolverFactory,
-    RustCryptoDotResolverFactory,
+    BuiltinResolverFactory, ResolverProxyBridge, ResolverTransportFactory,
+    RustCryptoDohResolverFactory, RustCryptoDotResolverFactory,
 };
 
 #[derive(Clone)]
@@ -59,6 +59,12 @@ impl RustCryptoResolverFactory {
                 cache_capacity,
             ),
         }
+    }
+
+    pub fn with_proxy_bridge(mut self, bridge: Arc<ResolverProxyBridge>) -> Self {
+        self.doh = self.doh.with_proxy_bridge(bridge.clone());
+        self.dot = self.dot.with_proxy_bridge(bridge);
+        self
     }
 }
 

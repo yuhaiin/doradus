@@ -12,7 +12,8 @@ use yuhaiin_store::{ConfigMutation, ConfigStore};
 use crate::data_plane::{ReloadableAsyncDnsHandler, inbound_dns_handler};
 use crate::monitor::SocketDnsHandler;
 use crate::{
-    ConnectionMonitor, RuntimeBuilder, RuntimeHandle, RuntimeProxySelector, RuntimeSnapshot,
+    ConnectionMonitor, ResolverProxyBridge, RuntimeBuilder, RuntimeHandle, RuntimeProxySelector,
+    RuntimeSnapshot,
 };
 
 /// Shared configuration-to-runtime owner for management APIs.
@@ -33,16 +34,21 @@ pub struct RuntimeController {
     inbound_reload_events: tokio::sync::broadcast::Sender<()>,
     tun_dns_handler: Arc<ReloadableAsyncDnsHandler>,
     restore_request: Arc<RwLock<Option<PathBuf>>>,
+    resolver_proxy_bridge: Option<Arc<ResolverProxyBridge>>,
 }
 
 impl RuntimeController {
     /// Build and publish the initial snapshot before exposing the controller.
     pub async fn from_builder(builder: RuntimeBuilder) -> Result<Self> {
         let builder = Arc::new(builder);
+        let resolver_proxy_bridge = builder.resolver_proxy_bridge();
         let initial_snapshot = builder.build().await?;
         let (reload_events, _) = tokio::sync::broadcast::channel(32);
         let (inbound_reload_events, _) = tokio::sync::broadcast::channel(32);
         let monitor = Arc::new(ConnectionMonitor::load_with_store(builder.store().clone()).await?);
+        if let Some(bridge) = &resolver_proxy_bridge {
+            bridge.set_monitor(&monitor);
+        }
         monitor.set_sniff_enabled(initial_snapshot.inbound_settings.sniff);
         monitor.set_dns_handler(
             inbound_dns_handler(&initial_snapshot)
@@ -63,6 +69,7 @@ impl RuntimeController {
             inbound_reload_events,
             tun_dns_handler,
             restore_request: Arc::new(RwLock::new(None)),
+            resolver_proxy_bridge,
         })
     }
 
@@ -204,6 +211,9 @@ impl RuntimeController {
                 .await?,
         );
         self.register_selector(&selector);
+        if let Some(bridge) = &self.resolver_proxy_bridge {
+            bridge.set_selector(selector.clone());
+        }
         Ok(selector)
     }
 

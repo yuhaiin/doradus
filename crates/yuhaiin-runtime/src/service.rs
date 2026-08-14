@@ -201,7 +201,9 @@ impl Drop for RuntimeService {
 
 async fn build_controller(store: ConfigStore) -> Result<RuntimeController> {
     let upstream: Arc<dyn AsyncIpResolver> = Arc::new(SystemAsyncIpResolver);
-    let mut builder = RuntimeBuilder::new(store, upstream);
+    let resolver_proxy_bridge = Arc::new(crate::ResolverProxyBridge::new());
+    let mut builder = RuntimeBuilder::new(store, upstream)
+        .with_resolver_proxy_bridge(resolver_proxy_bridge.clone());
     #[cfg(feature = "doh-tls")]
     {
         let mut roots = rustls::RootCertStore::empty();
@@ -217,7 +219,8 @@ async fn build_controller(store: ConfigStore) -> Result<RuntimeController> {
                 Arc::new(config),
                 Duration::from_secs(5),
                 256,
-            ),
+            )
+            .with_proxy_bridge(resolver_proxy_bridge),
         ));
     }
     #[cfg(not(feature = "doh-tls"))]

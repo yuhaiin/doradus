@@ -5163,3 +5163,34 @@ HTTPS、私有 CA、异常响应和生产浏览器矩阵继续保持 checklist �
 failure-only probe 做阶段限定的窄化，traffic-bearing telemetry、其他 failed-history 和其余
 管理面字段仍保持严格 diff。更广的 resolver failure telemetry parity 仍属于后续运行矩阵，
 不能用该归一化冒充已完成。
+
+## 209. 2026-08-14 resolver proxy bridge、A/AAAA 并行解析与异常失败持久化
+
+本轮把管理面 resolver 与 runtime proxy chain 接上了同一个 late-bound selector：DoH/DoT
+实际建立 TCP、TLS 和 HTTP/2 连接前都会经过当前 outbound selector；selector 尚未发布时
+保持 fail-closed，不退回绕过 router 的 direct socket。连接、TLS 或 ALPN 的实际失败会以
+Go-compatible 的原始错误消息写入 `ConnectionMonitor`，因此 resolver failure telemetry
+与普通 outbound failure 使用同一条统计边界。
+
+`AsyncDnsResolver` 的本地和 Send-safe 入口现在并行发起 A/AAAA 查询。任意一侧成功时保留
+另一侧的地址结果，只有两侧都失败才返回合并后的错误；新增 partial-query 单测锁定了两种
+QTYPE 都确实发出且单侧失败不会丢掉成功地址。
+
+失败历史不再只依赖异步 checkpoint：`ConfigStore::record_failed_history` 使用同步 SQLite
+UPSERT 按 `(protocol, host, process_name)` 累加计数并更新时间/错误，force-stop 前先落盘；
+启动恢复时把 durable `failed_history` 合并回 compact checkpoint。Podman force-abort 回归
+验证了进程被强杀后 `failedCount` 不回退。
+
+验证结果：core resolver partial-query 为 4/4，runtime DoH/DoT focused tests 为 9/9，
+monitor force-abort recovery 为 1/1；`make clippy` 和 `make release-windows-cross-smoke`
+也在 Podman 通过。四份停止态 Go fixture 合计通过完整 read/mutation/error parity 及
+`SIGKILL → 重启 → 全读矩阵 replay`。其中只对已确认的 Go/Rust 实现差异做 force-stop
+阶段窄化：`doh.pub` 的 CA trust、DoH HTTP/2 transport-attempt 计数、bootstrap DNS
+history 和 v2 SQLite `LIMIT 1000` tie；其他字段、错误和统计仍严格比较。一次多 fixture
+连续执行遇到 pasta namespace 延迟释放端口，剩余 fixture 用独立
+`YUHAIIN_PRODUCTION_PORT_BASE` 重跑通过。
+
+所有构建产物、日志、副本和测试缓存均写入 `~/.cache/yuhaiin-rust`，本轮没有使用 `/tmp`。
+当前缓存用量为 36.16 GiB，其中 `cargo-target` 占 23.90 GiB；脚本只发出超过 20 GiB 的
+告警，没有自动删除任何内容。更长 production-like statistics/reload 样本、未知异常字段
+以及真实 Windows/macOS runner 现场仍属于后续验收项。

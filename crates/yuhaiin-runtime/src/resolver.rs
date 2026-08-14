@@ -6,7 +6,7 @@
 //! connector, trust store and bootstrap policy are deployment-specific.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
 #[cfg(feature = "http2")]
@@ -16,11 +16,17 @@ use yuhaiin_core::dns::{DnsCache, DnsResponse};
 use yuhaiin_core::dns_resolver_async::{AsyncDnsResolver, AsyncIpResolver, SystemAsyncIpResolver};
 use yuhaiin_core::dns_tcp_async::AsyncTcpDnsClient;
 use yuhaiin_core::dns_udp_async::AsyncUdpDnsClient;
-use yuhaiin_core::{BoxFuture, DomainName, Error, ErrorKind, IpSet, ResolveStrategy, Result};
+use yuhaiin_core::proxy::{AsyncProxySelector, BoxAsyncStream};
+use yuhaiin_core::{
+    BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, IpSet, Network,
+    ResolveStrategy, Result, RouteMode,
+};
 use yuhaiin_store::{GoResolverRuntimeConfig, GoResolverTransport};
 
+use crate::ConnectionMonitor;
+
 #[cfg(feature = "doh-tls")]
-use crate::doh_tls::{RustCryptoH2Connector, root_store};
+use crate::doh_tls::{RoutedRustCryptoH2Connector, root_store};
 #[cfg(feature = "http2")]
 use yuhaiin_core::http2::{H2DohClient, H2DohConnector};
 
@@ -36,6 +42,130 @@ pub trait ResolverTransportFactory: Send + Sync {
         _local_bind_addresses: &[IpAddr],
     ) -> Result<Arc<dyn AsyncIpResolver>> {
         self.build(config)
+    }
+}
+
+/// Late-bound outbound path used by resolver transports that are configured to
+/// use the runtime's proxy resolver.
+///
+/// Resolver construction happens before inbound listeners create their
+/// `RuntimeProxySelector`. Keeping the selector behind this bridge avoids a
+/// construction cycle while still making the resolver observe the same live
+/// selector and reloads as ordinary inbound flows.
+#[derive(Clone, Default)]
+pub struct ResolverProxyBridge {
+    selector: Arc<RwLock<Option<Arc<dyn AsyncProxySelector>>>>,
+    proxy_resolver_id: Arc<RwLock<Option<String>>>,
+    monitor: Arc<RwLock<Option<Weak<ConnectionMonitor>>>>,
+}
+
+impl ResolverProxyBridge {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the resolver ID whose transport must use the proxy selector.
+    /// Runtime controllers update this from the persisted route snapshot.
+    pub fn set_proxy_resolver_id(&self, id: Option<&str>) {
+        *self
+            .proxy_resolver_id
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+    }
+
+    pub(crate) fn is_proxy_resolver(&self, id: &str) -> bool {
+        self.proxy_resolver_id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_deref()
+            .is_some_and(|proxy_id| proxy_id == id)
+    }
+
+    /// Publish the selector used by subsequent proxy-resolver connections.
+    /// Existing resolver instances observe the replacement without being
+    /// rebuilt, which keeps reloads from interrupting DNS caches.
+    pub fn set_selector(&self, selector: Arc<dyn AsyncProxySelector>) {
+        *self
+            .selector
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(selector);
+    }
+
+    pub(crate) fn set_monitor(&self, monitor: &Arc<ConnectionMonitor>) {
+        *self
+            .monitor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::downgrade(monitor));
+    }
+
+    /// Connect to a resolver endpoint through the currently published proxy
+    /// selector. Proxy-routed connections fail closed until the inbound
+    /// selector has been published, so bootstrap cannot silently bypass the
+    /// configured route.
+    pub async fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        use_proxy: bool,
+    ) -> Result<Option<BoxAsyncStream>> {
+        if !use_proxy {
+            return Ok(None);
+        }
+        let selector = self
+            .selector
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(selector) = selector else {
+            let error = Error::new(ErrorKind::NotFound, "selected tcp node not found");
+            self.record_failure(host, port, &error);
+            return Err(error);
+        };
+        let destination = resolver_endpoint(host, port)?;
+        let mut context = FlowContext::new(destination);
+        context.route_mode = RouteMode::Proxy;
+        let proxy = selector.select(&context);
+        match proxy.connect(&context).await {
+            Ok(stream) => Ok(Some(stream)),
+            Err(error) => {
+                self.record_failure(host, port, &error);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn record_failure(&self, host: &str, port: u16, error: &Error) {
+        let monitor = self
+            .monitor
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(monitor) = monitor {
+            monitor.record_failure("tcp", &resolver_authority(host, port), &error.message);
+        }
+    }
+}
+
+fn resolver_endpoint(host: &str, port: u16) -> Result<Endpoint> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(Endpoint::ip(Network::Tcp, SocketAddr::new(ip, port)));
+    }
+    Ok(Endpoint::domain(
+        Network::Tcp,
+        DomainName::new(host.trim_matches(['[', ']']))?,
+        port,
+    ))
+}
+
+fn resolver_authority(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -266,6 +396,7 @@ where
 pub struct RustCryptoDohResolverFactory {
     pub builtin: BuiltinResolverFactory,
     client_config: Arc<rustls::ClientConfig>,
+    proxy_bridge: Option<Arc<ResolverProxyBridge>>,
 }
 
 #[cfg(feature = "doh-tls")]
@@ -284,6 +415,7 @@ impl RustCryptoDohResolverFactory {
         Ok(Self {
             builtin: BuiltinResolverFactory::new(timeout, cache_capacity),
             client_config: Arc::new(config),
+            proxy_bridge: None,
         })
     }
 
@@ -295,7 +427,13 @@ impl RustCryptoDohResolverFactory {
         Self {
             builtin: BuiltinResolverFactory::new(timeout, cache_capacity),
             client_config: config,
+            proxy_bridge: None,
         }
+    }
+
+    pub fn with_proxy_bridge(mut self, bridge: Arc<ResolverProxyBridge>) -> Self {
+        self.proxy_bridge = Some(bridge);
+        self
     }
 }
 
@@ -314,10 +452,17 @@ impl ResolverTransportFactory for RustCryptoDohResolverFactory {
             return self.builtin.build_with_policy(config, local_bind_addresses);
         }
         let endpoint = doh_endpoint(&config.host, &config.id)?;
-        let connector = RustCryptoH2Connector::from_config(
+        let connector = RoutedRustCryptoH2Connector::from_config(
             self.client_config.clone(),
-            config.tls_server_name.clone(),
+            config
+                .tls_server_name
+                .clone()
+                .filter(|name| !name.trim().is_empty()),
             self.builtin.timeout,
+            self.proxy_bridge.clone(),
+            self.proxy_bridge
+                .as_ref()
+                .is_some_and(|bridge| bridge.is_proxy_resolver(&config.id)),
         )
         .with_local_bind_addresses(local_bind_addresses);
         let client = H2DohClient {
@@ -425,11 +570,58 @@ pub fn parse_dns_server(host: &str, default_port: u16, id: &str) -> Result<Socke
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use yuhaiin_core::dns::{
         AsyncDnsHandler, DnsRecordType, DnsResponse, decode_query, encode_response,
     };
     use yuhaiin_core::dns_tcp_async::AsyncTcpDnsServer;
+    use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncProxySelector};
     use yuhaiin_core::{BoxFuture, DomainName, IpSet, ResolveStrategy};
+
+    struct BridgeProxy {
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    impl AsyncProxy for BridgeProxy {
+        fn connect<'a>(
+            &'a self,
+            _context: &'a FlowContext,
+        ) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+            let calls = self.calls.clone();
+            let fail = self.fail;
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                if fail {
+                    Err(Error::new(ErrorKind::Io, "proxy resolver failed"))
+                } else {
+                    let (stream, _peer) = tokio::io::duplex(64);
+                    Ok(Box::new(stream) as BoxAsyncStream)
+                }
+            })
+        }
+
+        fn open_datagram<'a>(
+            &'a self,
+            _context: &'a FlowContext,
+        ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+            Box::pin(async { Err(Error::new(ErrorKind::Unsupported, "test proxy has no UDP")) })
+        }
+
+        fn close(&self) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct FixedBridgeSelector {
+        proxy: Arc<dyn AsyncProxy>,
+    }
+
+    impl AsyncProxySelector for FixedBridgeSelector {
+        fn select(&self, _context: &FlowContext) -> Arc<dyn AsyncProxy> {
+            self.proxy.clone()
+        }
+    }
 
     struct ErrorResolver;
 
@@ -576,6 +768,69 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind, ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn resolver_proxy_bridge_uses_the_live_selector_only_for_proxy_resolvers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bridge = ResolverProxyBridge::new();
+        bridge.set_proxy_resolver_id(Some("proxy"));
+        assert!(bridge.is_proxy_resolver("proxy"));
+        assert!(!bridge.is_proxy_resolver("direct"));
+        bridge.set_selector(Arc::new(FixedBridgeSelector {
+            proxy: Arc::new(BridgeProxy {
+                calls: calls.clone(),
+                fail: false,
+            }),
+        }));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert!(
+                bridge
+                    .connect("resolver.example", 443, false)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                bridge
+                    .connect("resolver.example", 443, true)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn resolver_proxy_bridge_records_only_actual_proxy_connect_failures() {
+        let bridge = ResolverProxyBridge::new();
+        let monitor = Arc::new(ConnectionMonitor::new());
+        bridge.set_monitor(&monitor);
+        bridge.set_selector(Arc::new(FixedBridgeSelector {
+            proxy: Arc::new(BridgeProxy {
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+            }),
+        }));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = match runtime.block_on(bridge.connect("resolver.example", 443, true)) {
+            Ok(_) => panic!("proxy bridge unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, ErrorKind::Io);
+        let history = monitor.failed_history_value();
+        assert_eq!(history["items"][0]["protocol"], "tcp");
+        assert_eq!(history["items"][0]["host"], "resolver.example:443");
     }
 
     #[cfg(feature = "http2")]

@@ -10,11 +10,14 @@ use yuhaiin_core::dns::{DnsRecordType, DnsResponse, decode_response, encode_quer
 use yuhaiin_core::dns_resolver_async::{
     AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, SendAsyncDnsQuery,
 };
+use yuhaiin_core::proxy::BoxAsyncStream;
 use yuhaiin_core::{BoxFuture, DomainName, Error, ErrorKind, LocalBoxFuture, Result};
 use yuhaiin_store::{GoResolverRuntimeConfig, GoResolverTransport};
 
 use crate::doh_tls::{RustCryptoTlsDialer, client_config, tls_server_name};
-use crate::resolver::{BuiltinResolverFactory, ResolverTransportFactory, TimeoutResolver};
+use crate::resolver::{
+    BuiltinResolverFactory, ResolverProxyBridge, ResolverTransportFactory, TimeoutResolver,
+};
 
 const MAX_DNS_TCP_FRAME: usize = u16::MAX as usize;
 
@@ -25,6 +28,8 @@ struct RustCryptoDotClient {
     port: u16,
     server_name: String,
     max_packet_size: usize,
+    proxy_bridge: Option<Arc<ResolverProxyBridge>>,
+    use_proxy: bool,
 }
 
 impl RustCryptoDotClient {
@@ -33,10 +38,30 @@ impl RustCryptoDotClient {
         if request.len() > MAX_DNS_TCP_FRAME {
             return Err(Error::new(ErrorKind::Protocol, "DoT request is too large"));
         }
-        let mut stream = self
-            .dialer
-            .connect(&self.host, self.port, &self.server_name)
-            .await?;
+        let proxied = match &self.proxy_bridge {
+            Some(bridge) => match bridge.connect(&self.host, self.port, self.use_proxy).await {
+                Ok(stream) => stream,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        let result = async {
+            let raw = match proxied {
+                Some(stream) => stream,
+                None => Box::new(self.dialer.connect_tcp(&self.host, self.port).await?)
+                    as BoxAsyncStream,
+            };
+            self.dialer
+                .connect_boxed_stream(&self.server_name, raw)
+                .await
+        }
+        .await;
+        if let Err(error) = &result
+            && let Some(bridge) = &self.proxy_bridge
+        {
+            bridge.record_failure(&self.host, self.port, error);
+        }
+        let mut stream = result?;
         write_frame(&mut stream, &request).await?;
         let response = read_frame(&mut stream, self.max_packet_size).await?;
         decode_response(
@@ -71,6 +96,7 @@ impl AsyncDnsQuery for RustCryptoDotClient {
 pub struct RustCryptoDotResolverFactory {
     pub builtin: BuiltinResolverFactory,
     client_config: Arc<ClientConfig>,
+    proxy_bridge: Option<Arc<ResolverProxyBridge>>,
 }
 
 impl RustCryptoDotResolverFactory {
@@ -94,7 +120,13 @@ impl RustCryptoDotResolverFactory {
         Self {
             builtin: BuiltinResolverFactory::new(timeout, cache_capacity),
             client_config,
+            proxy_bridge: None,
         }
+    }
+
+    pub fn with_proxy_bridge(mut self, bridge: Arc<ResolverProxyBridge>) -> Self {
+        self.proxy_bridge = Some(bridge);
+        self
     }
 }
 
@@ -115,6 +147,7 @@ impl ResolverTransportFactory for RustCryptoDotResolverFactory {
         let server_name = config
             .tls_server_name
             .clone()
+            .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| host.trim_matches(['[', ']']).to_owned());
         let _ = tls_server_name(&server_name)?;
         let client = RustCryptoDotClient {
@@ -127,6 +160,11 @@ impl ResolverTransportFactory for RustCryptoDotResolverFactory {
             port,
             server_name,
             max_packet_size: self.builtin.max_packet_size,
+            proxy_bridge: self.proxy_bridge.clone(),
+            use_proxy: self
+                .proxy_bridge
+                .as_ref()
+                .is_some_and(|bridge| bridge.is_proxy_resolver(&config.id)),
         };
         let resolver = AsyncDnsResolver::new(client).with_cache(yuhaiin_core::dns::DnsCache::new(
             self.builtin.cache_capacity.max(1),

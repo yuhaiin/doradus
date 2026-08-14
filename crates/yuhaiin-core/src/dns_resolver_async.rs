@@ -496,12 +496,18 @@ impl<Q: AsyncDnsQuery> AsyncDnsResolver<Q> {
                     result.v6 = self.query(domain, DnsRecordType::Aaaa).await?.addresses.v6;
                 }
                 ResolveStrategy::PreferIpv4 | ResolveStrategy::Default => {
-                    result.v4 = self.query(domain, DnsRecordType::A).await?.addresses.v4;
-                    result.v6 = self.query(domain, DnsRecordType::Aaaa).await?.addresses.v6;
+                    let (v4, v6) = tokio::join!(
+                        self.query(domain, DnsRecordType::A),
+                        self.query(domain, DnsRecordType::Aaaa),
+                    );
+                    merge_address_queries(&mut result, v4, v6)?;
                 }
                 ResolveStrategy::PreferIpv6 => {
-                    result.v6 = self.query(domain, DnsRecordType::Aaaa).await?.addresses.v6;
-                    result.v4 = self.query(domain, DnsRecordType::A).await?.addresses.v4;
+                    let (v4, v6) = tokio::join!(
+                        self.query(domain, DnsRecordType::A),
+                        self.query(domain, DnsRecordType::Aaaa),
+                    );
+                    merge_address_queries(&mut result, v4, v6)?;
                 }
             }
             Ok(result)
@@ -552,32 +558,51 @@ impl<Q: SendAsyncDnsQuery> AsyncDnsResolver<Q> {
                         .v6;
                 }
                 ResolveStrategy::PreferIpv4 | ResolveStrategy::Default => {
-                    result.v4 = self
-                        .query_send(domain, DnsRecordType::A)
-                        .await?
-                        .addresses
-                        .v4;
-                    result.v6 = self
-                        .query_send(domain, DnsRecordType::Aaaa)
-                        .await?
-                        .addresses
-                        .v6;
+                    let (v4, v6) = tokio::join!(
+                        self.query_send(domain, DnsRecordType::A),
+                        self.query_send(domain, DnsRecordType::Aaaa),
+                    );
+                    merge_address_queries(&mut result, v4, v6)?;
                 }
                 ResolveStrategy::PreferIpv6 => {
-                    result.v6 = self
-                        .query_send(domain, DnsRecordType::Aaaa)
-                        .await?
-                        .addresses
-                        .v6;
-                    result.v4 = self
-                        .query_send(domain, DnsRecordType::A)
-                        .await?
-                        .addresses
-                        .v4;
+                    let (v4, v6) = tokio::join!(
+                        self.query_send(domain, DnsRecordType::A),
+                        self.query_send(domain, DnsRecordType::Aaaa),
+                    );
+                    merge_address_queries(&mut result, v4, v6)?;
                 }
             }
             Ok(result)
         })
+    }
+}
+
+fn merge_address_queries(
+    result: &mut IpSet,
+    v4: Result<DnsResponse>,
+    v6: Result<DnsResponse>,
+) -> Result<()> {
+    match (v4, v6) {
+        (Ok(v4), Ok(v6)) => {
+            result.v4 = v4.addresses.v4;
+            result.v6 = v6.addresses.v6;
+            Ok(())
+        }
+        (Ok(v4), Err(_)) => {
+            result.v4 = v4.addresses.v4;
+            Ok(())
+        }
+        (Err(_), Ok(v6)) => {
+            result.v6 = v6.addresses.v6;
+            Ok(())
+        }
+        (Err(v4), Err(v6)) => Err(crate::Error::new(
+            crate::ErrorKind::Io,
+            format!(
+                "DNS A and AAAA queries failed: A: {}; AAAA: {}",
+                v4.message, v6.message
+            ),
+        )),
     }
 }
 
@@ -659,6 +684,51 @@ mod tests {
         }
     }
 
+    struct PartialQuery {
+        calls: Arc<Mutex<Vec<DnsRecordType>>>,
+    }
+
+    impl PartialQuery {
+        fn response(&self, record_type: DnsRecordType) -> Result<DnsResponse> {
+            self.calls
+                .lock()
+                .map_err(|_| Error::new(ErrorKind::Closed, "query types poisoned"))?
+                .push(record_type);
+            if record_type == DnsRecordType::Aaaa {
+                return Err(Error::new(ErrorKind::Io, "AAAA upstream unavailable"));
+            }
+            Ok(DnsResponse {
+                addresses: IpSet {
+                    v4: vec![Ipv4Addr::new(192, 0, 2, 88)],
+                    v6: Vec::new(),
+                },
+                ptr_names: Vec::new(),
+                service_bindings: Vec::new(),
+                minimum_ttl: Some(30),
+            })
+        }
+    }
+
+    impl AsyncDnsQuery for PartialQuery {
+        fn query<'a>(
+            &'a self,
+            _domain: &'a DomainName,
+            record_type: DnsRecordType,
+        ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
+            Box::pin(async move { self.response(record_type) })
+        }
+    }
+
+    impl SendAsyncDnsQuery for PartialQuery {
+        fn query_send<'a>(
+            &'a self,
+            _domain: &'a DomainName,
+            record_type: DnsRecordType,
+        ) -> BoxFuture<'a, Result<DnsResponse>> {
+            Box::pin(async move { self.response(record_type) })
+        }
+    }
+
     #[test]
     fn async_resolver_caches_and_preserves_packet_transaction() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -680,6 +750,27 @@ mod tests {
             assert_eq!(first, second);
             assert_eq!(*calls.lock().unwrap(), 1);
         });
+    }
+
+    #[tokio::test]
+    async fn default_resolution_keeps_ipv4_when_ipv6_query_fails() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let resolver = AsyncDnsResolver::new(PartialQuery {
+            calls: calls.clone(),
+        });
+        let domain = DomainName::new("partial.example").unwrap();
+
+        let addresses = resolver
+            .resolve(&domain, ResolveStrategy::Default)
+            .await
+            .unwrap();
+
+        assert_eq!(addresses.v4, vec![Ipv4Addr::new(192, 0, 2, 88)]);
+        assert!(addresses.v6.is_empty());
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.contains(&DnsRecordType::A));
+        assert!(calls.contains(&DnsRecordType::Aaaa));
     }
 
     #[tokio::test]

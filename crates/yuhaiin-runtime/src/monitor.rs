@@ -255,6 +255,7 @@ impl ConnectionMonitor {
     /// restart cannot prove that those sockets still exist.
     pub async fn load_with_store(store: ConfigStore) -> yuhaiin_core::Result<Self> {
         let monitor = Self::new();
+        let go_statistics = store.load_go_statistics()?;
         if let Some(bytes) = store.get_config(PERSISTENCE_KEY).await? {
             let persisted: PersistedMonitor = serde_json::from_slice(&bytes).map_err(|error| {
                 yuhaiin_core::Error::new(
@@ -269,9 +270,13 @@ impl ConnectionMonitor {
                 ));
             }
             monitor.restore_persisted(persisted);
+            // Failed history is updated synchronously on every failure, while
+            // the compact checkpoint is intentionally asynchronous. Merge the
+            // durable table after restoring it so SIGKILL cannot roll counts
+            // back to the last periodic checkpoint.
+            monitor.restore_failed_history(go_statistics.failed_history);
         } else {
-            let statistics = store.load_go_statistics()?;
-            monitor.restore_go_statistics(statistics)?;
+            monitor.restore_go_statistics(go_statistics)?;
         }
 
         let dirty = Arc::new(Notify::new());
@@ -738,8 +743,10 @@ impl ConnectionMonitor {
         error: &str,
         process: Option<&str>,
     ) {
+        let persistence = self.persistence.clone();
         let mut state = self.lock();
         let process = process.unwrap_or_default().to_owned();
+        let last_seen = unix_seconds();
         let key = (protocol.to_owned(), host.to_owned(), process.clone());
         let bucket = {
             let entry = state
@@ -750,12 +757,12 @@ impl ConnectionMonitor {
                     host: host.to_owned(),
                     process: process.clone(),
                     error: error.to_owned(),
-                    time: unix_seconds(),
+                    time: last_seen,
                     count: 0,
                 });
             entry.count = entry.count.saturating_add(1);
             entry.error = error.to_owned();
-            entry.time = unix_seconds();
+            entry.time = last_seen;
             entry.time.div_euclid(3600) * 3600
         };
         let connection = json!({
@@ -776,7 +783,17 @@ impl ConnectionMonitor {
                 .or_default();
             item.2 = item.2.saturating_add(1);
         }
+        drop(state);
         self.mark_dirty();
+        if let Some(persistence) = persistence
+            && let Err(storage_error) = persistence
+                .store
+                .record_failed_history(protocol, host, &process, error, last_seen)
+        {
+            self.warn(format!(
+                "persist failed connection history: {storage_error}"
+            ));
+        }
     }
 
     pub fn take_close_requests(&self) -> Vec<TunFlowKey> {
@@ -1109,6 +1126,32 @@ impl ConnectionMonitor {
                 )
             })
             .collect();
+    }
+
+    fn restore_failed_history(&self, persisted: Vec<GoFailedHistoryRecord>) {
+        let mut state = self.lock();
+        for failure in persisted {
+            let key = (
+                failure.protocol.clone(),
+                failure.host.clone(),
+                failure.process.clone(),
+            );
+            let entry = state.failed_history.entry(key).or_insert(FailedEntry {
+                protocol: failure.protocol.clone(),
+                host: failure.host.clone(),
+                process: failure.process.clone(),
+                error: failure.error.clone(),
+                time: failure.last_seen,
+                count: failure.count,
+            });
+            if failure.count > entry.count || failure.last_seen >= entry.time {
+                entry.count = entry.count.max(failure.count);
+                if failure.last_seen >= entry.time {
+                    entry.error = failure.error;
+                    entry.time = failure.last_seen;
+                }
+            }
+        }
     }
 
     fn restore_go_statistics(&self, persisted: GoStatisticsSnapshot) -> yuhaiin_core::Result<()> {
@@ -2560,6 +2603,7 @@ mod tests {
             monitor.opened(flow, context);
             monitor.bytes(flow.key, TunFlowDirection::Upload, 29);
             monitor.closed(flow.key);
+            monitor.record_failure("tcp", "resolver.example:443", "selected tcp node not found");
 
             // Keep the process alive so the parent can kill it before any
             // graceful monitor shutdown or Drop-based cleanup can run.
@@ -2608,6 +2652,8 @@ mod tests {
                 .unwrap();
             assert_eq!(go_statistics.total_upload, 29);
             assert_eq!(go_statistics.history[0].count, 1);
+            assert_eq!(go_statistics.failed_history[0].count, 1);
+            assert_eq!(go_statistics.failed_history[0].host, "resolver.example:443");
             monitor.shutdown().await.unwrap();
         });
         remove_monitor_test_database(&path);

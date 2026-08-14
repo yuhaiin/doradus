@@ -77,8 +77,8 @@ pub use resolver::H2DohResolverFactory;
 #[cfg(feature = "doh-tls")]
 pub use resolver::RustCryptoDohResolverFactory;
 pub use resolver::{
-    BuiltinResolverFactory, FallbackResolver, ResolverFailurePolicy, ResolverTransportFactory,
-    TimeoutResolver, parse_dns_server,
+    BuiltinResolverFactory, FallbackResolver, ResolverFailurePolicy, ResolverProxyBridge,
+    ResolverTransportFactory, TimeoutResolver, parse_dns_server,
 };
 pub use route::{
     ProxyRouteListTransport, RouteListRefreshReport, RouteListSnapshot, RouteListTransport,
@@ -281,6 +281,7 @@ pub struct RuntimeBuilder {
     upstream: Arc<dyn AsyncIpResolver>,
     options: RuntimeBuildOptions,
     resolver_factory: Option<Arc<dyn ResolverTransportFactory>>,
+    resolver_proxy_bridge: Option<Arc<ResolverProxyBridge>>,
 }
 
 impl RuntimeBuilder {
@@ -290,6 +291,7 @@ impl RuntimeBuilder {
             upstream,
             options: RuntimeBuildOptions::default(),
             resolver_factory: None,
+            resolver_proxy_bridge: None,
         }
     }
 
@@ -301,6 +303,15 @@ impl RuntimeBuilder {
     pub fn with_resolver_factory(mut self, factory: Arc<dyn ResolverTransportFactory>) -> Self {
         self.resolver_factory = Some(factory);
         self
+    }
+
+    pub fn with_resolver_proxy_bridge(mut self, bridge: Arc<ResolverProxyBridge>) -> Self {
+        self.resolver_proxy_bridge = Some(bridge);
+        self
+    }
+
+    pub(crate) fn resolver_proxy_bridge(&self) -> Option<Arc<ResolverProxyBridge>> {
+        self.resolver_proxy_bridge.clone()
     }
 
     pub fn store(&self) -> &ConfigStore {
@@ -318,6 +329,9 @@ impl RuntimeBuilder {
         let hosts = load_hosts(&repository, &self.store).await?;
         let resolvers = repository.list_go_resolver_runtime_configs().await?;
         let route = repository.load_go_route_runtime_config().await?;
+        if let Some(bridge) = &self.resolver_proxy_bridge {
+            bridge.set_proxy_resolver_id(route.as_ref().map(|route| route.proxy_resolver.as_str()));
+        }
         let route_rules = repository.list_go_route_rules().await?;
         let node_tags = repository.list_go_node_tags().await?;
         let route_list_records = repository.list_go_route_lists().await?;

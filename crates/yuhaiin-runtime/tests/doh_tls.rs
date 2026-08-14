@@ -2,6 +2,7 @@
 
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -13,10 +14,11 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 use yuhaiin_core::dns::{DnsResponse, encode_response};
-use yuhaiin_core::{DomainName, IpSet, ResolveStrategy};
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream};
+use yuhaiin_core::{BoxFuture, DomainName, Error, ErrorKind, FlowContext, IpSet, ResolveStrategy};
 use yuhaiin_runtime::{
-    ResolverTransportFactory, RustCryptoDohResolverFactory, RustCryptoDotResolverFactory,
-    RustCryptoResolverFactory,
+    ResolverProxyBridge, ResolverTransportFactory, RustCryptoDohResolverFactory,
+    RustCryptoDotResolverFactory, RustCryptoResolverFactory,
 };
 use yuhaiin_store::{GoResolverRuntimeConfig, GoResolverTransport};
 
@@ -214,6 +216,51 @@ fn dot_resolver_config(address: std::net::SocketAddr) -> GoResolverRuntimeConfig
     }
 }
 
+struct FixedTargetProxy {
+    target: std::net::SocketAddr,
+    calls: Arc<AtomicUsize>,
+}
+
+impl AsyncProxy for FixedTargetProxy {
+    fn connect<'a>(
+        &'a self,
+        _context: &'a FlowContext,
+    ) -> BoxFuture<'a, yuhaiin_core::Result<BoxAsyncStream>> {
+        let target = self.target;
+        let calls = self.calls.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            let stream = tokio::net::TcpStream::connect(target)
+                .await
+                .map_err(|error| {
+                    Error::new(ErrorKind::Io, format!("test proxy connect: {error}"))
+                })?;
+            Ok(Box::new(stream) as BoxAsyncStream)
+        })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        _context: &'a FlowContext,
+    ) -> BoxFuture<'a, yuhaiin_core::Result<Box<dyn AsyncDatagram>>> {
+        Box::pin(async { Err(Error::new(ErrorKind::Unsupported, "test proxy has no UDP")) })
+    }
+
+    fn close(&self) -> BoxFuture<'_, yuhaiin_core::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct FixedTargetSelector {
+    proxy: Arc<dyn AsyncProxy>,
+}
+
+impl AsyncProxySelector for FixedTargetSelector {
+    fn select(&self, _context: &FlowContext) -> Arc<dyn AsyncProxy> {
+        self.proxy.clone()
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn rustcrypto_doh_factory_resolves_over_real_tls_and_http2() {
     let (address, done) = spawn_doh_server(
@@ -241,6 +288,50 @@ async fn rustcrypto_doh_factory_resolves_over_real_tls_and_http2() {
         answer.v4,
         vec!["192.0.2.123".parse::<std::net::Ipv4Addr>().unwrap()]
     );
+    done.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rustcrypto_doh_proxy_resolver_uses_the_runtime_selector_before_tls() {
+    let (address, done) = spawn_doh_server(
+        true,
+        http::StatusCode::OK,
+        "application/dns-message",
+        Duration::ZERO,
+    )
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bridge = Arc::new(ResolverProxyBridge::new());
+    bridge.set_proxy_resolver_id(Some("doh-proxy"));
+    bridge.set_selector(Arc::new(FixedTargetSelector {
+        proxy: Arc::new(FixedTargetProxy {
+            target: address,
+            calls: calls.clone(),
+        }),
+    }));
+    let factory = RustCryptoDohResolverFactory::new(
+        &[certificate_der(CA_CERTIFICATE_PEM)],
+        Duration::from_secs(2),
+        8,
+    )
+    .unwrap()
+    .with_proxy_bridge(bridge);
+    let mut config = resolver_config(address);
+    config.id = "doh-proxy".to_owned();
+    let answer = factory
+        .build(&config)
+        .unwrap()
+        .resolve(
+            &DomainName::new("example.com").unwrap(),
+            ResolveStrategy::OnlyIpv4,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        answer.v4,
+        vec!["192.0.2.123".parse::<std::net::Ipv4Addr>().unwrap()]
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
     done.await.unwrap();
 }
 
