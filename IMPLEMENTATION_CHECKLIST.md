@@ -181,7 +181,48 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | DoQ / DoH3、QUIC、Reality、Mux、Tailscale | — | — | `延期` |
 | Shadowsocks / ShadowsocksR | — | — | `延期` |
 
-## 可执行 checklist（唯一未完成清单）
+## 当前未完成项与下一阶段计划（唯一执行清单）
+
+> 这里只列仍需动作的事项；已经完成的功能和证据保留在上面的模块表及下面的详细验证记录中。`[~]` 表示代码主路径已可运行，但还缺现场或更宽样本；`[ ]` 才表示功能尚未实现。本轮不把明确延期项混入 41 项统计。
+
+### Protocol、transport 和 proxy chain
+
+- `[~]` **tls_auto / ECH**：普通动态 SNI、证书缓存、Go-shaped CA 字段和真实 TCP 链已通过；rustls 当前没有可直接使用的 server-side ECH API。下一步确认上游 API 或可维护的纯 Rust 实现；若仍无稳定实现，保留明确降级行为并将 ECH 记为延期能力。
+- `[~]` **VLESS / VMess / Trojan 更宽运行矩阵**：TCP、UDP、TLS、WebSocket、HTTP/2、Go wire interop 和真实 router chain 已通过；下一步把更多独立 listener、IPv4/IPv6、远端 UDP fixture 和 latency 场景固化到可复用 harness。
+
+### SQLite、配置兼容和统计
+
+- `[~]` **Go 停止态 SQLite 快照**：4 份快照的 API read/mutation/error parity 和 schema audit 已通过；下一步增加逐表异常/未知对象 diff，报告只写入 `~/.cache/yuhaiin-rust`。
+- `[~]` **S3 backup**：SigV4、MinIO、restore、proxy transport 和失败语义已通过；下一步在拥有 AWS 权限的环境执行一次真实 S3 PUT/GET/restore，或保留 AWS 现场为外部验收项。
+- `[~]` **statistics projection**：实时 connections、SSE、traffic、history、telemetry、force-stop 和 48-reader soak 已通过；下一步增加更长的 production-like projection/reload 样本，检查长时运行的 SQLite/WAL 增长。
+
+### WireGuard 外部兼容
+
+- `[~]` **真实 WARP/public peer**：本地 BoringTun 双 peer 和 Debian VM 的 Go `wireguard-go` TCP/UDP interop 已通过；下一步验证 reserved、keepalive、NAT endpoint roaming 和网络策略现场。
+
+### CI、发布和原生 service manager
+
+- `[~]` **Darwin/Windows native runner**：release contract、Linux musl、Windows GNU dependency smoke 和 harness 静态检查已通过；下一步运行 GitHub Actions 的 macOS launchd、Windows SCM install/update/rollback job，保存现场日志并确认 SDK/权限差异。
+
+### 明确延期（不计入 41 项）
+
+- `延期` DoQ、DoH3、QUIC、Reality、Mux、yamux、Tailscale、Cloudflare WARP MASQUE。
+- `延期` Shadowsocks、ShadowsocksR、订阅更新、Android 独立应用、macOS utun/独立应用。
+
+### 已完成模块的回归入口
+
+| 模块 | 维护入口 |
+| --- | --- |
+| TUN / NAT / transparent | `make tun-api-process-smoke tun-chain-service-smoke tun-route-matrix-smoke transparent-service-smoke` |
+| DNS / FakeIP / MaxMindDB | `make dns-source-smoke doh-source-smoke maxmind-smoke` |
+| Router / route list / GeoIP | `make api-reload-flow-smoke production-parity-smoke` |
+| Inbound → router → outbound | `make service-chain-smoke api-contract-smoke go-live-flow-parity-smoke` |
+| Go protocol interop | `make go-protocol-interop-smoke` |
+| WireGuard | `make wireguard-smoke wireguard-chain-smoke wireguard-external-smoke` |
+| SQLite / backup / statistics | `make workspace-tests s3-minio-smoke stats-soak-smoke` |
+| release / service lifecycle | `make release-contract-smoke release-linux-cross-smoke release-windows-cross-smoke` |
+
+## 已完成验证记录（详细附录）
 
 ### Linux 权限和数据面
 
@@ -236,7 +277,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 - `[x]` 新增 `make release-linux-cross-smoke`，使用与 workflow 相同的 SHA 固定 `cross-tools/musl-cross` toolchain；Podman 中 `x86_64-unknown-linux-musl` 与 `aarch64-unknown-linux-musl` 的 runtime `--all-features` target check 均通过，验证了 Linux 两个架构的 linker、ring、SQLite 和完整 workspace 依赖。Darwin/Windows 的正式 release 仍必须由各自原生 runner 验证。
 - `[x]` 旧 Actions 的 `trojan.rs` `clippy::byte-char-slices` 已通过 `*b"\r\n"` 修复，`rusqlite 0.39.0` / `libsqlite3-sys 0.37.0` 锁定；Rust 1.97.1 Podman 中 fmt、全 workspace Clippy 和 workspace tests 均通过。HTTP/2 pool 的 key 还纳入 endpoint `network_interface`，避免相同地址的不同网卡策略复用连接。
 - `[x]` 发布资产名称与运行时 update contract 对齐：`yuhaiin-{linux,darwin,windows}-{amd64,arm64}`，Windows 保留 `.exe`；`v*` tag 发布稳定 release，`main` 生成可覆盖的 rolling prerelease 并更新 `main` tag。
-- `[~]` macOS launchd 与 Windows Service 的安装/更新/回滚代码、跨 target 编译和单测已完成；update helper 的替换事务已通过注入 platform hooks 覆盖成功与 restart failure rollback；新增 `native-service` GitHub Actions job，在 macOS/Windows 原生 runner 依次执行 install、health、restart、staged update、health、rollback、health 和 uninstall，日志只写入 `~/.cache/yuhaiin-rust`；真实 launchd/SCM 权限现场及远程 Actions 首次运行仍待验收。
+- `[~]` macOS launchd 与 Windows Service 的安装/更新/回滚代码、跨 target 编译和单测已完成；update helper 的替换事务已通过注入 platform hooks 覆盖成功与 restart failure rollback；新增 `native-service` GitHub Actions job，在 macOS/Windows 原生 runner 依次执行 install、health、restart、staged update、health、rollback、health 和 uninstall，日志只写入 `~/.cache/yuhaiin-rust` 并在 job 结束时上传 artifact；真实 launchd/SCM 权限现场及远程 Actions 首次运行仍待验收。
 - `[x]` 2026-08-13 在 Podman `network=none` 中重跑 `make release-contract-smoke`；六个 native target、checks gate、release artifact assembly、`release/checksums.txt` 和 rolling-main publication contract 均通过。该项仍不等价于 GitHub-hosted Darwin/Windows runner 的真实编译。
 - `[x]` 2026-08-13 在 Alpine Podman 容器中直接启动 `make build-release-musl` 生成的 Linux amd64 musl release 二进制，轮询 `/health` 后发送 `SIGTERM`，进程退出并记录 graceful shutdown；这补足了 release 产物的最小用户态生命周期证据，仍不替代原生 Darwin/Windows runner。
 

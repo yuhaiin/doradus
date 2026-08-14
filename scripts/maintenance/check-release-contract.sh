@@ -60,6 +60,7 @@ required_literals=(
   'native-service:'
   'Run native macOS launchd lifecycle'
   'Run native Windows Service lifecycle'
+  'Upload native service logs'
   'cargo build --locked --release --target'
   'matrix.target'
   '-p yuhaiin-runtime --bin yuhaiin --all-features'
