@@ -4020,7 +4020,13 @@ async fn reverse_http_termination_service_chain(tls_termination: bool, standalon
             .unwrap();
     });
 
-    let root = integration_dir("service-reverse-http-termination");
+    // The three termination variants run concurrently in the default Rust
+    // test harness. Keep their SQLite stores separate; sharing this directory
+    // makes one service's migration/cleanup race with another and can surface
+    // as a misleading TLS InvalidContentType handshake failure.
+    let root = integration_dir(&format!(
+        "service-reverse-http-termination-{tls_termination}-{standalone_tls}"
+    ));
     std::fs::create_dir_all(&root).unwrap();
     let database = root.join("state.sqlite");
     seed_empty_database(&database).await;
