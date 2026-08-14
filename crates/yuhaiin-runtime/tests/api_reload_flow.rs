@@ -5,18 +5,77 @@ use std::time::Duration;
 
 use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use yuhaiin_chain::AsyncYuubinsyaTcpSession;
+use yuhaiin_core::{Endpoint, Network};
 
 use support::{
-    ConnectFixture, ServiceProcess, api_json, configure_http_chain, echo_on_tunnel,
-    integration_dir, open_http_tunnel, reserve_loopback, seed_empty_database,
+    ConnectFixture, ServiceProcess, YUUBINSYA_PASSWORD, add_socks5_inbound, add_yuubinsya_inbound,
+    api_json, configure_http_chain, connect_loopback, echo_on_tunnel, integration_dir,
+    open_http_tunnel, reserve_loopback, seed_empty_database,
 };
 
 async fn connect_and_echo(inbound: SocketAddr, authority: &str, payload: &[u8]) {
     let mut client = open_http_tunnel(inbound, authority).await;
     echo_on_tunnel(&mut client, payload).await;
     client.shutdown().await.unwrap();
+}
+
+async fn open_socks5_tunnel(
+    inbound: SocketAddr,
+    username: &str,
+    password: &str,
+    destination: SocketAddr,
+) -> TcpStream {
+    let mut client = connect_loopback(inbound).await;
+    client.write_all(&[5, 1, 2]).await.unwrap();
+    let mut method = [0u8; 2];
+    client.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [5, 2]);
+
+    let username = username.as_bytes();
+    let password = password.as_bytes();
+    let mut auth = vec![1, username.len() as u8];
+    auth.extend_from_slice(username);
+    auth.push(password.len() as u8);
+    auth.extend_from_slice(password);
+    client.write_all(&auth).await.unwrap();
+    let mut auth_reply = [0u8; 2];
+    client.read_exact(&mut auth_reply).await.unwrap();
+    assert_eq!(auth_reply, [1, 0]);
+
+    let mut request = vec![5, 1, 0];
+    match destination {
+        SocketAddr::V4(address) => {
+            request.push(1);
+            request.extend_from_slice(&address.ip().octets());
+            request.extend_from_slice(&address.port().to_be_bytes());
+        }
+        SocketAddr::V6(address) => {
+            request.push(4);
+            request.extend_from_slice(&address.ip().octets());
+            request.extend_from_slice(&address.port().to_be_bytes());
+        }
+    }
+    client.write_all(&request).await.unwrap();
+
+    let mut reply = [0u8; 4];
+    client.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[..2], [5, 0]);
+    let address_len = match reply[3] {
+        1 => 4,
+        3 => {
+            let mut length = [0u8; 1];
+            client.read_exact(&mut length).await.unwrap();
+            usize::from(length[0])
+        }
+        4 => 16,
+        atyp => panic!("unexpected SOCKS5 reply address type {atyp}"),
+    };
+    let mut bound_address = vec![0u8; address_len + 2];
+    client.read_exact(&mut bound_address).await.unwrap();
+    client
 }
 
 async fn wait_for_authority(fixture: &ConnectFixture, expected: &str) {
@@ -41,7 +100,7 @@ async fn wait_for_listener_closed(address: SocketAddr) {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("old inbound listener {address} remained active after PUT reload");
+    panic!("inbound listener {address} remained active after reload");
 }
 
 async fn wait_for_history(service: &ServiceProcess) -> serde_json::Value {
@@ -419,4 +478,130 @@ async fn api_tun_inbound_toggle_reloads_and_persists() {
     assert_eq!(persisted["enabled"], false);
     assert_eq!(persisted["protocol"]["tun"]["name"], tun_name);
     restarted.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_adds_and_removes_socks5_and_yuubinsya_inbounds_live() {
+    let fixture = ConnectFixture::start().await;
+    let root = integration_dir("api-normal-inbound-add-remove");
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.sqlite");
+    seed_empty_database(&database).await;
+
+    let service = ServiceProcess::start(&database).await;
+    let http_inbound = reserve_loopback().await;
+    configure_http_chain(&service, http_inbound, fixture.outbound).await;
+
+    let socks5_inbound = reserve_loopback().await;
+    let yuubinsya_inbound = reserve_loopback().await;
+    add_socks5_inbound(
+        &service,
+        "api-live-socks5-in",
+        socks5_inbound,
+        "reload-user",
+        "reload-password",
+    )
+    .await;
+    add_yuubinsya_inbound(&service, "api-live-yuubinsya-in", yuubinsya_inbound).await;
+
+    let mut socks5 = open_socks5_tunnel(
+        socks5_inbound,
+        "reload-user",
+        "reload-password",
+        fixture.target,
+    )
+    .await;
+    echo_on_tunnel(&mut socks5, b"api-live-socks5-payload").await;
+
+    let mut yuubinsya = AsyncYuubinsyaTcpSession::connect(
+        connect_loopback(yuubinsya_inbound).await,
+        yuhaiin_core::yuubinsya::derive_salt(YUUBINSYA_PASSWORD.as_bytes()),
+        Endpoint::ip(Network::Tcp, fixture.target),
+    )
+    .await
+    .unwrap();
+    yuubinsya
+        .write_all(b"api-live-yuubinsya-payload")
+        .await
+        .unwrap();
+    let mut yuubinsya_echo = [0u8; 26];
+    yuubinsya.read_exact(&mut yuubinsya_echo).await.unwrap();
+    assert_eq!(&yuubinsya_echo, b"api-live-yuubinsya-payload");
+
+    let mut connections = serde_json::Value::Null;
+    for _ in 0..100 {
+        connections = api_json(
+            &service.client,
+            &service.base_url,
+            reqwest::Method::GET,
+            "/api/v2/connections",
+            None,
+        )
+        .await;
+        let items = connections["connections"].as_array().unwrap();
+        if items.iter().any(|item| {
+            item["inboundName"] == "SOCKS5 integration inbound"
+                && item["inbound"] == socks5_inbound.to_string()
+        }) && items.iter().any(|item| {
+            item["inboundName"] == "Yuubinsya integration inbound"
+                && item["inbound"] == yuubinsya_inbound.to_string()
+        }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let items = connections["connections"].as_array().unwrap();
+    assert!(
+        items.iter().any(|item| {
+            item["inboundName"] == "SOCKS5 integration inbound"
+                && item["inbound"] == socks5_inbound.to_string()
+        }),
+        "SOCKS5 live connection metadata: {items:?}"
+    );
+    assert!(
+        items.iter().any(|item| {
+            item["inboundName"] == "Yuubinsya integration inbound"
+                && item["inbound"] == yuubinsya_inbound.to_string()
+        }),
+        "Yuubinsya live connection metadata: {items:?}"
+    );
+
+    yuubinsya.shutdown().await.unwrap();
+    socks5.shutdown().await.unwrap();
+
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::DELETE,
+        "/api/v2/inbounds/api-live-socks5-in",
+        None,
+    )
+    .await;
+    wait_for_listener_closed(socks5_inbound).await;
+
+    api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::DELETE,
+        "/api/v2/inbounds/api-live-yuubinsya-in",
+        None,
+    )
+    .await;
+    wait_for_listener_closed(yuubinsya_inbound).await;
+
+    let inbounds = api_json(
+        &service.client,
+        &service.base_url,
+        reqwest::Method::GET,
+        "/api/v2/inbounds?page=1&pageSize=100",
+        None,
+    )
+    .await;
+    let items = inbounds["items"].as_array().unwrap();
+    assert!(!items.iter().any(|item| {
+        item["id"] == "api-live-socks5-in" || item["id"] == "api-live-yuubinsya-in"
+    }));
+
+    service.shutdown().await;
+    fixture.shutdown().await;
 }

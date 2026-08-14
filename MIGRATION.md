@@ -5204,7 +5204,7 @@ termination、透明 transport 和实时连接状态；重点链路
 `SOCKS5/Yuubinsya inbound → TLS → HTTP/2 → Yuubinsya outbound` 通过。
 
 随后执行 `make api-reload-flow-smoke tun-api-process-smoke`：API mutation/reload/restart
-2/2，通过真实前台二进制 API 开关并持久化 TUN 设备 1/1。该结果确认 TUN 是 inbound
+3/3，通过真实前台二进制 API 开关并持久化 TUN 设备 1/1。该结果确认 TUN 是 inbound
 supervisor 的一部分，普通 inbound 和 TUN 共用最新配置 reload 边界，不需要单独启动第二个
 服务。
 
@@ -5228,3 +5228,21 @@ stats concurrency 2。需要 Go 工具链、外网或用户提供 WARP 配置的
 `~/.cache/yuhaiin-rust/benchmarks/{http-throughput,tun-throughput,wireguard}`。
 本轮缓存检查为 36.33 GiB，其中 `cargo-target` 为 24.06 GiB；脚本只发出超过 20 GiB 的
 告警，没有自动删除内容，也没有使用 `/tmp`。
+
+## 211. 2026-08-14 普通 SOCKS5/Yuubinsya inbound 动态增删
+
+之前的 service-chain 已经证明 SOCKS5 和 Yuubinsya inbound 在进程启动时能工作，但还没有
+证明前端通过 API 动态添加、删除它们时 listener owner 会正确重绑。本轮新增
+`api_adds_and_removes_socks5_and_yuubinsya_inbounds_live`，沿用同一个可复用的 Podman
+`ServiceProcess`、SQLite state 和 HTTP outbound fixture：
+
+- API POST 两个 inbound 后，分别完成 SOCKS5 username/password TCP echo 与 Yuubinsya TCP
+  echo；
+- `/api/v2/connections` 在连接仍存活时验证 inbound 地址、名称和真实链路元数据；
+- API DELETE 后轮询两个 loopback listener，确认旧 socket 已关闭，并验证 SQLite 列表不再包含
+  已删除配置；
+- `make api-reload-flow-smoke` 结果为 3 passed、0 failed；已有 HTTP 移端口/关闭/重启和
+  TUN toggle 场景同时保持通过。
+
+测试状态和日志继续写入 `~/.cache/yuhaiin-rust/integration/api-reload-flow/`，没有使用
+`/tmp`。
