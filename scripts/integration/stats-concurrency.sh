@@ -42,6 +42,11 @@ podman run --rm \
   --network=none \
   -v "${test_binary}:/usr/local/bin/yuhaiin-stats-test:ro" \
   -v "${runtime_binary}:/usr/local/bin/yuhaiin:ro" \
+  -v "${scenario_dir}:/state:Z" \
+  -e HOME=/state/home \
+  -e XDG_CACHE_HOME=/state/cache \
+  -e TMPDIR=/state/tmp \
+  -e YUHAIIN_INTEGRATION_DIR=/state \
   -e YUHAIIN_RUNTIME_BIN=/usr/local/bin/yuhaiin \
   -e YUHAIIN_STATS_READER_COUNT="${reader_count}" \
   -e YUHAIIN_STATS_READER_ROUNDS="${reader_rounds}" \
@@ -50,11 +55,26 @@ podman run --rm \
   "${image}" \
   -ec '
     set -eu
+    mkdir -p /state/home /state/cache /state/tmp
     /usr/local/bin/yuhaiin-stats-test \
       --nocapture
   ' \
   | tee "${scenario_dir}/podman.log"
 
 grep -q 'test result: ok' "${scenario_dir}/podman.log"
+for database in \
+  "${scenario_dir}/stats-concurrency/state.sqlite" \
+  "${scenario_dir}/stats-concurrency-force-stop/state.sqlite"; do
+  if [[ ! -f "${database}" ]]; then
+    echo "[stats-concurrency] missing persisted database: ${database}" >&2
+    exit 1
+  fi
+done
+
+database_bytes="$(find "${scenario_dir}" -type f -name 'state.sqlite' -printf '%s\n' \
+  | awk '{total += $1} END {print total + 0}')"
+wal_bytes="$(find "${scenario_dir}" -type f -name 'state.sqlite-wal' -printf '%s\n' \
+  | awk '{total += $1} END {print total + 0}')"
 echo "[stats-concurrency] pressure: readers=${reader_count}, reader-rounds=${reader_rounds}, write-rounds=${write_rounds}"
+echo "[stats-concurrency] persisted state: sqlite-bytes=${database_bytes}, wal-bytes=${wal_bytes}, directory=${scenario_dir}"
 echo "[stats-concurrency] passed; logs=${scenario_dir}"
