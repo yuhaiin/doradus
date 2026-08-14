@@ -5265,6 +5265,37 @@ Podman 验证结果：`make go-termination-parity-smoke` Go/Rust 共 10/10（新
 2/2），`cargo test -p yuhaiin-runtime --all-features tls_termination` 为 4/4；所有状态、
 日志和构建缓存位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
 
+## 214. 2026-08-14 WireGuard 第三方 peer 验收状态
+
+能力矩阵中的 WireGuard 状态此前仍停留在“本地 BoringTun 双 peer”，与模块表和已经保存的
+第三方证据不一致。WireGuard 的范围是 Rust 复用 Cloudflare BoringTun userspace adapter，支持配置
+导入、TCP/UDP 数据面和 runtime chain；Cloudflare WARP MASQUE 另受 QUIC/HTTP3 延期项约束，
+不应混入普通 WireGuard 的完成状态。
+
+`~/.cache/yuhaiin-rust/integration/wireguard-external/podman.log` 记录了 Debian VM 上
+标准 Go `wireguard-go` peer 的真实互操作：`external_peer_tcp_connects` 和
+`external_peer_udp_round_trips` 均通过（2/2）。这与本地 BoringTun 双 peer、HTTP/TCP 与
+SOCKS5/UDP runtime chain、WireGuard throughput benchmark 证据合并后，已经覆盖当前桌面端
+要求的 WireGuard 功能边界；本轮只修正能力矩阵的陈旧标记，模块验收表原本已经是 `[x]`，
+因此总体 41 项覆盖率仍保持 91.5%。
+
+仍然延期的不是 WireGuard 本身，而是需要 QUIC/HTTP3 的 WARP MASQUE、公网 NAT roaming 和
+特定生产网络策略；这些不会被本地或 Go peer 结果冒充为已验证功能。
+
+## 215. 2026-08-14 workspace 全量回归
+
+在 HTTP termination 转发头修复和 WireGuard 清单校正后，重新执行 `make workspace-tests`。
+Podman 共运行 51 个 harness，0 个失败：backup 9、chain 56、core 157、runtime 315、
+store 136（5 ignored）、trie 27、service-chain 33（1 ignored）、WireGuard 11（1 benchmark
+ignored）、WireGuard runtime chain 3、stats concurrency 2。完整 service-chain 仍为 33 passed、
+1 ignored，ignored 项均明确需要外部 Go 工具链、外网、真实 TUN capability、legacy snapshot 或
+用户提供的 WARP 配置；没有把这些条件缺失伪装成通过。
+
+构建、测试日志和状态继续写入 `~/.cache/yuhaiin-rust/integration/workspace-tests`，本轮没有
+使用 `/tmp`。`make cache-usage` 报告缓存 42.54 GiB，随后只执行了
+`YUHAIIN_CACHE_DRY_RUN=1 make cache-prune`，预览 11 个超过一天的 integration 目录，没有删除
+`cargo-target`、fixture 或其他可复用构建产物。
+
 ## 213. 2026-08-14 http_termination forwarding headers parity
 
 继续对照 Go `net/http/httputil.ReverseProxy.ServeHTTP` 的 Director 后处理。Rust 的

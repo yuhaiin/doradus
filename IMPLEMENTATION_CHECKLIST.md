@@ -25,7 +25,7 @@ debug 二进制。所有临时状态仍放在 `~/.cache/yuhaiin-rust`，不使�
 | 有实际功能缺口 `[ ]` | 0 |
 | 加权覆盖率 | **91.5%** = `(34 + 7 × 0.5) / 41` |
 | 主目标 | Linux desktop：Rust 可启动、管理前端可接入、普通 inbound/outbound 可串联 |
-| 当前结论 | **Linux desktop 主路径已具备替换前验收条件**；TUN 多路由 lease、RST/reconnect、graceful/SIGKILL teardown、Debian rootful firewall matrix 和 TPROXY UDP delivery/idle/force-stop 已闭环，剩余 `[~]` 主要是生产异常快照、更长统计样本、TLS/ECH 现场、Windows/macOS 原生 runner 和第三方 WireGuard |
+| 当前结论 | **Linux desktop 主路径已具备替换前验收条件**；TUN 多路由 lease、RST/reconnect、graceful/SIGKILL teardown、Debian rootful firewall matrix、TPROXY UDP delivery/idle/force-stop 和标准 WireGuard 第三方 peer 互操作已闭环，剩余 `[~]` 主要是生产异常快照、更长统计样本、TLS/ECH 现场和 Windows/macOS 原生 runner |
 
 `[x]` 表示代码和对应测试/进程证据都存在；`[~]` 表示主路径已经能运行，但验证范围还不足以称为 Go 的完整替换；`[ ]` 表示仍有明确功能或现场证据缺口；`延期` 不计入 41 项统计。
 
@@ -134,7 +134,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | Go 权威入口 | Rust 位置 | 状态 | 证据 | 下一动作 |
 | --- | --- | :---: | --- | --- |
 | `pkg/storage/sqlite/{sqlite,migrations,compact}.go` | `crates/yuhaiin-store/src/sqlite.rs`、`schema.rs`、`migration.rs` | `[x]` | `rusqlite + bundled SQLite`、WAL、busy timeout、quick check、rollback、backup/restore、force-stop | — |
-| `pkg/store/{node,inbound,resolver,route_*,settings,backup}.go`、`pkg/app/backup.go`、`pkg/s3/*` | `crates/yuhaiin-store/src/repository.rs`、`compat_runtime.rs`、`crates/yuhaiin-backup/src/lib.rs`、`tests/*` | `[~]` | typed repository、Go v1/v5/v6/schema-7、unknown JSON、users/routes/tags/settings/NAT；S3 SigV4 PUT/GET、Go camelCase 配置、BLAKE2b `lastBackupHash` 和选中 outbound proxy transport 已接入 API，并由本地兼容端点 wire test、runtime API test、`make s3-minio-smoke` 的真实 MinIO Podman 上传/下载覆盖；新增 backup unit 8/8，覆盖禁用/不完整配置、空/绝对 object key、HTTP 状态/body 截断和签名请求；Rust `backup_to` 现按 Go `backupRuntimeTables` 清理与 Go 完全一致的 12 张统计/连接/FakeIP 运行时表，重置 `route_list_refresh` 并清空 `lastBackupHash`/`updated_at`，缺失的惰性统计表跳过；新增坏 JSON、目标 sidecar 和 staging 清理异常回归，store 定向 120 passed/0 failed/5 ignored、Clippy、workspace 49 harnesses 和真实 MinIO 均通过 | 真实 AWS 权限现场，以及更多异常快照逐表 diff |
+| `pkg/store/{node,inbound,resolver,route_*,settings,backup}.go`、`pkg/app/backup.go`、`pkg/s3/*` | `crates/yuhaiin-store/src/repository.rs`、`compat_runtime.rs`、`crates/yuhaiin-backup/src/lib.rs`、`tests/*` | `[~]` | typed repository、Go v1/v5/v6/schema-7、unknown JSON、users/routes/tags/settings/NAT；S3 SigV4 PUT/GET、Go camelCase 配置、BLAKE2b `lastBackupHash` 和选中 outbound proxy transport 已接入 API，并由本地兼容端点 wire test、runtime API test、`make s3-minio-smoke` 的真实 MinIO Podman 上传/下载覆盖；新增 backup unit 8/8，覆盖禁用/不完整配置、空/绝对 object key、HTTP 状态/body 截断和签名请求；Rust `backup_to` 现按 Go `backupRuntimeTables` 清理与 Go 完全一致的 12 张统计/连接/FakeIP 运行时表，重置 `route_list_refresh` 并清空 `lastBackupHash`/`updated_at`，缺失的惰性统计表跳过；新增坏 JSON、目标 sidecar 和 staging 清理异常回归，store 定向 120 passed/0 failed/5 ignored、Clippy、workspace 51 harnesses 和真实 MinIO 均通过 | 真实 AWS 权限现场，以及更多异常快照逐表 diff |
 | `pkg/net/dns/fakeip/sqlite.go`、`pool.go` | `crates/yuhaiin-store/src/fakeip.rs` | `[x]` | reopen、cursor、release、capacity、dual-stack 和 legacy import | 更多生产容量/TTL 样本 |
 | `pkg/statistics/{sqlite,statistic,telemetry,conn}.go` | `crates/yuhaiin-store/src/statistics.rs`、`crates/yuhaiin-runtime/src/monitor.rs` | `[~]` | traffic/history/telemetry、Go projection、SSE、并发 reader/writer、force-stop recovery；Go/Rust live-flow parity 与 API history UTC 已验证；新增真实前台 HTTP flow 的 SSE 初始/新增/移除、close、total/traffic/telemetry/history 进程测试；`make stats-soak-smoke` 在 Podman 中以 24 readers×1000 rounds、2000 writes 运行 89.50s 通过；统计 harness 现在把 SQLite、WAL、日志持久化到 `~/.cache/yuhaiin-rust`，并在每轮报告字节数；跨进程 SQLite 写锁释放后的 projection retry 也有 focused 回归 | 更长 production projection 与真实生产时段样本 |
 
@@ -176,7 +176,7 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 | TUN | 是 | — | `[x]`：真实 user/rootful data-plane、每个 enabled inbound 独立设备、3-route lease、reload、reset/reconnect、teardown、IPv4 五档和 IPv6 合法 MTU 四档 fragmentation、真实 IPv6 extension-header round-trip 均通过 |
 | redir TCP / TPROXY UDP | 是 | — | `[x]`：TLS/TLS-auto/AEAD transport 可在透明 TCP listener 上先解包再 relay；当前源码在 Debian rootful VM 通过 iptables/native nft 的 2-flow delivery、original destination、回包/rebind、idle reap、IPv4/IPv6 REDIRECT 和 force-stop |
 | DNS UDP / TCP / DoH / DoT | server/client | resolver/client | `[x]` |
-| WireGuard | — | 是 | `[~]`：BoringTun userspace adapter 已通过本地双 peer |
+| WireGuard | — | 是 | `[x]`：Cloudflare BoringTun userspace adapter 已通过本地双 peer、真实 HTTP/TCP 与 SOCKS5/UDP runtime chain，以及 Debian VM 上 Go `wireguard-go` 第三方 TCP/UDP peer 互操作 |
 | Cloudflare WARP MASQUE | — | — | `延期`：Go 侧依赖 QUIC/HTTP3；当前范围明确延期 QUIC/DoH3，不把它误报成 WireGuard 缺口 |
 | DoQ / DoH3、QUIC、Reality、Mux、Tailscale | — | — | `延期` |
 | Shadowsocks / ShadowsocksR | — | — | `延期` |
@@ -304,12 +304,12 @@ TUN 是 inbound 的一种。它和 SOCKS5、HTTP proxy、Yuubinsya、TLS/HTTP2 i
 
 | 类别 | 命令 | Podman 验证结果 |
 | --- | --- | --- |
-| 全 workspace | `make workspace-tests` | 51 个 harness，0 失败；backup 9、chain 56、core 157、runtime 314、store 136（5 ignored）、trie 27、service-chain 33（1 ignored）、WireGuard 11（1 benchmark ignored）、WireGuard runtime chain 3、stats concurrency 2；外部 WARP、Go 工具链和显式 release benchmark 按设计 ignored/单独入口；新增备份快照清理/非法设置/sidecar/staging 回归、RuntimeDnsHandler→UDP/TCP server/client 原始 QTYPE 回归与 Go no-op contract point chain 回归 |
+| 全 workspace | `make workspace-tests` | 51 个 harness，0 失败；backup 9、chain 56、core 157、runtime 315、store 136（5 ignored）、trie 27、service-chain 33（1 ignored）、WireGuard 11（1 benchmark ignored）、WireGuard runtime chain 3、stats concurrency 2；外部 WARP、Go 工具链和显式 release benchmark 按设计 ignored/单独入口；新增备份快照清理/非法设置/sidecar/staging 回归、RuntimeDnsHandler→UDP/TCP server/client 原始 QTYPE 回归与 Go no-op contract point chain 回归；本轮重跑 HTTP termination forwarding-header parity 后仍通过 |
 | NetworkSplit 兼容 | `podman-cargo.sh -- cargo test -p yuhaiin-runtime --all-features network_split`；`podman-cargo.sh -- cargo test -p yuhaiin-store --all-features go_network_split_runtime_keeps_branch_layers_and_prefix_transport` | runtime TCP/UDP dispatch、HTTP/2 branch wrapping parent 与 Go-shaped config/prefix transport 均通过；测试状态和构建缓存位于 `~/.cache/yuhaiin-rust/integration/network-split/`、`~/.cache/yuhaiin-rust/cargo-target/` |
 | Go API / SQLite | `make production-parity-smoke`、`make production-abnormal-parity-smoke` | 4 份停止态 Go SQLite 的 info/settings/nodes/inbounds/resolvers/routes/publishes/connections/统计稳定投影、核心 mutation 和错误矩阵逐项 identical；四份 fixture 又完成 `SIGKILL → 重启 → 全读矩阵 replay`，失败历史同步 UPSERT/恢复合并通过；Rust takeover 结构审计逐表保留源对象/列约束/索引，已知 projection migration 与 force-stop 环境差异单独记录 |
 | Go live flow | `make go-live-flow-parity-smoke`、`make go-rust-stats-smoke` | 2026-08-14 Go/Rust 真实 HTTP inbound → router → HTTP outbound 流量、connections、total、traffic、history、telemetry、reload 后统计及共享 state 实时统计 parity 通过 |
 | live inbound/reload | `make api-reload-flow-smoke tun-api-process-smoke` | Podman `network=none` API mutation/reload/restart flow 3/3；新增覆盖普通 SOCKS5/Yuubinsya inbound 的动态添加、真实 outbound echo、connections metadata、删除和 listener 解绑；真实前台二进制通过 API 开启、关闭并持久化 TUN 设备 1/1，确认 TUN 与普通 inbound 共用 reload supervisor |
-| SQLite backup snapshot | `podman-cargo.sh -- cargo test --locked -p yuhaiin-store --lib`；`make s3-minio-smoke` | Go 运行时表清理、路由刷新状态归零、备份哈希归零、非法设置/目标 sidecar/staging 失败均 fail-closed；store 120 passed、5 ignored，all-features workspace store 136 passed、5 ignored，Clippy、真实 MinIO 上传/下载/restore 和 workspace 49 harnesses 均通过 |
+| SQLite backup snapshot | `podman-cargo.sh -- cargo test --locked -p yuhaiin-store --lib`；`make s3-minio-smoke` | Go 运行时表清理、路由刷新状态归零、备份哈希归零、非法设置/目标 sidecar/staging 失败均 fail-closed；store 120 passed、5 ignored，all-features workspace store 136 passed、5 ignored，Clippy、真实 MinIO 上传/下载/restore 和 workspace 51 harnesses 均通过 |
 | SQLite lock contention | `podman-cargo.sh -- cargo test -p yuhaiin-store --test cross_process --no-run`，随后在 Debian Podman 执行 harness | 升级/启动 write-lock 与统计 `BEGIN IMMEDIATE` holder 两条跨进程场景通过；6 passed、1 ignored |
 | Go wire interop | `make go-protocol-interop-smoke` | 16 passed，覆盖 Yuubinsya、WebSocket/H2、H2 v1、VLESS TCP/UDP、VMess TCP/UDP、Trojan TCP/UDP 的 Go↔Rust wire tests |
 | HTTP/2 protocol layering | `podman-cargo.sh -- cargo test -p yuhaiin-chain --test http2_protocol_layers`；`make service-chain-smoke` | chain harness 1 passed；同一 harness 循环验证 VLESS/VMess/Trojan 在 Go-compatible H2 CONNECT transport 上完成 TCP 握手、响应头和 payload echo；runtime service-chain 以 1 个 TCP + 1 个 UDP 测试分别循环覆盖三种协议，并新增 IPv4/IPv6 H2 TCP outbound latency 3/3 |
