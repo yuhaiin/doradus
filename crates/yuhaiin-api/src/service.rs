@@ -256,6 +256,19 @@ impl RuntimeService {
             .task
             .take()
             .ok_or_else(|| Error::new(ErrorKind::Closed, "runtime service task is missing"))?;
+
+        // The service task is expected to live for the whole process lifetime.
+        // The shutdown deadline applies only after the shutdown channel has
+        // been signaled; applying it around the whole task would terminate a
+        // healthy service after ten seconds without any external signal.
+        let shutdown = self.shutdown.subscribe();
+        if !*shutdown.borrow() {
+            tokio::select! {
+                result = &mut task => return result.map_err(join_error)?,
+                _ = wait_for_shutdown(shutdown) => {}
+            }
+        }
+
         match tokio::time::timeout(SHUTDOWN_WAIT_TIMEOUT, &mut task).await {
             Ok(result) => result.map_err(join_error)?,
             Err(_) => {

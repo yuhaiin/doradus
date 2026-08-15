@@ -54,6 +54,14 @@ podman run --rm \
     fi
     grep -Fq "starting; database=/state/config/yuhaiin/state.db" /state/stderr.log
     grep -Fq "HTTP API listening on" /state/stderr.log
+    sleep 11
+    state="$(grep '^State:' "/proc/$pid/status" 2>/dev/null || true)"
+    case "$state" in
+      ""|*"(zombie)"*)
+        cat /state/stderr.log >&2
+        exit 1
+        ;;
+    esac
     kill -TERM "$pid"
     wait "$pid"
     grep -Fq "shutdown requested; stopping runtime tasks" /state/stderr.log
