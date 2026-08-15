@@ -13,8 +13,8 @@ use yuhaiin_chain::ChainProxy;
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::proxy::{
     AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream, DelayedDropAsyncProxy,
-    DirectAsyncProxy, DropAsyncProxy, YuubinsyaUdpDatagram, stream_local_addr,
-    with_stream_local_addr,
+    DirectAsyncProxy, DropAsyncProxy, YuubinsyaUdpDatagram, stream_local_addr, stream_remote_addr,
+    with_stream_local_addr, with_stream_socket_addrs,
 };
 use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyKind};
 use yuhaiin_core::{
@@ -382,12 +382,14 @@ fn track_stream(detector: &LoopbackDetector, stream: BoxAsyncStream) -> BoxAsync
     let Some(local_addr) = stream_local_addr(&*stream) else {
         return stream;
     };
-    with_stream_local_addr(
+    let remote_addr = stream_remote_addr(&*stream);
+    with_stream_socket_addrs(
         Box::new(LoopbackTrackedStream {
             inner: stream,
             _connection: detector.track_connection(local_addr),
         }),
         Some(local_addr),
+        remote_addr,
     )
 }
 
@@ -3151,11 +3153,13 @@ mod tests {
         let detector = LoopbackDetector::new();
         let (stream, _peer) = tokio::io::duplex(64);
         let local = "127.0.0.1:41000".parse().unwrap();
-        let stream = with_stream_local_addr(Box::new(stream), Some(local));
+        let remote = "198.51.100.20:443".parse().unwrap();
+        let stream = with_stream_socket_addrs(Box::new(stream), Some(local), Some(remote));
 
         let tracked = track_stream(&detector, stream);
 
         assert_eq!(stream_local_addr(&*tracked), Some(local));
+        assert_eq!(stream_remote_addr(&*tracked), Some(remote));
     }
 
     #[test]
