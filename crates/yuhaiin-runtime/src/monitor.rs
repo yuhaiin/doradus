@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc, watch};
 
 use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
@@ -35,6 +35,10 @@ const BUCKET_LIMIT: usize = 90 * 24 * 60;
 const GO_STATISTICS_PROJECTION_INTERVAL: Duration = Duration::from_secs(30);
 const GO_STATISTICS_PROJECTION_RETRY_INITIAL: Duration = Duration::from_secs(2);
 const GO_STATISTICS_PROJECTION_RETRY_MAX: Duration = Duration::from_secs(60);
+// Failed connection history is updated from many independent inbound tasks.
+// Keep the hand-off bounded and non-blocking: the compact runtime checkpoint
+// still contains the complete in-memory failure map if this queue is full.
+const FAILED_HISTORY_QUEUE_CAPACITY: usize = 1024;
 const PERSISTENCE_KEY: &str = "statistics.runtime";
 const PERSISTENCE_VERSION: u32 = 1;
 // Go stores the history key's protocol in a separate SQLite column, while
@@ -92,9 +96,19 @@ struct ConnectionEntry {
 type TelemetryBucketKey = (i64, i64, String, String);
 type TelemetryBucketValue = (u64, u64, u64);
 
+#[derive(Debug)]
+struct FailedHistoryWrite {
+    protocol: String,
+    host: String,
+    process: String,
+    error: String,
+    last_seen: i64,
+}
+
 struct PersistenceState {
     store: ConfigStore,
     dirty: Arc<Notify>,
+    failed_history_tx: mpsc::Sender<FailedHistoryWrite>,
     shutdown: watch::Sender<bool>,
     worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -270,20 +284,22 @@ impl ConnectionMonitor {
                 ));
             }
             monitor.restore_persisted(persisted);
-            // Failed history is updated synchronously on every failure, while
-            // the compact checkpoint is intentionally asynchronous. Merge the
-            // durable table after restoring it so SIGKILL cannot roll counts
-            // back to the last periodic checkpoint.
+            // The compact checkpoint is asynchronous, while the durable Go
+            // table is a derived projection. Merge it after restoring the
+            // checkpoint so a newer table cannot roll counts back.
             monitor.restore_failed_history(go_statistics.failed_history);
         } else {
             monitor.restore_go_statistics(go_statistics)?;
         }
 
         let dirty = Arc::new(Notify::new());
+        let (failed_history_tx, mut failed_history_rx) =
+            mpsc::channel(FAILED_HISTORY_QUEUE_CAPACITY);
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let persistence = Arc::new(PersistenceState {
             store,
             dirty,
+            failed_history_tx,
             shutdown,
             worker: AsyncMutex::new(None),
         });
@@ -297,23 +313,60 @@ impl ConnectionMonitor {
             let mut project_go_statistics = true;
             let mut next_go_projection = Instant::now();
             let mut projection_backoff = GO_STATISTICS_PROJECTION_RETRY_INITIAL;
+            let mut failed_history_warned = false;
             loop {
                 tokio::select! {
-                    _ = worker_persistence.dirty.notified() => {},
-                    _ = interval.tick() => {},
+                    biased;
                     changed = shutdown_rx.changed() => {
                         if changed.is_err() || *shutdown_rx.borrow() {
                             break;
                         }
                     }
+                    Some(failure) = failed_history_rx.recv() => {
+                        // rusqlite and the repository lock are synchronous. Run
+                        // this derived projection off the current-thread Tokio
+                        // executor, and use the non-blocking store variant so
+                        // another process cannot pin the runtime forever.
+                        let store = worker_persistence.store.clone();
+                        let write = tokio::task::spawn_blocking(move || {
+                            store.try_record_failed_history(
+                                &failure.protocol,
+                                &failure.host,
+                                &failure.process,
+                                &failure.error,
+                                failure.last_seen,
+                            )
+                        })
+                        .await;
+                        match write {
+                            Ok(Ok(())) => failed_history_warned = false,
+                            Ok(Err(error)) if !failed_history_warned => {
+                                writer_monitor.warn(format!(
+                                    "persist failed connection history: {error}"
+                                ));
+                                failed_history_warned = true;
+                            }
+                            Err(error) if !failed_history_warned => {
+                                writer_monitor.warn(format!(
+                                    "persist failed connection history task: {error}"
+                                ));
+                                failed_history_warned = true;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    _ = worker_persistence.dirty.notified() => {},
+                    _ = interval.tick() => {},
                 }
                 let value = writer_monitor.persisted_json();
                 if let Ok(bytes) = serde_json::to_vec(&value) {
-                    let checkpoint_written = worker_persistence
-                        .store
-                        .put_config(PERSISTENCE_KEY, &bytes)
-                        .await
-                        .is_ok();
+                    let store = worker_persistence.store.clone();
+                    let checkpoint_written = tokio::task::spawn_blocking(move || {
+                        store.try_put_config(PERSISTENCE_KEY, &bytes).is_ok()
+                    })
+                    .await
+                    .unwrap_or(false);
                     let projection_due =
                         project_go_statistics && Instant::now() >= next_go_projection;
                     if checkpoint_written
@@ -324,11 +377,14 @@ impl ConnectionMonitor {
                         // path, but refresh Go's public tables infrequently so
                         // another Go/Rust management process can observe
                         // recent totals without rewriting the tables per flow.
-                        if worker_persistence
-                            .store
-                            .replace_go_statistics(&writer_monitor.go_statistics_snapshot())
-                            .is_ok()
-                        {
+                        let store = worker_persistence.store.clone();
+                        let snapshot = writer_monitor.go_statistics_snapshot();
+                        let projected = tokio::task::spawn_blocking(move || {
+                            store.try_replace_go_statistics(&snapshot).is_ok()
+                        })
+                        .await
+                        .unwrap_or(false);
+                        if projected {
                             last_go_projection = Instant::now();
                             project_go_statistics = false;
                             next_go_projection =
@@ -385,13 +441,19 @@ impl ConnectionMonitor {
                 format!("statistics state serialization: {error}"),
             )
         })?;
-        persistence
-            .store
-            .put_config(PERSISTENCE_KEY, &bytes)
-            .await?;
-        persistence
-            .store
-            .replace_go_statistics(&self.go_statistics_snapshot())
+        let store = persistence.store.clone();
+        let snapshot = self.go_statistics_snapshot();
+        tokio::task::spawn_blocking(move || {
+            store.try_put_config(PERSISTENCE_KEY, &bytes)?;
+            store.try_replace_go_statistics(&snapshot)
+        })
+        .await
+        .map_err(|error| {
+            yuhaiin_core::Error::new(
+                yuhaiin_core::ErrorKind::Storage,
+                format!("statistics persistence task: {error}"),
+            )
+        })?
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<MonitorEvent> {
@@ -785,14 +847,22 @@ impl ConnectionMonitor {
         }
         drop(state);
         self.mark_dirty();
-        if let Some(persistence) = persistence
-            && let Err(storage_error) = persistence
-                .store
-                .record_failed_history(protocol, host, &process, error, last_seen)
-        {
-            self.warn(format!(
-                "persist failed connection history: {storage_error}"
-            ));
+        if let Some(persistence) = persistence {
+            // Never make the inbound task wait for SQLite. In particular, a
+            // busy write lock would otherwise retain the accepted socket for
+            // every concurrent failure until the retry loop completes, which
+            // can exhaust the process file-descriptor limit and prevent
+            // shutdown from being observed. The checkpoint written by the
+            // worker contains the same aggregate failure map, so a saturated
+            // queue does not lose the runtime's recoverable state.
+            let write = FailedHistoryWrite {
+                protocol: protocol.to_owned(),
+                host: host.to_owned(),
+                process,
+                error: error.to_owned(),
+                last_seen,
+            };
+            let _ = persistence.failed_history_tx.try_send(write);
         }
     }
 
@@ -2596,6 +2666,80 @@ mod tests {
             );
             reloaded.shutdown().await.unwrap();
         });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_history_callback_does_not_wait_for_the_store_lock() {
+        let path = monitor_test_database_path();
+        remove_monitor_test_database(&path);
+        let store = ConfigStore::open(&path).await.unwrap();
+        let monitor = ConnectionMonitor::load_with_store(store).await.unwrap();
+        monitor.shutdown().await.unwrap();
+
+        let lock_path = PathBuf::from(format!("{}-yuhaiin-write-lock", path.display()));
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+
+        let callback_monitor = monitor.clone();
+        let callback = std::thread::spawn(move || {
+            callback_monitor.record_failure("http", "example.com:443", "database busy");
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            callback.is_finished(),
+            "failure callback must not synchronously wait for SQLite"
+        );
+        drop(lock);
+        callback.join().unwrap();
+        remove_monitor_test_database(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn monitor_shutdown_does_not_wait_for_the_store_lock() {
+        let path = monitor_test_database_path();
+        remove_monitor_test_database(&path);
+        let store = ConfigStore::open(&path).await.unwrap();
+        let monitor = ConnectionMonitor::load_with_store(store).await.unwrap();
+        let lock_path = PathBuf::from(format!("{}-yuhaiin-write-lock", path.display()));
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+
+        monitor.record_failure("http", "example.com:443", "database busy");
+        let result = tokio::time::timeout(Duration::from_secs(1), monitor.shutdown())
+            .await
+            .expect("monitor shutdown must not wait for SQLite lock");
+        assert!(result.is_err());
+        drop(lock);
+        remove_monitor_test_database(&path);
+    }
+
+    #[tokio::test]
+    async fn failed_history_queue_saturation_keeps_the_checkpoint_complete() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let monitor = ConnectionMonitor::load_with_store(store.clone())
+            .await
+            .unwrap();
+        let expected = FAILED_HISTORY_QUEUE_CAPACITY + 256;
+        for _ in 0..expected {
+            monitor.record_failure("http", "example.com:443", "connection refused");
+        }
+
+        monitor.shutdown().await.unwrap();
+        let statistics = store.load_go_statistics().unwrap();
+        assert_eq!(statistics.failed_history.len(), 1);
+        assert_eq!(statistics.failed_history[0].count, expected as u64);
     }
 
     #[tokio::test]

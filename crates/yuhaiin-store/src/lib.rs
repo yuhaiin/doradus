@@ -836,6 +836,22 @@ impl ConfigStore {
         .await
     }
 
+    /// Best-effort single-key write used by runtime checkpoints. It never
+    /// waits for a different process' repository lock; the next checkpoint or
+    /// final flush can retry the complete in-memory state.
+    pub fn try_put_config(&self, key: &str, value: &[u8]) -> Result<()> {
+        validate_key(key)?;
+        self.with_try_write(|connection| {
+            apply_transaction(
+                connection,
+                &[ConfigMutation::Put {
+                    key: key.to_owned(),
+                    value: value.to_vec(),
+                }],
+            )
+        })
+    }
+
     pub async fn delete_config(&self, key: &str) -> Result<bool> {
         validate_key(key)?;
         self.with_write_retry(|connection| {
@@ -852,26 +868,7 @@ impl ConfigStore {
     /// Apply a group of mutations atomically. Any validation or SQL failure
     /// rolls the whole group back.
     pub async fn apply(&self, mutations: &[ConfigMutation]) -> Result<()> {
-        self.with_write_retry(|connection| {
-            if let Err(error) = connection.execute("BEGIN IMMEDIATE") {
-                let _ = connection.execute("ROLLBACK");
-                return Err(storage_error(error));
-            }
-            let result = apply_in_transaction(connection, mutations);
-            match result {
-                Ok(()) => match connection.execute("COMMIT") {
-                    Ok(_) => Ok(()),
-                    Err(error) => {
-                        let _ = connection.execute("ROLLBACK");
-                        Err(storage_error(error))
-                    }
-                },
-                Err(error) => {
-                    let _ = connection.execute("ROLLBACK");
-                    Err(error)
-                }
-            }
-        })
+        self.with_write_retry(|connection| apply_transaction(connection, mutations))
     }
 
     pub async fn list_fakeip_entries(
@@ -1267,6 +1264,24 @@ impl ConfigStore {
         unreachable!("busy retry loop returns on its final iteration")
     }
 
+    /// Run one best-effort write without waiting for another process which
+    /// owns the repository lock. Runtime telemetry uses this path for
+    /// per-failure observations: the in-memory checkpoint remains the source
+    /// of truth, so an unavailable SQLite writer must not retain sockets or
+    /// stall shutdown.
+    pub(crate) fn with_try_write<T, F>(&self, operation: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        let _write_lock = self
+            .write_lock_path
+            .as_ref()
+            .map(|path| try_lock_write_file(path.as_path()))
+            .transpose()?;
+        let connection = self.lock_connection()?;
+        operation(&connection)
+    }
+
     fn with_write_transaction<T, F>(&self, mut operation: F) -> Result<T>
     where
         F: FnMut(&Connection) -> Result<T>,
@@ -1644,6 +1659,27 @@ fn validate_json_bytes(value: &[u8], field: &str) -> Result<()> {
     Ok(())
 }
 
+fn apply_transaction(connection: &Connection, mutations: &[ConfigMutation]) -> Result<()> {
+    if let Err(error) = connection.execute("BEGIN IMMEDIATE") {
+        let _ = connection.execute("ROLLBACK");
+        return Err(storage_error(error));
+    }
+    let result = apply_in_transaction(connection, mutations);
+    match result {
+        Ok(()) => match connection.execute("COMMIT") {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let _ = connection.execute("ROLLBACK");
+                Err(storage_error(error))
+            }
+        },
+        Err(error) => {
+            let _ = connection.execute("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 fn apply_in_transaction(connection: &Connection, mutations: &[ConfigMutation]) -> Result<()> {
     for mutation in mutations {
         match mutation {
@@ -1913,6 +1949,24 @@ fn lock_write_file(path: &Path) -> Result<File> {
         .map_err(storage_error)?;
     file.lock().map_err(storage_error)?;
     Ok(file)
+}
+
+fn try_lock_write_file(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(storage_error)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::new(
+            ErrorKind::Storage,
+            "database write lock is busy",
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(storage_error(error)),
+    }
 }
 
 fn storage_error(error: impl std::fmt::Display) -> Error {

@@ -83,13 +83,18 @@ impl ConfigStore {
         self.with_write_retry(|connection| replace(connection, snapshot))
     }
 
-    /// Record one failed connection synchronously in Go's durable table.
+    /// Best-effort compatibility projection for shutdown/checkpoint paths.
+    /// Runtime state is retained in memory when another writer owns SQLite;
+    /// callers can retry it on the next periodic or final flush.
+    pub fn try_replace_go_statistics(&self, snapshot: &GoStatisticsSnapshot) -> Result<()> {
+        self.with_try_write(|connection| replace(connection, snapshot))
+    }
+
+    /// Record one failed connection in Go's durable table.
     ///
-    /// The runtime checkpoint is intentionally asynchronous, so it can be
-    /// lost when the process receives SIGKILL.  Go increments this table on
-    /// the failure path itself; keeping the same small UPSERT here preserves
-    /// failed-history counts across an abnormal exit without blocking the
-    /// packet path on a full statistics projection.
+    /// The runtime owns the call from a single persistence worker. Keeping the
+    /// small UPSERT here preserves Go's durable failed-history projection
+    /// without making every inbound failure callback wait for SQLite.
     pub fn record_failed_history(
         &self,
         protocol: &str,
@@ -99,38 +104,66 @@ impl ConfigStore {
         last_seen: i64,
     ) -> Result<()> {
         self.with_write_retry(|connection| {
-            connection
-                .execute_batch(
-                    "CREATE TABLE IF NOT EXISTS failed_connection_history (
-                        protocol INTEGER NOT NULL, host TEXT NOT NULL,
-                        process_name TEXT NOT NULL, failed_count INTEGER NOT NULL,
-                        last_seen_at INTEGER NOT NULL, last_error TEXT NOT NULL,
-                        PRIMARY KEY (protocol, host, process_name)
-                    )",
-                )
-                .map_err(storage_error)?;
-            connection
-                .execute_with_params(
-                    "INSERT INTO failed_connection_history(
-                        protocol, host, process_name, failed_count, last_seen_at, last_error
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(protocol, host, process_name) DO UPDATE SET
-                        failed_count = failed_connection_history.failed_count + excluded.failed_count,
-                        last_seen_at = excluded.last_seen_at,
-                        last_error = excluded.last_error",
-                    &[
-                        SqliteValue::from(protocol),
-                        SqliteValue::from(host),
-                        SqliteValue::from(process),
-                        SqliteValue::from(1_i64),
-                        SqliteValue::from(last_seen),
-                        SqliteValue::from(error),
-                    ],
-                )
-                .map_err(storage_error)
-                .map(|_| ())
+            record_failed_history_row(connection, protocol, host, process, error, last_seen)
         })
     }
+
+    /// Best-effort variant for the runtime failure-history queue. It does not
+    /// wait for another process' repository lock and performs only one SQLite
+    /// attempt. The runtime checkpoint contains the aggregate row, so a
+    /// transiently busy database can safely defer this derived projection.
+    pub fn try_record_failed_history(
+        &self,
+        protocol: &str,
+        host: &str,
+        process: &str,
+        error: &str,
+        last_seen: i64,
+    ) -> Result<()> {
+        self.with_try_write(|connection| {
+            record_failed_history_row(connection, protocol, host, process, error, last_seen)
+        })
+    }
+}
+
+fn record_failed_history_row(
+    connection: &Connection,
+    protocol: &str,
+    host: &str,
+    process: &str,
+    error: &str,
+    last_seen: i64,
+) -> Result<()> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS failed_connection_history (
+                protocol INTEGER NOT NULL, host TEXT NOT NULL,
+                process_name TEXT NOT NULL, failed_count INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL, last_error TEXT NOT NULL,
+                PRIMARY KEY (protocol, host, process_name)
+            )",
+        )
+        .map_err(storage_error)?;
+    connection
+        .execute_with_params(
+            "INSERT INTO failed_connection_history(
+                protocol, host, process_name, failed_count, last_seen_at, last_error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(protocol, host, process_name) DO UPDATE SET
+                failed_count = failed_connection_history.failed_count + excluded.failed_count,
+                last_seen_at = excluded.last_seen_at,
+                last_error = excluded.last_error",
+            &[
+                SqliteValue::from(protocol),
+                SqliteValue::from(host),
+                SqliteValue::from(process),
+                SqliteValue::from(1_i64),
+                SqliteValue::from(last_seen),
+                SqliteValue::from(error),
+            ],
+        )
+        .map_err(storage_error)
+        .map(|_| ())
 }
 
 fn load(connection: &Connection) -> Result<GoStatisticsSnapshot> {

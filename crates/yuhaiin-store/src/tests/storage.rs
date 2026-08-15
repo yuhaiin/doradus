@@ -3,6 +3,28 @@ use super::*;
 use std::sync::{Arc, Barrier};
 
 #[test]
+fn try_failed_history_write_does_not_wait_for_repository_lock() {
+    let path = test_database_path();
+    let store = block_on(ConfigStore::open(&path)).unwrap();
+    let lock_path = PathBuf::from(format!("{}-yuhaiin-write-lock", path.display()));
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    lock.lock().unwrap();
+
+    let error = store
+        .try_record_failed_history("http", "example.com:443", "", "database busy", 1)
+        .unwrap_err();
+    assert!(error.message.contains("write lock is busy"));
+    drop(lock);
+    remove_database_artifacts(&path);
+}
+
+#[test]
 fn config_round_trips_and_deletes() {
     let store = block_on(ConfigStore::open_memory()).unwrap();
     assert_eq!(block_on(store.get_config("missing")).unwrap(), None);
