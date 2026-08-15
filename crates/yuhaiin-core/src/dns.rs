@@ -4,12 +4,12 @@
 //! checks. The surrounding code owns timeout, routing, caching, and FakeIP
 //! policy; this module deliberately does not hide those decisions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hickory_proto::op::{Message, MessageType, Query};
+use hickory_proto::op::{Edns, Message, MessageType, Query};
 use hickory_proto::rr::rdata::svcb::{
     Alpn, EchConfigList, IpHint, Mandatory, SvcParamKey, SvcParamValue, Unknown,
 };
@@ -223,8 +223,8 @@ pub enum DnsPolicy {
 
 #[derive(Clone)]
 pub struct DnsCache {
-    entries: Arc<Mutex<HashMap<(DomainName, DnsRecordType), CachedDnsResponse>>>,
-    max_entries: usize,
+    entries: Arc<Mutex<LruMap<(DomainName, DnsRecordType), CachedDnsResponse>>>,
+    raw_entries: Arc<Mutex<LruMap<(DomainName, u16), CachedDnsPacket>>>,
 }
 
 #[derive(Clone)]
@@ -233,14 +233,87 @@ struct CachedDnsResponse {
     expires_at: std::time::Instant,
 }
 
+#[derive(Clone)]
+struct CachedDnsPacket {
+    packet: Vec<u8>,
+    expires_at: std::time::Instant,
+}
+
+struct LruMap<K, V> {
+    map: HashMap<K, V>,
+    order: VecDeque<K>,
+    capacity: usize,
+}
+
+impl<K: Eq + std::hash::Hash + Clone, V> LruMap<K, V> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn touch(&mut self, key: &K) {
+        if let Some(position) = self.order.iter().position(|current| current == key) {
+            self.order.remove(position);
+        }
+        self.order.push_front(key.clone());
+    }
+
+    fn get_cloned(&mut self, key: &K) -> Option<V>
+    where
+        V: Clone,
+    {
+        let value = self.map.get(key)?.clone();
+        self.touch(key);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key.clone(), value);
+            self.touch(&key);
+            return;
+        }
+        self.map.insert(key.clone(), value);
+        self.order.push_front(key);
+        while self.map.len() > self.capacity {
+            let Some(oldest) = self.order.pop_back() else {
+                break;
+            };
+            self.map.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, key: &K) -> Option<V> {
+        let value = self.map.remove(key);
+        if value.is_some()
+            && let Some(position) = self.order.iter().position(|current| current == key)
+        {
+            self.order.remove(position);
+        }
+        value
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&V) -> bool) {
+        self.map.retain(|_, value| keep(value));
+        self.order.retain(|key| self.map.contains_key(key));
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 impl DnsCache {
     pub fn new(max_entries: usize) -> Result<Self> {
         if max_entries == 0 {
             return Err(Error::invalid("DNS cache capacity must be non-zero"));
         }
         Ok(Self {
-            entries: Arc::new(Mutex::new(HashMap::new())),
-            max_entries,
+            entries: Arc::new(Mutex::new(LruMap::new(max_entries))),
+            raw_entries: Arc::new(Mutex::new(LruMap::new(max_entries))),
         })
     }
 
@@ -254,7 +327,7 @@ impl DnsCache {
             .entries
             .lock()
             .map_err(|_| Error::new(ErrorKind::Closed, "DNS cache lock poisoned"))?;
-        let Some(entry) = entries.get(&key) else {
+        let Some(entry) = entries.get_cloned(&key) else {
             return Ok(None);
         };
         if entry.expires_at <= std::time::Instant::now() {
@@ -270,26 +343,95 @@ impl DnsCache {
         record_type: DnsRecordType,
         response: DnsResponse,
     ) -> Result<()> {
-        let ttl = response.minimum_ttl.unwrap_or(60).max(1);
+        let ttl = response.minimum_ttl.unwrap_or(300);
+        if ttl <= 1 {
+            return Ok(());
+        }
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| Error::new(ErrorKind::Closed, "DNS cache lock poisoned"))?;
         let now = std::time::Instant::now();
-        entries.retain(|_, entry| entry.expires_at > now);
-        if entries.len() >= self.max_entries
-            && !entries.contains_key(&(domain.clone(), record_type))
-            && let Some(oldest) = entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.expires_at)
-                .map(|(key, _)| key.clone())
-        {
-            entries.remove(&oldest);
-        }
+        entries.retain(|entry| entry.expires_at > now);
         entries.insert(
             (domain, record_type),
             CachedDnsResponse {
                 response,
+                expires_at: now + Duration::from_secs(u64::from(ttl)),
+            },
+        );
+        Ok(())
+    }
+
+    /// Return a cached typed response even after its TTL, matching Go's
+    /// `LoadOptimistically`. The boolean reports whether the entry is stale.
+    pub fn get_optimistic(
+        &self,
+        domain: &DomainName,
+        record_type: DnsRecordType,
+    ) -> Result<Option<(DnsResponse, bool)>> {
+        let key = (domain.clone(), record_type);
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Closed, "DNS cache lock poisoned"))?;
+        let Some(entry) = entries.get_cloned(&key) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            entry.response,
+            entry.expires_at <= std::time::Instant::now(),
+        )))
+    }
+
+    /// Return a raw DNS response while retaining stale entries for a
+    /// background refresh. The cache key intentionally excludes the DNS
+    /// transaction ID, just like Go's `CacheKeyFromQuestion`.
+    pub(crate) fn get_raw_optimistic(
+        &self,
+        domain: &DomainName,
+        record_type: u16,
+    ) -> Result<Option<(Vec<u8>, bool)>> {
+        let key = (domain.clone(), record_type);
+        let mut entries = self
+            .raw_entries
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Closed, "DNS raw cache lock poisoned"))?;
+        let Some(entry) = entries.get_cloned(&key) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            entry.packet,
+            entry.expires_at <= std::time::Instant::now(),
+        )))
+    }
+
+    pub(crate) fn insert_raw(
+        &self,
+        domain: DomainName,
+        record_type: u16,
+        packet: Vec<u8>,
+    ) -> Result<()> {
+        let message = Message::from_vec(&packet)
+            .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+        let ttl = message
+            .answers
+            .first()
+            .map(|record| record.ttl)
+            .unwrap_or(300);
+        if ttl <= 1 {
+            return Ok(());
+        }
+        let now = std::time::Instant::now();
+        let mut entries = self
+            .raw_entries
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Closed, "DNS raw cache lock poisoned"))?;
+        entries.retain(|entry| entry.expires_at > now);
+        entries.insert(
+            (domain, record_type),
+            CachedDnsPacket {
+                packet,
                 expires_at: now + Duration::from_secs(u64::from(ttl)),
             },
         );
@@ -314,7 +456,7 @@ impl DnsCache {
         self.entries
             .lock()
             .map_err(|_| Error::new(ErrorKind::Closed, "DNS cache lock poisoned"))
-            .map(|entries| entries.is_empty())
+            .map(|entries| entries.len() == 0)
     }
 }
 
@@ -378,6 +520,9 @@ pub fn encode_query(id: u16, domain: &DomainName, record_type: DnsRecordType) ->
     );
     message.metadata.recursion_desired = true;
     message.add_query(Query::query(name, record_type.hickory()));
+    let mut edns = Edns::new();
+    edns.set_max_payload(8192);
+    message.set_edns(edns);
     message
         .to_vec()
         .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))
@@ -396,6 +541,9 @@ pub fn encode_raw_query(id: u16, domain: &DomainName, record_type: u16) -> Resul
     );
     message.metadata.recursion_desired = true;
     message.add_query(Query::query(name, RecordType::from(record_type)));
+    let mut edns = Edns::new();
+    edns.set_max_payload(8192);
+    message.set_edns(edns);
     message
         .to_vec()
         .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))
@@ -472,6 +620,83 @@ pub fn decode_query(packet: &[u8]) -> Result<DnsQuestion> {
     })
 }
 
+/// Decode the cache key used by the raw resolver path. Unlike [`decode_query`]
+/// this accepts every DNS QTYPE, because Go caches and forwards records that
+/// the address-oriented API does not model.
+pub fn decode_raw_query_key(packet: &[u8]) -> Result<(DomainName, u16)> {
+    let message = Message::from_vec(packet)
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+    let query = message
+        .queries
+        .first()
+        .ok_or_else(|| Error::new(ErrorKind::Protocol, "DNS request has no question"))?;
+    Ok((
+        DomainName::new(query.name().to_ascii().trim_end_matches('.'))?,
+        u16::from(query.query_type()),
+    ))
+}
+
+/// Rewrite a DNS transaction ID after serving a response from the raw cache.
+pub fn rewrite_dns_transaction_id(mut packet: Vec<u8>, id: u16) -> Result<Vec<u8>> {
+    if packet.len() < 2 {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "DNS response is shorter than its transaction id",
+        ));
+    }
+    packet[..2].copy_from_slice(&id.to_be_bytes());
+    Ok(packet)
+}
+
+/// Rebuild the caller-visible question and transaction ID on a cached DNS
+/// response. Go's `dns.Msg.SetReply` does this before returning a raw cached
+/// message; replacing only the ID would leak the first request's question
+/// flags or name encoding to later callers.
+pub fn rewrite_dns_response_for_query(response: Vec<u8>, query: &[u8]) -> Result<Vec<u8>> {
+    let mut response_message = Message::from_vec(&response)
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+    let query_message = Message::from_vec(query)
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+    if query_message.queries.is_empty() {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "DNS request has no question",
+        ));
+    }
+    response_message.metadata.id = query_message.metadata.id;
+    response_message.queries = query_message.queries;
+    response_message
+        .to_vec()
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))
+}
+
+/// Apply the RFC 1035 UDP size limit to a response. Go keeps the complete
+/// answer for TCP/DoH but strips sections and sets TC for an oversized UDP
+/// response, allowing the client to retry over TCP.
+pub fn truncate_dns_response(query: &[u8], response: &[u8]) -> Result<Vec<u8>> {
+    let query_message = Message::from_vec(query)
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+    let mut response_message = Message::from_vec(response)
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+    let client_buffer_size = query_message
+        .edns
+        .as_ref()
+        .map(|edns| usize::from(edns.max_payload()))
+        .unwrap_or(512)
+        .max(512);
+    if response.len() <= client_buffer_size {
+        return Ok(response.to_vec());
+    }
+    response_message.metadata.truncation = true;
+    response_message.answers.clear();
+    response_message.authorities.clear();
+    response_message.additionals.clear();
+    response_message.signature = None;
+    response_message
+        .to_vec()
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))
+}
+
 /// Validate a DNS query before handing it to a raw transport.
 ///
 /// The typed resolver API intentionally models only records that yuhaiin
@@ -509,6 +734,12 @@ pub fn validate_response_packet(query: &[u8], response: &[u8]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+pub fn response_is_truncated(packet: &[u8]) -> Result<bool> {
+    let message = Message::from_vec(packet)
+        .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+    Ok(message.metadata.truncation)
 }
 
 /// Build an empty response for any valid DNS QTYPE while retaining every
@@ -771,6 +1002,7 @@ impl<H: DnsHandler> UdpDnsServer<H> {
             Error::new(ErrorKind::Timeout, format!("receive DNS request: {error}"))
         })?;
         let packet = answer_query(&request[..size], &self.handler)?;
+        let packet = truncate_dns_response(&request[..size], &packet)?;
         let sent = self
             .socket
             .send_to(&packet, peer)
@@ -1008,6 +1240,130 @@ mod tests {
         handler.resolve(&second, DnsRecordType::A).unwrap();
         assert_eq!(cache.len().unwrap(), 1);
         assert!(cache.get(&first, DnsRecordType::A).unwrap().is_none());
+    }
+
+    #[test]
+    fn dns_cache_promotes_hits_before_evicting_the_least_recent_entry() {
+        let cache = DnsCache::new(2).unwrap();
+        let response = |address| DnsResponse {
+            addresses: IpSet {
+                v4: vec![address],
+                v6: Vec::new(),
+            },
+            ptr_names: Vec::new(),
+            service_bindings: Vec::new(),
+            minimum_ttl: Some(60),
+        };
+        let first = DomainName::new("first.example").unwrap();
+        let second = DomainName::new("second.example").unwrap();
+        let third = DomainName::new("third.example").unwrap();
+        cache
+            .insert(
+                first.clone(),
+                DnsRecordType::A,
+                response(Ipv4Addr::new(192, 0, 2, 1)),
+            )
+            .unwrap();
+        cache
+            .insert(
+                second.clone(),
+                DnsRecordType::A,
+                response(Ipv4Addr::new(192, 0, 2, 2)),
+            )
+            .unwrap();
+
+        // A hit must move `first` to the MRU position. Inserting `third`
+        // therefore evicts `second`, not the entry that was inserted first.
+        assert!(cache.get(&first, DnsRecordType::A).unwrap().is_some());
+        cache
+            .insert(
+                third.clone(),
+                DnsRecordType::A,
+                response(Ipv4Addr::new(192, 0, 2, 3)),
+            )
+            .unwrap();
+        assert!(cache.get(&first, DnsRecordType::A).unwrap().is_some());
+        assert!(cache.get(&second, DnsRecordType::A).unwrap().is_none());
+        assert!(cache.get(&third, DnsRecordType::A).unwrap().is_some());
+    }
+
+    #[test]
+    fn raw_dns_cache_has_the_same_lru_promotion_behavior() {
+        let cache = DnsCache::new(2).unwrap();
+        let packet = |id, domain: &DomainName, address| {
+            let query = encode_query(id, domain, DnsRecordType::A).unwrap();
+            encode_response(
+                &query,
+                &DnsResponse {
+                    addresses: IpSet {
+                        v4: vec![address],
+                        v6: Vec::new(),
+                    },
+                    ptr_names: Vec::new(),
+                    service_bindings: Vec::new(),
+                    minimum_ttl: Some(60),
+                },
+            )
+            .unwrap()
+        };
+        let first = DomainName::new("first.example").unwrap();
+        let second = DomainName::new("second.example").unwrap();
+        let third = DomainName::new("third.example").unwrap();
+        cache
+            .insert_raw(
+                first.clone(),
+                1,
+                packet(1, &first, Ipv4Addr::new(192, 0, 2, 1)),
+            )
+            .unwrap();
+        cache
+            .insert_raw(
+                second.clone(),
+                1,
+                packet(2, &second, Ipv4Addr::new(192, 0, 2, 2)),
+            )
+            .unwrap();
+        assert!(cache.get_raw_optimistic(&first, 1).unwrap().is_some());
+        cache
+            .insert_raw(
+                third.clone(),
+                1,
+                packet(3, &third, Ipv4Addr::new(192, 0, 2, 3)),
+            )
+            .unwrap();
+        assert!(cache.get_raw_optimistic(&first, 1).unwrap().is_some());
+        assert!(cache.get_raw_optimistic(&second, 1).unwrap().is_none());
+        assert!(cache.get_raw_optimistic(&third, 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn oversized_udp_dns_response_sets_truncation_without_returning_answers() {
+        // A legacy client without EDNS advertises the RFC 1035 512-byte
+        // limit. `encode_query` intentionally adds EDNS(0), so construct the
+        // legacy form explicitly for this truncation test.
+        let mut query_message =
+            Message::new(0x1234, MessageType::Query, hickory_proto::op::OpCode::Query);
+        query_message.add_query(Query::query(
+            Name::from_utf8("large.example.").unwrap(),
+            RecordType::A,
+        ));
+        let query = query_message.to_vec().unwrap();
+        let answer = DnsResponse {
+            addresses: IpSet {
+                v4: (0..128)
+                    .map(|index| Ipv4Addr::new(192, 0, 2, (index % 250) as u8))
+                    .collect(),
+                v6: Vec::new(),
+            },
+            ptr_names: Vec::new(),
+            service_bindings: Vec::new(),
+            minimum_ttl: Some(60),
+        };
+        let response = encode_response(&query, &answer).unwrap();
+        assert!(response.len() > 512);
+        let truncated = truncate_dns_response(&query, &response).unwrap();
+        assert!(response_is_truncated(&truncated).unwrap());
+        assert!(Message::from_vec(&truncated).unwrap().answers.is_empty());
     }
 
     #[test]

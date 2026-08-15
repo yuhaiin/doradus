@@ -12,6 +12,31 @@ use crate::dns::{
 };
 use crate::dns_udp_async::AsyncUdpDnsClient;
 use crate::{BoxFuture, DomainName, IpSet, LocalBoxFuture, ResolveStrategy, Result};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
+
+type DnsFlightKey = (DomainName, u16);
+
+struct AsyncDnsFlight {
+    notify: Notify,
+    result: Mutex<Option<Result<Vec<u8>>>>,
+}
+
+impl AsyncDnsFlight {
+    fn new() -> Self {
+        Self {
+            notify: Notify::new(),
+            result: Mutex::new(None),
+        }
+    }
+}
+
+#[derive(Default)]
+struct AsyncDnsResolverState {
+    in_flight: Mutex<HashMap<DnsFlightKey, Arc<AsyncDnsFlight>>>,
+    refreshing: Mutex<HashSet<DnsFlightKey>>,
+}
 
 /// Send-safe address resolution boundary shared by chain and base proxies.
 ///
@@ -165,13 +190,13 @@ async fn system_dns_client() -> Result<AsyncUdpDnsClient> {
                 format!("read system DNS server task: {error}"),
             )
         })??;
-    Ok(AsyncUdpDnsClient {
+    Ok(AsyncUdpDnsClient::new(
         server,
-        timeout: std::time::Duration::from_secs(5),
-        max_packet_size: 65535,
-        local_bind_addresses: std::sync::Arc::from(Vec::new().into_boxed_slice()),
-        bind_interface: None,
-    })
+        std::time::Duration::from_secs(5),
+        65535,
+        std::sync::Arc::from(Vec::new().into_boxed_slice()),
+        None,
+    ))
 }
 
 #[cfg(unix)]
@@ -446,15 +471,17 @@ impl<C: crate::http2::H2DohConnector> SendAsyncDnsQuery for crate::http2::H2DohC
 }
 
 pub struct AsyncDnsResolver<Q> {
-    pub upstream: Q,
+    pub upstream: Arc<Q>,
     pub cache: Option<DnsCache>,
+    state: Arc<AsyncDnsResolverState>,
 }
 
-impl<Q: AsyncDnsQuery> AsyncDnsResolver<Q> {
+impl<Q> AsyncDnsResolver<Q> {
     pub fn new(upstream: Q) -> Self {
         Self {
-            upstream,
+            upstream: Arc::new(upstream),
             cache: None,
+            state: Arc::new(AsyncDnsResolverState::default()),
         }
     }
 
@@ -463,22 +490,158 @@ impl<Q: AsyncDnsQuery> AsyncDnsResolver<Q> {
         self
     }
 
+    fn begin_flight(&self, key: DnsFlightKey) -> Result<(Arc<AsyncDnsFlight>, bool)> {
+        let mut in_flight =
+            self.state.in_flight.lock().map_err(|_| {
+                crate::Error::new(crate::ErrorKind::Closed, "DNS flight lock poisoned")
+            })?;
+        if let Some(waiter) = in_flight.get(&key) {
+            return Ok((waiter.clone(), false));
+        }
+        let flight = Arc::new(AsyncDnsFlight::new());
+        in_flight.insert(key, flight.clone());
+        Ok((flight, true))
+    }
+
+    fn flight_result(&self, flight: &AsyncDnsFlight) -> Result<Option<Result<Vec<u8>>>> {
+        flight
+            .result
+            .lock()
+            .map_err(|_| {
+                crate::Error::new(crate::ErrorKind::Closed, "DNS flight result lock poisoned")
+            })
+            .map(|result| result.clone())
+    }
+
+    fn finish_flight(
+        &self,
+        key: &DnsFlightKey,
+        flight: &Arc<AsyncDnsFlight>,
+        result: Result<Vec<u8>>,
+    ) {
+        if let Ok(mut stored) = flight.result.lock() {
+            *stored = Some(result);
+        }
+        let current = self.state.in_flight.lock().ok().and_then(|mut in_flight| {
+            if in_flight
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, flight))
+            {
+                in_flight.remove(key)
+            } else {
+                None
+            }
+        });
+        if current.is_some() {
+            flight.notify.notify_waiters();
+        }
+    }
+
+    fn start_refresh(&self, domain: DomainName, record_type: u16)
+    where
+        Q: SendAsyncDnsQuery + 'static,
+    {
+        let key = (domain.clone(), record_type);
+        let should_start = self
+            .state
+            .refreshing
+            .lock()
+            .map(|mut refreshing| refreshing.insert(key.clone()))
+            .unwrap_or(false);
+        if !should_start {
+            return;
+        }
+
+        let Some(cache) = self.cache.clone() else {
+            if let Ok(mut refreshing) = self.state.refreshing.lock() {
+                refreshing.remove(&key);
+            }
+            return;
+        };
+        let upstream = self.upstream.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let request = crate::dns::encode_raw_query(
+                    next_resolver_transaction_id(),
+                    &domain,
+                    record_type,
+                )?;
+                let response = upstream.query_packet_send(&request).await?;
+                crate::dns::validate_response_packet(&request, &response)?;
+                cache.insert_raw(domain, record_type, response)?;
+                Ok::<(), crate::Error>(())
+            }
+            .await;
+            let _ = result;
+            if let Ok(mut refreshing) = state.refreshing.lock() {
+                refreshing.remove(&key);
+            }
+        });
+    }
+}
+
+impl<Q: AsyncDnsQuery> AsyncDnsResolver<Q> {
+    fn query_packet_local<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            crate::dns::validate_query_packet(packet)?;
+            let (domain, record_type) = crate::dns::decode_raw_query_key(packet)?;
+            let key = (domain.clone(), record_type);
+            loop {
+                if let Some(cache) = &self.cache
+                    && let Some((response, expired)) =
+                        cache.get_raw_optimistic(&domain, record_type)?
+                {
+                    // The local-future variant is used by embedders that do
+                    // not guarantee a Tokio Send task. It still returns stale
+                    // data immediately; the Send variant below also starts
+                    // Go-compatible background refresh.
+                    let _ = expired;
+                    return crate::dns::rewrite_dns_response_for_query(response, packet);
+                }
+
+                let (flight, owner) = self.begin_flight(key.clone())?;
+                if owner {
+                    let result = self.upstream.query_packet(packet).await;
+                    let result = result.and_then(|response| {
+                        crate::dns::validate_response_packet(packet, &response)?;
+                        if let Some(cache) = &self.cache {
+                            cache.insert_raw(domain.clone(), record_type, response.clone())?;
+                        }
+                        crate::dns::rewrite_dns_response_for_query(response, packet)
+                    });
+                    self.finish_flight(&key, &flight, result.clone());
+                    return result;
+                }
+
+                let notified = flight.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(result) = self.flight_result(&flight)? {
+                    return result.and_then(|response| {
+                        crate::dns::rewrite_dns_response_for_query(response, packet)
+                    });
+                }
+                notified.await;
+                if let Some(result) = self.flight_result(&flight)? {
+                    return result.and_then(|response| {
+                        crate::dns::rewrite_dns_response_for_query(response, packet)
+                    });
+                }
+            }
+        })
+    }
+
     pub fn query<'a>(
         &'a self,
         domain: &'a DomainName,
         record_type: DnsRecordType,
     ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
         Box::pin(async move {
-            if let Some(cache) = &self.cache
-                && let Some(response) = cache.get(domain, record_type)?
-            {
-                return Ok(response);
-            }
-            let response = self.upstream.query(domain, record_type).await?;
-            if let Some(cache) = &self.cache {
-                cache.insert(domain.clone(), record_type, response.clone())?;
-            }
-            Ok(response)
+            let id = next_resolver_transaction_id();
+            let request = crate::dns::encode_query(id, domain, record_type)?;
+            let response = self.query_packet_local(&request).await?;
+            crate::dns::decode_response(&response, id, record_type)
         })
     }
 
@@ -516,23 +679,65 @@ impl<Q: AsyncDnsQuery> AsyncDnsResolver<Q> {
     }
 }
 
-impl<Q: SendAsyncDnsQuery> AsyncDnsResolver<Q> {
+impl<Q: SendAsyncDnsQuery + 'static> AsyncDnsResolver<Q> {
+    fn query_packet_send<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            crate::dns::validate_query_packet(packet)?;
+            let (domain, record_type) = crate::dns::decode_raw_query_key(packet)?;
+            let key = (domain.clone(), record_type);
+            loop {
+                if let Some(cache) = &self.cache
+                    && let Some((response, expired)) =
+                        cache.get_raw_optimistic(&domain, record_type)?
+                {
+                    if expired {
+                        self.start_refresh(domain.clone(), record_type);
+                    }
+                    return crate::dns::rewrite_dns_response_for_query(response, packet);
+                }
+
+                let (flight, owner) = self.begin_flight(key.clone())?;
+                if owner {
+                    let result = self.upstream.query_packet_send(packet).await;
+                    let result = result.and_then(|response| {
+                        crate::dns::validate_response_packet(packet, &response)?;
+                        if let Some(cache) = &self.cache {
+                            cache.insert_raw(domain.clone(), record_type, response.clone())?;
+                        }
+                        crate::dns::rewrite_dns_response_for_query(response, packet)
+                    });
+                    self.finish_flight(&key, &flight, result.clone());
+                    return result;
+                }
+
+                let notified = flight.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(result) = self.flight_result(&flight)? {
+                    return result.and_then(|response| {
+                        crate::dns::rewrite_dns_response_for_query(response, packet)
+                    });
+                }
+                notified.await;
+                if let Some(result) = self.flight_result(&flight)? {
+                    return result.and_then(|response| {
+                        crate::dns::rewrite_dns_response_for_query(response, packet)
+                    });
+                }
+            }
+        })
+    }
+
     fn query_send<'a>(
         &'a self,
         domain: &'a DomainName,
         record_type: DnsRecordType,
     ) -> BoxFuture<'a, Result<DnsResponse>> {
         Box::pin(async move {
-            if let Some(cache) = &self.cache
-                && let Some(response) = cache.get(domain, record_type)?
-            {
-                return Ok(response);
-            }
-            let response = self.upstream.query_send(domain, record_type).await?;
-            if let Some(cache) = &self.cache {
-                cache.insert(domain.clone(), record_type, response.clone())?;
-            }
-            Ok(response)
+            let id = next_resolver_transaction_id();
+            let request = crate::dns::encode_query(id, domain, record_type)?;
+            let response = self.query_packet_send(&request).await?;
+            crate::dns::decode_response(&response, id, record_type)
         })
     }
 
@@ -607,7 +812,7 @@ fn merge_address_queries(
     }
 }
 
-impl<Q: SendAsyncDnsQuery> AsyncIpResolver for AsyncDnsResolver<Q> {
+impl<Q: SendAsyncDnsQuery + 'static> AsyncIpResolver for AsyncDnsResolver<Q> {
     fn resolve<'a>(
         &'a self,
         domain: &'a DomainName,
@@ -625,26 +830,20 @@ impl<Q: SendAsyncDnsQuery> AsyncIpResolver for AsyncDnsResolver<Q> {
     }
 
     fn query_packet<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
-        self.upstream.query_packet_send(packet)
+        self.query_packet_send(packet)
     }
 }
 
 impl<Q: AsyncDnsQuery> AsyncDnsHandler for AsyncDnsResolver<Q> {
     fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
-        let packet_result = decode_query(packet);
-        Box::pin(async move {
-            match packet_result {
-                Ok(question) => {
-                    let answer = self.query(&question.domain, question.record_type).await?;
-                    encode_response(packet, &answer)
-                }
-                Err(error) if error.kind == crate::ErrorKind::Unsupported => {
-                    self.upstream.query_packet(packet).await
-                }
-                Err(error) => Err(error),
-            }
-        })
+        self.query_packet_local(packet)
     }
+}
+
+fn next_resolver_transaction_id() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -655,6 +854,7 @@ mod tests {
     };
     use crate::{Error, ErrorKind};
     use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     struct StaticQuery {
@@ -675,6 +875,35 @@ mod tests {
                 Ok(DnsResponse {
                     addresses: IpSet {
                         v4: vec![Ipv4Addr::new(192, 0, 2, 77)],
+                        v6: Vec::new(),
+                    },
+                    ptr_names: Vec::new(),
+                    service_bindings: Vec::new(),
+                    minimum_ttl: Some(30),
+                })
+            })
+        }
+    }
+
+    struct SlowQuery {
+        calls: Arc<AtomicUsize>,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl AsyncDnsQuery for SlowQuery {
+        fn query<'a>(
+            &'a self,
+            _domain: &'a DomainName,
+            _record_type: DnsRecordType,
+        ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(DnsResponse {
+                    addresses: IpSet {
+                        v4: vec![Ipv4Addr::new(192, 0, 2, 78)],
                         v6: Vec::new(),
                     },
                     ptr_names: Vec::new(),
@@ -744,13 +973,56 @@ mod tests {
             .with_cache(DnsCache::new(8).unwrap());
             let domain = DomainName::new("example.com").unwrap();
             let packet = encode_query(0x4242, &domain, DnsRecordType::A).unwrap();
+            let second_packet = encode_query(0x4243, &domain, DnsRecordType::A).unwrap();
             let first = resolver.answer(&packet).await.unwrap();
-            let second = resolver.answer(&packet).await.unwrap();
+            let second = resolver.answer(&second_packet).await.unwrap();
             let first = decode_response(&first, 0x4242, DnsRecordType::A).unwrap();
-            let second = decode_response(&second, 0x4242, DnsRecordType::A).unwrap();
+            let second = decode_response(&second, 0x4243, DnsRecordType::A).unwrap();
             assert_eq!(first, second);
             assert_eq!(*calls.lock().unwrap(), 1);
         });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_resolver_singleflights_concurrent_raw_queries() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let resolver = Arc::new(AsyncDnsResolver::new(SlowQuery {
+            calls: calls.clone(),
+            started: started.clone(),
+            release: release.clone(),
+        }));
+        let domain = DomainName::new("singleflight.example").unwrap();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let first_resolver = resolver.clone();
+                let first_domain = domain.clone();
+                let first = tokio::task::spawn_local(async move {
+                    first_resolver.query(&first_domain, DnsRecordType::A).await
+                });
+                let second_resolver = resolver.clone();
+                let second_domain = domain.clone();
+                let second = tokio::task::spawn_local(async move {
+                    second_resolver
+                        .query(&second_domain, DnsRecordType::A)
+                        .await
+                });
+
+                tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+                    .await
+                    .expect("singleflight owner did not reach the upstream");
+                // Give the second local task a chance to register as a
+                // waiter before the first upstream request is released.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+                release.notify_waiters();
+                assert!(first.await.unwrap().is_ok());
+                assert!(second.await.unwrap().is_ok());
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -802,13 +1074,13 @@ mod tests {
         .await
         .unwrap();
         let address = server.local_addr().unwrap();
-        let client = AsyncUdpDnsClient {
-            server: address,
-            timeout: std::time::Duration::from_secs(1),
-            max_packet_size: 4096,
-            local_bind_addresses: Arc::from(Vec::new().into_boxed_slice()),
-            bind_interface: None,
-        };
+        let client = AsyncUdpDnsClient::new(
+            address,
+            std::time::Duration::from_secs(1),
+            4096,
+            Arc::from(Vec::new().into_boxed_slice()),
+            None,
+        );
         let domain = DomainName::new("4.3.2.1.in-addr.arpa").unwrap();
         let (server_result, response) = tokio::join!(
             server.serve_once(),

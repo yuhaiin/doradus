@@ -646,13 +646,41 @@ pub async fn run_dns_supervisor(
             resolver: snapshot.resolver.clone(),
             fakeip: snapshot.fakeip.clone(),
         };
-        let udp = yuhaiin_core::dns_udp_async::AsyncUdpDnsServer::bind(
+        // UDP and TCP are independent listeners in the Go server. A stale
+        // process, another service, or a partial reload may occupy either
+        // one, so keep the available transport alive instead of terminating
+        // the whole DNS supervisor on the first bind error.
+        let udp = match yuhaiin_core::dns_udp_async::AsyncUdpDnsServer::bind(
             address,
             handler.clone(),
             snapshot.settings.udp_buffer_size.max(512),
         )
-        .await?;
-        let tcp = AsyncTcpDnsServer::bind(address, handler, 65535, Duration::from_secs(5)).await?;
+        .await
+        {
+            Ok(server) => Some(server),
+            Err(error) => {
+                controller.monitor().warn(format!(
+                    "DNS UDP listener unavailable on {address}: {error}"
+                ));
+                None
+            }
+        };
+        let tcp =
+            match AsyncTcpDnsServer::bind(address, handler, 65535, Duration::from_secs(5)).await {
+                Ok(server) => Some(server),
+                Err(error) => {
+                    controller.monitor().warn(format!(
+                        "DNS TCP listener unavailable on {address}: {error}"
+                    ));
+                    None
+                }
+            };
+        if udp.is_none() && tcp.is_none() {
+            if wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+                return Ok(());
+            }
+            continue;
+        }
         let udp_controller = controller.clone();
         let udp_shutdown_receiver = shutdown.clone();
         let udp_shutdown = async move {
@@ -663,7 +691,14 @@ pub async fn run_dns_supervisor(
         let tcp_shutdown = async move {
             let _ = wait_for_shutdown_or_reload(&tcp_controller, tcp_shutdown_receiver).await;
         };
-        tokio::try_join!(udp.serve_until(udp_shutdown), tcp.serve_until(tcp_shutdown))?;
+        match (udp, tcp) {
+            (Some(udp), Some(tcp)) => {
+                tokio::try_join!(udp.serve_until(udp_shutdown), tcp.serve_until(tcp_shutdown))?;
+            }
+            (Some(udp), None) => udp.serve_until(udp_shutdown).await?,
+            (None, Some(tcp)) => tcp.serve_until(tcp_shutdown).await?,
+            (None, None) => unreachable!("DNS listener availability checked above"),
+        }
         if *shutdown.borrow() {
             return Ok(());
         }
@@ -1318,13 +1353,13 @@ mod tests {
             AsyncUdpDnsServer::bind("127.0.0.1:0".parse().unwrap(), handler.clone(), 2048)
                 .await
                 .unwrap();
-        let udp_client = AsyncUdpDnsClient {
-            server: udp_server.local_addr().unwrap(),
-            timeout: Duration::from_secs(1),
-            max_packet_size: 2048,
-            local_bind_addresses: Arc::from(Vec::new().into_boxed_slice()),
-            bind_interface: None,
-        };
+        let udp_client = AsyncUdpDnsClient::new(
+            udp_server.local_addr().unwrap(),
+            Duration::from_secs(1),
+            2048,
+            Arc::from(Vec::new().into_boxed_slice()),
+            None,
+        );
         let (udp_server_result, udp_response) =
             tokio::join!(udp_server.serve_once(), udp_client.query_packet(&query));
         assert!(udp_server_result.unwrap() > 0);

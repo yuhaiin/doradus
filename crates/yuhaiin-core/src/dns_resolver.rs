@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use crate::dns::{
     DnsCache, DnsHandler, DnsRecordType, DnsResponse, DohClient, DohTransport, UdpDnsClient,
-    decode_query, encode_response, validate_query_packet,
+    decode_query, decode_raw_query_key, encode_response, rewrite_dns_response_for_query,
+    validate_query_packet,
 };
 use crate::dns_tcp::TcpDnsClient;
 use crate::{DomainName, IpSet, ResolveStrategy, Result};
@@ -86,12 +87,19 @@ impl DnsResolver {
         Ok(response)
     }
 
-    /// Forward a complete DNS message through the selected transport. The
-    /// typed cache is deliberately bypassed because EDNS/DNSSEC flags and
-    /// non-address records are part of the caller's wire-level contract.
+    /// Forward a complete DNS message through the selected transport. The raw
+    /// cache is keyed by domain and QTYPE, so EDNS/DNSSEC fields are preserved
+    /// in the first upstream request while repeated requests reuse the full
+    /// response just like Go's resolver client.
     pub fn query_packet(&self, packet: &[u8]) -> Result<Vec<u8>> {
         validate_query_packet(packet)?;
-        match &self.transport {
+        let (domain, record_type) = decode_raw_query_key(packet)?;
+        if let Some(cache) = &self.cache
+            && let Some((response, _expired)) = cache.get_raw_optimistic(&domain, record_type)?
+        {
+            return rewrite_dns_response_for_query(response, packet);
+        }
+        let response = match &self.transport {
             ResolverTransport::Udp(client) => client.query_packet(packet),
             ResolverTransport::Tcp(client) => client.query_packet(packet),
             ResolverTransport::Doh(client) => client.query_packet(packet),
@@ -100,7 +108,11 @@ impl DnsResolver {
                 let answer = handler.resolve(&question.domain, question.record_type)?;
                 encode_response(packet, &answer)
             }
+        }?;
+        if let Some(cache) = &self.cache {
+            cache.insert_raw(domain, record_type, response.clone())?;
         }
+        rewrite_dns_response_for_query(response, packet)
     }
 
     pub fn resolve(&self, domain: &DomainName, strategy: ResolveStrategy) -> Result<IpSet> {

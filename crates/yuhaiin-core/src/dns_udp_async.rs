@@ -4,35 +4,80 @@
 //! callers. This module keeps the async/TUN path independent of blocking
 //! sockets and preserves the caller's DNS transaction when it builds a reply.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::net::UdpSocket;
+use tokio::sync::{Notify, oneshot};
 
 use crate::dns::{
-    AsyncDnsHandler, DnsRecordType, DnsResponse, decode_response, encode_query,
-    validate_query_packet, validate_response_packet,
+    AsyncDnsHandler, DnsRecordType, DnsResponse, decode_raw_query_key, decode_response,
+    encode_query, truncate_dns_response, validate_query_packet, validate_response_packet,
 };
 use crate::proxy::bind_tokio_udp_socket_for_target;
 use crate::{DomainName, Error, ErrorKind, IpSet, LocalBoxFuture, ResolveStrategy, Result};
 
-#[derive(Debug, Clone)]
+type PendingKey = (u16, DomainName, u16);
+
+struct AsyncUdpDnsClientState {
+    socket: Mutex<Option<Arc<UdpSocket>>>,
+    pending: Mutex<HashMap<PendingKey, oneshot::Sender<Result<Vec<u8>>>>>,
+    shutdown: Arc<Notify>,
+}
+
+impl Default for AsyncUdpDnsClientState {
+    fn default() -> Self {
+        Self {
+            socket: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            shutdown: Arc::new(Notify::new()),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct AsyncUdpDnsClient {
     pub server: SocketAddr,
     pub timeout: Duration,
     pub max_packet_size: usize,
     pub local_bind_addresses: Arc<[IpAddr]>,
     pub bind_interface: Option<String>,
+    state: Arc<AsyncUdpDnsClientState>,
 }
 
 impl AsyncUdpDnsClient {
-    /// Send a complete DNS message without narrowing its QTYPE to the
-    /// address-oriented resolver model. This is used for MX/TXT/CNAME and
-    /// DNSSEC queries received by the runtime DNS server.
-    pub async fn query_packet(&self, packet: &[u8]) -> Result<Vec<u8>> {
-        validate_query_packet(packet)?;
+    pub fn new(
+        server: SocketAddr,
+        timeout: Duration,
+        max_packet_size: usize,
+        local_bind_addresses: Arc<[IpAddr]>,
+        bind_interface: Option<String>,
+    ) -> Self {
+        Self {
+            server,
+            timeout,
+            max_packet_size,
+            local_bind_addresses,
+            bind_interface,
+            state: Arc::new(AsyncUdpDnsClientState::default()),
+        }
+    }
+
+    async fn socket(&self) -> Result<Arc<UdpSocket>> {
+        if let Some(socket) = self
+            .state
+            .socket
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Closed, "DNS UDP socket lock poisoned"))?
+            .clone()
+        {
+            return Ok(socket);
+        }
+
         let default_bind = if self.server.is_ipv4() {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         } else {
@@ -45,34 +90,142 @@ impl AsyncUdpDnsClient {
             .find(|address| address.is_ipv4() == self.server.is_ipv4())
             .map(|address| SocketAddr::new(address, 0))
             .unwrap_or(default_bind);
-        let socket = bind_tokio_udp_socket_for_target(
-            bind_address,
-            self.server,
-            self.bind_interface.as_deref(),
-            "DNS",
-        )
-        .await?;
-        let max_packet_size = self.max_packet_size.max(512);
+        let socket = Arc::new(
+            bind_tokio_udp_socket_for_target(
+                bind_address,
+                self.server,
+                self.bind_interface.as_deref(),
+                "DNS",
+            )
+            .await?,
+        );
+
+        let mut stored = self
+            .state
+            .socket
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Closed, "DNS UDP socket lock poisoned"))?;
+        if let Some(existing) = stored.as_ref() {
+            return Ok(existing.clone());
+        }
+        *stored = Some(socket.clone());
+        drop(stored);
+
+        let state: Weak<AsyncUdpDnsClientState> = Arc::downgrade(&self.state);
+        let shutdown = self.state.shutdown.clone();
         let server = self.server;
-        tokio::time::timeout(self.timeout, async move {
-            socket
-                .send_to(packet, server)
-                .await
-                .map_err(|error| Error::new(ErrorKind::Io, format!("send DNS query: {error}")))?;
-            let mut response = vec![0; max_packet_size];
+        let receiver_socket = socket.clone();
+        tokio::spawn(async move {
+            let mut response = vec![0; 65535];
             loop {
-                let (size, peer) = socket.recv_from(&mut response).await.map_err(|error| {
-                    Error::new(ErrorKind::Io, format!("receive DNS response: {error}"))
-                })?;
-                if peer != server {
+                let result = tokio::select! {
+                    _ = shutdown.notified() => return,
+                    result = receiver_socket.recv_from(&mut response) => result,
+                };
+                let (size, peer) = match result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let Some(state) = state.upgrade() else {
+                            return;
+                        };
+                        if let Ok(mut stored) = state.socket.lock()
+                            && stored
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, &receiver_socket))
+                        {
+                            *stored = None;
+                        }
+                        if let Ok(mut pending) = state.pending.lock() {
+                            for (_, sender) in pending.drain() {
+                                let _ = sender.send(Err(Error::new(
+                                    ErrorKind::Io,
+                                    format!("receive DNS response: {error}"),
+                                )));
+                            }
+                        }
+                        return;
+                    }
+                };
+                if peer != server || size < 2 {
                     continue;
                 }
-                validate_response_packet(packet, &response[..size])?;
-                return Ok(response[..size].to_vec());
+                let packet = response[..size].to_vec();
+                let Ok((domain, record_type)) = decode_raw_query_key(&packet) else {
+                    continue;
+                };
+                let key = (
+                    u16::from_be_bytes([packet[0], packet[1]]),
+                    domain,
+                    record_type,
+                );
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                if let Ok(mut pending) = state.pending.lock()
+                    && let Some(sender) = pending.remove(&key)
+                {
+                    let _ = sender.send(Ok(packet));
+                }
             }
-        })
-        .await
-        .map_err(|_| Error::new(ErrorKind::Timeout, "DNS UDP query timed out"))?
+        });
+        Ok(socket)
+    }
+
+    async fn query_packet_once(&self, packet: &[u8]) -> Result<Vec<u8>> {
+        validate_query_packet(packet)?;
+        let (domain, record_type) = decode_raw_query_key(packet)?;
+        let request_id = u16::from_be_bytes([packet[0], packet[1]]);
+        let key = (request_id, domain, record_type);
+        let socket = self.socket().await?;
+        let (sender, receiver) = oneshot::channel();
+        self.state
+            .pending
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Closed, "DNS UDP pending lock poisoned"))?
+            .insert(key.clone(), sender);
+        if let Err(error) = socket.send_to(packet, self.server).await {
+            if let Ok(mut pending) = self.state.pending.lock() {
+                pending.remove(&key);
+            }
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!("send DNS query: {error}"),
+            ));
+        }
+        match tokio::time::timeout(self.timeout, receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(Error::new(
+                ErrorKind::Closed,
+                "DNS UDP response waiter closed",
+            )),
+            Err(_) => {
+                if let Ok(mut pending) = self.state.pending.lock() {
+                    pending.remove(&key);
+                }
+                Err(Error::new(ErrorKind::Timeout, "DNS UDP query timed out"))
+            }
+        }
+    }
+
+    /// Send a complete DNS message without narrowing its QTYPE to the
+    /// address-oriented resolver model. This is used for MX/TXT/CNAME and
+    /// DNSSEC queries received by the runtime DNS server.
+    pub async fn query_packet(&self, packet: &[u8]) -> Result<Vec<u8>> {
+        let response = self.query_packet_once(packet).await?;
+        validate_response_packet(packet, &response)?;
+        let message = hickory_proto::op::Message::from_vec(&response)
+            .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+        if message.metadata.truncation {
+            let client = crate::dns_tcp_async::AsyncTcpDnsClient {
+                server: self.server,
+                timeout: self.timeout,
+                max_packet_size: self.max_packet_size,
+                local_bind_addresses: self.local_bind_addresses.clone(),
+                bind_interface: self.bind_interface.clone(),
+            };
+            return client.query_packet(packet).await;
+        }
+        Ok(response)
     }
 
     pub async fn query(
@@ -80,47 +233,10 @@ impl AsyncUdpDnsClient {
         domain: &DomainName,
         record_type: DnsRecordType,
     ) -> Result<DnsResponse> {
-        let default_bind = if self.server.is_ipv4() {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-        } else {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-        };
-        let bind_address = self
-            .local_bind_addresses
-            .iter()
-            .copied()
-            .find(|address| address.is_ipv4() == self.server.is_ipv4())
-            .map(|address| SocketAddr::new(address, 0))
-            .unwrap_or(default_bind);
-        let socket = bind_tokio_udp_socket_for_target(
-            bind_address,
-            self.server,
-            self.bind_interface.as_deref(),
-            "DNS",
-        )
-        .await?;
         let id = next_transaction_id();
         let request = encode_query(id, domain, record_type)?;
-        let max_packet_size = self.max_packet_size.max(512);
-        let server = self.server;
-        tokio::time::timeout(self.timeout, async move {
-            socket
-                .send_to(&request, server)
-                .await
-                .map_err(|error| Error::new(ErrorKind::Io, format!("send DNS query: {error}")))?;
-            let mut response = vec![0; max_packet_size];
-            loop {
-                let (size, peer) = socket.recv_from(&mut response).await.map_err(|error| {
-                    Error::new(ErrorKind::Io, format!("receive DNS response: {error}"))
-                })?;
-                if peer != server {
-                    continue;
-                }
-                return decode_response(&response[..size], id, record_type);
-            }
-        })
-        .await
-        .map_err(|_| Error::new(ErrorKind::Timeout, "DNS UDP query timed out"))?
+        let response = self.query_packet(&request).await?;
+        decode_response(&response, id, record_type)
     }
 
     pub async fn resolve(&self, domain: &DomainName, strategy: ResolveStrategy) -> Result<IpSet> {
@@ -145,6 +261,17 @@ impl AsyncUdpDnsClient {
     }
 }
 
+impl Drop for AsyncUdpDnsClient {
+    fn drop(&mut self) {
+        // The receiver task intentionally keeps only a Weak reference to the
+        // client state. Wake it when the last public client handle disappears
+        // so reloads do not accumulate one task and socket per resolver.
+        if Arc::strong_count(&self.state) == 1 {
+            self.state.shutdown.notify_one();
+        }
+    }
+}
+
 pub struct AsyncUdpDnsHandler {
     pub client: AsyncUdpDnsClient,
 }
@@ -165,6 +292,7 @@ pub struct AsyncUdpDnsServer<H> {
     pub socket: UdpSocket,
     pub handler: H,
     pub max_packet_size: usize,
+    pub max_inflight: usize,
 }
 
 impl<H: AsyncDnsHandler> AsyncUdpDnsServer<H> {
@@ -176,6 +304,7 @@ impl<H: AsyncDnsHandler> AsyncUdpDnsServer<H> {
             socket,
             handler,
             max_packet_size: max_packet_size.max(512),
+            max_inflight: 150,
         })
     }
 
@@ -196,6 +325,7 @@ impl<H: AsyncDnsHandler> AsyncUdpDnsServer<H> {
                 Error::new(ErrorKind::Io, format!("receive DNS request: {error}"))
             })?;
         let packet = self.handler.answer(&request[..size]).await?;
+        let packet = truncate_dns_response(&request[..size], &packet)?;
         let sent =
             self.socket.send_to(&packet, peer).await.map_err(|error| {
                 Error::new(ErrorKind::Io, format!("send DNS response: {error}"))
@@ -214,14 +344,50 @@ impl<H: AsyncDnsHandler> AsyncUdpDnsServer<H> {
         S: Future<Output = ()>,
     {
         tokio::pin!(shutdown);
+        let mut pending = FuturesUnordered::new();
         loop {
             tokio::select! {
                 _ = &mut shutdown => return Ok(()),
-                result = self.serve_once() => {
-                    result?;
+                result = pending.next(), if !pending.is_empty() => {
+                    // Go logs and drops an individual malformed/upstream
+                    // request while keeping the listener alive.
+                    let _ = result;
+                }
+                result = async {
+                    let mut request = vec![0; self.max_packet_size];
+                    let (size, peer) = self.socket.recv_from(&mut request).await
+                        .map_err(|error| Error::new(ErrorKind::Io, format!("receive DNS request: {error}")))?;
+                    Ok::<_, Error>((request[..size].to_vec(), peer))
+                } => {
+                    let (request, peer) = result?;
+                    if pending.len() >= self.max_inflight.max(1)
+                        && let Some(result) = pending.next().await
+                    {
+                        let _ = result;
+                    }
+                    pending.push(self.serve_packet(request, peer));
                 }
             }
         }
+    }
+
+    fn serve_packet<'a>(
+        &'a self,
+        request: Vec<u8>,
+        peer: SocketAddr,
+    ) -> LocalBoxFuture<'a, Result<(usize, SocketAddr)>> {
+        Box::pin(async move {
+            let response = self.handler.answer(&request).await?;
+            let response = truncate_dns_response(&request, &response)?;
+            let sent = self
+                .socket
+                .send_to(&response, peer)
+                .await
+                .map_err(|error| {
+                    Error::new(ErrorKind::Io, format!("send DNS response: {error}"))
+                })?;
+            Ok((sent, peer))
+        })
     }
 }
 
@@ -276,15 +442,13 @@ mod tests {
                 assert_eq!(second_peer.ip(), IpAddr::V4("127.0.0.2".parse().unwrap()));
             };
 
-            let client = AsyncUdpDnsClient {
-                server: server_address,
-                timeout: Duration::from_secs(1),
-                max_packet_size: 4096,
-                local_bind_addresses: Arc::from(
-                    vec!["127.0.0.2".parse::<IpAddr>().unwrap()].into_boxed_slice(),
-                ),
-                bind_interface: None,
-            };
+            let client = AsyncUdpDnsClient::new(
+                server_address,
+                Duration::from_secs(1),
+                4096,
+                Arc::from(vec!["127.0.0.2".parse::<IpAddr>().unwrap()].into_boxed_slice()),
+                None,
+            );
             let domain = DomainName::new("example.com").unwrap();
             let client_future = async move {
                 let direct = client.query(&domain, DnsRecordType::A).await.unwrap();
@@ -329,13 +493,13 @@ mod tests {
                     socket.send_to(&response, peer).await.unwrap();
                 });
 
-                let client = AsyncUdpDnsClient {
-                    server: address,
-                    timeout: Duration::from_secs(1),
-                    max_packet_size: 2048,
-                    local_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
-                    bind_interface: None,
-                };
+                let client = AsyncUdpDnsClient::new(
+                    address,
+                    Duration::from_secs(1),
+                    2048,
+                    Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
+                    None,
+                );
                 let query = encode_raw_query(0x5a5a, &DomainName::new("example.com").unwrap(), 16)?;
                 let response = client.query_packet(&query).await?;
                 assert_eq!(&response[..2], &query[..2]);
@@ -386,13 +550,13 @@ mod tests {
                     })
                     .await
             };
-            let client = AsyncUdpDnsClient {
-                server: server_address,
-                timeout: Duration::from_secs(1),
-                max_packet_size: 4096,
-                local_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
-                bind_interface: None,
-            };
+            let client = AsyncUdpDnsClient::new(
+                server_address,
+                Duration::from_secs(1),
+                4096,
+                Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
+                None,
+            );
             let client_future = async {
                 let answer = client
                     .query(&DomainName::new("example.com").unwrap(), DnsRecordType::A)

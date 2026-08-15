@@ -15,8 +15,8 @@ use std::marker::PhantomData;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use yuhaiin_core::dns::{
-    DnsCache, DnsRecordType, DnsResponse, decode_response, encode_query, validate_query_packet,
-    validate_response_packet,
+    DnsCache, DnsRecordType, DnsResponse, decode_response, encode_query, response_is_truncated,
+    validate_query_packet, validate_response_packet,
 };
 use yuhaiin_core::dns_resolver_async::{
     AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, SendAsyncDnsQuery, SystemAsyncIpResolver,
@@ -496,41 +496,57 @@ impl RoutedDnsClient {
                 .await
                 .map_err(|_| Error::new(ErrorKind::Timeout, "DNS UDP proxy query timed out"))?;
                 let close_result = datagram.close().await;
-                match (result, close_result) {
+                let response = match (result, close_result) {
                     (Ok(response), Ok(())) => Ok(response),
                     (Err(error), _) => Err(error),
                     (Ok(_), Err(error)) => Err(error),
+                }?;
+                if response_is_truncated(&response)? {
+                    return Self::Tcp {
+                        server: *server,
+                        timeout: *timeout,
+                        max_packet_size: *max_packet_size,
+                        bridge: bridge.clone(),
+                    }
+                    .query_packet_tcp(packet)
+                    .await;
                 }
-            }
-            Self::Tcp {
-                server,
-                timeout,
-                max_packet_size,
-                bridge,
-            } => {
-                if packet.len() > MAX_DNS_TCP_FRAME {
-                    return Err(Error::new(
-                        ErrorKind::Protocol,
-                        "DNS TCP request is too large",
-                    ));
-                }
-                let host = server.ip().to_string();
-                let stream =
-                    tokio::time::timeout(*timeout, bridge.connect(&host, server.port(), true))
-                        .await
-                        .map_err(|_| {
-                            Error::new(ErrorKind::Timeout, "connect DNS TCP proxy timed out")
-                        })??
-                        .ok_or_else(|| Error::invalid("proxy DNS TCP transport was not opened"))?;
-                let response = tokio::time::timeout(*timeout, async {
-                    query_tcp_stream(stream, packet, *max_packet_size).await
-                })
-                .await
-                .map_err(|_| Error::new(ErrorKind::Timeout, "DNS TCP proxy query timed out"))??;
-                validate_response_packet(packet, &response)?;
                 Ok(response)
             }
+            Self::Tcp { .. } => self.query_packet_tcp(packet).await,
         }
+    }
+
+    async fn query_packet_tcp(&self, packet: &[u8]) -> Result<Vec<u8>> {
+        let Self::Tcp {
+            server,
+            timeout,
+            max_packet_size,
+            bridge,
+        } = self
+        else {
+            return Err(Error::invalid(
+                "TCP DNS fallback requested for UDP transport",
+            ));
+        };
+        if packet.len() > MAX_DNS_TCP_FRAME {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "DNS TCP request is too large",
+            ));
+        }
+        let host = server.ip().to_string();
+        let stream = tokio::time::timeout(*timeout, bridge.connect(&host, server.port(), true))
+            .await
+            .map_err(|_| Error::new(ErrorKind::Timeout, "connect DNS TCP proxy timed out"))??
+            .ok_or_else(|| Error::invalid("proxy DNS TCP transport was not opened"))?;
+        let response = tokio::time::timeout(*timeout, async {
+            query_tcp_stream(stream, packet, *max_packet_size).await
+        })
+        .await
+        .map_err(|_| Error::new(ErrorKind::Timeout, "DNS TCP proxy query timed out"))??;
+        validate_response_packet(packet, &response)?;
+        Ok(response)
     }
 }
 
@@ -644,10 +660,7 @@ where
             return self.builtin.build(config);
         }
         let endpoint = doh_endpoint(&config.host, &config.id)?;
-        let client = H2DohClient {
-            endpoint,
-            connector: (self.connector)(config)?,
-        };
+        let client = H2DohClient::new(endpoint, (self.connector)(config)?);
         let resolver = AsyncDnsResolver::new(client)
             .with_cache(DnsCache::new(self.builtin.cache_capacity.max(1))?);
         Ok(Arc::new(TimeoutResolver::new(
@@ -751,10 +764,7 @@ impl ResolverTransportFactory for RustCryptoDohResolverFactory {
         )
         .with_local_bind_addresses(local_bind_addresses)
         .with_bind_interface(bind_interface);
-        let client = H2DohClient {
-            endpoint,
-            connector,
-        };
+        let client = H2DohClient::new(endpoint, connector);
         let resolver = AsyncDnsResolver::new(client)
             .with_cache(DnsCache::new(self.builtin.cache_capacity.max(1))?);
         Ok(Arc::new(TimeoutResolver::new(
@@ -820,13 +830,13 @@ impl ResolverTransportFactory for BuiltinResolverFactory {
                         .with_cache(DnsCache::new(self.cache_capacity.max(1))?);
                     Ok(Arc::new(resolver))
                 } else {
-                    let client = AsyncUdpDnsClient {
+                    let client = AsyncUdpDnsClient::new(
                         server,
-                        timeout: self.timeout,
-                        max_packet_size: self.max_packet_size,
+                        self.timeout,
+                        self.max_packet_size,
                         local_bind_addresses,
-                        bind_interface: bind_interface.clone(),
-                    };
+                        bind_interface.clone(),
+                    );
                     let resolver = AsyncDnsResolver::new(client)
                         .with_cache(DnsCache::new(self.cache_capacity.max(1))?);
                     Ok(Arc::new(resolver))

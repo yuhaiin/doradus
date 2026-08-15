@@ -193,12 +193,12 @@ async fn async_main() -> io::Result<()> {
         .map_err(|error| io::Error::other(error.to_string()))?,
     );
     let resolver = DohResolver {
-        client: H2DohClient {
-            endpoint: "https://in-process.invalid/dns-query"
+        client: H2DohClient::new(
+            "https://in-process.invalid/dns-query"
                 .parse()
                 .map_err(|error| io::Error::other(format!("DoH URI: {error}")))?,
-            connector: InProcessDohConnector,
-        },
+            InProcessDohConnector,
+        ),
     };
     let dns_handler = FakeIpAsyncDnsHandler {
         upstream: resolver,

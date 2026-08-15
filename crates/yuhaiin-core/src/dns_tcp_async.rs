@@ -291,7 +291,9 @@ impl<H: AsyncDnsHandler> AsyncTcpDnsServer<H> {
                     connections.push(self.serve_stream(stream));
                 }
                 result = connections.next(), if !connections.is_empty() => {
-                    result.transpose()?;
+                    // Match Go's server loop: one malformed connection must
+                    // not tear down the DNS listener or affect other clients.
+                    let _ = result;
                 }
             }
         }

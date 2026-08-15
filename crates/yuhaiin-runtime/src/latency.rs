@@ -1058,10 +1058,23 @@ mod tests {
             let mut query = [0u8; 4096];
             let (length, peer) = socket.recv_from(&mut query).await.unwrap();
             assert!(length >= 12);
+            // The resolver advertises an EDNS UDP size. Build the mock
+            // response from the question only; copying the OPT pseudo-record
+            // into the answer section would be an invalid DNS response.
+            let mut question_end = 12;
+            loop {
+                let label_length = query[question_end] as usize;
+                question_end += 1;
+                if label_length == 0 {
+                    break;
+                }
+                question_end += label_length;
+            }
+            question_end += 4; // QTYPE and QCLASS
             let mut response = Vec::with_capacity(length + 16);
             response.extend_from_slice(&query[..2]);
             response.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
-            response.extend_from_slice(&query[12..length]);
+            response.extend_from_slice(&query[12..question_end]);
             response.extend_from_slice(&[
                 0xc0, 0x0c, // compressed owner name
                 0, 1, // A

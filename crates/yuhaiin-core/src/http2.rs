@@ -6,7 +6,9 @@
 
 use bytes::Bytes;
 use http::{Request, Uri, header};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Mutex;
 
 #[cfg(feature = "async-proxy")]
 use crate::LocalBoxFuture;
@@ -26,6 +28,7 @@ pub trait H2DohConnector: Send + Sync {
 pub struct H2DohClient<C> {
     pub endpoint: Uri,
     pub connector: C,
+    connection: Arc<Mutex<Option<h2::client::SendRequest<Bytes>>>>,
 }
 
 /// Packet-level adapter that makes the HTTP/2 DoH client usable by the
@@ -45,6 +48,34 @@ impl<C> H2DohDnsHandler<C> {
 }
 
 impl<C: H2DohConnector> H2DohClient<C> {
+    pub fn new(endpoint: Uri, connector: C) -> Self {
+        Self {
+            endpoint,
+            connector,
+            connection: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn sender(&self) -> Result<h2::client::SendRequest<Bytes>> {
+        let mut connection = self.connection.lock().await;
+        if let Some(sender) = connection.as_ref() {
+            return Ok(sender.clone());
+        }
+        let stream = self.connector.connect(&self.endpoint).await?;
+        let (sender, connection_driver) = h2::client::handshake(stream).await.map_err(|error| {
+            Error::new(ErrorKind::Protocol, format!("HTTP/2 handshake: {error}"))
+        })?;
+        tokio::spawn(async move {
+            let _ = connection_driver.await;
+        });
+        *connection = Some(sender.clone());
+        Ok(sender)
+    }
+
+    async fn clear_sender(&self) {
+        *self.connection.lock().await = None;
+    }
+
     pub async fn query(
         &self,
         domain: &DomainName,
@@ -62,10 +93,7 @@ impl<C: H2DohConnector> H2DohClient<C> {
     /// not model.
     pub async fn query_packet(&self, query_packet: &[u8]) -> Result<Vec<u8>> {
         validate_query_packet(query_packet)?;
-        let stream = self.connector.connect(&self.endpoint).await?;
-        let (mut sender, connection) = h2::client::handshake(stream).await.map_err(|error| {
-            Error::new(ErrorKind::Protocol, format!("HTTP/2 handshake: {error}"))
-        })?;
+        let mut sender = self.sender().await?;
 
         let request = Request::builder()
             .method("POST")
@@ -124,28 +152,11 @@ impl<C: H2DohConnector> H2DohClient<C> {
             Ok(bytes)
         };
 
-        // A DoH server normally keeps the HTTP/2 connection alive for reuse.
-        // Waiting for the connection future with `join` would therefore wait
-        // forever after the response body had arrived.  `select` still drives
-        // the connection while the response is pending, then drops the
-        // connection after this one-shot query has its complete body.
-        let response_future = Box::pin(response_future);
-        let connection = Box::pin(connection);
-        match futures_util::future::select(response_future, connection).await {
-            futures_util::future::Either::Left((result, _connection)) => result,
-            futures_util::future::Either::Right((connection_result, _response)) => {
-                connection_result
-                    .map_err(|error| {
-                        Error::new(ErrorKind::Protocol, format!("HTTP/2 connection: {error}"))
-                    })
-                    .and_then(|_| {
-                        Err(Error::new(
-                            ErrorKind::Protocol,
-                            "HTTP/2 connection closed before the DoH response completed",
-                        ))
-                    })
-            }
+        let result = response_future.await;
+        if result.is_err() {
+            self.clear_sender().await;
         }
+        result
     }
 }
 
@@ -238,10 +249,10 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let client = H2DohClient {
-                endpoint: "https://example.invalid/dns-query".parse().unwrap(),
-                connector: KeepAliveConnector,
-            };
+            let client = H2DohClient::new(
+                "https://example.invalid/dns-query".parse().unwrap(),
+                KeepAliveConnector,
+            );
             let domain = DomainName::new("example.com").unwrap();
             let response = tokio::time::timeout(
                 Duration::from_secs(1),
@@ -317,10 +328,10 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let handler = H2DohDnsHandler::new(H2DohClient {
-                endpoint: "https://example.invalid/dns-query".parse().unwrap(),
-                connector: AdapterConnector,
-            });
+            let handler = H2DohDnsHandler::new(H2DohClient::new(
+                "https://example.invalid/dns-query".parse().unwrap(),
+                AdapterConnector,
+            ));
             let domain = DomainName::new("example.com").unwrap();
             let request = encode_query(0x4a2a, &domain, DnsRecordType::A).unwrap();
             let response = handler.answer(&request).await.unwrap();
