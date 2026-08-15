@@ -145,9 +145,17 @@ impl ApiState {
     }
 
     fn request_shutdown(&self) -> bool {
-        self.shutdown
+        let requested = self
+            .shutdown
             .as_ref()
-            .is_some_and(|shutdown| shutdown.send(true).is_ok())
+            .is_some_and(|shutdown| shutdown.send(true).is_ok());
+        if requested {
+            self.controller
+                .monitor()
+                .logs()
+                .warn("runtime shutdown requested by API (source=backup-restore)");
+        }
+        requested
     }
 }
 

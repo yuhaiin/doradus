@@ -166,9 +166,26 @@ impl RuntimeService {
             let shutdown_signal = wait_for_shutdown(task_shutdown.subscribe());
             tokio::pin!(shutdown_signal);
             let api_result = tokio::select! {
-                result = &mut api_task => result
-                    .map_err(|error| Error::new(ErrorKind::Io, format!("HTTP API task: {error}")))?,
+                result = &mut api_task => {
+                    let result = result
+                        .map_err(|error| Error::new(ErrorKind::Io, format!("HTTP API task: {error}")))?;
+                    if *task_shutdown.borrow() {
+                        logs.warn(format!(
+                            "HTTP API task exited during an already-requested shutdown (source=shutdown-request, result={:?})",
+                            result.as_ref().err()
+                        ));
+                    } else {
+                        logs.error(format!(
+                            "HTTP API task exited before a shutdown request (source=http-api-task, result={:?})",
+                            result.as_ref().err()
+                        ));
+                    }
+                    result
+                },
                 _ = &mut shutdown_signal => {
+                    logs.warn(
+                        "runtime shutdown channel signaled (source=API request or runtime task)",
+                    );
                     match tokio::time::timeout(SHUTDOWN_CHILD_TIMEOUT, &mut api_task).await {
                         Ok(result) => result
                             .map_err(|error| Error::new(ErrorKind::Io, format!("HTTP API task: {error}")))?,
@@ -245,6 +262,12 @@ impl RuntimeService {
                 task.abort();
                 let _ = task.await;
                 self.abort_children();
+                self.controller
+                    .monitor()
+                    .logs()
+                    .error(format!(
+                        "runtime service shutdown exceeded {SHUTDOWN_WAIT_TIMEOUT:?} (source=shutdown-task-timeout)"
+                    ));
                 Err(Error::new(
                     ErrorKind::Timeout,
                     format!("runtime service shutdown exceeded {SHUTDOWN_WAIT_TIMEOUT:?}"),
