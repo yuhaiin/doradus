@@ -29,6 +29,18 @@ struct NatBindingKey {
     source: SocketAddr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct NatEndpointKey {
+    network: Network,
+    address: SocketAddr,
+}
+
+impl NatEndpointKey {
+    fn new(network: Network, address: SocketAddr) -> Self {
+        Self { network, address }
+    }
+}
+
 impl From<&NatKey> for NatBindingKey {
     fn from(key: &NatKey) -> Self {
         Self {
@@ -45,7 +57,7 @@ struct NatBinding {
 
 struct NatState {
     entries: HashMap<NatBindingKey, NatBinding>,
-    translated: HashMap<SocketAddr, NatBindingKey>,
+    translated: HashMap<NatEndpointKey, NatBindingKey>,
 }
 
 /// A point-in-time view of the endpoint-independent Full Cone NAT table.
@@ -237,7 +249,7 @@ impl NatTable {
         }
         if state
             .translated
-            .get(&translated)
+            .get(&NatEndpointKey::new(key.network, translated))
             .is_some_and(|owner| owner != &binding_key)
         {
             return Err(Error::invalid(
@@ -256,7 +268,9 @@ impl NatTable {
                 destinations: HashSet::from([key.destination]),
             },
         );
-        state.translated.insert(translated, binding_key);
+        state
+            .translated
+            .insert(NatEndpointKey::new(key.network, translated), binding_key);
         self.metrics.allocations.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -274,7 +288,10 @@ impl NatTable {
         if expired {
             let removed = state.entries.remove(&binding_key);
             if let Some(binding) = removed {
-                state.translated.remove(&binding.entry.translated);
+                state.translated.remove(&NatEndpointKey::new(
+                    binding_key.network,
+                    binding.entry.translated,
+                ));
                 self.metrics
                     .expired_bindings
                     .fetch_add(1, Ordering::Relaxed);
@@ -319,7 +336,9 @@ impl NatTable {
                 .entries
                 .remove(&binding_key)
                 .expect("binding was present");
-            state.translated.remove(&removed.entry.translated);
+            state
+                .translated
+                .remove(&NatEndpointKey::new(network, removed.entry.translated));
             self.metrics
                 .expired_bindings
                 .fetch_add(1, Ordering::Relaxed);
@@ -342,7 +361,7 @@ impl NatTable {
 
         if state
             .translated
-            .get(&translated)
+            .get(&NatEndpointKey::new(network, translated))
             .is_some_and(|owner| owner != &binding_key)
         {
             return Err(Error::invalid(
@@ -350,8 +369,12 @@ impl NatTable {
             ));
         }
         let previous_translated = current.entry.translated;
-        state.translated.remove(&previous_translated);
-        state.translated.insert(translated, binding_key);
+        state
+            .translated
+            .remove(&NatEndpointKey::new(network, previous_translated));
+        state
+            .translated
+            .insert(NatEndpointKey::new(network, translated), binding_key);
         self.metrics
             .translated_rebinds
             .fetch_add(1, Ordering::Relaxed);
@@ -378,7 +401,10 @@ impl NatTable {
             .entries
             .remove(&binding_key)
             .expect("binding was present");
-        state.translated.remove(&binding.entry.translated);
+        state.translated.remove(&NatEndpointKey::new(
+            binding_key.network,
+            binding.entry.translated,
+        ));
         self.metrics.explicit_closes.fetch_add(1, Ordering::Relaxed);
         Ok(Some(binding.entry))
     }
@@ -397,7 +423,9 @@ impl NatTable {
         let Some(binding) = binding else {
             return Ok(0);
         };
-        state.translated.remove(&binding.entry.translated);
+        state
+            .translated
+            .remove(&NatEndpointKey::new(network, binding.entry.translated));
         self.metrics.explicit_closes.fetch_add(1, Ordering::Relaxed);
         Ok(binding.destinations.len())
     }
@@ -431,7 +459,9 @@ impl NatTable {
             .collect();
         for (binding_key, translated, _) in &expired {
             state.entries.remove(binding_key);
-            state.translated.remove(translated);
+            state
+                .translated
+                .remove(&NatEndpointKey::new(binding_key.network, *translated));
         }
         self.metrics
             .expired_bindings
@@ -444,6 +474,7 @@ impl NatTable {
     /// source mapping exists, packets from any remote address are accepted.
     pub fn lookup_translated(
         &self,
+        network: Network,
         translated: SocketAddr,
         _external_source: SocketAddr,
     ) -> Result<Option<NatKey>> {
@@ -452,7 +483,10 @@ impl NatTable {
             .state
             .lock()
             .map_err(|_| Error::new(ErrorKind::Closed, "NAT reverse index lock poisoned"))?;
-        let binding_key = state.translated.get(&translated).copied();
+        let binding_key = state
+            .translated
+            .get(&NatEndpointKey::new(network, translated))
+            .copied();
         let Some(binding_key) = binding_key else {
             return Ok(None);
         };
@@ -464,7 +498,9 @@ impl NatTable {
                 .entries
                 .remove(&binding_key)
                 .expect("binding was present");
-            state.translated.remove(&binding.entry.translated);
+            state
+                .translated
+                .remove(&NatEndpointKey::new(network, binding.entry.translated));
             self.metrics
                 .expired_bindings
                 .fetch_add(1, Ordering::Relaxed);
@@ -505,7 +541,9 @@ impl NatTable {
                 .entries
                 .remove(&binding_key)
                 .expect("binding was present");
-            state.translated.remove(&binding.entry.translated);
+            state
+                .translated
+                .remove(&NatEndpointKey::new(network, binding.entry.translated));
             self.metrics
                 .expired_bindings
                 .fetch_add(1, Ordering::Relaxed);
@@ -652,7 +690,7 @@ impl UdpNatRelay {
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "UDP packet has no NAT mapping"))?;
         if self
             .table
-            .lookup_translated(self.local_addr()?, peer)?
+            .lookup_translated(Network::Udp, self.local_addr()?, peer)?
             .is_none()
         {
             return Err(Error::new(
@@ -674,7 +712,7 @@ impl UdpNatRelay {
             && let Some(key) = mapping.as_ref()
             && self
                 .table
-                .lookup_translated(self.local_addr()?, key.source)?
+                .lookup_translated(Network::Udp, self.local_addr()?, key.source)?
                 .is_none()
         {
             *mapping = None;

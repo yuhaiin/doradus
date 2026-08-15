@@ -63,7 +63,7 @@ fn full_cone_mapping_is_shared_across_destinations() {
     assert_eq!(table.len().unwrap(), 1);
     assert_eq!(
         table
-            .lookup_translated(translated, "192.0.2.200:9".parse().unwrap())
+            .lookup_translated(Network::Udp, translated, "192.0.2.200:9".parse().unwrap(),)
             .unwrap()
             .unwrap()
             .source,
@@ -75,7 +75,7 @@ fn full_cone_mapping_is_shared_across_destinations() {
     assert_eq!(table.len().unwrap(), 0);
     assert!(
         table
-            .lookup_translated(translated, "192.0.2.201:9".parse().unwrap())
+            .lookup_translated(Network::Udp, translated, "192.0.2.201:9".parse().unwrap(),)
             .unwrap()
             .is_none()
     );
@@ -100,7 +100,7 @@ fn nat_stats_expose_full_cone_reuse_reverse_and_close_lifecycle() {
     table.touch(&first).unwrap();
     assert!(
         table
-            .lookup_translated(placeholder, "203.0.113.7:9".parse().unwrap())
+            .lookup_translated(Network::Udp, placeholder, "203.0.113.7:9".parse().unwrap(),)
             .unwrap()
             .is_some()
     );
@@ -154,13 +154,17 @@ fn translated_endpoint_can_be_rebound_after_transport_creation() {
     assert_eq!(entry.translated, translated);
     assert!(
         table
-            .lookup_translated(placeholder, "198.51.100.200:9".parse().unwrap())
+            .lookup_translated(
+                Network::Udp,
+                placeholder,
+                "198.51.100.200:9".parse().unwrap(),
+            )
             .unwrap()
             .is_none()
     );
     assert_eq!(
         table
-            .lookup_translated(translated, "203.0.113.200:9".parse().unwrap())
+            .lookup_translated(Network::Udp, translated, "203.0.113.200:9".parse().unwrap(),)
             .unwrap()
             .unwrap()
             .source,
@@ -190,6 +194,53 @@ fn translated_endpoint_cannot_be_claimed_by_two_sources() {
         table
             .bind_translated(Network::Udp, second.source, translated)
             .is_err()
+    );
+}
+
+#[test]
+fn tcp_and_udp_bindings_can_share_the_same_socket_address() {
+    let table = NatTable::new();
+    let udp = key();
+    let tcp = NatKey {
+        network: Network::Tcp,
+        ..udp.clone()
+    };
+    let translated = "203.0.113.10:50001".parse().unwrap();
+
+    // Go's comparable address includes AddressNetwork, so TCP and UDP may
+    // legitimately reuse the same source port and translated address.
+    table
+        .insert(tcp.clone(), translated, Duration::from_secs(30))
+        .unwrap();
+    table
+        .insert(udp.clone(), translated, Duration::from_secs(30))
+        .unwrap();
+
+    assert_eq!(table.len().unwrap(), 2);
+    assert_eq!(
+        table
+            .lookup_translated(Network::Tcp, translated, "192.0.2.200:9".parse().unwrap())
+            .unwrap()
+            .unwrap()
+            .network,
+        Network::Tcp
+    );
+    assert_eq!(
+        table
+            .lookup_translated(Network::Udp, translated, "192.0.2.200:9".parse().unwrap())
+            .unwrap()
+            .unwrap()
+            .network,
+        Network::Udp
+    );
+
+    table.remove(&tcp).unwrap();
+    assert_eq!(table.len().unwrap(), 1);
+    assert!(
+        table
+            .lookup_translated(Network::Udp, translated, "192.0.2.200:9".parse().unwrap())
+            .unwrap()
+            .is_some()
     );
 }
 
@@ -469,7 +520,7 @@ fn full_cone_repeated_generations_survive_long_soak_and_release_matrix() {
             // must not remove a mapping that is being touched by traffic.
             assert!(
                 table
-                    .lookup_translated(relay.local_addr().unwrap(), external_probe)
+                    .lookup_translated(Network::Udp, relay.local_addr().unwrap(), external_probe)
                     .unwrap()
                     .is_some()
             );
@@ -632,7 +683,7 @@ fn concurrent_insert_touch_and_sweep_preserve_a_full_cone_binding() {
         scope.spawn(move || {
             for _ in 0..500 {
                 let _ = lookup_table
-                    .lookup_translated(translated, "203.0.113.200:9".parse().unwrap())
+                    .lookup_translated(Network::Udp, translated, "203.0.113.200:9".parse().unwrap())
                     .unwrap();
             }
         });
@@ -640,7 +691,7 @@ fn concurrent_insert_touch_and_sweep_preserve_a_full_cone_binding() {
     assert_eq!(table.len().unwrap(), 1);
     assert!(
         table
-            .lookup_translated(translated, "192.0.2.200:9".parse().unwrap())
+            .lookup_translated(Network::Udp, translated, "192.0.2.200:9".parse().unwrap(),)
             .unwrap()
             .is_some()
     );

@@ -284,6 +284,7 @@ async fn proxy_runtime_shares_one_udp_proxy_per_source_for_full_cone_nat() {
     assert_eq!(
         table
             .lookup_translated(
+                Network::Udp,
                 "127.0.0.1:1".parse().unwrap(),
                 "203.0.113.200:9".parse().unwrap(),
             )
@@ -619,7 +620,7 @@ async fn full_cone_real_direct_tun_accepts_unseen_peer_and_force_closes_source()
         .unwrap();
     assert_eq!(
         table
-            .lookup_translated(translated, unseen_peer.local_addr().unwrap())
+            .lookup_translated(Network::Udp, translated, unseen_peer.local_addr().unwrap())
             .unwrap()
             .unwrap()
             .source,
