@@ -81,6 +81,7 @@ FEATURE_ARGS += --features "$(FEATURES)"
 endif
 
 RUNTIME_PACKAGE := yuhaiin-runtime
+API_PACKAGE := yuhaiin-api
 RUNTIME_BIN := yuhaiin
 
 .PHONY: help cache-usage cache-prune checklist-check build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-udp-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-reset-reconnect-smoke tun-mtu-smoke tun-distro-smoke release-linux-cross-smoke release-windows-cross-smoke tun-ipv6-extension-smoke tun-route-matrix-smoke tun-api-process-smoke wireguard-smoke wireguard-chain-smoke wireguard-external-smoke maxmind-smoke s3-minio-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke go-termination-parity-smoke go-termination-https-smoke http-inbound-https-smoke go-protocol-interop-smoke refact-user-parity-smoke production-parity-smoke production-abnormal-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput benchmark-wireguard-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke socks5-protocol-smoke node-latency-dns-smoke stats-concurrency-smoke stats-soak-smoke startup-logs-smoke workspace-tests \
@@ -178,11 +179,11 @@ checklist-check:
 build: build-debug
 
 build-debug:
-	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p $(API_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
 	@printf 'binary: %s/%s\n' "$(DEBUG_BINARY_DIR)" "$(RUNTIME_BIN)"
 
 build-release:
-	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) --release -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) --release -p $(API_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
 	@printf 'binary: %s/%s\n' "$(RELEASE_BINARY_DIR)" "$(RUNTIME_BIN)"
 
 build-musl:
@@ -366,7 +367,7 @@ build-chain-smoke:
 	@printf 'binary: %s/debug/chain-smoke\n' "$(CARGO_TARGET_DIR)"
 
 run:
-	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) run $(CARGO_EXEC_COMMON_ARGS) -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS) -- $(ARGS)
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) run $(CARGO_EXEC_COMMON_ARGS) -p $(API_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS) -- $(ARGS)
 
 version: build-debug
 	"$(DEBUG_BINARY_DIR)/$(RUNTIME_BIN)" version
@@ -406,5 +407,5 @@ android-aarch64:
 	CC_aarch64_linux_android="$(ANDROID_CLANG)" \
 	AR_aarch64_linux_android="$(ANDROID_LLVM_AR)" \
 	CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$(ANDROID_CLANG)" \
-		$(CARGO) build $(CARGO_COMMON_ARGS) --target $(ANDROID_TARGET) --release -p $(RUNTIME_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
+		$(CARGO) build $(CARGO_COMMON_ARGS) --target $(ANDROID_TARGET) --release -p $(API_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
 	@printf 'binary: %s/%s/release/%s\n' "$(CARGO_TARGET_DIR)" "$(ANDROID_TARGET)" "$(RUNTIME_BIN)"

@@ -138,7 +138,11 @@ impl UpdateService {
         )
     }
 
-    #[cfg(test)]
+    /// Construct a short-timeout client for API contract tests. The API crate
+    /// is a separate package, so a dependency cannot see this method through
+    /// its own `cfg(test)` build unless the constructor is part of the public
+    /// runtime surface.
+    #[doc(hidden)]
     pub fn test_stub() -> Self {
         Self::with_releases_url("http://127.0.0.1:9".to_owned(), Duration::from_millis(100))
     }

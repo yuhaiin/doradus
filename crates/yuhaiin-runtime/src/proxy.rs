@@ -1546,7 +1546,7 @@ impl RuntimeSnapshot {
         )))
     }
 
-    pub(crate) fn resolve_proxy(&self, proxy: Arc<dyn AsyncProxy>) -> Arc<dyn AsyncProxy> {
+    pub fn resolve_proxy(&self, proxy: Arc<dyn AsyncProxy>) -> Arc<dyn AsyncProxy> {
         self.resolve_proxy_with_resolver(proxy, self.dns_resolver.clone())
     }
 
@@ -2310,7 +2310,6 @@ fn annotate_connection_metadata(
     if context.outbound_addr.is_none() {
         context.outbound_addr = Some(Endpoint::ip(context.network, endpoint));
     }
-    #[cfg(feature = "http-api")]
     if context.interface.is_none() {
         context.interface = crate::interfaces::interface_for_ip(endpoint.ip());
     }

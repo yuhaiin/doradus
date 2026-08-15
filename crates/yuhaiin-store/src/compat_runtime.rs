@@ -86,12 +86,12 @@ impl GoDnsSettingsRecord {
         // feature is off; normalize it to the same safe defaults before the
         // Rust runtime builds its typed configuration.
         let ipv4_range = if self.fakedns_ipv4_range.trim().is_empty() {
-            "198.18.0.0/15"
+            "10.2.0.1/24"
         } else {
             &self.fakedns_ipv4_range
         };
         let ipv6_range = if self.fakedns_ipv6_range.trim().is_empty() {
-            "fc00::/18"
+            "fc00::/64"
         } else {
             &self.fakedns_ipv6_range
         };

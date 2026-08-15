@@ -41,12 +41,12 @@ use yuhaiin_store::{
     GoSubscriptionLinkRecord, GoUserRecord, GoUserWrite, InboundSettings, MaxMindMetadataRecord,
 };
 
-use crate::update::UpdateService;
-use crate::{
+use crate::backup_transport::ProxyS3Transport;
+use yuhaiin_runtime::update::UpdateService;
+use yuhaiin_runtime::{
     ProxyRouteListTransport, RouteListTransport, RuntimeController,
-    backup_transport::ProxyS3Transport, download_route_url_with_transport,
-    interfaces::discover_interfaces, latency::LatencyRequest, log::log_batch_value,
-    refresh_route_list_caches_with_transport,
+    download_route_url_with_transport, interfaces::discover_interfaces, latency::LatencyRequest,
+    log::log_batch_value, refresh_route_list_caches_with_transport,
 };
 
 // Go keeps TCP and UDP node selection independently in metadata.  Keep the
@@ -1536,7 +1536,7 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
         .list_go_route_lists()
         .await?;
     let timeout = Duration::from_secs(90);
-    let proxy_id = crate::inbound::selected_proxy_id(&state.controller).await?;
+    let proxy_id = yuhaiin_runtime::inbound::selected_proxy_id(&state.controller).await?;
     let snapshot = state.controller.handle().load();
     let proxy: Arc<dyn AsyncProxy> = match snapshot.build_proxy(&proxy_id, timeout).await {
         Ok(build) => build.proxy,
@@ -2025,7 +2025,7 @@ async fn get_inbound_value(state: &ApiState, id: String) -> ApiResult {
 
 async fn save_inbound_value(state: &ApiState, value: Value, _index: Option<usize>) -> ApiResult {
     let mut value = value;
-    crate::inbound::fill_generated_fields(&mut value)?;
+    yuhaiin_runtime::inbound::fill_generated_fields(&mut value)?;
     let id = required_string(&value, "id")?;
     let record = GoInboundRecord {
         id: id.clone(),
@@ -2920,7 +2920,7 @@ async fn node_latency_value(state: &ApiState, value: &Value) -> ApiResult {
     let request: LatencyRequest = serde_json::from_value(value.clone())?;
     match tokio::time::timeout(
         timeout,
-        crate::latency::probe_with_resolver(proxy, resolver, request, timeout),
+        yuhaiin_runtime::latency::probe_with_resolver(proxy, resolver, request, timeout),
     )
     .await
     {
@@ -3438,7 +3438,7 @@ fn backup_s3_config(value: &Value) -> Result<S3Config, ApiError> {
 }
 
 async fn backup_s3_client(state: &ApiState, config: S3Config) -> Result<S3Client, ApiError> {
-    let selected = crate::inbound::selected_proxy_id(&state.controller)
+    let selected = yuhaiin_runtime::inbound::selected_proxy_id(&state.controller)
         .await
         .map_err(|error| ApiError::unavailable(format!("select S3 outbound proxy: {error}")))?;
     let proxy = state
@@ -4568,7 +4568,20 @@ fn route_list_refresh_duration(value: &Value) -> Option<Duration> {
     Some(Duration::from_secs(minutes.checked_mul(60)?))
 }
 fn default_fakedns() -> Value {
-    json!({"enabled":false,"ipv4Range":"198.18.0.0/15","ipv6Range":"fc00::/18","whitelist":[],"skipCheckList":[]})
+    json!({
+        "enabled": false,
+        "ipv4Range": "10.2.0.1/24",
+        "ipv6Range": "fc00::/64",
+        "whitelist": [
+            "*.msftncsi.com",
+            "*.msftconnecttest.com",
+            "ping.archlinux.org",
+            "mask.icloud.com",
+            "mask-h2.icloud.com",
+            "mask.apple-dns.net"
+        ],
+        "skipCheckList": []
+    })
 }
 fn default_tun_config() -> Value {
     json!({"enabled":false,"name":"yuhaiin0","mtu":1500,"queueCapacity":256,"channelCapacity":256,"directId":"","proxyId":"","bypassId":"","dropId":""})
@@ -4577,7 +4590,6 @@ fn default_tun_config() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RuntimeBuilder, RuntimeController};
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use base64::Engine;
@@ -4589,6 +4601,7 @@ mod tests {
     use tower::ServiceExt;
     use yuhaiin_core::dns::{DnsResponse, encode_response};
     use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_runtime::{RuntimeBuilder, RuntimeController};
     use yuhaiin_store::ConfigStore;
 
     #[test]
@@ -5716,7 +5729,7 @@ mod tests {
             .unwrap();
         assert_eq!(detail.0["errorMsgs"], json!([]));
 
-        let cache_path = crate::route::route_list_cache_path(&url);
+        let cache_path = yuhaiin_runtime::route_list_cache_path(&url);
         let _ = std::fs::remove_file(cache_path);
     }
 

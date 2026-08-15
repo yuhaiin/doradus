@@ -35,7 +35,7 @@ podman run --rm --network=host \
     CARGO_TERM_COLOR=never cargo build \
       --locked \
       --manifest-path /workspace/Cargo.toml \
-      -p yuhaiin-runtime \
+      -p yuhaiin-api \
       --all-features \
       --bin yuhaiin \
       >/state/runtime-build.log 2>&1

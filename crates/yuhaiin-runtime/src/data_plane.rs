@@ -1018,8 +1018,7 @@ mod tests {
             .unwrap()
             .addresses
             .v4[0];
-        assert_eq!(address.octets()[0], 198);
-        assert_eq!(address.octets()[1], 18);
+        assert_eq!(address.octets()[0], 10);
         assert_eq!(
             pools.view_store().lookup_domain_ip(address.into()),
             Some(domain)

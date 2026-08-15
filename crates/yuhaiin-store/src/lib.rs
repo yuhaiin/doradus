@@ -795,7 +795,12 @@ impl ConfigStore {
     }
 
     pub async fn list_config(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        validate_key(prefix)?;
+        // An empty prefix is the intentional "list all" form used by startup
+        // migration guards.  Non-empty prefixes retain the same key
+        // validation as get/put/delete.
+        if !prefix.is_empty() {
+            validate_key(prefix)?;
+        }
         let pattern = format!("{prefix}%");
         let connection = self.lock_connection()?;
         let rows = connection

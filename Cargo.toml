@@ -12,6 +12,7 @@ members = [
     "crates/yuhaiin-trie",
     "crates/yuhaiin-wireguard",
     "crates/yuhaiin-backup",
+    "crates/yuhaiin-api",
     "crates/yuhaiin-runtime",
 ]
 

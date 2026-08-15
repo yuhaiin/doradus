@@ -88,7 +88,7 @@ echo "[go-termination-parity] building Go and Rust services in Podman"
   env GOEXPERIMENT=jsonv2,greenteagc go build -o /state/yuhaiin-go ./cmd/yuhaiin
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${run_dir}" -- \
-  cargo build --locked -p yuhaiin-runtime --all-features --bin yuhaiin \
+  cargo build --locked -p yuhaiin-api --all-features --bin yuhaiin \
   >"${run_dir}/rust-build.log" 2>&1
 test -x "${rust_binary}"
 

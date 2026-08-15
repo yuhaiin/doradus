@@ -1,0 +1,79 @@
+[package]
+name = "yuhaiin-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["http-api", "tun", "tun-routes", "doh-tls", "websocket", "http-termination"]
+http-api = ["update"]
+update = ["yuhaiin-runtime/update"]
+http2 = ["yuhaiin-runtime/http2"]
+http-termination = ["yuhaiin-runtime/http-termination"]
+tun = ["yuhaiin-runtime/tun"]
+tun-routes = ["yuhaiin-runtime/tun-routes"]
+doh-tls = [
+    "yuhaiin-runtime/doh-tls",
+    "dep:rustls",
+    "dep:rustls-rustcrypto",
+    "dep:webpki-roots",
+]
+websocket = ["yuhaiin-runtime/websocket"]
+
+[dependencies]
+axum = { version = "0.8.4", default-features = false, features = ["http1", "json", "query", "tokio"] }
+base64 = "0.22.1"
+blake2 = { version = "0.10.6", default-features = false }
+futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
+http = "1.5.0"
+http-body-util = "0.1.4"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots-no-provider"] }
+rustls = { version = "0.23.41", optional = true, default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = { version = "0.0.2-alpha", optional = true, default-features = false, features = ["std", "tls12", "zeroize"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = { version = "0.11.0", default-features = false }
+time = { version = "0.3.44", features = ["formatting", "local-offset", "parsing"] }
+tokio = { version = "1.50.0", default-features = false, features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
+tower-http = { version = "0.6.6", default-features = false, features = ["cors", "fs"] }
+uuid = { version = "1.24.0", default-features = false, features = ["std", "v4"] }
+webpki-roots = { version = "1.0.3", optional = true }
+yuhaiin-backup = { path = "../yuhaiin-backup" }
+yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
+yuhaiin-geo = { path = "../yuhaiin-geo" }
+yuhaiin-runtime = { path = "../yuhaiin-runtime", default-features = false }
+yuhaiin-store = { path = "../yuhaiin-store", features = ["async-dns"] }
+
+[target.'cfg(unix)'.dependencies]
+pprof = { version = "0.15.0", default-features = false, features = ["prost-codec"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.0"
+
+[dev-dependencies]
+boringtun = { version = "0.7.1", default-features = false }
+bytes = "1.12.1"
+h2 = "0.4.15"
+hyper = { version = "1.11.0", default-features = false }
+nix = { version = "0.30.1", default-features = false, features = ["net", "uio", "process", "signal"] }
+p256-tls-auto = { package = "p256", version = "0.13.2", default-features = false, features = ["ecdsa", "pem", "pkcs8", "std"] }
+rustls = { version = "0.23.41", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["std", "tls12", "zeroize"] }
+rustls-pemfile = "2.2.0"
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["tls12"] }
+tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["handshake"] }
+tower = { version = "0.5.2", features = ["util"] }
+x509-cert = { version = "0.2.5", default-features = false, features = ["builder", "std"] }
+yuhaiin-chain = { path = "../yuhaiin-chain" }
+yuhaiin-platform = { path = "../yuhaiin-platform" }
+yuhaiin-protocol = { path = "../yuhaiin-protocol" }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "yuhaiin"
+path = "src/bin/yuhaiin.rs"
+required-features = ["http-api"]

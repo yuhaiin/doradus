@@ -14,7 +14,7 @@ echo "[throughput] building release runtime and benchmark test in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   cargo build \
-  -p yuhaiin-runtime \
+  -p yuhaiin-api \
   --all-features \
   --release \
   --bin yuhaiin \
@@ -22,7 +22,7 @@ echo "[throughput] building release runtime and benchmark test in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   cargo test \
-  -p yuhaiin-runtime \
+  -p yuhaiin-api \
   --all-features \
   --release \
   --test throughput \

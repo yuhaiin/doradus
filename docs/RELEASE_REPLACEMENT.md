@@ -38,7 +38,7 @@ CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ndk_bin/aarch64-linux-android35-clan
 CC_aarch64_linux_android="$ndk_bin/aarch64-linux-android35-clang" \
 CXX_aarch64_linux_android="$ndk_bin/aarch64-linux-android35-clang++" \
 AR_aarch64_linux_android="$ndk_bin/llvm-ar" \
-cargo build -p yuhaiin-runtime --bin yuhaiin --all-features \
+cargo build -p yuhaiin-api --bin yuhaiin --all-features \
   --target aarch64-linux-android --release --offline
 ```
 

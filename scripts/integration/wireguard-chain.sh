@@ -17,12 +17,12 @@ echo "[wireguard-chain] compiling runtime and process harness in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${integration_dir}" -- \
   cargo build \
-  --locked -p yuhaiin-runtime --bin yuhaiin --all-features \
+  --locked -p yuhaiin-api --bin yuhaiin --all-features \
   >"${integration_dir}/runtime-build.log" 2>&1
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${integration_dir}" -- \
   cargo test \
-  --locked -p yuhaiin-runtime --all-features --test wireguard_chain --no-run \
+  --locked -p yuhaiin-api --all-features --test wireguard_chain --no-run \
   >"${integration_dir}/build.log" 2>&1
 
 harness_path="$(sed -n 's/^  Executable tests\/wireguard_chain.rs (\(.*\))$/\1/p' "${integration_dir}/build.log" | tail -n 1)"

@@ -16,14 +16,14 @@ echo "[stats-concurrency] building runtime integration test binary in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   cargo build --locked \
-  -p yuhaiin-runtime \
+  -p yuhaiin-api \
   --all-features \
   --bin yuhaiin \
   >"${scenario_dir}/runtime-build.log"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   cargo test --locked \
-  -p yuhaiin-runtime \
+  -p yuhaiin-api \
   --all-features \
   --test stats_concurrency \
   --no-run \

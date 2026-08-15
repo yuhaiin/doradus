@@ -145,7 +145,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --release --target "${{ matrix.target }}" \
-            -p yuhaiin-runtime --bin yuhaiin --all-features
+            -p yuhaiin-api --bin yuhaiin --all-features
           mkdir -p dist
           source_binary="target/${{ matrix.target }}/release/yuhaiin${{ matrix.platform == 'windows' && '.exe' || '' }}"
           release_binary="dist/yuhaiin-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.platform == 'windows' && '.exe' || '' }}"

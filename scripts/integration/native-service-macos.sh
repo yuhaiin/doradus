@@ -52,11 +52,11 @@ trap cleanup EXIT INT TERM
 
 echo "[native-service-macos] building release binary in the native runner"
 cargo test --locked \
-  -p yuhaiin-runtime --bin yuhaiin --all-features \
+  -p yuhaiin-api --bin yuhaiin --all-features \
   service::macos::tests -- --nocapture \
   >"${run_dir}/unit-tests.log" 2>&1
 cargo build --locked --release \
-  -p yuhaiin-runtime --bin yuhaiin --all-features \
+  -p yuhaiin-api --bin yuhaiin --all-features \
   >"${run_dir}/build.log" 2>&1
 test -x "${binary}"
 

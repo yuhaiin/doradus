@@ -23,7 +23,7 @@ echo "[systemd-service] building runtime binary in Podman"
 "${repo_dir}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${run_dir}" -- \
   cargo build --locked \
-  -p yuhaiin-runtime \
+  -p yuhaiin-api \
   --all-features \
   --bin yuhaiin \
   >"${run_dir}/build.log"

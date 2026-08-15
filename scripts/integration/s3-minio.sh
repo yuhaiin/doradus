@@ -36,7 +36,7 @@ echo "[s3-minio] building runtime in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   cargo build \
-  --locked -p yuhaiin-runtime --bin yuhaiin --all-features \
+  --locked -p yuhaiin-api --bin yuhaiin --all-features \
   >"${scenario_dir}/runtime-build.log" 2>&1
 runtime_binary="${target_dir}/debug/yuhaiin"
 test -x "${runtime_binary}"

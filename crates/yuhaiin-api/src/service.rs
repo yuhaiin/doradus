@@ -9,25 +9,34 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::watch;
 
-#[cfg(not(feature = "doh-tls"))]
-use crate::BuiltinResolverFactory;
 use crate::api::ApiState;
-use crate::{RuntimeBuilder, RuntimeController, RuntimeHandle, RuntimeLog};
+use crate::api::{run_route_list_refresh_loop, serve_until};
 use yuhaiin_core::dns_resolver_async::{AsyncIpResolver, SystemAsyncIpResolver};
 use yuhaiin_core::{Error, ErrorKind, Result};
+#[cfg(not(feature = "doh-tls"))]
+use yuhaiin_runtime::BuiltinResolverFactory;
+#[cfg(feature = "tun")]
+use yuhaiin_runtime::TunRuntimeConfig;
+use yuhaiin_runtime::{
+    ResolverProxyBridge, RuntimeBuilder, RuntimeController, RuntimeHandle, RuntimeLog,
+    run_dns_supervisor,
+};
 use yuhaiin_store::{ConfigStore, restore_database};
+
+const SHUTDOWN_CHILD_TIMEOUT: Duration = Duration::from_secs(2);
+const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A TUN device supplied by a native host instead of opened by the desktop
 /// device builder.
 #[cfg(all(feature = "tun", unix))]
 pub struct InjectedTun {
     pub fd: std::os::fd::OwnedFd,
-    pub config: crate::TunRuntimeConfig,
+    pub config: TunRuntimeConfig,
 }
 
 /// Inputs required to start the shared runtime service.
@@ -62,6 +71,7 @@ pub struct RuntimeService {
     address: SocketAddr,
     shutdown: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
+    child_aborts: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
 impl RuntimeService {
@@ -94,6 +104,8 @@ impl RuntimeService {
         let task_controller = controller.clone();
         let task_shutdown = shutdown.clone();
         let route_refresh_state = state.clone();
+        let child_aborts = Arc::new(Mutex::new(Vec::new()));
+        let task_child_aborts = Arc::clone(&child_aborts);
         let task = tokio::task::spawn_local(async move {
             let logs = task_controller.monitor().logs();
             let dns_shutdown = shutdown_rx.clone();
@@ -103,7 +115,7 @@ impl RuntimeService {
             let dns_logs = logs.clone();
             let dns_controller = task_controller.clone();
             let dns_task = tokio::task::spawn_local(async move {
-                let result = crate::run_dns_supervisor(dns_controller, dns_shutdown).await;
+                let result = run_dns_supervisor(dns_controller, dns_shutdown).await;
                 if let Err(error) = &result {
                     // Report bind/configuration failures when they happen. The
                     // service intentionally keeps the API and other inbound
@@ -113,16 +125,15 @@ impl RuntimeService {
                 }
                 result
             });
-            let route_refresh_task =
-                tokio::task::spawn_local(crate::api::run_route_list_refresh_loop(
-                    route_refresh_state,
-                    route_refresh_shutdown,
-                ));
+            let route_refresh_task = tokio::task::spawn_local(run_route_list_refresh_loop(
+                route_refresh_state,
+                route_refresh_shutdown,
+            ));
             let inbound_controller = task_controller.clone();
             let inbound_task = tokio::task::spawn_local(async move {
                 #[cfg(all(feature = "tun", unix))]
                 if let Some(injected_tun) = injected_tun {
-                    return crate::inbound::run_until_with_tun_fd(
+                    return yuhaiin_runtime::inbound::run_until_with_tun_fd(
                         inbound_controller.clone(),
                         inbound_shutdown.clone(),
                         injected_tun.fd,
@@ -130,23 +141,57 @@ impl RuntimeService {
                     )
                     .await;
                 }
-                crate::inbound::run_until(inbound_controller, inbound_shutdown).await
+                yuhaiin_runtime::inbound::run_until(inbound_controller, inbound_shutdown).await
             });
-            let api_task = tokio::spawn(crate::api::serve_until(
+            let mut api_task = tokio::spawn(serve_until(
                 listener,
                 state,
                 wait_for_shutdown(api_shutdown),
             ));
 
-            let api_result = api_task
-                .await
-                .map_err(|error| Error::new(ErrorKind::Io, format!("HTTP API task: {error}")))?;
+            if let Ok(mut aborts) = task_child_aborts.lock() {
+                aborts.extend([
+                    dns_task.abort_handle(),
+                    route_refresh_task.abort_handle(),
+                    inbound_task.abort_handle(),
+                    api_task.abort_handle(),
+                ]);
+            }
+
+            // Axum's graceful shutdown waits for every active HTTP
+            // connection. A browser-held SSE stream, an unfinished pprof
+            // request, or a half-open client can therefore keep the whole
+            // process alive forever. Observe the service signal separately
+            // and force-close the API task after a bounded grace period.
+            let shutdown_signal = wait_for_shutdown(task_shutdown.subscribe());
+            tokio::pin!(shutdown_signal);
+            let api_result = tokio::select! {
+                result = &mut api_task => result
+                    .map_err(|error| Error::new(ErrorKind::Io, format!("HTTP API task: {error}")))?,
+                _ = &mut shutdown_signal => {
+                    match tokio::time::timeout(SHUTDOWN_CHILD_TIMEOUT, &mut api_task).await {
+                        Ok(result) => result
+                            .map_err(|error| Error::new(ErrorKind::Io, format!("HTTP API task: {error}")))?,
+                        Err(_) => {
+                            api_task.abort();
+                            let _ = api_task.await;
+                            logs.warn(format!(
+                                "HTTP API graceful shutdown exceeded {:?}; task aborted",
+                                SHUTDOWN_CHILD_TIMEOUT
+                            ));
+                            Ok(())
+                        }
+                    }
+                }
+            };
             let _ = task_shutdown.send(true);
-            let _ = dns_task.await.map_err(join_error)?;
-            if let Err(error) = inbound_task.await.map_err(join_error)? {
+            if let Some(Err(error)) = await_child(dns_task, "DNS", &logs).await {
+                logs.error(format!("inbound DNS task stopped: {error}"));
+            }
+            if let Some(Err(error)) = await_child(inbound_task, "inbound", &logs).await {
                 logs.error(format!("inbound task stopped: {error}"));
             }
-            route_refresh_task.await.map_err(join_error)?;
+            let _ = await_child(route_refresh_task, "route refresh", &logs).await;
             task_controller.persist_monitor().await?;
             if let Some(source) = task_controller.take_restore_request() {
                 restore_database(source, &database).await?;
@@ -159,6 +204,7 @@ impl RuntimeService {
             address,
             shutdown,
             task: Some(task),
+            child_aborts,
         })
     }
 
@@ -189,17 +235,37 @@ impl RuntimeService {
     }
 
     pub async fn wait(mut self) -> Result<()> {
-        let task = self
+        let mut task = self
             .task
             .take()
             .ok_or_else(|| Error::new(ErrorKind::Closed, "runtime service task is missing"))?;
-        task.await.map_err(join_error)?
+        match tokio::time::timeout(SHUTDOWN_WAIT_TIMEOUT, &mut task).await {
+            Ok(result) => result.map_err(join_error)?,
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                self.abort_children();
+                Err(Error::new(
+                    ErrorKind::Timeout,
+                    format!("runtime service shutdown exceeded {SHUTDOWN_WAIT_TIMEOUT:?}"),
+                ))
+            }
+        }
+    }
+
+    fn abort_children(&self) {
+        if let Ok(aborts) = self.child_aborts.lock() {
+            for abort in aborts.iter() {
+                abort.abort();
+            }
+        }
     }
 }
 
 impl Drop for RuntimeService {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
+        self.abort_children();
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -208,7 +274,7 @@ impl Drop for RuntimeService {
 
 async fn build_controller(store: ConfigStore) -> Result<RuntimeController> {
     let upstream: Arc<dyn AsyncIpResolver> = Arc::new(SystemAsyncIpResolver);
-    let resolver_proxy_bridge = Arc::new(crate::ResolverProxyBridge::new());
+    let resolver_proxy_bridge = Arc::new(ResolverProxyBridge::new());
     let mut builder = RuntimeBuilder::new(store, upstream)
         .with_resolver_proxy_bridge(resolver_proxy_bridge.clone());
     #[cfg(feature = "doh-tls")]
@@ -222,7 +288,7 @@ async fn build_controller(store: ConfigStore) -> Result<RuntimeController> {
                 .with_root_certificates(roots)
                 .with_no_client_auth();
         builder = builder.with_resolver_factory(Arc::new(
-            crate::RustCryptoResolverFactory::from_client_config(
+            yuhaiin_runtime::RustCryptoResolverFactory::from_client_config(
                 Arc::new(config),
                 Duration::from_secs(5),
                 256,
@@ -255,11 +321,34 @@ fn join_error(error: tokio::task::JoinError) -> Error {
     io_error(error)
 }
 
+async fn await_child<T>(
+    mut task: tokio::task::JoinHandle<T>,
+    name: &str,
+    logs: &RuntimeLog,
+) -> Option<T> {
+    match tokio::time::timeout(SHUTDOWN_CHILD_TIMEOUT, &mut task).await {
+        Ok(Ok(result)) => Some(result),
+        Ok(Err(error)) => {
+            logs.error(format!("{name} task join failed: {error}"));
+            None
+        }
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            logs.warn(format!(
+                "{name} shutdown exceeded {:?}; task aborted",
+                SHUTDOWN_CHILD_TIMEOUT
+            ));
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{RuntimeService, ServiceOptions};
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn test_database() -> PathBuf {
         let root = std::env::var_os("YUHAIIN_CACHE_DIR")
@@ -303,6 +392,30 @@ mod tests {
                 let _ = response.text().await.unwrap();
                 service.shutdown().unwrap();
                 service.wait().await.unwrap();
+                remove_database(&database);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_aborts_a_half_open_http_connection() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let database = test_database();
+                let service = RuntimeService::start(ServiceOptions::new(
+                    database.clone(),
+                    "127.0.0.1:0".parse().expect("loopback address"),
+                ))
+                .await
+                .unwrap();
+                let _held_connection = tokio::net::TcpStream::connect(service.address())
+                    .await
+                    .unwrap();
+                service.shutdown().unwrap();
+                tokio::time::timeout(Duration::from_secs(6), service.wait())
+                    .await
+                    .expect("shutdown must not wait for a half-open HTTP connection")
+                    .unwrap();
                 remove_database(&database);
             })
             .await;

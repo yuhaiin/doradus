@@ -50,7 +50,7 @@ echo "[go-rust-stats] building Go and Rust services in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${run_dir}" -- \
   cargo build --locked \
-  -p yuhaiin-runtime \
+  -p yuhaiin-api \
   --all-features \
   --bin yuhaiin \
   >"${run_dir}/rust-build.log"

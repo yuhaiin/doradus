@@ -4,9 +4,6 @@
 //! models. It is suitable for a future HTTP/yuhaiin-react handler without
 //! introducing a second DTO tree or exposing SQLite connections.
 
-#[cfg(feature = "http-api")]
-pub mod api;
-mod backup_transport;
 mod controller;
 mod data_plane;
 mod defaults;
@@ -17,7 +14,7 @@ mod dot_tls;
 mod handle;
 #[path = "inbounds/mod.rs"]
 pub mod inbound;
-mod interfaces;
+pub mod interfaces;
 pub mod latency;
 pub mod log;
 mod loopback;
@@ -27,8 +24,6 @@ mod resolver;
 mod route;
 #[cfg(feature = "doh-tls")]
 mod rustcrypto_resolver;
-#[cfg(feature = "http-api")]
-pub mod service;
 mod settings;
 #[cfg(feature = "update")]
 pub mod update;
@@ -64,6 +59,7 @@ pub use data_plane::{
 pub use data_plane::{
     TunRuntimeConfig, load_tun_config, run_tun_device_until, run_tun_device_until_ref,
 };
+pub use defaults::DefaultAddressPlan;
 #[cfg(feature = "doh-tls")]
 pub use doh_tls::{RustCryptoH2Connector, RustCryptoTlsDialer, root_store as doh_root_store};
 #[cfg(feature = "doh-tls")]
@@ -668,8 +664,8 @@ fn default_fakeip_runtime_config() -> Result<yuhaiin_store::GoFakeIpRuntimeConfi
         id: 0,
         server: String::new(),
         fakedns_enabled: false,
-        fakedns_ipv4_range: "198.18.0.0/15".to_owned(),
-        fakedns_ipv6_range: "fc00::/18".to_owned(),
+        fakedns_ipv4_range: "10.2.0.1/24".to_owned(),
+        fakedns_ipv6_range: "fc00::/64".to_owned(),
     }
     .to_fakeip_runtime_config()
 }
@@ -776,12 +772,12 @@ async fn load_fakeip_config(
         .get("ipv4Range")
         .or_else(|| value.get("ipv4_range"))
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("198.18.0.0/15");
+        .unwrap_or("10.2.0.1/24");
     let ipv6_range = value
         .get("ipv6Range")
         .or_else(|| value.get("ipv6_range"))
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("fc00::/18");
+        .unwrap_or("fc00::/64");
     let record = yuhaiin_store::GoDnsSettingsRecord {
         id: 0,
         server: String::new(),

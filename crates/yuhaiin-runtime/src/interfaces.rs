@@ -11,12 +11,12 @@ use crate::RuntimeSettings;
 /// and returns addresses in CIDR form, so the platform discovery code below
 /// normalizes to that same shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct InterfaceInfo {
+pub struct InterfaceInfo {
     pub name: String,
     pub addresses: Vec<String>,
 }
 
-pub(crate) fn discover_interfaces() -> Vec<InterfaceInfo> {
+pub fn discover_interfaces() -> Vec<InterfaceInfo> {
     #[cfg(target_os = "linux")]
     if let Ok(interfaces) = linux::discover() {
         return interfaces;
@@ -30,8 +30,7 @@ pub(crate) fn discover_interfaces() -> Vec<InterfaceInfo> {
 /// be created by a platform-specific binder that is not represented in the
 /// portable interface listing, in which case the connection field stays empty
 /// instead of reporting a guessed interface.
-#[cfg(any(feature = "http-api", test))]
-pub(crate) fn interface_for_ip(ip: std::net::IpAddr) -> Option<String> {
+pub fn interface_for_ip(ip: std::net::IpAddr) -> Option<String> {
     let by_address = discover_interfaces().into_iter().find_map(|interface| {
         interface
             .addresses
@@ -106,7 +105,6 @@ pub(crate) fn bind_interface_for_settings(settings: &RuntimeSettings) -> Option<
     (!requested.is_empty()).then(|| requested.to_owned())
 }
 
-#[cfg(any(feature = "http-api", test))]
 fn cidr_contains(cidr: &str, ip: std::net::IpAddr) -> bool {
     let Some((network, prefix)) = cidr.rsplit_once('/') else {
         return false;

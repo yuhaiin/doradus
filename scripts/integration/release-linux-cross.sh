@@ -62,7 +62,7 @@ podman run --rm --network=host \
     eval "export AR_${target_env}=${toolchain_root}/bin/${target}-ar"
     cd /workspace
     cargo check --config net.offline=false --locked --target "${target}" \
-      -p yuhaiin-runtime --bin yuhaiin --all-features
+      -p yuhaiin-api --bin yuhaiin --all-features
   ' -- "${target}" "${sha256}"
 
 echo "[release-linux-cross] passed; target=${target} state=${scenario_dir}"

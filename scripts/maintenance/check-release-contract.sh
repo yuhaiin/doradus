@@ -65,7 +65,7 @@ required_literals=(
   'Upload native service logs'
   'cargo build --locked --release --target'
   'matrix.target'
-  '-p yuhaiin-runtime --bin yuhaiin --all-features'
+  '-p yuhaiin-api --bin yuhaiin --all-features'
   'actions/upload-artifact@v7'
   'actions/download-artifact@v7'
   'sha256sum -- * | sort -k2'

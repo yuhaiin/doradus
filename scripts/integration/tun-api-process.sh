@@ -37,13 +37,13 @@ podman run --rm --network=host \
     cd /workspace
     cargo build --locked \
       --manifest-path /workspace/Cargo.toml \
-      -p yuhaiin-runtime \
+      -p yuhaiin-api \
       --all-features \
       --bin yuhaiin \
       >/state/runtime-build.log 2>&1
     cargo test --locked \
       --manifest-path /workspace/Cargo.toml \
-      -p yuhaiin-runtime \
+      -p yuhaiin-api \
       --all-features \
       --test tun_api_process \
       --no-run \

@@ -8,7 +8,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 go_root="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" 2>/dev/null && pwd || true)}"
 go_routes="${go_root}/pkg/httpapi/v2_routes.go"
-rust_api="${repo_root}/crates/yuhaiin-runtime/src/api.rs"
+rust_api="${repo_root}/crates/yuhaiin-api/src/api.rs"
 
 if [[ ! -f "${go_routes}" ]]; then
   echo "[api-route-parity] Go route source is unavailable: ${go_routes}" >&2

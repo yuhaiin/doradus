@@ -70,7 +70,7 @@ podman run --rm --network=host \
     cd /workspace
     cargo build --locked \
       --manifest-path /workspace/Cargo.toml \
-      -p yuhaiin-runtime \
+      -p yuhaiin-api \
       --all-features \
       --bin yuhaiin \
       >/state/rust-build.log 2>&1

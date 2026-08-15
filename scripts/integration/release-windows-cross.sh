@@ -61,7 +61,7 @@ podman run --rm --network=host \
     eval "export CC_${target_env}=$linker"
     cd /workspace
     cargo check --config net.offline=false --locked --target "$target" \
-      -p yuhaiin-runtime --bin yuhaiin --all-features \
+      -p yuhaiin-api --bin yuhaiin --all-features \
       >/state/cargo-check.log 2>&1 || {
         echo "[release-windows-cross] cargo check failed; see /state/cargo-check.log" >&2
         cat /state/cargo-check.log >&2

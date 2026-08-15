@@ -57,7 +57,7 @@ fn has_transport(transports: &[String], kind: &str) -> bool {
 /// contract.  Keeping this at the API/storage boundary means a reload sees
 /// the same bytes that the listener used, instead of generating a new CA on
 /// every process start.
-pub(crate) fn fill_generated_fields(value: &mut serde_json::Value) -> Result<()> {
+pub fn fill_generated_fields(value: &mut serde_json::Value) -> Result<()> {
     #[cfg(feature = "doh-tls")]
     {
         tls_auto::fill_generated_fields(value)

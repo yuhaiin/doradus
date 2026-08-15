@@ -29,7 +29,7 @@ mkdir -p "${scenario_dir}"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   cargo build --locked \
-  -p yuhaiin-runtime \
+  -p yuhaiin-api \
   --all-features \
   --bin yuhaiin \
   >"${scenario_dir}/rust-build.log"

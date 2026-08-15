@@ -29,13 +29,13 @@ podman run --rm --network=host \
     unset CARGO_NET_OFFLINE
     CARGO_TERM_COLOR=never cargo build --locked \
       --manifest-path /workspace/Cargo.toml \
-      -p yuhaiin-runtime \
+      -p yuhaiin-api \
       --all-features \
       --bin yuhaiin \
       >/state/runtime-build.log 2>&1
     CARGO_TERM_COLOR=never cargo test --locked \
       --manifest-path /workspace/Cargo.toml \
-      -p yuhaiin-runtime \
+      -p yuhaiin-api \
       --all-features \
       --test service_chain \
       --no-run \

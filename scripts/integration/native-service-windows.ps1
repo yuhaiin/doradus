@@ -42,7 +42,7 @@ function Invoke-Yuhaiin {
 
 try {
     Write-Host "[native-service-windows] building release binary in the native runner"
-    & cargo build --locked --release -p yuhaiin-runtime --bin yuhaiin --all-features *> (Join-Path $runDir "build.log")
+    & cargo build --locked --release -p yuhaiin-api --bin yuhaiin --all-features *> (Join-Path $runDir "build.log")
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
     if (-not (Test-Path -LiteralPath $binary)) { throw "release binary missing: $binary" }
 

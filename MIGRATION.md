@@ -7,6 +7,13 @@
 > 本文覆盖网络运行时的第一批高优先级能力：fakeip、DNS、router、proxy、`pkg/net/nat`、TUN、MaxMindDB 和 SQLite 配置存储。
 > 不把整个 yuhaiin 一次性翻译成 Rust，也不把 Go 的包边界机械复制过来。
 
+> 2026-08-16 管理面与默认值收口：`yuhaiin-api` 现在独立拥有 HTTP API、`RuntimeService`、桌面
+> binary 和 API/service 集成测试；`yuhaiin-runtime` 只提供数据面、snapshot/reload、inbound
+> supervisor 和平台无关的运行时能力，避免 runtime 反向依赖管理面。默认 FakeIP/TUN 地址按 Go
+> 的一次性生成并持久化语义写入兼容配置，服务关闭对 API、DNS、route 和 inbound owner 使用
+> 有界等待并在超时后取消，覆盖半开 HTTP 连接的 shutdown 回归。相关验证全部通过 Podman，临时
+> 状态和缓存位于 `~/.cache/yuhaiin-rust`。
+
 > 2026-08-14 system DNS typed-query parity：`SystemAsyncIpResolver` 不再让默认 trait
 > 实现把 PTR/HTTPS/SVCB 查询转换成 address-only 的 A/AAAA 查询。Unix/macOS 继续使用
 > 原始 UDP system resolver，以保留完整 DNS packet forwarding；Windows desktop 使用纯 Rust
@@ -261,7 +268,7 @@
 
 > 2026-08-10 统计与透明入站复核：`make service-chain-smoke` 的 13 条真实 inbound→router→outbound 链全部通过；`make go-rust-stats-smoke` 验证 Go/Rust 共享 SQLite 上的真实流量、统计读取和跨进程接管，`make stats-concurrency-smoke` 验证并发统计读取、优雅重启和 force-stop 后恢复；node latency DNS 与 SOCKS5 UDP ASSOCIATE smoke 也通过。`make transparent-service-smoke` 已通过 IPv4/IPv6 REDIRECT TCP；rootless Podman 的 TPROXY UDP 仍不作为通过证据，显式 `YUHAIIN_TPROXY_ENABLED=1` 现在在启动容器前以 exit 77 明确提示需要 rootful/CAP_NET_ADMIN。新的 64 MiB release benchmark 为 HTTP CONNECT 116.14 MiB/s、peak RSS 17,516 KiB，TLS/H2/Yuubinsya 为 19.59 MiB/s、peak RSS 19,120 KiB；原始结果位于 `~/.cache/yuhaiin-rust/benchmarks/http-throughput`，本轮未使用 `/tmp`。
 
-> 当前实现快照：可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store`、`yuhaiin-geo`、`yuhaiin-protocol`、`yuhaiin-platform` 和 `yuhaiin-runtime` 八个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，MaxMindDB 位于独立的 `yuhaiin-geo`，协议 wire codec/可组合 transport 位于 `yuhaiin-protocol`，平台 FD/权限边界位于 `yuhaiin-platform`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责应用层组装和原子 reload，`yuhaiin-runtime::api` 提供与现有 `yuhaiin-react` client 对齐的管理面和 Rust-native pprof endpoint，`yuhaiin-runtime::run_tun_device_until` 负责已创建设备的数据面生命周期，`yuhaiin-runtime::inbound::run_until` 统一拥有 TUN、TCP/HTTP/WebSocket 和 UDP inbound 的启动、reload、shutdown 及 accepted-flow 生命周期，`src/bin/yuhaiin.rs` 只负责桌面 host/API/DNS wiring。HTTP 层复用 Go compatibility records，不新增一套配置 DTO，也不把平台权限细节泄漏到上层。
+> 当前实现快照：可编译 workspace 已落地为 `yuhaiin-core`、`yuhaiin-chain`、`yuhaiin-trie`、`yuhaiin-store`、`yuhaiin-geo`、`yuhaiin-protocol`、`yuhaiin-platform`、`yuhaiin-runtime` 和 `yuhaiin-api` 九个 crate。FakeIP 位于 `yuhaiin-store::fakeip`，MaxMindDB 位于独立的 `yuhaiin-geo`，协议 wire codec/可组合 transport 位于 `yuhaiin-protocol`，平台 FD/权限边界位于 `yuhaiin-platform`，TUN 位于 feature-gated 的 `yuhaiin-core::tun`；`yuhaiin-runtime::RuntimeSnapshot` 负责数据面组装和原子 reload，`yuhaiin-api` 提供与现有 `yuhaiin-react` client 对齐的管理面、Rust-native pprof endpoint、`RuntimeService` 和桌面 host wiring，`yuhaiin-runtime::run_tun_device_until` 负责已创建设备的数据面生命周期，`yuhaiin-runtime::inbound::run_until` 统一拥有 TUN、TCP/HTTP/WebSocket 和 UDP inbound 的启动、reload、shutdown 及 accepted-flow 生命周期。HTTP 层复用 Go compatibility records，不新增一套配置 DTO，也不把平台权限细节泄漏到上层。
 
 > 2026-08-10 Go/Rust publishes 与 update status parity：`publishes` 不再存于 Rust overlay，而是通过 `yuhaiin-store::ConfigRepository` 读写 Go 原生 `publishes(name, updated_at, data_json)` 表。API 只在 storage boundary 解码 Go Publish 的已知字段（`name/points/path/password/address/insecure`），未知 JSON 字段继续由存储层保留；resolve 与 Go 一致：不存在或 path/password 不匹配返回 `points: null`，匹配时返回空数组或现存节点列表，删除不存在的 publish 返回 404。`update.status` 初始 `stage` 也与 Go zero value 一致为空字符串。`go-api-parity.sh` 已加入 update.status 以及 publishes 的稳定读取和 put/resolve/delete 变更序列，三份停止的 Go 生产快照均已通过；日志位于 `~/.cache/yuhaiin-rust/production-parity`。
 
@@ -328,9 +335,9 @@
 
 > 2026-08-09 route list settings 接管：Go 生产库的 `route_extra.refresh_config` 与 `route_extra.maxminddb_geoip` 位于 `settings_kv`，Rust `/api/v2/route/lists/config` 现在优先读取这些 canonical rows，并将保存/refresh 的结果同时写回 `settings_kv` 与 Rust overlay；没有 Go 表的新库继续使用 `yuhaiin_config` fallback。`refreshInterval` 按 Go 的无符号十进制字符串解析，响应只返回规范化 contract；新增 canonical mapping、数字字符串和未知字段回归。
 
-> 2026-08-09 runtime socket policy：`useDefaultInterface/netInterface` 已在 immutable snapshot 中解析为接口 IPv4/IPv6 source addresses；统一 `SocketPolicyProxy` 将策略传递到 direct/fixed、HTTP CONNECT、SOCKS5、协议 wrapper、HTTP/2 Yuubinsya、直连 UOT 和 native UDP socket。连接建立按目标地址族选择 source address，selector reload 会替换策略而不影响旧 flow。新增 FlowContext/connector/runtime reload 回归，`cargo test -p yuhaiin-core --all-features --offline --lib` 通过 121 项，`cargo test -p yuhaiin-runtime --all-features --offline --lib` 通过 137 项；inbound listen socket 的平台专用绑定仍保留为平台验收项。
+> 2026-08-09 runtime socket policy：`useDefaultInterface/netInterface` 已在 immutable snapshot 中解析为接口 IPv4/IPv6 source addresses；统一 `SocketPolicyProxy` 将策略传递到 direct/fixed、HTTP CONNECT、SOCKS5、协议 wrapper、HTTP/2 Yuubinsya、直连 UOT 和 native UDP socket。连接建立按目标地址族选择 source address，selector reload 会替换策略而不影响旧 flow。新增 FlowContext/connector/runtime reload 回归，`cargo test -p yuhaiin-core --all-features --offline --lib` 通过 121 项，`cargo test -p yuhaiin-api --all-features --offline --lib` 通过 137 项；inbound listen socket 的平台专用绑定仍保留为平台验收项。
 
-> 2026-08-09 Go empty-store object graph：新增 `runtime::defaults::ensure_go_defaults`。真正没有 inbound/resolver/route settings/route rule/route list 的新 SQLite store 首次构建时，会一次性写入 Go 兼容的 mixed（`127.0.0.1:1080`）、禁用的 TUN、禁用的 Yuubinsya、`bootstrap` UDP resolver、LAN host list、direct LAN rule 和 route settings；通过 `yuhaiin_config` marker 保证重复启动幂等，也保证用户删除默认行后不会被下次启动强行恢复。默认对象仍复用现有 typed repository 和 API/runtime reload boundary；新增默认 JSON、非空 store 不修改、重复 build 和中断恢复回归，`cargo test -p yuhaiin-runtime --all-features --offline` 通过 157 个 runtime 单测、2 个 binary tests、7 个 DoH/DoT 集成测试。
+> 2026-08-09 Go empty-store object graph：新增 `runtime::defaults::ensure_go_defaults`。真正没有 inbound/resolver/route settings/route rule/route list 的新 SQLite store 首次构建时，会一次性写入 Go 兼容的 mixed（`127.0.0.1:1080`）、禁用的 TUN、禁用的 Yuubinsya、`bootstrap` UDP resolver、LAN host list、direct LAN rule 和 route settings；通过 `yuhaiin_config` marker 保证重复启动幂等，也保证用户删除默认行后不会被下次启动强行恢复。默认对象仍复用现有 typed repository 和 API/runtime reload boundary；新增默认 JSON、非空 store 不修改、重复 build 和中断恢复回归，`cargo test -p yuhaiin-api --all-features --offline` 通过 157 个 runtime 单测、2 个 binary tests、7 个 DoH/DoT 集成测试。
 
 > 2026-08-09 DNS resolver socket policy：`ResolverTransportFactory` 增加带 source-address policy 的默认扩展入口；内置 UDP/TCP DNS client 和 RustCrypto DoH/DoT direct dialer 已按目标地址族绑定接口地址，旧的自定义 factory 不实现扩展时仍走原有 `build`。新增 UDP/TCP/runtime resolver 回归；完整 workspace 测试继续通过。
 
@@ -364,11 +371,11 @@
 >
 > 本轮新增 Go 自定义 AEAD transport：它与 Shadowsocks AEAD 不同，使用 P-256/Ed25519 handshake、ChaCha20/XChaCha20 方向 stream，以及 Go 兼容的 `nonce || ciphertext` UDP packet。协议 codec、TCP/UDP outbound wrapper、SOCKS5 AEAD inbound 和 AEAD 外层 Yuubinsya UDP 已接入；Rust 本地回归与 Go↔Rust TCP/UDP 双向实例互操作通过，更完整组合仍列为 P1 验收项。
 
-> 2026-08-09 管理面补齐 `tools.interfaces` 的替换契约：Go 返回所有非 loopback 接口及其 `net.Interface.Addrs()` CIDR 字符串；Rust 现在在 Linux 通过纯 Rust netlink packet API 读取 RTM_GETADDR，同时使用 sysfs 的接口索引映射名称，覆盖 IPv4/IPv6、无地址接口和 loopback 过滤。实现位于 `yuhaiin-runtime::interfaces`，API 继续直接序列化共享 `InterfaceInfo`，没有新增 HTTP DTO；netlink 不可用时回退到无 loopback 的 sysfs/IPv6 发现。`cargo test -p yuhaiin-runtime --all-features --offline` 已通过 117 个 runtime 单测及 7 个 DoH 集成测试，最小 `http-api` library 构建也已验证。
+> 2026-08-09 管理面补齐 `tools.interfaces` 的替换契约：Go 返回所有非 loopback 接口及其 `net.Interface.Addrs()` CIDR 字符串；Rust 现在在 Linux 通过纯 Rust netlink packet API 读取 RTM_GETADDR，同时使用 sysfs 的接口索引映射名称，覆盖 IPv4/IPv6、无地址接口和 loopback 过滤。实现位于 `yuhaiin-runtime::interfaces`，API 继续直接序列化共享 `InterfaceInfo`，没有新增 HTTP DTO；netlink 不可用时回退到无 loopback 的 sysfs/IPv6 发现。`cargo test -p yuhaiin-api --all-features --offline` 已通过 117 个 runtime 单测及 7 个 DoH 集成测试，最小 `http-api` library 构建也已验证。
 
 > 2026-08-09 inbound 生命周期收口：TUN 不再由 binary 单独启动；`yuhaiin-runtime::inbound::run_until` 与 SOCKS5、HTTP、Yuubinsya、WebSocket、HTTP/2 listener 共享同一个 inbound owner。普通 TCP/WebSocket accepted task 由 `JoinSet` 归属 listener，reload/shutdown/abort 会回收子任务；`yuhaiin-core::flow::FlowObserverGuard` 让正常结束、管理面 close 和强制取消都能完成 monitor close、history/SSE/traffic 收敛。Yuubinsya server 也提升到 listener 级，HTTP/2 多 stream 可共享 migrate ID 的 UDP session，listener 结束时显式 close 上游 session。runtime 新增 listener abort 后 live connection 清理回归；`yuhaiin-runtime` 117 个单测、`yuhaiin-chain` 42 个单测和 `yuhaiin-core` 116 个单测均通过。Podman 特权无网络容器中 `tun-smoke` 的真实 TUN 创建/关闭和 route smoke 也通过。
 > 2026-08-09 TUN 配置边界收口：Go 的 `inbounds_v2` 中 `network.type=empty`、`protocol.type=tun` 现在是 Rust TUN supervisor 的主配置源，按 Go `TunProtocol` 读取 `tun://` 名称、`portal`/`portalV6`、`routes`/`excludes`；旧 `tun.runtime` 仅作为没有 Go TUN inbound 时的兼容回退。普通 TCP/UDP listener 会跳过 TUN record，单设备 runtime 只对多个 enabled TUN fail-closed，禁用的默认/历史 TUN 定义不会阻塞唯一启用项。新增 Go inbound 配置解析回归，runtime 全部 118 个单测和 7 个 DoH 集成测试通过；此前 Podman 特权无网络容器中的真实 TUN 创建/关闭及 route smoke 仍通过。
-> 2026-08-09 Podman runtime smoke：用 `cargo build -p yuhaiin-runtime --bin yuhaiin --all-features --offline` 构建 binary，在 Debian testing `--network=host` 容器中通过 API 创建 HTTP inbound；宿主机经 `127.0.0.1:18083` 访问本地 HTTP server，验证 API reload、HTTP inbound→direct outbound、history/traffic 统计。停止并重启同一容器后，`inbounds.get` 和 `connections.history` 均从 SQLite 读回。容器状态目录使用 `~/.cache/yuhaiin-rust-podman.*`，不使用 `/tmp`。
+> 2026-08-09 Podman runtime smoke：用 `cargo build -p yuhaiin-api --bin yuhaiin --all-features --offline` 构建 binary，在 Debian testing `--network=host` 容器中通过 API 创建 HTTP inbound；宿主机经 `127.0.0.1:18083` 访问本地 HTTP server，验证 API reload、HTTP inbound→direct outbound、history/traffic 统计。停止并重启同一容器后，`inbounds.get` 和 `connections.history` 均从 SQLite 读回。容器状态目录使用 `~/.cache/yuhaiin-rust-podman.*`，不使用 `/tmp`。
 > 2026-08-09 Podman live management smoke：在 Debian testing `--network=host` 容器中让 HTTP upstream 延迟响应，真实验证 `/api/v2/connections` 返回 live connection、非法 close ID 返回 `400`、合法 `connections/close` 返回 `200` 并使 relay 退出，随后 `/connections` 为空且 `/connections/history` 使用 Go 兼容的 `items` 形状；EventSource 收到初始 `connections_added`、建立连接的 `connections_added` 和关闭后的 `connections_removed`。另通过 `/api/v2/inbounds/{id}` PUT reload 验证旧 inbound 端口变为 `000`、新端口返回 `200`。测试临时目录均在 `~/.cache/yuhaiin-rust-*`。
 > 2026-08-09 统计持久化生命周期收口：`ConnectionMonitor` 现在拥有 SQLite persistence worker，并提供显式 `shutdown()`；inbound/DNS owner 收敛后，binary 会先执行 final flush、等待 writer 退出，再处理 backup restore，避免短连接/低流量统计丢失或与恢复竞态。新增回归不等待 2 秒周期即可重启读回最后一条 history/traffic；Podman Debian testing host-network smoke 已验证服务立即 SIGINT 退出后同一 SQLite 直接读回 history 和 total。
 > 2026-08-09 服务信号生命周期收口：Unix binary 同时监听 SIGINT 和 SIGTERM，并复用同一个 shutdown watch；Podman `stop --time 10` 已验证 inbound owner、DNS owner、统计 final flush 完成后以 exit code 0 退出，不再因只监听 Ctrl-C 而退化到 SIGKILL。
@@ -381,7 +388,7 @@
 > 2026-08-09 bounded stream sniff：`yuhaiin-core::sniff` 以纯 Rust 解析完整 TLS ClientHello 的 SNI 和 HTTP request 的 Host（含 IPv4/IPv6 authority port 处理）；共享 TCP relay 在打开 `FlowObserverGuard` 前最多等待 55ms 读取首段，写入 `tlsServerName/httpHost` 后通过 `PrefixedStream` 原样回放，避免窥探吞掉首包。HTTP/SOCKS/Yuubinsya/Trojan/VLESS 等复用该 relay 的路径因此获得一致观测行为；core parser、relay prefix preservation 和 monitor-before-open 均有回归。hosts resolver source、实际 socket interface、outbound Geo 以及 TUN packet-level sniff 仍是独立适配项。
 > 2026-08-09 connection metadata adapter：`RuntimeProxySelector::route_context` 现在复用同一份 runtime snapshot 检查 Go 持久化 hosts 命中，并在 selected direct/fixed/HTTP/SOCKS5/Trojan/VLESS/Yuubinsya/chain endpoint 解析后填充 `FlowContext.hosts`、`interface` 和 `outboundGeo`；interface 先按非 loopback 本机 CIDR 匹配，Linux 再按 `/proc/net/route`/`ipv6_route` 最长前缀回退，Geo 使用 snapshot 已加载的 MaxMind reader。新增 selector、IPv4/IPv6 CIDR 和 snapshot reload metadata 回归；系统 `/etc/hosts`、握手后才可见的底层 socket interface、Android/macOS 路径仍未伪造兼容。
 > 2026-08-09 system hosts overlay：runtime snapshot 在持久化 Go `dns_hosts`/兼容配置之前加载平台 hosts 文件（Unix `/etc/hosts`，Windows 使用系统 hosts 路径），并用 `HostsTable::overlay` 保证显式配置覆盖系统值；同一层同时供 `AsyncHostsResolver` 和 connection metadata selector 使用。新增注释、IPv4/IPv6、别名/非法行与覆盖优先级回归；握手后才可见的底层 socket interface、Android/macOS 原生 interface backend 仍未伪造兼容。
-> 2026-08-09 runtime settings 应用：新增 `RuntimeSettings`，由 persisted `settings` JSON 解析并随 `RuntimeSnapshot` 原子 reload；`ipv6` 现在统一约束共享 resolver、按 ID resolver、DNS answer 和 TUN `portalV6`，默认 pprof 兼容 Go 的历史默认值。新增 settings parser、IPv6 resolver、snapshot reload 和 TUN 配置回归；`useDefaultInterface/netInterface` 真实 socket bind、buffer/semaphore 调优和 pprof endpoint 仍未宣称完成。`cargo test -p yuhaiin-runtime --all-features --offline` 当前 133 个单测、7 个集成测试通过；Podman Debian testing privileged TUN smoke 输出 `tun-opened`，route smoke 输出 `tun-route-installed`。
+> 2026-08-09 runtime settings 应用：新增 `RuntimeSettings`，由 persisted `settings` JSON 解析并随 `RuntimeSnapshot` 原子 reload；`ipv6` 现在统一约束共享 resolver、按 ID resolver、DNS answer 和 TUN `portalV6`，默认 pprof 兼容 Go 的历史默认值。新增 settings parser、IPv6 resolver、snapshot reload 和 TUN 配置回归；`useDefaultInterface/netInterface` 真实 socket bind、buffer/semaphore 调优和 pprof endpoint 仍未宣称完成。`cargo test -p yuhaiin-api --all-features --offline` 当前 133 个单测、7 个集成测试通过；Podman Debian testing privileged TUN smoke 输出 `tun-opened`，route smoke 输出 `tun-route-installed`。
 > 2026-08-09 Go settings KV compatibility：进一步补齐真实 Go SQLite 的 `settings_kv(section,key,value_json)`。Rust 在没有 `settings` overlay 时从该表读取全局 settings，`settings.get` 返回同一前端字段形状；Rust `settings.put` 在旧表存在时回写已知 scalar keys，未知 platform/application rows 保持不变。生产形状 Go v6 fixture 已覆盖读取与回写，避免把配置保存到 Rust 私有 key 后 Go 兼容层看不到。真实 socket bind、buffer/semaphore 调优和 pprof endpoint 仍未完成。
 > 2026-08-09 DNS server compatibility：`run_dns_supervisor` 与 resolver server API 现在遵循 Go 的来源优先级：Rust `resolver.server` overlay 优先，否则读取/回写 `dns_settings.server`；因此真实 Go SQLite 导入后配置的监听地址不再被遗漏。新增 Go v6 fixture server 读写和 overlay precedence 回归；DNS server 的完整 TCP/UDP/DoH/DoT transport 组合及 DoQ/DoH3 仍按清单推进。
 > 2026-08-09 DNS server UDP/TCP owner：Rust runtime DNS supervisor 现在在同一配置地址同时启动 UDP 与 RFC 1035 TCP listener，共用 immutable snapshot 的 `RuntimeDnsHandler`，reload/shutdown 同时收敛两条 listener；runtime 新增同地址双协议回归，Podman Debian host-network smoke 实际查询 UDP/TCP 均返回答案。DoQ/DoH3 仍按低优先级延期。
@@ -1136,7 +1143,7 @@ Rust 版管理面位于 `yuhaiin-runtime::api`，不要求前端改写。第一�
 ### 7.7.2 可运行 binary
 
 ```bash
-cargo run -p yuhaiin-runtime --bin yuhaiin --all-features
+cargo run -p yuhaiin-api --bin yuhaiin --all-features
 ```
 
 默认监听 `127.0.0.1:18080`，数据库使用 `$XDG_DATA_HOME/yuhaiin-rust/state.sqlite`，没有 `XDG_DATA_HOME` 时使用 `~/.local/share/yuhaiin-rust/state.sqlite`。`YUHAIIN_HTTP` 和 `YUHAIIN_DB` 可覆盖这两个值；测试和迁移临时文件放在 `~/.cache`，不使用 `/tmp`。
@@ -1883,7 +1890,7 @@ React operation inventory：88 个 operation 已按真实传输逐项检查，�
 operation 逐个发空 JSON 请求并断言不能返回 404，`connections.events`、`tools/logs` 和
 `tools/logs/v2` 的直接 GET/SSE 路由另外断言
 200 及 `text/event-stream`。该测试不要求 mutation 的空参数成功，因此不会掩盖参数校验；
-它专门保证前端可见 operation 仍然进入 Rust handler。`cargo test -p yuhaiin-runtime
+它专门保证前端可见 operation 仍然进入 Rust handler。`cargo test -p yuhaiin-api
 every_generated_frontend_rpc_operation_has_a_route --all-features` 已通过。
 
 ## 38. 2026-08-09 telemetry daily projection 与 Go v5→v6 接管
@@ -1940,7 +1947,7 @@ latency/管理面调用中，同时不会破坏 proxy-side DNS 和 TLS SNI。
 运行命令：
 
 ```bash
-cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
+cargo test -p yuhaiin-api --all-features --offline --test service_chain -- --nocapture
 # 或使用可重复检查的 cache-owned 目录：
 bash scripts/integration/service-chain.sh
 ```
@@ -1969,7 +1976,7 @@ traffic、telemetry、failed-history，并在 TCP flow 关闭后确认 history �
 执行：
 
 ```bash
-cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
+cargo test -p yuhaiin-api --all-features --offline --test service_chain -- --nocapture
 ```
 
 ## 46. 2026-08-10 React management API process contract
@@ -1994,7 +2001,7 @@ Axum router 内调用 handler。该测试覆盖：
 执行：
 
 ```bash
-cargo test -p yuhaiin-runtime --all-features --offline --test api_contract -- --nocapture
+cargo test -p yuhaiin-api --all-features --offline --test api_contract -- --nocapture
 ```
 
 ## 43. 2026-08-09 SOCKS5 outbound process-chain regression
@@ -2041,7 +2048,7 @@ runtime H2 inbound 单测继续验证 HTTP/2 transport 到 HTTP protocol 的 CON
 
 ```bash
 cargo test -p yuhaiin-chain --all-features --offline --test standalone_http2 -- --nocapture
-cargo test -p yuhaiin-runtime --all-features --offline --lib http2_transport_bridges_each_connect_stream_to_the_protocol_server -- --nocapture
+cargo test -p yuhaiin-api --all-features --offline --lib http2_transport_bridges_each_connect_stream_to_the_protocol_server -- --nocapture
 ```
 
 这项现记为 `[x]`：raw transport、HTTP/SOCKS5 final wrapper 和 inbound 都有 wire-level
@@ -2052,7 +2059,7 @@ cargo test -p yuhaiin-runtime --all-features --offline --lib http2_transport_bri
 
 ```bash
 cargo test -p yuhaiin-chain --all-features --offline --test http2_protocol -- --nocapture
-cargo test -p yuhaiin-runtime --all-features --offline --test service_chain http_inbound_routes_through_http2 -- --nocapture
+cargo test -p yuhaiin-api --all-features --offline --test service_chain http_inbound_routes_through_http2 -- --nocapture
 ```
 
 前一组验证 raw H2 与 HTTP CONNECT/SOCKS5 wire 组合及双向 payload，后一组启动真实
@@ -2118,7 +2125,7 @@ router/selector 的 direct 出口连接 loopback echo target。
 执行：
 
 ```bash
-cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
+cargo test -p yuhaiin-api --all-features --offline --test service_chain -- --nocapture
 ```
 
 ## 47. 2026-08-10 runtime-owned TUN process smoke
@@ -2646,7 +2653,7 @@ interface 偏好 IPv4/IPv6 后逐个尝试连接。当前构建产物中已不�
 定向证据：
 
 - `cargo test -p yuhaiin-core --all-features --offline direct_async_proxy_resolves_domain_when_called_without_runtime_wrapper` 通过；
-- `cargo test -p yuhaiin-runtime --all-features --offline mixed_inbound_exposes_socks5_udp_and_keeps_supervisor_alive` 通过；
+- `cargo test -p yuhaiin-api --all-features --offline mixed_inbound_exposes_socks5_udp_and_keeps_supervisor_alive` 通过；
 - `make build` 成功，debug binary 位于 `~/.cache/yuhaiin-rust/cargo-target/debug/yuhaiin`。
 
 同时修复了上一轮 route test parity 暴露的真实差异：Go 无规则命中时 `Matchers.Match` 返回
@@ -2765,7 +2772,7 @@ UDP flow key，异步回包沿用同一 hash，避免同一 peer/target 下不�
 password 规则；HTTP central user allow/reject；Yuubinsya `decode_header_any` 与
 `decode_udp_packet_any`；native UDP server 的多密码接收/命中 hash 回包；Trojan 多 hash；
 AEAD server 多 password。core/runtime 定向单元测试分别通过 129/213 项，真实
-`cargo test -p yuhaiin-runtime --test service_chain --all-features --offline` 的 11 个
+`cargo test -p yuhaiin-api --test service_chain --all-features --offline` 的 11 个
 inbound→router→outbound 场景也全部通过。工作区最终验收继续使用
 `~/.cache/yuhaiin-rust` 作为构建、互操作和临时状态目录。
 
@@ -2785,7 +2792,7 @@ AEAD 外层 UDP 仍是单密码设计，暂不声称支持中心多密码；它�
 
 验证证据：新增 `udp_packet_accepts_any_bounded_password_hash_and_returns_the_match`、
 `yuubinsya_native_udp_server_preserves_the_authenticated_password_for_replies`；`cargo test
--p yuhaiin-core -p yuhaiin-runtime --lib --all-features --offline` 通过 129 + 213 个测试，
+-p yuhaiin-core -p yuhaiin-api --lib --all-features --offline` 通过 129 + 213 个测试，
 并且真实 `service_chain` 进程测试 11/11 通过。构建和测试缓存均在
 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
 
@@ -3643,7 +3650,7 @@ GitHub runner 的 macOS SDK、Windows ARM64 linker 以及 musl-cross 下载需�
   128、WireGuard 7（1 个 benchmark ignored）、service-chain 15，0 失败；
 - make clippy、make fmt-check、git diff --check、workflow 六 target/asset YAML 检查、
   ast-grep cfg 审计均通过；
-- cargo check --locked --tests --target x86_64-pc-windows-gnu -p yuhaiin-runtime
+- cargo check --locked --tests --target x86_64-pc-windows-gnu -p yuhaiin-api
   --all-features 通过，包含 Windows Service test-cfg；Linux host 的 Windows GNU 检查
   只验证编译门禁，不替代 Windows SCM 现场；
 - macOS launchd 和 Windows SCM 的真实 root/admin 安装、更新、回滚仍必须在对应平台权限
@@ -4054,7 +4061,7 @@ GitHub Actions 之前在旧提交上报告 `trojan.rs:20` 的
 archiver 和 Rust target，执行与 release job 相同的：
 
 ```text
-cargo build --locked --offline --release --target <target> -p yuhaiin-runtime --bin yuhaiin --all-features
+cargo build --locked --offline --release --target <target> -p yuhaiin-api --bin yuhaiin --all-features
 ```
 
 两个 target 均成功链接：x86_64 产出 static-pie ELF，aarch64 产出静态 ARM64 ELF。此次检查覆盖
@@ -4619,7 +4626,7 @@ x86_64。这个失败不是 Rust 源码失败，也不能代表 release workflow
 
 为避免这条验证只能依赖远程 Actions，新增 `make release-linux-cross-smoke`，复用 workflow
 的 `cross-tools/musl-cross` 版本和 SHA 校验，在 Podman 中配置 linker、CC、AR 后执行
-`cargo check --locked --target aarch64-unknown-linux-musl -p yuhaiin-runtime --bin yuhaiin
+`cargo check --locked --target aarch64-unknown-linux-musl -p yuhaiin-api --bin yuhaiin
 --all-features`。本轮结果为 `Finished dev profile`、`[release-linux-cross] passed`，状态和
 toolchain 缓存位于 `~/.cache/yuhaiin-rust/integration/release-linux-cross/`，没有使用系统
 `/tmp`。这闭环了 Linux arm64 的源码/linker 证据；Darwin/Windows 的原生 SDK、runner 和
@@ -4657,7 +4664,7 @@ Podman 完成，临时状态位于 `~/.cache/yuhaiin-rust`，未使用 `/tmp`。
 为补强 release workflow 的结构检查，本轮在 Podman 中分别检查了非 Linux target：
 
 - Windows `x86_64-pc-windows-gnu`：临时容器安装 MinGW，设置 target linker/CC 后执行
-  `cargo check --locked --target x86_64-pc-windows-gnu -p yuhaiin-runtime --bin yuhaiin
+  `cargo check --locked --target x86_64-pc-windows-gnu -p yuhaiin-api --bin yuhaiin
   --all-features`，完整通过，包含 `windows-service`、BoringTun、SQLite 和 runtime/API
   依赖。这是 Windows `cfg`/依赖图证据，不替代 workflow 的 MSVC 原生 release。
 - Darwin `x86_64-apple-darwin`：Rust target 安装成功，但容器没有 Apple clang/SDK；`ring`
@@ -4780,7 +4787,7 @@ Podman 验证命令：
 
 ```bash
 ./scripts/integration/podman-cargo.sh \
-  -- cargo test --target-dir /target -p yuhaiin-runtime --all-features \
+  -- cargo test --target-dir /target -p yuhaiin-api --all-features \
   runtime_network_split_wraps_http2_tcp_branch_over_parent -- --nocapture
 make service-chain-smoke
 ```
@@ -5262,7 +5269,7 @@ stats concurrency 2。需要 Go 工具链、外网或用户提供 WARP 配置的
 connections 流程。
 
 Podman 验证结果：`make go-termination-parity-smoke` Go/Rust 共 10/10（新增坏文件回退场景
-2/2），`cargo test -p yuhaiin-runtime --all-features tls_termination` 为 4/4；所有状态、
+2/2），`cargo test -p yuhaiin-api --all-features tls_termination` 为 4/4；所有状态、
 日志和构建缓存位于 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。
 
 ## 214. 2026-08-14 WireGuard 第三方 peer 验收状态
@@ -5310,7 +5317,7 @@ Rust 现在从 `FlowContext.source` 取得 client IP，按 Go 的既有 XFF 值�
 被清理。新增 focused test 检查 XFF、TE、空 UA 和 token header 清理，并使用真实 parent
 stream 验证 200 response/body，不把纯函数断言当成链路证据。
 
-Podman 验证结果：`cargo test --locked -p yuhaiin-runtime --all-features http_termination`
+Podman 验证结果：`cargo test --locked -p yuhaiin-api --all-features http_termination`
 过滤集 9/9，`make service-chain-smoke` 为 33 passed、1 ignored，`make
 go-termination-parity-smoke` 为 Go/Rust 10/10；所有状态、日志和 cargo target 继续位于
 `~/.cache/yuhaiin-rust`，没有使用 `/tmp`。HTTP termination 仍保留 `[~]`，因为 Go live
@@ -5363,7 +5370,7 @@ HTTP inbound → direct outbound → origin TLS → response 和实时 connectio
 `PID` 字段，严格检查 `bootout`，对旧 PID 使用 `kill -0` 轮询等待进程消失（最多 30 秒），
 然后才 bootstrap/kickstart。缺少 PID 时保留 launchd 自身负责拉起的兼容路径；bootout、进程探测、
 超时和 bootstrap/kickstart 错误都会向调用方返回。PID parser 新增有效、大小写、字段顺序和坏值
-单测，Podman 中 `cargo test -p yuhaiin-runtime --bin yuhaiin --all-features service::tests`
+单测，Podman 中 `cargo test -p yuhaiin-api --bin yuhaiin --all-features service::tests`
 结果为 4/4，`make clippy` 通过，`make release-windows-cross-smoke` 也通过。
 
 Linux Podman 容器可以安装 Darwin rust-std 并进入 macOS cfg，但不能代替真实 Darwin 链接：当前

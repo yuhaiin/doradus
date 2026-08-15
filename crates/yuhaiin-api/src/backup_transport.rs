@@ -219,12 +219,11 @@ async fn tls_stream(host: &str, stream: BoxAsyncStream) -> Result<BoxAsyncStream
     {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let config = crate::doh_tls::client_config(roots)
-            .map_err(|error| Error::Transport(format!("build S3 TLS config: {error}")))?;
-        let server_name = crate::doh_tls::tls_server_name(host)
-            .map_err(|error| Error::Transport(format!("S3 TLS server name: {error}")))?;
-        let stream = tokio_rustls::TlsConnector::from(config)
-            .connect(server_name, stream)
+        let dialer =
+            yuhaiin_runtime::RustCryptoTlsDialer::from_root_store(roots, Duration::from_secs(10))
+                .map_err(|error| Error::Transport(format!("build S3 TLS config: {error}")))?;
+        let stream = dialer
+            .connect_boxed_stream(host, stream)
             .await
             .map_err(|error| Error::Transport(format!("S3 TLS handshake: {error}")))?;
         Ok(Box::new(stream))
