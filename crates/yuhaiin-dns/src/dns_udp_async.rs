@@ -18,7 +18,7 @@ use crate::dns::{
     AsyncDnsHandler, DnsRecordType, DnsResponse, decode_raw_query_key, decode_response,
     encode_query, truncate_dns_response, validate_query_packet, validate_response_packet,
 };
-use crate::proxy::bind_tokio_udp_socket_for_target;
+use crate::transport::bind_udp_socket;
 use crate::{DomainName, Error, ErrorKind, IpSet, LocalBoxFuture, ResolveStrategy, Result};
 
 type PendingKey = (u16, DomainName, u16);
@@ -91,7 +91,7 @@ impl AsyncUdpDnsClient {
             .map(|address| SocketAddr::new(address, 0))
             .unwrap_or(default_bind);
         let socket = Arc::new(
-            bind_tokio_udp_socket_for_target(
+            bind_udp_socket(
                 bind_address,
                 self.server,
                 self.bind_interface.as_deref(),

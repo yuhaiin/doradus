@@ -5,7 +5,7 @@ use std::sync::Arc;
 use yuhaiin_core::dns::{DnsRecordType, DnsResponse, DnsServiceParam};
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::{BoxFuture, DomainName, IpSet, ResolveStrategy, Result};
-use yuhaiin_trie::DomainTrie;
+pub use yuhaiin_dns::FakeIpPolicy;
 
 use crate::fakeip::{FakeIpPool, FakeIpV6Pool, FakeIpView, FakeIpViewStore, reverse_name_to_ip};
 
@@ -15,55 +15,6 @@ pub struct FakeIpPools {
     pub ipv4: Arc<FakeIpPool>,
     pub ipv6: Arc<FakeIpV6Pool>,
     view: FakeIpViewStore,
-}
-
-/// Domain policy loaded from Go's `dns_fakedns_lists` table or the
-/// `resolver.fakedns` JSON overlay.
-///
-/// Whitelist has precedence over skip-check, matching Go's resolver: a
-/// whitelisted name always uses the upstream resolver, while skip-check only
-/// suppresses the upstream A/AAAA lookup before allocating a FakeIP.
-#[derive(Clone, Default)]
-pub struct FakeIpPolicy {
-    whitelist: DomainTrie<()>,
-    skip_check: DomainTrie<()>,
-}
-
-impl FakeIpPolicy {
-    pub fn from_lists(whitelist: &[String], skip_check: &[String]) -> Result<Self> {
-        let mut policy = Self::default();
-        for pattern in whitelist {
-            policy.whitelist.insert(pattern, ()).map_err(|error| {
-                yuhaiin_core::Error::invalid(format!(
-                    "invalid FakeIP whitelist entry {pattern:?}: {error}"
-                ))
-            })?;
-        }
-        for pattern in skip_check {
-            policy.skip_check.insert(pattern, ()).map_err(|error| {
-                yuhaiin_core::Error::invalid(format!(
-                    "invalid FakeIP skip-check entry {pattern:?}: {error}"
-                ))
-            })?;
-        }
-        Ok(policy)
-    }
-
-    pub fn is_whitelisted(&self, domain: &DomainName) -> bool {
-        self.whitelist
-            .search(domain.as_str())
-            .ok()
-            .flatten()
-            .is_some()
-    }
-
-    pub fn is_skip_check(&self, domain: &DomainName) -> bool {
-        self.skip_check
-            .search(domain.as_str())
-            .ok()
-            .flatten()
-            .is_some()
-    }
 }
 
 impl FakeIpPools {

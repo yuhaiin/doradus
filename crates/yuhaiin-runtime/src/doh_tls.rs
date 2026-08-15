@@ -16,7 +16,7 @@ use yuhaiin_core::http2::H2DohConnector;
 use yuhaiin_core::proxy::{
     BoxAsyncStream, connect_tokio_tcp_with_interface, stream_local_addr, with_stream_local_addr,
 };
-use yuhaiin_core::{BoxFuture, Error, ErrorKind, Result};
+use yuhaiin_core::{BoxFuture, Error, ErrorKind, Result, RouteMode};
 
 use crate::resolver::ResolverProxyBridge;
 
@@ -239,7 +239,7 @@ pub(crate) struct RoutedRustCryptoH2Connector {
     dialer: RustCryptoTlsDialer,
     server_name: Option<String>,
     proxy_bridge: Option<Arc<ResolverProxyBridge>>,
-    use_proxy: bool,
+    route_mode: Option<RouteMode>,
 }
 
 impl RoutedRustCryptoH2Connector {
@@ -248,7 +248,7 @@ impl RoutedRustCryptoH2Connector {
         server_name: Option<String>,
         timeout: Duration,
         proxy_bridge: Option<Arc<ResolverProxyBridge>>,
-        use_proxy: bool,
+        route_mode: Option<RouteMode>,
     ) -> Self {
         let mut config = (*config).clone();
         if !config
@@ -262,7 +262,7 @@ impl RoutedRustCryptoH2Connector {
             dialer: RustCryptoTlsDialer::from_config(Arc::new(config), timeout),
             server_name,
             proxy_bridge,
-            use_proxy,
+            route_mode,
         }
     }
 
@@ -293,12 +293,15 @@ impl H2DohConnector for RoutedRustCryptoH2Connector {
                 .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "DoH URI has no host"))?;
             let port = uri.port_u16().unwrap_or(443);
             let server_name = self.server_name.as_deref().unwrap_or(host);
-            let proxied = match &self.proxy_bridge {
-                Some(bridge) => match bridge.connect(host, port, self.use_proxy).await {
-                    Ok(stream) => stream,
-                    Err(error) => return Err(error),
-                },
-                None => None,
+            let proxied = match (&self.proxy_bridge, self.route_mode) {
+                (Some(bridge), Some(RouteMode::Direct)) => {
+                    Some(bridge.connect_direct(host, port).await?)
+                }
+                (Some(bridge), Some(RouteMode::Proxy)) => bridge.connect(host, port, true).await?,
+                (Some(_), Some(RouteMode::Bypass | RouteMode::Block)) => {
+                    return Err(Error::invalid("unsupported DoH resolver route mode"));
+                }
+                _ => None,
             };
             let result = async {
                 let raw = match proxied {

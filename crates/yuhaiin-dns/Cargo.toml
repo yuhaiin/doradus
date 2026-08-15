@@ -1,0 +1,26 @@
+[package]
+name = "yuhaiin-dns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+async-proxy = ["dep:futures-util", "dep:hickory-resolver", "dep:tokio"]
+http2 = ["async-proxy", "dep:bytes", "dep:h2", "dep:http"]
+
+[dependencies]
+bytes = { version = "1.12.1", optional = true }
+futures-util = { version = "0.3.33", optional = true, default-features = false, features = ["std"] }
+hickory-proto = { version = "0.26.1", default-features = false, features = ["std"] }
+h2 = { version = "0.4.15", optional = true }
+http = { version = "1.5.0", optional = true }
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.50.0", optional = true, default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+yuhaiin-types = { path = "../yuhaiin-types" }
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+hickory-resolver = { version = "0.26.1", optional = true, default-features = false, features = ["system-config", "tokio"] }

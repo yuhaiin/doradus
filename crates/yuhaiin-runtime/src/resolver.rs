@@ -98,9 +98,9 @@ impl ResolverProxyBridge {
     }
 
     /// Publish the resolver registry known by the current runtime snapshot.
-    /// Go routes every configured resolver through its proxy dialer; the one
-    /// exception is the reserved `bootstrap` resolver, whose transport is
-    /// intentionally direct so it can break DNS bootstrap cycles.
+    /// Go routes every configured resolver through its common DNS dialer. The
+    /// reserved `bootstrap` resolver is part of that registry too; its dialer
+    /// route is forced to `direct` so it can break DNS bootstrap cycles.
     pub fn set_configured_resolver_ids<I, S>(&self, ids: I)
     where
         I: IntoIterator<Item = S>,
@@ -109,7 +109,7 @@ impl ResolverProxyBridge {
         let ids = ids
             .into_iter()
             .map(|id| id.as_ref().trim().to_owned())
-            .filter(|id| !id.is_empty() && id != "bootstrap")
+            .filter(|id| !id.is_empty())
             .collect();
         *self
             .configured_resolver_ids
@@ -118,8 +118,16 @@ impl ResolverProxyBridge {
     }
 
     pub(crate) fn is_proxy_resolver(&self, id: &str) -> bool {
+        self.route_mode_for_resolver(id) == Some(RouteMode::Proxy)
+    }
+
+    /// Return the route used by the resolver's dialer. This is intentionally
+    /// separate from `is_proxy_resolver`: bootstrap must use the selector and
+    /// the same direct outbound proxy as ordinary flows, while never being
+    /// allowed to select the configured proxy DNS route.
+    pub(crate) fn route_mode_for_resolver(&self, id: &str) -> Option<RouteMode> {
         if id.trim() == "bootstrap" {
-            return false;
+            return Some(RouteMode::Direct);
         }
         let selected = self
             .proxy_resolver_id
@@ -127,12 +135,17 @@ impl ResolverProxyBridge {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_deref()
             .is_some_and(|proxy_id| proxy_id == id);
-        selected
+        if selected
             || self
                 .configured_resolver_ids
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .contains(id)
+        {
+            Some(RouteMode::Proxy)
+        } else {
+            None
+        }
     }
 
     /// Publish the selector used by subsequent proxy-resolver connections.
@@ -165,6 +178,25 @@ impl ResolverProxyBridge {
         if !use_proxy {
             return Ok(None);
         }
+        self.connect_via_selector(host, port, RouteMode::Proxy)
+            .await
+            .map(Some)
+    }
+
+    /// Connect through the runtime selector with a forced route mode. This is
+    /// used by Go-compatible bootstrap DNS: it still enters the common
+    /// dialer/monitor path, but the selected outbound slot is always direct.
+    pub(crate) async fn connect_direct(&self, host: &str, port: u16) -> Result<BoxAsyncStream> {
+        self.connect_via_selector(host, port, RouteMode::Direct)
+            .await
+    }
+
+    async fn connect_via_selector(
+        &self,
+        host: &str,
+        port: u16,
+        route_mode: RouteMode,
+    ) -> Result<BoxAsyncStream> {
         let selector = self
             .selector
             .read()
@@ -177,11 +209,12 @@ impl ResolverProxyBridge {
         };
         let destination = resolver_endpoint(host, port, Network::Tcp)?;
         let mut context = FlowContext::new(destination);
-        context.route_mode = RouteMode::Proxy;
+        context.route_mode = route_mode;
+        context.skip_route = route_mode == RouteMode::Direct;
         selector.route_context(&mut context);
         let proxy = selector.select(&context);
         match proxy.connect(&context).await {
-            Ok(stream) => Ok(Some(stream)),
+            Ok(stream) => Ok(stream),
             Err(error) => {
                 self.record_failure_with_protocol("tcp", host, port, &error);
                 Err(error)
@@ -202,6 +235,28 @@ impl ResolverProxyBridge {
         if !use_proxy {
             return Ok(None);
         }
+        self.open_datagram_via_selector(host, port, RouteMode::Proxy)
+            .await
+            .map(Some)
+    }
+
+    /// Open a UDP resolver endpoint through the common selector while forcing
+    /// the direct route. See [`Self::connect_direct`].
+    pub(crate) async fn open_datagram_direct(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<Box<dyn AsyncDatagram>> {
+        self.open_datagram_via_selector(host, port, RouteMode::Direct)
+            .await
+    }
+
+    async fn open_datagram_via_selector(
+        &self,
+        host: &str,
+        port: u16,
+        route_mode: RouteMode,
+    ) -> Result<Box<dyn AsyncDatagram>> {
         let selector = self
             .selector
             .read()
@@ -214,11 +269,12 @@ impl ResolverProxyBridge {
         };
         let destination = resolver_endpoint(host, port, Network::Udp)?;
         let mut context = FlowContext::new(destination);
-        context.route_mode = RouteMode::Proxy;
+        context.route_mode = route_mode;
+        context.skip_route = route_mode == RouteMode::Direct;
         selector.route_context(&mut context);
         let proxy = selector.select(&context);
         match proxy.open_datagram(&context).await {
-            Ok(datagram) => Ok(Some(datagram)),
+            Ok(datagram) => Ok(datagram),
             Err(error) => {
                 self.record_failure_with_protocol("udp", host, port, &error);
                 Err(error)
@@ -433,9 +489,9 @@ impl BuiltinResolverFactory {
         }
     }
 
-    /// Route UDP/TCP resolver transports through the same live selector used
-    /// by inbound traffic. Bootstrap/direct resolvers remain ordinary direct
-    /// sockets when their route does not select this resolver as proxy DNS.
+    /// Route configured UDP/TCP resolver transports through the same live
+    /// selector used by inbound traffic. The bootstrap resolver is included
+    /// as well, but its selector route is forced to `direct`.
     pub fn with_proxy_bridge(mut self, bridge: Arc<ResolverProxyBridge>) -> Self {
         self.proxy_bridge = Some(bridge);
         self
@@ -451,12 +507,14 @@ enum RoutedDnsClient {
         timeout: Duration,
         max_packet_size: usize,
         bridge: Arc<ResolverProxyBridge>,
+        route_mode: RouteMode,
     },
     Tcp {
         server: SocketAddr,
         timeout: Duration,
         max_packet_size: usize,
         bridge: Arc<ResolverProxyBridge>,
+        route_mode: RouteMode,
     },
 }
 
@@ -476,15 +534,29 @@ impl RoutedDnsClient {
                 timeout,
                 max_packet_size,
                 bridge,
+                route_mode,
             } => {
                 let host = server.ip().to_string();
-                let datagram = tokio::time::timeout(
-                    *timeout,
-                    bridge.open_datagram(&host, server.port(), true),
-                )
+                let datagram = tokio::time::timeout(*timeout, async {
+                    match route_mode {
+                        RouteMode::Direct => {
+                            bridge.open_datagram_direct(&host, server.port()).await
+                        }
+                        RouteMode::Proxy => bridge
+                            .open_datagram(&host, server.port(), true)
+                            .await?
+                            .ok_or_else(|| {
+                                Error::invalid("proxy DNS UDP transport was not opened")
+                            }),
+                        RouteMode::Bypass | RouteMode::Block => {
+                            Err(Error::invalid("unsupported DNS resolver route mode"))
+                        }
+                    }
+                })
                 .await
-                .map_err(|_| Error::new(ErrorKind::Timeout, "connect DNS UDP proxy timed out"))??
-                .ok_or_else(|| Error::invalid("proxy DNS UDP transport was not opened"))?;
+                .map_err(|_| {
+                    Error::new(ErrorKind::Timeout, "connect DNS UDP resolver timed out")
+                })??;
                 let result = tokio::time::timeout(*timeout, async {
                     let target = Endpoint::ip(Network::Udp, *server);
                     datagram.send_to(packet, target).await?;
@@ -507,6 +579,7 @@ impl RoutedDnsClient {
                         timeout: *timeout,
                         max_packet_size: *max_packet_size,
                         bridge: bridge.clone(),
+                        route_mode: *route_mode,
                     }
                     .query_packet_tcp(packet)
                     .await;
@@ -523,6 +596,7 @@ impl RoutedDnsClient {
             timeout,
             max_packet_size,
             bridge,
+            route_mode,
         } = self
         else {
             return Err(Error::invalid(
@@ -536,10 +610,20 @@ impl RoutedDnsClient {
             ));
         }
         let host = server.ip().to_string();
-        let stream = tokio::time::timeout(*timeout, bridge.connect(&host, server.port(), true))
-            .await
-            .map_err(|_| Error::new(ErrorKind::Timeout, "connect DNS TCP proxy timed out"))??
-            .ok_or_else(|| Error::invalid("proxy DNS TCP transport was not opened"))?;
+        let stream = tokio::time::timeout(*timeout, async {
+            match route_mode {
+                RouteMode::Direct => bridge.connect_direct(&host, server.port()).await,
+                RouteMode::Proxy => bridge
+                    .connect(&host, server.port(), true)
+                    .await?
+                    .ok_or_else(|| Error::invalid("proxy DNS TCP transport was not opened")),
+                RouteMode::Bypass | RouteMode::Block => {
+                    Err(Error::invalid("unsupported DNS resolver route mode"))
+                }
+            }
+        })
+        .await
+        .map_err(|_| Error::new(ErrorKind::Timeout, "connect DNS TCP resolver timed out"))??;
         let response = tokio::time::timeout(*timeout, async {
             query_tcp_stream(stream, packet, *max_packet_size).await
         })
@@ -760,7 +844,7 @@ impl ResolverTransportFactory for RustCryptoDohResolverFactory {
             self.proxy_bridge.clone(),
             self.proxy_bridge
                 .as_ref()
-                .is_some_and(|bridge| bridge.is_proxy_resolver(&config.id)),
+                .and_then(|bridge| bridge.route_mode_for_resolver(&config.id)),
         )
         .with_local_bind_addresses(local_bind_addresses)
         .with_bind_interface(bind_interface);
@@ -815,16 +899,17 @@ impl ResolverTransportFactory for BuiltinResolverFactory {
             GoResolverTransport::System => Ok(Arc::new(SystemAsyncIpResolver)),
             GoResolverTransport::Udp => {
                 let server = parse_dns_server(&config.host, 53, &config.id)?;
-                if let Some(bridge) = self
-                    .proxy_bridge
-                    .as_ref()
-                    .filter(|bridge| bridge.is_proxy_resolver(&config.id))
-                {
+                if let Some((bridge, route_mode)) = self.proxy_bridge.as_ref().and_then(|bridge| {
+                    bridge
+                        .route_mode_for_resolver(&config.id)
+                        .map(|route_mode| (bridge.clone(), route_mode))
+                }) {
                     let client = RoutedDnsClient::Udp {
                         server,
                         timeout: self.timeout,
                         max_packet_size: self.max_packet_size,
-                        bridge: bridge.clone(),
+                        bridge,
+                        route_mode,
                     };
                     let resolver = AsyncDnsResolver::new(client)
                         .with_cache(DnsCache::new(self.cache_capacity.max(1))?);
@@ -844,16 +929,17 @@ impl ResolverTransportFactory for BuiltinResolverFactory {
             }
             GoResolverTransport::Tcp => {
                 let server = parse_dns_server(&config.host, 53, &config.id)?;
-                if let Some(bridge) = self
-                    .proxy_bridge
-                    .as_ref()
-                    .filter(|bridge| bridge.is_proxy_resolver(&config.id))
-                {
+                if let Some((bridge, route_mode)) = self.proxy_bridge.as_ref().and_then(|bridge| {
+                    bridge
+                        .route_mode_for_resolver(&config.id)
+                        .map(|route_mode| (bridge.clone(), route_mode))
+                }) {
                     let client = RoutedDnsClient::Tcp {
                         server,
                         timeout: self.timeout,
                         max_packet_size: self.max_packet_size,
-                        bridge: bridge.clone(),
+                        bridge,
+                        route_mode,
                     };
                     let resolver = AsyncDnsResolver::new(client)
                         .with_cache(DnsCache::new(self.cache_capacity.max(1))?);
@@ -963,6 +1049,21 @@ mod tests {
     impl AsyncProxySelector for FixedBridgeSelector {
         fn select(&self, _context: &FlowContext) -> Arc<dyn AsyncProxy> {
             self.proxy.clone()
+        }
+    }
+
+    struct RouteModeBridgeSelector {
+        direct: Arc<dyn AsyncProxy>,
+        proxy: Arc<dyn AsyncProxy>,
+    }
+
+    impl AsyncProxySelector for RouteModeBridgeSelector {
+        fn select(&self, context: &FlowContext) -> Arc<dyn AsyncProxy> {
+            match context.route_mode {
+                RouteMode::Direct => self.direct.clone(),
+                RouteMode::Proxy => self.proxy.clone(),
+                RouteMode::Bypass | RouteMode::Block => self.direct.clone(),
+            }
         }
     }
 
@@ -1266,6 +1367,52 @@ mod tests {
     }
 
     #[test]
+    fn builtin_bootstrap_udp_resolver_enters_selector_but_uses_direct_slot() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let bridge = Arc::new(ResolverProxyBridge::new());
+            bridge.set_configured_resolver_ids(["bootstrap"]);
+            let direct_calls = Arc::new(AtomicUsize::new(0));
+            let proxy_calls = Arc::new(AtomicUsize::new(0));
+            bridge.set_selector(Arc::new(RouteModeBridgeSelector {
+                direct: Arc::new(ProxyDnsProxy {
+                    udp_calls: direct_calls.clone(),
+                    tcp_calls: Arc::new(AtomicUsize::new(0)),
+                }),
+                proxy: Arc::new(ProxyDnsProxy {
+                    udp_calls: proxy_calls.clone(),
+                    tcp_calls: Arc::new(AtomicUsize::new(0)),
+                }),
+            }));
+            let factory =
+                BuiltinResolverFactory::new(Duration::from_secs(1), 32).with_proxy_bridge(bridge);
+            let resolver = factory
+                .build(&GoResolverRuntimeConfig {
+                    id: "bootstrap".to_owned(),
+                    transport: GoResolverTransport::Udp,
+                    host: "127.0.0.1:9".to_owned(),
+                    subnet: None,
+                    tls_server_name: None,
+                })
+                .unwrap();
+            let domain = DomainName::new("proxy.example").unwrap();
+            let addresses = resolver
+                .resolve(&domain, ResolveStrategy::OnlyIpv4)
+                .await
+                .unwrap();
+            assert_eq!(
+                addresses.v4,
+                vec!["192.0.2.123".parse::<std::net::Ipv4Addr>().unwrap()]
+            );
+            assert_eq!(direct_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(proxy_calls.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
     fn builtin_tcp_resolver_uses_the_proxy_chain_for_proxy_dns() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1311,15 +1458,19 @@ mod tests {
     }
 
     #[test]
-    fn resolver_proxy_bridge_uses_the_live_selector_only_for_proxy_resolvers() {
+    fn resolver_proxy_bridge_routes_configured_resolvers_and_bootstrap_direct() {
         let calls = Arc::new(AtomicUsize::new(0));
         let bridge = ResolverProxyBridge::new();
         bridge.set_proxy_resolver_id(Some("proxy"));
         assert!(bridge.is_proxy_resolver("proxy"));
         assert!(!bridge.is_proxy_resolver("direct"));
-        bridge.set_configured_resolver_ids(["direct"]);
+        bridge.set_configured_resolver_ids(["direct", "bootstrap"]);
         assert!(bridge.is_proxy_resolver("direct"));
         assert!(!bridge.is_proxy_resolver("bootstrap"));
+        assert_eq!(
+            bridge.route_mode_for_resolver("bootstrap"),
+            Some(RouteMode::Direct)
+        );
         bridge.set_selector(Arc::new(FixedBridgeSelector {
             proxy: Arc::new(BridgeProxy {
                 calls: calls.clone(),
@@ -1346,8 +1497,9 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
+            assert!(bridge.connect_direct("resolver.example", 443).await.is_ok());
         });
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]

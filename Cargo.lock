@@ -3994,13 +3994,8 @@ dependencies = [
 name = "yuhaiin-core"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "futures-lite",
  "futures-util",
- "h2",
- "hickory-proto",
- "hickory-resolver",
- "http",
  "route_manager",
  "rustls",
  "rustls-rustcrypto",
@@ -4009,7 +4004,24 @@ dependencies = [
  "socket2",
  "tokio",
  "tokio-tungstenite",
+ "yuhaiin-dns",
  "yuhaiin-platform",
+ "yuhaiin-types",
+]
+
+[[package]]
+name = "yuhaiin-dns"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "h2",
+ "hickory-proto",
+ "hickory-resolver",
+ "http",
+ "serde",
+ "tokio",
+ "yuhaiin-types",
 ]
 
 [[package]]
@@ -4133,7 +4145,7 @@ dependencies = [
  "smoltcp",
  "tokio",
  "yuhaiin-core",
- "yuhaiin-trie",
+ "yuhaiin-dns",
 ]
 
 [[package]]
@@ -4145,6 +4157,10 @@ dependencies = [
  "yuhaiin-core",
  "yuhaiin-store",
 ]
+
+[[package]]
+name = "yuhaiin-types"
+version = "0.1.0"
 
 [[package]]
 name = "yuhaiin-wireguard"

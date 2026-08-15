@@ -486,7 +486,13 @@ fn event_flow_key(event: &TunEvent) -> TunFlowKey {
 }
 
 fn is_recoverable_proxy_flow_error(error: &Error) -> bool {
-    matches!(error.kind, ErrorKind::Closed | ErrorKind::NotFound)
+    // A bounded per-flow command queue being full is backpressure on one
+    // flow. The event loop cleans up that flow and continues serving all
+    // other TUN flows; it must not tear down the owner task.
+    matches!(
+        error.kind,
+        ErrorKind::Closed | ErrorKind::NotFound | ErrorKind::Timeout
+    )
 }
 
 #[derive(Debug)]
@@ -1159,6 +1165,12 @@ struct UdpProxyTask {
 }
 
 #[cfg(feature = "async-proxy")]
+struct SyncDnsTask {
+    flow: TunFlowKey,
+    join: tokio::task::JoinHandle<Option<Vec<u8>>>,
+}
+
+#[cfg(feature = "async-proxy")]
 struct NatBinding {
     table: NatTable,
     idle_timeout: Duration,
@@ -1187,7 +1199,7 @@ pub struct TunProxyRuntime {
     udp_tasks: HashMap<UdpSourceKey, UdpProxyTask>,
     udp_flow_sources: HashMap<TunFlowKey, UdpSourceKey>,
     pending_tcp: HashMap<TunFlowKey, VecDeque<Vec<u8>>>,
-    dns_tasks: Vec<tokio::task::JoinHandle<()>>,
+    dns_tasks: Vec<SyncDnsTask>,
     async_dns_tasks: FuturesUnordered<AsyncDnsTask>,
     tracked_flows: HashSet<TunFlowKey>,
     output_tx: mpsc::Sender<ProxyOutput>,
@@ -1411,12 +1423,13 @@ impl TunProxyRuntime {
                 if flow.key.destination.port() == 53
                     && let Some(handler) = self.dns_handler.clone()
                 {
-                    let output = self.output_tx.clone();
                     let timeout = self.timeouts.read;
-                    let join = tokio::spawn(async move {
-                        run_dns_query(handler, flow.key, payload, output, timeout).await;
+                    let join =
+                        tokio::spawn(async move { run_dns_query(handler, payload, timeout).await });
+                    self.dns_tasks.push(SyncDnsTask {
+                        flow: flow.key,
+                        join,
                     });
-                    self.dns_tasks.push(join);
                     return Ok(());
                 }
                 let target = context.effective_destination();
@@ -1491,7 +1504,6 @@ impl TunProxyRuntime {
 
     pub fn poll_outputs(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
         self.apply_close_requests(dispatcher)?;
-        self.poll_async_dns()?;
         let mut count = 0;
         let pending_flows = self.pending_tcp.keys().copied().collect::<Vec<_>>();
         for flow in pending_flows {
@@ -1603,16 +1615,27 @@ impl TunProxyRuntime {
                         nat.table
                             .bind_translated(source.network, source.source, translated)
                     {
+                        tun_debug(format!(
+                            "TUN UDP translated endpoint rejected source={source:?} translated={translated}: {error}"
+                        ));
                         let flows = self.remove_udp_source_task(source);
                         for flow in flows {
                             let _ = dispatcher.close_udp(flow);
                             self.untrack_flow(&flow)?;
                         }
-                        return Err(error);
+                        // A translated endpoint collision belongs to this
+                        // UDP source.  Drop that source and keep the owner
+                        // alive for unrelated TCP/UDP/DNS flows.
+                        continue;
                     }
                 }
             }
         }
+        // Drain the shared proxy output queue before polling DNS completions.
+        // DNS responses are delivered directly below, so a full proxy queue
+        // can never turn a completed DNS query into an inbound-fatal error.
+        count += self.poll_async_dns(dispatcher)?;
+        count += self.poll_sync_dns(dispatcher)?;
         let finished_tcp: Vec<_> = self
             .tasks
             .iter()
@@ -1643,7 +1666,6 @@ impl TunProxyRuntime {
                 self.untrack_flow(&flow)?;
             }
         }
-        self.dns_tasks.retain(|task| !task.is_finished());
         Ok(count)
     }
 
@@ -1669,25 +1691,80 @@ impl TunProxyRuntime {
         Ok(())
     }
 
+    /// Deliver a DNS response through the dispatcher-owned UDP socket.
+    ///
+    /// DNS interception is part of the TUN packet path, not a proxy task. It
+    /// must therefore not compete with proxy task output for the bounded
+    /// `output_tx` queue: a busy proxy queue is normal backpressure and must
+    /// not stop the whole TUN owner.
+    fn deliver_dns_output(
+        &mut self,
+        dispatcher: &mut TunDispatcher,
+        flow: TunFlowKey,
+        payload: Option<Vec<u8>>,
+    ) -> Result<()> {
+        match payload {
+            Some(payload) => {
+                self.touch_flow(flow)?;
+                if let Some(observer) = &self.observer {
+                    observer.bytes(flow, TunFlowDirection::Download, payload.len());
+                }
+                if let Err(error) = dispatcher.write_udp(flow, &payload) {
+                    tun_debug(format!(
+                        "TUN DNS output dropped flow={flow:?} bytes={} error={error}",
+                        payload.len()
+                    ));
+                    self.remove_flow_task(&flow);
+                    let _ = dispatcher.close_udp(flow);
+                    self.untrack_flow(&flow)?;
+                }
+            }
+            None => {
+                self.remove_flow_task(&flow);
+                let _ = dispatcher.close_udp(flow);
+                self.untrack_flow(&flow)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Poll locally-owned async DNS futures without awaiting a pending
     /// resolver. This keeps the TUN packet loop responsive while preserving
     /// `LocalBoxFuture` support for handlers that do not require `Send`.
-    fn poll_async_dns(&mut self) -> Result<usize> {
+    fn poll_async_dns(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
         let mut count = 0;
         while let Some(Some((flow, answer))) = self.async_dns_tasks.next().now_or_never() {
             count += 1;
-            let output = match answer {
-                Ok(payload) => ProxyOutput::UdpData { flow, payload },
-                Err(_) => ProxyOutput::UdpClosed { flow },
+            self.deliver_dns_output(dispatcher, flow, answer.ok())?;
+        }
+        Ok(count)
+    }
+
+    fn poll_sync_dns(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
+        let finished = self
+            .dns_tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.join.is_finished())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let mut count = 0;
+        for index in finished.into_iter().rev() {
+            let SyncDnsTask { flow, join } = self.dns_tasks.swap_remove(index);
+            let answer = match join
+                .now_or_never()
+                .expect("finished DNS join handle must be ready")
+            {
+                Ok(answer) => answer,
+                Err(error) => {
+                    tun_debug(format!(
+                        "TUN synchronous DNS task ended with join error flow={flow:?}: {error}"
+                    ));
+                    None
+                }
             };
-            if let Err(error) = self.output_tx.try_send(output) {
-                self.remove_flow_task(&flow);
-                let _ = self.untrack_flow(&flow);
-                return Err(Error::new(
-                    ErrorKind::Timeout,
-                    format!("TUN async DNS output channel: {error}"),
-                ));
-            }
+            count += 1;
+            self.deliver_dns_output(dispatcher, flow, answer)?;
         }
         Ok(count)
     }
@@ -1710,7 +1787,7 @@ impl TunProxyRuntime {
             }
         }
         for task in self.dns_tasks.drain(..) {
-            task.abort();
+            task.join.abort();
         }
         self.async_dns_tasks = FuturesUnordered::new();
         self.clear_tracked_flows();
@@ -1757,13 +1834,12 @@ impl TunProxyRuntime {
         }
         while self.tasks.values().any(|task| !task.join.is_finished())
             || self.udp_tasks.values().any(|task| !task.join.is_finished())
-            || self.dns_tasks.iter().any(|task| !task.is_finished())
+            || self.dns_tasks.iter().any(|task| !task.join.is_finished())
             || !self.async_dns_tasks.is_empty()
         {
             if tokio::time::Instant::now() >= end {
                 break;
             }
-            let _ = self.poll_async_dns();
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         self.close();
@@ -1790,7 +1866,10 @@ impl TunProxyRuntime {
         match self.send_command(flow, command) {
             Ok(()) => Ok(()),
             Err(error) => {
-                if matches!(error.kind, ErrorKind::Closed | ErrorKind::NotFound) {
+                if matches!(
+                    error.kind,
+                    ErrorKind::Closed | ErrorKind::NotFound | ErrorKind::Timeout
+                ) {
                     self.remove_task(flow);
                     self.untrack_flow(flow)?;
                 }
@@ -1915,7 +1994,7 @@ impl Drop for TunProxyRuntime {
             task.join.abort();
         }
         for task in self.dns_tasks.drain(..) {
-            task.abort();
+            task.join.abort();
         }
         let nat_table = self.nat.as_ref().map(|nat| nat.table.clone());
         if let Some(nat_table) = nat_table {
@@ -2248,25 +2327,15 @@ async fn emit_output(
 #[cfg(feature = "async-proxy")]
 async fn run_dns_query(
     handler: Arc<dyn DnsHandler>,
-    flow: TunFlowKey,
     payload: Vec<u8>,
-    output: mpsc::Sender<ProxyOutput>,
     timeout: Duration,
-) {
+) -> Option<Vec<u8>> {
     let mut task = tokio::task::spawn_blocking(move || answer_query(&payload, handler.as_ref()));
-    let answer = match tokio::time::timeout(timeout, &mut task).await {
+    match tokio::time::timeout(timeout, &mut task).await {
         Ok(Ok(answer)) => answer.ok(),
         Ok(Err(_)) | Err(_) => {
             task.abort();
             None
-        }
-    };
-    match answer {
-        Some(payload) => {
-            let _ = emit_output(&output, ProxyOutput::UdpData { flow, payload }, timeout).await;
-        }
-        None => {
-            let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeout).await;
         }
     }
 }

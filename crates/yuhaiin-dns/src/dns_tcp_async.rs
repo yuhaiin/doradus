@@ -18,7 +18,7 @@ use crate::dns::{
     validate_query_packet, validate_response_packet,
 };
 use crate::dns_resolver_async::{AsyncDnsQuery, SendAsyncDnsQuery};
-use crate::proxy::connect_tokio_tcp_with_interface;
+use crate::transport::connect_tcp;
 use crate::{
     BoxFuture, DomainName, Error, ErrorKind, IpSet, LocalBoxFuture, ResolveStrategy, Result,
 };
@@ -48,7 +48,7 @@ impl AsyncTcpDnsClient {
             .map(|address| SocketAddr::new(address, 0));
         let mut stream = tokio::time::timeout(
             self.timeout,
-            connect_tokio_tcp_with_interface(
+            connect_tcp(
                 self.server,
                 local_bind,
                 self.bind_interface.as_deref(),
@@ -83,7 +83,7 @@ impl AsyncTcpDnsClient {
             .map(|address| SocketAddr::new(address, 0));
         let mut stream = tokio::time::timeout(
             self.timeout,
-            connect_tokio_tcp_with_interface(
+            connect_tcp(
                 self.server,
                 local_bind,
                 self.bind_interface.as_deref(),

@@ -6,9 +6,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::lock::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use yuhaiin_core::dns::{DnsRecordType, DnsResponse, DnsServiceParam};
 use yuhaiin_core::{DomainName, Error, ErrorKind, IpSet, Result};
+pub use yuhaiin_dns::{
+    FakeIpConfig, FakeIpPoolOptions, FakeIpV6Config, FakeIpView, FakeIpViewStore,
+    reverse_name_to_ip,
+};
 
 #[cfg(feature = "async-dns")]
 use yuhaiin_core::LocalBoxFuture;
@@ -22,43 +26,6 @@ const MAP_PREFIX: &str = "fakeip/map/";
 const NEXT_V6_KEY: &str = "fakeip/ipv6/next";
 const MAP_V6_PREFIX: &str = "fakeip/ipv6/map/";
 const IMPORT_MARKER_PREFIX: &str = "fakeip/legacy-import/";
-const DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
-const DEFAULT_TOUCH_INTERVAL_SECONDS: i64 = 5 * 60;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FakeIpConfig {
-    pub start: Ipv4Addr,
-    pub end: Ipv4Addr,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FakeIpV6Config {
-    pub start: Ipv6Addr,
-    pub end: Ipv6Addr,
-}
-
-impl FakeIpV6Config {
-    pub fn new(start: Ipv6Addr, end: Ipv6Addr) -> Result<Self> {
-        if u128::from(start) > u128::from(end) {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "FakeIP IPv6 start must not be greater than end",
-            ));
-        }
-        Ok(Self { start, end })
-    }
-
-    fn size(self) -> Result<u128> {
-        u128::from(self.end)
-            .checked_sub(u128::from(self.start))
-            .and_then(|size| size.checked_add(1))
-            .ok_or_else(|| Error::invalid("FakeIP IPv6 pool is too large"))
-    }
-
-    fn range_prefix(self) -> String {
-        format!("range:{}-{}", self.start, self.end)
-    }
-}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyFakeIpEntry {
     pub domain: DomainName,
@@ -334,82 +301,6 @@ fn validate_legacy_export_prefix(prefix: &str, expected_family: u8) -> Result<()
     Ok(())
 }
 
-impl FakeIpConfig {
-    pub fn new(start: Ipv4Addr, end: Ipv4Addr) -> Result<Self> {
-        if u32::from(start) > u32::from(end) {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "FakeIP start must not be greater than end",
-            ));
-        }
-        Ok(Self { start, end })
-    }
-
-    fn size(self) -> u64 {
-        u64::from(u32::from(self.end) - u32::from(self.start)) + 1
-    }
-
-    fn range_prefix(self) -> String {
-        format!("range:{}-{}", self.start, self.end)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FakeIpPoolOptions {
-    /// Maximum number of live mappings in this pool.  It may be lower than
-    /// the address range to bound database growth and memory use.
-    pub max_entries: u64,
-    /// An entry is eligible for reuse after this many seconds without a hit.
-    pub ttl_seconds: i64,
-    /// `last_used_at` touches are coalesced until this interval elapses.  A
-    /// final [`FakeIpPool::flush_touches`] persists all dirty timestamps.
-    pub touch_interval_seconds: i64,
-}
-
-impl FakeIpPoolOptions {
-    pub fn for_config(config: FakeIpConfig) -> Self {
-        Self {
-            max_entries: config.size(),
-            ttl_seconds: DEFAULT_TTL_SECONDS,
-            touch_interval_seconds: DEFAULT_TOUCH_INTERVAL_SECONDS,
-        }
-    }
-
-    pub fn for_v6_config(config: FakeIpV6Config) -> Self {
-        Self {
-            max_entries: config
-                .size()
-                .unwrap_or(u64::MAX as u128)
-                .min(u64::MAX as u128) as u64,
-            ttl_seconds: DEFAULT_TTL_SECONDS,
-            touch_interval_seconds: DEFAULT_TOUCH_INTERVAL_SECONDS,
-        }
-    }
-
-    pub fn new(max_entries: u64, ttl_seconds: i64) -> Result<Self> {
-        if max_entries == 0 || ttl_seconds <= 0 {
-            return Err(Error::invalid(
-                "FakeIP max_entries and ttl_seconds must be positive",
-            ));
-        }
-        Ok(Self {
-            max_entries,
-            ttl_seconds,
-            touch_interval_seconds: DEFAULT_TOUCH_INTERVAL_SECONDS,
-        })
-    }
-
-    pub fn with_touch_interval(mut self, seconds: i64) -> Result<Self> {
-        if seconds <= 0 {
-            return Err(Error::invalid(
-                "FakeIP touch_interval_seconds must be positive",
-            ));
-        }
-        self.touch_interval_seconds = seconds;
-        Ok(self)
-    }
-}
-
 #[derive(Debug, Default)]
 struct State {
     next: u32,
@@ -431,94 +322,6 @@ pub struct FakeIpPool {
     prefix: String,
     options: FakeIpPoolOptions,
     state: Arc<Mutex<State>>,
-}
-
-/// Send/Sync read-only view used by the packet data plane. It contains no
-/// SQLite handle, so it can safely be captured by a TUN context provider.
-#[derive(Debug, Clone, Default)]
-pub struct FakeIpView {
-    reverse: Arc<HashMap<Ipv4Addr, DomainName>>,
-    reverse_v6: Arc<HashMap<Ipv6Addr, DomainName>>,
-}
-
-/// Synchronous, SQLite-free holder for the latest reverse-lookup view.
-///
-/// Packet callbacks use this holder while the async resolver replaces the
-/// view after allocating a new FakeIP.  The lock is intentionally limited to
-/// a small immutable-map read and is never held across an await.
-#[derive(Clone, Default)]
-pub struct FakeIpViewStore {
-    view: Arc<std::sync::RwLock<FakeIpView>>,
-}
-
-impl FakeIpViewStore {
-    pub fn new(view: FakeIpView) -> Self {
-        Self {
-            view: Arc::new(std::sync::RwLock::new(view)),
-        }
-    }
-
-    pub fn lookup_domain_ip(&self, address: IpAddr) -> Option<DomainName> {
-        self.view
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .lookup_domain_ip(address)
-    }
-
-    pub fn replace(&self, view: FakeIpView) {
-        *self
-            .view
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = view;
-    }
-
-    pub fn snapshot(&self) -> FakeIpView {
-        self.view
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-}
-
-impl FakeIpView {
-    pub fn lookup_domain(&self, address: Ipv4Addr) -> Option<DomainName> {
-        self.reverse.get(&address).cloned()
-    }
-
-    pub fn lookup_domain_v6(&self, address: Ipv6Addr) -> Option<DomainName> {
-        self.reverse_v6.get(&address).cloned()
-    }
-
-    pub fn lookup_domain_ip(&self, address: IpAddr) -> Option<DomainName> {
-        match address {
-            IpAddr::V4(address) => self.lookup_domain(address),
-            IpAddr::V6(address) => self.lookup_domain_v6(address),
-        }
-    }
-
-    /// Combine independently snapshotted IPv4 and IPv6 pools for a dual-stack
-    /// TUN context.  The address families have disjoint maps, so merging is
-    /// deterministic and does not allow one pool to shadow the other.
-    pub fn merge(&self, other: &Self) -> Self {
-        let mut reverse = (*self.reverse).clone();
-        reverse.extend(
-            other
-                .reverse
-                .iter()
-                .map(|(address, domain)| (*address, domain.clone())),
-        );
-        let mut reverse_v6 = (*self.reverse_v6).clone();
-        reverse_v6.extend(
-            other
-                .reverse_v6
-                .iter()
-                .map(|(address, domain)| (*address, domain.clone())),
-        );
-        Self {
-            reverse: Arc::new(reverse),
-            reverse_v6: Arc::new(reverse_v6),
-        }
-    }
 }
 
 /// Applies the IPv4 FakeIP answer policy while keeping the store on its
@@ -652,38 +455,6 @@ impl FakeIpPtrTransform {
     ) -> Result<DnsResponse> {
         Ok(response)
     }
-}
-
-pub(crate) fn reverse_name_to_ip(domain: &DomainName) -> Option<IpAddr> {
-    let labels: Vec<_> = domain.labels().collect();
-    if labels.len() == 6
-        && labels[4] == "in-addr"
-        && labels[5] == "arpa"
-        && labels[..4].iter().all(|label| label.parse::<u8>().is_ok())
-    {
-        return Some(IpAddr::V4(Ipv4Addr::new(
-            labels[3].parse().ok()?,
-            labels[2].parse().ok()?,
-            labels[1].parse().ok()?,
-            labels[0].parse().ok()?,
-        )));
-    }
-    if labels.len() != 34 || labels[32] != "ip6" || labels[33] != "arpa" {
-        return None;
-    }
-    let mut nibbles = Vec::with_capacity(32);
-    for label in labels[..32].iter().rev() {
-        let nibble = u8::from_str_radix(label, 16).ok()?;
-        if *label != format!("{nibble:x}") {
-            return None;
-        }
-        nibbles.push(nibble);
-    }
-    let mut bytes = [0u8; 16];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = (nibbles[index * 2] << 4) | nibbles[index * 2 + 1];
-    }
-    Some(IpAddr::V6(Ipv6Addr::from(bytes)))
 }
 
 impl FakeIpAnswerTransform {
@@ -1388,10 +1159,7 @@ impl FakeIpPool {
     }
 
     pub async fn snapshot(&self) -> FakeIpView {
-        FakeIpView {
-            reverse: Arc::new(self.state.lock().await.reverse.clone()),
-            reverse_v6: Arc::new(HashMap::new()),
-        }
+        FakeIpView::from_maps(self.state.lock().await.reverse.clone(), HashMap::new())
     }
 
     pub async fn release(&self, domain: &DomainName) -> Result<bool> {
@@ -1884,10 +1652,7 @@ impl FakeIpV6Pool {
     }
 
     pub async fn snapshot(&self) -> FakeIpView {
-        FakeIpView {
-            reverse: Arc::new(HashMap::new()),
-            reverse_v6: Arc::new(self.state.lock().await.reverse.clone()),
-        }
+        FakeIpView::from_maps(HashMap::new(), self.state.lock().await.reverse.clone())
     }
 
     pub async fn release(&self, domain: &DomainName) -> Result<bool> {

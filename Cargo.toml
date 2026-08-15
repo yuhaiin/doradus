@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/yuhaiin-types",
+    "crates/yuhaiin-dns",
     "crates/yuhaiin-core",
     "crates/yuhaiin-chain",
     "crates/yuhaiin-geo",

@@ -5,28 +5,44 @@
 //! runtime appropriate for desktop, Android, or embedded integration.
 
 use std::fmt;
-use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::Pin;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, atomic::AtomicU64};
 
-pub mod dns;
-pub mod dns_hosts;
-pub mod dns_resolver;
+pub mod dns {
+    pub use yuhaiin_dns::dns::*;
+}
+pub mod dns_hosts {
+    pub use yuhaiin_dns::dns_hosts::*;
+}
+pub mod dns_resolver {
+    pub use yuhaiin_dns::dns_resolver::*;
+}
 #[cfg(feature = "async-proxy")]
-pub mod dns_resolver_async;
+pub mod dns_resolver_async {
+    pub use yuhaiin_dns::dns_resolver_async::*;
+}
 #[cfg(feature = "async-proxy")]
-pub mod dns_resolver_stack;
-pub mod dns_tcp;
+pub mod dns_resolver_stack {
+    pub use yuhaiin_dns::dns_resolver_stack::*;
+}
+pub mod dns_tcp {
+    pub use yuhaiin_dns::dns_tcp::*;
+}
 #[cfg(feature = "async-proxy")]
-pub mod dns_tcp_async;
+pub mod dns_tcp_async {
+    pub use yuhaiin_dns::dns_tcp_async::*;
+}
 #[cfg(feature = "async-proxy")]
-pub mod dns_udp_async;
+pub mod dns_udp_async {
+    pub use yuhaiin_dns::dns_udp_async::*;
+}
 pub mod flow;
 pub mod geo;
 pub use geo::GeoLookup;
 #[cfg(feature = "http2")]
-pub mod http2;
+pub mod http2 {
+    pub use yuhaiin_dns::http2::*;
+}
 pub mod nat;
 pub mod process;
 pub mod proxy;
@@ -41,8 +57,9 @@ pub mod tun;
 pub mod websocket;
 pub mod yuubinsya;
 
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+pub use yuhaiin_types::{
+    BoxFuture, DomainName, Error, ErrorKind, IpSet, LocalBoxFuture, ResolveStrategy, Result,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Network {
@@ -59,73 +76,6 @@ impl fmt::Display for Network {
             Self::Icmp => "icmp",
             Self::Any => "any",
         })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DomainName(String);
-
-impl DomainName {
-    pub fn new(value: &str) -> Result<Self> {
-        let value = value.trim().trim_end_matches('.').to_ascii_lowercase();
-        if value.is_empty() || value.len() > 253 {
-            return Err(Error::invalid("domain must contain 1..=253 bytes"));
-        }
-        for label in value.split('.') {
-            if label.is_empty() || label.len() > 63 {
-                return Err(Error::invalid("domain label must contain 1..=63 bytes"));
-            }
-            if label.starts_with('-') || label.ends_with('-') {
-                return Err(Error::invalid("domain label cannot start or end with '-'"));
-            }
-            if !label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-            {
-                return Err(Error::invalid("domain contains an unsupported character"));
-            }
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn into_string(self) -> String {
-        self.0
-    }
-
-    pub fn labels(&self) -> impl DoubleEndedIterator<Item = &str> {
-        self.0.split('.')
-    }
-}
-
-impl TryFrom<&str> for DomainName {
-    type Error = Error;
-
-    fn try_from(value: &str) -> Result<Self> {
-        Self::new(value)
-    }
-}
-
-impl TryFrom<String> for DomainName {
-    type Error = Error;
-
-    fn try_from(value: String) -> Result<Self> {
-        Self::new(&value)
-    }
-}
-
-impl AsRef<str> for DomainName {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl fmt::Display for DomainName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -226,15 +176,6 @@ pub enum RouteMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolveStrategy {
-    Default,
-    OnlyIpv4,
-    PreferIpv4,
-    OnlyIpv6,
-    PreferIpv6,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolverPolicy {
     pub strategy: ResolveStrategy,
     pub use_fake_ip: bool,
@@ -250,26 +191,6 @@ impl Default for ResolverPolicy {
             fake_ip_skip_check_upstream: false,
             udp_skip_resolve_target: false,
         }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct IpSet {
-    pub v4: Vec<Ipv4Addr>,
-    pub v6: Vec<Ipv6Addr>,
-}
-
-impl IpSet {
-    pub fn is_empty(&self) -> bool {
-        self.v4.is_empty() && self.v6.is_empty()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = IpAddr> + '_ {
-        self.v4
-            .iter()
-            .copied()
-            .map(IpAddr::V4)
-            .chain(self.v6.iter().copied().map(IpAddr::V6))
     }
 }
 
@@ -440,51 +361,10 @@ pub struct MatchResult {
     pub matched: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorKind {
-    InvalidInput,
-    NotFound,
-    Conflict,
-    Unsupported,
-    Io,
-    Protocol,
-    Storage,
-    Timeout,
-    Closed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Error {
-    pub kind: ErrorKind,
-    pub message: String,
-}
-
-impl Error {
-    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-        }
-    }
-
-    pub fn invalid(message: impl Into<String>) -> Self {
-        Self::new(ErrorKind::InvalidInput, message)
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}: {}", self.kind, self.message)
-    }
-}
-
-impl std::error::Error for Error {}
-
-pub type Result<T> = std::result::Result<T, Error>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn domain_names_are_canonicalized_and_checked() {

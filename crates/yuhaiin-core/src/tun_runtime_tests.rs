@@ -124,6 +124,49 @@ async fn graceful_proxy_runtime_broadcasts_shutdown_when_one_command_queue_is_fu
 
 #[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
+async fn tcp_input_backpressure_releases_only_the_affected_flow() {
+    use crate::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
+
+    let drop_proxy: Arc<dyn AsyncProxy> = Arc::new(DropAsyncProxy);
+    let selector = Arc::new(StaticProxySelector {
+        direct: Arc::clone(&drop_proxy),
+        proxy: Arc::clone(&drop_proxy),
+        bypass: Arc::clone(&drop_proxy),
+        drop: Arc::clone(&drop_proxy),
+    });
+    let table = NatTable::new();
+    let mut runtime = TunProxyRuntime::new(selector, 1)
+        .unwrap()
+        .with_nat(table.clone(), Duration::from_secs(30))
+        .unwrap();
+    let flow = TunFlow {
+        key: TunFlowKey {
+            network: Network::Tcp,
+            source: "192.0.2.10:40000".parse().unwrap(),
+            destination: "198.51.100.1:443".parse().unwrap(),
+        },
+    };
+    runtime.track_flow(flow.key).unwrap();
+    let (command, _commands) = mpsc::channel(1);
+    command.try_send(ProxyCommand::Data(vec![1])).unwrap();
+    let join = tokio::spawn(async { std::future::pending::<()>().await });
+    runtime.tasks.insert(flow.key, ProxyTask { command, join });
+
+    let error = runtime
+        .handle_event(TunEvent::TcpData {
+            flow,
+            payload: b"blocked".to_vec(),
+        })
+        .unwrap_err();
+
+    assert_eq!(error.kind, ErrorKind::Timeout);
+    assert_eq!(runtime.task_len(), 0);
+    assert_eq!(runtime.nat_len().unwrap(), 0);
+    assert_eq!(table.len().unwrap(), 0);
+}
+
+#[cfg(feature = "async-proxy")]
+#[tokio::test(flavor = "current_thread")]
 async fn idle_timeout_closes_quiet_tcp_flow_and_releases_nat() {
     use crate::proxy::{AsyncProxy, DirectAsyncProxy, StaticProxySelector};
 
@@ -736,6 +779,84 @@ async fn sync_dns_task_is_owned_and_releases_full_cone_mapping_on_force_close() 
 
 #[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
+async fn sync_dns_completion_does_not_use_shared_proxy_output_queue() {
+    use crate::dns::{DnsHandler, DnsRecordType, DnsResponse};
+    use crate::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
+    use crate::{DomainName, IpSet};
+
+    struct FixedDns;
+    impl DnsHandler for FixedDns {
+        fn resolve(
+            &self,
+            _domain: &DomainName,
+            _record_type: DnsRecordType,
+        ) -> Result<DnsResponse> {
+            Ok(DnsResponse {
+                addresses: IpSet {
+                    v4: vec![Ipv4Addr::new(192, 0, 2, 1)],
+                    v6: Vec::new(),
+                },
+                ptr_names: Vec::new(),
+                service_bindings: Vec::new(),
+                minimum_ttl: Some(30),
+            })
+        }
+    }
+
+    let drop_proxy: Arc<dyn AsyncProxy> = Arc::new(DropAsyncProxy);
+    let selector = Arc::new(StaticProxySelector {
+        direct: Arc::clone(&drop_proxy),
+        proxy: Arc::clone(&drop_proxy),
+        bypass: Arc::clone(&drop_proxy),
+        drop: Arc::clone(&drop_proxy),
+    });
+    let table = NatTable::new();
+    let mut runtime = TunProxyRuntime::new(selector, 1)
+        .unwrap()
+        .with_dns_handler(Arc::new(FixedDns))
+        .with_nat(table.clone(), Duration::from_secs(30))
+        .unwrap();
+    let flow = TunFlow {
+        key: TunFlowKey {
+            network: Network::Udp,
+            source: "192.0.2.10:40000".parse().unwrap(),
+            destination: "198.51.100.1:53".parse().unwrap(),
+        },
+    };
+    runtime
+        .handle_event(TunEvent::UdpDatagram {
+            flow,
+            payload: b"malformed-dns-packet".to_vec(),
+        })
+        .unwrap();
+    runtime
+        .output_tx
+        .try_send(ProxyOutput::UdpClosed {
+            flow: TunFlowKey {
+                network: Network::Udp,
+                source: "192.0.2.1:40000".parse().unwrap(),
+                destination: "192.0.2.2:53".parse().unwrap(),
+            },
+        })
+        .unwrap();
+
+    let mut dispatcher = TunDispatcher::new(32, 32, 4).unwrap();
+    dispatcher.ensure_udp_socket(flow.key.destination).unwrap();
+    for _ in 0..100 {
+        if runtime.dns_tasks[0].join.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    runtime.poll_outputs(&mut dispatcher).unwrap();
+
+    assert_eq!(runtime.task_len(), 0);
+    assert_eq!(runtime.nat_len().unwrap(), 0);
+    assert_eq!(table.len().unwrap(), 0);
+}
+
+#[cfg(feature = "async-proxy")]
+#[tokio::test(flavor = "current_thread")]
 async fn proxy_runtime_hijacks_dns_udp_flow_without_entering_proxy() {
     use crate::dns::{DnsHandler, DnsRecordType, DnsResponse, encode_query};
     use crate::proxy::{AsyncProxy, DirectAsyncProxy, StaticProxySelector};
@@ -788,7 +909,7 @@ async fn proxy_runtime_hijacks_dns_udp_flow_without_entering_proxy() {
         bypass: Arc::clone(&direct),
         drop: Arc::new(crate::proxy::DropAsyncProxy),
     });
-    let mut proxy_runtime = TunProxyRuntime::new(selector, 8)
+    let mut proxy_runtime = TunProxyRuntime::new(selector, 1)
         .unwrap()
         .with_async_dns_handler(Arc::new(FixedDns));
     let query = encode_query(
@@ -806,6 +927,20 @@ async fn proxy_runtime_hijacks_dns_udp_flow_without_entering_proxy() {
     for event in dispatcher.events().collect::<Vec<_>>() {
         proxy_runtime.handle_event_async(event).await.unwrap();
     }
+
+    // Keep the shared proxy output queue full while the DNS future completes.
+    // DNS interception must not turn this unrelated flow backpressure into a
+    // fatal TUN owner error.
+    proxy_runtime
+        .output_tx
+        .try_send(ProxyOutput::UdpClosed {
+            flow: TunFlowKey {
+                network: Network::Udp,
+                source: "192.0.2.1:40000".parse().unwrap(),
+                destination: "192.0.2.2:53".parse().unwrap(),
+            },
+        })
+        .unwrap();
 
     let mut response = None;
     for tick in 2..100 {
@@ -826,6 +961,74 @@ async fn proxy_runtime_hijacks_dns_udp_flow_without_entering_proxy() {
     let udp = UdpPacket::new_checked(ip.payload()).unwrap();
     let response = crate::dns::decode_response(udp.payload(), 7, DnsRecordType::A).unwrap();
     assert_eq!(response.addresses.v4, vec![Ipv4Addr::new(192, 0, 2, 1)]);
+}
+
+#[cfg(feature = "async-proxy")]
+#[tokio::test(flavor = "current_thread")]
+async fn translated_udp_endpoint_conflict_releases_only_the_conflicting_source() {
+    use crate::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
+
+    let drop_proxy: Arc<dyn AsyncProxy> = Arc::new(DropAsyncProxy);
+    let selector = Arc::new(StaticProxySelector {
+        direct: Arc::clone(&drop_proxy),
+        proxy: Arc::clone(&drop_proxy),
+        bypass: Arc::clone(&drop_proxy),
+        drop: Arc::clone(&drop_proxy),
+    });
+    let table = NatTable::new();
+    let mut runtime = TunProxyRuntime::new(selector, 2)
+        .unwrap()
+        .with_nat(table.clone(), Duration::from_secs(30))
+        .unwrap();
+    let first = TunFlowKey {
+        network: Network::Udp,
+        source: "192.0.2.10:40000".parse().unwrap(),
+        destination: "198.51.100.1:443".parse().unwrap(),
+    };
+    let second = TunFlowKey {
+        network: Network::Udp,
+        source: "192.0.2.10:40001".parse().unwrap(),
+        destination: "198.51.100.2:443".parse().unwrap(),
+    };
+    for flow in [first, second] {
+        runtime.track_flow(flow).unwrap();
+        let (command, _commands) = mpsc::channel(1);
+        let join = tokio::spawn(async { std::future::pending::<()>().await });
+        let source = udp_source_key(flow);
+        runtime.udp_tasks.insert(
+            source,
+            UdpProxyTask {
+                command,
+                join,
+                flows: HashSet::from([flow]),
+            },
+        );
+        runtime.udp_flow_sources.insert(flow, source);
+    }
+    let translated = "127.0.0.1:53000".parse().unwrap();
+    runtime
+        .output_tx
+        .try_send(ProxyOutput::UdpBound {
+            source: udp_source_key(first),
+            translated,
+        })
+        .unwrap();
+    runtime
+        .output_tx
+        .try_send(ProxyOutput::UdpBound {
+            source: udp_source_key(second),
+            translated,
+        })
+        .unwrap();
+
+    let mut dispatcher = TunDispatcher::new(32, 32, 4).unwrap();
+    runtime.poll_outputs(&mut dispatcher).unwrap();
+
+    assert!(runtime.udp_tasks.contains_key(&udp_source_key(first)));
+    assert!(!runtime.udp_tasks.contains_key(&udp_source_key(second)));
+    assert_eq!(runtime.nat_len().unwrap(), 1);
+    runtime.close();
+    assert_eq!(table.len().unwrap(), 0);
 }
 
 #[cfg(feature = "async-proxy")]

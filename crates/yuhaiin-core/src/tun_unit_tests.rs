@@ -2,7 +2,7 @@ use super::tun_test_support::*;
 use super::*;
 
 #[test]
-fn stale_proxy_flow_errors_are_recoverable_but_backpressure_is_not() {
+fn stale_proxy_flow_and_backpressure_errors_are_recoverable() {
     assert!(is_recoverable_proxy_flow_error(&Error::new(
         ErrorKind::Closed,
         "flow command channel closed",
@@ -11,7 +11,7 @@ fn stale_proxy_flow_errors_are_recoverable_but_backpressure_is_not() {
         ErrorKind::NotFound,
         "flow no longer exists",
     )));
-    assert!(!is_recoverable_proxy_flow_error(&Error::new(
+    assert!(is_recoverable_proxy_flow_error(&Error::new(
         ErrorKind::Timeout,
         "flow command queue full",
     )));
