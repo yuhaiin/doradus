@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, watch};
 
 use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
@@ -35,10 +35,6 @@ const BUCKET_LIMIT: usize = 90 * 24 * 60;
 const GO_STATISTICS_PROJECTION_INTERVAL: Duration = Duration::from_secs(30);
 const GO_STATISTICS_PROJECTION_RETRY_INITIAL: Duration = Duration::from_secs(2);
 const GO_STATISTICS_PROJECTION_RETRY_MAX: Duration = Duration::from_secs(60);
-// Failed connection history is updated from many independent inbound tasks.
-// Keep the hand-off bounded and non-blocking: the compact runtime checkpoint
-// still contains the complete in-memory failure map if this queue is full.
-const FAILED_HISTORY_QUEUE_CAPACITY: usize = 1024;
 const PERSISTENCE_KEY: &str = "statistics.runtime";
 const PERSISTENCE_VERSION: u32 = 1;
 // Go stores the history key's protocol in a separate SQLite column, while
@@ -96,19 +92,9 @@ struct ConnectionEntry {
 type TelemetryBucketKey = (i64, i64, String, String);
 type TelemetryBucketValue = (u64, u64, u64);
 
-#[derive(Debug)]
-struct FailedHistoryWrite {
-    protocol: String,
-    host: String,
-    process: String,
-    error: String,
-    last_seen: i64,
-}
-
 struct PersistenceState {
     store: ConfigStore,
     dirty: Arc<Notify>,
-    failed_history_tx: mpsc::Sender<FailedHistoryWrite>,
     shutdown: watch::Sender<bool>,
     worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -293,13 +279,10 @@ impl ConnectionMonitor {
         }
 
         let dirty = Arc::new(Notify::new());
-        let (failed_history_tx, mut failed_history_rx) =
-            mpsc::channel(FAILED_HISTORY_QUEUE_CAPACITY);
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let persistence = Arc::new(PersistenceState {
             store,
             dirty,
-            failed_history_tx,
             shutdown,
             worker: AsyncMutex::new(None),
         });
@@ -313,7 +296,6 @@ impl ConnectionMonitor {
             let mut project_go_statistics = true;
             let mut next_go_projection = Instant::now();
             let mut projection_backoff = GO_STATISTICS_PROJECTION_RETRY_INITIAL;
-            let mut failed_history_warned = false;
             loop {
                 tokio::select! {
                     biased;
@@ -321,40 +303,6 @@ impl ConnectionMonitor {
                         if changed.is_err() || *shutdown_rx.borrow() {
                             break;
                         }
-                    }
-                    Some(failure) = failed_history_rx.recv() => {
-                        // rusqlite and the repository lock are synchronous. Run
-                        // this derived projection off the current-thread Tokio
-                        // executor, and use the non-blocking store variant so
-                        // another process cannot pin the runtime forever.
-                        let store = worker_persistence.store.clone();
-                        let write = tokio::task::spawn_blocking(move || {
-                            store.try_record_failed_history(
-                                &failure.protocol,
-                                &failure.host,
-                                &failure.process,
-                                &failure.error,
-                                failure.last_seen,
-                            )
-                        })
-                        .await;
-                        match write {
-                            Ok(Ok(())) => failed_history_warned = false,
-                            Ok(Err(error)) if !failed_history_warned => {
-                                writer_monitor.warn(format!(
-                                    "persist failed connection history: {error}"
-                                ));
-                                failed_history_warned = true;
-                            }
-                            Err(error) if !failed_history_warned => {
-                                writer_monitor.warn(format!(
-                                    "persist failed connection history task: {error}"
-                                ));
-                                failed_history_warned = true;
-                            }
-                            _ => {}
-                        }
-                        continue;
                     }
                     _ = worker_persistence.dirty.notified() => {},
                     _ = interval.tick() => {},
@@ -805,7 +753,6 @@ impl ConnectionMonitor {
         error: &str,
         process: Option<&str>,
     ) {
-        let persistence = self.persistence.clone();
         let mut state = self.lock();
         let process = process.unwrap_or_default().to_owned();
         let last_seen = unix_seconds();
@@ -847,23 +794,11 @@ impl ConnectionMonitor {
         }
         drop(state);
         self.mark_dirty();
-        if let Some(persistence) = persistence {
-            // Never make the inbound task wait for SQLite. In particular, a
-            // busy write lock would otherwise retain the accepted socket for
-            // every concurrent failure until the retry loop completes, which
-            // can exhaust the process file-descriptor limit and prevent
-            // shutdown from being observed. The checkpoint written by the
-            // worker contains the same aggregate failure map, so a saturated
-            // queue does not lose the runtime's recoverable state.
-            let write = FailedHistoryWrite {
-                protocol: protocol.to_owned(),
-                host: host.to_owned(),
-                process,
-                error: error.to_owned(),
-                last_seen,
-            };
-            let _ = persistence.failed_history_tx.try_send(write);
-        }
+        // Failed history is part of the in-memory statistics checkpoint. The
+        // persistence worker projects the complete snapshot periodically and
+        // on shutdown; do not open a second SQLite/write-lock path for every
+        // failed dial, since that adds file-descriptor pressure precisely
+        // when many inbound connections are failing.
     }
 
     pub fn take_close_requests(&self) -> Vec<TunFlowKey> {
@@ -2726,12 +2661,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_history_queue_saturation_keeps_the_checkpoint_complete() {
+    async fn failed_history_checkpoint_keeps_all_failures() {
         let store = ConfigStore::open_memory().await.unwrap();
         let monitor = ConnectionMonitor::load_with_store(store.clone())
             .await
             .unwrap();
-        let expected = FAILED_HISTORY_QUEUE_CAPACITY + 256;
+        let expected = 1_280;
         for _ in 0..expected {
             monitor.record_failure("http", "example.com:443", "connection refused");
         }
