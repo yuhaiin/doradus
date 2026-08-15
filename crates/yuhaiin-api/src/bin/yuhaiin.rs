@@ -135,20 +135,26 @@ async fn run_with_shutdown(
     ));
     let signal_tx = service.shutdown_handle();
     tokio::spawn(async move {
-        #[cfg(windows)]
-        if let Some(mut service_shutdown) = service_shutdown {
-            tokio::select! {
-                _ = wait_for_process_shutdown() => {}
-                _ = &mut service_shutdown => {}
+        let shutdown_reason = {
+            #[cfg(windows)]
+            {
+                if let Some(mut service_shutdown) = service_shutdown {
+                    tokio::select! {
+                        reason = wait_for_process_shutdown() => reason,
+                        _ = &mut service_shutdown => "Windows service stop".to_owned(),
+                    }
+                } else {
+                    wait_for_process_shutdown().await
+                }
             }
-        } else {
-            wait_for_process_shutdown().await;
-        }
-        #[cfg(not(windows))]
-        {
-            wait_for_process_shutdown().await;
-        }
-        console_notice("shutdown requested; stopping runtime tasks");
+            #[cfg(not(windows))]
+            {
+                wait_for_process_shutdown().await
+            }
+        };
+        console_notice(format!(
+            "shutdown requested; stopping runtime tasks (signal={shutdown_reason})"
+        ));
         let _ = signal_tx.send(true);
     });
     console_notice("runtime ready; DNS, inbound and HTTP API supervisors started");
@@ -370,7 +376,7 @@ mod tests {
     }
 }
 
-async fn wait_for_process_shutdown() {
+async fn wait_for_process_shutdown() -> String {
     #[cfg(unix)]
     {
         let signals = (
@@ -381,21 +387,45 @@ async fn wait_for_process_shutdown() {
         match signals {
             (Ok(mut sighup), Ok(mut sigquit), Ok(mut sigterm)) => {
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {},
-                    _ = sighup.recv() => {},
-                    _ = sigquit.recv() => {},
-                    _ = sigterm.recv() => {},
+                    result = tokio::signal::ctrl_c() => match result {
+                        Ok(()) => "SIGINT (Ctrl-C)".to_owned(),
+                        Err(error) => format!("SIGINT handler error: {error}"),
+                    },
+                    signal = sighup.recv() => if signal.is_some() {
+                        "SIGHUP".to_owned()
+                    } else {
+                        "SIGHUP stream closed".to_owned()
+                    },
+                    signal = sigquit.recv() => if signal.is_some() {
+                        "SIGQUIT".to_owned()
+                    } else {
+                        "SIGQUIT stream closed".to_owned()
+                    },
+                    signal = sigterm.recv() => if signal.is_some() {
+                        "SIGTERM".to_owned()
+                    } else {
+                        "SIGTERM stream closed".to_owned()
+                    },
                 }
             }
-            _ => {
-                let _ = tokio::signal::ctrl_c().await;
-            }
+            (sighup, sigquit, sigterm) => match tokio::signal::ctrl_c().await {
+                Ok(()) => "SIGINT (Ctrl-C)".to_owned(),
+                Err(error) => format!(
+                    "signal setup error (SIGHUP={:?}, SIGQUIT={:?}, SIGTERM={:?}, SIGINT={error})",
+                    sighup.err(),
+                    sigquit.err(),
+                    sigterm.err()
+                ),
+            },
         }
     }
 
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => "SIGINT (Ctrl-C)".to_owned(),
+            Err(error) => format!("SIGINT handler error: {error}"),
+        }
     }
 }
 

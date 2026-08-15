@@ -57,6 +57,7 @@ podman run --rm \
     kill -TERM "$pid"
     wait "$pid"
     grep -Fq "shutdown requested; stopping runtime tasks" /state/stderr.log
+    grep -Fq "shutdown requested; stopping runtime tasks (signal=SIGTERM)" /state/stderr.log
     grep -Fq "stopped" /state/stderr.log
     cat /state/stderr.log
   ' \

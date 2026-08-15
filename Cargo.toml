@@ -30,5 +30,17 @@ incremental = false
 [profile.test]
 incremental = false
 
+# Keep release artifacts portable while enabling cross-crate optimization.
+# Thin LTO provides most of the link-time optimization benefit without the
+# build time and memory cost of full LTO. A single codegen unit gives rustc
+# more room to optimize hot paths, and symbol stripping keeps distributions
+# small. Do not set target-cpu=native here: release artifacts are cross-built
+# for multiple platforms and must run on other machines of the same target.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
