@@ -890,6 +890,42 @@ impl ConfigStore {
         rows.iter().map(fakeip_entry_from_row).collect()
     }
 
+    /// Find live-address candidates from other FakeIP prefixes that overlap
+    /// the currently active range.  Prefix is part of the persistence key,
+    /// but it is not present in packets, so reusing an address across two
+    /// ranges can make a stale client packet resolve to the wrong domain.
+    pub async fn list_fakeip_entries_in_range(
+        &self,
+        family: i64,
+        prefix: &str,
+        start_ip: &[u8],
+        end_ip: &[u8],
+    ) -> Result<Vec<FakeIpEntryRecord>> {
+        validate_fakeip_scope(family, prefix)?;
+        let expected_len = if family == 4 { 4 } else { 16 };
+        if start_ip.len() != expected_len || end_ip.len() != expected_len || start_ip > end_ip {
+            return Err(Error::invalid("invalid FakeIP address range"));
+        }
+        let connection = self.lock_connection()?;
+        let rows = connection
+            .query_with_params(
+                "SELECT family, prefix, domain, ip, created_at, last_used_at
+                 FROM fakeip_entries
+                 WHERE family = ?1 AND prefix <> ?2 AND length(ip) = ?3
+                   AND ip >= ?4 AND ip <= ?5
+                 ORDER BY ip, prefix, domain",
+                &[
+                    SqliteValue::from(family),
+                    SqliteValue::from(prefix),
+                    SqliteValue::from(expected_len as i64),
+                    SqliteValue::from(start_ip),
+                    SqliteValue::from(end_ip),
+                ],
+            )
+            .map_err(storage_error)?;
+        rows.iter().map(fakeip_entry_from_row).collect()
+    }
+
     pub async fn get_fakeip_cursor(
         &self,
         family: i64,

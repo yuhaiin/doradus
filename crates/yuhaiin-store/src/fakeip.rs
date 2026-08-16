@@ -306,6 +306,7 @@ struct State {
     next: u32,
     forward: HashMap<DomainName, Mapping4>,
     reverse: HashMap<Ipv4Addr, DomainName>,
+    reserved: HashMap<Ipv4Addr, i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -777,6 +778,23 @@ impl FakeIpPool {
         let now = unix_now();
         let family = 4;
         let typed_entries = store.list_fakeip_entries(family, &prefix).await?;
+        let reserved = store
+            .list_fakeip_entries_in_range(
+                family,
+                &prefix,
+                &config.start.octets(),
+                &config.end.octets(),
+            )
+            .await?
+            .into_iter()
+            .filter(|entry| !expired_at(entry.last_used_at, now, options.ttl_seconds))
+            .filter_map(|entry| {
+                (entry.ip.len() == 4)
+                    .then(|| <[u8; 4]>::try_from(entry.ip).ok())
+                    .flatten()
+                    .map(|ip| (Ipv4Addr::from(ip), entry.last_used_at))
+            })
+            .collect::<HashMap<_, _>>();
         let typed_entries_were_absent = typed_entries.is_empty();
         let typed_cursor = store.get_fakeip_cursor(family, &prefix).await?;
         let legacy_entries = if typed_entries_were_absent {
@@ -801,6 +819,7 @@ impl FakeIpPool {
                 })
                 .or(legacy_cursor)
                 .unwrap_or(u32::from(config.start)),
+            reserved,
             ..State::default()
         };
         normalize_next_v4(&mut state.next, config);
@@ -820,6 +839,7 @@ impl FakeIpPool {
             };
             let address = Ipv4Addr::from(<[u8; 4]>::try_from(entry.ip.as_slice()).unwrap());
             if !config_contains(config, address)
+                || state.reserved.contains_key(&address)
                 || state.reverse.contains_key(&address)
                 || state.forward.contains_key(&domain)
             {
@@ -927,6 +947,9 @@ impl FakeIpPool {
 
     pub async fn allocate_at(&self, domain: DomainName, now: i64) -> Result<Ipv4Addr> {
         let mut state = self.state.lock().await;
+        state
+            .reserved
+            .retain(|_, last_used_at| !expired_at(*last_used_at, now, self.options.ttl_seconds));
         if let Some(mapping) = state.forward.get(&domain).copied() {
             if !expired_at(mapping.last_used_at, now, self.options.ttl_seconds) {
                 if now.saturating_sub(mapping.persisted_last_used_at)
@@ -986,7 +1009,7 @@ impl FakeIpPool {
             for offset in 0..size {
                 let candidate = start + ((u64::from(state.next - start) + offset) % size) as u32;
                 let address = Ipv4Addr::from(candidate);
-                if !state.reverse.contains_key(&address) {
+                if !state.reverse.contains_key(&address) && !state.reserved.contains_key(&address) {
                     selected = Some(address);
                     break;
                 }
@@ -1217,6 +1240,7 @@ struct V6State {
     next: u128,
     forward: HashMap<DomainName, Mapping6>,
     reverse: HashMap<Ipv6Addr, DomainName>,
+    reserved: HashMap<Ipv6Addr, i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1274,6 +1298,23 @@ impl FakeIpV6Pool {
         let now = unix_now();
         let family = 6;
         let typed_entries = store.list_fakeip_entries(family, &prefix).await?;
+        let reserved = store
+            .list_fakeip_entries_in_range(
+                family,
+                &prefix,
+                &config.start.octets(),
+                &config.end.octets(),
+            )
+            .await?
+            .into_iter()
+            .filter(|entry| !expired_at(entry.last_used_at, now, options.ttl_seconds))
+            .filter_map(|entry| {
+                (entry.ip.len() == 16)
+                    .then(|| <[u8; 16]>::try_from(entry.ip).ok())
+                    .flatten()
+                    .map(|ip| (Ipv6Addr::from(ip), entry.last_used_at))
+            })
+            .collect::<HashMap<_, _>>();
         let typed_entries_were_absent = typed_entries.is_empty();
         let typed_cursor = store.get_fakeip_cursor(family, &prefix).await?;
         let legacy_entries = if typed_entries_were_absent {
@@ -1297,6 +1338,7 @@ impl FakeIpV6Pool {
                 })
                 .or(legacy_cursor)
                 .unwrap_or(u128::from(config.start)),
+            reserved,
             ..V6State::default()
         };
         normalize_next_v6(&mut state.next, config);
@@ -1316,6 +1358,7 @@ impl FakeIpV6Pool {
             };
             let address = Ipv6Addr::from(<[u8; 16]>::try_from(entry.ip.as_slice()).unwrap());
             if !config_contains_v6(config, address)
+                || state.reserved.contains_key(&address)
                 || state.reverse.contains_key(&address)
                 || state.forward.contains_key(&domain)
             {
@@ -1415,6 +1458,9 @@ impl FakeIpV6Pool {
 
     pub async fn allocate_at(&self, domain: DomainName, now: i64) -> Result<Ipv6Addr> {
         let mut state = self.state.lock().await;
+        state
+            .reserved
+            .retain(|_, last_used_at| !expired_at(*last_used_at, now, self.options.ttl_seconds));
         if let Some(mapping) = state.forward.get(&domain).copied() {
             if !expired_at(mapping.last_used_at, now, self.options.ttl_seconds) {
                 if now.saturating_sub(mapping.persisted_last_used_at)
@@ -1477,7 +1523,7 @@ impl FakeIpV6Pool {
             for offset in 0..size {
                 let candidate = start + ((state.next - start + offset) % size);
                 let address = Ipv6Addr::from(candidate);
-                if !state.reverse.contains_key(&address) {
+                if !state.reverse.contains_key(&address) && !state.reserved.contains_key(&address) {
                     selected = Some(address);
                     break;
                 }

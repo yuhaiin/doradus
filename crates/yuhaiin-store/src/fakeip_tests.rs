@@ -1041,6 +1041,119 @@ fn ipv6_pool_is_stable_reversible_and_uses_a_separate_namespace() {
 }
 
 #[test]
+fn overlapping_prefixes_quarantine_live_address_reuse_for_both_families() {
+    let store = block_on(ConfigStore::open_memory()).unwrap();
+    let options = FakeIpPoolOptions::new(3, 24 * 60 * 60).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let legacy_v4 = block_on(FakeIpPool::open_with_prefix(
+        store.clone(),
+        config(),
+        "legacy-v4",
+        options,
+    ))
+    .unwrap();
+    let legacy_v4_address =
+        block_on(legacy_v4.allocate_at(DomainName::new("legacy-v4.example").unwrap(), now))
+            .unwrap();
+    let current_v4 = block_on(FakeIpPool::open_with_prefix(
+        store.clone(),
+        config(),
+        "current-v4",
+        options,
+    ))
+    .unwrap();
+    let current_v4_address =
+        block_on(current_v4.allocate_at(DomainName::new("current-v4.example").unwrap(), now + 1))
+            .unwrap();
+    assert_eq!(legacy_v4_address, Ipv4Addr::new(198, 18, 0, 1));
+    assert_eq!(current_v4_address, Ipv4Addr::new(198, 18, 0, 2));
+
+    let legacy_v6 = block_on(FakeIpV6Pool::open_with_prefix(
+        store.clone(),
+        v6_config(),
+        "legacy-v6",
+        options,
+    ))
+    .unwrap();
+    let legacy_v6_address =
+        block_on(legacy_v6.allocate_at(DomainName::new("legacy-v6.example").unwrap(), now))
+            .unwrap();
+    let current_v6 = block_on(FakeIpV6Pool::open_with_prefix(
+        store,
+        v6_config(),
+        "current-v6",
+        options,
+    ))
+    .unwrap();
+    let current_v6_address =
+        block_on(current_v6.allocate_at(DomainName::new("current-v6.example").unwrap(), now + 1))
+            .unwrap();
+    assert_eq!(legacy_v6_address, "fc00::1".parse::<Ipv6Addr>().unwrap());
+    assert_eq!(current_v6_address, "fc00::2".parse::<Ipv6Addr>().unwrap());
+}
+
+#[test]
+fn overlapping_prefixes_quarantine_an_existing_conflicting_row() {
+    let store = block_on(ConfigStore::open_memory()).unwrap();
+    let options = FakeIpPoolOptions::new(3, 24 * 60 * 60).unwrap();
+    let now = unix_now();
+    let legacy_prefix = "legacy-v6";
+    let current_prefix = "current-v6";
+    let conflicting_address = "fc00::1".parse::<Ipv6Addr>().unwrap();
+    let legacy_domain = DomainName::new("legacy-v6.example").unwrap();
+    let current_domain = DomainName::new("current-v6.example").unwrap();
+
+    let legacy = block_on(FakeIpV6Pool::open_with_prefix(
+        store.clone(),
+        v6_config(),
+        legacy_prefix,
+        options,
+    ))
+    .unwrap();
+    assert_eq!(
+        block_on(legacy.allocate_at(legacy_domain, now)).unwrap(),
+        conflicting_address
+    );
+
+    block_on(store.replace_fakeip_entry(
+        &FakeIpEntryRecord {
+            family: 6,
+            prefix: current_prefix.to_owned(),
+            domain: current_domain.to_string(),
+            ip: conflicting_address.octets().to_vec(),
+            created_at: now,
+            last_used_at: now,
+        },
+        &FakeIpCursorRecord {
+            family: 6,
+            prefix: current_prefix.to_owned(),
+            cursor_ip: "fc00::2".parse::<Ipv6Addr>().unwrap().octets().to_vec(),
+            cursor_idx: 1,
+            updated_at: now,
+        },
+        None,
+    ))
+    .unwrap();
+
+    let current = block_on(FakeIpV6Pool::open_with_prefix(
+        store,
+        v6_config(),
+        current_prefix,
+        options,
+    ))
+    .unwrap();
+    assert_eq!(block_on(current.lookup_domain(conflicting_address)), None);
+    assert_eq!(
+        block_on(current.allocate_at(current_domain, now + 1)).unwrap(),
+        "fc00::2".parse::<Ipv6Addr>().unwrap()
+    );
+}
+
+#[test]
 fn ipv6_pool_reopens_with_mapping_and_cursor() {
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
