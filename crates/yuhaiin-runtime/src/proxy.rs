@@ -21,7 +21,8 @@ use yuhaiin_core::{
     BoxFuture, Endpoint, Error, ErrorKind, FlowContext, GeoLookup, IpSet, ResolveStrategy, Result,
     RouteMode,
 };
-use yuhaiin_store::{GoProxyLayer, GoProxyRuntimeConfig, GoProxyTransport};
+use yuhaiin_store::fakeip::FakeIpViewStore;
+use yuhaiin_store::{FakeIpPools, GoProxyLayer, GoProxyRuntimeConfig, GoProxyTransport};
 use yuhaiin_trie::router::RuntimeRoutedProxySelector;
 
 use crate::RuntimeSnapshot;
@@ -883,8 +884,9 @@ impl RuntimeSnapshot {
                 .await?
                 .proxy
         };
+        let proxy_resolver = self.dns_resolver_for_route_mode(RouteMode::Proxy)?;
         let udp_server = parent_config
-            .resolved_fixed_endpoint(self.resolver.as_ref())
+            .resolved_fixed_endpoint(proxy_resolver.as_ref())
             .await?
             .map(|address| Endpoint::ip(yuhaiin_core::Network::Udp, address));
         let tcp = match tcp {
@@ -937,8 +939,9 @@ impl RuntimeSnapshot {
             "drop" => Ok(Arc::new(DelayedDropAsyncProxy::new())),
             "fixed" | "simple" | "fixedv2" => {
                 let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Fixed);
+                let resolver = self.dns_resolver_for_route_mode(RouteMode::Proxy)?;
                 Ok(child
-                    .to_base_proxy_config_with_resolver(timeout, self.resolver.clone())
+                    .to_base_proxy_config_with_resolver(timeout, resolver)
                     .await?
                     .build()?)
             }
@@ -1066,10 +1069,11 @@ impl RuntimeSnapshot {
             }
             "wireguard" | "wire_guard" | "wg" => {
                 let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Wireguard);
+                let resolver = self.dns_resolver_for_route_mode(RouteMode::Proxy)?;
                 build_wireguard_proxy(
                     layer,
                     timeout,
-                    self.resolver.clone(),
+                    resolver,
                     child
                         .network_interface()
                         .or_else(|| self.socket_bind_interface.clone()),
@@ -1112,17 +1116,21 @@ impl RuntimeSnapshot {
                 format!("proxy runtime config {:?} is disabled", config.id),
             ));
         }
+        // Go resolves a node's own upstream endpoint through the route-selected
+        // DNS resolver. The FakeDNS wrapper is a flow/dial layer and must not
+        // turn the node endpoint into a TUN FakeIP.
+        let resolver = self.dns_resolver_for_route_mode(RouteMode::Proxy)?;
 
         let proxy = if config.transport == yuhaiin_store::GoProxyTransport::NetworkSplit {
             self.build_network_split_proxy(&config, timeout).await?
         } else if is_protocol_h2_config(&config) {
-            build_protocol_h2_proxy(&config, timeout, self.resolver.clone()).await?
+            build_protocol_h2_proxy(&config, timeout, resolver.clone()).await?
         } else if is_vless_websocket_config(&config) {
-            build_vless_transport_proxy(&config, timeout, self.resolver.clone()).await?
+            build_vless_transport_proxy(&config, timeout, resolver.clone()).await?
         } else if is_vmess_transport_config(&config) {
-            build_vmess_transport_proxy(&config, timeout, self.resolver.clone()).await?
+            build_vmess_transport_proxy(&config, timeout, resolver.clone()).await?
         } else if is_trojan_websocket_config(&config) {
-            build_trojan_transport_proxy(&config, timeout, self.resolver.clone()).await?
+            build_trojan_transport_proxy(&config, timeout, resolver.clone()).await?
         } else if config.transport == yuhaiin_store::GoProxyTransport::Wireguard {
             let layer = config
                 .layers
@@ -1132,7 +1140,7 @@ impl RuntimeSnapshot {
             build_wireguard_proxy(
                 layer,
                 timeout,
-                self.resolver.clone(),
+                resolver.clone(),
                 config
                     .network_interface()
                     .or_else(|| self.socket_bind_interface.clone()),
@@ -1140,7 +1148,7 @@ impl RuntimeSnapshot {
             .await?
         } else if config.transport == yuhaiin_store::GoProxyTransport::HttpMock {
             let base = config
-                .to_base_proxy_config_with_resolver(timeout, self.resolver.clone())
+                .to_base_proxy_config_with_resolver(timeout, resolver.clone())
                 .await?;
             Arc::new(yuhaiin_protocol::http_mock::HttpMockProxy::new(
                 base.build()?,
@@ -1212,10 +1220,10 @@ impl RuntimeSnapshot {
             })?;
             Arc::new(ChainProxy::from_go_json_with_resolver(
                 json,
-                self.resolver.clone(),
+                resolver.clone(),
             )?) as Arc<dyn AsyncProxy>
         } else if config.transport == yuhaiin_store::GoProxyTransport::Aead {
-            build_aead_proxy(&config, timeout, self.resolver.clone()).await?
+            build_aead_proxy(&config, timeout, resolver.clone()).await?
         } else if matches!(
             config.transport,
             yuhaiin_store::GoProxyTransport::Shadowsocks
@@ -1225,7 +1233,7 @@ impl RuntimeSnapshot {
                 | yuhaiin_store::GoProxyTransport::Vmess
         ) {
             let base = config
-                .to_base_proxy_config_with_resolver(timeout, self.resolver.clone())
+                .to_base_proxy_config_with_resolver(timeout, resolver.clone())
                 .await?;
             let mut upstream = base.build()?;
             if config
@@ -1390,7 +1398,7 @@ impl RuntimeSnapshot {
             }
         } else {
             let base = config
-                .to_base_proxy_config_with_resolver(timeout, self.resolver.clone())
+                .to_base_proxy_config_with_resolver(timeout, resolver)
                 .await?;
             base.build()?
         };
@@ -1763,6 +1771,8 @@ struct ProxyContextMetadata {
     hosts: yuhaiin_core::dns_hosts::HostsTable,
     route_lists: RouteListSnapshot,
     geo: Option<Arc<dyn GeoLookup>>,
+    fakeip_view: Option<FakeIpViewStore>,
+    fakeip_pools: Option<FakeIpPools>,
     endpoints: BTreeMap<String, SocketAddr>,
     tag_endpoints: BTreeMap<String, SocketAddr>,
     tag_node_ids: BTreeMap<String, String>,
@@ -2049,6 +2059,66 @@ impl AsyncProxySelector for RuntimeProxySelector {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        if context.original_domain.is_none()
+            && let Some(address) = context.destination.addr()
+        {
+            if let Some(fakeip_view) = &metadata.fakeip_view
+                && let Some(domain) = fakeip_view.lookup_domain_ip(address.ip())
+            {
+                context.original_domain = Some(domain.clone());
+                context.fake_ip = Some(address.ip().to_string());
+                context.destination = Endpoint::domain(context.network, domain, address.port());
+            } else if metadata
+                .fakeip_pools
+                .as_ref()
+                .is_some_and(|pools| pools.contains_ip(address.ip()))
+            {
+                context.route_mode = RouteMode::Block;
+                context.skip_route = true;
+                context.tag = Some("fakeip_unmapped".to_owned());
+                context.match_history.clear();
+            }
+        }
+        let hosts_target = if !context.skip_route {
+            match &context.destination {
+                Endpoint::Domain { host, port, .. } => metadata
+                    .hosts
+                    .resolve_domain_target(host, *port)
+                    .ok()
+                    .flatten(),
+                Endpoint::Ip { addr, .. } if context.original_domain.is_none() => metadata
+                    .hosts
+                    .resolve_ip_target(addr.ip(), addr.port())
+                    .ok()
+                    .flatten(),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(target) = hosts_target {
+            let source_port = match &context.destination {
+                Endpoint::Ip { addr, .. } => addr.port(),
+                Endpoint::Domain { port, .. } => *port,
+            };
+            let source = hosts_context_value(&context.destination);
+            if context.hosts.is_none() {
+                context.hosts = Some(source);
+            }
+            let port = target.port.unwrap_or(source_port);
+            match target.target {
+                yuhaiin_core::dns_hosts::HostsTarget::Ip(target) => {
+                    context.destination =
+                        Endpoint::ip(context.network, SocketAddr::new(target, port));
+                }
+                yuhaiin_core::dns_hosts::HostsTarget::Domain(target) => {
+                    context.destination = Endpoint::domain(context.network, target.clone(), port);
+                    if context.original_domain.is_none() {
+                        context.original_domain = Some(target);
+                    }
+                }
+            }
+        }
         let matched_lists = metadata.route_lists.matching_names(context);
         context.lists = matched_lists.clone();
         if let Some(reason) = self.loopback.reason(context) {
@@ -2175,6 +2245,7 @@ impl RuntimeSnapshot {
         bypass_id: &str,
         drop_id: &str,
     ) -> Result<ProxyContextMetadata> {
+        let proxy_resolver = self.dns_resolver_for_route_mode(RouteMode::Proxy)?;
         let mut endpoints = BTreeMap::new();
         for id in [direct_id, proxy_id, udp_proxy_id, bypass_id, drop_id]
             .into_iter()
@@ -2183,7 +2254,9 @@ impl RuntimeSnapshot {
             let Some(config) = self.proxy_config(id) else {
                 continue;
             };
-            if let Ok(Some(endpoint)) = config.resolved_fixed_endpoint(self.resolver.as_ref()).await
+            if let Ok(Some(endpoint)) = config
+                .resolved_fixed_endpoint(proxy_resolver.as_ref())
+                .await
             {
                 endpoints.insert(id.to_owned(), endpoint);
             }
@@ -2207,10 +2280,24 @@ impl RuntimeSnapshot {
                 )
             })
             .unwrap_or_default();
+        let fakeip_view = match self.inbound_fakeip.as_ref().or(self.fakeip.as_ref()) {
+            Some(pools) => {
+                pools.snapshot().await;
+                Some(pools.view_store())
+            }
+            None => None,
+        };
+        let fakeip_pools = self
+            .inbound_fakeip
+            .as_ref()
+            .or(self.fakeip.as_ref())
+            .cloned();
         Ok(ProxyContextMetadata {
             hosts: self.hosts.clone(),
             route_lists: self.route_lists.clone(),
             geo: self.geo.clone(),
+            fakeip_view,
+            fakeip_pools,
             endpoints,
             tag_endpoints,
             tag_node_ids,
@@ -2224,6 +2311,7 @@ impl RuntimeSnapshot {
         &self,
     ) -> Result<(BTreeMap<String, SocketAddr>, BTreeMap<String, String>)> {
         let definitions = self.node_tag_definitions()?;
+        let proxy_resolver = self.dns_resolver_for_route_mode(RouteMode::Proxy)?;
 
         let mut endpoints = BTreeMap::new();
         let mut node_ids = BTreeMap::new();
@@ -2237,8 +2325,9 @@ impl RuntimeSnapshot {
                     continue;
                 }
                 node_ids.entry(tag.clone()).or_insert_with(|| id.clone());
-                if let Ok(Some(endpoint)) =
-                    config.resolved_fixed_endpoint(self.resolver.as_ref()).await
+                if let Ok(Some(endpoint)) = config
+                    .resolved_fixed_endpoint(proxy_resolver.as_ref())
+                    .await
                 {
                     endpoints.insert(tag.clone(), endpoint);
                     break;
@@ -2318,6 +2407,13 @@ fn annotate_connection_metadata(
             .geo
             .as_ref()
             .and_then(|geo| geo.country_code(endpoint.ip()).ok().flatten());
+    }
+}
+
+fn hosts_context_value(endpoint: &Endpoint) -> String {
+    match endpoint {
+        Endpoint::Ip { addr, .. } => addr.to_string(),
+        Endpoint::Domain { host, port, .. } => format!("{host}:{port}"),
     }
 }
 
@@ -5115,6 +5211,87 @@ mod tests {
             block_on(snapshot(config).build_proxy("websocket-chain", Duration::from_secs(1)))
                 .unwrap();
         assert_eq!(built.config.id, "websocket-chain");
+    }
+
+    #[tokio::test]
+    async fn go_chain_upstream_endpoint_bypasses_tun_fakeip_resolver() {
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = closed_listener.local_addr().unwrap().port();
+        drop(closed_listener);
+
+        let fake_queries = Arc::new(Mutex::new(Vec::new()));
+        let fake_resolver: Arc<dyn AsyncIpResolver> = Arc::new(MappingResolver {
+            address: "198.18.0.1".parse().unwrap(),
+            queries: Arc::clone(&fake_queries),
+        });
+        let real_queries = Arc::new(Mutex::new(Vec::new()));
+        let real_resolver: Arc<dyn AsyncIpResolver> = Arc::new(MappingResolver {
+            address: "127.0.0.1".parse().unwrap(),
+            queries: Arc::clone(&real_queries),
+        });
+        let config = GoProxyRuntimeConfig {
+            id: "chain".to_owned(),
+            name: "chain".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types: vec![
+                "fixedv2".to_owned(),
+                "tls".to_owned(),
+                "http2".to_owned(),
+                "yuubinsya".to_owned(),
+            ],
+            layers: Vec::new(),
+            transport: GoProxyTransport::Yuubinsya,
+            data_json: serde_json::json!({
+                "chain": [
+                    {"type": "fixedv2", "fixedv2": {
+                        "addresses": [{"host": "proxy.example", "port": port}]
+                    }},
+                    {"type": "tls", "tls": {
+                        "enable": true,
+                        "insecure_skip_verify": true,
+                        "next_protos": ["h2"],
+                        "servernames": ["proxy.example"]
+                    }},
+                    {"type": "http2", "http2": {"concurrency": 8}},
+                    {"type": "yuubinsya", "yuubinsya": {
+                        "password": "test-secret",
+                        "udp_coalesce": true,
+                        "udp_over_stream": true
+                    }}
+                ]
+            })
+            .to_string()
+            .into_bytes(),
+        };
+        let mut snapshot = snapshot_with_resolver(config, fake_resolver);
+        snapshot.dns_resolver = real_resolver;
+
+        let proxy = snapshot
+            .build_proxy("chain", Duration::from_secs(1))
+            .await
+            .unwrap()
+            .proxy;
+        let context = FlowContext::new(yuhaiin_core::Endpoint::ip(
+            yuhaiin_core::Network::Tcp,
+            "192.0.2.1:443".parse().unwrap(),
+        ));
+        let _ = tokio::time::timeout(Duration::from_secs(1), proxy.connect(&context)).await;
+
+        assert!(
+            fake_queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
+        assert_eq!(
+            real_queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            ["proxy.example"]
+        );
     }
 
     #[cfg(feature = "websocket")]

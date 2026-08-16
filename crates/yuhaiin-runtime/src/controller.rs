@@ -315,30 +315,9 @@ impl RuntimeController {
                 .await?,
         );
         let (nat, idle_timeout) = snapshot.new_full_cone_nat()?;
-        let fakeip_view = match snapshot
-            .inbound_fakeip
-            .as_ref()
-            .or(snapshot.fakeip.as_ref())
-        {
-            Some(pools) => {
-                pools.snapshot().await;
-                Some(pools.view_store())
-            }
-            None => None,
-        };
         let mut runtime =
             yuhaiin_core::tun::TunProxyRuntime::new(selector.clone(), channel_capacity)?
                 .with_nat(nat, idle_timeout)?;
-        runtime = runtime.with_context_provider(move |flow| {
-            let mut context = flow.context();
-            if let Some(fakeip_view) = &fakeip_view
-                && let Some(domain) = fakeip_view.lookup_domain_ip(flow.key.destination.ip())
-            {
-                context.original_domain = Some(domain);
-                context.fake_ip = Some(flow.key.destination.ip().to_string());
-            }
-            context
-        });
         runtime = runtime.with_observer(self.monitor.clone());
         if let Some(handler) = async_dns_handler {
             runtime = runtime.with_async_dns_handler(handler);
@@ -756,6 +735,184 @@ mod tests {
         assert_eq!(context.hosts.as_deref(), Some("reload.example:443"));
     }
 
+    #[test]
+    fn shared_selector_restores_ipv4_and_ipv6_fakeip_for_socket_inbounds() {
+        let controller = controller();
+        block_on(controller.store().put_config(
+            "resolver.fakedns",
+            br#"{"enabled":true,"ipv4Range":"198.18.2.0/30","ipv6Range":"fc00:2::/126"}"#,
+        ))
+        .unwrap();
+        block_on(controller.store().put_config(
+            "resolver.hosts",
+            br#"{"hosts":{"socket-v4.example.com:443":"socket-target.example.com:9443","socket-v6.example.com":"socket-v6-target.example.com"}}"#,
+        ))
+        .unwrap();
+        block_on(controller.store().repository().put_go_node(&GoNodeRecord {
+            id: "direct".to_owned(),
+            name: "direct".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types_json: br#"["direct"]"#.to_vec(),
+            updated_at: 1,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        }))
+        .unwrap();
+        block_on(controller.reload()).unwrap();
+
+        let snapshot = controller.handle().load();
+        let domain = yuhaiin_core::DomainName::new("socket-v4.example.com").unwrap();
+        let fake_ip = block_on(
+            snapshot
+                .fakeip
+                .as_ref()
+                .expect("FakeIP should be enabled")
+                .ipv4
+                .allocate(domain.clone()),
+        )
+        .unwrap();
+        let v6_domain = yuhaiin_core::DomainName::new("socket-v6.example.com").unwrap();
+        let v6_fake_ip = block_on(
+            snapshot
+                .fakeip
+                .as_ref()
+                .expect("FakeIP should be enabled")
+                .ipv6
+                .allocate(v6_domain.clone()),
+        )
+        .unwrap();
+
+        let selector = block_on(controller.build_proxy_selector(
+            "direct",
+            "direct",
+            "",
+            "",
+            std::time::Duration::from_secs(1),
+        ))
+        .unwrap();
+        let mut tcp = FlowContext::new(Endpoint::ip(
+            Network::Tcp,
+            std::net::SocketAddr::new(fake_ip.into(), 443),
+        ));
+        selector.route_context(&mut tcp);
+        assert_eq!(tcp.original_domain, Some(domain));
+        assert_eq!(tcp.fake_ip.as_deref(), Some(fake_ip.to_string().as_str()));
+        assert_eq!(
+            tcp.destination,
+            Endpoint::domain(
+                Network::Tcp,
+                yuhaiin_core::DomainName::new("socket-target.example.com").unwrap(),
+                9443,
+            )
+        );
+        assert_eq!(tcp.hosts.as_deref(), Some("socket-v4.example.com:443"));
+
+        let mut udp = FlowContext::new(Endpoint::ip(
+            Network::Udp,
+            std::net::SocketAddr::new(v6_fake_ip.into(), 443),
+        ));
+        selector.route_context(&mut udp);
+        assert_eq!(udp.original_domain, Some(v6_domain));
+        assert_eq!(
+            udp.fake_ip.as_deref(),
+            Some(v6_fake_ip.to_string().as_str())
+        );
+        assert_eq!(
+            udp.destination,
+            Endpoint::domain(
+                Network::Udp,
+                yuhaiin_core::DomainName::new("socket-v6-target.example.com").unwrap(),
+                443,
+            )
+        );
+
+        let mut unmapped = FlowContext::new(Endpoint::ip(
+            Network::Udp,
+            "[fc00:2::3]:443".parse().unwrap(),
+        ));
+        selector.route_context(&mut unmapped);
+        assert_eq!(unmapped.route_mode, RouteMode::Block);
+        assert!(unmapped.skip_route);
+    }
+
+    #[test]
+    fn shared_selector_dispatches_ip_hosts_for_socket_inbounds() {
+        let controller = controller();
+        block_on(controller.store().put_config(
+            "resolver.hosts",
+            br#"{"hosts":{"192.0.2.50:443":"host.example.com:8443","source.example:443":"target.example:9443"}}"#,
+        ))
+        .unwrap();
+        block_on(controller.store().repository().put_go_node(&GoNodeRecord {
+            id: "direct".to_owned(),
+            name: "direct".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types_json: br#"["direct"]"#.to_vec(),
+            updated_at: 1,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        }))
+        .unwrap();
+        block_on(controller.reload()).unwrap();
+
+        let selector = block_on(controller.build_proxy_selector(
+            "direct",
+            "direct",
+            "",
+            "",
+            std::time::Duration::from_secs(1),
+        ))
+        .unwrap();
+        let mut tcp = FlowContext::new(Endpoint::ip(
+            Network::Tcp,
+            "192.0.2.50:443".parse().unwrap(),
+        ));
+        selector.route_context(&mut tcp);
+        assert_eq!(
+            tcp.destination,
+            Endpoint::domain(
+                Network::Tcp,
+                yuhaiin_core::DomainName::new("host.example.com").unwrap(),
+                8443,
+            )
+        );
+        assert_eq!(
+            tcp.original_domain,
+            Some(yuhaiin_core::DomainName::new("host.example.com").unwrap())
+        );
+        assert_eq!(tcp.hosts.as_deref(), Some("192.0.2.50:443"));
+
+        let mut domain = FlowContext::new(Endpoint::domain(
+            Network::Tcp,
+            yuhaiin_core::DomainName::new("source.example").unwrap(),
+            443,
+        ));
+        domain.original_domain = domain.destination.host().cloned();
+        selector.route_context(&mut domain);
+        assert_eq!(
+            domain.destination,
+            Endpoint::domain(
+                Network::Tcp,
+                yuhaiin_core::DomainName::new("target.example").unwrap(),
+                9443,
+            )
+        );
+        assert_eq!(domain.hosts.as_deref(), Some("source.example:443"));
+
+        let mut udp = FlowContext::new(Endpoint::ip(
+            Network::Udp,
+            "192.0.2.50:443".parse().unwrap(),
+        ));
+        selector.route_context(&mut udp);
+        assert_eq!(
+            udp.original_domain,
+            Some(yuhaiin_core::DomainName::new("host.example.com").unwrap())
+        );
+        assert_eq!(udp.hosts.as_deref(), Some("192.0.2.50:443"));
+    }
+
     #[cfg(feature = "tun")]
     #[test]
     fn controller_assembles_tun_runtime_from_one_full_cone_snapshot() {
@@ -819,6 +976,18 @@ mod tests {
                 .allocate(domain.clone()),
         )
         .unwrap();
+        let v6_domain = yuhaiin_core::DomainName::new("fake-v6.example.com").unwrap();
+        let v6_fake_ip = block_on(
+            controller
+                .handle()
+                .load()
+                .fakeip
+                .as_ref()
+                .expect("FakeIP should be enabled")
+                .ipv6
+                .allocate(v6_domain.clone()),
+        )
+        .unwrap();
         let mut runtime = block_on(controller.build_tun_proxy_runtime(
             "direct",
             "direct",
@@ -840,7 +1009,35 @@ mod tests {
                 .handle_event(yuhaiin_core::tun::TunEvent::TcpOpened { flow })
                 .unwrap();
 
-            let connection = &controller.monitor().connections_value()["connections"][0];
+            let v6_flow = yuhaiin_core::flow::Flow {
+                key: yuhaiin_core::flow::FlowKey {
+                    network: Network::Udp,
+                    source: "10.0.0.2:41001".parse().unwrap(),
+                    destination: std::net::SocketAddr::new(v6_fake_ip.into(), 443),
+                },
+            };
+            runtime
+                .handle_event(yuhaiin_core::tun::TunEvent::UdpDatagram {
+                    flow: v6_flow,
+                    payload: vec![0],
+                })
+                .unwrap();
+
+            let connections = controller.monitor().connections_value();
+            let connection = &connections["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|connection| connection["fakeIp"] == v6_fake_ip.to_string())
+                .expect("IPv6 FakeIP connection should be monitored");
+            assert_eq!(connection["domain"], v6_domain.to_string());
+            assert_eq!(connection["fakeIp"], v6_fake_ip.to_string());
+            let connection = &connections["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|connection| connection["fakeIp"] == fake_ip.to_string())
+                .expect("IPv4 FakeIP connection should be monitored");
             assert_eq!(connection["domain"], domain.to_string());
             assert_eq!(connection["fakeIp"], fake_ip.to_string());
             assert_eq!(connection["destination"], format!("tcp://{fake_ip}:443"));

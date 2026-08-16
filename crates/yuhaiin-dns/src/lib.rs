@@ -19,7 +19,9 @@ pub use dns::*;
 pub mod dns_hosts;
 #[cfg(feature = "async-proxy")]
 pub use dns_hosts::AsyncHostsDnsHandler;
-pub use dns_hosts::{HostsDnsHandler, HostsTable, host_without_port};
+pub use dns_hosts::{
+    HostsDispatchTarget, HostsDnsHandler, HostsTable, HostsTarget, host_without_port,
+};
 pub mod dns_resolver;
 pub use dns_resolver::{DnsResolver, ResolverTransport};
 #[cfg(feature = "async-proxy")]

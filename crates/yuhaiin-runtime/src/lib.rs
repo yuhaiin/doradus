@@ -702,7 +702,7 @@ async fn load_hosts(
         let Some(target) = target.as_str() else {
             return Err(Error::invalid("resolver.hosts targets must be strings"));
         };
-        configured.insert_target(DomainName::new(host)?, target)?;
+        configured.insert_host_target(host, target)?;
     }
     hosts.overlay(&configured)?;
     Ok(hosts)

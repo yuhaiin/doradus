@@ -1,5 +1,6 @@
 //! FakeIP address-resolver layer for the shared application runtime.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use yuhaiin_core::dns::{DnsRecordType, DnsResponse, DnsServiceParam};
@@ -41,6 +42,15 @@ impl FakeIpPools {
 
     pub fn view_store(&self) -> FakeIpViewStore {
         self.view.clone()
+    }
+
+    /// Match Go FakeDNS's fail-closed check for an address inside an active
+    /// FakeIP range that has no reverse mapping.
+    pub fn contains_ip(&self, address: IpAddr) -> bool {
+        match address {
+            IpAddr::V4(address) => self.ipv4.contains(address),
+            IpAddr::V6(address) => self.ipv6.contains(address),
+        }
     }
 
     /// Resolve an `in-addr.arpa` or `ip6.arpa` name from the current

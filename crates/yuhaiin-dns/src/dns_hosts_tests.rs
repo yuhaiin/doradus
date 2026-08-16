@@ -183,6 +183,7 @@ fn host_overrides_accept_go_address_forms_with_optional_ports() {
     assert_eq!(host_without_port("example.com"), "example.com");
     assert_eq!(host_without_port("example.com:443"), "example.com");
     assert_eq!(host_without_port("[2001:db8::1]:443"), "2001:db8::1");
+    assert_eq!(host_without_port("[2001:db8::1]"), "2001:db8::1");
     assert_eq!(host_without_port("2001:db8::1"), "2001:db8::1");
 
     let hosts = HostsTable::new();
@@ -197,6 +198,110 @@ fn host_overrides_accept_go_address_forms_with_optional_ports() {
             .v4,
         vec!["127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()]
     );
+}
+
+#[test]
+fn host_dispatch_accepts_ip_source_keys_like_go() {
+    let hosts = HostsTable::new();
+    hosts
+        .insert_host_target("192.0.2.30:443", "alias.example:8443")
+        .unwrap();
+    assert_eq!(
+        hosts
+            .resolve_ip_target("192.0.2.30".parse().unwrap(), 443)
+            .unwrap(),
+        Some(HostsDispatchTarget {
+            target: HostsTarget::Domain(DomainName::new("alias.example").unwrap()),
+            port: Some(8443),
+        })
+    );
+    assert_eq!(
+        hosts
+            .resolve_ip_target("192.0.2.30".parse().unwrap(), 80)
+            .unwrap(),
+        None
+    );
+
+    hosts
+        .insert_host_target("2001:db8::30", "192.0.2.31")
+        .unwrap();
+    assert_eq!(
+        hosts
+            .resolve_ip_target("2001:db8::30".parse().unwrap(), 443)
+            .unwrap(),
+        Some(HostsDispatchTarget {
+            target: HostsTarget::Ip("192.0.2.31".parse().unwrap()),
+            port: None,
+        })
+    );
+}
+
+#[test]
+fn host_dispatch_accepts_domain_source_keys_and_preserves_go_ports() {
+    let hosts = HostsTable::new();
+    hosts
+        .insert_host_target("source.example:443", "target.example:8443")
+        .unwrap();
+    assert_eq!(
+        hosts
+            .resolve_domain_target(&DomainName::new("source.example").unwrap(), 443)
+            .unwrap(),
+        Some(HostsDispatchTarget {
+            target: HostsTarget::Domain(DomainName::new("target.example").unwrap()),
+            port: Some(8443),
+        })
+    );
+    assert_eq!(
+        hosts
+            .resolve_domain_target(&DomainName::new("source.example").unwrap(), 80)
+            .unwrap(),
+        None
+    );
+
+    hosts
+        .insert_host_target("source-v6.example", "2001:db8::44")
+        .unwrap();
+    assert_eq!(
+        hosts
+            .resolve_domain_target(&DomainName::new("source-v6.example").unwrap(), 443)
+            .unwrap(),
+        Some(HostsDispatchTarget {
+            target: HostsTarget::Ip("2001:db8::44".parse().unwrap()),
+            port: None,
+        })
+    );
+}
+
+#[test]
+fn hosts_ptr_reverse_lookup_matches_go_hosts_dispatch() {
+    let hosts = HostsTable::new();
+    let v4_domain = DomainName::new("ptr-v4.example").unwrap();
+    let v6_domain = DomainName::new("ptr-v6.example").unwrap();
+    hosts
+        .insert_target(v4_domain.clone(), "192.0.2.44")
+        .unwrap();
+    hosts.insert_target(v6_domain.clone(), "::1").unwrap();
+    let handler = HostsDnsHandler {
+        hosts,
+        upstream: StaticUpstream,
+    };
+    let v4 = handler
+        .resolve(
+            &DomainName::new("44.2.0.192.in-addr.arpa").unwrap(),
+            DnsRecordType::Ptr,
+        )
+        .unwrap();
+    assert_eq!(v4.ptr_names, vec![v4_domain]);
+    let v6 = handler
+        .resolve(
+            &DomainName::new(
+                "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa",
+            )
+            .unwrap(),
+            DnsRecordType::Ptr,
+        )
+        .unwrap();
+    assert_eq!(v6.ptr_names, vec![v6_domain]);
 }
 
 #[cfg(feature = "async-proxy")]

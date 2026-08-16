@@ -1,8 +1,7 @@
 //! Typed and Go compatibility repositories.
 
 use super::*;
-use yuhaiin_core::DomainName;
-use yuhaiin_core::dns_hosts::{HostsTable, host_without_port};
+use yuhaiin_core::dns_hosts::HostsTable;
 
 fn validate_route_resolver_name(value: &str, field: &str) -> Result<()> {
     if value.len() > 512 || value.chars().any(char::is_control) {
@@ -425,10 +424,10 @@ impl ConfigRepository {
             // and valid `host:port` compatibility entries are indexed by
             // hostname.  A single stale row must not prevent the service
             // from starting with an otherwise usable production database.
-            let Ok(domain) = DomainName::new(host_without_port(&record.host)) else {
-                continue;
-            };
-            if hosts.insert_target(domain, &record.target).is_err() {
+            if hosts
+                .insert_host_target(&record.host, &record.target)
+                .is_err()
+            {
                 continue;
             }
         }

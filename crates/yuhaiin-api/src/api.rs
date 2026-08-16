@@ -1553,10 +1553,10 @@ async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
         }
         Err(error) => return Err(error.into()),
     };
-    let transport = Arc::new(ProxyRouteListTransport::new(
-        proxy,
-        snapshot.resolver.clone(),
-    ));
+    let resolver = snapshot
+        .dns_resolver_for_route_mode(yuhaiin_core::RouteMode::Proxy)
+        .map_err(ApiError::from)?;
+    let transport = Arc::new(ProxyRouteListTransport::new(proxy, resolver));
     let report = refresh_route_list_caches_with_transport(
         &records,
         timeout,
@@ -2553,7 +2553,7 @@ async fn route_rules_test_value(state: &ApiState, value: &Value) -> ApiResult {
         Endpoint::Ip { addr, .. } => vec![addr.ip().to_string()],
         Endpoint::Domain { host, .. } => {
             let mut resolved = Vec::new();
-            if let Ok(resolver) = snapshot.resolver_for_route_mode(decision.mode)
+            if let Ok(resolver) = snapshot.dns_resolver_for_route_mode(decision.mode)
                 && let Ok(addresses) = resolver.resolve(host, ResolveStrategy::Default).await
             {
                 resolved.extend(addresses.v4.into_iter().map(|address| address.to_string()));
@@ -2919,7 +2919,13 @@ async fn node_latency_value(state: &ApiState, value: &Value) -> ApiResult {
             .clamp(100, 120_000),
     );
     let snapshot = state.controller.handle().load();
-    let resolver = snapshot.resolver.clone();
+    // Go's IP latency probe uses netapi.Bootstrap(), not the FakeDNS wrapper.
+    // The direct-route resolver is the Rust public equivalent here; it is only
+    // for the management probe target, while the node proxy handles the
+    // actual connection.
+    let resolver = snapshot
+        .dns_resolver_for_route_mode(yuhaiin_core::RouteMode::Direct)
+        .map_err(ApiError::from)?;
     let proxy = snapshot
         .build_proxy(&id, timeout)
         .await
