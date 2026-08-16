@@ -4019,6 +4019,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
+ "futures-util",
  "h2",
  "http",
  "rand 0.10.2",

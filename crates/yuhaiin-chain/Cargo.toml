@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 bytes = "1.12.1"
+futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
 h2 = "0.4.15"
 http = "1.5.0"
 rand = { version = "0.10.2", default-features = false, features = ["std", "thread_rng"] }

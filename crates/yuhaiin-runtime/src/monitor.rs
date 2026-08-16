@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, watch};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, watch};
 
 use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
@@ -32,6 +32,7 @@ use crate::RuntimeLog;
 const HISTORY_LIMIT: usize = 2048;
 const GO_HISTORY_SIZE: usize = 1000;
 const BUCKET_LIMIT: usize = 90 * 24 * 60;
+const PERSISTENCE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 const GO_STATISTICS_PROJECTION_INTERVAL: Duration = Duration::from_secs(30);
 const GO_STATISTICS_PROJECTION_RETRY_INITIAL: Duration = Duration::from_secs(2);
 const GO_STATISTICS_PROJECTION_RETRY_MAX: Duration = Duration::from_secs(60);
@@ -94,7 +95,7 @@ type TelemetryBucketValue = (u64, u64, u64);
 
 struct PersistenceState {
     store: ConfigStore,
-    dirty: Arc<Notify>,
+    dirty: AtomicBool,
     shutdown: watch::Sender<bool>,
     worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -278,11 +279,10 @@ impl ConnectionMonitor {
             monitor.restore_go_statistics(go_statistics)?;
         }
 
-        let dirty = Arc::new(Notify::new());
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let persistence = Arc::new(PersistenceState {
             store,
-            dirty,
+            dirty: AtomicBool::new(false),
             shutdown,
             worker: AsyncMutex::new(None),
         });
@@ -291,7 +291,8 @@ impl ConnectionMonitor {
         let writer_monitor = persistent.clone();
         let worker_persistence = persistence.clone();
         let worker = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            let mut interval = tokio::time::interval(PERSISTENCE_CHECKPOINT_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut last_go_projection = Instant::now();
             let mut project_go_statistics = true;
             let mut next_go_projection = Instant::now();
@@ -304,8 +305,14 @@ impl ConnectionMonitor {
                             break;
                         }
                     }
-                    _ = worker_persistence.dirty.notified() => {},
                     _ = interval.tick() => {},
+                }
+                let dirty = worker_persistence.dirty.swap(false, Ordering::AcqRel);
+                let projection_due = project_go_statistics && Instant::now() >= next_go_projection;
+                let periodic_projection_due =
+                    last_go_projection.elapsed() >= GO_STATISTICS_PROJECTION_INTERVAL;
+                if !dirty && !projection_due && !periodic_projection_due {
+                    continue;
                 }
                 let value = writer_monitor.persisted_json();
                 if let Ok(bytes) = serde_json::to_vec(&value) {
@@ -315,12 +322,10 @@ impl ConnectionMonitor {
                     })
                     .await
                     .unwrap_or(false);
-                    let projection_due =
-                        project_go_statistics && Instant::now() >= next_go_projection;
-                    if checkpoint_written
-                        && (projection_due
-                            || last_go_projection.elapsed() >= GO_STATISTICS_PROJECTION_INTERVAL)
-                    {
+                    if !checkpoint_written {
+                        worker_persistence.dirty.store(true, Ordering::Release);
+                    }
+                    if checkpoint_written && (projection_due || periodic_projection_due) {
                         // Keep the compact checkpoint as the crash-recovery
                         // path, but refresh Go's public tables infrequently so
                         // another Go/Rust management process can observe
@@ -344,6 +349,8 @@ impl ConnectionMonitor {
                             projection_backoff = next_projection_backoff(projection_backoff);
                         }
                     }
+                } else {
+                    worker_persistence.dirty.store(true, Ordering::Release);
                 }
             }
         });
@@ -1049,7 +1056,7 @@ impl ConnectionMonitor {
 
     fn mark_dirty(&self) {
         if let Some(persistence) = self.persistence.as_ref() {
-            persistence.dirty.notify_one();
+            persistence.dirty.store(true, Ordering::Release);
         }
     }
 
@@ -2708,6 +2715,56 @@ mod tests {
         monitor.shutdown().await.unwrap();
         drop(reader_store);
         remove_monitor_test_database(&path);
+    }
+
+    #[tokio::test]
+    async fn monitor_coalesces_dirty_updates_until_the_next_checkpoint_interval() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let monitor = ConnectionMonitor::load_with_store(store.clone())
+            .await
+            .unwrap();
+        let (flow, context) = flow();
+        monitor.opened(flow, context);
+        monitor.bytes(flow.key, TunFlowDirection::Upload, 13);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(bytes) = store.get_config(PERSISTENCE_KEY).await.unwrap() {
+                    let checkpoint: PersistedMonitor = serde_json::from_slice(&bytes).unwrap();
+                    if checkpoint.total_upload == 13 {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial checkpoint should be written");
+
+        monitor.bytes(flow.key, TunFlowDirection::Upload, 17);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let checkpoint: PersistedMonitor =
+            serde_json::from_slice(&store.get_config(PERSISTENCE_KEY).await.unwrap().unwrap())
+                .unwrap();
+        assert_eq!(checkpoint.total_upload, 13);
+
+        tokio::time::timeout(
+            PERSISTENCE_CHECKPOINT_INTERVAL + Duration::from_secs(1),
+            async {
+                loop {
+                    if let Some(bytes) = store.get_config(PERSISTENCE_KEY).await.unwrap() {
+                        let checkpoint: PersistedMonitor = serde_json::from_slice(&bytes).unwrap();
+                        if checkpoint.total_upload == 30 {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .expect("dirty update should be persisted on the next interval");
+        monitor.shutdown().await.unwrap();
     }
 
     #[test]

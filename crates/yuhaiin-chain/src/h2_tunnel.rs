@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use http::Request;
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
@@ -18,6 +19,7 @@ use yuhaiin_core::{Error, ErrorKind, Result};
 const DEFAULT_MAX_CONNECTIONS_PER_ENDPOINT: usize = 4;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(650);
 
 /// One HTTP/2 connection that can own multiple independent CONNECT streams.
 /// The sender mutex is held only while opening a stream; data transfer is
@@ -430,6 +432,7 @@ impl H2Pool {
         if endpoints.is_empty() {
             return Err(Error::invalid("HTTP/2 pool has no fixed endpoint"));
         }
+        let mut last_error = None;
         self.reap_idle().await;
         let start = self.next.fetch_add(1, Ordering::Relaxed);
         for offset in 0..endpoints.len() {
@@ -465,13 +468,14 @@ impl H2Pool {
                         self.metrics
                             .stream_open_failures
                             .fetch_add(1, Ordering::Relaxed);
-                        return Err(error);
+                        last_error = Some(error);
                     }
                 }
             }
         }
 
         let _guard = self.connect_lock.lock().await;
+        let mut candidates = Vec::new();
         for endpoint in endpoints {
             let key = H2PoolKey {
                 address: endpoint.address,
@@ -502,7 +506,7 @@ impl H2Pool {
                         self.metrics
                             .stream_open_failures
                             .fetch_add(1, Ordering::Relaxed);
-                        return Err(error);
+                        last_error = Some(error);
                     }
                 }
             }
@@ -510,39 +514,81 @@ impl H2Pool {
             if connection_count >= self.max_connections_per_endpoint {
                 continue;
             }
-            self.metrics
-                .connection_attempts
-                .fetch_add(1, Ordering::Relaxed);
-            let connection = match connect(endpoint.clone()).await {
-                Ok(connection) => connection,
-                Err(error) => {
-                    self.metrics
-                        .connection_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(error);
-                }
-            };
-            let stream = match connection
-                .open_connect_stream_with_local_addr(concurrency)
-                .await
-            {
-                Ok(stream) => stream,
-                Err(error) => {
-                    self.metrics
-                        .stream_open_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(error);
-                }
-            };
-            self.connections
-                .lock()
-                .await
-                .entry(key)
-                .or_default()
-                .push(connection);
-            return Ok(stream);
+            candidates.push(endpoint.clone());
         }
-        Err(protocol_error("HTTP/2 pool could not open a connection"))
+        if candidates.is_empty() {
+            return Err(last_error
+                .unwrap_or_else(|| protocol_error("HTTP/2 pool could not open a connection")));
+        }
+
+        let (endpoint, connection, stream) = self
+            .open_new_connection_happy_eyeballs(candidates, concurrency, &connect)
+            .await?;
+        let key = H2PoolKey {
+            address: endpoint.address,
+            bind_interface: endpoint.bind_interface,
+            tls_identity: tls_identity.to_owned(),
+        };
+        self.connections
+            .lock()
+            .await
+            .entry(key)
+            .or_default()
+            .push(connection);
+        Ok(stream)
+    }
+
+    async fn open_new_connection_happy_eyeballs<F, Fut>(
+        &self,
+        endpoints: Vec<H2PoolEndpoint>,
+        concurrency: usize,
+        connect: &F,
+    ) -> Result<(
+        H2PoolEndpoint,
+        Arc<H2Connection>,
+        (DuplexStream, Option<SocketAddr>),
+    )>
+    where
+        F: Fn(H2PoolEndpoint) -> Fut,
+        Fut: Future<Output = Result<Arc<H2Connection>>>,
+    {
+        let mut attempts = FuturesUnordered::new();
+        for (index, endpoint) in endpoints.into_iter().enumerate() {
+            let metrics = Arc::clone(&self.metrics);
+            attempts.push(async move {
+                if index > 0 {
+                    tokio::time::sleep(HAPPY_EYEBALLS_DELAY * index as u32).await;
+                }
+                metrics.connection_attempts.fetch_add(1, Ordering::Relaxed);
+                let connection = match connect(endpoint.clone()).await {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        metrics.connection_failures.fetch_add(1, Ordering::Relaxed);
+                        return Err(error);
+                    }
+                };
+                let stream = match connection
+                    .open_connect_stream_with_local_addr(concurrency)
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        metrics.stream_open_failures.fetch_add(1, Ordering::Relaxed);
+                        return Err(error);
+                    }
+                };
+                Ok((endpoint, connection, stream))
+            });
+        }
+
+        let mut last_error = None;
+        while let Some(result) = attempts.next().await {
+            match result {
+                Ok(success) => return Ok(success),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| protocol_error("HTTP/2 pool could not open a connection")))
     }
 
     async fn remove_connection(&self, key: &H2PoolKey, target: &Arc<H2Connection>) {
@@ -1121,6 +1167,53 @@ mod tests {
 
         pool.close().await;
         assert_eq!(pool.len().await, 0);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pool_falls_back_to_next_endpoint_after_connection_failure() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(request.method(), http::Method::CONNECT);
+            respond.send_response(Response::new(()), false).unwrap();
+            while connection.accept().await.is_some() {}
+        });
+
+        let unreachable_v6 = "[2001:db8::1]:443".parse().unwrap();
+        let reachable_v4 = "127.0.0.1:443".parse().unwrap();
+        let io = Arc::new(Mutex::new(Some(client_io)));
+        let pool = H2Pool::new();
+        let stream = tokio::time::timeout(
+            Duration::from_secs(2),
+            pool.open(&[unreachable_v6, reachable_v4], 1, {
+                let io = Arc::clone(&io);
+                move |address| {
+                    let io = Arc::clone(&io);
+                    async move {
+                        if address == unreachable_v6 {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            return Err(Error::new(
+                                ErrorKind::Io,
+                                "simulated unreachable IPv6 endpoint",
+                            ));
+                        }
+                        let io = io.lock().await.take().ok_or_else(|| {
+                            Error::new(ErrorKind::Closed, "test transport missing")
+                        })?;
+                        H2Connection::handshake_with_limits(io, 128).await
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("IPv4 fallback did not race the stalled IPv6 endpoint")
+        .unwrap();
+        assert_eq!(pool.stats().connection_attempts, 2);
+        drop(stream);
+        pool.close().await;
         server.abort();
         let _ = server.await;
     }
