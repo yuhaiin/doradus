@@ -12,7 +12,6 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::split;
 use tokio::sync::Mutex;
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::proxy::{
@@ -340,22 +339,19 @@ impl DirectUotProxy {
                     continue;
                 }
             };
-            let session = match AsyncYuubinsyaUotSession::connect(
+            let (reader, writer, assigned_id) = match AsyncYuubinsyaUotSession::connect_split(
                 stream,
                 self.password_hash,
                 migrate_id,
-                self.udp_coalesce,
             )
             .await
             {
-                Ok(session) => session,
+                Ok(parts) => parts,
                 Err(error) => {
                     last_error = Some(error);
                     continue;
                 }
             };
-            let assigned_id = session.migrate_id;
-            let (reader, writer) = split(session.into_inner());
             return Ok((
                 DirectUotSession::new(reader, writer, self.udp_coalesce),
                 assigned_id,

@@ -241,6 +241,7 @@ impl AsyncProxy for NetworkSplitYuubinsyaProxy {
         Box::pin(async move {
             if self.udp_over_stream {
                 let stream = self.upstream.connect(context).await?;
+                let local_addr = stream_local_addr(&stream);
                 let session = yuhaiin_chain::AsyncYuubinsyaUotSession::connect(
                     stream,
                     self.password_hash,
@@ -251,9 +252,8 @@ impl AsyncProxy for NetworkSplitYuubinsyaProxy {
                 context
                     .udp_migrate_id
                     .store(session.migrate_id, Ordering::Release);
-                let local_addr = stream_local_addr(session.transport());
                 return Ok(Box::new(NetworkSplitYuubinsyaUotDatagram {
-                    session: tokio::sync::Mutex::new(Some(session)),
+                    session: Arc::new(session),
                     local_addr,
                 }) as Box<dyn AsyncDatagram>);
             }
@@ -284,29 +284,21 @@ impl AsyncProxy for NetworkSplitYuubinsyaProxy {
 }
 
 struct NetworkSplitYuubinsyaUotDatagram {
-    session: tokio::sync::Mutex<Option<yuhaiin_chain::AsyncYuubinsyaUotSession<BoxAsyncStream>>>,
+    session: Arc<yuhaiin_chain::AsyncYuubinsyaUotSession<BoxAsyncStream>>,
     local_addr: Option<SocketAddr>,
 }
 
 impl AsyncDatagram for NetworkSplitYuubinsyaUotDatagram {
     fn send_to<'a>(&'a self, payload: &'a [u8], target: Endpoint) -> BoxFuture<'a, Result<usize>> {
         Box::pin(async move {
-            let mut session = self.session.lock().await;
-            let session = session
-                .as_mut()
-                .ok_or_else(|| Error::new(ErrorKind::Closed, "Yuubinsya UDP session is closed"))?;
-            session.send_to(&target, payload).await?;
+            self.session.send_to(&target, payload).await?;
             Ok(payload.len())
         })
     }
 
     fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
         Box::pin(async move {
-            let mut session = self.session.lock().await;
-            let session = session
-                .as_mut()
-                .ok_or_else(|| Error::new(ErrorKind::Closed, "Yuubinsya UDP session is closed"))?;
-            let (target, payload) = session.recv_from().await?;
+            let (target, payload) = self.session.recv_from().await?;
             if buffer.len() < payload.len() {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
@@ -327,13 +319,7 @@ impl AsyncDatagram for NetworkSplitYuubinsyaUotDatagram {
     }
 
     fn close(&self) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move {
-            let session = self.session.lock().await.take();
-            if let Some(mut session) = session {
-                session.shutdown().await?;
-            }
-            Ok(())
-        })
+        Box::pin(async move { self.session.shutdown().await })
     }
 }
 

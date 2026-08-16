@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, mpsc};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split};
+use tokio::sync::{Mutex, Notify, mpsc};
 use yuhaiin_core::flow::{Flow, FlowDirection, FlowKey, FlowObserver, FlowObserverGuard};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy};
 use yuhaiin_core::yuubinsya::{
@@ -19,6 +19,10 @@ use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Result};
 
 pub(crate) const MAX_UOT_COALESCE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_UOT_COALESCE_FRAMES: usize = 32;
+// Go's coalescer receives one queued packet and drains the packets already
+// waiting behind it before writing. A short scheduling window gives the async
+// sender the same opportunity without flushing every notification separately.
+const UOT_COALESCE_FLUSH_DELAY: Duration = Duration::from_micros(100);
 const SERVER_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SERVER_UDP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -244,13 +248,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncYuubinsyaTcpSession<S> {
 /// Yuubinsya UDP-over-TCP session. A session starts with the migrate-ID
 /// handshake and then carries `[address][u16 length][payload]` frames.
 pub struct AsyncYuubinsyaUotSession<S> {
-    stream: S,
+    reader: Option<Mutex<ReadHalf<S>>>,
+    writer: Option<Arc<Mutex<AsyncYuubinsyaUotWriter<S>>>>,
+    coalescer: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    coalesce_notify: Arc<Notify>,
     password_hash: [u8; 32],
     pub migrate_id: u64,
     pub udp_coalesce: bool,
+    local_addr: Option<SocketAddr>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+struct AsyncYuubinsyaUotWriter<S> {
+    stream: WriteHalf<S>,
     pending: Vec<u8>,
     pending_frames: usize,
-    write_shutdown: bool,
 }
 
 /// Server-side UOT session.  It owns only the authenticated migration
@@ -959,12 +971,14 @@ where
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncYuubinsyaUotSession<S> {
-    pub async fn connect(
+    /// Perform the UOT migration handshake and return independent read/write
+    /// halves. Direct-UOT uses this to hand the halves to its concurrent
+    /// datagram session without briefly serializing both directions.
+    pub async fn connect_split(
         mut stream: S,
         password_hash: [u8; 32],
         migrate_id: u64,
-        udp_coalesce: bool,
-    ) -> Result<Self> {
+    ) -> Result<(ReadHalf<S>, WriteHalf<S>, u64)> {
         let header = encode_header(
             &password_hash,
             &YuubinsyaHeader {
@@ -977,66 +991,175 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncYuubinsyaUotSession<S> {
         stream.flush().await.map_err(io_error)?;
         let mut assigned = [0u8; 8];
         stream.read_exact(&mut assigned).await.map_err(io_error)?;
-        Ok(Self {
-            stream,
-            password_hash,
-            migrate_id: u64::from_be_bytes(assigned),
-            udp_coalesce,
+        let (reader, writer) = split(stream);
+        Ok((reader, writer, u64::from_be_bytes(assigned)))
+    }
+
+    pub async fn connect(
+        stream: S,
+        password_hash: [u8; 32],
+        migrate_id: u64,
+        udp_coalesce: bool,
+    ) -> Result<Self>
+    where
+        S: Send + 'static,
+    {
+        Self::connect_with_local_addr(stream, password_hash, migrate_id, udp_coalesce, None).await
+    }
+
+    pub async fn connect_with_local_addr(
+        stream: S,
+        password_hash: [u8; 32],
+        migrate_id: u64,
+        udp_coalesce: bool,
+        local_addr: Option<SocketAddr>,
+    ) -> Result<Self>
+    where
+        S: Send + 'static,
+    {
+        let (reader, writer, assigned_migrate_id) =
+            Self::connect_split(stream, password_hash, migrate_id).await?;
+        let writer = Arc::new(Mutex::new(AsyncYuubinsyaUotWriter {
+            stream: writer,
             pending: Vec::new(),
             pending_frames: 0,
-            write_shutdown: false,
+        }));
+        let coalesce_notify = Arc::new(Notify::new());
+        let coalescer = if udp_coalesce {
+            let writer = Arc::downgrade(&writer);
+            let notify = Arc::clone(&coalesce_notify);
+            Some(tokio::spawn(async move {
+                loop {
+                    notify.notified().await;
+                    tokio::time::sleep(UOT_COALESCE_FLUSH_DELAY).await;
+                    let Some(writer) = writer.upgrade() else {
+                        return;
+                    };
+                    let mut writer = writer.lock().await;
+                    if flush_async_uot_writer(&mut writer).await.is_err() {
+                        return;
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+        Ok(Self {
+            reader: Some(Mutex::new(reader)),
+            writer: Some(writer),
+            coalescer: StdMutex::new(coalescer),
+            coalesce_notify,
+            password_hash,
+            migrate_id: assigned_migrate_id,
+            udp_coalesce,
+            local_addr,
+            closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
-    pub async fn send_to(&mut self, destination: &Endpoint, payload: &[u8]) -> Result<()> {
+    pub async fn send_to(&self, destination: &Endpoint, payload: &[u8]) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::new(
+                ErrorKind::Closed,
+                "Yuubinsya UDP session is closed",
+            ));
+        }
         let frame = encode_uot_frame(destination, payload)?;
+        let mut writer = self
+            .writer
+            .as_ref()
+            .expect("UOT writer missing")
+            .lock()
+            .await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::new(
+                ErrorKind::Closed,
+                "Yuubinsya UDP session is closed",
+            ));
+        }
         if !self.udp_coalesce {
-            self.stream.write_all(&frame).await.map_err(io_error)?;
-            return self.stream.flush().await.map_err(io_error);
+            writer.stream.write_all(&frame).await.map_err(io_error)?;
+            return writer.stream.flush().await.map_err(io_error);
         }
         if frame.len() > MAX_UOT_COALESCE_BYTES
-            || self.pending.len() + frame.len() > MAX_UOT_COALESCE_BYTES
-            || self.pending_frames >= MAX_UOT_COALESCE_FRAMES
+            || writer.pending.len() + frame.len() > MAX_UOT_COALESCE_BYTES
+            || writer.pending_frames >= MAX_UOT_COALESCE_FRAMES
         {
-            self.flush().await?;
+            flush_async_uot_writer(&mut writer).await?;
         }
-        self.pending.extend_from_slice(&frame);
-        self.pending_frames += 1;
-        if self.pending_frames >= MAX_UOT_COALESCE_FRAMES {
-            self.flush().await?;
+        writer.pending.extend_from_slice(&frame);
+        writer.pending_frames += 1;
+        if writer.pending_frames >= MAX_UOT_COALESCE_FRAMES {
+            flush_async_uot_writer(&mut writer).await?;
         }
+        drop(writer);
+        self.coalesce_notify.notify_one();
         Ok(())
     }
 
-    pub async fn recv_from(&mut self) -> Result<(Endpoint, Vec<u8>)> {
+    pub async fn recv_from(&self) -> Result<(Endpoint, Vec<u8>)> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::new(
+                ErrorKind::Closed,
+                "Yuubinsya UDP session is closed",
+            ));
+        }
         self.flush().await?;
-        let frame = read_uot_frame(&mut self.stream).await?;
+        let mut reader = self
+            .reader
+            .as_ref()
+            .expect("UOT reader missing")
+            .lock()
+            .await;
+        let frame = read_uot_frame(&mut *reader).await?;
         let (destination, payload, _) = decode_uot_frame(&frame)?;
         Ok((destination, payload.to_vec()))
     }
 
     /// Flush all queued UOT frames as one bounded byte batch.
-    pub async fn flush(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
+    pub async fn flush(&self) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::new(
+                ErrorKind::Closed,
+                "Yuubinsya UDP session is closed",
+            ));
         }
-        self.stream
-            .write_all(&self.pending)
-            .await
-            .map_err(io_error)?;
-        self.stream.flush().await.map_err(io_error)?;
-        self.pending.clear();
-        self.pending_frames = 0;
-        Ok(())
+        self.flush_writer().await
     }
 
-    pub async fn shutdown(&mut self) -> Result<()> {
-        if self.write_shutdown {
+    async fn flush_writer(&self) -> Result<()> {
+        let mut writer = self
+            .writer
+            .as_ref()
+            .expect("UOT writer missing")
+            .lock()
+            .await;
+        flush_async_uot_writer(&mut writer).await
+    }
+
+    async fn stop_coalescer(&self) {
+        let task = self.coalescer.lock().ok().and_then(|mut task| task.take());
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        self.flush().await?;
-        self.stream.shutdown().await.map_err(io_error)?;
-        self.write_shutdown = true;
+        self.stop_coalescer().await;
+        self.flush_writer().await?;
+        self.writer
+            .as_ref()
+            .expect("UOT writer missing")
+            .lock()
+            .await
+            .stream
+            .shutdown()
+            .await
+            .map_err(io_error)?;
         Ok(())
     }
 
@@ -1044,13 +1167,52 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncYuubinsyaUotSession<S> {
         &self.password_hash
     }
 
-    pub fn transport(&self) -> &S {
-        &self.stream
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.local_addr
     }
 
-    pub fn into_inner(self) -> S {
-        self.stream
+    /// Consume the session after the handshake and return independent halves.
+    /// No UOT frame can be pending immediately after `connect`, so this is
+    /// safe for adapters that install their own concurrent writer/reader.
+    pub async fn into_split(mut self) -> (ReadHalf<S>, WriteHalf<S>) {
+        self.stop_coalescer().await;
+        let writer = Arc::try_unwrap(self.writer.take().expect("UOT writer missing"))
+            .ok()
+            .expect("UOT coalescer still owns writer")
+            .into_inner();
+        debug_assert!(writer.pending.is_empty());
+        (
+            self.reader.take().expect("UOT reader missing").into_inner(),
+            writer.stream,
+        )
     }
+}
+
+impl<S> Drop for AsyncYuubinsyaUotSession<S> {
+    fn drop(&mut self) {
+        if let Ok(mut task) = self.coalescer.lock()
+            && let Some(task) = task.take()
+        {
+            task.abort();
+        }
+    }
+}
+
+async fn flush_async_uot_writer<S: AsyncWrite + Unpin>(
+    writer: &mut AsyncYuubinsyaUotWriter<S>,
+) -> Result<()> {
+    if writer.pending.is_empty() {
+        return Ok(());
+    }
+    writer
+        .stream
+        .write_all(&writer.pending)
+        .await
+        .map_err(io_error)?;
+    writer.stream.flush().await.map_err(io_error)?;
+    writer.pending.clear();
+    writer.pending_frames = 0;
+    Ok(())
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncYuubinsyaUotServerSession<S> {
@@ -1437,7 +1599,7 @@ mod tests {
             drop(session);
             Result::<()>::Ok(())
         });
-        let mut client = AsyncYuubinsyaUotSession::connect(client_io, password, 0, false)
+        let client = AsyncYuubinsyaUotSession::connect(client_io, password, 0, false)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), server_task)
@@ -1475,7 +1637,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { server.serve(server_io).await })
         };
-        let mut first = AsyncYuubinsyaUotSession::connect(client_io, password, 0, false)
+        let first = AsyncYuubinsyaUotSession::connect(client_io, password, 0, false)
             .await
             .unwrap();
         first.send_to(&destination, b"first").await.unwrap();
@@ -1490,7 +1652,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { server.serve(server_io).await })
         };
-        let mut second = AsyncYuubinsyaUotSession::connect(client_io, password, migrate_id, false)
+        let second = AsyncYuubinsyaUotSession::connect(client_io, password, migrate_id, false)
             .await
             .unwrap();
         assert_eq!(second.migrate_id, migrate_id);
@@ -1576,7 +1738,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { server.serve(server_io).await })
         };
-        let mut client = AsyncYuubinsyaUotSession::connect(client_io, password, 0, false)
+        let client = AsyncYuubinsyaUotSession::connect(client_io, password, 0, false)
             .await
             .unwrap();
         let destination = Endpoint::ip(Network::Udp, "192.0.2.17:5353".parse().unwrap());
@@ -1622,7 +1784,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { server.serve(first_server_io).await })
         };
-        let mut first = AsyncYuubinsyaUotSession::connect(first_client_io, password, 0, false)
+        let first = AsyncYuubinsyaUotSession::connect(first_client_io, password, 0, false)
             .await
             .unwrap();
         let migrate_id = first.migrate_id;
@@ -1632,7 +1794,7 @@ mod tests {
             let server = Arc::clone(&server);
             tokio::spawn(async move { server.serve(second_server_io).await })
         };
-        let mut second =
+        let second =
             AsyncYuubinsyaUotSession::connect(second_client_io, password, migrate_id, false)
                 .await
                 .unwrap();
@@ -1822,7 +1984,7 @@ mod tests {
                     .await
             })
         };
-        let mut client = AsyncYuubinsyaUotSession::connect(client_io, password, 0, false)
+        let client = AsyncYuubinsyaUotSession::connect(client_io, password, 0, false)
             .await
             .unwrap();
         let destination = Endpoint::ip(Network::Udp, "192.0.2.10:53".parse().unwrap());
@@ -1895,7 +2057,7 @@ mod tests {
         let (client, mut server) = duplex(4096);
         let password = [9u8; 32];
         let client_task = tokio::spawn(async move {
-            let mut session = AsyncYuubinsyaUotSession::connect(client, password, 12, true)
+            let session = AsyncYuubinsyaUotSession::connect(client, password, 12, true)
                 .await
                 .unwrap();
             assert_eq!(session.migrate_id, 99);
@@ -1918,6 +2080,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn uot_coalesced_frame_flushes_without_a_follow_up_read() {
+        let (client, mut server) = duplex(4096);
+        let password = [4u8; 32];
+        let destination = Endpoint::ip(Network::Udp, "192.0.2.44:5353".parse().unwrap());
+        let expected = encode_uot_frame(&destination, b"one-packet").unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut header = vec![0u8; 1 + 8 + 32];
+            server.read_exact(&mut header).await.unwrap();
+            let (decoded, _) = yuhaiin_core::yuubinsya::decode_header(&password, &header).unwrap();
+            assert_eq!(decoded.protocol, YuubinsyaProtocol::UdpWithMigrateId);
+            server.write_all(&77u64.to_be_bytes()).await.unwrap();
+            let mut frame = vec![0u8; expected.len()];
+            tokio::time::timeout(Duration::from_secs(1), server.read_exact(&mut frame))
+                .await
+                .expect("coalesced UOT frame flush timeout")
+                .unwrap();
+            assert_eq!(frame, expected);
+        });
+
+        let client = AsyncYuubinsyaUotSession::connect(client, password, 0, true)
+            .await
+            .unwrap();
+        client.send_to(&destination, b"one-packet").await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn uot_server_assigns_zero_migration_and_round_trips_frames() {
         let (client, server) = duplex(4096);
         let password = [5u8; 32];
@@ -1937,7 +2126,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let mut client = AsyncYuubinsyaUotSession::connect(client, password, 0, false)
+        let client = AsyncYuubinsyaUotSession::connect(client, password, 0, false)
             .await
             .unwrap();
         assert_eq!(client.migrate_id, 99);
@@ -2063,12 +2252,15 @@ mod tests {
         let first = encode_uot_frame(&first_destination, b"one").unwrap();
         let second = encode_uot_frame(&second_destination, b"two").unwrap();
         let client_task = tokio::spawn(async move {
-            let mut session = AsyncYuubinsyaUotSession::connect(client, password, 12, true)
+            let session = AsyncYuubinsyaUotSession::connect(client, password, 12, true)
                 .await
                 .unwrap();
             session.send_to(&first_destination, b"one").await.unwrap();
             session.send_to(&second_destination, b"two").await.unwrap();
-            assert_eq!(session.pending_frames, 2);
+            assert_eq!(
+                session.writer.as_ref().unwrap().lock().await.pending_frames,
+                2
+            );
             session.flush().await.unwrap();
         });
         let mut header = vec![0u8; 1 + 8 + 32];

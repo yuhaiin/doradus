@@ -684,8 +684,8 @@ mod tests {
     fn router_prefers_lower_priority_matching_rule() {
         let router = Router::compile(
             vec![
-                rule("example.com", RuleAction::Direct, 1),
-                rule("example.com", RuleAction::Proxy, 2),
+                rule("*.example.com", RuleAction::Direct, 1),
+                rule("*.example.com", RuleAction::Proxy, 2),
             ],
             RouteDecision {
                 mode: RouteMode::Block,
@@ -746,7 +746,7 @@ mod tests {
         let mut rejected = rule("not-example.com", RuleAction::Direct, 1);
         rejected.rule_name = "rejected-rule".to_owned();
         rejected.list_names = vec!["not-example".to_owned()];
-        let mut selected = rule("example.com", RuleAction::Proxy, 2);
+        let mut selected = rule("*.example.com", RuleAction::Proxy, 2);
         selected.rule_name = "selected-rule".to_owned();
         selected.list_names = vec!["example".to_owned()];
         let router = Router::compile(
@@ -781,11 +781,11 @@ mod tests {
 
     #[test]
     fn route_match_history_keeps_list_match_when_a_later_process_match_rejects_rule() {
-        let mut rejected = rule("example.com", RuleAction::Direct, 1);
+        let mut rejected = rule("*.example.com", RuleAction::Direct, 1);
         rejected.rule_name = "process-rejected".to_owned();
         rejected.list_names = vec!["shared-hosts".to_owned()];
         rejected.process_names = vec!["curl".to_owned()];
-        let mut selected = rule("example.com", RuleAction::Proxy, 2);
+        let mut selected = rule("*.example.com", RuleAction::Proxy, 2);
         selected.rule_name = "fallback-rule".to_owned();
         selected.list_names = vec!["selected-hosts".to_owned()];
         let router = Router::compile(
@@ -869,7 +869,7 @@ mod tests {
         let mut negative = rule("", RuleAction::Proxy, 10);
         negative
             .excluded_patterns
-            .insert("blocked.example", ())
+            .insert("*.blocked.example", ())
             .unwrap();
         negative.excluded_networks.push(Network::Udp);
         negative.excluded_ports.push((80, 80));

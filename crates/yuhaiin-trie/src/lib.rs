@@ -23,8 +23,9 @@ impl<T> Default for DomainNode<T> {
 
 /// A reversed-label domain trie.
 ///
-/// `*.example.com` is stored as a literal wildcard label and matches exactly
-/// one label. A normal parent rule continues to match subdomains.
+/// `*.example.com` is stored as a literal wildcard label. Like the Go trie it
+/// matches the base domain as well as any descendant. A normal `example.com`
+/// rule is exact and does not match `www.example.com`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainTrie<T> {
     root: DomainNode<T>,
@@ -62,7 +63,7 @@ impl<T> DomainTrie<T> {
     pub fn search(&self, domain: &str) -> Result<Option<&T>> {
         let domain = DomainName::try_from(domain)?;
         let labels: Vec<&str> = domain.labels().rev().collect();
-        Ok(search_domain(&self.root, &labels, 0, None))
+        Ok(search_domain(&self.root, &labels, 0))
     }
 }
 
@@ -104,25 +105,32 @@ where
     Ok(result)
 }
 
-fn search_domain<'a, T>(
-    node: &'a DomainNode<T>,
-    labels: &[&str],
-    depth: usize,
-    best: Option<&'a T>,
-) -> Option<&'a T> {
-    let best = node.value.as_ref().or(best);
+fn search_domain<'a, T>(node: &'a DomainNode<T>, labels: &[&str], depth: usize) -> Option<&'a T> {
+    // A normal Go trie value is exact: `example.com` does not match
+    // `www.example.com`. Wildcard values are the exception and match the
+    // base domain plus any remaining labels.
     if depth == labels.len() {
-        return best;
+        return node.value.as_ref().or_else(|| {
+            node.children
+                .get("*")
+                .and_then(|child| child.value.as_ref())
+        });
     }
 
-    let exact = node.children.get(labels[depth]);
-    let wildcard = node.children.get("*");
-    let exact_result = exact.and_then(|child| search_domain(child, labels, depth + 1, best));
-    let wildcard_result = (depth + 1 == labels.len())
-        .then_some(wildcard)
-        .flatten()
-        .and_then(|child| search_domain(child, labels, depth + 1, best));
-    exact_result.or(wildcard_result).or(best)
+    let exact = node
+        .children
+        .get(labels[depth])
+        .and_then(|child| search_domain(child, labels, depth + 1));
+    let wildcard = node.children.get("*").and_then(|child| {
+        // A terminal wildcard absorbs the rest of the query. A wildcard with
+        // descendants consumes one label and continues, which preserves Go's
+        // support for patterns such as `api.sec.miui.*`.
+        child
+            .value
+            .as_ref()
+            .or_else(|| search_domain(child, labels, depth + 1))
+    });
+    exact.or(wildcard)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,21 +307,39 @@ mod tests {
     use yuhaiin_core::{DomainName, Network};
 
     #[test]
-    fn domain_lookup_supports_parent_and_one_label_wildcard() {
+    fn domain_lookup_supports_parent_and_go_wildcard() {
         let mut trie = DomainTrie::new();
         trie.insert("example.com", "parent").unwrap();
         trie.insert("*.api.example.com", "wildcard").unwrap();
         assert_eq!(trie.search("example.com").unwrap(), Some(&"parent"));
-        assert_eq!(trie.search("www.example.com").unwrap(), Some(&"parent"));
+        assert_eq!(trie.search("www.example.com").unwrap(), None);
         assert_eq!(
             trie.search("edge.api.example.com").unwrap(),
             Some(&"wildcard")
         );
         assert_eq!(
             trie.search("a.edge.api.example.com").unwrap(),
-            Some(&"parent")
+            Some(&"wildcard")
         );
+        assert_eq!(trie.search("api.example.com").unwrap(), Some(&"wildcard"));
         assert_eq!(trie.search("other.net").unwrap(), None);
+    }
+
+    #[test]
+    fn go_terminal_wildcard_matches_base_domain_and_descendants() {
+        let mut trie = DomainTrie::new();
+        trie.insert("*.bilibili.com", "bilibili").unwrap();
+
+        assert_eq!(trie.search("bilibili.com").unwrap(), Some(&"bilibili"));
+        assert_eq!(
+            trie.search("www.bilibili.com").unwrap(),
+            Some(&"bilibili")
+        );
+        assert_eq!(
+            trie.search("api.www.bilibili.com").unwrap(),
+            Some(&"bilibili")
+        );
+        assert_eq!(trie.search("not-bilibili.com").unwrap(), None);
     }
 
     #[test]
@@ -360,25 +386,27 @@ mod tests {
                 .iter()
                 .filter(|(pattern, _)| {
                     if let Some(base) = pattern.strip_prefix("*.") {
-                        query.strip_suffix(base).is_some_and(|prefix| {
-                            prefix.ends_with('.') && !prefix[..prefix.len() - 1].contains('.')
-                        })
+                        query == base
+                            || query
+                                .strip_suffix(base)
+                                .is_some_and(|prefix| prefix.ends_with('.'))
                     } else {
                         query == **pattern
-                            || query
-                                .strip_suffix(pattern.as_str())
-                                .is_some_and(|prefix| prefix.ends_with('.'))
                     }
                 })
                 .max_by_key(|(pattern, _)| {
                     let base = pattern.strip_prefix("*.").unwrap_or(pattern);
                     (
                         base.split('.').count(),
-                        usize::from(pattern.starts_with("*.")),
+                        usize::from(!pattern.starts_with("*.")),
                     )
                 })
                 .map(|(_, value)| *value);
-            assert_eq!(trie.search(&query).unwrap().copied(), expected);
+            assert_eq!(
+                trie.search(&query).unwrap().copied(),
+                expected,
+                "query={query}"
+            );
         }
     }
 
@@ -501,11 +529,7 @@ mod tests {
         let mut trie = CombinedTrie::new();
         trie.insert("example.com", "domain").unwrap();
         trie.insert("192.0.2.0/24", "cidr").unwrap();
-        let domain = Endpoint::domain(
-            Network::Tcp,
-            DomainName::new("www.example.com").unwrap(),
-            443,
-        );
+        let domain = Endpoint::domain(Network::Tcp, DomainName::new("example.com").unwrap(), 443);
         let ip = Endpoint::ip(Network::Tcp, SocketAddr::from(([192, 0, 2, 1], 443)));
         assert_eq!(trie.search(&domain), Some(&"domain"));
         assert_eq!(trie.search(&ip), Some(&"cidr"));

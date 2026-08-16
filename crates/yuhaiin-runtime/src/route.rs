@@ -1047,18 +1047,7 @@ fn parse_rule_expression_inner(
         }
         "geoip" => {
             let nested = value.get("geoip").unwrap_or(value);
-            let countries = nested
-                .get("countries")
-                .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                })
-                .or_else(|| string_field(nested, &["country"]).map(|value| vec![value]))
-                .unwrap_or_default();
+            let countries = geoip_countries(nested);
             if countries.is_empty() {
                 return Err(unsupported_expression(id, "geoip countries"));
             }
@@ -1584,6 +1573,45 @@ fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
     })
 }
 
+fn geoip_countries(value: &Value) -> Vec<String> {
+    fn strings(value: &Value) -> Vec<String> {
+        match value {
+            Value::String(value) => value
+                .split([',', '|'])
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            Value::Array(values) => values
+                .iter()
+                .filter_map(Value::as_str)
+                .flat_map(|value| {
+                    value
+                        .split([',', '|'])
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    if !value.is_object() {
+        return strings(value);
+    }
+    for key in ["countries", "country", "country_codes", "countryCodes"] {
+        if let Some(value) = value.get(key) {
+            let countries = strings(value);
+            if !countries.is_empty() {
+                return countries;
+            }
+        }
+    }
+    Vec::new()
+}
+
 fn invalid_port(id: &str) -> Error {
     Error::new(
         ErrorKind::InvalidInput,
@@ -1637,7 +1665,7 @@ mod tests {
         .unwrap();
         let endpoint = Endpoint::domain(
             Network::Tcp,
-            yuhaiin_core::DomainName::new("www.example.com").unwrap(),
+            yuhaiin_core::DomainName::new("example.com").unwrap(),
             443,
         );
         assert_eq!(
@@ -1716,7 +1744,7 @@ mod tests {
                 updated_at: 0,
                 data_json: br#"{
                     "type":"host",
-                    "source":{"type":"local","local":{"lists":["example.com"]}}
+                    "source":{"type":"local","local":{"lists":["*.example.com"]}}
                 }"#
                 .to_vec(),
             },
@@ -1832,6 +1860,37 @@ mod tests {
     }
 
     #[test]
+    fn geoip_accepts_go_country_string_and_list_forms() {
+        let string_rule = expand_go_route_rule(
+            &record(
+                r#"{"mode":"proxy","rules":[{"type":"geoip","geoip":{"countries":"CN"}}]}"#,
+                "proxy",
+                "all",
+            ),
+            &RouteListSnapshot::default(),
+        )
+        .unwrap();
+        assert_eq!(string_rule[0].geo_country.as_deref(), Some("CN"));
+
+        let list_rule = expand_go_route_rule(
+            &record(
+                r#"{"mode":"proxy","rules":[{"type":"geoip","geoip":{"countries":["CN","US"]}}]}"#,
+                "proxy",
+                "all",
+            ),
+            &RouteListSnapshot::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            list_rule
+                .iter()
+                .map(|rule| rule.geo_country.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("CN"), Some("US")]
+        );
+    }
+
+    #[test]
     fn local_host_list_expands_go_nested_rule_into_router_patterns() {
         let list = GoRouteListRecord {
             name: "domains".to_owned(),
@@ -1841,7 +1900,7 @@ mod tests {
             data_json: br#"{
                 "name":"domains",
                 "type":"host",
-                "source":{"type":"local","local":{"lists":["example.com","*.blocked.test"]}}
+                "source":{"type":"local","local":{"lists":["*.example.com","*.blocked.test"]}}
             }"#
             .to_vec(),
         };
@@ -1894,8 +1953,32 @@ mod tests {
             lists
                 .values("domains")
                 .unwrap()
-                .contains(&"example.com".to_owned())
+                .contains(&"*.example.com".to_owned())
         );
+    }
+
+    #[test]
+    fn go_wildcard_host_list_matches_bilibili_base_and_subdomain() {
+        let lists = load_route_lists(&[GoRouteListRecord {
+            name: "china-domains".to_owned(),
+            list_type: "host".to_owned(),
+            source_type: "local".to_owned(),
+            updated_at: 1,
+            data_json: br#"{
+                "type":"host",
+                "source":{"type":"local","local":{"lists":["*.bilibili.com"]}}
+            }"#
+            .to_vec(),
+        }]);
+
+        for domain in ["bilibili.com", "www.bilibili.com"] {
+            let context = FlowContext::new(Endpoint::domain(
+                Network::Tcp,
+                DomainName::new(domain).unwrap(),
+                443,
+            ));
+            assert_eq!(lists.matching_names(&context), vec!["china-domains"]);
+        }
     }
 
     #[test]
@@ -1908,7 +1991,7 @@ mod tests {
                 updated_at: 1,
                 data_json: br#"{
                     "type":"host",
-                    "source":{"type":"local","local":{"lists":["example.com","192.0.2.0/24"]}}
+                    "source":{"type":"local","local":{"lists":["*.example.com","192.0.2.0/24"]}}
                 }"#
                 .to_vec(),
             },
@@ -1991,7 +2074,7 @@ mod tests {
     fn not_domain_expression_compiles_to_an_exclusion_trie() {
         let router = compile_go_route_rules_with_lists(
             &[record(
-                r#"{"mode":"drop","rules":[{"type":"not","not":{"type":"domain","domain":"blocked.example"}}]}"#,
+                r#"{"mode":"drop","rules":[{"type":"not","not":{"type":"domain","domain":"*.blocked.example"}}]}"#,
                 "drop",
                 "all",
             )],

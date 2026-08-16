@@ -6,19 +6,30 @@
 //! authenticated UDP, and Ping.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
-use yuhaiin_chain::YuubinsyaServerProxy;
+use yuhaiin_chain::{ChainClient, YuubinsyaServerProxy};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, YuubinsyaUdpServer};
 use yuhaiin_core::yuubinsya::derive_salt;
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 const PASSWORD: &str = "rust-go-interop";
+
+struct GoServerProcess(Option<Child>);
+
+impl Drop for GoServerProcess {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 struct EchoProxy;
 
@@ -212,4 +223,126 @@ async fn go_client_round_trips_against_rust_yuubinsya_server() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires the Go checkout and an available Go toolchain"]
+async fn rust_client_round_trips_and_measures_uot_against_go_server() {
+    let port_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve Go Yuubinsya port");
+    let port = port_listener
+        .local_addr()
+        .expect("Go Yuubinsya port")
+        .port();
+    drop(port_listener);
+
+    let helper =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/interop/yuubinsya_go_server.go");
+    let go_root = std::env::var_os("YUHAIIN_GO_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/home/asutorufa/Documents/Programming/yuhaiin"));
+    let go_tmp = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from(".cache"))
+        .join("yuhaiin-rust/go-tmp");
+    std::fs::create_dir_all(&go_tmp).expect("create Go temp directory");
+
+    let go_server = GoServerProcess(Some(
+        Command::new("go")
+            .args([
+                "run",
+                helper.to_str().expect("Go helper path is UTF-8"),
+                &port.to_string(),
+            ])
+            .current_dir(go_root)
+            .env("GOEXPERIMENT", "jsonv2,greenteagc")
+            .env("GOTMPDIR", go_tmp)
+            .env("YUHAIIN_TEST_PASSWORD", PASSWORD)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start Go Yuubinsya server"),
+    ));
+
+    let address = format!("127.0.0.1:{port}");
+    let mut ready = false;
+    for _ in 0..200 {
+        if TcpStream::connect(&address).await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "Go Yuubinsya server did not become ready");
+
+    let config = format!(
+        r#"{{
+            "chain": [
+                {{"type":"fixedv2","fixedv2":{{"addresses":[{{"host":"127.0.0.1:{port}"}}]}}}},
+                {{"type":"http2","http2":{{"concurrency":8}}}},
+                {{"type":"yuubinsya","yuubinsya":{{"password":"{PASSWORD}","udp_coalesce":true,"udp_over_stream":true}}}}
+            ]
+        }}"#
+    );
+    let client = ChainClient::from_json(&config).expect("parse Rust H2/UOT client config");
+    let session = tokio::time::timeout(Duration::from_secs(10), client.connect_uot(0))
+        .await
+        .expect("Rust H2/UOT handshake timeout")
+        .expect("Rust H2/UOT handshake with Go server");
+    let session = Arc::new(session);
+    let target = Endpoint::ip(Network::Udp, "127.0.0.1:5353".parse().unwrap());
+    let packet_count = 4096usize;
+    let packet_size = 1200usize;
+    let started = std::time::Instant::now();
+    let sender_session = Arc::clone(&session);
+    let sender = tokio::spawn(async move {
+        for sequence in 0..packet_count {
+            let mut payload = vec![0u8; packet_size];
+            payload[..8].copy_from_slice(&(sequence as u64).to_be_bytes());
+            sender_session
+                .send_to(&target, &payload)
+                .await
+                .expect("send Rust UOT packet to Go server");
+        }
+        sender_session.flush().await.expect("flush Rust UOT sender");
+    });
+
+    let receiver_session = Arc::clone(&session);
+    let receiver = tokio::spawn(async move {
+        let mut response = vec![0u8; packet_size];
+        for sequence in 0..packet_count {
+            let (_, payload) =
+                tokio::time::timeout(Duration::from_secs(20), receiver_session.recv_from())
+                    .await
+                    .expect("receive Rust UOT packet from Go server")
+                    .expect("Rust UOT receive from Go server");
+            assert_eq!(payload.len(), packet_size);
+            response.copy_from_slice(&payload);
+            assert_eq!(
+                u64::from_be_bytes(response[..8].try_into().unwrap()),
+                sequence as u64
+            );
+        }
+    });
+    sender.await.expect("Rust UOT sender task");
+    receiver.await.expect("Rust UOT receiver task");
+    let elapsed = started.elapsed();
+    let wire_bits = (packet_count * packet_size * 2 * 8) as f64;
+    eprintln!(
+        "Go Yuubinsya UOT echo: {} packets x {} bytes in {:.3}s ({:.2} Mbit/s wire payload)",
+        packet_count,
+        packet_size,
+        elapsed.as_secs_f64(),
+        wire_bits / elapsed.as_secs_f64() / 1_000_000.0
+    );
+
+    let session = match Arc::try_unwrap(session) {
+        Ok(session) => session,
+        Err(_) => panic!("Rust UOT session has no task owners"),
+    };
+    session.shutdown().await.expect("close Rust UOT client");
+    client.close().await;
+    drop(go_server);
 }

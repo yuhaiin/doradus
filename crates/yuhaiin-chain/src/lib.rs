@@ -40,7 +40,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use rustls::{ClientConfig, RootCertStore};
-use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf, split};
+use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{Mutex, Notify, watch};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -474,11 +474,13 @@ impl ChainClient {
         let stream = self
             .open_h2_stream(local_bind_addresses, bind_interface)
             .await?;
-        AsyncYuubinsyaUotSession::connect(
+        let local_addr = stream_local_addr(&*stream);
+        AsyncYuubinsyaUotSession::connect_with_local_addr(
             stream,
             derive_salt(yuubinsya.password.as_bytes()),
             migrate_id,
             yuubinsya.udp_coalesce,
+            local_addr,
         )
         .await
     }
@@ -792,8 +794,8 @@ impl AsyncProxy for ChainProxy {
                         .await?;
                     let migrate = session.migrate_id;
                     let udp_coalesce = session.udp_coalesce;
-                    let local_addr = stream_local_addr(session.transport());
-                    let (reader, writer) = split(session.into_inner());
+                    let local_addr = session.local_addr();
+                    let (reader, writer) = session.into_split().await;
                     migrate_id.store(migrate, Ordering::Release);
                     Ok(Box::new(ChainDatagram {
                         client,
@@ -1278,8 +1280,8 @@ impl ChainDatagram {
             .await?;
         let replacement_id = replacement.migrate_id;
         let udp_coalesce = replacement.udp_coalesce;
-        let local_addr = stream_local_addr(replacement.transport());
-        let (reader, writer) = split(replacement.into_inner());
+        let local_addr = replacement.local_addr();
+        let (reader, writer) = replacement.into_split().await;
         let replacement = ChainUotSession::new(reader, writer, udp_coalesce);
         let retry = self.retry.lock().await.snapshot();
         for (target, payload) in &retry {
