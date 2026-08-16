@@ -955,6 +955,224 @@ fn icmp_socket_round_trips_echo_request_and_reply() {
 }
 
 #[test]
+fn interface_auto_replies_to_external_ipv4_echo_request() {
+    let local = Ipv4Address::new(10, 0, 0, 1);
+    let remote = Ipv4Address::new(10, 0, 0, 2);
+    let destination = Ipv4Address::new(8, 8, 8, 8);
+    let mut device = SmoltcpTunDevice::new(1500, 8).unwrap();
+    let mut interface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    interface.set_any_ip(true);
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(IpAddress::Ipv4(local), 24))
+            .unwrap();
+    });
+
+    device
+        .enqueue_rx(icmp_echo_packet(remote, destination, 7, 9, b"echo", false))
+        .unwrap();
+    interface.poll(
+        Instant::from_millis(1),
+        &mut device,
+        &mut SocketSet::new(vec![]),
+    );
+
+    let response = device.take_tx().unwrap().expect("ICMP echo reply");
+    let ip = Ipv4Packet::new_checked(&response).unwrap();
+    assert_eq!(ip.src_addr(), destination);
+    assert_eq!(ip.dst_addr(), remote);
+    let response = Icmpv4Repr::parse(
+        &Icmpv4Packet::new_checked(ip.payload()).unwrap(),
+        &ChecksumCapabilities::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(response, Icmpv4Repr::EchoReply { ident: 7, seq_no: 9, data } if data == b"echo")
+    );
+}
+
+#[test]
+fn interface_auto_replies_to_external_ipv6_echo_request() {
+    let local: Ipv6Address = "fd00::1".parse().unwrap();
+    let remote: Ipv6Address = "fd00::2".parse().unwrap();
+    let destination: Ipv6Address = "2001:4860:4860::8888".parse().unwrap();
+    let mut device = SmoltcpTunDevice::new(1500, 8).unwrap();
+    let mut interface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    interface.set_any_ip(true);
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(IpAddress::Ipv6(local), 64))
+            .unwrap();
+    });
+
+    device
+        .enqueue_rx(icmpv6_echo_packet(
+            remote,
+            destination,
+            7,
+            9,
+            b"echo6",
+            false,
+        ))
+        .unwrap();
+    interface.poll(
+        Instant::from_millis(1),
+        &mut device,
+        &mut SocketSet::new(vec![]),
+    );
+
+    let response = device.take_tx().unwrap().expect("ICMPv6 echo reply");
+    let ip = Ipv6Packet::new_checked(&response).unwrap();
+    assert_eq!(ip.src_addr(), destination);
+    assert_eq!(ip.dst_addr(), remote);
+    let response = Icmpv6Repr::parse(
+        &ip.src_addr(),
+        &ip.dst_addr(),
+        &Icmpv6Packet::new_checked(ip.payload()).unwrap(),
+        &ChecksumCapabilities::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(response, Icmpv6Repr::EchoReply { ident: 7, seq_no: 9, data } if data == b"echo6")
+    );
+}
+
+#[test]
+fn dispatcher_intercepts_external_ipv4_echo_for_proxy_ping() {
+    let local = Ipv4Address::new(10, 0, 0, 1);
+    let remote = Ipv4Address::new(10, 0, 0, 2);
+    let destination = Ipv4Address::new(8, 8, 8, 8);
+    let mut device = SmoltcpTunDevice::new(1500, 8).unwrap();
+    let mut interface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    interface.set_any_ip(true);
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(IpAddress::Ipv4(local), 24))
+            .unwrap();
+    });
+    let mut dispatcher = TunDispatcher::new(2048, 2048, 4).unwrap();
+    device
+        .enqueue_rx(icmp_echo_packet(remote, destination, 7, 9, b"proxy", false))
+        .unwrap();
+
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(1))
+        .unwrap();
+
+    let events: Vec<_> = dispatcher.events().collect();
+    assert!(matches!(
+        events.as_slice(),
+        [TunEvent::IcmpEchoRequest { flow, packet }]
+            if flow.key.network == Network::Icmp
+                && flow.key.source == SocketAddr::new(IpAddr::V4(remote), 0)
+                && flow.key.destination == SocketAddr::new(IpAddr::V4(destination), 0)
+                && packet.len() == 20 + 8 + 5
+    ));
+    assert_eq!(device.queued_rx().unwrap(), 0);
+    assert_eq!(device.queued_tx().unwrap(), 0);
+}
+
+#[test]
+fn dispatcher_intercepts_external_ipv6_echo_for_proxy_ping() {
+    let local: Ipv6Address = "fd00::1".parse().unwrap();
+    let remote: Ipv6Address = "fd00::2".parse().unwrap();
+    let destination: Ipv6Address = "2001:4860:4860::8888".parse().unwrap();
+    let mut device = SmoltcpTunDevice::new(1500, 8).unwrap();
+    let mut interface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    interface.set_any_ip(true);
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(IpAddress::Ipv6(local), 64))
+            .unwrap();
+    });
+    let mut dispatcher = TunDispatcher::new(2048, 2048, 4).unwrap();
+    device
+        .enqueue_rx(icmpv6_echo_packet(
+            remote,
+            destination,
+            7,
+            9,
+            b"proxy6",
+            false,
+        ))
+        .unwrap();
+
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(1))
+        .unwrap();
+
+    let events: Vec<_> = dispatcher.events().collect();
+    assert!(matches!(
+        events.as_slice(),
+        [TunEvent::IcmpEchoRequest { flow, packet }]
+            if flow.key.network == Network::Icmp
+                && flow.key.source == SocketAddr::new(IpAddr::V6(remote), 0)
+                && flow.key.destination == SocketAddr::new(IpAddr::V6(destination), 0)
+                && packet.len() == 40 + 8 + 6
+    ));
+    assert_eq!(device.queued_rx().unwrap(), 0);
+    assert_eq!(device.queued_tx().unwrap(), 0);
+}
+
+#[test]
+fn proxy_icmp_reply_rewrite_preserves_echo_identity_for_both_families() {
+    let v4 = icmp_echo_packet(
+        Ipv4Address::new(10, 0, 0, 2),
+        Ipv4Address::new(8, 8, 8, 8),
+        17,
+        23,
+        b"v4",
+        false,
+    );
+    let v4_reply = rewrite_icmp_echo_reply(v4, true).unwrap();
+    let v4_ip = Ipv4Packet::new_checked(&v4_reply).unwrap();
+    assert_eq!(v4_ip.src_addr(), Ipv4Address::new(8, 8, 8, 8));
+    assert_eq!(v4_ip.dst_addr(), Ipv4Address::new(10, 0, 0, 2));
+    assert!(matches!(
+        Icmpv4Repr::parse(
+            &Icmpv4Packet::new_checked(v4_ip.payload()).unwrap(),
+            &ChecksumCapabilities::default(),
+        )
+        .unwrap(),
+        Icmpv4Repr::EchoReply { ident: 17, seq_no: 23, data } if data == b"v4"
+    ));
+
+    let v6_source: Ipv6Address = "fd00::2".parse().unwrap();
+    let v6_destination: Ipv6Address = "2001:4860:4860::8888".parse().unwrap();
+    let v6 = icmpv6_echo_packet(v6_source, v6_destination, 19, 29, b"v6", false);
+    let v6_reply = rewrite_icmp_echo_reply(v6, true).unwrap();
+    let v6_ip = Ipv6Packet::new_checked(&v6_reply).unwrap();
+    assert_eq!(v6_ip.src_addr(), v6_destination);
+    assert_eq!(v6_ip.dst_addr(), v6_source);
+    assert!(matches!(
+        Icmpv6Repr::parse(
+            &v6_ip.src_addr(),
+            &v6_ip.dst_addr(),
+            &Icmpv6Packet::new_checked(v6_ip.payload()).unwrap(),
+            &ChecksumCapabilities::default(),
+        )
+        .unwrap(),
+        Icmpv6Repr::EchoReply { ident: 19, seq_no: 29, data } if data == b"v6"
+    ));
+}
+
+#[test]
 fn dispatcher_emits_udp_flow_and_writes_response_back_to_tun() {
     let local = Ipv4Address::new(10, 0, 0, 1);
     let remote = Ipv4Address::new(10, 0, 0, 2);

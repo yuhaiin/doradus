@@ -2,8 +2,9 @@ pub(super) use smoltcp::iface::{Config, Interface, SocketSet};
 pub(super) use smoltcp::phy::{ChecksumCapabilities, Device, Medium, TxToken};
 pub(super) use smoltcp::socket::{icmp, tcp, udp};
 pub(super) use smoltcp::wire::{
-    HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpProtocol, Ipv4Address, Ipv4Packet,
-    Ipv4Repr, Ipv6Packet, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+    HardwareAddress, Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpProtocol,
+    Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket,
+    TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
 };
 
 pub(super) fn udp_packet(
@@ -166,6 +167,48 @@ pub(super) fn icmp_echo_packet(
         .emit(&mut ip, &ChecksumCapabilities::default());
         icmp_repr.emit(
             &mut Icmpv4Packet::new_unchecked(ip.payload_mut()),
+            &ChecksumCapabilities::default(),
+        );
+    }
+    bytes
+}
+
+pub(super) fn icmpv6_echo_packet(
+    source: Ipv6Address,
+    destination: Ipv6Address,
+    ident: u16,
+    sequence: u16,
+    payload: &[u8],
+    reply: bool,
+) -> Vec<u8> {
+    let icmp_repr = if reply {
+        Icmpv6Repr::EchoReply {
+            ident,
+            seq_no: sequence,
+            data: payload,
+        }
+    } else {
+        Icmpv6Repr::EchoRequest {
+            ident,
+            seq_no: sequence,
+            data: payload,
+        }
+    };
+    let mut bytes = vec![0; 40 + icmp_repr.buffer_len()];
+    {
+        let mut ip = Ipv6Packet::new_unchecked(&mut bytes[..]);
+        Ipv6Repr {
+            src_addr: source,
+            dst_addr: destination,
+            next_header: IpProtocol::Icmpv6,
+            payload_len: icmp_repr.buffer_len(),
+            hop_limit: 64,
+        }
+        .emit(&mut ip);
+        icmp_repr.emit(
+            &source,
+            &destination,
+            &mut Icmpv6Packet::new_unchecked(ip.payload_mut()),
             &ChecksumCapabilities::default(),
         );
     }

@@ -3,6 +3,140 @@ use super::*;
 
 #[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
+async fn external_icmp_flow_uses_proxy_ping_and_writes_back_echo_reply() {
+    use crate::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, StaticProxySelector};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct PingProxy {
+        checked_context: Arc<AtomicBool>,
+    }
+
+    impl AsyncProxy for PingProxy {
+        fn connect<'a>(
+            &'a self,
+            _context: &'a crate::FlowContext,
+        ) -> crate::BoxFuture<'a, Result<BoxAsyncStream>> {
+            Box::pin(async {
+                Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "ICMP fixture has no TCP stream path",
+                ))
+            })
+        }
+
+        fn open_datagram<'a>(
+            &'a self,
+            _context: &'a crate::FlowContext,
+        ) -> crate::BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+            Box::pin(async {
+                Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "ICMP fixture has no UDP path",
+                ))
+            })
+        }
+
+        fn ping<'a>(
+            &'a self,
+            context: &'a crate::FlowContext,
+        ) -> crate::BoxFuture<'a, Result<Duration>> {
+            let checked_context = Arc::clone(&self.checked_context);
+            Box::pin(async move {
+                if context.network == Network::Tcp && context.destination.network() == Network::Tcp
+                {
+                    checked_context.store(true, Ordering::Release);
+                    Ok(Duration::from_millis(3))
+                } else {
+                    Err(Error::invalid("ICMP fixture received the wrong context"))
+                }
+            })
+        }
+
+        fn close(&self) -> crate::BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    let checked_context = Arc::new(AtomicBool::new(false));
+    let proxy: Arc<dyn AsyncProxy> = Arc::new(PingProxy {
+        checked_context: Arc::clone(&checked_context),
+    });
+    let selector = Arc::new(StaticProxySelector {
+        direct: Arc::clone(&proxy),
+        proxy: Arc::clone(&proxy),
+        bypass: Arc::clone(&proxy),
+        drop: Arc::clone(&proxy),
+    });
+    let mut runtime = TunProxyRuntime::new(selector, 1).unwrap();
+    let flow = TunFlow {
+        key: TunFlowKey {
+            network: Network::Icmp,
+            source: "10.0.0.2:0".parse().unwrap(),
+            destination: "8.8.8.8:0".parse().unwrap(),
+        },
+    };
+    // A full TCP/UDP output queue must not block an ICMP completion.  Go's
+    // ping path writes its result independently of ordinary relay payloads.
+    runtime
+        .output_tx
+        .try_send(ProxyOutput::TcpClosed { flow: flow.key })
+        .unwrap();
+    runtime
+        .handle_event(TunEvent::IcmpEchoRequest {
+            flow,
+            packet: icmp_echo_packet(
+                "10.0.0.2".parse().unwrap(),
+                "8.8.8.8".parse().unwrap(),
+                7,
+                9,
+                b"ping",
+                false,
+            ),
+        })
+        .unwrap();
+
+    let mut dispatcher = TunDispatcher::new(32, 32, 4).unwrap();
+    for _ in 0..20 {
+        runtime.poll_outputs(&mut dispatcher).unwrap();
+        if runtime.task_len() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(checked_context.load(Ordering::Acquire));
+    assert_eq!(runtime.task_len(), 0);
+
+    let local = Ipv4Address::new(10, 0, 0, 1);
+    let mut device = SmoltcpTunDevice::new(1500, 8).unwrap();
+    let mut interface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(IpAddress::Ipv4(local), 24))
+            .unwrap();
+    });
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(1))
+        .unwrap();
+    let reply = device.take_tx().unwrap().expect("proxy ICMP reply");
+    let ip = Ipv4Packet::new_checked(&reply).unwrap();
+    assert_eq!(ip.src_addr(), Ipv4Address::new(8, 8, 8, 8));
+    assert_eq!(ip.dst_addr(), Ipv4Address::new(10, 0, 0, 2));
+    assert!(matches!(
+        Icmpv4Repr::parse(
+            &Icmpv4Packet::new_checked(ip.payload()).unwrap(),
+            &ChecksumCapabilities::default(),
+        )
+        .unwrap(),
+        Icmpv4Repr::EchoReply { ident: 7, seq_no: 9, data } if data == b"ping"
+    ));
+}
+
+#[cfg(feature = "async-proxy")]
+#[tokio::test(flavor = "current_thread")]
 async fn dropping_proxy_runtime_releases_full_cone_nat_tracking() {
     use crate::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
 

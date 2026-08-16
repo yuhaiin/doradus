@@ -10,8 +10,9 @@ use smoltcp::phy::{self, ChecksumCapabilities, DeviceCapabilities, Medium};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion,
-    TcpPacket, UdpPacket,
+    HardwareAddress, Icmpv4Message, Icmpv4Packet, Icmpv4Repr, Icmpv6Message, Icmpv6Packet,
+    Icmpv6Repr, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion, Ipv4Packet,
+    Ipv6Packet, TcpPacket, UdpPacket,
 };
 use std::borrow::Cow;
 #[cfg(feature = "async-proxy")]
@@ -547,11 +548,30 @@ pub struct PacketInfo {
 /// across I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TunEvent {
-    TcpOpened { flow: TunFlow },
-    TcpData { flow: TunFlow, payload: Vec<u8> },
-    TcpHalfClosed { flow: TunFlow },
-    TcpClosed { flow: TunFlow },
-    UdpDatagram { flow: TunFlow, payload: Vec<u8> },
+    TcpOpened {
+        flow: TunFlow,
+    },
+    TcpData {
+        flow: TunFlow,
+        payload: Vec<u8>,
+    },
+    TcpHalfClosed {
+        flow: TunFlow,
+    },
+    TcpClosed {
+        flow: TunFlow,
+    },
+    UdpDatagram {
+        flow: TunFlow,
+        payload: Vec<u8>,
+    },
+    /// An external ICMP echo request that must be measured by the selected
+    /// proxy before the reply is written back to the TUN device. Local and
+    /// same-subnet echo requests remain handled by smoltcp's automatic reply.
+    IcmpEchoRequest {
+        flow: TunFlow,
+        packet: Vec<u8>,
+    },
 }
 
 fn event_flow_key(event: &TunEvent) -> TunFlowKey {
@@ -560,7 +580,8 @@ fn event_flow_key(event: &TunEvent) -> TunFlowKey {
         | TunEvent::TcpData { flow, .. }
         | TunEvent::TcpHalfClosed { flow }
         | TunEvent::TcpClosed { flow }
-        | TunEvent::UdpDatagram { flow, .. } => flow.key,
+        | TunEvent::UdpDatagram { flow, .. }
+        | TunEvent::IcmpEchoRequest { flow, .. } => flow.key,
     }
 }
 
@@ -602,6 +623,7 @@ pub struct TunDispatcher {
     udp: HashMap<SocketHandle, UdpSocketState>,
     udp_by_local: HashMap<SocketAddr, SocketHandle>,
     events: VecDeque<TunEvent>,
+    pending_icmp_tx: VecDeque<Vec<u8>>,
     rx_buffer_size: usize,
     tx_buffer_size: usize,
     udp_packet_capacity: usize,
@@ -624,6 +646,7 @@ impl TunDispatcher {
             udp: HashMap::new(),
             udp_by_local: HashMap::new(),
             events: VecDeque::new(),
+            pending_icmp_tx: VecDeque::new(),
             rx_buffer_size,
             tx_buffer_size,
             udp_packet_capacity,
@@ -666,11 +689,25 @@ impl TunDispatcher {
         device: &mut SmoltcpTunDevice,
         timestamp: Instant,
     ) -> Result<smoltcp::iface::PollResult> {
+        self.flush_pending_icmp_tx(device)?;
         self.drop_skipped_multicast(device)?;
-        self.prepare_rx(device)?;
+        self.prepare_rx_inner(Some(interface), device)?;
         let result = interface.poll(timestamp, device, &mut self.sockets);
         self.collect_events()?;
         Ok(result)
+    }
+
+    fn flush_pending_icmp_tx(&mut self, device: &SmoltcpTunDevice) -> Result<()> {
+        while let Some(packet) = self.pending_icmp_tx.front().cloned() {
+            if !device.enqueue_tx(packet)? {
+                // Leave the packet pending. The outer TUN loop drains the
+                // device TX queue independently, so a momentarily full queue
+                // is backpressure rather than an inbound-fatal error.
+                break;
+            }
+            self.pending_icmp_tx.pop_front();
+        }
+        Ok(())
     }
 
     fn drop_skipped_multicast(&self, device: &SmoltcpTunDevice) -> Result<()> {
@@ -689,6 +726,14 @@ impl TunDispatcher {
     /// are keyed by their local destination endpoint and can receive multiple
     /// application source tuples.
     pub fn prepare_rx(&mut self, device: &SmoltcpTunDevice) -> Result<()> {
+        self.prepare_rx_inner(None, device)
+    }
+
+    fn prepare_rx_inner(
+        &mut self,
+        interface: Option<&Interface>,
+        device: &SmoltcpTunDevice,
+    ) -> Result<()> {
         let Some(packet) = device.peek_rx_packet()? else {
             return Ok(());
         };
@@ -700,6 +745,28 @@ impl TunDispatcher {
         // receive boundary; this guard remains for directly injected device
         // packets and prevents extension fragments from reaching this hook.
         if is_non_initial_fragment(&packet)? {
+            return Ok(());
+        }
+        if let Some(interface) = interface
+            && let Ok(Some((source, destination))) = parse_icmp_echo_request(&packet)
+            && should_proxy_icmp_request(interface, source, destination)
+        {
+            let packet = device.take_rx_packet()?.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Io,
+                    "TUN ICMP request disappeared before dispatch",
+                )
+            })?;
+            let flow = TunFlow {
+                key: TunFlowKey {
+                    network: Network::Icmp,
+                    source,
+                    destination,
+                },
+            };
+            tun_debug(format!("TUN external ICMP echo request flow={flow:?}"));
+            self.events
+                .push_back(TunEvent::IcmpEchoRequest { flow, packet });
             return Ok(());
         }
         let Some(tuple) = parse_dispatch_transport_tuple(&packet)? else {
@@ -771,6 +838,23 @@ impl TunDispatcher {
             .get_mut::<udp::Socket>(handle)
             .send_slice(payload, IpEndpoint::from(flow.source))
             .map_err(|error| Error::new(ErrorKind::Closed, format!("TUN UDP write: {error:?}")))
+    }
+
+    /// Queue a raw ICMP packet for the next TUN poll.
+    ///
+    /// ICMP echo replies do not belong to a smoltcp socket. They are produced
+    /// by the proxy-level ping path and therefore bypass the socket set while
+    /// still crossing the same bounded TX queue as ordinary TUN output.
+    pub fn write_icmp(&mut self, packet: Vec<u8>) -> Result<()> {
+        inspect_ip_packet(&packet)?;
+        if self.pending_icmp_tx.len() >= self.udp_packet_capacity {
+            return Err(Error::new(
+                ErrorKind::Timeout,
+                "TUN ICMP output queue is full",
+            ));
+        }
+        self.pending_icmp_tx.push_back(packet);
+        Ok(())
     }
 
     pub fn close_udp(&mut self, flow: TunFlowKey) -> Result<()> {
@@ -1221,6 +1305,11 @@ enum ProxyOutput {
     UdpClosed {
         flow: TunFlowKey,
     },
+    IcmpData {
+        id: u64,
+        flow: TunFlowKey,
+        packet: Vec<u8>,
+    },
 }
 
 #[cfg(feature = "async-proxy")]
@@ -1250,6 +1339,12 @@ struct SyncDnsTask {
 }
 
 #[cfg(feature = "async-proxy")]
+struct IcmpProxyTask {
+    flow: TunFlowKey,
+    join: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(feature = "async-proxy")]
 struct NatBinding {
     table: NatTable,
     idle_timeout: Duration,
@@ -1275,6 +1370,8 @@ pub struct TunProxyRuntime {
     async_dns_handler: Option<Arc<dyn AsyncDnsHandler>>,
     nat: Option<NatBinding>,
     tasks: HashMap<TunFlowKey, ProxyTask>,
+    icmp_tasks: HashMap<u64, IcmpProxyTask>,
+    next_icmp_id: u64,
     udp_tasks: HashMap<UdpSourceKey, UdpProxyTask>,
     udp_flow_sources: HashMap<TunFlowKey, UdpSourceKey>,
     pending_tcp: HashMap<TunFlowKey, VecDeque<Vec<u8>>>,
@@ -1283,6 +1380,8 @@ pub struct TunProxyRuntime {
     tracked_flows: HashSet<TunFlowKey>,
     output_tx: mpsc::Sender<ProxyOutput>,
     output_rx: mpsc::Receiver<ProxyOutput>,
+    icmp_output_tx: mpsc::Sender<ProxyOutput>,
+    icmp_output_rx: mpsc::Receiver<ProxyOutput>,
     channel_capacity: usize,
     timeouts: ProxyTimeouts,
 }
@@ -1296,6 +1395,7 @@ impl TunProxyRuntime {
             ));
         }
         let (output_tx, output_rx) = mpsc::channel(channel_capacity);
+        let (icmp_output_tx, icmp_output_rx) = mpsc::channel(channel_capacity);
         Ok(Self {
             selector,
             context_provider: Arc::new(|flow| flow.context()),
@@ -1305,6 +1405,8 @@ impl TunProxyRuntime {
             async_dns_handler: None,
             nat: None,
             tasks: HashMap::new(),
+            icmp_tasks: HashMap::new(),
+            next_icmp_id: 0,
             udp_tasks: HashMap::new(),
             udp_flow_sources: HashMap::new(),
             pending_tcp: HashMap::new(),
@@ -1313,6 +1415,8 @@ impl TunProxyRuntime {
             tracked_flows: HashSet::new(),
             output_tx,
             output_rx,
+            icmp_output_tx,
+            icmp_output_rx,
             channel_capacity,
             timeouts: ProxyTimeouts::default(),
         })
@@ -1401,7 +1505,11 @@ impl TunProxyRuntime {
     /// that timeout, close, and cancellation paths have released their task
     /// owner without reaching into the task map.
     pub fn task_len(&self) -> usize {
-        self.tasks.len() + self.udp_tasks.len() + self.dns_tasks.len() + self.async_dns_tasks.len()
+        self.tasks.len()
+            + self.icmp_tasks.len()
+            + self.udp_tasks.len()
+            + self.dns_tasks.len()
+            + self.async_dns_tasks.len()
     }
 
     fn context_for_flow(&self, flow: TunFlow) -> crate::FlowContext {
@@ -1487,6 +1595,45 @@ impl TunProxyRuntime {
                 tun_debug(format!("TUN TCP socket closed flow={:?}", flow.key));
                 self.remove_task(&flow.key);
                 self.untrack_flow(&flow.key)?;
+            }
+            TunEvent::IcmpEchoRequest { flow, packet } => {
+                self.track_flow(flow.key)?;
+                let mut context = self.context_for_flow(flow);
+                // Go's tun2socket ping path enters route.Ping, which selects
+                // the UDP node set before it invokes the protocol-level ping
+                // method. Keep the ICMP flow key for telemetry/NAT, but use a
+                // UDP routing context so the same selected chain is used.
+                context.network = Network::Udp;
+                context.destination = match context.destination {
+                    Endpoint::Ip { addr, .. } => Endpoint::ip(Network::Udp, addr),
+                    Endpoint::Domain { host, port, .. } => {
+                        Endpoint::domain(Network::Udp, host, port)
+                    }
+                };
+                self.selector.route_context(&mut context);
+                if let Some(observer) = &self.observer {
+                    observer.opened(flow, context.clone());
+                    observer.bytes(flow.key, TunFlowDirection::Upload, packet.len());
+                }
+                let proxy = self.selector.select(&context);
+                let id = loop {
+                    self.next_icmp_id = self.next_icmp_id.wrapping_add(1);
+                    if !self.icmp_tasks.contains_key(&self.next_icmp_id) {
+                        break self.next_icmp_id;
+                    }
+                };
+                let output = self.icmp_output_tx.clone();
+                let timeouts = self.timeouts;
+                let join = tokio::spawn(async move {
+                    run_icmp_proxy(proxy, context, id, flow.key, packet, output, timeouts).await;
+                });
+                self.icmp_tasks.insert(
+                    id,
+                    IcmpProxyTask {
+                        flow: flow.key,
+                        join,
+                    },
+                );
             }
             TunEvent::UdpDatagram { flow, payload } => {
                 let first = !self.tracked_flows.contains(&flow.key);
@@ -1616,6 +1763,16 @@ impl TunProxyRuntime {
                 self.pending_tcp.remove(&flow);
             }
         }
+        // ICMP has its own bounded completion queue.  A blocked TCP/UDP
+        // payload must not delay a completed ping response behind unrelated
+        // stream data; Go writes the ping result back independently of those
+        // relays.
+        while let Ok(output) = self.icmp_output_rx.try_recv() {
+            count += 1;
+            if let ProxyOutput::IcmpData { id, flow, packet } = output {
+                self.handle_icmp_output(dispatcher, id, flow, packet)?;
+            }
+        }
         while let Ok(output) = self.output_rx.try_recv() {
             count += 1;
             match output {
@@ -1665,6 +1822,9 @@ impl TunProxyRuntime {
                             self.untrack_flow(&flow)?;
                         }
                     }
+                }
+                ProxyOutput::IcmpData { id, flow, packet } => {
+                    self.handle_icmp_output(dispatcher, id, flow, packet)?;
                 }
                 ProxyOutput::UdpClosed { flow } => {
                     let source = self.udp_flow_sources.get(&flow).copied();
@@ -1732,6 +1892,23 @@ impl TunProxyRuntime {
                 self.untrack_flow(&flow)?;
             }
         }
+        let finished_icmp: Vec<_> = self
+            .icmp_tasks
+            .iter()
+            .filter(|(_, task)| task.join.is_finished())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in finished_icmp {
+            if let Some(task) = self.icmp_tasks.remove(&id) {
+                if let Some(Err(error)) = task.join.now_or_never() {
+                    tun_debug(format!(
+                        "ICMP proxy task ended with join error flow={:?}: {error}",
+                        task.flow
+                    ));
+                }
+                self.untrack_icmp_flow_if_idle(task.flow)?;
+            }
+        }
         let finished: Vec<_> = self
             .udp_tasks
             .iter()
@@ -1746,6 +1923,33 @@ impl TunProxyRuntime {
             }
         }
         Ok(count)
+    }
+
+    fn handle_icmp_output(
+        &mut self,
+        dispatcher: &mut TunDispatcher,
+        id: u64,
+        flow: TunFlowKey,
+        packet: Vec<u8>,
+    ) -> Result<()> {
+        self.icmp_tasks.remove(&id);
+        self.touch_flow(flow)?;
+        if let Some(observer) = &self.observer {
+            observer.bytes(flow, TunFlowDirection::Download, packet.len());
+        }
+        if let Err(error) = dispatcher.write_icmp(packet) {
+            tun_debug(format!(
+                "TUN ICMP output dropped flow={flow:?} error={error}"
+            ));
+        }
+        self.untrack_icmp_flow_if_idle(flow)
+    }
+
+    fn untrack_icmp_flow_if_idle(&mut self, flow: TunFlowKey) -> Result<()> {
+        if self.icmp_tasks.values().any(|task| task.flow == flow) {
+            return Ok(());
+        }
+        self.untrack_flow(&flow)
     }
 
     fn apply_close_requests(&mut self, dispatcher: &mut TunDispatcher) -> Result<()> {
@@ -1858,6 +2062,17 @@ impl TunProxyRuntime {
         for flow in flows {
             let _ = self.untrack_flow(&flow);
         }
+        let icmp_flows: Vec<_> = self
+            .icmp_tasks
+            .drain()
+            .map(|(_, task)| {
+                task.join.abort();
+                task.flow
+            })
+            .collect();
+        for flow in icmp_flows {
+            let _ = self.untrack_flow(&flow);
+        }
         let sources: Vec<_> = self.udp_tasks.keys().copied().collect();
         for source in sources {
             let flows = self.remove_udp_source_task(source);
@@ -1912,6 +2127,10 @@ impl TunProxyRuntime {
             let _ = tokio::time::timeout(remaining, send_commands).await;
         }
         while self.tasks.values().any(|task| !task.join.is_finished())
+            || self
+                .icmp_tasks
+                .values()
+                .any(|task| !task.join.is_finished())
             || self.udp_tasks.values().any(|task| !task.join.is_finished())
             || self.dns_tasks.iter().any(|task| !task.join.is_finished())
             || !self.async_dns_tasks.is_empty()
@@ -1964,8 +2183,22 @@ impl TunProxyRuntime {
         self.pending_tcp.remove(flow);
     }
 
+    fn remove_icmp_tasks_for_flow(&mut self, flow: &TunFlowKey) {
+        let ids = self
+            .icmp_tasks
+            .iter()
+            .filter_map(|(id, task)| (task.flow == *flow).then_some(*id))
+            .collect::<Vec<_>>();
+        for id in ids {
+            if let Some(task) = self.icmp_tasks.remove(&id) {
+                task.join.abort();
+            }
+        }
+    }
+
     fn remove_flow_task(&mut self, flow: &TunFlowKey) {
         self.remove_task(flow);
+        self.remove_icmp_tasks_for_flow(flow);
         let Some(source) = self.udp_flow_sources.remove(flow) else {
             return;
         };
@@ -2070,6 +2303,9 @@ impl Drop for TunProxyRuntime {
     fn drop(&mut self) {
         let flows: Vec<_> = self.tasks.keys().copied().collect();
         for task in self.tasks.drain().map(|(_, task)| task) {
+            task.join.abort();
+        }
+        for task in self.icmp_tasks.drain().map(|(_, task)| task) {
             task.join.abort();
         }
         for task in self.dns_tasks.drain(..) {
@@ -2419,12 +2655,206 @@ async fn run_dns_query(
     }
 }
 
+#[cfg(feature = "async-proxy")]
+async fn run_icmp_proxy(
+    proxy: Arc<dyn AsyncProxy>,
+    mut context: crate::FlowContext,
+    id: u64,
+    flow: TunFlowKey,
+    packet: Vec<u8>,
+    output: mpsc::Sender<ProxyOutput>,
+    timeouts: ProxyTimeouts,
+) {
+    // Routing and telemetry selected this flow as ICMP. The existing
+    // ChainProxy ping contract deliberately accepts a TCP endpoint, however,
+    // and its effective-destination helper uses `context.network` when a
+    // FakeIP reverse lookup restored a domain. Convert only the task-local
+    // context after selection so that both IP and restored-domain pings use
+    // the same protocol-level probe as the Go TUN path.
+    let destination = context.effective_destination();
+    context.network = Network::Tcp;
+    context.destination = match destination {
+        Endpoint::Ip { addr, .. } => Endpoint::ip(Network::Tcp, addr),
+        Endpoint::Domain { host, port, .. } => Endpoint::domain(Network::Tcp, host, port),
+    };
+    let result = tokio::time::timeout(timeouts.connect, proxy.ping(&context)).await;
+    let success = matches!(result, Ok(Ok(_)));
+    if !success {
+        tun_debug(format!(
+            "ICMP proxy ping failed flow={flow:?} result={result:?}"
+        ));
+    }
+    let packet = match rewrite_icmp_echo_reply(packet, success) {
+        Ok(packet) => packet,
+        Err(error) => {
+            tun_debug(format!(
+                "ICMP proxy reply rewrite failed flow={flow:?}: {error}"
+            ));
+            return;
+        }
+    };
+    let _ = emit_output(
+        &output,
+        ProxyOutput::IcmpData { id, flow, packet },
+        timeouts.idle,
+    )
+    .await;
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TransportTuple {
     protocol: IpProtocol,
     source: SocketAddr,
     destination: SocketAddr,
     tcp_syn: bool,
+}
+
+fn parse_icmp_echo_request(packet: &[u8]) -> Result<Option<(SocketAddr, SocketAddr)>> {
+    let version = IpVersion::of_packet(packet)
+        .map_err(|_| Error::invalid("TUN packet is not IPv4 or IPv6"))?;
+    match version {
+        IpVersion::Ipv4 => {
+            let packet = Ipv4Packet::new_checked(packet)
+                .map_err(|_| Error::invalid("malformed IPv4 packet"))?;
+            if packet.next_header() != IpProtocol::Icmp {
+                return Ok(None);
+            }
+            let icmp = Icmpv4Packet::new_checked(packet.payload())
+                .map_err(|_| Error::invalid("malformed TUN ICMPv4 packet"))?;
+            let repr = Icmpv4Repr::parse(&icmp, &ChecksumCapabilities::default())
+                .map_err(|_| Error::invalid("invalid TUN ICMPv4 checksum or message"))?;
+            if !matches!(repr, Icmpv4Repr::EchoRequest { .. }) {
+                return Ok(None);
+            }
+            Ok(Some((
+                SocketAddr::new(IpAddr::V4(packet.src_addr()), 0),
+                SocketAddr::new(IpAddr::V4(packet.dst_addr()), 0),
+            )))
+        }
+        IpVersion::Ipv6 => {
+            let packet = Ipv6Packet::new_checked(packet)
+                .map_err(|_| Error::invalid("malformed IPv6 packet"))?;
+            if packet.next_header() != IpProtocol::Icmpv6 {
+                return Ok(None);
+            }
+            let source = packet.src_addr();
+            let destination = packet.dst_addr();
+            let icmp = Icmpv6Packet::new_checked(packet.payload())
+                .map_err(|_| Error::invalid("malformed TUN ICMPv6 packet"))?;
+            let repr = Icmpv6Repr::parse(
+                &source,
+                &destination,
+                &icmp,
+                &ChecksumCapabilities::default(),
+            )
+            .map_err(|_| Error::invalid("invalid TUN ICMPv6 checksum or message"))?;
+            if !matches!(repr, Icmpv6Repr::EchoRequest { .. }) {
+                return Ok(None);
+            }
+            Ok(Some((
+                SocketAddr::new(IpAddr::V6(source), 0),
+                SocketAddr::new(IpAddr::V6(destination), 0),
+            )))
+        }
+    }
+}
+
+fn should_proxy_icmp_request(
+    interface: &Interface,
+    source: SocketAddr,
+    destination: SocketAddr,
+) -> bool {
+    if destination.ip().is_loopback() {
+        return false;
+    }
+    let source = IpAddress::from(source.ip());
+    let destination = IpAddress::from(destination.ip());
+    let source_is_local = interface
+        .ip_addrs()
+        .iter()
+        .any(|cidr| cidr.contains_addr(&source));
+    let destination_is_local = interface
+        .ip_addrs()
+        .iter()
+        .any(|cidr| cidr.contains_addr(&destination));
+    source_is_local && !destination_is_local
+}
+
+fn rewrite_icmp_echo_reply(packet: Vec<u8>, success: bool) -> Result<Vec<u8>> {
+    let version = IpVersion::of_packet(&packet)
+        .map_err(|_| Error::invalid("TUN ICMP packet is not IPv4 or IPv6"))?;
+    match version {
+        IpVersion::Ipv4 => {
+            let (source, destination) = {
+                let ip = Ipv4Packet::new_checked(&packet)
+                    .map_err(|_| Error::invalid("malformed TUN ICMPv4 packet"))?;
+                if ip.next_header() != IpProtocol::Icmp {
+                    return Err(Error::invalid("TUN packet is not ICMPv4"));
+                }
+                let icmp = Icmpv4Packet::new_checked(ip.payload())
+                    .map_err(|_| Error::invalid("malformed TUN ICMPv4 payload"))?;
+                let repr = Icmpv4Repr::parse(&icmp, &ChecksumCapabilities::default())
+                    .map_err(|_| Error::invalid("invalid TUN ICMPv4 echo request"))?;
+                if !matches!(repr, Icmpv4Repr::EchoRequest { .. }) {
+                    return Err(Error::invalid("TUN packet is not an ICMPv4 echo request"));
+                }
+                (ip.src_addr(), ip.dst_addr())
+            };
+            let mut output = packet;
+            let mut ip = Ipv4Packet::new_unchecked(&mut output);
+            ip.set_src_addr(destination);
+            ip.set_dst_addr(source);
+            {
+                let mut icmp = Icmpv4Packet::new_unchecked(ip.payload_mut());
+                icmp.set_msg_type(if success {
+                    Icmpv4Message::EchoReply
+                } else {
+                    Icmpv4Message::DstUnreachable
+                });
+                icmp.fill_checksum();
+            }
+            ip.fill_checksum();
+            Ok(output)
+        }
+        IpVersion::Ipv6 => {
+            let (source, destination) = {
+                let ip = Ipv6Packet::new_checked(&packet)
+                    .map_err(|_| Error::invalid("malformed TUN ICMPv6 packet"))?;
+                if ip.next_header() != IpProtocol::Icmpv6 {
+                    return Err(Error::invalid("TUN packet is not ICMPv6"));
+                }
+                let source = ip.src_addr();
+                let destination = ip.dst_addr();
+                let icmp = Icmpv6Packet::new_checked(ip.payload())
+                    .map_err(|_| Error::invalid("malformed TUN ICMPv6 payload"))?;
+                let repr = Icmpv6Repr::parse(
+                    &source,
+                    &destination,
+                    &icmp,
+                    &ChecksumCapabilities::default(),
+                )
+                .map_err(|_| Error::invalid("invalid TUN ICMPv6 echo request"))?;
+                if !matches!(repr, Icmpv6Repr::EchoRequest { .. }) {
+                    return Err(Error::invalid("TUN packet is not an ICMPv6 echo request"));
+                }
+                (source, destination)
+            };
+            let mut output = packet;
+            let mut ip = Ipv6Packet::new_unchecked(&mut output);
+            ip.set_src_addr(destination);
+            ip.set_dst_addr(source);
+            {
+                let mut icmp = Icmpv6Packet::new_unchecked(ip.payload_mut());
+                icmp.set_msg_type(if success {
+                    Icmpv6Message::EchoReply
+                } else {
+                    Icmpv6Message::DstUnreachable
+                });
+                icmp.fill_checksum(&destination, &source);
+            }
+            Ok(output)
+        }
+    }
 }
 
 fn parse_transport_tuple(packet: &[u8]) -> Result<Option<TransportTuple>> {
@@ -3106,6 +3536,14 @@ impl PacketQueue {
         true
     }
 
+    fn push_tx(&mut self, packet: Vec<u8>) -> bool {
+        if self.tx.len() >= self.capacity {
+            return false;
+        }
+        self.tx.push_back(packet);
+        true
+    }
+
     fn pop_tx(&mut self) -> Option<Vec<u8>> {
         self.tx.pop_front()
     }
@@ -3143,9 +3581,8 @@ impl phy::TxToken for QueueTxToken {
         let result = f(&mut packet);
         if len <= self.max_packet_size
             && let Ok(mut queue) = self.queue.lock()
-            && queue.tx.len() < queue.capacity
         {
-            queue.tx.push_back(packet);
+            let _ = queue.push_tx(packet);
         }
         let _ = self.timestamp;
         result
@@ -3181,6 +3618,14 @@ impl SmoltcpTunDevice {
     pub fn enqueue_rx(&self, packet: Vec<u8>) -> Result<bool> {
         inspect_ip_packet_with_mtu(&packet, self.mtu)?;
         self.enqueue_rx_validated(packet)
+    }
+
+    fn enqueue_tx(&self, packet: Vec<u8>) -> Result<bool> {
+        inspect_ip_packet_with_mtu(&packet, self.mtu)?;
+        self.queue
+            .lock()
+            .map(|mut queue| queue.push_tx(packet))
+            .map_err(|_| Error::new(crate::ErrorKind::Io, "TUN packet queue poisoned"))
     }
 
     /// Enqueue a packet reassembled from IPv6 wire fragments.
@@ -3804,6 +4249,15 @@ impl TunRuntime {
                 }
             }
             if let Err(error) = proxy_runtime.poll_outputs(dispatcher) {
+                proxy_runtime.close();
+                return Err(io::Error::other(error.to_string()));
+            }
+            // ICMP replies are queued by `poll_outputs`, while TCP/UDP
+            // replies are emitted through smoltcp's normal poll path. Flush
+            // the raw ICMP queue before handing packets back to the kernel so
+            // an echo request does not wait for another TUN tick (or get lost
+            // if the runtime is stopped immediately after the proxy reply).
+            if let Err(error) = dispatcher.flush_pending_icmp_tx(&self.smoltcp_device) {
                 proxy_runtime.close();
                 return Err(io::Error::other(error.to_string()));
             }
