@@ -158,6 +158,14 @@ impl ResolverProxyBridge {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(selector);
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_selector(&self) -> bool {
+        self.selector
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
     pub(crate) fn set_monitor(&self, monitor: &Arc<ConnectionMonitor>) {
         *self
             .monitor
@@ -211,6 +219,7 @@ impl ResolverProxyBridge {
         let mut context = FlowContext::new(destination);
         context.route_mode = route_mode;
         context.skip_route = route_mode == RouteMode::Direct;
+        context.skip_resolve = true;
         selector.route_context(&mut context);
         let proxy = selector.select(&context);
         match proxy.connect(&context).await {
@@ -998,7 +1007,7 @@ pub fn parse_dns_server(host: &str, default_port: u16, id: &str) -> Result<Socke
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use yuhaiin_core::dns::{
         AsyncDnsHandler, DnsRecordType, DnsResponse, decode_query, encode_response,
@@ -1010,15 +1019,19 @@ mod tests {
     struct BridgeProxy {
         calls: Arc<AtomicUsize>,
         fail: bool,
+        saw_skip_resolve: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl AsyncProxy for BridgeProxy {
         fn connect<'a>(
             &'a self,
-            _context: &'a FlowContext,
+            context: &'a FlowContext,
         ) -> BoxFuture<'a, Result<BoxAsyncStream>> {
             let calls = self.calls.clone();
             let fail = self.fail;
+            if let Some(flag) = &self.saw_skip_resolve {
+                flag.store(context.skip_resolve, Ordering::Relaxed);
+            }
             Box::pin(async move {
                 calls.fetch_add(1, Ordering::Relaxed);
                 if fail {
@@ -1460,6 +1473,7 @@ mod tests {
     #[test]
     fn resolver_proxy_bridge_routes_configured_resolvers_and_bootstrap_direct() {
         let calls = Arc::new(AtomicUsize::new(0));
+        let saw_skip_resolve = Arc::new(AtomicBool::new(false));
         let bridge = ResolverProxyBridge::new();
         bridge.set_proxy_resolver_id(Some("proxy"));
         assert!(bridge.is_proxy_resolver("proxy"));
@@ -1475,6 +1489,7 @@ mod tests {
             proxy: Arc::new(BridgeProxy {
                 calls: calls.clone(),
                 fail: false,
+                saw_skip_resolve: Some(saw_skip_resolve.clone()),
             }),
         }));
 
@@ -1500,6 +1515,7 @@ mod tests {
             assert!(bridge.connect_direct("resolver.example", 443).await.is_ok());
         });
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(saw_skip_resolve.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -1511,6 +1527,7 @@ mod tests {
             proxy: Arc::new(BridgeProxy {
                 calls: Arc::new(AtomicUsize::new(0)),
                 fail: true,
+                saw_skip_resolve: None,
             }),
         }));
 

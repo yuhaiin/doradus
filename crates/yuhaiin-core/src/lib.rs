@@ -206,6 +206,11 @@ pub struct FlowContext {
     /// socket. Keep this separate from `destination`: protocol layers must
     /// still see the original domain for routing, SNI and proxy framing.
     pub resolved_destination: Option<Endpoint>,
+    /// Do not resolve the destination through the runtime resolver.  Proxy
+    /// transports that can carry a domain remotely use this to avoid
+    /// recursively invoking the resolver while that resolver is connecting
+    /// to its own upstream endpoint.
+    pub skip_resolve: bool,
     pub network: Network,
     pub route_mode: RouteMode,
     pub resolver_policy: ResolverPolicy,
@@ -285,6 +290,7 @@ impl FlowContext {
             local_addr: None,
             destination,
             resolved_destination: None,
+            skip_resolve: false,
             network,
             route_mode: RouteMode::Proxy,
             resolver_policy: ResolverPolicy::default(),

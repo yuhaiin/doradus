@@ -765,6 +765,9 @@ impl ResolvingProxy {
         context: &'a FlowContext,
     ) -> BoxFuture<'a, Result<FlowContext>> {
         let mut resolved = context.clone();
+        if resolved.skip_resolve {
+            return Box::pin(async move { Ok(resolved) });
+        }
         let destination = resolved.effective_destination();
         let Endpoint::Domain {
             network,
@@ -884,7 +887,7 @@ impl RuntimeSnapshot {
                 .await?
                 .proxy
         };
-        let proxy_resolver = self.dns_resolver_for_route_mode(RouteMode::Proxy)?;
+        let proxy_resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
         let udp_server = parent_config
             .resolved_fixed_endpoint(proxy_resolver.as_ref())
             .await?
@@ -939,7 +942,7 @@ impl RuntimeSnapshot {
             "drop" => Ok(Arc::new(DelayedDropAsyncProxy::new())),
             "fixed" | "simple" | "fixedv2" => {
                 let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Fixed);
-                let resolver = self.dns_resolver_for_route_mode(RouteMode::Proxy)?;
+                let resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
                 Ok(child
                     .to_base_proxy_config_with_resolver(timeout, resolver)
                     .await?
@@ -1069,7 +1072,7 @@ impl RuntimeSnapshot {
             }
             "wireguard" | "wire_guard" | "wg" => {
                 let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Wireguard);
-                let resolver = self.dns_resolver_for_route_mode(RouteMode::Proxy)?;
+                let resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
                 build_wireguard_proxy(
                     layer,
                     timeout,
@@ -1116,10 +1119,10 @@ impl RuntimeSnapshot {
                 format!("proxy runtime config {:?} is disabled", config.id),
             ));
         }
-        // Go resolves a node's own upstream endpoint through the route-selected
-        // DNS resolver. The FakeDNS wrapper is a flow/dial layer and must not
-        // turn the node endpoint into a TUN FakeIP.
-        let resolver = self.dns_resolver_for_route_mode(RouteMode::Proxy)?;
+        // A proxy node's own fixed/transport endpoint must use the direct
+        // bootstrap resolver. Using the proxy DoH resolver here would make a
+        // DoH resolver recursively resolve the node it needs to reach.
+        let resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
 
         let proxy = if config.transport == yuhaiin_store::GoProxyTransport::NetworkSplit {
             self.build_network_split_proxy(&config, timeout).await?
@@ -2245,7 +2248,7 @@ impl RuntimeSnapshot {
         bypass_id: &str,
         drop_id: &str,
     ) -> Result<ProxyContextMetadata> {
-        let proxy_resolver = self.dns_resolver_for_route_mode(RouteMode::Proxy)?;
+        let proxy_resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
         let mut endpoints = BTreeMap::new();
         for id in [direct_id, proxy_id, udp_proxy_id, bypass_id, drop_id]
             .into_iter()
@@ -2311,7 +2314,7 @@ impl RuntimeSnapshot {
         &self,
     ) -> Result<(BTreeMap<String, SocketAddr>, BTreeMap<String, String>)> {
         let definitions = self.node_tag_definitions()?;
-        let proxy_resolver = self.dns_resolver_for_route_mode(RouteMode::Proxy)?;
+        let proxy_resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
 
         let mut endpoints = BTreeMap::new();
         let mut node_ids = BTreeMap::new();

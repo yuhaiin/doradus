@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use crate::api::ApiState;
 use crate::api::{run_route_list_refresh_loop, serve_until};
@@ -114,7 +114,38 @@ impl RuntimeService {
             let route_refresh_shutdown = shutdown_rx.clone();
             let dns_logs = logs.clone();
             let dns_controller = task_controller.clone();
+            let (selector_ready_tx, selector_ready_rx) = oneshot::channel();
+            let route_refresh_task = tokio::task::spawn_local(run_route_list_refresh_loop(
+                route_refresh_state,
+                route_refresh_shutdown,
+            ));
+            let inbound_controller = task_controller.clone();
+            let inbound_task = tokio::task::spawn_local(async move {
+                #[cfg(all(feature = "tun", unix))]
+                if let Some(injected_tun) = injected_tun {
+                    return yuhaiin_runtime::inbound::run_until_with_tun_fd_selector_ready(
+                        inbound_controller.clone(),
+                        inbound_shutdown.clone(),
+                        injected_tun.fd,
+                        injected_tun.config,
+                        selector_ready_tx,
+                    )
+                    .await;
+                }
+                yuhaiin_runtime::inbound::run_until_with_selector_ready(
+                    inbound_controller,
+                    inbound_shutdown,
+                    selector_ready_tx,
+                )
+                .await
+            });
             let dns_task = tokio::task::spawn_local(async move {
+                if selector_ready_rx.await.is_err() {
+                    return Err(Error::new(
+                        ErrorKind::Closed,
+                        "inbound supervisor stopped before selector was published",
+                    ));
+                }
                 let result = run_dns_supervisor(dns_controller, dns_shutdown).await;
                 if let Err(error) = &result {
                     // Report bind/configuration failures when they happen. The
@@ -124,24 +155,6 @@ impl RuntimeService {
                     dns_logs.error(format!("DNS task stopped: {error}"));
                 }
                 result
-            });
-            let route_refresh_task = tokio::task::spawn_local(run_route_list_refresh_loop(
-                route_refresh_state,
-                route_refresh_shutdown,
-            ));
-            let inbound_controller = task_controller.clone();
-            let inbound_task = tokio::task::spawn_local(async move {
-                #[cfg(all(feature = "tun", unix))]
-                if let Some(injected_tun) = injected_tun {
-                    return yuhaiin_runtime::inbound::run_until_with_tun_fd(
-                        inbound_controller.clone(),
-                        inbound_shutdown.clone(),
-                        injected_tun.fd,
-                        injected_tun.config,
-                    )
-                    .await;
-                }
-                yuhaiin_runtime::inbound::run_until(inbound_controller, inbound_shutdown).await
             });
             let mut api_task = tokio::spawn(serve_until(
                 listener,
@@ -326,7 +339,7 @@ async fn build_controller(store: ConfigStore) -> Result<RuntimeController> {
         builder = builder.with_resolver_factory(Arc::new(
             yuhaiin_runtime::RustCryptoResolverFactory::from_client_config(
                 Arc::new(config),
-                Duration::from_secs(5),
+                Duration::from_secs(15),
                 256,
             )
             .with_proxy_bridge(resolver_proxy_bridge),

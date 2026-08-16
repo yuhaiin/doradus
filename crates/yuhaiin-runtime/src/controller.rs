@@ -314,6 +314,9 @@ impl RuntimeController {
                 )
                 .await?,
         );
+        if let Some(bridge) = &self.resolver_proxy_bridge {
+            bridge.set_selector(selector.clone());
+        }
         let (nat, idle_timeout) = snapshot.new_full_cone_nat()?;
         let mut runtime =
             yuhaiin_core::tun::TunProxyRuntime::new(selector.clone(), channel_capacity)?
@@ -940,6 +943,43 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(runtime.task_len(), 0);
+    }
+
+    #[cfg(feature = "tun")]
+    #[test]
+    fn tun_runtime_registers_selector_with_resolver_proxy_bridge() {
+        let bridge = Arc::new(crate::resolver::ResolverProxyBridge::new());
+        let store = block_on(ConfigStore::open_memory()).unwrap();
+        let controller = block_on(RuntimeController::from_builder(
+            RuntimeBuilder::new(store, Arc::new(SystemAsyncIpResolver))
+                .with_resolver_proxy_bridge(bridge.clone()),
+        ))
+        .unwrap();
+        block_on(controller.store().repository().put_go_node(&GoNodeRecord {
+            id: "proxy".to_owned(),
+            name: "proxy".to_owned(),
+            group_name: "default".to_owned(),
+            origin: "test".to_owned(),
+            enabled: true,
+            chain_types_json: br#"["direct"]"#.to_vec(),
+            updated_at: 1,
+            data_json: br#"{"protocol":"direct"}"#.to_vec(),
+        }))
+        .unwrap();
+        block_on(controller.reload()).unwrap();
+        assert!(!bridge.has_selector());
+
+        let runtime = block_on(controller.build_tun_proxy_runtime(
+            "",
+            "proxy",
+            "",
+            "",
+            std::time::Duration::from_secs(1),
+            8,
+        ))
+        .unwrap();
+        assert_eq!(runtime.task_len(), 0);
+        assert!(bridge.has_selector());
     }
 
     #[cfg(feature = "tun")]

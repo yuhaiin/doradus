@@ -20,7 +20,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 #[cfg(feature = "tun")]
 use tokio::task::JoinSet;
 
@@ -193,6 +193,26 @@ pub async fn run_until(
     controller: RuntimeController,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    run_until_with_ready_signal(controller, shutdown, None).await
+}
+
+/// Run all inbounds and notify the caller after the first listener setup has
+/// built and published the shared outbound selector. DNS must wait for this
+/// boundary because resolver transports can start dialing before any inbound
+/// client connects.
+pub async fn run_until_with_selector_ready(
+    controller: RuntimeController,
+    shutdown: watch::Receiver<bool>,
+    selector_ready: oneshot::Sender<()>,
+) -> Result<()> {
+    run_until_with_ready_signal(controller, shutdown, Some(selector_ready)).await
+}
+
+async fn run_until_with_ready_signal(
+    controller: RuntimeController,
+    shutdown: watch::Receiver<bool>,
+    selector_ready: Option<oneshot::Sender<()>>,
+) -> Result<()> {
     #[cfg(feature = "tun")]
     {
         let tun_controller = controller.clone();
@@ -201,7 +221,7 @@ pub async fn run_until(
             run_desktop_tun_supervisor(tun_controller, tun_shutdown).await;
         });
 
-        let result = run_until_inner(controller, shutdown).await;
+        let result = run_until_inner(controller, shutdown, selector_ready).await;
         if !tun_task.is_finished() {
             tun_task.abort();
         }
@@ -210,7 +230,7 @@ pub async fn run_until(
     }
 
     #[cfg(not(feature = "tun"))]
-    run_until_inner(controller, shutdown).await
+    run_until_inner(controller, shutdown, selector_ready).await
 }
 
 /// Run normal inbounds together with a TUN device created by the platform
@@ -225,8 +245,32 @@ pub async fn run_until(
 pub async fn run_until_with_tun_runtime(
     controller: RuntimeController,
     shutdown: watch::Receiver<bool>,
+    tun: yuhaiin_core::tun::TunRuntime,
+    config: crate::TunRuntimeConfig,
+) -> Result<()> {
+    run_until_with_tun_runtime_ready(controller, shutdown, tun, config, None).await
+}
+
+/// Variant of [`run_until_with_tun_runtime`] that notifies the caller after
+/// the normal inbound listener set has published the shared selector.
+#[cfg(feature = "tun")]
+pub async fn run_until_with_tun_runtime_selector_ready(
+    controller: RuntimeController,
+    shutdown: watch::Receiver<bool>,
+    tun: yuhaiin_core::tun::TunRuntime,
+    config: crate::TunRuntimeConfig,
+    selector_ready: oneshot::Sender<()>,
+) -> Result<()> {
+    run_until_with_tun_runtime_ready(controller, shutdown, tun, config, Some(selector_ready)).await
+}
+
+#[cfg(feature = "tun")]
+async fn run_until_with_tun_runtime_ready(
+    controller: RuntimeController,
+    shutdown: watch::Receiver<bool>,
     mut tun: yuhaiin_core::tun::TunRuntime,
     config: crate::TunRuntimeConfig,
+    selector_ready: Option<oneshot::Sender<()>>,
 ) -> Result<()> {
     let tun_controller = controller.clone();
     let tun_shutdown = shutdown.clone();
@@ -302,7 +346,7 @@ pub async fn run_until_with_tun_runtime(
         }
     });
 
-    let result = run_until_inner(controller, shutdown).await;
+    let result = run_until_inner(controller, shutdown, selector_ready).await;
     if !tun_task.is_finished() {
         tun_task.abort();
     }
@@ -328,6 +372,22 @@ pub async fn run_until_with_tun_fd(
     let tun = yuhaiin_core::tun::TunRuntime::from_owned_fd(config.tun.clone(), fd)
         .map_err(|error| Error::new(ErrorKind::Io, format!("open injected TUN fd: {error}")))?;
     run_until_with_tun_runtime(controller, shutdown, tun, config).await
+}
+
+/// Injected-TUN variant that notifies the caller after the first inbound
+/// listener setup has published the shared selector.
+#[cfg(all(feature = "tun", unix))]
+pub async fn run_until_with_tun_fd_selector_ready(
+    controller: RuntimeController,
+    shutdown: watch::Receiver<bool>,
+    fd: OwnedFd,
+    config: crate::TunRuntimeConfig,
+    selector_ready: oneshot::Sender<()>,
+) -> Result<()> {
+    let tun = yuhaiin_core::tun::TunRuntime::from_owned_fd(config.tun.clone(), fd)
+        .map_err(|error| Error::new(ErrorKind::Io, format!("open injected TUN fd: {error}")))?;
+    run_until_with_tun_runtime_selector_ready(controller, shutdown, tun, config, selector_ready)
+        .await
 }
 
 /// Own desktop TUN devices independently from TCP/UDP listener reloads.
@@ -490,6 +550,7 @@ async fn wait_for_shutdown_or_reload(
 async fn run_until_inner(
     controller: RuntimeController,
     mut shutdown: watch::Receiver<bool>,
+    mut selector_ready: Option<oneshot::Sender<()>>,
 ) -> Result<()> {
     let mut reload = controller.subscribe_inbound_reload();
     let mut listeners = Vec::new();
@@ -497,6 +558,9 @@ async fn run_until_inner(
         loop {
             abort_listeners(&mut listeners).await;
             listeners = start_listeners(&controller).await?;
+            if let Some(selector_ready) = selector_ready.take() {
+                let _ = selector_ready.send(());
+            }
             if *shutdown.borrow() {
                 break;
             }
