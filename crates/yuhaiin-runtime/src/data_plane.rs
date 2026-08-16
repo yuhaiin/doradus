@@ -149,6 +149,7 @@ pub(crate) fn inbound_dns_handler(snapshot: &RuntimeSnapshot) -> Option<Arc<Runt
 #[cfg(feature = "tun")]
 #[derive(Debug, Clone)]
 pub struct TunRuntimeConfig {
+    pub inbound_id: Option<String>,
     pub enabled: bool,
     pub tun: yuhaiin_core::tun::TunConfig,
     /// Go's `TunProtocol.routes` and `excludes`, kept together because Go
@@ -207,6 +208,7 @@ pub async fn load_tun_config(store: &yuhaiin_store::ConfigStore) -> Result<TunRu
             .unwrap_or(false),
     };
     let mut config = TunRuntimeConfig {
+        inbound_id: None,
         enabled,
         tun,
         routes: Vec::new(),
@@ -426,6 +428,7 @@ fn parse_go_tun_config(record: &GoInboundRecord) -> Result<TunRuntimeConfig> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     Ok(TunRuntimeConfig {
+        inbound_id: Some(record.id.clone()),
         enabled: record.enabled,
         tun: yuhaiin_core::tun::TunConfig {
             name,
@@ -605,7 +608,12 @@ pub async fn run_tun_device_until_ref(
         &mut proxy_runtime,
         Duration::from_millis(10),
         async {
-            let _ = wait_for_shutdown_or_inbound_reload(&controller, shutdown.clone()).await;
+            let _ = wait_for_shutdown_or_matching_inbound_reload(
+                &controller,
+                shutdown.clone(),
+                config.inbound_id.as_deref(),
+            )
+            .await;
         },
     )
     .await
@@ -632,7 +640,7 @@ pub async fn run_dns_supervisor(
         }
         let server = configured_dns_server(controller.store()).await?;
         let Some(server) = server else {
-            if wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+            if wait_for_shutdown_or_dns_reload(&controller, shutdown.clone()).await {
                 return Ok(());
             }
             continue;
@@ -642,10 +650,7 @@ pub async fn run_dns_supervisor(
         }
         let address = parse_dns_server(&server, 53, "api-dns")?;
         let snapshot = controller.handle().load();
-        let handler = RuntimeDnsHandler {
-            resolver: snapshot.resolver.clone(),
-            fakeip: snapshot.fakeip.clone(),
-        };
+        let handler = (*controller.dns_handler()).clone();
         // UDP and TCP are independent listeners in the Go server. A stale
         // process, another service, or a partial reload may occupy either
         // one, so keep the available transport alive instead of terminating
@@ -676,7 +681,7 @@ pub async fn run_dns_supervisor(
                 }
             };
         if udp.is_none() && tcp.is_none() {
-            if wait_for_shutdown_or_reload(&controller, shutdown.clone()).await {
+            if wait_for_shutdown_or_dns_reload(&controller, shutdown.clone()).await {
                 return Ok(());
             }
             continue;
@@ -684,12 +689,12 @@ pub async fn run_dns_supervisor(
         let udp_controller = controller.clone();
         let udp_shutdown_receiver = shutdown.clone();
         let udp_shutdown = async move {
-            let _ = wait_for_shutdown_or_reload(&udp_controller, udp_shutdown_receiver).await;
+            let _ = wait_for_shutdown_or_dns_reload(&udp_controller, udp_shutdown_receiver).await;
         };
         let tcp_controller = controller.clone();
         let tcp_shutdown_receiver = shutdown.clone();
         let tcp_shutdown = async move {
-            let _ = wait_for_shutdown_or_reload(&tcp_controller, tcp_shutdown_receiver).await;
+            let _ = wait_for_shutdown_or_dns_reload(&tcp_controller, tcp_shutdown_receiver).await;
         };
         match (udp, tcp) {
             (Some(udp), Some(tcp)) => {
@@ -774,6 +779,20 @@ pub async fn wait_for_shutdown_or_reload(
     }
 }
 
+pub async fn wait_for_shutdown_or_dns_reload(
+    controller: &RuntimeController,
+    mut shutdown: watch::Receiver<bool>,
+) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+    let mut reload = controller.subscribe_dns_reload();
+    tokio::select! {
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+        changed = reload.recv() => changed.is_err() && *shutdown.borrow(),
+    }
+}
+
 pub async fn wait_for_shutdown_or_inbound_reload(
     controller: &RuntimeController,
     mut shutdown: watch::Receiver<bool>,
@@ -785,6 +804,29 @@ pub async fn wait_for_shutdown_or_inbound_reload(
     tokio::select! {
         changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
         changed = reload.recv() => changed.is_err() && *shutdown.borrow(),
+    }
+}
+
+pub async fn wait_for_shutdown_or_matching_inbound_reload(
+    controller: &RuntimeController,
+    mut shutdown: watch::Receiver<bool>,
+    inbound_id: Option<&str>,
+) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+    let mut reload = controller.subscribe_inbound_reload();
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => return changed.is_err() || *shutdown.borrow(),
+            changed = reload.recv() => match changed {
+                Ok(crate::controller::InboundReload::All) => return true,
+                Ok(crate::controller::InboundReload::One(id))
+                    if inbound_id == Some(id.as_str()) => return true,
+                Ok(crate::controller::InboundReload::One(_)) => continue,
+                Err(_) => return *shutdown.borrow(),
+            },
+        }
     }
 }
 
@@ -811,6 +853,7 @@ mod tests {
 
     fn platform_tun_config(enabled: bool) -> TunRuntimeConfig {
         TunRuntimeConfig {
+            inbound_id: None,
             enabled,
             tun: yuhaiin_core::tun::TunConfig {
                 name: Some("platform-vpn".to_owned()),

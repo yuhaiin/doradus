@@ -9,7 +9,7 @@ use yuhaiin_core::Result;
 use yuhaiin_core::proxy::AsyncProxy;
 use yuhaiin_store::{ConfigMutation, ConfigStore};
 
-use crate::data_plane::{ReloadableAsyncDnsHandler, inbound_dns_handler};
+use crate::data_plane::{ReloadableAsyncDnsHandler, RuntimeDnsHandler, inbound_dns_handler};
 use crate::monitor::SocketDnsHandler;
 use crate::{
     ConnectionMonitor, ResolverProxyBridge, RuntimeBuilder, RuntimeHandle, RuntimeProxySelector,
@@ -31,10 +31,18 @@ pub struct RuntimeController {
     selectors: Arc<RwLock<Vec<Weak<RuntimeProxySelector>>>>,
     monitor: Arc<ConnectionMonitor>,
     reload_events: tokio::sync::broadcast::Sender<()>,
-    inbound_reload_events: tokio::sync::broadcast::Sender<()>,
+    dns_reload_events: tokio::sync::broadcast::Sender<()>,
+    inbound_reload_events: tokio::sync::broadcast::Sender<InboundReload>,
+    dns_handler: Arc<ReloadableAsyncDnsHandler>,
     tun_dns_handler: Arc<ReloadableAsyncDnsHandler>,
     restore_request: Arc<RwLock<Option<PathBuf>>>,
     resolver_proxy_bridge: Option<Arc<ResolverProxyBridge>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InboundReload {
+    All,
+    One(String),
 }
 
 impl RuntimeController {
@@ -44,6 +52,7 @@ impl RuntimeController {
         let resolver_proxy_bridge = builder.resolver_proxy_bridge();
         let initial_snapshot = builder.build().await?;
         let (reload_events, _) = tokio::sync::broadcast::channel(32);
+        let (dns_reload_events, _) = tokio::sync::broadcast::channel(32);
         let (inbound_reload_events, _) = tokio::sync::broadcast::channel(32);
         let monitor = Arc::new(ConnectionMonitor::load_with_store(builder.store().clone()).await?);
         if let Some(bridge) = &resolver_proxy_bridge {
@@ -57,6 +66,10 @@ impl RuntimeController {
         let tun_dns_handler = Arc::new(ReloadableAsyncDnsHandler::new(
             inbound_dns_handler(&initial_snapshot).map(|handler| (*handler).clone()),
         ));
+        let dns_handler = Arc::new(ReloadableAsyncDnsHandler::new(Some(RuntimeDnsHandler {
+            resolver: initial_snapshot.resolver.clone(),
+            fakeip: initial_snapshot.fakeip.clone(),
+        })));
         let handle = RuntimeHandle::new(initial_snapshot);
         Ok(Self {
             builder,
@@ -66,7 +79,9 @@ impl RuntimeController {
             selectors: Arc::new(RwLock::new(Vec::new())),
             monitor,
             reload_events,
+            dns_reload_events,
             inbound_reload_events,
+            dns_handler,
             tun_dns_handler,
             restore_request: Arc::new(RwLock::new(None)),
             resolver_proxy_bridge,
@@ -87,6 +102,10 @@ impl RuntimeController {
 
     pub(crate) fn tun_dns_handler(&self) -> Arc<ReloadableAsyncDnsHandler> {
         self.tun_dns_handler.clone()
+    }
+
+    pub(crate) fn dns_handler(&self) -> Arc<ReloadableAsyncDnsHandler> {
+        self.dns_handler.clone()
     }
 
     /// Flush and stop the monitor's owned SQLite persistence task after all
@@ -129,13 +148,19 @@ impl RuntimeController {
         self.reload_events.subscribe()
     }
 
+    pub(crate) fn subscribe_dns_reload(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.dns_reload_events.subscribe()
+    }
+
     /// Subscribe to changes that require rebinding inbound listeners.
     ///
     /// Node, route, resolver, and backup changes publish only the ordinary
     /// reload event because registered selectors are refreshed in place.
-    /// Inbound/user changes additionally publish this event so listeners can
-    /// be replaced without interrupting unrelated live connections.
-    pub fn subscribe_inbound_reload(&self) -> tokio::sync::broadcast::Receiver<()> {
+    /// Inbound/user changes additionally publish this event. A single inbound
+    /// mutation identifies its owner so supervisors can preserve siblings;
+    /// shared user changes use `All` because every authenticated listener
+    /// depends on that user table.
+    pub fn subscribe_inbound_reload(&self) -> tokio::sync::broadcast::Receiver<InboundReload> {
         self.inbound_reload_events.subscribe()
     }
 
@@ -376,7 +401,39 @@ impl RuntimeController {
             self.set_reload_error(&error.to_string());
             return Err(error);
         }
-        self.rebuild_locked(true).await
+        self.rebuild_locked_with_events(Some(InboundReload::All), false)
+            .await
+    }
+
+    pub async fn mutate_and_reload_inbound<F, Fut>(
+        &self,
+        id: impl Into<String>,
+        operation: F,
+    ) -> Result<Arc<RuntimeSnapshot>>
+    where
+        F: FnOnce(ConfigStore) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let _guard = self.reload_lock.lock().await;
+        if let Err(error) = operation(self.store().clone()).await {
+            self.set_reload_error(&error.to_string());
+            return Err(error);
+        }
+        self.rebuild_locked_with_events(Some(InboundReload::One(id.into())), false)
+            .await
+    }
+
+    pub async fn mutate_and_reload_dns<F, Fut>(&self, operation: F) -> Result<Arc<RuntimeSnapshot>>
+    where
+        F: FnOnce(ConfigStore) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let _guard = self.reload_lock.lock().await;
+        if let Err(error) = operation(self.store().clone()).await {
+            self.set_reload_error(&error.to_string());
+            return Err(error);
+        }
+        self.rebuild_locked_with_events(None, true).await
     }
 
     /// Commit generic configuration mutations, then rebuild the runtime from
@@ -385,11 +442,19 @@ impl RuntimeController {
     /// flows; the returned error tells the management layer to report/retry it.
     pub async fn apply(&self, mutations: &[ConfigMutation]) -> Result<Arc<RuntimeSnapshot>> {
         let mutations = mutations.to_vec();
-        self.mutate_and_reload_inbounds(|store| async move { store.apply(&mutations).await })
+        self.mutate_and_reload(|store| async move { store.apply(&mutations).await })
             .await
     }
 
-    async fn rebuild_locked(&self, reload_inbounds: bool) -> Result<Arc<RuntimeSnapshot>> {
+    async fn rebuild_locked(&self, _reload_inbounds: bool) -> Result<Arc<RuntimeSnapshot>> {
+        self.rebuild_locked_with_events(None, false).await
+    }
+
+    async fn rebuild_locked_with_events(
+        &self,
+        reload_inbound: Option<InboundReload>,
+        reload_dns: bool,
+    ) -> Result<Arc<RuntimeSnapshot>> {
         let expected_revision = self.handle.revision();
         let next = match self.builder.build().await {
             Ok(snapshot) => Arc::new(snapshot),
@@ -427,9 +492,16 @@ impl RuntimeController {
         );
         self.tun_dns_handler
             .replace(inbound_dns_handler(&next).map(|handler| (*handler).clone()));
+        self.dns_handler.replace(Some(RuntimeDnsHandler {
+            resolver: next.resolver.clone(),
+            fakeip: next.fakeip.clone(),
+        }));
         let _ = self.reload_events.send(());
-        if reload_inbounds {
-            let _ = self.inbound_reload_events.send(());
+        if reload_dns {
+            let _ = self.dns_reload_events.send(());
+        }
+        if let Some(reload_inbound) = reload_inbound {
+            let _ = self.inbound_reload_events.send(reload_inbound);
         }
         self.set_reload_error("");
         Ok(next)
@@ -520,11 +592,41 @@ mod tests {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
 
-        block_on(controller.mutate_and_reload_inbounds(|store| async move {
-            store.put_config("test.inbound", b"changed").await
+        block_on(
+            controller.mutate_and_reload_inbound("test.inbound", |store| async move {
+                store.put_config("test.inbound", b"changed").await
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            inbound.try_recv().unwrap(),
+            InboundReload::One("test.inbound".to_owned())
+        );
+    }
+
+    #[test]
+    fn ordinary_reload_updates_dns_handler_without_restarting_dns_listener() {
+        let controller = controller();
+        let mut ordinary = controller.subscribe_reload();
+        let mut dns = controller.subscribe_dns_reload();
+
+        block_on(controller.mutate_and_reload(|store| async move {
+            store.put_config("resolver.hosts", br#"{}"#).await
         }))
         .unwrap();
-        assert!(inbound.try_recv().is_ok());
+        assert!(ordinary.try_recv().is_ok());
+        assert!(matches!(
+            dns.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        block_on(controller.mutate_and_reload_dns(|store| async move {
+            store
+                .put_config("resolver.server", br#"{\"server\":\"127.0.0.1:5533\"}"#)
+                .await
+        }))
+        .unwrap();
+        assert!(dns.try_recv().is_ok());
     }
 
     #[test]

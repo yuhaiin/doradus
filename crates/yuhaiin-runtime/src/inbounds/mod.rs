@@ -8,6 +8,7 @@
 //! direct/proxy/bypass/drop changes after a reload without duplicating proxy
 //! construction logic.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
@@ -20,9 +21,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{oneshot, watch};
-#[cfg(feature = "tun")]
-use tokio::task::JoinSet;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use yuhaiin_core::process::{ProcessResolver, default_process_resolver};
 use yuhaiin_core::proxy::BoxAsyncStream;
@@ -400,7 +399,7 @@ pub async fn run_until_with_tun_fd_selector_ready(
 #[cfg(feature = "tun")]
 async fn run_desktop_tun_supervisor(
     controller: RuntimeController,
-    shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let monitor = controller.monitor();
     let mut reload = controller.subscribe_inbound_reload();
@@ -416,126 +415,141 @@ async fn run_desktop_tun_supervisor(
         }
     };
 
+    let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+    let mut tasks = HashMap::new();
+    for config in configs.iter().filter(|config| config.enabled) {
+        spawn_tun_owner(
+            &mut tasks,
+            config.clone(),
+            &controller,
+            &shutdown,
+            monitor.clone(),
+            completed_tx.clone(),
+        );
+    }
+    if tasks.is_empty() {
+        monitor.info("TUN inbound disabled");
+    }
+
     loop {
         if *shutdown.borrow() {
             break;
         }
-
-        let mut tasks = JoinSet::new();
-        let mut enabled_count = 0;
-        for config in configs.iter().filter(|config| config.enabled) {
-            enabled_count += 1;
-            let name = config.tun.name.as_deref().unwrap_or("<unnamed>").to_owned();
-            monitor.info(format!("TUN inbound started name={name}"));
-            match crate::data_plane::open_tun(config) {
-                Ok(tun) => {
-                    let controller = controller.clone();
-                    let shutdown = shutdown.clone();
-                    let config = config.clone();
-                    let monitor = monitor.clone();
-                    tasks.spawn_local(async move {
-                        let result =
-                            crate::run_tun_device_until(controller, tun, config, shutdown).await;
-                        if let Err(error) = &result {
-                            monitor.error(format!("TUN inbound stopped name={name}: {error}"));
-                        }
-                        result
-                    });
-                }
-                Err(error) => {
-                    monitor.error(format!("TUN inbound open failed name={name}: {error}"));
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
                 }
             }
-        }
-
-        if enabled_count == 0 {
-            monitor.info("TUN inbound disabled");
-        }
-        let mut shutdown_requested = false;
-        let mut reload_requested = false;
-        if tasks.is_empty() {
-            shutdown_requested = wait_for_shutdown_or_reload(&mut reload, shutdown.clone()).await;
-            reload_requested = !shutdown_requested;
-        } else {
-            let mut shutdown_wait = shutdown.clone();
-            tokio::select! {
-                changed = shutdown_wait.changed() => {
-                    shutdown_requested = changed.is_err() || *shutdown.borrow();
-                    reload_requested = !shutdown_requested;
-                }
-                changed = reload.recv() => {
-                    if changed.is_err() {
-                        shutdown_requested = *shutdown.borrow();
-                        reload_requested = !shutdown_requested;
-                    } else {
-                        reload_requested = true;
+            changed = reload.recv() => {
+                let Ok(event) = changed else { break; };
+                match event {
+                    crate::controller::InboundReload::All => {
+                        abort_tun_owners(&mut tasks).await;
+                        let Some(new_configs) = load_tun_configs_for_supervisor(&controller, &mut reload, shutdown.clone()).await else { break; };
+                        configs = new_configs;
+                        for config in configs.iter().filter(|config| config.enabled) {
+                            spawn_tun_owner(&mut tasks, config.clone(), &controller, &shutdown, monitor.clone(), completed_tx.clone());
+                        }
                     }
-                }
-                result = tasks.join_next() => {
-                    if let Some(result) = result {
-                        match result {
-                            Ok(Ok(())) => {
-                                // A dispatcher normally returns when its own
-                                // inbound reload or global shutdown wakes it.
-                                // Rebuild the complete set only after that
-                                // explicit lifecycle event; a sibling TUN is
-                                // not an error merely because this owner
-                                // returned.
-                                shutdown_requested = *shutdown.borrow();
-                                reload_requested = !shutdown_requested;
-                            }
-                            Ok(Err(error)) => {
-                                monitor.error(format!(
-                                    "TUN inbound owner stopped; preserving sibling owners until reload: {error}"
-                                ));
-                                // Keep healthy sibling devices alive while a
-                                // failed owner waits for an explicit reload.
-                                // This matches Go's one-owner-per-inbound
-                                // lifecycle and avoids a failure in one TUN
-                                // tearing down all other devices.
-                                shutdown_requested =
-                                    wait_for_shutdown_or_reload(&mut reload, shutdown.clone())
-                                        .await;
-                                reload_requested = !shutdown_requested;
-                            }
-                            Err(error) => {
-                                monitor.error(format!(
-                                    "TUN inbound owner task failed; preserving sibling owners until reload: {error}"
-                                ));
-                                shutdown_requested =
-                                    wait_for_shutdown_or_reload(&mut reload, shutdown.clone())
-                                        .await;
-                                reload_requested = !shutdown_requested;
+                    crate::controller::InboundReload::One(id) => {
+                        if !tasks.contains_key(&id) {
+                            let Some(new_configs) = load_tun_configs_for_supervisor(&controller, &mut reload, shutdown.clone()).await else { break; };
+                            configs = new_configs;
+                            if let Some(config) = configs.iter().find(|config| config.inbound_id.as_deref() == Some(id.as_str()) && config.enabled) {
+                                spawn_tun_owner(&mut tasks, config.clone(), &controller, &shutdown, monitor.clone(), completed_tx.clone());
                             }
                         }
                     }
                 }
             }
-        }
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
-
-        if shutdown_requested {
-            break;
-        }
-        debug_assert!(reload_requested);
-        configs = loop {
-            match crate::data_plane::load_tun_configs_for_desktop(controller.store()).await {
-                Ok(configs) => break configs,
-                Err(error) => {
-                    monitor.error(format!("reload TUN inbound config failed: {error}"));
-                    if wait_for_shutdown_or_reload(&mut reload, shutdown.clone()).await {
-                        return;
-                    }
+            completed = completed_rx.recv() => {
+                let Some((id, result)) = completed else { break; };
+                tasks.remove(&id);
+                if let Err(error) = result {
+                    monitor.error(format!("TUN inbound owner stopped id={id}: {error}"));
+                    continue;
+                }
+                let Some(new_configs) = load_tun_configs_for_supervisor(&controller, &mut reload, shutdown.clone()).await else { break; };
+                configs = new_configs;
+                if let Some(config) = configs.iter().find(|config| config.inbound_id.as_deref() == Some(id.as_str()) && config.enabled) {
+                    spawn_tun_owner(&mut tasks, config.clone(), &controller, &shutdown, monitor.clone(), completed_tx.clone());
                 }
             }
-        };
+        }
+    }
+    abort_tun_owners(&mut tasks).await;
+}
+
+#[cfg(feature = "tun")]
+fn spawn_tun_owner(
+    tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    config: crate::data_plane::TunRuntimeConfig,
+    controller: &RuntimeController,
+    shutdown: &watch::Receiver<bool>,
+    monitor: Arc<ConnectionMonitor>,
+    completed_tx: mpsc::UnboundedSender<(String, Result<()>)>,
+) {
+    let id = config
+        .inbound_id
+        .clone()
+        .or_else(|| config.tun.name.clone())
+        .unwrap_or_else(|| "tun".to_owned());
+    let name = config.tun.name.as_deref().unwrap_or("<unnamed>").to_owned();
+    monitor.info(format!("TUN inbound started name={name}"));
+    let Some(tun) = (match crate::data_plane::open_tun(&config) {
+        Ok(tun) => Some(tun),
+        Err(error) => {
+            monitor.error(format!("TUN inbound open failed name={name}: {error}"));
+            None
+        }
+    }) else {
+        return;
+    };
+    let controller = controller.clone();
+    let shutdown = shutdown.clone();
+    let task_id = id.clone();
+    tasks.insert(
+        id,
+        tokio::task::spawn_local(async move {
+            let result = crate::run_tun_device_until(controller, tun, config, shutdown).await;
+            let _ = completed_tx.send((task_id, result));
+        }),
+    );
+}
+
+#[cfg(feature = "tun")]
+async fn abort_tun_owners(tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>) {
+    for (_, task) in tasks.drain() {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+#[cfg(feature = "tun")]
+async fn load_tun_configs_for_supervisor(
+    controller: &RuntimeController,
+    reload: &mut tokio::sync::broadcast::Receiver<crate::controller::InboundReload>,
+    shutdown: watch::Receiver<bool>,
+) -> Option<Vec<crate::data_plane::TunRuntimeConfig>> {
+    loop {
+        match crate::data_plane::load_tun_configs_for_desktop(controller.store()).await {
+            Ok(configs) => return Some(configs),
+            Err(error) => {
+                controller
+                    .monitor()
+                    .error(format!("reload TUN inbound config failed: {error}"));
+                if wait_for_shutdown_or_reload(reload, shutdown.clone()).await {
+                    return None;
+                }
+            }
+        }
     }
 }
 
 #[cfg(feature = "tun")]
 async fn wait_for_shutdown_or_reload(
-    reload: &mut tokio::sync::broadcast::Receiver<()>,
+    reload: &mut tokio::sync::broadcast::Receiver<crate::controller::InboundReload>,
     mut shutdown: watch::Receiver<bool>,
 ) -> bool {
     if *shutdown.borrow() {
@@ -553,35 +567,41 @@ async fn run_until_inner(
     mut selector_ready: Option<oneshot::Sender<()>>,
 ) -> Result<()> {
     let mut reload = controller.subscribe_inbound_reload();
-    let mut listeners = Vec::new();
+    let mut listeners = ListenerOwners::new();
     let result = async {
-        loop {
+        'supervisor: loop {
             abort_listeners(&mut listeners).await;
-            listeners = start_listeners(&controller).await?;
+            listeners = start_listeners(&controller, None).await?;
             if let Some(selector_ready) = selector_ready.take() {
                 let _ = selector_ready.send(());
             }
             if *shutdown.borrow() {
                 break;
             }
-            tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        break;
+            'listeners: loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break 'supervisor;
+                        }
                     }
-                }
-                changed = reload.recv() => {
-                    if changed.is_err() {
-                        break;
+                    changed = reload.recv() => {
+                        let Ok(event) = changed else { break 'supervisor; };
+                        match event {
+                            crate::controller::InboundReload::All => {
+                                // A single API operation can publish several
+                                // compatible reloads; the store and snapshot
+                                // are latest-wins, so discard intermediates.
+                                while reload.try_recv().is_ok() {}
+                                break 'listeners;
+                            }
+                            crate::controller::InboundReload::One(id) => {
+                                abort_listener_owner(&mut listeners, &id).await;
+                                let owner = start_listeners(&controller, Some(&id)).await?;
+                                listeners.extend(owner);
+                            }
+                        }
                     }
-                    // A single API operation can publish several compatible
-                    // reloads while listeners are still binding. The store
-                    // and snapshot are already latest-wins, so discard the
-                    // queued intermediate notifications before restarting;
-                    // otherwise a client can connect to a freshly-bound
-                    // socket only to have the next stale notification abort
-                    // it immediately.
-                    while reload.try_recv().is_ok() {}
                 }
             }
         }
@@ -593,9 +613,16 @@ async fn run_until_inner(
     result
 }
 
+type ListenerOwners = HashMap<String, Vec<tokio::task::JoinHandle<()>>>;
+
+fn push_listener(listeners: &mut ListenerOwners, id: &str, listener: tokio::task::JoinHandle<()>) {
+    listeners.entry(id.to_owned()).or_default().push(listener);
+}
+
 async fn start_listeners(
     controller: &RuntimeController,
-) -> Result<Vec<tokio::task::JoinHandle<()>>> {
+    only_id: Option<&str>,
+) -> Result<ListenerOwners> {
     let records = controller.store().repository().list_go_inbounds().await?;
     let inbound_auth = Arc::new(InboundAuth::from_users(
         controller
@@ -616,7 +643,7 @@ async fn start_listeners(
         )
         .await?;
     let monitor = controller.monitor();
-    let mut listeners = Vec::new();
+    let mut listeners = HashMap::new();
 
     async fn bind_tcp_listener(
         listen: SocketAddr,
@@ -636,6 +663,9 @@ async fn start_listeners(
         .into_iter()
         .filter(|record| record.enabled && !record.protocol_type.eq_ignore_ascii_case("tun"))
     {
+        if only_id.is_some_and(|id| id != record.id) {
+            continue;
+        }
         let mut spec = match InboundSpec::from_record(record.clone()) {
             Ok(spec) => spec,
             Err(error) => {
@@ -718,37 +748,45 @@ async fn start_listeners(
                 let listener_monitor = monitor.clone();
                 let listener_tls_acceptor = tls_acceptor.clone();
                 let logs = listener_monitor.logs();
-                listeners.push(tokio::spawn(async move {
-                    if let Err(error) = crate::proxy::transparent::serve_listener(
-                        listener_spec.listen,
-                        protocol,
-                        listener_spec,
-                        listener_selector,
-                        listener_monitor,
-                        listener_tls_acceptor,
-                    )
-                    .await
-                    {
-                        logs.error(format!("transparent inbound listener stopped: {error}"));
-                    }
-                }));
+                push_listener(
+                    &mut listeners,
+                    &listener_spec.id.clone(),
+                    tokio::spawn(async move {
+                        if let Err(error) = crate::proxy::transparent::serve_listener(
+                            listener_spec.listen,
+                            protocol,
+                            listener_spec,
+                            listener_selector,
+                            listener_monitor,
+                            listener_tls_acceptor,
+                        )
+                        .await
+                        {
+                            logs.error(format!("transparent inbound listener stopped: {error}"));
+                        }
+                    }),
+                );
                 if udp_enabled && is_tproxy {
                     let selector = selector.clone();
                     let monitor = monitor.clone();
                     let spec = udp_spec;
                     let logs = monitor.logs();
-                    listeners.push(tokio::spawn(async move {
-                        if let Err(error) = crate::proxy::transparent::serve_udp_listener(
-                            spec.listen,
-                            spec,
-                            selector,
-                            monitor,
-                        )
-                        .await
-                        {
-                            logs.error(format!("transparent UDP listener stopped: {error}"));
-                        }
-                    }));
+                    push_listener(
+                        &mut listeners,
+                        &spec.id.clone(),
+                        tokio::spawn(async move {
+                            if let Err(error) = crate::proxy::transparent::serve_udp_listener(
+                                spec.listen,
+                                spec,
+                                selector,
+                                monitor,
+                            )
+                            .await
+                            {
+                                logs.error(format!("transparent UDP listener stopped: {error}"));
+                            }
+                        }),
+                    );
                 }
             }
             #[cfg(not(target_os = "linux"))]
@@ -779,35 +817,45 @@ async fn start_listeners(
                 #[cfg(all(feature = "websocket", feature = "http2"))]
                 {
                     if has_transport(&spec.transports, "http2") {
-                        listeners.push(tokio::spawn(async move {
-                            if let Err(error) = serve_websocket_h2_listener(
-                                listener,
-                                spec,
-                                selector,
-                                monitor,
-                                tls_acceptor,
-                            )
-                            .await
-                            {
-                                logs.error(format!(
-                                    "WebSocket+HTTP/2 inbound listener stopped: {error}"
-                                ));
-                            }
-                        }));
+                        push_listener(
+                            &mut listeners,
+                            &spec.id.clone(),
+                            tokio::spawn(async move {
+                                if let Err(error) = serve_websocket_h2_listener(
+                                    listener,
+                                    spec,
+                                    selector,
+                                    monitor,
+                                    tls_acceptor,
+                                )
+                                .await
+                                {
+                                    logs.error(format!(
+                                        "WebSocket+HTTP/2 inbound listener stopped: {error}"
+                                    ));
+                                }
+                            }),
+                        );
                     } else {
-                        listeners.push(tokio::spawn(async move {
-                            if let Err(error) = serve_websocket_listener(
-                                listener,
-                                spec,
-                                selector,
-                                monitor,
-                                tls_acceptor,
-                            )
-                            .await
-                            {
-                                logs.error(format!("WebSocket inbound listener stopped: {error}"));
-                            }
-                        }));
+                        push_listener(
+                            &mut listeners,
+                            &spec.id.clone(),
+                            tokio::spawn(async move {
+                                if let Err(error) = serve_websocket_listener(
+                                    listener,
+                                    spec,
+                                    selector,
+                                    monitor,
+                                    tls_acceptor,
+                                )
+                                .await
+                                {
+                                    logs.error(format!(
+                                        "WebSocket inbound listener stopped: {error}"
+                                    ));
+                                }
+                            }),
+                        );
                     }
                 }
                 #[cfg(all(feature = "websocket", not(feature = "http2")))]
@@ -818,19 +866,25 @@ async fn start_listeners(
                             "skip inbound: WebSocket+HTTP/2 requires both websocket and http2 features",
                         );
                     } else {
-                        listeners.push(tokio::spawn(async move {
-                            if let Err(error) = serve_websocket_listener(
-                                listener,
-                                spec,
-                                selector,
-                                monitor,
-                                tls_acceptor,
-                            )
-                            .await
-                            {
-                                logs.error(format!("WebSocket inbound listener stopped: {error}"));
-                            }
-                        }));
+                        push_listener(
+                            &mut listeners,
+                            &spec.id.clone(),
+                            tokio::spawn(async move {
+                                if let Err(error) = serve_websocket_listener(
+                                    listener,
+                                    spec,
+                                    selector,
+                                    monitor,
+                                    tls_acceptor,
+                                )
+                                .await
+                                {
+                                    logs.error(format!(
+                                        "WebSocket inbound listener stopped: {error}"
+                                    ));
+                                }
+                            }),
+                        );
                     }
                 }
                 #[cfg(not(feature = "websocket"))]
@@ -860,13 +914,17 @@ async fn start_listeners(
                 let tls_acceptor = tls_acceptor.clone();
                 let logs = monitor.logs();
                 #[cfg(feature = "http2")]
-                listeners.push(tokio::spawn(async move {
-                    if let Err(error) =
-                        serve_h2_listener(listener, spec, selector, monitor, tls_acceptor).await
-                    {
-                        logs.error(format!("HTTP/2 inbound listener stopped: {error}"));
-                    }
-                }));
+                push_listener(
+                    &mut listeners,
+                    &spec.id.clone(),
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            serve_h2_listener(listener, spec, selector, monitor, tls_acceptor).await
+                        {
+                            logs.error(format!("HTTP/2 inbound listener stopped: {error}"));
+                        }
+                    }),
+                );
                 #[cfg(not(feature = "http2"))]
                 {
                     let _ = (listener, spec, selector, monitor, tls_acceptor);
@@ -887,13 +945,17 @@ async fn start_listeners(
             let spec = spec.clone();
             let tls_acceptor = tls_acceptor.clone();
             let logs = monitor.logs();
-            listeners.push(tokio::spawn(async move {
-                if let Err(error) =
-                    serve_listener(listener, spec, selector, monitor, tls_acceptor).await
-                {
-                    logs.error(format!("inbound listener stopped: {error}"));
-                }
-            }));
+            push_listener(
+                &mut listeners,
+                &spec.id.clone(),
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        serve_listener(listener, spec, selector, monitor, tls_acceptor).await
+                    {
+                        logs.error(format!("inbound listener stopped: {error}"));
+                    }
+                }),
+            );
         }
         if spec.udp_mode.udp_enabled() {
             let selector = selector.clone();
@@ -966,13 +1028,18 @@ async fn start_listeners(
                     }
                 };
                 let logs = monitor.logs();
-                listeners.push(tokio::spawn(async move {
-                    if let Err(error) =
-                        crate::proxy::yuubinsya::serve_udp(socket, spec, selector, monitor).await
-                    {
-                        logs.error(format!("Yuubinsya UDP listener stopped: {error}"));
-                    }
-                }));
+                push_listener(
+                    &mut listeners,
+                    &spec.id.clone(),
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            crate::proxy::yuubinsya::serve_udp(socket, spec, selector, monitor)
+                                .await
+                        {
+                            logs.error(format!("Yuubinsya UDP listener stopped: {error}"));
+                        }
+                    }),
+                );
             } else if protocol.eq_ignore_ascii_case("socks5")
                 || protocol.eq_ignore_ascii_case("mixed")
                 || protocol.eq_ignore_ascii_case("mix")
@@ -1008,25 +1075,33 @@ async fn start_listeners(
                         password,
                         spec.aead_method,
                     );
-                    listeners.push(tokio::spawn(async move {
-                        if let Err(error) = crate::inbound::socks5::serve_udp_socket(
-                            socket, spec, selector, monitor,
-                        )
-                        .await
-                        {
-                            logs.error(format!("AEAD SOCKS5 UDP listener stopped: {error}"));
-                        }
-                    }));
+                    push_listener(
+                        &mut listeners,
+                        &spec.id.clone(),
+                        tokio::spawn(async move {
+                            if let Err(error) = crate::inbound::socks5::serve_udp_socket(
+                                socket, spec, selector, monitor,
+                            )
+                            .await
+                            {
+                                logs.error(format!("AEAD SOCKS5 UDP listener stopped: {error}"));
+                            }
+                        }),
+                    );
                 } else {
-                    listeners.push(tokio::spawn(async move {
-                        if let Err(error) = crate::inbound::socks5::serve_udp_socket(
-                            socket, spec, selector, monitor,
-                        )
-                        .await
-                        {
-                            logs.error(format!("SOCKS5 UDP listener stopped: {error}"));
-                        }
-                    }));
+                    push_listener(
+                        &mut listeners,
+                        &spec.id.clone(),
+                        tokio::spawn(async move {
+                            if let Err(error) = crate::inbound::socks5::serve_udp_socket(
+                                socket, spec, selector, monitor,
+                            )
+                            .await
+                            {
+                                logs.error(format!("SOCKS5 UDP listener stopped: {error}"));
+                            }
+                        }),
+                    );
                 }
             } else {
                 monitor.warn(format!(
@@ -1103,10 +1178,21 @@ pub async fn selected_proxy_id(controller: &RuntimeController) -> Result<String>
     Ok(selected_proxy_ids(controller).await?.0)
 }
 
-async fn abort_listeners(listeners: &mut Vec<tokio::task::JoinHandle<()>>) {
-    for listener in listeners.drain(..) {
-        listener.abort();
-        let _ = listener.await;
+async fn abort_listeners(listeners: &mut ListenerOwners) {
+    for (_, owner) in listeners.drain() {
+        for listener in owner {
+            listener.abort();
+            let _ = listener.await;
+        }
+    }
+}
+
+async fn abort_listener_owner(listeners: &mut ListenerOwners, id: &str) {
+    if let Some(owner) = listeners.remove(id) {
+        for listener in owner {
+            listener.abort();
+            let _ = listener.await;
+        }
     }
 }
 

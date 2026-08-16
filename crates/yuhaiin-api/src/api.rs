@@ -1293,7 +1293,7 @@ async fn inbounds_config_put_value(state: &ApiState, value: Value) -> ApiResult 
         .map_err(|error| ApiError::bad(format!("invalid inbound settings: {error}")))?;
     state
         .controller
-        .mutate_and_reload_inbounds(move |store| async move {
+        .mutate_and_reload(move |store| async move {
             store.repository().put_inbound_settings(settings).await
         })
         .await?;
@@ -1990,7 +1990,7 @@ async fn select_node_value(state: &ApiState, id: String) -> ApiResult {
     let bytes = serde_json::to_vec(&json!({"id": id}))?;
     state
         .controller
-        .mutate_and_reload_inbounds(move |store| async move {
+        .mutate_and_reload(move |store| async move {
             store.put_config(SELECTED_TCP_NODE_KEY, &bytes).await?;
             store.put_config(SELECTED_UDP_NODE_KEY, &bytes).await?;
             store.put_config(LEGACY_SELECTED_NODE_KEY, &bytes).await?;
@@ -2052,7 +2052,7 @@ async fn save_inbound_value(state: &ApiState, value: Value, _index: Option<usize
     };
     state
         .controller
-        .mutate_and_reload_inbounds(move |store| async move {
+        .mutate_and_reload_inbound(id.clone(), move |store| async move {
             store.repository().put_go_inbound(&record).await
         })
         .await?;
@@ -2065,7 +2065,7 @@ async fn save_inbound_value(state: &ApiState, value: Value, _index: Option<usize
 async fn delete_inbound_value(state: &ApiState, id: String) -> ApiResult {
     let result = state
         .controller
-        .mutate_and_reload_inbounds(move |store| async move {
+        .mutate_and_reload_inbound(id.clone(), move |store| async move {
             if store.repository().delete_go_inbound(&id).await? {
                 Ok(())
             } else {
@@ -2775,7 +2775,7 @@ async fn resolver_server_put_value(state: &ApiState, value: Value) -> ApiResult 
     let bytes = serde_json::to_vec(&config)?;
     state
         .controller
-        .mutate_and_reload(move |store| async move {
+        .mutate_and_reload_dns(move |store| async move {
             store.put_config("resolver.server", &bytes).await?;
             store.repository().put_go_dns_server(&server).await
         })
