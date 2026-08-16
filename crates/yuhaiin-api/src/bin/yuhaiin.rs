@@ -12,6 +12,18 @@ use yuhaiin_core::{Error, ErrorKind, Result};
 
 mod service;
 
+// Use mimalloc on every platform. On non-Windows targets PprofAlloc wraps it
+// and records sampled allocation stacks in both Debug and Release builds.
+#[cfg(not(windows))]
+#[global_allocator]
+static ALLOC: pprof_alloc::PprofAlloc = pprof_alloc::PprofAlloc::new()
+    .with_default(pprof_alloc::Allocator::Mimalloc)
+    .with_pprof();
+
+#[cfg(windows)]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RunOptions {
     database: Option<PathBuf>,

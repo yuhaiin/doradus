@@ -403,8 +403,12 @@ pub fn router(state: ApiState) -> Router {
         .layer(middleware::from_fn(move |request, next| {
             let auth = auth.clone();
             async move { authenticate(auth, request, next).await }
-        }))
-        .with_state(state);
+        }));
+    #[cfg(not(windows))]
+    let router = router
+        .route("/debug/pprof/heap", get(pprof_heap))
+        .route("/debug/pprof/allocs", get(pprof_heap));
+    let router = router.with_state(state);
     if let Some(root) = web_root {
         let index = root.join("index.html");
         router.fallback_service(ServeDir::new(root).fallback(ServeFile::new(index)))
@@ -464,12 +468,55 @@ async fn pprof_index(State(state): State<ApiState>) -> Response {
     if !state.controller.handle().load().settings.pprof {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let heap_link = if cfg!(not(windows)) {
+        "<li><a href=\"/debug/pprof/heap\">Heap profile (pprof)</a></li><li><a href=\"/debug/pprof/allocs\">Allocation profile (pprof)</a></li>"
+    } else {
+        ""
+    };
+    let body = format!(
+        "<!doctype html><title>yuhaiin Rust profiles</title>\n<ul><li><a href=\"/debug/pprof/profile?seconds=10\">CPU profile (protobuf)</a></li>{heap_link}</ul>\n"
+    );
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        "<!doctype html><title>yuhaiin Rust profiles</title>\n<ul><li><a href=\"/debug/pprof/profile?seconds=10\">CPU profile (protobuf)</a></li></ul>\n",
+        body,
     )
         .into_response()
+}
+
+/// Return the current sampled mimalloc allocation snapshot in gzipped
+/// protobuf pprof format. The route is available in Debug and Release builds
+/// on non-Windows targets.
+#[cfg(not(windows))]
+async fn pprof_heap(State(state): State<ApiState>) -> Response {
+    if !state.controller.handle().load().settings.pprof {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let body = match pprof_alloc::generate_pprof() {
+        Ok(body) => body,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot build mimalloc heap profile: {error}"),
+            )
+                .into_response();
+        }
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"yuhaiin-rust-heap.pb.gz\"",
+        )
+        .body(Body::from(body))
+        .unwrap_or_else(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot create heap profile response: {error}"),
+            )
+                .into_response()
+        })
 }
 
 #[cfg(unix)]
@@ -5406,6 +5453,7 @@ mod tests {
             "text/html; charset=utf-8"
         );
         let profile = app
+            .clone()
             .oneshot(
                 Request::get("/debug/pprof/profile?seconds=1")
                     .body(Body::empty())
@@ -5424,6 +5472,30 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        #[cfg(not(windows))]
+        {
+            let heap = app
+                .clone()
+                .oneshot(
+                    Request::get("/debug/pprof/heap")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(heap.status(), StatusCode::OK);
+            assert_eq!(
+                heap.headers()[header::CONTENT_TYPE],
+                "application/octet-stream"
+            );
+            assert!(
+                !to_bytes(heap.into_body(), 16 * 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
 
         state
             .controller

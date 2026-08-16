@@ -38,6 +38,7 @@ tokio = { version = "1.50.0", default-features = false, features = ["fs", "io-ut
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 tower-http = { version = "0.6.6", default-features = false, features = ["cors", "fs"] }
 uuid = { version = "1.24.0", default-features = false, features = ["std", "v4"] }
+mimalloc = "0.1.52"
 webpki-roots = { version = "1.0.3", optional = true }
 yuhaiin-backup = { path = "../yuhaiin-backup" }
 yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
@@ -47,6 +48,11 @@ yuhaiin-store = { path = "../yuhaiin-store", features = ["async-dns"] }
 
 [target.'cfg(unix)'.dependencies]
 pprof = { version = "0.15.0", default-features = false, features = ["prost-codec"] }
+
+[target.'cfg(not(windows))'.dependencies]
+# PprofAlloc supplies sampled heap profiles while using mimalloc as its
+# underlying allocator. It is enabled in both Debug and Release builds.
+pprof-alloc = { version = "0.5.0", features = ["allocator-mimalloc"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.0"
