@@ -448,6 +448,7 @@ fn route_rule(pattern: &str) -> RouteRule {
         tag: String::new(),
         list_names: Vec::new(),
         pattern: pattern.to_owned(),
+        host_lists: Vec::new(),
         required_patterns: Vec::new(),
         always_false: false,
         action: RuleAction::Proxy,
@@ -462,6 +463,7 @@ fn route_rule(pattern: &str) -> RouteRule {
         process_names: Vec::new(),
         excluded_process_names: Vec::new(),
         excluded_patterns: yuhaiin_trie::CombinedTrie::new(),
+        excluded_host_lists: Vec::new(),
         resolver_policy: ResolverPolicy::default(),
         priority: 10,
     }

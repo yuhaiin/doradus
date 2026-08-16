@@ -1,6 +1,6 @@
 //! Allocation-conscious routing indexes for domain names and IP prefixes.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 use yuhaiin_core::{DomainName, Endpoint, Error, Result};
@@ -10,13 +10,13 @@ pub mod router;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DomainNode<T> {
     value: Option<T>,
-    children: BTreeMap<String, DomainNode<T>>,
+    children: HashMap<u32, u32>,
 }
 impl<T> Default for DomainNode<T> {
     fn default() -> Self {
         Self {
             value: None,
-            children: BTreeMap::new(),
+            children: HashMap::new(),
         }
     }
 }
@@ -28,13 +28,15 @@ impl<T> Default for DomainNode<T> {
 /// rule is exact and does not match `www.example.com`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainTrie<T> {
-    root: DomainNode<T>,
+    nodes: Vec<DomainNode<T>>,
+    labels: HashMap<Box<str>, u32>,
 }
 
 impl<T> Default for DomainTrie<T> {
     fn default() -> Self {
         Self {
-            root: DomainNode::default(),
+            nodes: vec![DomainNode::default()],
+            labels: HashMap::new(),
         }
     }
 }
@@ -42,28 +44,85 @@ impl<T> Default for DomainTrie<T> {
 impl<T> DomainTrie<T> {
     pub fn new() -> Self {
         Self {
-            root: DomainNode::default(),
+            nodes: vec![DomainNode::default()],
+            labels: HashMap::new(),
         }
     }
 
     pub fn insert(&mut self, domain: &str, value: T) -> Result<Option<T>> {
         let labels = pattern_labels(domain)?;
-        let mut node = &mut self.root;
+        let mut node_id = 0;
         for label in labels.iter().rev() {
-            node = node.children.entry(label.clone()).or_default();
+            let label_id = self.intern_label(label)?;
+            let next_id = self.nodes[node_id as usize]
+                .children
+                .get(&label_id)
+                .copied()
+                .unwrap_or_else(|| {
+                    let next_id = self.nodes.len() as u32;
+                    self.nodes.push(DomainNode::default());
+                    self.nodes[node_id as usize]
+                        .children
+                        .insert(label_id, next_id);
+                    next_id
+                });
+            node_id = next_id;
         }
-        Ok(node.value.replace(value))
+        Ok(self.nodes[node_id as usize].value.replace(value))
     }
 
     pub fn remove(&mut self, domain: &str) -> Result<Option<T>> {
         let labels = pattern_labels(domain)?;
-        remove_domain(&mut self.root, &mut labels.iter().rev().map(String::as_str))
+        let labels = labels.iter().rev().map(String::as_str).collect::<Vec<_>>();
+        self.remove_domain(0, &labels, 0)
     }
 
     pub fn search(&self, domain: &str) -> Result<Option<&T>> {
         let domain = DomainName::try_from(domain)?;
         let labels: Vec<&str> = domain.labels().rev().collect();
-        Ok(search_domain(&self.root, &labels, 0))
+        Ok(search_domain(self, 0, &labels, 0))
+    }
+
+    /// Search a host-list entry using Go's list-membership semantics: an
+    /// exact entry also covers its subdomains, while wildcard entries retain
+    /// their normal matching behavior.
+    pub fn search_parent(&self, domain: &str) -> Result<Option<&T>> {
+        let domain = DomainName::try_from(domain)?;
+        let labels: Vec<&str> = domain.labels().rev().collect();
+        for end in (1..=labels.len()).rev() {
+            if let Some(value) = search_domain(self, 0, &labels[..end], 0) {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    fn intern_label(&mut self, label: &str) -> Result<u32> {
+        if let Some(&id) = self.labels.get(label) {
+            return Ok(id);
+        }
+        let id = u32::try_from(self.labels.len())
+            .map_err(|_| Error::invalid("domain trie contains too many labels"))?;
+        self.labels.insert(label.into(), id);
+        Ok(id)
+    }
+
+    fn remove_domain(&mut self, node_id: u32, labels: &[&str], depth: usize) -> Result<Option<T>> {
+        if depth == labels.len() {
+            return Ok(self.nodes[node_id as usize].value.take());
+        }
+        let Some(&label_id) = self.labels.get(labels[depth]) else {
+            return Ok(None);
+        };
+        let Some(&child_id) = self.nodes[node_id as usize].children.get(&label_id) else {
+            return Ok(None);
+        };
+        let result = self.remove_domain(child_id, labels, depth + 1)?;
+        let child = &self.nodes[child_id as usize];
+        if child.value.is_none() && child.children.is_empty() {
+            self.nodes[node_id as usize].children.remove(&label_id);
+        }
+        Ok(result)
     }
 }
 
@@ -87,49 +146,42 @@ fn pattern_labels(pattern: &str) -> Result<Vec<String>> {
     Ok(labels)
 }
 
-fn remove_domain<'a, I, T>(node: &mut DomainNode<T>, labels: &mut I) -> Result<Option<T>>
-where
-    T: 'a,
-    I: Iterator<Item = &'a str>,
-{
-    let Some(label) = labels.next() else {
-        return Ok(node.value.take());
-    };
-    let Some(child) = node.children.get_mut(label) else {
-        return Ok(None);
-    };
-    let result = remove_domain(child, labels)?;
-    if child.value.is_none() && child.children.is_empty() {
-        node.children.remove(label);
-    }
-    Ok(result)
-}
-
-fn search_domain<'a, T>(node: &'a DomainNode<T>, labels: &[&str], depth: usize) -> Option<&'a T> {
+fn search_domain<'a, T>(
+    trie: &'a DomainTrie<T>,
+    node_id: u32,
+    labels: &[&str],
+    depth: usize,
+) -> Option<&'a T> {
+    let node = &trie.nodes[node_id as usize];
+    let wildcard_id = trie.labels.get("*").copied();
     // A normal Go trie value is exact: `example.com` does not match
     // `www.example.com`. Wildcard values are the exception and match the
     // base domain plus any remaining labels.
     if depth == labels.len() {
         return node.value.as_ref().or_else(|| {
-            node.children
-                .get("*")
-                .and_then(|child| child.value.as_ref())
+            wildcard_id
+                .and_then(|id| node.children.get(&id))
+                .and_then(|child_id| trie.nodes[*child_id as usize].value.as_ref())
         });
     }
 
-    let exact = node
-        .children
+    let exact = trie
+        .labels
         .get(labels[depth])
-        .and_then(|child| search_domain(child, labels, depth + 1));
-    let wildcard = node.children.get("*").and_then(|child| {
-        // A terminal wildcard absorbs the rest of the query. A wildcard with
-        // descendants consumes one label and continues, which preserves Go's
-        // support for patterns such as `api.sec.miui.*`.
-        child
-            .value
-            .as_ref()
-            .or_else(|| search_domain(child, labels, depth + 1))
-    });
+        .and_then(|label_id| node.children.get(label_id))
+        .and_then(|child_id| search_domain(trie, *child_id, labels, depth + 1));
+    let wildcard = wildcard_id
+        .and_then(|label_id| node.children.get(&label_id))
+        .and_then(|child_id| {
+            let child = &trie.nodes[*child_id as usize];
+            // A terminal wildcard absorbs the rest of the query. A wildcard with
+            // descendants consumes one label and continues, which preserves Go's
+            // support for patterns such as `api.sec.miui.*`.
+            child
+                .value
+                .as_ref()
+                .or_else(|| search_domain(trie, *child_id, labels, depth + 1))
+        });
     exact.or(wildcard)
 }
 
@@ -297,6 +349,15 @@ impl<T> CombinedTrie<T> {
             Endpoint::Domain { host, .. } => self.domains.search(host.as_str()).ok().flatten(),
         }
     }
+
+    pub fn search_parent(&self, endpoint: &Endpoint) -> Option<&T> {
+        match endpoint {
+            Endpoint::Ip { addr, .. } => self.cidrs.search(addr.ip()),
+            Endpoint::Domain { host, .. } => {
+                self.domains.search_parent(host.as_str()).ok().flatten()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -331,10 +392,7 @@ mod tests {
         trie.insert("*.bilibili.com", "bilibili").unwrap();
 
         assert_eq!(trie.search("bilibili.com").unwrap(), Some(&"bilibili"));
-        assert_eq!(
-            trie.search("www.bilibili.com").unwrap(),
-            Some(&"bilibili")
-        );
+        assert_eq!(trie.search("www.bilibili.com").unwrap(), Some(&"bilibili"));
         assert_eq!(
             trie.search("api.www.bilibili.com").unwrap(),
             Some(&"bilibili")

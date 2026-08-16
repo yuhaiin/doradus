@@ -17,17 +17,19 @@ use std::borrow::Cow;
 #[cfg(feature = "async-proxy")]
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
-use std::io;
+use std::fs::File;
+use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 #[cfg(all(feature = "tun-routes", target_os = "linux"))]
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "async-proxy")]
 use std::time::Duration;
-use std::time::{Duration as StdDuration, Instant as StdInstant};
+use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use yuhaiin_platform::AsyncDevice;
 #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
 use yuhaiin_platform::DeviceBuilder;
@@ -63,6 +65,83 @@ use crate::proxy::{AsyncProxy, AsyncProxySelector, stream_local_addr, stream_rem
 fn tun_debug(message: impl std::fmt::Display) {
     if std::env::var_os("YUHAIIN_TUN_DEBUG").is_some() {
         eprintln!("yuhaiin-rust: tun-debug: {message}");
+    }
+}
+
+const PCAP_LINKTYPE_RAW: u32 = 101;
+const PCAP_SNAPLEN: u32 = 262_144;
+
+/// A deliberately small classic-PCAP writer for raw IP packets crossing the
+/// TUN boundary.  Keeping this local avoids making packet capture a runtime
+/// dependency and lets Wireshark/tcpdump inspect the exact virtual packets
+/// without adding Ethernet headers that never existed on the TUN device.
+struct TunPcapWriter {
+    file: File,
+}
+
+impl TunPcapWriter {
+    fn create(path: &PathBuf) -> io::Result<Self> {
+        let mut file = File::create(path)?;
+        // Little-endian PCAP global header, version 2.4, raw IP link type.
+        file.write_all(&0xa1b2c3d4u32.to_le_bytes())?;
+        file.write_all(&2u16.to_le_bytes())?;
+        file.write_all(&4u16.to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
+        file.write_all(&PCAP_SNAPLEN.to_le_bytes())?;
+        file.write_all(&PCAP_LINKTYPE_RAW.to_le_bytes())?;
+        file.flush()?;
+        Ok(Self { file })
+    }
+
+    fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let original_len = packet.len().min(u32::MAX as usize) as u32;
+        let included_len = packet.len().min(PCAP_SNAPLEN as usize) as u32;
+        self.file
+            .write_all(&(timestamp.as_secs().min(u32::MAX as u64) as u32).to_le_bytes())?;
+        self.file
+            .write_all(&timestamp.subsec_micros().to_le_bytes())?;
+        self.file.write_all(&included_len.to_le_bytes())?;
+        self.file.write_all(&original_len.to_le_bytes())?;
+        self.file.write_all(&packet[..included_len as usize])?;
+        self.file.flush()
+    }
+}
+
+struct TunPcapCapture {
+    writer: Mutex<Option<TunPcapWriter>>,
+}
+
+impl TunPcapCapture {
+    fn from_env() -> io::Result<Option<Arc<Self>>> {
+        let Some(path) = std::env::var_os("YUHAIIN_TUN_PCAP") else {
+            return Ok(None);
+        };
+        if path.is_empty() {
+            return Ok(None);
+        }
+        let path = PathBuf::from(path);
+        let writer = TunPcapWriter::create(&path)?;
+        eprintln!("yuhaiin-rust: TUN PCAP capture enabled: {}", path.display());
+        Ok(Some(Arc::new(Self {
+            writer: Mutex::new(Some(writer)),
+        })))
+    }
+
+    fn record(&self, packet: &[u8]) {
+        let Ok(mut writer) = self.writer.lock() else {
+            return;
+        };
+        let Some(writer_ref) = writer.as_mut() else {
+            return;
+        };
+        if let Err(error) = writer_ref.write_packet(packet) {
+            *writer = None;
+            eprintln!("yuhaiin-rust: TUN PCAP capture disabled: {error}");
+        }
     }
 }
 
@@ -3261,6 +3340,7 @@ pub struct TunRuntime {
     buffer: Vec<u8>,
     ipv6_fragments: Ipv6FragmentReassembler,
     fragment_identification: AtomicU32,
+    pcap_capture: Option<Arc<TunPcapCapture>>,
     #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
     configured_name: Option<String>,
 }
@@ -3276,6 +3356,7 @@ impl TunRuntime {
         config
             .validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let pcap_capture = TunPcapCapture::from_env()?;
         #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
         let configured_name = config.name.clone();
         let mut smoltcp_device = SmoltcpTunDevice::new(config.mtu, config.queue_capacity)
@@ -3309,6 +3390,7 @@ impl TunRuntime {
             buffer: vec![0; config.mtu.max(65535)],
             ipv6_fragments: Ipv6FragmentReassembler::default(),
             fragment_identification: AtomicU32::new(0),
+            pcap_capture,
             #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
             configured_name,
         })
@@ -3541,6 +3623,9 @@ impl TunRuntime {
 
     pub async fn recv_from_tun(&mut self) -> io::Result<usize> {
         let length = self.device.recv(&mut self.buffer).await?;
+        if let Some(capture) = &self.pcap_capture {
+            capture.record(&self.buffer[..length]);
+        }
         tun_debug(format!(
             "TUN packet received length={} prefix={:02x?}",
             length,
@@ -3595,6 +3680,9 @@ impl TunRuntime {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         let mut sent = 0;
         for fragment in fragments {
+            if let Some(capture) = &self.pcap_capture {
+                capture.record(&fragment);
+            }
             tun_debug(format!(
                 "TUN packet sending length={} prefix={:02x?}",
                 fragment.len(),
@@ -3750,6 +3838,41 @@ impl Drop for TunRuntime {
         {
             let _ = self.close_routes();
         }
+    }
+}
+
+#[cfg(test)]
+mod tun_pcap_tests {
+    use super::{PCAP_LINKTYPE_RAW, TunPcapWriter};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn writes_raw_pcap_header_and_packet() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "yuhaiin-rust-tun-{pid}-{suffix}.pcap",
+            pid = std::process::id()
+        ));
+        let mut writer = TunPcapWriter::create(&path).unwrap();
+        writer.write_packet(&[0x45, 0x00, 0x00]).unwrap();
+        drop(writer);
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[..4], &[0xd4, 0xc3, 0xb2, 0xa1]);
+        assert_eq!(
+            u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+            PCAP_LINKTYPE_RAW
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[24 + 8..24 + 12].try_into().unwrap()),
+            3
+        );
+        assert_eq!(&bytes[40..], &[0x45, 0x00, 0x00]);
+        fs::remove_file(path).unwrap();
     }
 }
 

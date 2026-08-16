@@ -36,10 +36,13 @@ pub struct RouteRule {
     /// Stable Go rule name used by the management and telemetry contracts.
     pub rule_name: String,
     pub tag: String,
-    /// Names of Go host/process lists contributing to this expanded rule.
+    /// Names of Go host/process lists contributing to this route rule.
     pub list_names: Vec<String>,
     /// Primary domain/CIDR pattern used to find candidates in `Router::rules`.
     pub pattern: String,
+    /// Positive Go host-list constraints. The list index is shared with the
+    /// route-list snapshot instead of expanding one RouteRule per entry.
+    pub host_lists: Vec<Arc<CombinedTrie<()>>>,
     /// Additional positive domain/CIDR constraints from a Go `all` matcher.
     /// Every index must match the endpoint after the primary candidate lookup.
     pub required_patterns: Vec<CombinedTrie<()>>,
@@ -71,6 +74,8 @@ pub struct RouteRule {
     /// this rule. This keeps negative domain/CIDR matching on the same trie
     /// implementation as positive routing.
     pub excluded_patterns: CombinedTrie<()>,
+    /// Negative Go host-list constraints, also shared by Arc.
+    pub excluded_host_lists: Vec<Arc<CombinedTrie<()>>>,
     pub resolver_policy: ResolverPolicy,
     pub priority: i32,
 }
@@ -90,6 +95,20 @@ impl RouteRule {
             return false;
         }
         if self.excluded_patterns.search(endpoint).is_some() {
+            return false;
+        }
+        if self
+            .excluded_host_lists
+            .iter()
+            .any(|index| index.search_parent(endpoint).is_some())
+        {
+            return false;
+        }
+        if self
+            .host_lists
+            .iter()
+            .any(|index| index.search_parent(endpoint).is_none())
+        {
             return false;
         }
         if self
@@ -207,16 +226,15 @@ pub struct RouteDecision {
 
 #[derive(Clone)]
 pub struct Router {
-    rules: CombinedTrie<Vec<RouteRule>>,
-    /// Expanded rules in the same persisted-priority order used by Go's
-    /// matcher.  The indexes above are for fast selection; this flat view is
-    /// retained so connection metadata can explain rules that were tried and
-    /// rejected before the selected rule.
-    all_rules: Vec<RouteRule>,
+    rules: CombinedTrie<Vec<Arc<RouteRule>>>,
+    /// Rules in the same persisted-priority order used by Go's matcher. The
+    /// indexes above are for fast selection; this flat view is retained so
+    /// connection metadata can explain rules that were tried and rejected.
+    all_rules: Vec<Arc<RouteRule>>,
     /// Rules without a domain/CIDR matcher (for example Go's network-only or
     /// empty `all` rule) are evaluated for every endpoint. Keeping them out of
     /// the trie avoids inventing a fake domain that would not match IP flows.
-    global_rules: Vec<RouteRule>,
+    global_rules: Vec<Arc<RouteRule>>,
     fallback: RouteDecision,
     geo: Option<Arc<dyn GeoLookup>>,
 }
@@ -232,6 +250,7 @@ pub struct RouterRuntime {
 impl Router {
     pub fn compile(mut rules: Vec<RouteRule>, fallback: RouteDecision) -> crate::Result<Self> {
         rules.sort_by_key(|rule| rule.priority);
+        let rules = rules.into_iter().map(Arc::new).collect::<Vec<_>>();
         let all_rules = rules.clone();
         let mut index = Self {
             rules: CombinedTrie::new(),
@@ -240,7 +259,7 @@ impl Router {
             fallback,
             geo: None,
         };
-        let mut grouped: BTreeMap<String, Vec<RouteRule>> = BTreeMap::new();
+        let mut grouped: BTreeMap<String, Vec<Arc<RouteRule>>> = BTreeMap::new();
         for rule in rules {
             if rule.pattern.trim().is_empty() {
                 index.global_rules.push(rule);
@@ -305,6 +324,7 @@ impl Router {
             // stops at the first match.  Lower priority values therefore win;
             // this is also what makes the UI's drag-and-drop order effective.
             .min_by_key(|rule| rule.priority)
+            .map(|rule| rule.as_ref())
     }
 
     fn selected_rule<'a>(&'a self, context: &FlowContext) -> Option<&'a RouteRule> {
@@ -368,7 +388,7 @@ impl Router {
         }
         self.rules
             .search(endpoint)
-            .is_some_and(|rules| rules.iter().any(|candidate| candidate == rule))
+            .is_some_and(|rules| rules.iter().any(|candidate| candidate.as_ref() == rule))
     }
 
     fn rule_matches(&self, rule: &RouteRule, endpoint: &Endpoint, context: &FlowContext) -> bool {
@@ -384,7 +404,7 @@ impl Router {
         let mut output = Vec::new();
         let mut offset = 0;
         while offset < self.all_rules.len() {
-            let first = &self.all_rules[offset];
+            let first = self.all_rules[offset].as_ref();
             let key = (first.rule_name.clone(), first.priority);
             let mut history = Vec::new();
             let mut matched = false;
@@ -392,7 +412,7 @@ impl Router {
                 && self.all_rules[offset].rule_name == key.0
                 && self.all_rules[offset].priority == key.1
             {
-                let rule = &self.all_rules[offset];
+                let rule = self.all_rules[offset].as_ref();
                 let endpoint = context.effective_destination();
                 matched |= self.rule_matches(rule, &endpoint, context);
                 append_rule_history(&mut history, rule, context, &endpoint);
@@ -657,6 +677,7 @@ mod tests {
             tag: String::new(),
             list_names: Vec::new(),
             pattern: pattern.to_owned(),
+            host_lists: Vec::new(),
             required_patterns: Vec::new(),
             always_false: false,
             action,
@@ -671,6 +692,7 @@ mod tests {
             process_names: Vec::new(),
             excluded_process_names: Vec::new(),
             excluded_patterns: CombinedTrie::new(),
+            excluded_host_lists: Vec::new(),
             resolver_policy: ResolverPolicy {
                 strategy: ResolveStrategy::Default,
                 use_fake_ip: action == RuleAction::Proxy,

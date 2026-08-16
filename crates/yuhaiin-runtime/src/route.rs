@@ -35,7 +35,7 @@ use yuhaiin_trie::router::{RouteDecision, RouteRule, Router, RouterRuntime, Rule
 pub struct RouteListSnapshot {
     values: BTreeMap<String, Vec<String>>,
     kinds: BTreeMap<String, String>,
-    host_indexes: BTreeMap<String, CombinedTrie<()>>,
+    host_indexes: BTreeMap<String, Arc<CombinedTrie<()>>>,
     errors: BTreeMap<String, String>,
 }
 
@@ -50,6 +50,10 @@ fn process_path_matches(actual: &str, expected: &str) -> bool {
 impl RouteListSnapshot {
     pub fn values(&self, name: &str) -> Option<&[String]> {
         self.values.get(name).map(Vec::as_slice)
+    }
+
+    pub fn host_index(&self, name: &str) -> Option<Arc<CombinedTrie<()>>> {
+        self.host_indexes.get(name).cloned()
     }
 
     pub fn error(&self, name: &str) -> Option<&str> {
@@ -87,7 +91,7 @@ impl RouteListSnapshot {
             } else {
                 self.host_indexes
                     .get(name)
-                    .is_some_and(|index| index.search(&destination).is_some())
+                    .is_some_and(|index| index.search_parent(&destination).is_some())
             };
             if matched {
                 names.push(name.clone());
@@ -144,7 +148,9 @@ pub fn load_route_lists(records: &[GoRouteListRecord]) -> RouteListSnapshot {
                             let _ = index.insert(value, ());
                         }
                         snapshot.kinds.insert(record.name.clone(), normalized_kind);
-                        snapshot.host_indexes.insert(record.name.clone(), index);
+                        snapshot
+                            .host_indexes
+                            .insert(record.name.clone(), Arc::new(index));
                     }
                     snapshot.values.insert(record.name.clone(), values);
                 }
@@ -790,6 +796,7 @@ pub fn expand_go_route_rule(
                 tag: record.tag.clone(),
                 list_names: variant.list_names,
                 pattern: variant.pattern.clone().unwrap_or_default(),
+                host_lists: variant.host_lists,
                 required_patterns: compile_required_patterns(
                     variant.additional_patterns,
                     record.id.as_str(),
@@ -810,6 +817,7 @@ pub fn expand_go_route_rule(
                     variant.excluded_patterns,
                     record.id.as_str(),
                 )?,
+                excluded_host_lists: variant.excluded_host_lists,
                 resolver_policy,
                 priority,
             })
@@ -864,6 +872,7 @@ fn route_rule_from_root(record: &GoRouteRuleRecord, root: &Value) -> Result<Opti
         tag: record.tag.clone(),
         list_names: Vec::new(),
         pattern,
+        host_lists: Vec::new(),
         required_patterns: Vec::new(),
         always_false: false,
         action,
@@ -878,6 +887,7 @@ fn route_rule_from_root(record: &GoRouteRuleRecord, root: &Value) -> Result<Opti
         process_names: process_names.unwrap_or_default(),
         excluded_process_names: Vec::new(),
         excluded_patterns: CombinedTrie::new(),
+        excluded_host_lists: Vec::new(),
         resolver_policy,
         priority,
     }))
@@ -901,6 +911,7 @@ struct RuleVariant {
     /// `None` means the expression has no host/CIDR constraint and is a
     /// global rule whose remaining network/port/geo predicates still apply.
     pattern: Option<String>,
+    host_lists: Vec<Arc<CombinedTrie<()>>>,
     /// Positive patterns beyond `pattern`, produced by nested `all`.
     additional_patterns: Vec<String>,
     network: Option<Network>,
@@ -914,6 +925,7 @@ struct RuleVariant {
     process_names: Option<Vec<String>>,
     excluded_process_names: Option<Vec<String>>,
     excluded_patterns: Vec<String>,
+    excluded_host_lists: Vec<Arc<CombinedTrie<()>>>,
     list_names: Vec<String>,
     always_false: bool,
 }
@@ -992,20 +1004,30 @@ fn parse_rule_expression_inner(
                 }]);
             }
             if negated {
-                Ok(vec![RuleVariant {
-                    excluded_patterns: patterns.to_vec(),
-                    list_names: vec![name],
-                    ..RuleVariant::default()
+                Ok(vec![match lists.host_index(&name) {
+                    Some(index) => RuleVariant {
+                        excluded_host_lists: vec![index],
+                        list_names: vec![name],
+                        ..RuleVariant::default()
+                    },
+                    None => RuleVariant {
+                        list_names: vec![name],
+                        ..RuleVariant::default()
+                    },
                 }])
             } else {
-                Ok(patterns
-                    .iter()
-                    .map(|pattern| RuleVariant {
-                        pattern: Some(pattern.clone()),
-                        list_names: vec![name.clone()],
+                Ok(vec![match lists.host_index(&name) {
+                    Some(index) => RuleVariant {
+                        host_lists: vec![index],
+                        list_names: vec![name],
                         ..RuleVariant::default()
-                    })
-                    .collect())
+                    },
+                    None => RuleVariant {
+                        list_names: vec![name],
+                        always_false: true,
+                        ..RuleVariant::default()
+                    },
+                }])
             }
         }
         "network" => {
@@ -1214,6 +1236,10 @@ fn combine_all(
                 );
                 let mut excluded_patterns = left.excluded_patterns.clone();
                 excluded_patterns.extend(right.excluded_patterns.iter().cloned());
+                let mut host_lists = left.host_lists.clone();
+                host_lists.extend(right.host_lists.iter().cloned());
+                let mut excluded_host_lists = left.excluded_host_lists.clone();
+                excluded_host_lists.extend(right.excluded_host_lists.iter().cloned());
                 let mut additional_patterns = left.additional_patterns.clone();
                 if let Some(pattern) = right.pattern.clone()
                     && left.pattern.is_some()
@@ -1241,6 +1267,7 @@ fn combine_all(
                 }
                 combined.push(RuleVariant {
                     pattern: left.pattern.clone().or_else(|| right.pattern.clone()),
+                    host_lists,
                     additional_patterns,
                     network,
                     port,
@@ -1253,6 +1280,7 @@ fn combine_all(
                     excluded_inbound_names,
                     excluded_process_names,
                     excluded_patterns,
+                    excluded_host_lists,
                     list_names,
                     always_false: left.always_false || right.always_false,
                 });
@@ -1891,7 +1919,7 @@ mod tests {
     }
 
     #[test]
-    fn local_host_list_expands_go_nested_rule_into_router_patterns() {
+    fn local_host_list_keeps_one_router_rule_and_shares_the_index() {
         let list = GoRouteListRecord {
             name: "domains".to_owned(),
             list_type: "host".to_owned(),
@@ -1914,8 +1942,9 @@ mod tests {
             &lists,
         )
         .unwrap();
-        assert!(!expanded.is_empty());
+        assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].list_names, vec!["domains"]);
+        assert_eq!(expanded[0].host_lists.len(), 1);
         let router = compile_go_route_rules_with_lists(
             &[record(
                 r#"{"mode":"proxy","rules":[{"type":"host","host":{"list":"domains"}}]}"#,
