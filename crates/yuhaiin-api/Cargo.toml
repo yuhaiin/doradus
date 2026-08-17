@@ -17,6 +17,7 @@ doh-tls = [
     "dep:rustls",
     "dep:rustls-rustcrypto",
     "dep:webpki-roots",
+    "yuhaiin-dns/tls",
 ]
 websocket = ["yuhaiin-runtime/websocket"]
 
@@ -41,6 +42,7 @@ uuid = { version = "1.24.0", default-features = false, features = ["std", "v4"] 
 mimalloc = "0.1.52"
 webpki-roots = { version = "1.0.3", optional = true }
 yuhaiin-backup = { path = "../yuhaiin-backup" }
+yuhaiin-dns = { path = "../yuhaiin-dns" }
 yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
 yuhaiin-geo = { path = "../yuhaiin-geo" }
 yuhaiin-runtime = { path = "../yuhaiin-runtime", default-features = false }

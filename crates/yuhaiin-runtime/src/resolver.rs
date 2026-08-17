@@ -7,13 +7,14 @@
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
 #[cfg(feature = "http2")]
 use std::marker::PhantomData;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use yuhaiin_core::dns::{
     DnsCache, DnsRecordType, DnsResponse, decode_response, encode_query, response_is_truncated,
     validate_query_packet, validate_response_packet,
@@ -32,10 +33,12 @@ use yuhaiin_store::{GoResolverRuntimeConfig, GoResolverTransport};
 
 use crate::ConnectionMonitor;
 
-#[cfg(feature = "doh-tls")]
-use crate::doh_tls::{RoutedRustCryptoH2Connector, root_store};
 #[cfg(feature = "http2")]
 use yuhaiin_core::http2::{H2DohClient, H2DohConnector};
+#[cfg(feature = "doh-tls")]
+use yuhaiin_dns::{
+    DnsIoStream, DnsStreamConnector, DnsTlsResolverConfig, DohResolverFactory, DotResolverFactory,
+};
 
 pub trait ResolverTransportFactory: Send + Sync {
     fn build(&self, config: &GoResolverRuntimeConfig) -> Result<Arc<dyn AsyncIpResolver>>;
@@ -117,6 +120,7 @@ impl ResolverProxyBridge {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = ids;
     }
 
+    #[cfg(test)]
     pub(crate) fn is_proxy_resolver(&self, id: &str) -> bool {
         self.route_mode_for_resolver(id) == Some(RouteMode::Proxy)
     }
@@ -289,10 +293,6 @@ impl ResolverProxyBridge {
                 Err(error)
             }
         }
-    }
-
-    pub(crate) fn record_failure(&self, host: &str, port: u16, error: &Error) {
-        self.record_failure_with_protocol("tcp", host, port, error);
     }
 
     fn record_failure_with_protocol(&self, protocol: &str, host: &str, port: u16, error: &Error) {
@@ -763,17 +763,117 @@ where
     }
 }
 
-/// Direct DoH factory using the selected RustCrypto TLS provider.
-///
-/// This is the ready-to-use application path. Deployments that need to dial
-/// through a yuhaiin proxy or use a custom bootstrap resolver can keep using
-/// [`H2DohResolverFactory`] with their own `H2DohConnector`.
+#[cfg(feature = "doh-tls")]
+struct ResolverBridgeStreamConnector {
+    bridge: Arc<ResolverProxyBridge>,
+}
+
+#[cfg(feature = "doh-tls")]
+struct RuntimeDnsIoStream(BoxAsyncStream);
+
+#[cfg(feature = "doh-tls")]
+impl AsyncRead for RuntimeDnsIoStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.0).poll_read(cx, buffer)
+    }
+}
+
+#[cfg(feature = "doh-tls")]
+impl AsyncWrite for RuntimeDnsIoStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut *self.0).poll_write(cx, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.0).poll_shutdown(cx)
+    }
+}
+
+#[cfg(feature = "doh-tls")]
+impl DnsStreamConnector for ResolverBridgeStreamConnector {
+    fn connect<'a>(
+        &'a self,
+        resolver_id: &'a str,
+        host: &'a str,
+        port: u16,
+        _local_bind_addresses: &'a [IpAddr],
+        _bind_interface: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<DnsIoStream>>> {
+        Box::pin(async move {
+            let Some(route_mode) = self.bridge.route_mode_for_resolver(resolver_id) else {
+                return Ok(None);
+            };
+            let stream = match route_mode {
+                RouteMode::Direct => self.bridge.connect_direct(host, port).await?,
+                RouteMode::Proxy => self
+                    .bridge
+                    .connect(host, port, true)
+                    .await?
+                    .ok_or_else(|| Error::invalid("DNS proxy TCP transport was not opened"))?,
+                RouteMode::Bypass | RouteMode::Block => {
+                    return Err(Error::invalid("unsupported DNS resolver route mode"));
+                }
+            };
+            let stream: DnsIoStream = Box::pin(RuntimeDnsIoStream(stream));
+            Ok(Some(stream))
+        })
+    }
+}
+
+#[cfg(feature = "http2")]
+fn doh_endpoint(host: &str, id: &str) -> Result<http::Uri> {
+    let host = host.trim();
+    let endpoint = if host.contains("://") {
+        host.to_owned()
+    } else {
+        format!("https://{host}/dns-query")
+    };
+    endpoint.parse().map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("resolver {id} has invalid DoH endpoint: {error}"),
+        )
+    })
+}
+
+#[cfg(feature = "doh-tls")]
+fn dns_tls_config(
+    config: &GoResolverRuntimeConfig,
+    local_bind_addresses: &[IpAddr],
+    bind_interface: Option<&str>,
+) -> DnsTlsResolverConfig {
+    DnsTlsResolverConfig {
+        id: config.id.clone(),
+        host: config.host.clone(),
+        server_name: config.tls_server_name.clone(),
+        local_bind_addresses: local_bind_addresses.to_vec(),
+        bind_interface: bind_interface.map(str::to_owned),
+    }
+}
+
 #[cfg(feature = "doh-tls")]
 #[derive(Clone)]
 pub struct RustCryptoDohResolverFactory {
     pub builtin: BuiltinResolverFactory,
-    client_config: Arc<rustls::ClientConfig>,
-    proxy_bridge: Option<Arc<ResolverProxyBridge>>,
+    inner: DohResolverFactory,
 }
 
 #[cfg(feature = "doh-tls")]
@@ -783,16 +883,9 @@ impl RustCryptoDohResolverFactory {
         timeout: Duration,
         cache_capacity: usize,
     ) -> Result<Self> {
-        let provider = Arc::new(rustls_rustcrypto::provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-            .map_err(|error| Error::new(ErrorKind::Protocol, format!("DoH TLS: {error}")))?
-            .with_root_certificates(root_store(root_certificates)?)
-            .with_no_client_auth();
         Ok(Self {
             builtin: BuiltinResolverFactory::new(timeout, cache_capacity),
-            client_config: Arc::new(config),
-            proxy_bridge: None,
+            inner: DohResolverFactory::new(root_certificates, timeout, cache_capacity)?,
         })
     }
 
@@ -803,14 +896,15 @@ impl RustCryptoDohResolverFactory {
     ) -> Self {
         Self {
             builtin: BuiltinResolverFactory::new(timeout, cache_capacity),
-            client_config: config,
-            proxy_bridge: None,
+            inner: DohResolverFactory::from_client_config(config, timeout, cache_capacity),
         }
     }
 
     pub fn with_proxy_bridge(mut self, bridge: Arc<ResolverProxyBridge>) -> Self {
         self.builtin = self.builtin.with_proxy_bridge(bridge.clone());
-        self.proxy_bridge = Some(bridge);
+        self.inner = self
+            .inner
+            .with_stream_connector(Arc::new(ResolverBridgeStreamConnector { bridge }));
         self
     }
 }
@@ -842,45 +936,91 @@ impl ResolverTransportFactory for RustCryptoDohResolverFactory {
                 bind_interface,
             );
         }
-        let endpoint = doh_endpoint(&config.host, &config.id)?;
-        let connector = RoutedRustCryptoH2Connector::from_config(
-            self.client_config.clone(),
-            config
-                .tls_server_name
-                .clone()
-                .filter(|name| !name.trim().is_empty()),
-            self.builtin.timeout,
-            self.proxy_bridge.clone(),
-            self.proxy_bridge
-                .as_ref()
-                .and_then(|bridge| bridge.route_mode_for_resolver(&config.id)),
-        )
-        .with_local_bind_addresses(local_bind_addresses)
-        .with_bind_interface(bind_interface);
-        let client = H2DohClient::new(endpoint, connector);
-        let resolver = AsyncDnsResolver::new(client)
-            .with_cache(DnsCache::new(self.builtin.cache_capacity.max(1))?);
+        let resolver =
+            self.inner
+                .build(dns_tls_config(config, local_bind_addresses, bind_interface))?;
         Ok(Arc::new(TimeoutResolver::new(
-            Arc::new(resolver),
+            resolver,
             self.builtin.timeout,
         )))
     }
 }
 
-#[cfg(feature = "http2")]
-fn doh_endpoint(host: &str, id: &str) -> Result<http::Uri> {
-    let host = host.trim();
-    let endpoint = if host.contains("://") {
-        host.to_owned()
-    } else {
-        format!("https://{host}/dns-query")
-    };
-    endpoint.parse().map_err(|error| {
-        Error::new(
-            ErrorKind::InvalidInput,
-            format!("resolver {id} has invalid DoH endpoint: {error}"),
-        )
-    })
+#[cfg(feature = "doh-tls")]
+#[derive(Clone)]
+pub struct RustCryptoDotResolverFactory {
+    pub builtin: BuiltinResolverFactory,
+    inner: DotResolverFactory,
+}
+
+#[cfg(feature = "doh-tls")]
+impl RustCryptoDotResolverFactory {
+    pub fn new(
+        root_certificates: &[Vec<u8>],
+        timeout: Duration,
+        cache_capacity: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            builtin: BuiltinResolverFactory::new(timeout, cache_capacity),
+            inner: DotResolverFactory::new(root_certificates, timeout, cache_capacity)?,
+        })
+    }
+
+    pub fn from_client_config(
+        config: Arc<rustls::ClientConfig>,
+        timeout: Duration,
+        cache_capacity: usize,
+    ) -> Self {
+        Self {
+            builtin: BuiltinResolverFactory::new(timeout, cache_capacity),
+            inner: DotResolverFactory::from_client_config(config, timeout, cache_capacity),
+        }
+    }
+
+    pub fn with_proxy_bridge(mut self, bridge: Arc<ResolverProxyBridge>) -> Self {
+        self.builtin = self.builtin.with_proxy_bridge(bridge.clone());
+        self.inner = self
+            .inner
+            .with_stream_connector(Arc::new(ResolverBridgeStreamConnector { bridge }));
+        self
+    }
+}
+
+#[cfg(feature = "doh-tls")]
+impl ResolverTransportFactory for RustCryptoDotResolverFactory {
+    fn build(&self, config: &GoResolverRuntimeConfig) -> Result<Arc<dyn AsyncIpResolver>> {
+        self.build_with_policy(config, &[])
+    }
+
+    fn build_with_policy(
+        &self,
+        config: &GoResolverRuntimeConfig,
+        local_bind_addresses: &[IpAddr],
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
+        self.build_with_policy_and_interface(config, local_bind_addresses, None)
+    }
+
+    fn build_with_policy_and_interface(
+        &self,
+        config: &GoResolverRuntimeConfig,
+        local_bind_addresses: &[IpAddr],
+        bind_interface: Option<&str>,
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
+        if config.transport != GoResolverTransport::Dot {
+            return self.builtin.build_with_policy_and_interface(
+                config,
+                local_bind_addresses,
+                bind_interface,
+            );
+        }
+        let resolver =
+            self.inner
+                .build(dns_tls_config(config, local_bind_addresses, bind_interface))?;
+        Ok(Arc::new(TimeoutResolver::new(
+            resolver,
+            self.builtin.timeout,
+        )))
+    }
 }
 
 impl ResolverTransportFactory for BuiltinResolverFactory {

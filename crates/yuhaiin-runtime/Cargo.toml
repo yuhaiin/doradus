@@ -43,6 +43,8 @@ doh-tls = [
     "yuhaiin-core/tls-rustcrypto",
     "yuhaiin-protocol/tls-rustcrypto",
     "dep:webpki-roots",
+    "yuhaiin-dns/tls",
+    "yuhaiin-dns/quic",
 ]
 websocket = [
     "dep:futures-util",
@@ -82,6 +84,7 @@ uuid = { version = "1.24.0", default-features = false, features = ["std", "v4"] 
 rand = { version = "0.10.2", default-features = false, features = ["std", "thread_rng"] }
 reqwest = { version = "0.12.28", optional = true, default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots-no-provider"] }
 yuhaiin-chain = { path = "../yuhaiin-chain" }
+yuhaiin-dns = { path = "../yuhaiin-dns", features = ["async-proxy"] }
 yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
 yuhaiin-geo = { path = "../yuhaiin-geo" }
 yuhaiin-protocol = { path = "../yuhaiin-protocol" }

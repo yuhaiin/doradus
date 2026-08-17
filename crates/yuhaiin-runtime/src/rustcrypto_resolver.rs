@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use rustls::ClientConfig;
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
-use yuhaiin_core::{Error, ErrorKind, Result};
+use yuhaiin_core::proxy::AsyncDatagram;
+use yuhaiin_core::{Endpoint, Error, ErrorKind, Network, Result};
+use yuhaiin_dns::{AsyncDnsDatagram, DnsDatagramConnector, DoqResolverConfig, DoqResolverFactory};
 use yuhaiin_store::{GoResolverRuntimeConfig, GoResolverTransport};
 
 use crate::{
@@ -19,11 +21,90 @@ use crate::{
     RustCryptoDohResolverFactory, RustCryptoDotResolverFactory,
 };
 
+struct ResolverBridgeDatagramConnector {
+    bridge: Arc<ResolverProxyBridge>,
+}
+
+impl DnsDatagramConnector for ResolverBridgeDatagramConnector {
+    fn open<'a>(
+        &'a self,
+        resolver_id: &'a str,
+        host: &'a str,
+        target: std::net::SocketAddr,
+        _local_bind_addresses: &'a [IpAddr],
+        _bind_interface: Option<&'a str>,
+    ) -> yuhaiin_core::BoxFuture<'a, Result<Option<Box<dyn AsyncDnsDatagram>>>> {
+        Box::pin(async move {
+            let Some(route_mode) = self.bridge.route_mode_for_resolver(resolver_id) else {
+                return Ok(None);
+            };
+            let datagram = match route_mode {
+                yuhaiin_core::RouteMode::Direct => {
+                    self.bridge
+                        .open_datagram_direct(host, target.port())
+                        .await?
+                }
+                yuhaiin_core::RouteMode::Proxy => self
+                    .bridge
+                    .open_datagram(host, target.port(), true)
+                    .await?
+                    .ok_or_else(|| Error::invalid("DoQ proxy UDP transport was not opened"))?,
+                yuhaiin_core::RouteMode::Bypass | yuhaiin_core::RouteMode::Block => {
+                    return Err(Error::invalid("unsupported DoQ resolver route mode"));
+                }
+            };
+            Ok(Some(
+                Box::new(RuntimeDnsDatagram { inner: datagram }) as Box<dyn AsyncDnsDatagram>
+            ))
+        })
+    }
+}
+
+struct RuntimeDnsDatagram {
+    inner: Box<dyn AsyncDatagram>,
+}
+
+impl AsyncDnsDatagram for RuntimeDnsDatagram {
+    fn send_to<'a>(
+        &'a self,
+        payload: &'a [u8],
+        target: std::net::SocketAddr,
+    ) -> yuhaiin_core::BoxFuture<'a, Result<usize>> {
+        let endpoint = Endpoint::ip(Network::Udp, target);
+        self.inner.send_to(payload, endpoint)
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buffer: &'a mut [u8],
+    ) -> yuhaiin_core::BoxFuture<'a, Result<(usize, std::net::SocketAddr)>> {
+        Box::pin(async move {
+            let (length, endpoint) = self.inner.recv_from(buffer).await?;
+            let address = endpoint
+                .addr()
+                .ok_or_else(|| Error::invalid("DNS datagram has no socket address"))?;
+            Ok((length, address))
+        })
+    }
+
+    fn local_addr(&self) -> Result<std::net::SocketAddr> {
+        self.inner
+            .local_addr()?
+            .addr()
+            .ok_or_else(|| Error::invalid("DNS datagram has no local socket address"))
+    }
+
+    fn close(&self) -> yuhaiin_core::BoxFuture<'_, Result<()>> {
+        self.inner.close()
+    }
+}
+
 #[derive(Clone)]
 pub struct RustCryptoResolverFactory {
     pub builtin: BuiltinResolverFactory,
     doh: RustCryptoDohResolverFactory,
     dot: RustCryptoDotResolverFactory,
+    doq: DoqResolverFactory,
 }
 
 impl RustCryptoResolverFactory {
@@ -34,15 +115,31 @@ impl RustCryptoResolverFactory {
     ) -> Result<Self> {
         let doh = RustCryptoDohResolverFactory::new(root_certificates, timeout, cache_capacity)?;
         let dot = RustCryptoDotResolverFactory::new(root_certificates, timeout, cache_capacity)?;
+        let doq = DoqResolverFactory::new(root_certificates, timeout, cache_capacity)?;
         Ok(Self {
             builtin: BuiltinResolverFactory::new(timeout, cache_capacity),
             doh,
             dot,
+            doq,
         })
     }
 
     pub fn from_client_config(
         client_config: Arc<ClientConfig>,
+        timeout: Duration,
+        cache_capacity: usize,
+    ) -> Self {
+        Self::from_client_config_with_doq_config(
+            client_config.clone(),
+            client_config,
+            timeout,
+            cache_capacity,
+        )
+    }
+
+    pub fn from_client_config_with_doq_config(
+        client_config: Arc<ClientConfig>,
+        doq_client_config: Arc<ClientConfig>,
         timeout: Duration,
         cache_capacity: usize,
     ) -> Self {
@@ -54,17 +151,43 @@ impl RustCryptoResolverFactory {
                 cache_capacity,
             ),
             dot: RustCryptoDotResolverFactory::from_client_config(
+                client_config.clone(),
+                timeout,
+                cache_capacity,
+            ),
+            doq: DoqResolverFactory::from_client_config(doq_client_config, timeout, cache_capacity),
+        }
+    }
+
+    pub fn from_client_config_with_webpki_roots(
+        client_config: Arc<ClientConfig>,
+        timeout: Duration,
+        cache_capacity: usize,
+    ) -> Result<Self> {
+        let doq = DoqResolverFactory::from_webpki_roots(timeout, cache_capacity)?;
+        Ok(Self {
+            builtin: BuiltinResolverFactory::new(timeout, cache_capacity),
+            doh: RustCryptoDohResolverFactory::from_client_config(
+                client_config.clone(),
+                timeout,
+                cache_capacity,
+            ),
+            dot: RustCryptoDotResolverFactory::from_client_config(
                 client_config,
                 timeout,
                 cache_capacity,
             ),
-        }
+            doq,
+        })
     }
 
     pub fn with_proxy_bridge(mut self, bridge: Arc<ResolverProxyBridge>) -> Self {
         self.builtin = self.builtin.with_proxy_bridge(bridge.clone());
         self.doh = self.doh.with_proxy_bridge(bridge.clone());
-        self.dot = self.dot.with_proxy_bridge(bridge);
+        self.dot = self.dot.with_proxy_bridge(bridge.clone());
+        self.doq = self
+            .doq
+            .with_datagram_connector(Arc::new(ResolverBridgeDatagramConnector { bridge }));
         self
     }
 }
@@ -99,7 +222,20 @@ impl ResolverTransportFactory for RustCryptoResolverFactory {
                 local_bind_addresses,
                 bind_interface,
             ),
-            GoResolverTransport::Doq | GoResolverTransport::Doh3 => Err(Error::new(
+            GoResolverTransport::Doq => {
+                let resolver = self.doq.build(DoqResolverConfig {
+                    id: config.id.clone(),
+                    host: config.host.clone(),
+                    server_name: config.tls_server_name.clone(),
+                    local_bind_addresses: local_bind_addresses.to_vec(),
+                    bind_interface: bind_interface.map(str::to_owned),
+                })?;
+                Ok(Arc::new(crate::TimeoutResolver::new(
+                    resolver,
+                    self.doq.timeout(),
+                )))
+            }
+            GoResolverTransport::Doh3 => Err(Error::new(
                 ErrorKind::Unsupported,
                 format!(
                     "resolver {} transport {:?} is not implemented by the RustCrypto registry",

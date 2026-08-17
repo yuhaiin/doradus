@@ -7,17 +7,19 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
-use yuhaiin_core::dns::{DnsRecordType, decode_response, encode_query};
 use yuhaiin_core::dns_resolver_async::{AsyncIpResolver, SystemAsyncIpResolver};
-use yuhaiin_core::proxy::{AsyncProxy, BoxAsyncStream};
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{
     DomainName, Endpoint, Error, ErrorKind, FlowContext, IpSet, Network, ResolveStrategy, Result,
 };
+use yuhaiin_dns::{AsyncDnsDatagram, DnsDatagramConnector, probe_dns_udp};
+#[cfg(feature = "doh-tls")]
+use yuhaiin_dns::{DoqResolverConfig, DoqResolverFactory, probe_doq};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -104,7 +106,6 @@ struct HttpReply {
 }
 
 static TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(1);
-static DNS_TRANSACTION_COUNTER: AtomicU16 = AtomicU16::new(1);
 
 pub async fn probe(
     proxy: Arc<dyn AsyncProxy>,
@@ -148,9 +149,12 @@ pub async fn probe_with_resolver(
         "ip" => probe_ip(proxy, resolver, request, timeout).await,
         "stun" | "stun_tcp" => probe_stun(proxy, request, timeout).await,
         "dns" | "udp" => probe_dns(proxy, request, timeout).await,
+        #[cfg(feature = "doh-tls")]
+        "doq" => probe_doq_latency(proxy, request, timeout).await,
+        #[cfg(not(feature = "doh-tls"))]
         "doq" => Err(Error::new(
             ErrorKind::Unsupported,
-            format!("latency probe type {probe_type:?} is not implemented; DoQ remains deferred"),
+            "DoQ latency requires the doh-tls feature",
         )),
         other => Err(Error::new(
             ErrorKind::Unsupported,
@@ -666,26 +670,108 @@ async fn probe_dns(
     timeout: Duration,
 ) -> Result<LatencyResponse> {
     let (host, port) = parse_host_port(&request.dns_host_or_default(), 53)?;
-    let resolver = endpoint(Network::Udp, &host, port)?;
-    let context = FlowContext::new(resolver.clone());
     let domain = DomainName::new(&request.dns_target_or_default())?;
-    let id = DNS_TRANSACTION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let packet = encode_query(id, &domain, DnsRecordType::A)?;
-    let started = std::time::Instant::now();
-    let datagram = tokio::time::timeout(timeout, proxy.open_datagram(&context))
-        .await
-        .map_err(|_| Error::new(ErrorKind::Timeout, "DNS UDP open timed out"))??;
-    tokio::time::timeout(timeout, datagram.send_to(&packet, resolver))
-        .await
-        .map_err(|_| Error::new(ErrorKind::Timeout, "DNS UDP write timed out"))??;
+    let elapsed = probe_dns_udp(
+        &LatencyDatagramConnector { proxy },
+        "latency-dns",
+        &host,
+        port,
+        &domain,
+        timeout,
+    )
+    .await?;
+    Ok(success(elapsed))
+}
 
-    let mut buffer = vec![0u8; 4096];
-    let (length, _) = tokio::time::timeout(timeout, datagram.recv_from(&mut buffer))
-        .await
-        .map_err(|_| Error::new(ErrorKind::Timeout, "DNS UDP response timed out"))??;
-    decode_response(&buffer[..length], id, DnsRecordType::A)?;
-    datagram.close().await?;
-    Ok(success(started.elapsed()))
+#[cfg(feature = "doh-tls")]
+async fn probe_doq_latency(
+    proxy: Arc<dyn AsyncProxy>,
+    request: LatencyRequest,
+    timeout: Duration,
+) -> Result<LatencyResponse> {
+    let (host, _) = parse_host_port(&request.dns_host_or_default(), 853)?;
+    let domain = DomainName::new(&request.dns_target_or_default())?;
+    let factory = DoqResolverFactory::from_webpki_roots(timeout, 1)?
+        .with_datagram_connector(Arc::new(LatencyDatagramConnector { proxy }));
+    let elapsed = probe_doq(
+        &factory,
+        DoqResolverConfig {
+            id: "latency-doq".to_owned(),
+            host: request.dns_host_or_default(),
+            server_name: Some(host),
+            local_bind_addresses: Vec::new(),
+            bind_interface: None,
+        },
+        &domain,
+        timeout,
+    )
+    .await?;
+    Ok(success(elapsed))
+}
+
+struct LatencyDatagramConnector {
+    proxy: Arc<dyn AsyncProxy>,
+}
+
+impl DnsDatagramConnector for LatencyDatagramConnector {
+    fn open<'a>(
+        &'a self,
+        _resolver_id: &'a str,
+        host: &'a str,
+        target: SocketAddr,
+        _local_bind_addresses: &'a [IpAddr],
+        _bind_interface: Option<&'a str>,
+    ) -> yuhaiin_core::BoxFuture<'a, Result<Option<Box<dyn AsyncDnsDatagram>>>> {
+        Box::pin(async move {
+            let destination = endpoint(Network::Udp, host, target.port())?;
+            let context = FlowContext::new(destination);
+            let datagram = self.proxy.open_datagram(&context).await?;
+            Ok(Some(
+                Box::new(LatencyDatagram { inner: datagram }) as Box<dyn AsyncDnsDatagram>
+            ))
+        })
+    }
+}
+
+struct LatencyDatagram {
+    inner: Box<dyn AsyncDatagram>,
+}
+
+impl AsyncDnsDatagram for LatencyDatagram {
+    fn send_to<'a>(
+        &'a self,
+        payload: &'a [u8],
+        target: SocketAddr,
+    ) -> yuhaiin_core::BoxFuture<'a, Result<usize>> {
+        self.inner
+            .send_to(payload, Endpoint::ip(Network::Udp, target))
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buffer: &'a mut [u8],
+    ) -> yuhaiin_core::BoxFuture<'a, Result<(usize, SocketAddr)>> {
+        Box::pin(async move {
+            let (length, endpoint) = self.inner.recv_from(buffer).await?;
+            Ok((
+                length,
+                endpoint
+                    .addr()
+                    .ok_or_else(|| Error::invalid("latency DNS datagram has no address"))?,
+            ))
+        })
+    }
+
+    fn local_addr(&self) -> Result<SocketAddr> {
+        self.inner
+            .local_addr()?
+            .addr()
+            .ok_or_else(|| Error::invalid("latency DNS datagram has no local address"))
+    }
+
+    fn close(&self) -> yuhaiin_core::BoxFuture<'_, Result<()>> {
+        self.inner.close()
+    }
 }
 
 async fn read_stun_tcp(stream: &mut BoxAsyncStream, timeout: Duration) -> Result<Vec<u8>> {
@@ -788,9 +874,9 @@ async fn wrap_tls_if_needed(
     {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let config = crate::doh_tls::client_config(roots)?;
+        let config = crate::tls::client_config(roots)?;
         let connector = tokio_rustls::TlsConnector::from(config);
-        let name = crate::doh_tls::tls_server_name(&target.host)?;
+        let name = crate::tls::tls_server_name(&target.host)?;
         let tls = tokio::time::timeout(timeout, connector.connect(name, stream))
             .await
             .map_err(|_| Error::new(ErrorKind::Timeout, "TLS handshake timed out"))?

@@ -201,14 +201,14 @@ async fn wrap_https_if_needed(
     }
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let connector = tokio_rustls::TlsConnector::from(crate::doh_tls::client_config(roots)?);
+    let connector = tokio_rustls::TlsConnector::from(crate::tls::client_config(roots)?);
     let name = config
         .target
         .host()
         .map(|host| host.as_str().to_owned())
         .or_else(|| config.target.addr().map(|addr| addr.ip().to_string()))
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "reverse_http target has no host"))?;
-    let server_name = crate::doh_tls::tls_server_name(&name)?;
+    let server_name = crate::tls::tls_server_name(&name)?;
     let stream = connector
         .connect(server_name, stream)
         .await

@@ -7,10 +7,6 @@
 mod controller;
 mod data_plane;
 mod defaults;
-#[cfg(feature = "doh-tls")]
-mod doh_tls;
-#[cfg(feature = "doh-tls")]
-mod dot_tls;
 mod handle;
 #[path = "inbounds/mod.rs"]
 pub mod inbound;
@@ -25,6 +21,8 @@ mod route;
 #[cfg(feature = "doh-tls")]
 mod rustcrypto_resolver;
 mod settings;
+#[cfg(feature = "doh-tls")]
+mod tls;
 #[cfg(feature = "update")]
 pub mod update;
 
@@ -60,10 +58,6 @@ pub use data_plane::{
     TunRuntimeConfig, load_tun_config, run_tun_device_until, run_tun_device_until_ref,
 };
 pub use defaults::DefaultAddressPlan;
-#[cfg(feature = "doh-tls")]
-pub use doh_tls::{RustCryptoH2Connector, RustCryptoTlsDialer, root_store as doh_root_store};
-#[cfg(feature = "doh-tls")]
-pub use dot_tls::RustCryptoDotResolverFactory;
 pub use handle::RuntimeHandle;
 pub use log::RuntimeLog;
 pub use monitor::ConnectionMonitor;
@@ -72,6 +66,8 @@ pub use proxy::{ProxyBuild, RuntimeProxySelector};
 pub use resolver::H2DohResolverFactory;
 #[cfg(feature = "doh-tls")]
 pub use resolver::RustCryptoDohResolverFactory;
+#[cfg(feature = "doh-tls")]
+pub use resolver::RustCryptoDotResolverFactory;
 pub use resolver::{
     BuiltinResolverFactory, FallbackResolver, ResolverFailurePolicy, ResolverProxyBridge,
     ResolverTransportFactory, TimeoutResolver, parse_dns_server,
@@ -86,6 +82,8 @@ pub use route::{
 #[cfg(feature = "doh-tls")]
 pub use rustcrypto_resolver::RustCryptoResolverFactory;
 pub use settings::{Ipv6PolicyResolver, RuntimeSettings};
+#[cfg(feature = "doh-tls")]
+pub use tls::RustCryptoTlsDialer;
 
 /// Runtime-only knobs that are not part of the persisted Go schema.
 #[derive(Debug, Clone)]

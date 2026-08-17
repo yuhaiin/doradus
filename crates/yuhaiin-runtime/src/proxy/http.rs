@@ -124,7 +124,7 @@ where
                     .ok_or_else(|| {
                         Error::new(ErrorKind::InvalidInput, "HTTPS target has no host")
                     })?;
-                match crate::doh_tls::wrap_system_tls_stream(&server_name, outbound).await {
+                match crate::tls::wrap_system_tls_stream(&server_name, outbound).await {
                     Ok(stream) => stream,
                     Err(error) => {
                         monitor.record_failure_with_process(

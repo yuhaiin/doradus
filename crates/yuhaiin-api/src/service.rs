@@ -328,20 +328,14 @@ async fn build_controller(store: ConfigStore) -> Result<RuntimeController> {
         .with_resolver_proxy_bridge(resolver_proxy_bridge.clone());
     #[cfg(feature = "doh-tls")]
     {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let config =
-            rustls::ClientConfig::builder_with_provider(Arc::new(rustls_rustcrypto::provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-                .map_err(|error| Error::new(ErrorKind::Protocol, format!("TLS provider: {error}")))?
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+        let config = yuhaiin_dns::webpki_client_config()
+            .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
         builder = builder.with_resolver_factory(Arc::new(
-            yuhaiin_runtime::RustCryptoResolverFactory::from_client_config(
-                Arc::new(config),
+            yuhaiin_runtime::RustCryptoResolverFactory::from_client_config_with_webpki_roots(
+                config,
                 Duration::from_secs(15),
                 256,
-            )
+            )?
             .with_proxy_bridge(resolver_proxy_bridge),
         ));
     }

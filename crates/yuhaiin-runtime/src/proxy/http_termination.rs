@@ -345,13 +345,13 @@ fn request_target<B>(
 async fn wrap_https(stream: BoxAsyncStream, destination: &Endpoint) -> Result<BoxAsyncStream> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let connector = tokio_rustls::TlsConnector::from(crate::doh_tls::client_config(roots)?);
+    let connector = tokio_rustls::TlsConnector::from(crate::tls::client_config(roots)?);
     let name = destination
         .host()
         .map(|host| host.as_str().to_owned())
         .or_else(|| destination.addr().map(|addr| addr.ip().to_string()))
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "HTTPS target has no host"))?;
-    let server_name = crate::doh_tls::tls_server_name(&name)?;
+    let server_name = crate::tls::tls_server_name(&name)?;
     let local_addr = stream_local_addr(&*stream);
     let stream = connector
         .connect(server_name, stream)

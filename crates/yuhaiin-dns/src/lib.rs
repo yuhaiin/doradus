@@ -34,6 +34,10 @@ pub use dns_resolver_async::{
 pub mod dns_resolver_stack;
 #[cfg(feature = "async-proxy")]
 pub use dns_resolver_stack::AsyncHostsResolver;
+#[cfg(feature = "async-proxy")]
+mod dns_datagram;
+#[cfg(feature = "async-proxy")]
+pub use dns_datagram::{AsyncDnsDatagram, DnsDatagramConnector, probe_dns_udp};
 pub mod dns_tcp;
 pub use dns_tcp::{TcpDnsClient, TcpDnsServer};
 #[cfg(feature = "async-proxy")]
@@ -48,5 +52,16 @@ pub use dns_udp_async::{AsyncUdpDnsClient, AsyncUdpDnsHandler, AsyncUdpDnsServer
 pub mod http2;
 #[cfg(feature = "http2")]
 pub use http2::{H2DohClient, H2DohConnector, H2DohDnsHandler};
+#[cfg(feature = "quic")]
+pub mod dns_quic;
+#[cfg(feature = "quic")]
+pub use dns_quic::{DoqResolverConfig, DoqResolverFactory, probe_doq, query_doq};
+#[cfg(feature = "tls")]
+pub mod dns_tls;
+#[cfg(feature = "tls")]
+pub use dns_tls::{
+    DnsIoStream, DnsStreamConnector, DnsTlsConnector, DnsTlsResolverConfig, DohResolverFactory,
+    DotResolverFactory, RustCryptoH2Connector, RustCryptoTlsConnector, webpki_client_config,
+};
 #[cfg(feature = "async-proxy")]
 mod transport;
