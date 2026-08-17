@@ -149,7 +149,12 @@ impl GoResolverRecord {
             transport,
             host,
             subnet: contract.subnet,
-            tls_server_name: contract.tls_server_name,
+            // Go persists an omitted TLS server name as an empty string.
+            // Treat that representation as unset so encrypted resolvers use
+            // the endpoint host as their SNI instead of rejecting it.
+            tls_server_name: contract
+                .tls_server_name
+                .filter(|name| !name.trim().is_empty()),
         })
     }
 }

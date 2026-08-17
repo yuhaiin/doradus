@@ -388,6 +388,32 @@ fn go_resolver_runtime_preserves_supported_transport_kinds() {
 }
 
 #[test]
+fn go_resolver_runtime_treats_empty_tls_server_name_as_unset() {
+    for (resolver_type, host) in [
+        ("doh", "https://dns.example/dns-query"),
+        ("dot", "dns.example:853"),
+        ("doq", "dns.example:784"),
+    ] {
+        let record = GoResolverRecord {
+            id: format!("{resolver_type}-proxy"),
+            resolver_type: resolver_type.to_owned(),
+            host: host.to_owned(),
+            updated_at: 0,
+            data_json: format!(
+                r#"{{"type":"{resolver_type}","host":"{host}","tlsServerName":""}}"#
+            )
+            .into_bytes(),
+        };
+
+        assert_eq!(
+            record.to_runtime_config().unwrap().tls_server_name,
+            None,
+            "transport={resolver_type}"
+        );
+    }
+}
+
+#[test]
 fn go_node_runtime_preserves_proxy_layers_and_selects_supported_base() {
     let cases = [
         ("direct", GoProxyTransport::Direct),

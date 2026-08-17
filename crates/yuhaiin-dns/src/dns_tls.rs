@@ -198,7 +198,7 @@ impl H2DohConnector for RustCryptoH2Connector {
                 .host()
                 .ok_or_else(|| Error::invalid("DoH endpoint has no host"))?;
             let port = uri.port_u16().unwrap_or(443);
-            let server_name = self.server_name.as_deref().unwrap_or(host);
+            let server_name = effective_tls_server_name(self.server_name.as_deref(), host);
             let stream = self
                 .tls
                 .connect(
@@ -457,6 +457,12 @@ fn tls_server_name(name: &str) -> Result<ServerName<'static>> {
         .map_err(|_| Error::new(ErrorKind::InvalidInput, "invalid TLS server name"))
 }
 
+fn effective_tls_server_name<'a>(configured: Option<&'a str>, host: &'a str) -> &'a str {
+    configured
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(host)
+}
+
 async fn direct_stream(
     host: &str,
     port: u16,
@@ -563,4 +569,41 @@ fn next_transaction_id() -> u16 {
     use std::sync::atomic::{AtomicU16, Ordering};
     static NEXT: AtomicU16 = AtomicU16::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::effective_tls_server_name;
+
+    #[test]
+    fn empty_doh_server_name_uses_endpoint_host() {
+        assert_eq!(
+            effective_tls_server_name(Some("  "), "dns.example"),
+            "dns.example"
+        );
+        assert_eq!(
+            effective_tls_server_name(Some("custom.example"), "dns.example"),
+            "custom.example"
+        );
+        assert_eq!(
+            effective_tls_server_name(None, "dns.example"),
+            "dns.example"
+        );
+    }
+
+    #[test]
+    fn dot_factory_accepts_empty_server_name() {
+        let factory = super::DotResolverFactory::new(&[], Duration::from_secs(1), 1).unwrap();
+        let resolver = factory.build(super::DnsTlsResolverConfig {
+            id: "dot-test".to_owned(),
+            host: "192.0.2.1:853".to_owned(),
+            server_name: Some("".to_owned()),
+            local_bind_addresses: Vec::new(),
+            bind_interface: None,
+        });
+
+        assert!(resolver.is_ok());
+    }
 }

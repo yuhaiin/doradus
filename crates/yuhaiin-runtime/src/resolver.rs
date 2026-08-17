@@ -337,16 +337,6 @@ pub enum ResolverFailurePolicy {
     KeepUnavailable,
 }
 
-/// Query-time fallback used for a resolver that was constructed successfully
-/// but later loses its network or proxy path.  The fallback is the already
-/// assembled application resolver, so it retains hosts/FakeIP policy and does
-/// not create a second bootstrap chain.
-#[derive(Clone)]
-pub struct FallbackResolver {
-    pub primary: Arc<dyn AsyncIpResolver>,
-    pub fallback: Arc<dyn AsyncIpResolver>,
-}
-
 /// Bounds the complete upstream resolver operation, including the response
 /// body after a successful TCP/TLS connection. Dropping the timed-out future
 /// also cancels the underlying h2 driver and socket operation.
@@ -394,90 +384,6 @@ impl AsyncIpResolver for TimeoutResolver {
                 .map_err(|_| Error::new(ErrorKind::Timeout, "DNS resolver query timed out"))?
         })
     }
-}
-
-impl FallbackResolver {
-    pub fn new(primary: Arc<dyn AsyncIpResolver>, fallback: Arc<dyn AsyncIpResolver>) -> Self {
-        Self { primary, fallback }
-    }
-}
-
-impl AsyncIpResolver for FallbackResolver {
-    fn resolve<'a>(
-        &'a self,
-        domain: &'a DomainName,
-        strategy: ResolveStrategy,
-    ) -> BoxFuture<'a, Result<IpSet>> {
-        Box::pin(async move {
-            match self.primary.resolve(domain, strategy).await {
-                Ok(addresses) if !addresses.is_empty() => Ok(addresses),
-                Ok(_) => self.fallback.resolve(domain, strategy).await,
-                Err(primary_error) => self
-                    .fallback
-                    .resolve(domain, strategy)
-                    .await
-                    .map_err(|fallback_error| {
-                        Error::new(
-                            ErrorKind::Io,
-                            format!(
-                                "resolver primary failed: {primary_error}; fallback failed: {fallback_error}"
-                            ),
-                        )
-                    }),
-            }
-        })
-    }
-
-    fn query<'a>(
-        &'a self,
-        domain: &'a DomainName,
-        record_type: yuhaiin_core::dns::DnsRecordType,
-    ) -> BoxFuture<'a, Result<DnsResponse>> {
-        Box::pin(async move {
-            match self.primary.query(domain, record_type).await {
-                Ok(response) if !dns_response_empty(&response) => Ok(response),
-                Ok(_) => self.fallback.query(domain, record_type).await,
-                Err(primary_error) => self
-                    .fallback
-                    .query(domain, record_type)
-                    .await
-                    .map_err(|fallback_error| {
-                        Error::new(
-                            ErrorKind::Io,
-                            format!(
-                                "resolver primary failed: {primary_error}; fallback failed: {fallback_error}"
-                            ),
-                        )
-                    }),
-            }
-        })
-    }
-
-    fn query_packet<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
-        Box::pin(async move {
-            match self.primary.query_packet(packet).await {
-                Ok(response) => Ok(response),
-                Err(primary_error) => self
-                    .fallback
-                    .query_packet(packet)
-                    .await
-                    .map_err(|fallback_error| {
-                        Error::new(
-                            ErrorKind::Io,
-                            format!(
-                                "resolver primary failed: {primary_error}; fallback failed: {fallback_error}"
-                            ),
-                        )
-                    }),
-            }
-        })
-    }
-}
-
-fn dns_response_empty(response: &DnsResponse) -> bool {
-    response.addresses.is_empty()
-        && response.ptr_names.is_empty()
-        && response.service_bindings.is_empty()
 }
 
 #[derive(Clone)]
@@ -1347,20 +1253,6 @@ mod tests {
         }
     }
 
-    struct ErrorResolver;
-
-    impl AsyncIpResolver for ErrorResolver {
-        fn resolve<'a>(
-            &'a self,
-            _domain: &'a DomainName,
-            _strategy: ResolveStrategy,
-        ) -> BoxFuture<'a, Result<IpSet>> {
-            Box::pin(async { Err(Error::new(ErrorKind::Timeout, "primary timeout")) })
-        }
-    }
-
-    struct StaticResolver;
-
     struct StaticDnsHandler;
 
     impl AsyncDnsHandler for StaticDnsHandler {
@@ -1383,21 +1275,6 @@ mod tests {
                         minimum_ttl: Some(30),
                     },
                 )
-            })
-        }
-    }
-
-    impl AsyncIpResolver for StaticResolver {
-        fn resolve<'a>(
-            &'a self,
-            _domain: &'a DomainName,
-            _strategy: ResolveStrategy,
-        ) -> BoxFuture<'a, Result<IpSet>> {
-            Box::pin(async {
-                Ok(IpSet {
-                    v4: vec!["192.0.2.99".parse::<std::net::Ipv4Addr>().unwrap()],
-                    v6: Vec::new(),
-                })
             })
         }
     }
@@ -1713,21 +1590,5 @@ mod tests {
             ))
             .unwrap();
         let _ = resolver;
-    }
-
-    #[test]
-    fn query_fallback_retries_empty_or_failed_primary() {
-        let domain = DomainName::new("example.com").unwrap();
-        let resolver = FallbackResolver::new(Arc::new(ErrorResolver), Arc::new(StaticResolver));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let result = runtime
-            .block_on(resolver.resolve(&domain, ResolveStrategy::OnlyIpv4))
-            .unwrap();
-        assert_eq!(
-            result.v4,
-            vec!["192.0.2.99".parse::<std::net::Ipv4Addr>().unwrap()]
-        );
     }
 }

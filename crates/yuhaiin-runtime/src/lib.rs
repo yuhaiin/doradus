@@ -69,8 +69,8 @@ pub use resolver::RustCryptoDohResolverFactory;
 #[cfg(feature = "doh-tls")]
 pub use resolver::RustCryptoDotResolverFactory;
 pub use resolver::{
-    BuiltinResolverFactory, FallbackResolver, ResolverFailurePolicy, ResolverProxyBridge,
-    ResolverTransportFactory, TimeoutResolver, parse_dns_server,
+    BuiltinResolverFactory, ResolverFailurePolicy, ResolverProxyBridge, ResolverTransportFactory,
+    TimeoutResolver, parse_dns_server,
 };
 pub use route::{
     ProxyRouteListTransport, RouteListRefreshReport, RouteListSnapshot, RouteListTransport,
@@ -95,9 +95,6 @@ pub struct RuntimeBuildOptions {
     pub fakeip_skip_check_upstream: bool,
     /// Fallback used when no persisted route rule matches.
     pub route_fallback: RouteDecision,
-    /// Whether configured resolver IDs should retry through the main resolver
-    /// after a transport-level failure or an empty answer.
-    pub resolver_query_fallback: bool,
     /// Whether one malformed/unavailable optional resolver prevents the whole
     /// snapshot from being published.
     pub resolver_failure_policy: ResolverFailurePolicy,
@@ -117,7 +114,6 @@ impl Default for RuntimeBuildOptions {
                 resolver_policy: ResolverPolicy::default(),
                 priority: 0,
             },
-            resolver_query_fallback: true,
             resolver_failure_policy: ResolverFailurePolicy::FailBuild,
         }
     }
@@ -524,12 +520,6 @@ impl RuntimeBuilder {
                             &fakeip_policy,
                             settings.ipv6,
                         );
-                        let wrapped = if self.options.resolver_query_fallback {
-                            Arc::new(FallbackResolver::new(wrapped, resolver.clone()))
-                                as Arc<dyn AsyncIpResolver>
-                        } else {
-                            wrapped
-                        };
                         resolver_by_id.insert(config.id.clone(), wrapped);
 
                         let inbound_wrapped = wrap_resolver(
@@ -540,14 +530,6 @@ impl RuntimeBuilder {
                             &fakeip_policy,
                             settings.ipv6,
                         );
-                        let inbound_wrapped = if self.options.resolver_query_fallback {
-                            Arc::new(FallbackResolver::new(
-                                inbound_wrapped,
-                                inbound_resolver.clone(),
-                            )) as Arc<dyn AsyncIpResolver>
-                        } else {
-                            inbound_wrapped
-                        };
                         inbound_resolver_by_id.insert(config.id.clone(), inbound_wrapped);
 
                         let dns_wrapped = wrap_resolver(
@@ -558,12 +540,6 @@ impl RuntimeBuilder {
                             &fakeip_policy,
                             settings.ipv6,
                         );
-                        let dns_wrapped = if self.options.resolver_query_fallback {
-                            Arc::new(FallbackResolver::new(dns_wrapped, dns_resolver.clone()))
-                                as Arc<dyn AsyncIpResolver>
-                        } else {
-                            dns_wrapped
-                        };
                         dns_resolver_by_id.insert(config.id.clone(), dns_wrapped);
                     }
                     Err(error) => match self.options.resolver_failure_policy {

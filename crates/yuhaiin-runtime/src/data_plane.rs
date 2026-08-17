@@ -129,21 +129,21 @@ impl crate::monitor::SocketDnsHandler for RuntimeDnsHandler {
 /// Build the one DNS handler used by all inbound owners. Keeping this at the
 /// snapshot boundary makes reloads choose the same resolver/FakeIP policy for
 /// socket DNS and TUN DNS instead of letting each protocol invent its own.
-pub(crate) fn inbound_dns_handler(snapshot: &RuntimeSnapshot) -> Option<Arc<RuntimeDnsHandler>> {
-    snapshot.inbound_settings.hijack_dns.then(|| {
-        Arc::new(RuntimeDnsHandler {
-            resolver: if snapshot.inbound_settings.hijack_dns_fakeip {
-                snapshot
-                    .inbound_resolver_for_route_mode(RouteMode::Proxy)
-                    .unwrap_or_else(|_| snapshot.inbound_resolver.clone())
-            } else {
-                snapshot
-                    .dns_resolver_for_route_mode(RouteMode::Proxy)
-                    .unwrap_or_else(|_| snapshot.dns_resolver.clone())
-            },
-            fakeip: snapshot.inbound_fakeip.clone(),
-        })
-    })
+pub(crate) fn inbound_dns_handler(
+    snapshot: &RuntimeSnapshot,
+) -> Result<Option<Arc<RuntimeDnsHandler>>> {
+    if !snapshot.inbound_settings.hijack_dns {
+        return Ok(None);
+    }
+    let resolver = if snapshot.inbound_settings.hijack_dns_fakeip {
+        snapshot.inbound_resolver_for_route_mode(RouteMode::Proxy)?
+    } else {
+        snapshot.dns_resolver_for_route_mode(RouteMode::Proxy)?
+    };
+    Ok(Some(Arc::new(RuntimeDnsHandler {
+        resolver,
+        fakeip: snapshot.inbound_fakeip.clone(),
+    })))
 }
 
 #[cfg(feature = "tun")]
@@ -1009,7 +1009,7 @@ mod tests {
         let packet = encode_query(0x5353, &domain, DnsRecordType::A).unwrap();
 
         snapshot.inbound_settings.hijack_dns_fakeip = true;
-        let handler = inbound_dns_handler(&snapshot).unwrap();
+        let handler = inbound_dns_handler(&snapshot).unwrap().unwrap();
         let response = handler.answer(&packet).await.unwrap();
         assert_eq!(
             decode_response(&response, 0x5353, DnsRecordType::A)
@@ -1020,7 +1020,7 @@ mod tests {
         );
 
         snapshot.inbound_settings.hijack_dns_fakeip = false;
-        let handler = inbound_dns_handler(&snapshot).unwrap();
+        let handler = inbound_dns_handler(&snapshot).unwrap().unwrap();
         let response = handler.answer(&packet).await.unwrap();
         assert_eq!(
             decode_response(&response, 0x5353, DnsRecordType::A)
@@ -1029,6 +1029,25 @@ mod tests {
                 .v4,
             vec![Ipv4Addr::new(192, 0, 2, 54)]
         );
+    }
+
+    #[tokio::test]
+    async fn inbound_dns_handler_reports_a_missing_route_resolver() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let mut snapshot = RuntimeBuilder::new(store, Arc::new(SystemAsyncIpResolver))
+            .build()
+            .await
+            .unwrap();
+        snapshot.inbound_settings.hijack_dns = true;
+        snapshot.resolver_registry_enabled = true;
+        snapshot.route.as_mut().unwrap().proxy_resolver = "missing".to_owned();
+
+        let error = match inbound_dns_handler(&snapshot) {
+            Ok(_) => panic!("missing route resolver unexpectedly produced a DNS handler"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, ErrorKind::NotFound);
+        assert!(error.message.contains("missing"));
     }
 
     #[tokio::test]
@@ -1055,7 +1074,7 @@ mod tests {
 
         let domain = DomainName::new("inbound-only-fakeip.example.test").unwrap();
         let packet = encode_query(0x5454, &domain, DnsRecordType::A).unwrap();
-        let handler = inbound_dns_handler(&snapshot).unwrap();
+        let handler = inbound_dns_handler(&snapshot).unwrap().unwrap();
         let response = handler.answer(&packet).await.unwrap();
         let address = decode_response(&response, 0x5454, DnsRecordType::A)
             .unwrap()

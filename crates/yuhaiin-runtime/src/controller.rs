@@ -59,12 +59,14 @@ impl RuntimeController {
             bridge.set_monitor(&monitor);
         }
         monitor.set_sniff_enabled(initial_snapshot.inbound_settings.sniff);
+        let initial_inbound_dns_handler = inbound_dns_handler(&initial_snapshot)?;
         monitor.set_dns_handler(
-            inbound_dns_handler(&initial_snapshot)
+            initial_inbound_dns_handler
+                .clone()
                 .map(|handler| handler as Arc<dyn SocketDnsHandler>),
         );
         let tun_dns_handler = Arc::new(ReloadableAsyncDnsHandler::new(
-            inbound_dns_handler(&initial_snapshot).map(|handler| (*handler).clone()),
+            initial_inbound_dns_handler.map(|handler| (*handler).clone()),
         ));
         let dns_handler = Arc::new(ReloadableAsyncDnsHandler::new(Some(RuntimeDnsHandler {
             resolver: initial_snapshot.resolver.clone(),
@@ -463,6 +465,7 @@ impl RuntimeController {
                 return Err(error);
             }
         };
+        let next_inbound_dns_handler = inbound_dns_handler(&next)?;
 
         let selectors = self.live_selectors();
         let mut prepared = Vec::with_capacity(selectors.len());
@@ -488,10 +491,12 @@ impl RuntimeController {
         }
         self.monitor.set_sniff_enabled(next.inbound_settings.sniff);
         self.monitor.set_dns_handler(
-            inbound_dns_handler(&next).map(|handler| handler as Arc<dyn SocketDnsHandler>),
+            next_inbound_dns_handler
+                .clone()
+                .map(|handler| handler as Arc<dyn SocketDnsHandler>),
         );
         self.tun_dns_handler
-            .replace(inbound_dns_handler(&next).map(|handler| (*handler).clone()));
+            .replace(next_inbound_dns_handler.map(|handler| (*handler).clone()));
         self.dns_handler.replace(Some(RuntimeDnsHandler {
             resolver: next.resolver.clone(),
             fakeip: next.fakeip.clone(),

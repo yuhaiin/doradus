@@ -826,7 +826,7 @@ mod tests {
             .build(DoqResolverConfig {
                 id: "doq-test".to_owned(),
                 host: "192.0.2.1:853".to_owned(),
-                server_name: None,
+                server_name: Some(String::new()),
                 local_bind_addresses: Vec::new(),
                 bind_interface: None,
             })
