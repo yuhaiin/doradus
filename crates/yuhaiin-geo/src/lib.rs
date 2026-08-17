@@ -29,11 +29,17 @@ pub struct GeoMetadata {
     pub updated_at: i64,
 }
 
-/// Read-only geographic database. The reader owns its bytes, so an old
-/// snapshot remains valid after the on-disk file is atomically replaced.
+/// Read-only geographic database. Unix readers map the installed file, while
+/// other platforms keep an owned copy so atomic replacement remains safe.
 #[derive(Clone)]
 pub struct GeoDb {
-    reader: Arc<maxminddb::Reader<Vec<u8>>>,
+    reader: Arc<GeoReader>,
+}
+
+enum GeoReader {
+    Owned(maxminddb::Reader<Vec<u8>>),
+    #[cfg(unix)]
+    Mapped(maxminddb::Reader<maxminddb::Mmap>),
 }
 
 impl GeoDb {
@@ -41,17 +47,47 @@ impl GeoDb {
         let reader = maxminddb::Reader::from_source(bytes)
             .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
         Ok(Self {
-            reader: Arc::new(reader),
+            reader: Arc::new(GeoReader::Owned(reader)),
         })
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let bytes = fs::read(path)
-            .map_err(|error| Error::new(ErrorKind::Io, format!("read MaxMindDB: {error}")))?;
-        Self::from_bytes(bytes)
+        #[cfg(unix)]
+        {
+            return Self::open_mmap(path);
+        }
+
+        #[cfg(not(unix))]
+        {
+            let bytes = fs::read(path)
+                .map_err(|error| Error::new(ErrorKind::Io, format!("read MaxMindDB: {error}")))?;
+            Self::from_bytes(bytes)
+        }
     }
 
-    pub fn country_code(&self, address: IpAddr) -> Result<Option<String>> {
+    #[cfg(unix)]
+    fn open_mmap(path: impl AsRef<Path>) -> Result<Self> {
+        let file = File::open(path)
+            .map_err(|error| Error::new(ErrorKind::Io, format!("open MaxMindDB: {error}")))?;
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
+            .map_err(|error| Error::new(ErrorKind::Io, format!("map MaxMindDB: {error}")))?;
+        let reader = maxminddb::Reader::from_source(mmap)
+            .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+        Ok(Self {
+            reader: Arc::new(GeoReader::Mapped(reader)),
+        })
+    }
+
+    fn validate_bytes(bytes: &[u8]) -> Result<()> {
+        maxminddb::Reader::from_source(bytes)
+            .map(|_| ())
+            .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))
+    }
+
+    fn country_code_from_reader<S: AsRef<[u8]>>(
+        reader: &maxminddb::Reader<S>,
+        address: IpAddr,
+    ) -> Result<Option<String>> {
         let address = match address {
             IpAddr::V6(address) => address
                 .to_ipv4()
@@ -59,8 +95,7 @@ impl GeoDb {
                 .unwrap_or(IpAddr::V6(address)),
             address => address,
         };
-        let result = self
-            .reader
+        let result = reader
             .lookup(address)
             .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
         if !result.has_data() {
@@ -73,6 +108,14 @@ impl GeoDb {
             return Ok(None);
         };
         Ok(record.country.iso_code.map(str::to_owned))
+    }
+
+    pub fn country_code(&self, address: IpAddr) -> Result<Option<String>> {
+        match self.reader.as_ref() {
+            GeoReader::Owned(reader) => Self::country_code_from_reader(reader, address),
+            #[cfg(unix)]
+            GeoReader::Mapped(reader) => Self::country_code_from_reader(reader, address),
+        }
     }
 }
 
@@ -177,7 +220,12 @@ impl GeoDatabaseManager {
         if metadata.sha256.is_empty() {
             metadata.sha256 = sha256(&bytes);
         }
-        let database = validate_database(&bytes, &metadata, self.max_bytes)?;
+        validate_metadata(&bytes, &metadata, self.max_bytes)?;
+        GeoDb::validate_bytes(&bytes)?;
+        #[cfg(unix)]
+        let database = GeoDb::open_mmap(&metadata.path)?;
+        #[cfg(not(unix))]
+        let database = GeoDb::from_bytes(bytes)?;
         Ok(self.publish(metadata, database))
     }
 
@@ -226,8 +274,13 @@ impl GeoDatabaseManager {
             size: bytes.len() as u64,
             updated_at: request.updated_at,
         };
-        let database = validate_database(&bytes, &metadata, self.max_bytes)?;
+        validate_metadata(&bytes, &metadata, self.max_bytes)?;
+        GeoDb::validate_bytes(&bytes)?;
         atomic_install(&metadata.path, &bytes)?;
+        #[cfg(unix)]
+        let database = GeoDb::open_mmap(&metadata.path)?;
+        #[cfg(not(unix))]
+        let database = GeoDb::from_bytes(bytes)?;
         Ok(self.publish(metadata, database))
     }
 
@@ -256,7 +309,7 @@ impl Default for GeoDatabaseManager {
     }
 }
 
-fn validate_database(bytes: &[u8], metadata: &GeoMetadata, max_bytes: usize) -> Result<GeoDb> {
+fn validate_metadata(bytes: &[u8], metadata: &GeoMetadata, max_bytes: usize) -> Result<()> {
     if bytes.len() > max_bytes {
         return Err(Error::invalid(format!(
             "GeoIP database exceeds {} bytes",
@@ -279,7 +332,7 @@ fn validate_database(bytes: &[u8], metadata: &GeoMetadata, max_bytes: usize) -> 
             "GeoIP file SHA-256 mismatch",
         ));
     }
-    GeoDb::from_bytes(bytes.to_vec())
+    Ok(())
 }
 
 fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
@@ -448,6 +501,22 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_an_installed_database_uses_mmap_on_unix() {
+        let path = cache_path("mmap.mmdb");
+        atomic_install(&path, FIXTURE).unwrap();
+        let db = GeoDb::open(&path).unwrap();
+        assert!(matches!(db.reader.as_ref(), GeoReader::Mapped(_)));
+        assert_eq!(
+            db.country_code("2.125.160.217".parse().unwrap())
+                .unwrap()
+                .as_deref(),
+            Some("GB")
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]

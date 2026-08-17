@@ -86,6 +86,7 @@ pub struct MonitorEvent {
 struct ConnectionEntry {
     id: String,
     value: Value,
+    telemetry: Arc<[(String, String)]>,
     upload: u64,
     download: u64,
 }
@@ -834,6 +835,9 @@ impl ConnectionMonitor {
         if let Some(entry) = state.connections.get_mut(&flow.key) {
             let update = connection_value(&entry.id, flow, &context);
             let changed = merge_connection_metadata(&mut entry.value, update);
+            if changed {
+                entry.telemetry = Arc::from(telemetry_dimensions(&entry.value));
+            }
             let value = entry.value.clone();
             drop(state);
             if changed {
@@ -849,6 +853,7 @@ impl ConnectionMonitor {
         state.next_id = state.next_id.saturating_add(1);
         let id = state.next_id.to_string();
         let value = connection_value(&id, flow, &context);
+        let telemetry = Arc::from(telemetry_dimensions(&value));
         state.ids.insert(id.clone(), flow.key);
         state.counters.entry(id.clone()).or_default();
         state.connections.insert(
@@ -856,6 +861,7 @@ impl ConnectionMonitor {
             ConnectionEntry {
                 id,
                 value: value.clone(),
+                telemetry,
                 upload: 0,
                 download: 0,
             },
@@ -893,35 +899,28 @@ impl ConnectionMonitor {
             self.mark_dirty();
             return;
         };
-        let object = state
-            .connections
-            .get(&flow)
-            .and_then(|entry| entry.value.as_object())
-            .cloned();
-        let Some(entry) = state.connections.get_mut(&flow) else {
-            drop(state);
-            self.mark_dirty();
-            return;
+        let telemetry = {
+            let Some(entry) = state.connections.get_mut(&flow) else {
+                drop(state);
+                self.mark_dirty();
+                return;
+            };
+            match direction {
+                TunFlowDirection::Upload => {
+                    entry.upload = entry.upload.saturating_add(bytes);
+                }
+                TunFlowDirection::Download => {
+                    entry.download = entry.download.saturating_add(bytes);
+                }
+            }
+            Arc::clone(&entry.telemetry)
         };
-        match direction {
-            TunFlowDirection::Upload => {
-                entry.upload = entry.upload.saturating_add(bytes);
-            }
-            TunFlowDirection::Download => {
-                entry.download = entry.download.saturating_add(bytes);
-            }
-        }
         let counter = state.counters.entry(id).or_default();
         match direction {
             TunFlowDirection::Upload => counter.1 = counter.1.saturating_add(bytes),
             TunFlowDirection::Download => counter.0 = counter.0.saturating_add(bytes),
         }
-        let Some(object) = object else {
-            drop(state);
-            self.mark_dirty();
-            return;
-        };
-        for (dimension, value) in telemetry_dimensions(&Value::Object(object)) {
+        for (dimension, value) in telemetry.iter() {
             let item = state
                 .telemetry
                 .entry((dimension.clone(), value.clone()))
@@ -936,8 +935,8 @@ impl ConnectionMonitor {
                     now.div_euclid(TELEMETRY_HOURLY_BUCKET_SECONDS)
                         * TELEMETRY_HOURLY_BUCKET_SECONDS,
                     TELEMETRY_HOURLY_BUCKET_SECONDS,
-                    dimension,
-                    value,
+                    dimension.clone(),
+                    value.clone(),
                 ))
                 .or_default();
             match direction {

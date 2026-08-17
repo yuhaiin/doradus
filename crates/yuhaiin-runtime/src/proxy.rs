@@ -1750,7 +1750,7 @@ pub struct RuntimeProxySelector {
     timeout: Duration,
     closed_nodes: RwLock<BTreeSet<String>>,
     retargeted_nodes: RwLock<BTreeSet<String>>,
-    metadata: RwLock<ProxyContextMetadata>,
+    metadata: RwLock<Arc<ProxyContextMetadata>>,
     settings: RwLock<crate::RuntimeSettings>,
     loopback: LoopbackDetector,
 }
@@ -1826,7 +1826,7 @@ impl RuntimeProxySelector {
             timeout,
             closed_nodes: RwLock::new(BTreeSet::new()),
             retargeted_nodes: RwLock::new(BTreeSet::new()),
-            metadata: RwLock::new(
+            metadata: RwLock::new(Arc::new(
                 snapshot
                     .proxy_context_metadata(
                         direct_id,
@@ -1836,7 +1836,7 @@ impl RuntimeProxySelector {
                         drop_id,
                     )
                     .await?,
-            ),
+            )),
             settings: RwLock::new(snapshot.settings.clone()),
             loopback,
         })
@@ -1880,9 +1880,17 @@ impl RuntimeProxySelector {
             ),
             tagged: track_tagged_proxies(tagged, &self.loopback),
             udp_tagged: track_tagged_proxies(udp_tagged, &self.loopback),
-            metadata: snapshot
-                .proxy_context_metadata(&direct_id, &proxy_id, &udp_proxy_id, &bypass_id, &drop_id)
-                .await?,
+            metadata: Arc::new(
+                snapshot
+                    .proxy_context_metadata(
+                        &direct_id,
+                        &proxy_id,
+                        &udp_proxy_id,
+                        &bypass_id,
+                        &drop_id,
+                    )
+                    .await?,
+            ),
             settings: snapshot.settings.clone(),
         })
     }
@@ -2033,7 +2041,7 @@ pub(crate) struct PreparedProxySelector {
     pub(crate) udp_selector: RuntimeRoutedProxySelector,
     tagged: BTreeMap<String, Arc<dyn AsyncProxy>>,
     udp_tagged: BTreeMap<String, Arc<dyn AsyncProxy>>,
-    metadata: ProxyContextMetadata,
+    metadata: Arc<ProxyContextMetadata>,
     settings: crate::RuntimeSettings,
 }
 
