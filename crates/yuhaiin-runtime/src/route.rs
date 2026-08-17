@@ -23,7 +23,7 @@ use yuhaiin_core::{
     ResolverPolicy, Result,
 };
 use yuhaiin_store::{GoRouteListRecord, GoRouteRuleRecord};
-use yuhaiin_trie::CombinedTrie;
+use yuhaiin_trie::HostTrie;
 use yuhaiin_trie::router::{RouteDecision, RouteRule, Router, RouterRuntime, RuleAction};
 
 /// Runtime contents of Go route lists. The persisted record keeps the
@@ -35,7 +35,7 @@ use yuhaiin_trie::router::{RouteDecision, RouteRule, Router, RouterRuntime, Rule
 pub struct RouteListSnapshot {
     values: BTreeMap<String, Vec<String>>,
     kinds: BTreeMap<String, String>,
-    host_indexes: BTreeMap<String, Arc<CombinedTrie<()>>>,
+    host_indexes: BTreeMap<String, Arc<HostTrie>>,
     errors: BTreeMap<String, String>,
 }
 
@@ -52,7 +52,7 @@ impl RouteListSnapshot {
         self.values.get(name).map(Vec::as_slice)
     }
 
-    pub fn host_index(&self, name: &str) -> Option<Arc<CombinedTrie<()>>> {
+    pub fn host_index(&self, name: &str) -> Option<Arc<HostTrie>> {
         self.host_indexes.get(name).cloned()
     }
 
@@ -143,10 +143,16 @@ pub fn load_route_lists(records: &[GoRouteListRecord]) -> RouteListSnapshot {
                     if normalized_kind == "process" || normalized_kind == "processes" {
                         snapshot.kinds.insert(record.name.clone(), normalized_kind);
                     } else {
-                        let mut index = CombinedTrie::new();
-                        for value in &values {
-                            let _ = index.insert(value, ());
-                        }
+                        let index = match HostTrie::from_patterns(values.iter()) {
+                            Ok(index) => index,
+                            Err(error) => {
+                                snapshot.errors.insert(
+                                    record.name.clone(),
+                                    format!("failed to build on-disk route list index: {error}"),
+                                );
+                                continue;
+                            }
+                        };
                         snapshot.kinds.insert(record.name.clone(), normalized_kind);
                         snapshot
                             .host_indexes
@@ -886,7 +892,7 @@ fn route_rule_from_root(record: &GoRouteRuleRecord, root: &Value) -> Result<Opti
         excluded_inbound_names: Vec::new(),
         process_names: process_names.unwrap_or_default(),
         excluded_process_names: Vec::new(),
-        excluded_patterns: CombinedTrie::new(),
+        excluded_patterns: HostTrie::new(),
         excluded_host_lists: Vec::new(),
         resolver_policy,
         priority,
@@ -911,7 +917,7 @@ struct RuleVariant {
     /// `None` means the expression has no host/CIDR constraint and is a
     /// global rule whose remaining network/port/geo predicates still apply.
     pattern: Option<String>,
-    host_lists: Vec<Arc<CombinedTrie<()>>>,
+    host_lists: Vec<Arc<HostTrie>>,
     /// Positive patterns beyond `pattern`, produced by nested `all`.
     additional_patterns: Vec<String>,
     network: Option<Network>,
@@ -925,7 +931,7 @@ struct RuleVariant {
     process_names: Option<Vec<String>>,
     excluded_process_names: Option<Vec<String>>,
     excluded_patterns: Vec<String>,
-    excluded_host_lists: Vec<Arc<CombinedTrie<()>>>,
+    excluded_host_lists: Vec<Arc<HostTrie>>,
     list_names: Vec<String>,
     always_false: bool,
 }
@@ -1302,31 +1308,25 @@ fn union_name_constraints(
     (!values.is_empty()).then_some(values)
 }
 
-fn compile_excluded_patterns(patterns: Vec<String>, id: &str) -> Result<CombinedTrie<()>> {
-    let mut index = CombinedTrie::new();
-    for pattern in patterns {
-        index.insert(pattern.as_str(), ()).map_err(|error| {
-            Error::new(
-                ErrorKind::InvalidInput,
-                format!("route rule {id} has invalid excluded pattern {pattern:?}: {error}"),
-            )
-        })?;
-    }
-    Ok(index)
+fn compile_excluded_patterns(patterns: Vec<String>, id: &str) -> Result<HostTrie> {
+    HostTrie::from_patterns(patterns.iter()).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("route rule {id} has invalid excluded pattern set: {error}"),
+        )
+    })
 }
 
-fn compile_required_patterns(patterns: Vec<String>, id: &str) -> Result<Vec<CombinedTrie<()>>> {
+fn compile_required_patterns(patterns: Vec<String>, id: &str) -> Result<Vec<HostTrie>> {
     patterns
         .into_iter()
         .map(|pattern| {
-            let mut index = CombinedTrie::new();
-            index.insert(&pattern, ()).map_err(|error| {
+            HostTrie::from_patterns([pattern.clone()]).map_err(|error| {
                 Error::new(
                     ErrorKind::InvalidInput,
                     format!("route rule {id} has invalid required pattern {pattern:?}: {error}"),
                 )
-            })?;
-            Ok(index)
+            })
         })
         .collect()
 }
@@ -1945,6 +1945,7 @@ mod tests {
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].list_names, vec!["domains"]);
         assert_eq!(expanded[0].host_lists.len(), 1);
+        assert!(lists.host_index("domains").unwrap().is_on_disk());
         let router = compile_go_route_rules_with_lists(
             &[record(
                 r#"{"mode":"proxy","rules":[{"type":"host","host":{"list":"domains"}}]}"#,

@@ -11,7 +11,7 @@ use yuhaiin_core::{
 #[cfg(feature = "async-proxy")]
 use yuhaiin_core::proxy::{AsyncProxy, AsyncProxySelector};
 
-use crate::CombinedTrie;
+use crate::{CombinedTrie, HostTrie};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleAction {
@@ -42,10 +42,10 @@ pub struct RouteRule {
     pub pattern: String,
     /// Positive Go host-list constraints. The list index is shared with the
     /// route-list snapshot instead of expanding one RouteRule per entry.
-    pub host_lists: Vec<Arc<CombinedTrie<()>>>,
+    pub host_lists: Vec<Arc<HostTrie>>,
     /// Additional positive domain/CIDR constraints from a Go `all` matcher.
     /// Every index must match the endpoint after the primary candidate lookup.
-    pub required_patterns: Vec<CombinedTrie<()>>,
+    pub required_patterns: Vec<HostTrie>,
     /// Preserve a rule whose Go list is not loaded yet, but keep it
     /// fail-closed until the list contents become available.
     pub always_false: bool,
@@ -73,9 +73,9 @@ pub struct RouteRule {
     /// Patterns compiled once at route publication time and excluded from
     /// this rule. This keeps negative domain/CIDR matching on the same trie
     /// implementation as positive routing.
-    pub excluded_patterns: CombinedTrie<()>,
+    pub excluded_patterns: HostTrie,
     /// Negative Go host-list constraints, also shared by Arc.
-    pub excluded_host_lists: Vec<Arc<CombinedTrie<()>>>,
+    pub excluded_host_lists: Vec<Arc<HostTrie>>,
     pub resolver_policy: ResolverPolicy,
     pub priority: i32,
 }
@@ -691,7 +691,7 @@ mod tests {
             excluded_inbound_names: Vec::new(),
             process_names: Vec::new(),
             excluded_process_names: Vec::new(),
-            excluded_patterns: CombinedTrie::new(),
+            excluded_patterns: HostTrie::new(),
             excluded_host_lists: Vec::new(),
             resolver_policy: ResolverPolicy {
                 strategy: ResolveStrategy::Default,

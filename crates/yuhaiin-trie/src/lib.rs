@@ -5,7 +5,10 @@ use std::net::IpAddr;
 
 use yuhaiin_core::{DomainName, Endpoint, Error, Result};
 
+pub mod ondisk;
 pub mod router;
+
+pub use ondisk::HostTrie;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DomainNode<T> {

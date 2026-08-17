@@ -462,7 +462,7 @@ fn route_rule(pattern: &str) -> RouteRule {
         excluded_inbound_names: Vec::new(),
         process_names: Vec::new(),
         excluded_process_names: Vec::new(),
-        excluded_patterns: yuhaiin_trie::CombinedTrie::new(),
+        excluded_patterns: yuhaiin_trie::HostTrie::new(),
         excluded_host_lists: Vec::new(),
         resolver_policy: ResolverPolicy::default(),
         priority: 10,
