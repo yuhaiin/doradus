@@ -29,6 +29,26 @@ struct AsyncUdpDnsClientState {
     shutdown: Arc<Notify>,
 }
 
+struct ReceiverCleanup {
+    state: Weak<AsyncUdpDnsClientState>,
+    socket: Arc<UdpSocket>,
+}
+
+impl Drop for ReceiverCleanup {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        if let Ok(mut stored) = state.socket.lock()
+            && stored
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.socket))
+        {
+            *stored = None;
+        }
+    }
+}
+
 impl Default for AsyncUdpDnsClientState {
     fn default() -> Self {
         Self {
@@ -114,9 +134,14 @@ impl AsyncUdpDnsClient {
         let state: Weak<AsyncUdpDnsClientState> = Arc::downgrade(&self.state);
         let shutdown = self.state.shutdown.clone();
         let server = self.server;
+        let response_buffer_size = self.max_packet_size.max(512);
         let receiver_socket = socket.clone();
         tokio::spawn(async move {
-            let mut response = vec![0; 65535];
+            let _cleanup = ReceiverCleanup {
+                state: state.clone(),
+                socket: receiver_socket.clone(),
+            };
+            let mut response = vec![0; response_buffer_size];
             loop {
                 let result = tokio::select! {
                     _ = shutdown.notified() => return,

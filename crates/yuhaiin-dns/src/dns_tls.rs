@@ -464,9 +464,7 @@ async fn direct_stream(
     bind_interface: Option<&str>,
     timeout: Duration,
 ) -> Result<DnsIoStream> {
-    let addresses = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|error| Error::new(ErrorKind::Io, format!("resolve DNS TLS endpoint: {error}")))?;
+    let addresses = crate::dns_resolver_async::resolve_internet_addresses(host, port).await?;
     let mut last_error = None;
     for address in addresses {
         let local_bind = local_bind_addresses

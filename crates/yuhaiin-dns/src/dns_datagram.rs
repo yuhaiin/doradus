@@ -2,7 +2,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use crate::dns::{DnsRecordType, decode_response, encode_query};
-use crate::{BoxFuture, DomainName, Error, ErrorKind, Result};
+use crate::dns_resolver_async::AsyncIpResolver;
+use crate::{BoxFuture, DomainName, Error, ErrorKind, ResolveStrategy, Result};
 
 pub trait AsyncDnsDatagram: Send + Sync {
     fn send_to<'a>(&'a self, payload: &'a [u8], target: SocketAddr)
@@ -51,15 +52,79 @@ pub async fn probe_dns_udp(
 }
 
 pub(crate) async fn resolve_server(host: &str, port: u16) -> Result<SocketAddr> {
+    resolve_server_with_resolver(host, port, None).await
+}
+
+pub(crate) async fn resolve_server_with_resolver(
+    host: &str,
+    port: u16,
+    resolver: Option<&dyn AsyncIpResolver>,
+) -> Result<SocketAddr> {
     if let Ok(address) = host.parse::<SocketAddr>() {
         return Ok(address);
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
-    tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|error| Error::new(ErrorKind::Io, format!("resolve DNS endpoint: {error}")))?
-        .next()
-        .ok_or_else(|| Error::new(ErrorKind::Io, "DNS endpoint resolved to no address"))
+
+    if let Some(resolver) = resolver {
+        let domain = DomainName::new(host)?;
+        let addresses = resolver
+            .resolve(&domain, ResolveStrategy::PreferIpv4)
+            .await?;
+        if let Some(address) = addresses
+            .v4
+            .first()
+            .copied()
+            .map(|ip| SocketAddr::new(IpAddr::V4(ip), port))
+        {
+            return Ok(address);
+        }
+        if let Some(address) = addresses
+            .v6
+            .first()
+            .copied()
+            .map(|ip| SocketAddr::new(IpAddr::V6(ip), port))
+        {
+            return Ok(address);
+        }
+        return Err(Error::new(
+            ErrorKind::NotFound,
+            format!("DNS endpoint {host} resolved to no address"),
+        ));
+    }
+
+    crate::dns_resolver_async::resolve_internet_server(host, port).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    struct StaticResolver;
+
+    impl AsyncIpResolver for StaticResolver {
+        fn resolve<'a>(
+            &'a self,
+            _domain: &'a DomainName,
+            _strategy: ResolveStrategy,
+        ) -> BoxFuture<'a, Result<crate::IpSet>> {
+            Box::pin(async {
+                Ok(crate::IpSet {
+                    v4: vec![Ipv4Addr::new(192, 0, 2, 53)],
+                    v6: vec![Ipv6Addr::LOCALHOST],
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_resolution_uses_supplied_resolver_and_prefers_ipv4() {
+        let address = resolve_server_with_resolver("dns.example", 853, Some(&StaticResolver))
+            .await
+            .unwrap();
+
+        assert_eq!(address, "192.0.2.53:853".parse().unwrap());
+    }
 }

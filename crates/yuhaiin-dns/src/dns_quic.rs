@@ -18,7 +18,7 @@ use crate::dns::{
     DnsRecordType, DnsResponse, decode_response, encode_query, validate_query_packet,
     validate_response_packet,
 };
-use crate::dns_datagram::{AsyncDnsDatagram, DnsDatagramConnector, resolve_server};
+use crate::dns_datagram::{AsyncDnsDatagram, DnsDatagramConnector, resolve_server_with_resolver};
 use crate::dns_resolver_async::{
     AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, SendAsyncDnsQuery,
 };
@@ -28,8 +28,16 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 
-const DOQ_ALPN: &[u8] = b"doq";
-const DOQ_DEFAULT_PORT: u16 = 853;
+const DOQ_ALPN_PROTOCOLS: &[&[u8]] = &[
+    b"http/1.1",
+    b"doq-i02",
+    b"doq-i01",
+    b"doq-i00",
+    b"doq",
+    b"dq",
+    b"h2",
+];
+const DOQ_DEFAULT_PORT: u16 = 784;
 const MAX_DNS_FRAME: usize = u16::MAX as usize;
 const MAX_QUIC_DATAGRAM: usize = 65_535;
 
@@ -49,6 +57,7 @@ pub struct DoqResolverFactory {
     max_packet_size: usize,
     cache_capacity: usize,
     datagram_connector: Option<Arc<dyn DnsDatagramConnector>>,
+    server_resolver: Option<Arc<dyn AsyncIpResolver>>,
 }
 
 impl DoqResolverFactory {
@@ -75,6 +84,7 @@ impl DoqResolverFactory {
             max_packet_size: 4096,
             cache_capacity,
             datagram_connector: None,
+            server_resolver: None,
         }
     }
 
@@ -90,6 +100,11 @@ impl DoqResolverFactory {
 
     pub fn with_datagram_connector(mut self, connector: Arc<dyn DnsDatagramConnector>) -> Self {
         self.datagram_connector = Some(connector);
+        self
+    }
+
+    pub fn with_server_resolver(mut self, resolver: Arc<dyn AsyncIpResolver>) -> Self {
+        self.server_resolver = Some(resolver);
         self
     }
 
@@ -120,6 +135,7 @@ impl DoqResolverFactory {
             &config.local_bind_addresses,
             config.bind_interface.as_deref(),
             self.datagram_connector.clone(),
+            self.server_resolver.clone(),
         );
         let resolver = AsyncDnsResolver::new(client)
             .with_cache(crate::dns::DnsCache::new(self.cache_capacity.max(1))?);
@@ -173,6 +189,7 @@ struct DoqClient {
     local_bind_addresses: Arc<[IpAddr]>,
     bind_interface: Option<String>,
     datagram_connector: Option<Arc<dyn DnsDatagramConnector>>,
+    server_resolver: Option<Arc<dyn AsyncIpResolver>>,
     endpoint: Arc<AsyncMutex<Option<Arc<DoqEndpoint>>>>,
     connection: Arc<AsyncMutex<Option<quinn::Connection>>>,
 }
@@ -190,6 +207,7 @@ impl DoqClient {
         local_bind_addresses: &[IpAddr],
         bind_interface: Option<&str>,
         datagram_connector: Option<Arc<dyn DnsDatagramConnector>>,
+        server_resolver: Option<Arc<dyn AsyncIpResolver>>,
     ) -> Self {
         Self {
             client_config,
@@ -202,6 +220,7 @@ impl DoqClient {
             local_bind_addresses: Arc::from(local_bind_addresses.to_vec().into_boxed_slice()),
             bind_interface: bind_interface.map(str::to_owned),
             datagram_connector,
+            server_resolver,
             endpoint: Arc::new(AsyncMutex::new(None)),
             connection: Arc::new(AsyncMutex::new(None)),
         }
@@ -213,7 +232,9 @@ impl DoqClient {
             return Ok(endpoint.clone());
         }
 
-        let server = resolve_server(&self.host, self.port).await?;
+        let server =
+            resolve_server_with_resolver(&self.host, self.port, self.server_resolver.as_deref())
+                .await?;
         let datagram = match &self.datagram_connector {
             Some(connector) => match connector
                 .open(
@@ -261,7 +282,10 @@ impl DoqClient {
 
     fn quinn_client_config(&self) -> Result<quinn::ClientConfig> {
         let mut tls = (*self.client_config).clone();
-        tls.alpn_protocols = vec![DOQ_ALPN.to_vec()];
+        tls.alpn_protocols = DOQ_ALPN_PROTOCOLS
+            .iter()
+            .map(|protocol| protocol.to_vec())
+            .collect();
         // rustls-rustcrypto currently exposes no QUIC packet suite. The
         // default constructor therefore supplies a ring-backed config; callers
         // using from_client_config must provide a QUIC-capable provider too.
@@ -761,10 +785,10 @@ mod tests {
     }
 
     #[test]
-    fn doq_endpoint_defaults_to_rfc_port() {
+    fn doq_endpoint_defaults_to_go_default_port() {
         assert_eq!(
             split_doq_endpoint("dns.example", "test").unwrap(),
-            ("dns.example".into(), 853)
+            ("dns.example".into(), 784)
         );
         assert_eq!(
             split_doq_endpoint("dns.example:8853", "test").unwrap().1,
@@ -772,7 +796,7 @@ mod tests {
         );
         assert_eq!(
             split_doq_endpoint("[2001:db8::1]", "test").unwrap(),
-            ("2001:db8::1".into(), 853)
+            ("2001:db8::1".into(), 784)
         );
     }
 
@@ -787,6 +811,7 @@ mod tests {
             Duration::from_secs(1),
             4096,
             &[],
+            None,
             None,
             None,
         );

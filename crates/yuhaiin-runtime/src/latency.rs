@@ -150,7 +150,7 @@ pub async fn probe_with_resolver(
         "stun" | "stun_tcp" => probe_stun(proxy, request, timeout).await,
         "dns" | "udp" => probe_dns(proxy, request, timeout).await,
         #[cfg(feature = "doh-tls")]
-        "doq" => probe_doq_latency(proxy, request, timeout).await,
+        "doq" => probe_doq_latency(proxy, resolver, request, timeout).await,
         #[cfg(not(feature = "doh-tls"))]
         "doq" => Err(Error::new(
             ErrorKind::Unsupported,
@@ -187,6 +187,13 @@ impl LatencyRequest {
             return self.host.trim().to_owned();
         }
         "223.5.5.5:53".to_owned()
+    }
+
+    fn doq_host_or_default(&self) -> String {
+        if !self.host.trim().is_empty() {
+            return self.host.trim().to_owned();
+        }
+        "dns.nextdns.io:853".to_owned()
     }
 
     fn dns_target_or_default(&self) -> String {
@@ -686,18 +693,20 @@ async fn probe_dns(
 #[cfg(feature = "doh-tls")]
 async fn probe_doq_latency(
     proxy: Arc<dyn AsyncProxy>,
+    resolver: Arc<dyn AsyncIpResolver>,
     request: LatencyRequest,
     timeout: Duration,
 ) -> Result<LatencyResponse> {
-    let (host, _) = parse_host_port(&request.dns_host_or_default(), 853)?;
+    let (host, _) = parse_host_port(&request.doq_host_or_default(), 853)?;
     let domain = DomainName::new(&request.dns_target_or_default())?;
     let factory = DoqResolverFactory::from_webpki_roots(timeout, 1)?
+        .with_server_resolver(resolver)
         .with_datagram_connector(Arc::new(LatencyDatagramConnector { proxy }));
     let elapsed = probe_doq(
         &factory,
         DoqResolverConfig {
             id: "latency-doq".to_owned(),
-            host: request.dns_host_or_default(),
+            host: request.doq_host_or_default(),
             server_name: Some(host),
             local_bind_addresses: Vec::new(),
             bind_interface: None,
@@ -724,27 +733,30 @@ impl DnsDatagramConnector for LatencyDatagramConnector {
     ) -> yuhaiin_core::BoxFuture<'a, Result<Option<Box<dyn AsyncDnsDatagram>>>> {
         Box::pin(async move {
             let destination = endpoint(Network::Udp, host, target.port())?;
-            let context = FlowContext::new(destination);
+            let context = FlowContext::new(destination.clone());
             let datagram = self.proxy.open_datagram(&context).await?;
-            Ok(Some(
-                Box::new(LatencyDatagram { inner: datagram }) as Box<dyn AsyncDnsDatagram>
-            ))
+            Ok(Some(Box::new(LatencyDatagram {
+                inner: datagram,
+                destination,
+                server: target,
+            }) as Box<dyn AsyncDnsDatagram>))
         })
     }
 }
 
 struct LatencyDatagram {
     inner: Box<dyn AsyncDatagram>,
+    destination: Endpoint,
+    server: SocketAddr,
 }
 
 impl AsyncDnsDatagram for LatencyDatagram {
     fn send_to<'a>(
         &'a self,
         payload: &'a [u8],
-        target: SocketAddr,
+        _target: SocketAddr,
     ) -> yuhaiin_core::BoxFuture<'a, Result<usize>> {
-        self.inner
-            .send_to(payload, Endpoint::ip(Network::Udp, target))
+        self.inner.send_to(payload, self.destination.clone())
     }
 
     fn recv_from<'a>(
@@ -753,12 +765,7 @@ impl AsyncDnsDatagram for LatencyDatagram {
     ) -> yuhaiin_core::BoxFuture<'a, Result<(usize, SocketAddr)>> {
         Box::pin(async move {
             let (length, endpoint) = self.inner.recv_from(buffer).await?;
-            Ok((
-                length,
-                endpoint
-                    .addr()
-                    .ok_or_else(|| Error::invalid("latency DNS datagram has no address"))?,
-            ))
+            Ok((length, endpoint.addr().unwrap_or(self.server)))
         })
     }
 
