@@ -382,6 +382,7 @@ impl TunDispatcher {
             tcp::SocketBuffer::new(vec![0; self.rx_buffer_size]),
             tcp::SocketBuffer::new(vec![0; self.tx_buffer_size]),
         );
+        socket.set_congestion_control(tcp::CongestionControl::Cubic);
         socket
             .listen(IpListenEndpoint {
                 // A TUN gateway must accept destinations that are not local
