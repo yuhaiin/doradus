@@ -390,11 +390,13 @@ pub(crate) fn ipv6_fragment_layout(
     Err(Error::invalid("IPv6 extension header chain is too long"))
 }
 
-pub(crate) fn fragment_ip_packet(
-    packet: &[u8],
-    mtu: usize,
-    identification: u32,
-) -> Result<Vec<Vec<u8>>> {
+/// Fragment one complete IPv4 or IPv6 datagram for a wire MTU.
+///
+/// The returned packets are individually bounded by `mtu`. IPv4 and IPv6
+/// use the same boundary API so callers such as the native TUN runtime and a
+/// WireGuard virtual interface cannot accidentally implement different MTU
+/// behavior.
+pub fn fragment_ip_packet(packet: &[u8], mtu: usize, identification: u32) -> Result<Vec<Vec<u8>>> {
     if !(576..=9216).contains(&mtu) {
         return Err(Error::invalid("TUN MTU must be between 576 and 9216"));
     }
@@ -710,12 +712,13 @@ pub(crate) fn ipv6_unfragmentable_prefixes_match(left: &[u8], right: &[u8]) -> b
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct Ipv6FragmentReassembler {
+pub struct Ipv6FragmentReassembler {
     pub(crate) assemblies: HashMap<Ipv6FragmentKey, Ipv6FragmentAssembly>,
 }
 
 impl Ipv6FragmentReassembler {
-    pub(crate) fn expire(&mut self, now: StdInstant) {
+    /// Remove assemblies that have exceeded the bounded reassembly timeout.
+    pub fn expire(&mut self, now: StdInstant) {
         self.assemblies
             .retain(|_, assembly| assembly.expires_at > now);
     }
@@ -723,7 +726,12 @@ impl Ipv6FragmentReassembler {
     /// Return the packet to enqueue, or `None` for an incomplete/invalid
     /// assembly. Invalid and resource-exhausted fragments are intentionally
     /// dropped without poisoning the TUN runtime.
-    pub(crate) fn push(&mut self, packet: &[u8], now: StdInstant) -> Result<Option<Vec<u8>>> {
+    /// Add one IP packet to the reassembler.
+    ///
+    /// Non-fragmented packets are returned unchanged. A fragmented packet
+    /// returns `None` until all pieces arrive; malformed, overlapping, or
+    /// resource-exhausted assemblies are dropped and also return `None`.
+    pub fn push(&mut self, packet: &[u8], now: StdInstant) -> Result<Option<Vec<u8>>> {
         self.expire(now);
         let Some(metadata) = parse_ipv6_fragment_metadata(packet)? else {
             return Ok(Some(packet.to_vec()));
@@ -945,7 +953,7 @@ impl SmoltcpTunDevice {
     /// MTU.  Keep this path separate from [`Self::enqueue_rx`] so a caller
     /// cannot accidentally bypass the wire-packet validation for ordinary
     /// TUN input.
-    pub(crate) fn enqueue_rx_reassembled(&self, packet: Vec<u8>) -> Result<bool> {
+    pub fn enqueue_rx_reassembled(&self, packet: Vec<u8>) -> Result<bool> {
         inspect_ip_packet(&packet)?;
         if packet.len() > MAX_SMOLTCP_PACKET_SIZE {
             return Err(Error::invalid("reassembled TUN packet is too large"));

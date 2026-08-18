@@ -583,7 +583,9 @@ pub(crate) fn ip_packet_has_multicast_destination(packet: &[u8]) -> Result<bool>
 /// IP gateway, though, so normalize the bounded extension chain before the
 /// packet reaches smoltcp. The UDP checksum is independent of extension
 /// headers, and the original source/destination addresses remain unchanged.
-pub(crate) fn normalize_ipv6_extension_headers(packet: &[u8]) -> Result<Cow<'_, [u8]>> {
+/// Normalize the bounded IPv6 extension-header chain into the form consumed
+/// by smoltcp's IP-medium parser.
+pub fn normalize_ipv6_extension_headers(packet: &[u8]) -> Result<Cow<'_, [u8]>> {
     if IpVersion::of_packet(packet).ok() != Some(IpVersion::Ipv6) {
         return Ok(Cow::Borrowed(packet));
     }
