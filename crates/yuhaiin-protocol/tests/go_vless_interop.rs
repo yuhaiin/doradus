@@ -12,7 +12,7 @@ use yuhaiin_core::proxy::{AsyncProxy, FixedAsyncProxy};
 use yuhaiin_core::{DomainName, Endpoint, FlowContext, Network};
 use yuhaiin_protocol::vless::{self, VlessProxy};
 
-#[cfg(all(feature = "tls-rustcrypto", feature = "websocket"))]
+#[cfg(all(feature = "tls-ring", feature = "websocket"))]
 mod support;
 
 #[tokio::test]
@@ -91,7 +91,7 @@ async fn go_vless_client_round_trips_against_rust_wire_server() {
     server.await.unwrap();
 }
 
-#[cfg(all(feature = "tls-rustcrypto", feature = "websocket"))]
+#[cfg(all(feature = "tls-ring", feature = "websocket"))]
 #[tokio::test]
 #[ignore = "requires the sibling Go checkout and Go toolchain"]
 async fn go_vless_client_over_tls_websocket_round_trips_against_rust_wire_server() {

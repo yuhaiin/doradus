@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use yuhaiin_core::{DomainName, Endpoint, Network};
 use yuhaiin_protocol::trojan::{self, Command as TrojanCommand};
 
-#[cfg(all(feature = "tls-rustcrypto", feature = "websocket"))]
+#[cfg(all(feature = "tls-ring", feature = "websocket"))]
 mod support;
 
 #[tokio::test]
@@ -28,7 +28,7 @@ async fn go_trojan_client_connects_to_rust_wire_server() {
     server.await.unwrap();
 }
 
-#[cfg(all(feature = "tls-rustcrypto", feature = "websocket"))]
+#[cfg(all(feature = "tls-ring", feature = "websocket"))]
 #[tokio::test]
 #[ignore = "requires the sibling Go checkout and Go toolchain"]
 async fn go_trojan_client_over_tls_websocket_connects_to_rust_wire_server() {

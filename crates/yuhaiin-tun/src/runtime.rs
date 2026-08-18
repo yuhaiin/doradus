@@ -83,7 +83,7 @@ impl TunRuntime {
         config
             .validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let device = yuhaiin_platform::async_device_from_owned_fd(fd)?;
+        let device = async_device_from_owned_fd(fd)?;
         Self::from_async_device(config, device)
     }
 

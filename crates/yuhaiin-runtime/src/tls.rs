@@ -1,4 +1,4 @@
-//! Runtime-owned RustCrypto TLS helpers for already-routed streams and direct
+//! Runtime-owned ring-backed TLS helpers for already-routed streams and direct
 //! management connections. DNS protocol framing and encrypted DNS clients
 //! live in `yuhaiin-dns`.
 
@@ -98,7 +98,7 @@ impl RustCryptoTlsDialer {
         self.connect_stream(server_name, stream).await
     }
 
-    /// Complete a RustCrypto TLS handshake over an already established stream.
+    /// Complete a ring-backed TLS handshake over an already established stream.
     /// This is shared by proxy-aware management downloads and direct DoH/DoT
     /// dialing, so TLS never needs to know how the underlying connection was
     /// routed.
@@ -152,7 +152,7 @@ pub(crate) fn tls_server_name(name: &str) -> Result<ServerName<'static>> {
 }
 
 pub(crate) fn client_config(root_store: RootCertStore) -> Result<Arc<ClientConfig>> {
-    let provider = Arc::new(rustls_rustcrypto::provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(tls_error)?

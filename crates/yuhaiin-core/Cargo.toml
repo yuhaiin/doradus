@@ -8,7 +8,9 @@ license.workspace = true
 default = []
 http2 = ["yuhaiin-dns/http2"]
 async-proxy = ["dep:futures-util", "dep:tokio", "yuhaiin-dns/async-proxy"]
-tls-rustcrypto = []
+tls-ring = []
+# Compatibility alias for callers using the former provider feature name.
+tls-rustcrypto = ["tls-ring"]
 
 [dependencies]
 futures-util = { version = "0.3.33", optional = true, default-features = false, features = ["std"] }

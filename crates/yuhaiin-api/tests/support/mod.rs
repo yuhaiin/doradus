@@ -135,7 +135,7 @@ async fn connect_tls_loopback_with_server_name(
     server_name: ServerName<'static>,
     alpn_protocols: &[&[u8]],
 ) -> TlsStream<TcpStream> {
-    let provider = Arc::new(rustls_rustcrypto::provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .unwrap()
@@ -496,7 +496,7 @@ fn build_tls_server_config(alpn_protocols: Vec<Vec<u8>>) -> Arc<ServerConfig> {
     let key = rustls_pemfile::private_key(&mut Cursor::new(PRIVATE_KEY_PEM))
         .unwrap()
         .unwrap();
-    let provider = Arc::new(rustls_rustcrypto::provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .unwrap()
@@ -1163,7 +1163,7 @@ impl ServiceProcess {
                 }
             });
         }
-        let _ = rustls_rustcrypto::provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         let base_url = format!("http://{api_address}");
         let mut service = Self {

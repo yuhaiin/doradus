@@ -603,7 +603,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
         let key = rustls_pemfile::private_key(&mut Cursor::new(PRIVATE_KEY_PEM))
             .unwrap()
             .unwrap();
-        let provider = Arc::new(rustls_rustcrypto::provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let config = ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .unwrap()
@@ -621,7 +621,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             .unwrap()
             .unwrap();
         roots.add(certificate).unwrap();
-        let provider = Arc::new(rustls_rustcrypto::provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let config = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .unwrap()

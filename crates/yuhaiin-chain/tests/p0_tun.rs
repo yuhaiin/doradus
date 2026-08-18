@@ -322,7 +322,7 @@ async fn spawn_ping_fixture() -> (SocketAddr, Vec<u8>, tokio::task::JoinHandle<(
     let key = rustls_pemfile::private_key(&mut Cursor::new(PRIVATE_KEY_PEM))
         .unwrap()
         .unwrap();
-    let provider = Arc::new(rustls_rustcrypto::provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .unwrap()
@@ -358,7 +358,7 @@ async fn spawn_chain_fixture(
     let key = rustls_pemfile::private_key(&mut Cursor::new(PRIVATE_KEY_PEM))
         .unwrap()
         .unwrap();
-    let provider = Arc::new(rustls_rustcrypto::provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .unwrap()
@@ -748,7 +748,7 @@ fn yuubinsya_server_config() -> Arc<ServerConfig> {
     let key = rustls_pemfile::private_key(&mut Cursor::new(PRIVATE_KEY_PEM))
         .unwrap()
         .unwrap();
-    let provider = Arc::new(rustls_rustcrypto::provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .unwrap()

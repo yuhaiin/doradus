@@ -115,7 +115,7 @@ async fn run_go_websocket_http2_client(tls: bool) {
 }
 
 fn websocket_server_config() -> Arc<rustls::ServerConfig> {
-    let provider = Arc::new(rustls_rustcrypto::provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .unwrap()

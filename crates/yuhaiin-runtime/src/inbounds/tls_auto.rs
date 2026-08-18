@@ -2,7 +2,7 @@
 //!
 //! Go's `tls_auto` transport keeps a CA key and creates a leaf certificate for
 //! the SNI in each ClientHello.  This module keeps the same boundary while
-//! using RustCrypto's X.509 builder and rustls' synchronous certificate
+//! using the Rust X.509 builder and rustls' synchronous certificate
 //! resolver.  Generated certificates are cached per normalized SNI so a busy
 //! listener does not repeatedly perform public-key work.
 
@@ -72,7 +72,7 @@ pub(crate) fn build(data_json: &[u8], transports: &[String]) -> Result<Option<Tl
     let authority = Arc::new(TlsAutoAuthority::parse(&ca_cert, &ca_key)?);
     let resolver = Arc::new(TlsAutoResolver::new(authority, server_names)?);
 
-    let provider = Arc::new(rustls_rustcrypto::provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut server = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(|error| {
@@ -505,7 +505,7 @@ fn certified_key(certificate: Vec<u8>, private_key: &[u8]) -> Result<CertifiedKe
     let certificate = CertificateDer::from(certificate);
     let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key.to_vec()));
     let signing_key =
-        rustls_rustcrypto::sign::any_supported_type(&private_key).map_err(|error| {
+        rustls::crypto::ring::sign::any_supported_type(&private_key).map_err(|error| {
             Error::new(
                 ErrorKind::Protocol,
                 format!("TLS-auto rustls leaf key: {error:?}"),
@@ -1074,7 +1074,7 @@ mod tests {
             let mut roots = rustls::RootCertStore::empty();
             roots.add(CertificateDer::from(ca_cert)).unwrap();
             let client = rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls_rustcrypto::provider(),
+                rustls::crypto::ring::default_provider(),
             ))
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .unwrap()
@@ -1121,7 +1121,7 @@ mod tests {
             let mut roots = rustls::RootCertStore::empty();
             roots.add(CertificateDer::from(ca_cert)).unwrap();
             let client = rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls_rustcrypto::provider(),
+                rustls::crypto::ring::default_provider(),
             ))
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .unwrap()

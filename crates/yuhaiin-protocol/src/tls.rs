@@ -1,4 +1,4 @@
-//! Async RustCrypto TLS transport wrapper for protocol layers.
+//! Async ring-backed TLS transport wrapper for protocol layers.
 
 use std::sync::Arc;
 
@@ -40,7 +40,7 @@ impl RustCryptoTlsProxy {
         next_protocols: &[String],
         insecure_skip_verify: bool,
     ) -> Result<Self> {
-        let provider = Arc::new(rustls_rustcrypto::provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = if insecure_skip_verify {
             ClientConfig::builder_with_provider(Arc::clone(&provider))
                 .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])

@@ -286,9 +286,9 @@ impl DoqClient {
             .iter()
             .map(|protocol| protocol.to_vec())
             .collect();
-        // rustls-rustcrypto currently exposes no QUIC packet suite. The
-        // default constructor therefore supplies a ring-backed config; callers
-        // using from_client_config must provide a QUIC-capable provider too.
+        // QUIC requires a provider with packet-protection support. The
+        // default constructor supplies a ring-backed config; callers using
+        // from_client_config must provide a QUIC-capable provider too.
         let crypto =
             quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls)).map_err(|error| {
                 Error::new(ErrorKind::Protocol, format!("configure DoQ TLS: {error}"))

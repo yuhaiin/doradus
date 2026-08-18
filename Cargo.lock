@@ -2168,18 +2168,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p384"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe42f1670a52a47d448f14b6a5c61dd78fce51856e68edaa38f7ae3a46b8d6b6"
-dependencies = [
- "ecdsa",
- "elliptic-curve",
- "primeorder",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2268,23 +2256,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "pkcs5"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e847e2c91a18bfa887dd028ec33f2fe6f25db77db3619024764914affe8b69a6"
-dependencies = [
- "der",
- "spki",
-]
-
-[[package]]
 name = "pkcs8"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
 dependencies = [
  "der",
- "pkcs5",
  "spki",
 ]
 
@@ -2936,7 +2913,7 @@ dependencies = [
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.14",
+ "rustls-webpki",
  "subtle",
  "zeroize",
 ]
@@ -2958,47 +2935,6 @@ checksum = "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
 dependencies = [
  "web-time",
  "zeroize",
-]
-
-[[package]]
-name = "rustls-rustcrypto"
-version = "0.0.2-alpha"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f12052947763ab8515f753315357599e9b0b4dab3b8ba15f30f725fe6d025557"
-dependencies = [
- "aead",
- "aes-gcm",
- "chacha20poly1305",
- "crypto-common 0.1.7",
- "der",
- "digest 0.10.7",
- "ecdsa",
- "ed25519-dalek",
- "hmac",
- "p256",
- "p384",
- "paste",
- "pkcs8",
- "rand_core 0.6.4",
- "rsa",
- "rustls",
- "rustls-pki-types",
- "rustls-webpki 0.102.8",
- "sec1",
- "sha2 0.10.9",
- "signature",
- "x25519-dalek",
-]
-
-[[package]]
-name = "rustls-webpki"
-version = "0.102.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
-dependencies = [
- "ring",
- "rustls-pki-types",
- "untrusted",
 ]
 
 [[package]]
@@ -4285,7 +4221,6 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pemfile",
- "rustls-rustcrypto",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4306,7 +4241,6 @@ dependencies = [
  "yuhaiin-core",
  "yuhaiin-dns",
  "yuhaiin-geo",
- "yuhaiin-platform",
  "yuhaiin-protocol",
  "yuhaiin-runtime",
  "yuhaiin-store",
@@ -4319,7 +4253,7 @@ version = "0.1.0"
 dependencies = [
  "hmac",
  "reqwest",
- "rustls-rustcrypto",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4341,7 +4275,6 @@ dependencies = [
  "rand 0.10.2",
  "rustls",
  "rustls-pemfile",
- "rustls-rustcrypto",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4382,7 +4315,6 @@ dependencies = [
  "rsa",
  "rustls",
  "rustls-pemfile",
- "rustls-rustcrypto",
  "serde",
  "sha2 0.10.9",
  "signature",
@@ -4400,17 +4332,6 @@ dependencies = [
  "memmap2",
  "sha2 0.11.0",
  "yuhaiin-core",
-]
-
-[[package]]
-name = "yuhaiin-platform"
-version = "0.1.0"
-dependencies = [
- "netlink-packet-core",
- "netlink-packet-route 0.31.0",
- "netlink-sys",
- "nix 0.30.1",
- "tun-rs",
 ]
 
 [[package]]
@@ -4435,7 +4356,6 @@ dependencies = [
  "rand 0.10.2",
  "rustls",
  "rustls-pemfile",
- "rustls-rustcrypto",
  "serde_json",
  "sha1",
  "sha2 0.10.9",
@@ -4472,7 +4392,6 @@ dependencies = [
  "rsa",
  "rustls",
  "rustls-pemfile",
- "rustls-rustcrypto",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4493,7 +4412,6 @@ dependencies = [
  "yuhaiin-core",
  "yuhaiin-dns",
  "yuhaiin-geo",
- "yuhaiin-platform",
  "yuhaiin-protocol",
  "yuhaiin-store",
  "yuhaiin-trie",
@@ -4540,11 +4458,15 @@ version = "0.1.0"
 dependencies = [
  "futures-lite",
  "futures-util",
+ "netlink-packet-core",
+ "netlink-packet-route 0.31.0",
+ "netlink-sys",
+ "nix 0.30.1",
  "route_manager",
  "smoltcp",
  "tokio",
+ "tun-rs",
  "yuhaiin-core",
- "yuhaiin-platform",
 ]
 
 [[package]]

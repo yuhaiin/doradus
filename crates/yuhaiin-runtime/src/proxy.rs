@@ -2953,17 +2953,18 @@ fn build_tls_termination_proxy(
         return Err(Error::invalid("TLS termination has no usable certificates"));
     }
     let resolver = StaticTlsTerminationResolver { default, named };
-    let mut server =
-        rustls::ServerConfig::builder_with_provider(Arc::new(rustls_rustcrypto::provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-            .map_err(|error| {
-                Error::new(
-                    ErrorKind::Protocol,
-                    format!("TLS termination provider: {error}"),
-                )
-            })?
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(resolver));
+    let mut server = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+    .map_err(|error| {
+        Error::new(
+            ErrorKind::Protocol,
+            format!("TLS termination provider: {error}"),
+        )
+    })?
+    .with_no_client_auth()
+    .with_cert_resolver(Arc::new(resolver));
     server.alpn_protocols = tls
         .get("nextProtos")
         .or_else(|| tls.get("next_protos"))
@@ -3075,7 +3076,7 @@ fn tls_termination_certified_key_from_bytes(
             )
         })?
     };
-    let signer = rustls_rustcrypto::sign::any_supported_type(&key).map_err(|error| {
+    let signer = rustls::crypto::ring::sign::any_supported_type(&key).map_err(|error| {
         Error::new(
             ErrorKind::Protocol,
             format!("TLS termination signing key: {error:?}"),

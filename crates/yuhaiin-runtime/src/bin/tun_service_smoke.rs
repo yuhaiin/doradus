@@ -227,7 +227,7 @@ async fn run() -> Result<()> {
     // so bring only this disposable namespace's loopback interface up before
     // opening the TUN.  Production does not need this test-only setup.
     if traffic || dns_test {
-        yuhaiin_platform::enable_loopback().map_err(io_error)?;
+        yuhaiin_tun::enable_loopback().map_err(io_error)?;
     }
 
     let (target_address, target_task, udp_target_task, chain_fixture) = if chain_mode.is_some() {
@@ -1522,7 +1522,7 @@ fn chain_server_config() -> Result<Arc<rustls::ServerConfig>> {
     let key = rustls_pemfile::private_key(&mut Cursor::new(PRIVATE_KEY_PEM))
         .map_err(|error| Error::invalid(format!("TUN chain fixture key: {error}")))?
         .ok_or_else(|| Error::invalid("TUN chain fixture key is empty"))?;
-    let provider = Arc::new(rustls_rustcrypto::provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(|error| Error::new(ErrorKind::InvalidInput, error.to_string()))?

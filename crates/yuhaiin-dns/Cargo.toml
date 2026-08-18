@@ -12,7 +12,6 @@ tls = [
     "http2",
     "async-proxy",
     "dep:rustls",
-    "dep:rustls-rustcrypto",
     "dep:tokio-rustls",
     "dep:p256-tls-auto",
     "dep:sha2_10",
@@ -32,9 +31,8 @@ http = { version = "1.5.0", optional = true }
 ed25519-tls-auto = { package = "ed25519-dalek", version = "2.2.0", optional = true, default-features = false, features = ["std", "pkcs8"] }
 p256-tls-auto = { package = "p256", version = "0.13.2", optional = true, default-features = false, features = ["ecdsa", "pem", "pkcs8", "std"] }
 quinn = { version = "0.11.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rustls = { version = "0.23.41", optional = true, default-features = false, features = ["std", "tls12"] }
+rustls = { version = "0.23.41", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
 rsa-tls-auto = { package = "rsa", version = "0.9.10", optional = true, default-features = false, features = ["std", "pem", "sha2"] }
-rustls-rustcrypto = { version = "0.0.2-alpha", optional = true, default-features = false, features = ["std", "tls12", "zeroize"] }
 sha2_10 = { package = "sha2", version = "0.10.9", optional = true, features = ["oid"] }
 signature-tls-auto = { package = "signature", version = "2.2.0", optional = true, default-features = false, features = ["alloc", "rand_core"] }
 tokio-rustls = { version = "0.26.4", optional = true, default-features = false, features = ["tls12"] }

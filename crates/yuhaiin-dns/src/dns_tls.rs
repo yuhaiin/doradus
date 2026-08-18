@@ -434,7 +434,7 @@ pub fn root_store(certificates: &[Vec<u8>]) -> Result<RootCertStore> {
 }
 
 pub fn client_config(root_store: RootCertStore) -> Result<Arc<ClientConfig>> {
-    let provider = Arc::new(rustls_rustcrypto::provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(|error| Error::new(ErrorKind::Protocol, format!("TLS provider: {error}")))?

@@ -166,7 +166,7 @@ impl S3Client {
         } else {
             Url::parse(config.endpoint_url.trim())?
         };
-        let _ = rustls_rustcrypto::provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = Client::builder()
             .user_agent("yuhaiin-rust-backup")
             .timeout(Duration::from_secs(30))

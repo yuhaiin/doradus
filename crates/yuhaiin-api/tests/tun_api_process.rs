@@ -130,7 +130,7 @@ async fn put_inbound(client: &reqwest::Client, base_url: &str, id: &str, config:
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Podman /dev/net/tun and CAP_NET_ADMIN; run scripts/integration/tun-api-process.sh"]
 async fn foreground_binary_api_toggle_changes_real_tun_device() {
-    yuhaiin_platform::enable_loopback().unwrap();
+    yuhaiin_tun::enable_loopback().unwrap();
 
     let root = integration_dir("tun-api-process");
     std::fs::create_dir_all(&root).unwrap();
@@ -138,7 +138,7 @@ async fn foreground_binary_api_toggle_changes_real_tun_device() {
     seed_empty_database(&database).await;
     let address = reserve_loopback().await;
     let base_url = format!("http://{address}");
-    let _ = rustls_rustcrypto::provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::new();
     let diagnostics = Arc::new(Mutex::new(String::new()));
     let runtime = RuntimeChild::spawn(&database, &address.to_string(), &diagnostics);

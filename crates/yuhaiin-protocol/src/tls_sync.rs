@@ -1,9 +1,8 @@
-//! Pure Rust TLS client adapter for proxy and HTTP/2 transports.
+//! Ring-backed TLS client adapter for proxy and HTTP/2 transports.
 //!
-//! This module is feature-gated because `rustls-rustcrypto` is currently an
-//! alpha provider. It is nevertheless a real `rustls` client implementation,
-//! not a placeholder: callers supply a `RootCertStore`, and the resulting
-//! `RustCryptoTlsClient` implements the synchronous `proxy::TlsClient` seam.
+//! This module is feature-gated because TLS is an optional protocol capability.
+//! Callers supply a `RootCertStore`, and the resulting `RustCryptoTlsClient`
+//! implements the synchronous `proxy::TlsClient` seam.
 
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -19,11 +18,11 @@ pub struct RustCryptoTlsClient {
 }
 
 impl RustCryptoTlsClient {
-    /// Build a TLS client using the pure RustCrypto provider and caller-owned
+    /// Build a TLS client using the ring provider and caller-owned
     /// trust roots. Empty roots are allowed for test construction but will
     /// reject normal server certificates during the handshake.
     pub fn new(root_store: RootCertStore) -> Result<Self> {
-        let provider = Arc::new(rustls_rustcrypto::provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let config = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .map_err(tls_error)?
@@ -64,7 +63,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_builds_a_client_config_without_c_backend() {
+    fn ring_provider_builds_a_client_config() {
         let client = RustCryptoTlsClient::new(RootCertStore::empty()).unwrap();
         assert!(client.config().alpn_protocols.is_empty());
     }

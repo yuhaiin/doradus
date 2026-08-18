@@ -15,7 +15,6 @@ tun-routes = ["yuhaiin-runtime/tun-routes"]
 doh-tls = [
     "yuhaiin-runtime/doh-tls",
     "dep:rustls",
-    "dep:rustls-rustcrypto",
     "dep:webpki-roots",
     "yuhaiin-dns/tls",
 ]
@@ -29,8 +28,7 @@ futures-util = { version = "0.3.33", default-features = false, features = ["std"
 http = "1.5.0"
 http-body-util = "0.1.4"
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots-no-provider"] }
-rustls = { version = "0.23.41", optional = true, default-features = false, features = ["std", "tls12"] }
-rustls-rustcrypto = { version = "0.0.2-alpha", optional = true, default-features = false, features = ["std", "tls12", "zeroize"] }
+rustls = { version = "0.23.41", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = { version = "0.11.0", default-features = false }
@@ -67,8 +65,7 @@ h2 = "0.4.15"
 hyper = { version = "1.11.0", default-features = false }
 nix = { version = "0.30.1", default-features = false, features = ["net", "uio", "process", "signal"] }
 p256-tls-auto = { package = "p256", version = "0.13.2", default-features = false, features = ["ecdsa", "pem", "pkcs8", "std"] }
-rustls = { version = "0.23.41", default-features = false, features = ["std", "tls12"] }
-rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["std", "tls12", "zeroize"] }
+rustls = { version = "0.23.41", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-pemfile = "2.2.0"
 smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["tls12"] }
@@ -76,7 +73,6 @@ tokio-tungstenite = { version = "0.28.0", default-features = false, features = [
 tower = { version = "0.5.2", features = ["util"] }
 x509-cert = { version = "0.2.5", default-features = false, features = ["builder", "std"] }
 yuhaiin-chain = { path = "../yuhaiin-chain" }
-yuhaiin-platform = { path = "../yuhaiin-platform" }
 yuhaiin-protocol = { path = "../yuhaiin-protocol", features = ["websocket"] }
 
 [lints]

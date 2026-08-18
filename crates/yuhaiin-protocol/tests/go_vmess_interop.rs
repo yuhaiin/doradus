@@ -11,7 +11,7 @@ use yuhaiin_protocol::vmess::{
     encode_response_header, read_body_frame, read_request, write_body_frame,
 };
 
-#[cfg(all(feature = "tls-rustcrypto", feature = "websocket"))]
+#[cfg(all(feature = "tls-ring", feature = "websocket"))]
 mod support;
 
 const UUID: [u8; 16] = [
@@ -32,7 +32,7 @@ async fn go_vmess_client_round_trips_against_rust_wire_server() {
     server.await.unwrap();
 }
 
-#[cfg(all(feature = "tls-rustcrypto", feature = "websocket"))]
+#[cfg(all(feature = "tls-ring", feature = "websocket"))]
 #[tokio::test]
 #[ignore = "requires the sibling Go checkout and Go toolchain"]
 async fn go_vmess_client_over_tls_websocket_round_trips_against_rust_wire_server() {

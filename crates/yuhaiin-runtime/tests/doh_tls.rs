@@ -68,7 +68,7 @@ fn server_config(with_h2: bool) -> Arc<ServerConfig> {
     let key = rustls_pemfile::private_key(&mut Cursor::new(PRIVATE_KEY_PEM))
         .unwrap()
         .unwrap();
-    let provider = Arc::new(rustls_rustcrypto::provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .unwrap()

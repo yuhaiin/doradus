@@ -1668,7 +1668,7 @@ fn build_inbound_tls_acceptor(
                 Error::new(ErrorKind::Protocol, format!("inbound TLS DER key: {error}"))
             })?
         };
-        let provider = Arc::new(rustls_rustcrypto::provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut server = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .map_err(|error| {
@@ -4115,7 +4115,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     .unwrap();
                 roots.add(certificate).unwrap();
                 let client = rustls::ClientConfig::builder_with_provider(Arc::new(
-                    rustls_rustcrypto::provider(),
+                    rustls::crypto::ring::default_provider(),
                 ))
                 .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
                 .unwrap()

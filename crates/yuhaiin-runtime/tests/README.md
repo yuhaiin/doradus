@@ -96,7 +96,7 @@ The current scenarios cover:
   that the configured local IPv4 address reaches the DNS server for both
   transports; build and Podman logs are kept under
   `~/.cache/yuhaiin-rust/integration/dns-source-bind`.
-- `scripts/integration/doh-source-bind.sh` runs a real RustCrypto DoH/HTTP2 and
+- `scripts/integration/doh-source-bind.sh` runs a real ring-backed DoH/HTTP2 and
   DoT/TLS resolver pair in a host-network Podman container. It asserts that
   both TLS transports reach their server from the configured local IPv4
   address; logs are kept under `~/.cache/yuhaiin-rust/integration/doh-source-bind`.

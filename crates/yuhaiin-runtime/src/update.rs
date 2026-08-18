@@ -3,7 +3,8 @@
 //! The update endpoint is deliberately kept outside the proxy/data-plane
 //! builder.  It only deals with release metadata, bounded downloads and an
 //! atomic hand-off to the platform helper.  The HTTP client uses reqwest with
-//! rustls and the RustCrypto provider; no native TLS library is required.
+//! rustls and its ring provider; no system TLS library such as OpenSSL is
+//! required.
 
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -149,9 +150,9 @@ impl UpdateService {
 
     fn with_releases_url(releases_url: String, timeout: Duration) -> Self {
         // reqwest is built with rustls' no-provider feature.  Install the
-        // RustCrypto provider once for this process; an already installed
+        // ring provider once for this process; an already installed
         // provider is harmless when another runtime component initialized it.
-        let _ = rustls_rustcrypto::provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = Client::builder()
             .timeout(timeout)
             .user_agent(format!("yuhaiin-rust/{}", env!("CARGO_PKG_VERSION")))

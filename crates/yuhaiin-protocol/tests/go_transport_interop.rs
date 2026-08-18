@@ -2,7 +2,7 @@
 //! transport.  The ordinary VLESS wire test intentionally uses a plain
 //! parent; this test makes the transport boundary observable as well.
 
-#![cfg(all(unix, feature = "tls-rustcrypto"))]
+#![cfg(all(unix, feature = "tls-ring"))]
 
 use std::process::{Command, Stdio};
 use std::sync::Arc;

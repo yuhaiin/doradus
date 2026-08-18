@@ -30,9 +30,10 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "async-proxy")]
 use std::time::Duration;
 use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
-use yuhaiin_platform::AsyncDevice;
+mod platform;
 #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
-use yuhaiin_platform::DeviceBuilder;
+pub use platform::DeviceBuilder;
+pub use platform::{AsyncDevice, async_device_from_owned_fd, enable_loopback};
 
 #[cfg(feature = "async-proxy")]
 use tokio::sync::mpsc;

@@ -8,7 +8,6 @@ members = [
     "crates/yuhaiin-chain",
     "crates/yuhaiin-geo",
     "crates/yuhaiin-protocol",
-    "crates/yuhaiin-platform",
     "crates/yuhaiin-store",
     "crates/yuhaiin-trie",
     "crates/yuhaiin-wireguard",

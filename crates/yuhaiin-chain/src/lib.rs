@@ -140,7 +140,7 @@ impl ChainClient {
             root_store(&chain.tls.ca_certificates)?
         };
         let h2_idle_timeout = chain.http2.idle_timeout;
-        let provider = Arc::new(rustls_rustcrypto::provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = if chain.tls.insecure_skip_verify {
             ClientConfig::builder_with_provider(Arc::clone(&provider))
                 .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])

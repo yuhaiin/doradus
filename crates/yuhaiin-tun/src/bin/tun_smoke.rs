@@ -139,7 +139,7 @@ fn main() -> std::io::Result<()> {
     // target, so enable only this disposable test namespace; production TUN
     // setup does not use this helper.
     if proxy_throughput || proxy_echo || udp_proxy_echo {
-        yuhaiin_platform::enable_loopback()?;
+        yuhaiin_tun::enable_loopback()?;
     }
     if proxy_throughput {
         #[cfg(feature = "async-proxy")]
