@@ -8,10 +8,10 @@
 use std::net::TcpStream;
 use std::sync::Arc;
 
-use crate::proxy::TlsClient;
-use crate::{Error, ErrorKind, Result};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use yuhaiin_core::proxy::TlsClient;
+use yuhaiin_core::{Error, ErrorKind, Result};
 
 #[derive(Clone)]
 pub struct RustCryptoTlsClient {

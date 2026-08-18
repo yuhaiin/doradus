@@ -33,8 +33,8 @@ use x509_cert::spki::SubjectPublicKeyInfoOwned;
 use x509_cert::time::Validity;
 use yuhaiin_chain::{YuubinsyaH2Server, YuubinsyaServerProxy};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, DirectAsyncProxy};
-use yuhaiin_core::yuubinsya::derive_salt;
 use yuhaiin_core::{BoxFuture, Endpoint, FlowContext, Result};
+use yuhaiin_protocol::yuubinsya::derive_salt;
 use yuhaiin_store::ConfigStore;
 
 use p256_tls_auto::ecdsa::{DerSignature, SigningKey};

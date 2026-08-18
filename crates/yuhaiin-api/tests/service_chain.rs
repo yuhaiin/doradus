@@ -11,8 +11,11 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use yuhaiin_chain::{AsyncYuubinsyaTcpSession, AsyncYuubinsyaUotSession};
-use yuhaiin_core::proxy::{AsyncDatagram, YuubinsyaUdpDatagram};
-use yuhaiin_core::{DomainName, Endpoint, Network, websocket::WebSocketIo};
+use yuhaiin_core::proxy::AsyncDatagram;
+use yuhaiin_core::{DomainName, Endpoint, Network};
+use yuhaiin_protocol::websocket::WebSocketIo;
+use yuhaiin_protocol::yuubinsya::derive_salt;
+use yuhaiin_protocol::yuubinsya_udp::YuubinsyaUdpDatagram;
 use yuhaiin_protocol::{trojan, vless, vmess};
 
 use support::{
@@ -1309,7 +1312,7 @@ async fn yuubinsya_auth_is_rejected(
         Duration::from_secs(1),
         AsyncYuubinsyaTcpSession::connect(
             stream,
-            yuhaiin_core::yuubinsya::derive_salt(password.as_bytes()),
+            derive_salt(password.as_bytes()),
             Endpoint::domain(Network::Tcp, DomainName::new(host).unwrap(), port),
         ),
     )
@@ -2529,7 +2532,7 @@ async fn central_basic_user_authenticates_socks5_and_yuubinsya_inbounds() {
     let yuubinsya_stream = connect_loopback(yuubinsya_inbound).await;
     let mut yuubinsya = AsyncYuubinsyaTcpSession::connect(
         yuubinsya_stream,
-        yuhaiin_core::yuubinsya::derive_salt(b"central-password"),
+        derive_salt(b"central-password"),
         Endpoint::domain(
             Network::Tcp,
             DomainName::new("example.test").unwrap(),
@@ -3189,7 +3192,7 @@ async fn socks5_and_yuubinsya_inbounds_route_through_tls_h2_yuubinsya_outbound()
     let yuubinsya_stream = connect_loopback(yuubinsya_inbound).await;
     let mut yuubinsya = AsyncYuubinsyaTcpSession::connect(
         yuubinsya_stream,
-        yuhaiin_core::yuubinsya::derive_salt(YUUBINSYA_PASSWORD.as_bytes()),
+        derive_salt(YUUBINSYA_PASSWORD.as_bytes()),
         Endpoint::domain(
             Network::Tcp,
             DomainName::new("example.test").unwrap(),
@@ -3426,7 +3429,7 @@ async fn socks5_and_yuubinsya_inbounds_route_through_the_runtime_process() {
     let yuubinsya_stream = connect_loopback(yuubinsya_inbound).await;
     let mut yuubinsya = AsyncYuubinsyaTcpSession::connect(
         yuubinsya_stream,
-        yuhaiin_core::yuubinsya::derive_salt(YUUBINSYA_PASSWORD.as_bytes()),
+        derive_salt(YUUBINSYA_PASSWORD.as_bytes()),
         Endpoint::ip(Network::Tcp, fixture.target),
     )
     .await
@@ -3495,7 +3498,7 @@ async fn yuubinsya_native_udp_and_uot_inbounds_route_through_the_runtime_process
     let service = ServiceProcess::start(&database).await;
     add_yuubinsya_udp_inbound(&service, "yuubinsya-udp-uot-in", inbound).await;
 
-    let password_hash = yuhaiin_core::yuubinsya::derive_salt(YUUBINSYA_PASSWORD.as_bytes());
+    let password_hash = derive_salt(YUUBINSYA_PASSWORD.as_bytes());
     let destination = Endpoint::ip(Network::Udp, echo_address);
 
     let native = YuubinsyaUdpDatagram::bind(
@@ -3523,7 +3526,7 @@ async fn yuubinsya_native_udp_and_uot_inbounds_route_through_the_runtime_process
     assert_eq!(native_target, destination);
 
     let uot_stream = connect_loopback(inbound).await;
-    let mut uot = AsyncYuubinsyaUotSession::connect(uot_stream, password_hash, 0, false)
+    let uot = AsyncYuubinsyaUotSession::connect(uot_stream, password_hash, 0, false)
         .await
         .unwrap();
     let uot_payload = b"yuubinsya-uot-inbound-payload";

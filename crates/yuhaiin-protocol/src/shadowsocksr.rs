@@ -7,6 +7,7 @@
 use std::io;
 use std::sync::Arc;
 
+use crate::yuubinsya::{decode_endpoint, encode_endpoint};
 use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit, generic_array::GenericArray};
 use aes::{Aes128, Aes192, Aes256};
 use base64::Engine;
@@ -15,7 +16,6 @@ use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
-use yuhaiin_core::yuubinsya::{decode_endpoint, encode_endpoint};
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 const MAX_FRAME_SIZE: usize = 8192;

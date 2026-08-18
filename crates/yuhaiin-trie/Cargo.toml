@@ -15,7 +15,8 @@ yuhaiin-core = { path = "../yuhaiin-core" }
 [dev-dependencies]
 smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp"] }
 tokio = { version = "1.50.0", default-features = false, features = ["macros", "net", "rt", "sync", "time"] }
-yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy", "tun"] }
+yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
+yuhaiin-tun = { path = "../yuhaiin-tun", features = ["async-proxy"] }
 yuhaiin-store = { path = "../yuhaiin-store", features = ["async-dns"] }
 
 [[test]]

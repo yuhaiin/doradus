@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use sha2::{Digest, Sha256};
 
-use crate::{DomainName, Endpoint, Error, ErrorKind, Network, Result};
+use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, Network, Result};
 
 pub const MAX_SEGMENT_SIZE: usize = 64 * 1024 - 1;
 

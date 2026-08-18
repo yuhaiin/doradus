@@ -8,12 +8,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::proxy::{
+use crate::YuubinsyaUdpProxy;
+use yuhaiin_core::proxy::{
     AsyncProxy, BindInterfaceProxy, BlockingStreamProxy, DelayedDropAsyncProxy, DirectAsyncProxy,
     DropAsyncProxy, FallbackAsyncProxy, FixedAsyncProxy, HttpProxyConnector, Socks5AsyncProxy,
-    StreamConnector, YuubinsyaUdpProxy,
+    StreamConnector,
 };
-use crate::{Error, ErrorKind, Result};
+use yuhaiin_core::{Error, ErrorKind, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseProxyEndpoint {
@@ -242,8 +243,8 @@ fn blocking_connector(connector: impl StreamConnector + 'static) -> BlockingStre
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Endpoint, FlowContext, Network};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use yuhaiin_core::{Endpoint, FlowContext, Network};
 
     fn timeout() -> Duration {
         Duration::from_secs(3)
@@ -398,7 +399,7 @@ mod tests {
         .unwrap();
         let target = Endpoint::domain(
             Network::Udp,
-            crate::DomainName::new("udp-blocked.example").unwrap(),
+            yuhaiin_core::DomainName::new("udp-blocked.example").unwrap(),
             53,
         );
         let context = FlowContext::new(target.clone());
@@ -419,7 +420,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let password_hash = crate::yuubinsya::derive_salt(b"password");
-            let server = crate::proxy::YuubinsyaUdpServer::bind(
+            let server = crate::YuubinsyaUdpServer::bind(
                 "127.0.0.1:0".parse().unwrap(),
                 password_hash,
                 false,
@@ -438,7 +439,7 @@ mod tests {
             .unwrap();
             let target = Endpoint::domain(
                 Network::Udp,
-                crate::DomainName::new("example.com").unwrap(),
+                yuhaiin_core::DomainName::new("example.com").unwrap(),
                 53,
             );
             let context = FlowContext::new(target.clone());

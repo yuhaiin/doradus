@@ -14,9 +14,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 use yuhaiin_chain::{ChainClient, YuubinsyaServerProxy};
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, YuubinsyaUdpServer};
-use yuhaiin_core::yuubinsya::derive_salt;
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use yuhaiin_protocol::yuubinsya::derive_salt;
+use yuhaiin_protocol::yuubinsya_udp::YuubinsyaUdpServer;
 
 const PASSWORD: &str = "rust-go-interop";
 

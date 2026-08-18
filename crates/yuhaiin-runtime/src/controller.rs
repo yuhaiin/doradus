@@ -270,7 +270,7 @@ impl RuntimeController {
         drop_id: &str,
         proxy_timeout: std::time::Duration,
         channel_capacity: usize,
-    ) -> Result<yuhaiin_core::tun::TunProxyRuntime> {
+    ) -> Result<yuhaiin_tun::TunProxyRuntime> {
         self.build_tun_proxy_runtime_with_dns(
             direct_id,
             proxy_id,
@@ -299,7 +299,7 @@ impl RuntimeController {
         proxy_timeout: std::time::Duration,
         channel_capacity: usize,
         async_dns_handler: Option<Arc<dyn yuhaiin_core::dns::AsyncDnsHandler>>,
-    ) -> Result<yuhaiin_core::tun::TunProxyRuntime> {
+    ) -> Result<yuhaiin_tun::TunProxyRuntime> {
         self.build_tun_proxy_runtime_with_dns_and_udp(
             direct_id,
             proxy_id,
@@ -326,7 +326,7 @@ impl RuntimeController {
         proxy_timeout: std::time::Duration,
         channel_capacity: usize,
         async_dns_handler: Option<Arc<dyn yuhaiin_core::dns::AsyncDnsHandler>>,
-    ) -> Result<yuhaiin_core::tun::TunProxyRuntime> {
+    ) -> Result<yuhaiin_tun::TunProxyRuntime> {
         let _guard = self.reload_lock.lock().await;
         let snapshot = self.handle.load();
         let selector = Arc::new(
@@ -345,9 +345,8 @@ impl RuntimeController {
             bridge.set_selector(selector.clone());
         }
         let (nat, idle_timeout) = snapshot.new_full_cone_nat()?;
-        let mut runtime =
-            yuhaiin_core::tun::TunProxyRuntime::new(selector.clone(), channel_capacity)?
-                .with_nat(nat, idle_timeout)?;
+        let mut runtime = yuhaiin_tun::TunProxyRuntime::new(selector.clone(), channel_capacity)?
+            .with_nat(nat, idle_timeout)?;
         runtime = runtime.with_observer(self.monitor.clone());
         if let Some(handler) = async_dns_handler {
             runtime = runtime.with_async_dns_handler(handler);
@@ -1153,7 +1152,7 @@ mod tests {
         };
         block_on(async {
             runtime
-                .handle_event(yuhaiin_core::tun::TunEvent::TcpOpened { flow })
+                .handle_event(yuhaiin_tun::TunEvent::TcpOpened { flow })
                 .unwrap();
 
             let v6_flow = yuhaiin_core::flow::Flow {
@@ -1164,7 +1163,7 @@ mod tests {
                 },
             };
             runtime
-                .handle_event(yuhaiin_core::tun::TunEvent::UdpDatagram {
+                .handle_event(yuhaiin_tun::TunEvent::UdpDatagram {
                     flow: v6_flow,
                     payload: vec![0],
                 })

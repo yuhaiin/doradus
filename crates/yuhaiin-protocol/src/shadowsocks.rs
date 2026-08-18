@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::yuubinsya::{decode_endpoint, encode_endpoint};
 use aes_gcm::{
     Aes128Gcm, Aes256Gcm,
     aead::{Aead, KeyInit},
@@ -20,7 +21,6 @@ use md5::{Digest, Md5};
 use sha1::Sha1;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
-use yuhaiin_core::yuubinsya::{decode_endpoint, encode_endpoint};
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 pub const MAX_PAYLOAD_SIZE: usize = 0x3fff;

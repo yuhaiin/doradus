@@ -17,8 +17,8 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use yuhaiin_core::{Error, ErrorKind, Result};
 
-use crate::YuubinsyaServerProxy;
 use crate::h2_tunnel::send_h2_data;
+use crate::session::YuubinsyaServerProxy;
 
 const H2_RELAY_CAPACITY: usize = 16 * 1024;
 

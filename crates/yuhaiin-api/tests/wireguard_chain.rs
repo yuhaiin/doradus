@@ -115,7 +115,7 @@ async fn run_peer(
         2,
         None,
     );
-    let mut device = yuhaiin_core::tun::SmoltcpTunDevice::new(MTU, 256).unwrap();
+    let mut device = yuhaiin_tun::SmoltcpTunDevice::new(MTU, 256).unwrap();
     let mut interface = Interface::new(
         InterfaceConfig::new(HardwareAddress::Ip),
         &mut device,
@@ -303,7 +303,7 @@ fn packet_summary(packet: &[u8], direction: &str) -> String {
 }
 
 async fn flush_device_packets(
-    device: &yuhaiin_core::tun::SmoltcpTunDevice,
+    device: &yuhaiin_tun::SmoltcpTunDevice,
     tunnel: &mut Tunn,
     source: Option<SocketAddr>,
     socket: &UdpSocket,
@@ -323,7 +323,7 @@ async fn flush_device_packets(
 
 async fn process_wireguard_packet(
     tunnel: &mut Tunn,
-    device: &yuhaiin_core::tun::SmoltcpTunDevice,
+    device: &yuhaiin_tun::SmoltcpTunDevice,
     source: SocketAddr,
     packet: &[u8],
     output: &mut [u8],

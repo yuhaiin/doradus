@@ -16,7 +16,8 @@ tun-fakeip-smoke = [
     "dep:smoltcp",
     "dep:tokio",
     "yuhaiin-core/http2",
-    "yuhaiin-core/tun",
+    "dep:yuhaiin-tun",
+    "yuhaiin-tun/async-proxy",
 ]
 sqlite-rusqlite-probe = []
 
@@ -33,6 +34,8 @@ smoltcp = { version = "0.13.1", optional = true, default-features = false, featu
 tokio = { version = "1.50.0", optional = true, default-features = false, features = ["io-util", "rt", "sync", "time"] }
 yuhaiin-core = { path = "../yuhaiin-core" }
 yuhaiin-dns = { path = "../yuhaiin-dns" }
+yuhaiin-protocol = { path = "../yuhaiin-protocol" }
+yuhaiin-tun = { path = "../yuhaiin-tun", optional = true }
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 
 [lints]

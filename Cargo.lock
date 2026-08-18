@@ -4310,6 +4310,7 @@ dependencies = [
  "yuhaiin-protocol",
  "yuhaiin-runtime",
  "yuhaiin-store",
+ "yuhaiin-tun",
 ]
 
 [[package]]
@@ -4351,24 +4352,17 @@ dependencies = [
  "webpki-roots",
  "yuhaiin-core",
  "yuhaiin-protocol",
+ "yuhaiin-tun",
 ]
 
 [[package]]
 name = "yuhaiin-core"
 version = "0.1.0"
 dependencies = [
- "futures-lite",
  "futures-util",
- "route_manager",
- "rustls",
- "rustls-rustcrypto",
- "sha2 0.11.0",
- "smoltcp",
  "socket2",
  "tokio",
- "tokio-tungstenite",
  "yuhaiin-dns",
- "yuhaiin-platform",
  "yuhaiin-types",
 ]
 
@@ -4426,19 +4420,23 @@ dependencies = [
  "aes",
  "aes-gcm",
  "base64 0.22.1",
+ "bytes",
  "chacha20 0.9.1",
  "chacha20poly1305",
  "crc32fast",
  "ed25519-dalek",
  "futures-util",
+ "h2",
  "hkdf",
  "hmac",
+ "http",
  "md-5",
  "p256",
  "rand 0.10.2",
  "rustls",
  "rustls-pemfile",
  "rustls-rustcrypto",
+ "serde_json",
  "sha1",
  "sha2 0.10.9",
  "sha2 0.11.0",
@@ -4499,6 +4497,7 @@ dependencies = [
  "yuhaiin-protocol",
  "yuhaiin-store",
  "yuhaiin-trie",
+ "yuhaiin-tun",
  "yuhaiin-wireguard",
 ]
 
@@ -4519,6 +4518,8 @@ dependencies = [
  "tokio",
  "yuhaiin-core",
  "yuhaiin-dns",
+ "yuhaiin-protocol",
+ "yuhaiin-tun",
 ]
 
 [[package]]
@@ -4530,6 +4531,20 @@ dependencies = [
  "tokio",
  "yuhaiin-core",
  "yuhaiin-store",
+ "yuhaiin-tun",
+]
+
+[[package]]
+name = "yuhaiin-tun"
+version = "0.1.0"
+dependencies = [
+ "futures-lite",
+ "futures-util",
+ "route_manager",
+ "smoltcp",
+ "tokio",
+ "yuhaiin-core",
+ "yuhaiin-platform",
 ]
 
 [[package]]
@@ -4550,6 +4565,7 @@ dependencies = [
  "socket2",
  "tokio",
  "yuhaiin-core",
+ "yuhaiin-tun",
 ]
 
 [[package]]

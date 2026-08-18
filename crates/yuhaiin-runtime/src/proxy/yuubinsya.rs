@@ -10,9 +10,10 @@ use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection as TunFlowDirection, FlowObserver as TunFlowObserver,
     FlowObserverGuard,
 };
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncProxySelector, YuubinsyaUdpServer};
-use yuhaiin_core::yuubinsya::derive_salt;
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncProxySelector};
 use yuhaiin_core::{BoxFuture, Error, FlowContext, Result};
+use yuhaiin_protocol::yuubinsya::derive_salt;
+use yuhaiin_protocol::yuubinsya_udp::YuubinsyaUdpServer;
 
 use super::common::{
     RoutedProxy, UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows,

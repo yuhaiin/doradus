@@ -1,0 +1,29 @@
+[package]
+name = "yuhaiin-tun"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+async-proxy = ["dep:futures-util", "dep:tokio", "yuhaiin-core/async-proxy"]
+tun-routes = ["dep:route_manager"]
+
+[dependencies]
+futures-lite = "2.6.1"
+futures-util = { version = "0.3.33", optional = true, default-features = false, features = ["std"] }
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "auto-icmp-echo-reply", "async", "iface-max-addr-count-8"] }
+tokio = { version = "1.50.0", optional = true, default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+yuhaiin-core = { path = "../yuhaiin-core" }
+yuhaiin-platform = { path = "../yuhaiin-platform", features = ["tun"] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tun-smoke"
+path = "src/bin/tun_smoke.rs"
+required-features = ["async-proxy"]
+
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
+route_manager = { version = "0.2.13", optional = true, default-features = false }

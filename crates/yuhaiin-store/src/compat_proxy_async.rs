@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
-use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyEndpoint, BaseProxyKind};
 use yuhaiin_core::{DomainName, Error, ErrorKind, Result};
+use yuhaiin_protocol::proxy_factory::{BaseProxyConfig, BaseProxyEndpoint, BaseProxyKind};
 
 use crate::{GoProxyLayer, GoProxyRuntimeConfig, GoProxyTransport};
 
@@ -225,7 +225,7 @@ impl GoProxyRuntimeConfig {
             GoProxyTransport::Yuubinsya => {
                 let config = layer_config(&self.layers, "yuubinsya")?;
                 let password = required_string(config, "password")?;
-                let password_hash = yuhaiin_core::yuubinsya::derive_salt(password.as_bytes());
+                let password_hash = yuhaiin_protocol::yuubinsya::derive_salt(password.as_bytes());
                 let socks5_prefix = config
                     .get("socks5_prefix")
                     .and_then(serde_json::Value::as_bool)
@@ -678,7 +678,7 @@ mod tests {
             built.kind,
             BaseProxyKind::YuubinsyaUdp {
                 server: "192.0.2.44:40501".parse().unwrap(),
-                password_hash: yuhaiin_core::yuubinsya::derive_salt(b"password"),
+                password_hash: yuhaiin_protocol::yuubinsya::derive_salt(b"password"),
                 socks5_prefix: false,
             }
         );

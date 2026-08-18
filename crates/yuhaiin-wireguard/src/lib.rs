@@ -1246,8 +1246,7 @@ impl Driver {
 
     async fn run(mut self, ready: Option<oneshot::Sender<Result<()>>>) {
         let mut device =
-            match yuhaiin_core::tun::SmoltcpTunDevice::new(self.config.mtu, DEFAULT_QUEUE_CAPACITY)
-            {
+            match yuhaiin_tun::SmoltcpTunDevice::new(self.config.mtu, DEFAULT_QUEUE_CAPACITY) {
                 Ok(device) => device,
                 Err(error) => {
                     if let Some(ready) = ready {
@@ -1551,7 +1550,7 @@ impl Driver {
         }
     }
 
-    async fn flush_ip_packets(&mut self, device: &yuhaiin_core::tun::SmoltcpTunDevice) {
+    async fn flush_ip_packets(&mut self, device: &yuhaiin_tun::SmoltcpTunDevice) {
         while let Ok(Some(packet)) = device.take_tx() {
             let Ok((peer, packet)) = self.engine.encapsulate(&packet) else {
                 continue;
@@ -1568,7 +1567,7 @@ impl Driver {
 
     async fn process_underlay(
         &mut self,
-        device: &yuhaiin_core::tun::SmoltcpTunDevice,
+        device: &yuhaiin_tun::SmoltcpTunDevice,
         source: SocketAddr,
         packet: &[u8],
     ) {

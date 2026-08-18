@@ -13,14 +13,15 @@ use yuhaiin_chain::ChainProxy;
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::proxy::{
     AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream, DelayedDropAsyncProxy,
-    DirectAsyncProxy, DropAsyncProxy, YuubinsyaUdpDatagram, stream_local_addr, stream_remote_addr,
+    DirectAsyncProxy, DropAsyncProxy, stream_local_addr, stream_remote_addr,
     with_stream_local_addr, with_stream_socket_addrs,
 };
-use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyKind};
 use yuhaiin_core::{
     BoxFuture, Endpoint, Error, ErrorKind, FlowContext, GeoLookup, IpSet, ResolveStrategy, Result,
     RouteMode,
 };
+use yuhaiin_protocol::YuubinsyaUdpDatagram;
+use yuhaiin_protocol::proxy_factory::{BaseProxyConfig, BaseProxyKind};
 use yuhaiin_store::fakeip::FakeIpViewStore;
 use yuhaiin_store::{FakeIpPools, GoProxyLayer, GoProxyRuntimeConfig, GoProxyTransport};
 use yuhaiin_trie::router::RuntimeRoutedProxySelector;
@@ -1021,7 +1022,7 @@ impl RuntimeSnapshot {
                     .ok_or_else(|| Error::invalid("Yuubinsya password is empty"))?;
                 Ok(Arc::new(NetworkSplitYuubinsyaProxy {
                     upstream: parent,
-                    password_hash: yuhaiin_core::yuubinsya::derive_salt(password.as_bytes()),
+                    password_hash: yuhaiin_protocol::yuubinsya::derive_salt(password.as_bytes()),
                     udp_over_stream: layer_bool(layer, "udp_over_stream", "udpOverStream"),
                     udp_coalesce: layer_bool(layer, "udp_coalesce", "udpCoalesce"),
                     udp_server,
@@ -3184,9 +3185,9 @@ mod tests {
     use std::sync::Arc;
     use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
     use yuhaiin_core::proxy::FixedAsyncProxy;
-    use yuhaiin_core::proxy::{AsyncProxySelector, YuubinsyaUdpServer};
-    use yuhaiin_core::proxy_factory::{BaseProxyConfig, BaseProxyKind};
     use yuhaiin_core::{FlowContext, GeoLookup, RouteMode};
+    use yuhaiin_protocol::YuubinsyaUdpServer;
+    use yuhaiin_protocol::proxy_factory::{BaseProxyConfig, BaseProxyKind};
     use yuhaiin_protocol::trojan::{self, Command};
     use yuhaiin_store::GoProxyLayer;
     use yuhaiin_store::GoProxyTransport;
@@ -5059,7 +5060,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let password_hash = yuhaiin_core::yuubinsya::derive_salt(b"password");
+            let password_hash = yuhaiin_protocol::yuubinsya::derive_salt(b"password");
             let server =
                 YuubinsyaUdpServer::bind("127.0.0.1:0".parse().unwrap(), password_hash, false)
                     .await

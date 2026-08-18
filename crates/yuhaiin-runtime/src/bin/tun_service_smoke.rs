@@ -1467,7 +1467,7 @@ impl ChainFixture {
             udp_target: target,
         });
         let proxy = Arc::new(YuubinsyaServerProxy::new(
-            yuhaiin_core::yuubinsya::derive_salt(YUUBINSYA_PASSWORD.as_bytes()),
+            yuhaiin_protocol::yuubinsya::derive_salt(YUUBINSYA_PASSWORD.as_bytes()),
             upstream,
         ));
         let tls_config = chain_server_config()?;

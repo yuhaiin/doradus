@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use crate::yuubinsya::derive_salt;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::proxy::{
     AsyncDatagram, AsyncProxy, BoxAsyncStream, connect_tokio_tcp_with_interface,
 };
-use yuhaiin_core::yuubinsya::derive_salt;
 use yuhaiin_core::{BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, Result};
 
 use crate::direct_uot_session::{DirectUotSession, closed_error};
@@ -33,7 +33,7 @@ struct DirectUotEndpoint {
 }
 
 #[derive(Clone)]
-pub(crate) struct DirectUotProxy {
+pub struct DirectUotProxy {
     endpoints: Arc<Vec<DirectUotEndpoint>>,
     password_hash: [u8; 32],
     udp_coalesce: bool,
@@ -42,7 +42,7 @@ pub(crate) struct DirectUotProxy {
     closed: Arc<AtomicBool>,
 }
 
-pub(crate) fn parse_go_direct_uot(
+pub fn parse_go_direct_uot(
     json_text: &str,
     resolver: Arc<dyn AsyncIpResolver>,
 ) -> Result<Option<DirectUotProxy>> {
@@ -551,151 +551,8 @@ fn is_recoverable(error: &Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-    use std::sync::atomic::AtomicUsize;
-
-    use super::*;
-    use crate::session::YuubinsyaServerProxy;
-    use tokio::net::TcpListener;
-    use tokio::sync::Notify;
-    use yuhaiin_core::Network;
-
-    type DatagramPacket = (Vec<u8>, Endpoint);
-
-    struct EchoDatagram {
-        queue: Arc<Mutex<VecDeque<DatagramPacket>>>,
-        notify: Arc<Notify>,
-    }
-
-    impl AsyncDatagram for EchoDatagram {
-        fn send_to<'a>(
-            &'a self,
-            payload: &'a [u8],
-            target: Endpoint,
-        ) -> BoxFuture<'a, Result<usize>> {
-            let queue = Arc::clone(&self.queue);
-            let notify = Arc::clone(&self.notify);
-            Box::pin(async move {
-                queue.lock().await.push_back((payload.to_vec(), target));
-                notify.notify_one();
-                Ok(payload.len())
-            })
-        }
-
-        fn recv_from<'a>(
-            &'a self,
-            buffer: &'a mut [u8],
-        ) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
-            let queue = Arc::clone(&self.queue);
-            let notify = Arc::clone(&self.notify);
-            Box::pin(async move {
-                loop {
-                    if let Some((payload, target)) = queue.lock().await.pop_front() {
-                        if buffer.len() < payload.len() {
-                            return Err(Error::invalid("echo buffer is too small"));
-                        }
-                        buffer[..payload.len()].copy_from_slice(&payload);
-                        return Ok((payload.len(), target));
-                    }
-                    notify.notified().await;
-                }
-            })
-        }
-
-        fn local_addr(&self) -> Result<Endpoint> {
-            Ok(Endpoint::ip(Network::Udp, "127.0.0.1:1".parse().unwrap()))
-        }
-
-        fn close(&self) -> BoxFuture<'_, Result<()>> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    struct EchoProxy {
-        opened: Arc<AtomicUsize>,
-    }
-
-    impl AsyncProxy for EchoProxy {
-        fn connect<'a>(
-            &'a self,
-            _context: &'a FlowContext,
-        ) -> BoxFuture<'a, Result<BoxAsyncStream>> {
-            Box::pin(async { Err(Error::new(ErrorKind::Unsupported, "echo has no TCP path")) })
-        }
-
-        fn open_datagram<'a>(
-            &'a self,
-            _context: &'a FlowContext,
-        ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
-            self.opened.fetch_add(1, Ordering::AcqRel);
-            Box::pin(async {
-                Ok(Box::new(EchoDatagram {
-                    queue: Arc::new(Mutex::new(VecDeque::new())),
-                    notify: Arc::new(Notify::new()),
-                }) as Box<dyn AsyncDatagram>)
-            })
-        }
-
-        fn close(&self) -> BoxFuture<'_, Result<()>> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn direct_go_uot_proxy_round_trips_through_tcp_server() {
-        let password_hash = derive_salt(b"password");
-        let opened = Arc::new(AtomicUsize::new(0));
-        let server = Arc::new(YuubinsyaServerProxy::new(
-            password_hash,
-            Arc::new(EchoProxy {
-                opened: Arc::clone(&opened),
-            }),
-        ));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server_task = {
-            let server = Arc::clone(&server);
-            tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let _ = server.serve(stream).await;
-            })
-        };
-        let config = serde_json::json!({
-            "chain": [
-                { "type": "fixedv2", "fixedv2": {
-                    "addresses": [{ "host": address.ip().to_string(), "port": address.port() }]
-                }},
-                { "type": "yuubinsya", "yuubinsya": {
-                    "password": "password",
-                    "udp_over_stream": true,
-                    "udp_coalesce": true
-                }}
-            ]
-        });
-        let proxy = crate::ChainProxy::from_go_json_with_resolver(
-            &config.to_string(),
-            Arc::new(yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver),
-        )
-        .unwrap();
-        let target = Endpoint::domain(Network::Udp, DomainName::new("example.com").unwrap(), 53);
-        let context = FlowContext::new(target.clone());
-        let datagram = proxy.open_datagram(&context).await.unwrap();
-        datagram.send_to(b"query", target.clone()).await.unwrap();
-        let mut buffer = [0u8; 64];
-        let (length, response_target) = datagram.recv_from(&mut buffer).await.unwrap();
-        assert_eq!(&buffer[..length], b"query");
-        assert_eq!(response_target, target);
-        assert_eq!(opened.load(Ordering::Acquire), 1);
-        proxy.close().await.unwrap();
-        let error = datagram
-            .send_to(b"after-close", target.clone())
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind, ErrorKind::Closed);
-        datagram.close().await.unwrap();
-        server.close().await;
-        server_task.abort();
-    }
+    use crate::direct_uot::{fixed_endpoints, parse_go_direct_uot};
+    use std::sync::Arc;
 
     #[test]
     fn direct_uot_parser_leaves_tls_chain_for_the_full_chain_builder() {

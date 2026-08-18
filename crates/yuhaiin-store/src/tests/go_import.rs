@@ -588,7 +588,7 @@ fn go_node_runtime_keeps_unknown_protocols_but_rejects_malformed_json() {
 #[test]
 fn go_proxy_runtime_converts_core_base_transports_and_rejects_chain_layers() {
     use std::time::Duration;
-    use yuhaiin_core::proxy_factory::BaseProxyKind;
+    use yuhaiin_protocol::proxy_factory::BaseProxyKind;
 
     let direct = GoNodeRecord {
         id: "direct".to_owned(),

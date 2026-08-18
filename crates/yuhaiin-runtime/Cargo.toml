@@ -26,8 +26,8 @@ http-termination = [
     "hyper-util/server-auto",
     "hyper-util/tokio",
 ]
-tun = ["yuhaiin-core/tun"]
-tun-routes = ["tun", "yuhaiin-core/tun-routes"]
+tun = ["yuhaiin-tun/async-proxy"]
+tun-routes = ["tun", "yuhaiin-tun/tun-routes"]
 doh-tls = [
     "http2",
     "dep:rustls",
@@ -40,7 +40,6 @@ doh-tls = [
     "dep:ed25519-tls-auto",
     "dep:rsa-tls-auto",
     "dep:signature-tls-auto",
-    "yuhaiin-core/tls-rustcrypto",
     "yuhaiin-protocol/tls-rustcrypto",
     "dep:webpki-roots",
     "yuhaiin-dns/tls",
@@ -49,7 +48,6 @@ doh-tls = [
 websocket = [
     "dep:futures-util",
     "dep:tokio-tungstenite",
-    "yuhaiin-core/websocket",
     "yuhaiin-protocol/websocket",
 ]
 
@@ -89,6 +87,7 @@ yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
 yuhaiin-geo = { path = "../yuhaiin-geo" }
 yuhaiin-protocol = { path = "../yuhaiin-protocol" }
 yuhaiin-store = { path = "../yuhaiin-store", features = ["async-dns"] }
+yuhaiin-tun = { path = "../yuhaiin-tun" }
 yuhaiin-trie = { path = "../yuhaiin-trie", features = ["async-proxy"] }
 yuhaiin-wireguard = { path = "../yuhaiin-wireguard" }
 yuhaiin-platform = { path = "../yuhaiin-platform" }

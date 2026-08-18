@@ -515,7 +515,7 @@ async fn api_adds_and_removes_socks5_and_yuubinsya_inbounds_live() {
 
     let mut yuubinsya = AsyncYuubinsyaTcpSession::connect(
         connect_loopback(yuubinsya_inbound).await,
-        yuhaiin_core::yuubinsya::derive_salt(YUUBINSYA_PASSWORD.as_bytes()),
+        yuhaiin_protocol::yuubinsya::derive_salt(YUUBINSYA_PASSWORD.as_bytes()),
         Endpoint::ip(Network::Tcp, fixture.target),
     )
     .await

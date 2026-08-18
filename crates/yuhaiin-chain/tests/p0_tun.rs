@@ -24,12 +24,12 @@ use yuhaiin_chain::{
     ValidatedYuubinsya, YuubinsyaH2Server, YuubinsyaServerProxy, parse_config,
 };
 use yuhaiin_core::proxy::{AsyncProxy, DirectAsyncProxy, DropAsyncProxy, StaticProxySelector};
-use yuhaiin_core::tun::{SmoltcpTunDevice, TunDispatcher, TunProxyRuntime};
-use yuhaiin_core::websocket::WebSocketIo;
-use yuhaiin_core::yuubinsya::{
+use yuhaiin_core::{DomainName, Endpoint, FlowContext, Network};
+use yuhaiin_protocol::websocket::WebSocketIo;
+use yuhaiin_protocol::yuubinsya::{
     YuubinsyaProtocol, decode_header, decode_uot_frame, derive_salt, encode_uot_frame,
 };
-use yuhaiin_core::{DomainName, Endpoint, FlowContext, Network};
+use yuhaiin_tun::{SmoltcpTunDevice, TunDispatcher, TunProxyRuntime};
 
 const PASSWORD: &str = "p0-yuubinsya-password";
 const CA_CERTIFICATE_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
@@ -1250,9 +1250,9 @@ async fn chain_client_uses_multiple_tls_h2_connections_for_concurrent_migrated_u
         .unwrap();
     let chain = chain_client_with_max_streams(address, certificate.as_ref().to_vec(), 1);
 
-    let mut first = chain.connect_uot(0).await.unwrap();
+    let first = chain.connect_uot(0).await.unwrap();
     let migrate_id = first.migrate_id;
-    let mut second = chain.connect_uot(migrate_id).await.unwrap();
+    let second = chain.connect_uot(migrate_id).await.unwrap();
     assert_eq!(chain.h2_connection_count().await, 2);
     assert_eq!(chain.h2_active_streams().await, 2);
     let stats = chain.runtime_stats().await;
@@ -1343,7 +1343,7 @@ async fn tls_h2_yuubinsya_server_dispatches_tcp_and_migrated_uot() {
     tcp.shutdown().await.unwrap();
 
     let udp_destination = Endpoint::ip(Network::Udp, udp_target_address);
-    let mut first = chain.connect_uot(0).await.unwrap();
+    let first = chain.connect_uot(0).await.unwrap();
     assert_ne!(first.migrate_id, 0);
     first.send_to(&udp_destination, b"first-uot").await.unwrap();
     let (source, response) = first.recv_from().await.unwrap();
@@ -1352,7 +1352,7 @@ async fn tls_h2_yuubinsya_server_dispatches_tcp_and_migrated_uot() {
     let migrate_id = first.migrate_id;
     first.shutdown().await.unwrap();
 
-    let mut second = chain.connect_uot(migrate_id).await.unwrap();
+    let second = chain.connect_uot(migrate_id).await.unwrap();
     assert_eq!(second.migrate_id, migrate_id);
     second
         .send_to(&udp_destination, b"second-uot")

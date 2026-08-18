@@ -22,13 +22,13 @@ use yuhaiin_core::dns::{
 };
 use yuhaiin_core::http2::{H2DohClient, H2DohConnector};
 use yuhaiin_core::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
-use yuhaiin_core::tun::{TunConfig, TunDispatcher, TunProxyRuntime, TunRuntime};
 use yuhaiin_core::{BoxFuture, DomainName, IpSet, LocalBoxFuture, Result as CoreResult};
 use yuhaiin_store::ConfigStore;
 use yuhaiin_store::fakeip::{
     AsyncDomainResolver, FakeIpAnswerTransform, FakeIpAsyncDnsHandler, FakeIpConfig, FakeIpPool,
     FakeIpPoolOptions,
 };
+use yuhaiin_tun::{TunConfig, TunDispatcher, TunProxyRuntime, TunRuntime};
 
 const FAKEIP_START: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 10);
 const FAKEIP_END: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 14);

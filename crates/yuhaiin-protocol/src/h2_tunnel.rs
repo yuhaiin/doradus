@@ -313,9 +313,9 @@ struct H2PoolKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct H2PoolEndpoint {
-    pub(crate) address: SocketAddr,
-    pub(crate) bind_interface: Option<String>,
+pub struct H2PoolEndpoint {
+    pub address: SocketAddr,
+    pub bind_interface: Option<String>,
 }
 
 /// A small endpoint, interface-policy, and TLS-identity keyed HTTP/2 pool.
@@ -418,7 +418,7 @@ impl H2Pool {
         .await
     }
 
-    pub(crate) async fn open_with_endpoints_and_local_addr<F, Fut>(
+    pub async fn open_with_endpoints_and_local_addr<F, Fut>(
         &self,
         endpoints: &[H2PoolEndpoint],
         tls_identity: &str,
@@ -741,7 +741,7 @@ async fn relay(
     }
 }
 
-pub(crate) async fn send_h2_data(stream: &mut h2::SendStream<Bytes>, data: &[u8]) -> Result<()> {
+pub async fn send_h2_data(stream: &mut h2::SendStream<Bytes>, data: &[u8]) -> Result<()> {
     // `h2::SendStream::send_data` buffers without a producer-side bound when
     // the peer's flow-control window is exhausted. Never hand it bytes until
     // capacity has been assigned; this keeps the relay's pending memory

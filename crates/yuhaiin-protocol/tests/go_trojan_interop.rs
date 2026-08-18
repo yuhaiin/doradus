@@ -37,7 +37,7 @@ async fn go_trojan_client_over_tls_websocket_connects_to_rust_wire_server() {
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let websocket = support::accept_tls_websocket(stream).await;
-        let mut stream = yuhaiin_core::websocket::WebSocketIo::new(websocket);
+        let mut stream = yuhaiin_protocol::websocket::WebSocketIo::new(websocket);
         serve_trojan_wire(&mut stream).await;
     });
 

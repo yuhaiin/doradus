@@ -14,7 +14,7 @@ use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::icmp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpVersion, Ipv4Packet};
-use yuhaiin_core::tun::{TunConfig, TunRuntime};
+use yuhaiin_tun::{TunConfig, TunRuntime};
 
 fn main() -> std::io::Result<()> {
     let name = env::var("YUHAIIN_TUN_NAME").ok();
@@ -64,7 +64,7 @@ fn main() -> std::io::Result<()> {
     if route_smoke {
         #[cfg(all(feature = "tun-routes", target_os = "linux"))]
         {
-            use yuhaiin_core::tun::TunRoute;
+            use yuhaiin_tun::TunRoute;
 
             // Keep the route smoke independent from the service fixture's
             // single /32 route.  Multiple disjoint prefixes exercise the
@@ -391,7 +391,7 @@ fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
     use std::time::{Duration, Instant};
 
     use yuhaiin_core::proxy::{AsyncProxy, DropAsyncProxy, FixedAsyncProxy, StaticProxySelector};
-    use yuhaiin_core::tun::{TunDispatcher, TunProxyRuntime};
+    use yuhaiin_tun::{TunDispatcher, TunProxyRuntime};
 
     let total_bytes = env::var("YUHAIIN_TUN_BENCH_BYTES")
         .ok()
@@ -562,7 +562,7 @@ fn run_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
     use std::sync::Arc;
     use std::time::Duration;
     use yuhaiin_core::proxy::{AsyncProxy, DropAsyncProxy, FixedAsyncProxy, StaticProxySelector};
-    use yuhaiin_core::tun::{TunDispatcher, TunProxyRuntime};
+    use yuhaiin_tun::{TunDispatcher, TunProxyRuntime};
 
     let async_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -657,7 +657,7 @@ fn run_udp_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
     use std::time::Duration;
 
     use yuhaiin_core::proxy::{AsyncProxy, DropAsyncProxy, FixedAsyncProxy, StaticProxySelector};
-    use yuhaiin_core::tun::{TunDispatcher, TunProxyRuntime};
+    use yuhaiin_tun::{TunDispatcher, TunProxyRuntime};
 
     let async_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -753,8 +753,8 @@ fn run_dns_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
         encode_query,
     };
     use yuhaiin_core::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
-    use yuhaiin_core::tun::{TunDispatcher, TunProxyRuntime};
     use yuhaiin_core::{DomainName, IpSet, LocalBoxFuture, Result as CoreResult};
+    use yuhaiin_tun::{TunDispatcher, TunProxyRuntime};
 
     struct FixedDns;
     impl DnsHandler for FixedDns {

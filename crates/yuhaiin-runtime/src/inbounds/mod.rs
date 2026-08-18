@@ -244,7 +244,7 @@ async fn run_until_with_ready_signal(
 pub async fn run_until_with_tun_runtime(
     controller: RuntimeController,
     shutdown: watch::Receiver<bool>,
-    tun: yuhaiin_core::tun::TunRuntime,
+    tun: yuhaiin_tun::TunRuntime,
     config: crate::TunRuntimeConfig,
 ) -> Result<()> {
     run_until_with_tun_runtime_ready(controller, shutdown, tun, config, None).await
@@ -256,7 +256,7 @@ pub async fn run_until_with_tun_runtime(
 pub async fn run_until_with_tun_runtime_selector_ready(
     controller: RuntimeController,
     shutdown: watch::Receiver<bool>,
-    tun: yuhaiin_core::tun::TunRuntime,
+    tun: yuhaiin_tun::TunRuntime,
     config: crate::TunRuntimeConfig,
     selector_ready: oneshot::Sender<()>,
 ) -> Result<()> {
@@ -267,7 +267,7 @@ pub async fn run_until_with_tun_runtime_selector_ready(
 async fn run_until_with_tun_runtime_ready(
     controller: RuntimeController,
     shutdown: watch::Receiver<bool>,
-    mut tun: yuhaiin_core::tun::TunRuntime,
+    mut tun: yuhaiin_tun::TunRuntime,
     config: crate::TunRuntimeConfig,
     selector_ready: Option<oneshot::Sender<()>>,
 ) -> Result<()> {
@@ -368,7 +368,7 @@ pub async fn run_until_with_tun_fd(
     fd: OwnedFd,
     config: crate::TunRuntimeConfig,
 ) -> Result<()> {
-    let tun = yuhaiin_core::tun::TunRuntime::from_owned_fd(config.tun.clone(), fd)
+    let tun = yuhaiin_tun::TunRuntime::from_owned_fd(config.tun.clone(), fd)
         .map_err(|error| Error::new(ErrorKind::Io, format!("open injected TUN fd: {error}")))?;
     run_until_with_tun_runtime(controller, shutdown, tun, config).await
 }
@@ -383,7 +383,7 @@ pub async fn run_until_with_tun_fd_selector_ready(
     config: crate::TunRuntimeConfig,
     selector_ready: oneshot::Sender<()>,
 ) -> Result<()> {
-    let tun = yuhaiin_core::tun::TunRuntime::from_owned_fd(config.tun.clone(), fd)
+    let tun = yuhaiin_tun::TunRuntime::from_owned_fd(config.tun.clone(), fd)
         .map_err(|error| Error::new(ErrorKind::Io, format!("open injected TUN fd: {error}")))?;
     run_until_with_tun_runtime_selector_ready(controller, shutdown, tun, config, selector_ready)
         .await
@@ -976,12 +976,12 @@ async fn start_listeners(
                     .map(|auth| {
                         auth.inbound_passwords()
                             .into_iter()
-                            .map(|password| yuhaiin_core::yuubinsya::derive_salt(&password))
+                            .map(|password| yuhaiin_protocol::yuubinsya::derive_salt(&password))
                             .collect::<Vec<_>>()
                     })
                     .filter(|passwords| !passwords.is_empty())
                     .unwrap_or_else(|| {
-                        vec![yuhaiin_core::yuubinsya::derive_salt(
+                        vec![yuhaiin_protocol::yuubinsya::derive_salt(
                             spec.password.as_bytes(),
                         )]
                     });
@@ -996,7 +996,7 @@ async fn start_listeners(
                             continue;
                         }
                     };
-                    yuhaiin_core::proxy::YuubinsyaUdpServer::new(
+                    yuhaiin_protocol::yuubinsya_udp::YuubinsyaUdpServer::new(
                         Box::new(yuhaiin_protocol::aead::AeadUdpServer::new(
                             raw,
                             password,
@@ -1010,7 +1010,7 @@ async fn start_listeners(
                     // format without the SOCKS5 three-byte prefix.  The
                     // prefix is only used when Yuubinsya wraps a SOCKS5
                     // UDP association.
-                    match yuhaiin_core::proxy::YuubinsyaUdpServer::bind_with_password_hashes(
+                    match yuhaiin_protocol::yuubinsya_udp::YuubinsyaUdpServer::bind_with_password_hashes(
                         spec.listen,
                         password_hashes,
                         false,
@@ -4026,7 +4026,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
 
             let result = tokio::time::timeout(Duration::from_secs(2), async {
                 let transport = TcpStream::connect(inbound_address).await.unwrap();
-                let password = yuhaiin_core::yuubinsya::derive_salt(b"test-password");
+                let password = yuhaiin_protocol::yuubinsya::derive_salt(b"test-password");
                 let destination = Endpoint::ip(Network::Tcp, echo_address);
                 let mut client =
                     AsyncYuubinsyaTcpSession::connect(transport, password, destination)

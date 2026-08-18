@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use tokio_tungstenite::{client_async, tungstenite::client::IntoClientRequest};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
-use yuhaiin_core::websocket::WebSocketIo;
 use yuhaiin_core::{BoxFuture, Error, ErrorKind, FlowContext, Result};
+
+pub use super::websocket_io::WebSocketIo;
 
 pub struct WebSocketProxy {
     upstream: Arc<dyn AsyncProxy>,

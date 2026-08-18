@@ -44,24 +44,29 @@ use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
 
 #[cfg(feature = "async-proxy")]
-use crate::Endpoint;
+use yuhaiin_core::Endpoint;
 #[cfg(feature = "async-proxy")]
-use crate::LocalBoxFuture;
+use yuhaiin_core::RouteMode;
 #[cfg(feature = "async-proxy")]
-use crate::nat::{NatKey, NatTable};
+use yuhaiin_core::nat::{NatKey, NatTable};
 #[cfg(feature = "async-proxy")]
-use crate::process::{ProcessResolver, default_process_resolver};
-use crate::{Error, ErrorKind, Network, Result, RouteMode};
+use yuhaiin_core::process::{ProcessResolver, default_process_resolver};
+#[cfg(test)]
+pub use yuhaiin_core::{BoxFuture, DomainName, IpSet};
+use yuhaiin_core::{Error, ErrorKind, Network, Result};
+pub use yuhaiin_core::{FlowContext, LocalBoxFuture};
+#[cfg(test)]
+pub use yuhaiin_core::{dns, process, proxy};
 
-pub use crate::flow::{Flow as TunFlow, FlowKey as TunFlowKey};
+pub use yuhaiin_core::flow::{Flow as TunFlow, FlowKey as TunFlowKey};
 #[cfg(feature = "async-proxy")]
-pub use crate::flow::{FlowDirection as TunFlowDirection, FlowObserver as TunFlowObserver};
+pub use yuhaiin_core::flow::{FlowDirection as TunFlowDirection, FlowObserver as TunFlowObserver};
 
 #[cfg(feature = "async-proxy")]
-use crate::dns::{AsyncDnsHandler, DnsHandler, answer_query};
+use yuhaiin_core::dns::{AsyncDnsHandler, DnsHandler, answer_query};
 
 #[cfg(feature = "async-proxy")]
-use crate::proxy::{AsyncProxy, AsyncProxySelector, stream_local_addr, stream_remote_addr};
+use yuhaiin_core::proxy::{AsyncProxy, AsyncProxySelector, stream_local_addr, stream_remote_addr};
 
 fn tun_debug(message: impl std::fmt::Display) {
     if std::env::var_os("YUHAIIN_TUN_DEBUG").is_some() {
@@ -4285,7 +4290,6 @@ impl TunRuntime {
     }
 }
 
-#[cfg(feature = "tun")]
 impl Drop for TunRuntime {
     fn drop(&mut self) {
         #[cfg(feature = "tun-routes")]

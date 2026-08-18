@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let target =
                 env::var("YUHAIIN_CHAIN_TARGET").unwrap_or_else(|_| "example.com:53".to_owned());
             let destination = endpoint(&target, Network::Udp)?;
-            let mut session = client.connect_uot(0).await?;
+            let session = client.connect_uot(0).await?;
             let probe = env::var_os("YUHAIIN_CHAIN_PROBE").is_some();
             let payload = if probe {
                 dns_probe_query()

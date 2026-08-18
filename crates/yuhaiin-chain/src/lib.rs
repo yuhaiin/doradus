@@ -11,25 +11,20 @@
 //! being accidentally mixed into one "universal" connection type.
 
 mod config;
-mod direct_uot;
-mod direct_uot_session;
 mod go_node;
-mod h2_server;
-mod h2_tunnel;
-mod session;
 
 pub use config::{
     ChainConfig, ChainNode, ValidatedChain, ValidatedFixedAddress, ValidatedHttp, ValidatedHttp2,
     ValidatedSocks5, ValidatedTls, ValidatedWebSocket, ValidatedYuubinsya, parse_config,
 };
 pub use go_node::parse_go_node;
-pub use h2_server::YuubinsyaH2Server;
-pub use h2_tunnel::{H2Connection, H2PoolStats};
-pub use session::{
+pub use yuhaiin_protocol::YuubinsyaH2Server;
+pub use yuhaiin_protocol::{
     AsyncYuubinsyaPingServerSession, AsyncYuubinsyaPingSession, AsyncYuubinsyaTcpSession,
     AsyncYuubinsyaUotServerSession, AsyncYuubinsyaUotSession, YuubinsyaDnsHandler,
     YuubinsyaServerProxy,
 };
+pub use yuhaiin_protocol::{H2Connection, H2PoolStats};
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -51,12 +46,12 @@ use yuhaiin_core::proxy::{
 };
 use yuhaiin_core::{
     BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, ResolveStrategy, Result,
-    yuubinsya::derive_salt,
 };
 
-use crate::direct_uot::{DirectUotProxy, parse_go_direct_uot};
-use crate::h2_tunnel::{H2Pool, H2PoolEndpoint};
-use crate::session::{MAX_UOT_COALESCE_BYTES, MAX_UOT_COALESCE_FRAMES, read_uot_frame};
+use yuhaiin_protocol::direct_uot::{DirectUotProxy, parse_go_direct_uot};
+use yuhaiin_protocol::session::{MAX_UOT_COALESCE_BYTES, MAX_UOT_COALESCE_FRAMES, read_uot_frame};
+use yuhaiin_protocol::yuubinsya::derive_salt;
+use yuhaiin_protocol::{H2Pool, H2PoolEndpoint};
 
 /// A single best-effort runtime observation for the reusable chain client.
 /// The pool counters are monotonic, while connection/stream counts describe
@@ -622,7 +617,7 @@ impl ChainClient {
                 .map_err(|error| {
                     Error::new(ErrorKind::Protocol, format!("WebSocket handshake: {error}"))
                 })?;
-            stream = Box::new(yuhaiin_core::websocket::WebSocketIo::new(websocket));
+            stream = Box::new(yuhaiin_protocol::websocket::WebSocketIo::new(websocket));
         }
         H2Connection::handshake_with_limits_and_local_addr(
             stream,
@@ -1002,7 +997,7 @@ impl ChainUotSession {
     }
 
     async fn send_to(&self, target: &Endpoint, payload: &[u8]) -> Result<()> {
-        let frame = yuhaiin_core::yuubinsya::encode_uot_frame(target, payload)?;
+        let frame = yuhaiin_protocol::yuubinsya::encode_uot_frame(target, payload)?;
         let mut writer = self.writer.lock().await;
         if !writer.udp_coalesce {
             writer.stream.write_all(&frame).await.map_err(io_error)?;
@@ -1032,7 +1027,7 @@ impl ChainUotSession {
         self.flush().await?;
         let mut reader = self.reader.lock().await;
         let frame = read_uot_frame(&mut *reader).await?;
-        let (destination, payload, _) = yuhaiin_core::yuubinsya::decode_uot_frame(&frame)?;
+        let (destination, payload, _) = yuhaiin_protocol::yuubinsya::decode_uot_frame(&frame)?;
         Ok((destination, payload.to_vec()))
     }
 
@@ -1530,7 +1525,7 @@ mod tests {
             .expect("coalesced UOT frame was not flushed")
             .unwrap();
         let (decoded_target, payload, _) =
-            yuhaiin_core::yuubinsya::decode_uot_frame(&frame).unwrap();
+            yuhaiin_protocol::yuubinsya::decode_uot_frame(&frame).unwrap();
         assert_eq!(decoded_target, target);
         assert_eq!(payload, b"low-traffic");
         session.shutdown().await.unwrap();

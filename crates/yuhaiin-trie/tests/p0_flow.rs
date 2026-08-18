@@ -22,7 +22,6 @@ use yuhaiin_core::proxy::{
     AsyncDatagram, AsyncProxy, BlockingStreamProxy, BoxAsyncStream, FixedAsyncProxy,
     HttpProxyConnector, Socks5Connector, StaticProxySelector,
 };
-use yuhaiin_core::tun::{SmoltcpTunDevice, TunDispatcher, TunEvent, TunFlowKey, TunProxyRuntime};
 use yuhaiin_core::{
     BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, IpSet, Network, ResolverPolicy,
     Result, RouteMode,
@@ -31,6 +30,7 @@ use yuhaiin_store::ConfigStore;
 use yuhaiin_store::fakeip::{
     AsyncDomainResolver, FakeIpAnswerTransform, FakeIpAsyncDnsHandler, FakeIpConfig, FakeIpPool,
 };
+use yuhaiin_tun::{SmoltcpTunDevice, TunDispatcher, TunEvent, TunFlowKey, TunProxyRuntime};
 
 use yuhaiin_trie::router::{
     RouteDecision, RouteRule, Router, RouterRuntime, RuleAction, RuntimeRoutedProxySelector,
@@ -822,7 +822,7 @@ async fn tcp_half_close_forwards_eof_and_close_releases_task() {
         .unwrap()
         .with_io_timeout(Duration::from_secs(1))
         .unwrap();
-    let flow = yuhaiin_core::tun::TunFlow {
+    let flow = yuhaiin_tun::TunFlow {
         key: TunFlowKey {
             network: Network::Tcp,
             source: "10.0.0.2:41000".parse().unwrap(),
@@ -872,7 +872,7 @@ async fn tcp_connect_timeout_drops_pending_future_and_task() {
         .unwrap()
         .with_io_timeout(Duration::from_millis(10))
         .unwrap();
-    let flow = yuhaiin_core::tun::TunFlow {
+    let flow = yuhaiin_tun::TunFlow {
         key: TunFlowKey {
             network: Network::Tcp,
             source: "10.0.0.2:41001".parse().unwrap(),
@@ -910,7 +910,7 @@ async fn dropping_proxy_runtime_aborts_owned_flow_tasks() {
     });
     {
         let mut runtime = TunProxyRuntime::new(selector, 8).unwrap();
-        let flow = yuhaiin_core::tun::TunFlow {
+        let flow = yuhaiin_tun::TunFlow {
             key: TunFlowKey {
                 network: Network::Tcp,
                 source: "10.0.0.2:41003".parse().unwrap(),
@@ -1058,7 +1058,7 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
     );
     runtime
         .handle_event(TunEvent::UdpDatagram {
-            flow: yuhaiin_core::tun::TunFlow { key: flow.key },
+            flow: yuhaiin_tun::TunFlow { key: flow.key },
             payload: payload.to_vec(),
         })
         .unwrap();

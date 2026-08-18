@@ -8,11 +8,11 @@
 
 use std::sync::Arc;
 
+use crate::yuubinsya::{decode_endpoint, encode_endpoint};
 use sha2::{Digest, Sha224};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split};
 use tokio::sync::Mutex;
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
-use yuhaiin_core::yuubinsya::{decode_endpoint, encode_endpoint};
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 pub const MAX_PACKET_SIZE: usize = 8 * 1024;

@@ -4,6 +4,7 @@ members = [
     "crates/yuhaiin-types",
     "crates/yuhaiin-dns",
     "crates/yuhaiin-core",
+    "crates/yuhaiin-tun",
     "crates/yuhaiin-chain",
     "crates/yuhaiin-geo",
     "crates/yuhaiin-protocol",

@@ -151,7 +151,7 @@ pub(crate) fn inbound_dns_handler(
 pub struct TunRuntimeConfig {
     pub inbound_id: Option<String>,
     pub enabled: bool,
-    pub tun: yuhaiin_core::tun::TunConfig,
+    pub tun: yuhaiin_tun::TunConfig,
     /// Go's `TunProtocol.routes` and `excludes`, kept together because Go
     /// installs both lists through the same device route boundary.
     pub routes: Vec<String>,
@@ -185,7 +185,7 @@ pub async fn load_tun_config(store: &yuhaiin_store::ConfigStore) -> Result<TunRu
         .and_then(Value::as_bool)
         .unwrap_or(false)
         || std::env::var("YUHAIIN_TUN").ok().as_deref() == Some("1");
-    let tun = yuhaiin_core::tun::TunConfig {
+    let tun = yuhaiin_tun::TunConfig {
         name: value.get("name").and_then(Value::as_str).map(str::to_owned),
         ipv4: value
             .get("ipv4")
@@ -430,7 +430,7 @@ fn parse_go_tun_config(record: &GoInboundRecord) -> Result<TunRuntimeConfig> {
     Ok(TunRuntimeConfig {
         inbound_id: Some(record.id.clone()),
         enabled: record.enabled,
-        tun: yuhaiin_core::tun::TunConfig {
+        tun: yuhaiin_tun::TunConfig {
             name,
             ipv4,
             ipv6,
@@ -484,7 +484,7 @@ fn parse_ipv6_string(value: &Value) -> Option<(Ipv6Addr, u8)> {
 }
 
 #[cfg(all(feature = "tun", feature = "tun-routes", target_os = "linux"))]
-fn parse_tun_routes(routes: &[String]) -> Result<Vec<yuhaiin_core::tun::TunRoute>> {
+fn parse_tun_routes(routes: &[String]) -> Result<Vec<yuhaiin_tun::TunRoute>> {
     routes
         .iter()
         .map(|value| {
@@ -497,15 +497,15 @@ fn parse_tun_routes(routes: &[String]) -> Result<Vec<yuhaiin_core::tun::TunRoute
             let prefix = prefix
                 .parse()
                 .map_err(|error| Error::invalid(format!("TUN route prefix {value:?}: {error}")))?;
-            yuhaiin_core::tun::TunRoute::new(address, prefix)
+            yuhaiin_tun::TunRoute::new(address, prefix)
                 .map_err(|error| Error::invalid(format!("TUN route {value:?}: {error}")))
         })
         .collect()
 }
 
 #[cfg(feature = "tun")]
-pub(crate) fn open_tun(config: &TunRuntimeConfig) -> Result<yuhaiin_core::tun::TunRuntime> {
-    let tun = yuhaiin_core::tun::TunRuntime::open(config.tun.clone()).map_err(io_error)?;
+pub(crate) fn open_tun(config: &TunRuntimeConfig) -> Result<yuhaiin_tun::TunRuntime> {
+    let tun = yuhaiin_tun::TunRuntime::open(config.tun.clone()).map_err(io_error)?;
     if config.routes.is_empty() {
         return Ok(tun);
     }
@@ -551,7 +551,7 @@ pub(crate) fn open_tun(config: &TunRuntimeConfig) -> Result<yuhaiin_core::tun::T
 #[cfg(feature = "tun")]
 pub async fn run_tun_device_until(
     controller: RuntimeController,
-    tun: yuhaiin_core::tun::TunRuntime,
+    tun: yuhaiin_tun::TunRuntime,
     config: TunRuntimeConfig,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -569,7 +569,7 @@ pub async fn run_tun_device_until(
 #[cfg(feature = "tun")]
 pub async fn run_tun_device_until_ref(
     controller: RuntimeController,
-    tun: &mut yuhaiin_core::tun::TunRuntime,
+    tun: &mut yuhaiin_tun::TunRuntime,
     config: TunRuntimeConfig,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -601,7 +601,7 @@ pub async fn run_tun_device_until_ref(
         )
         .await?;
     controller.monitor().info("TUN inbound ready");
-    let mut dispatcher = yuhaiin_core::tun::TunDispatcher::new(64 * 1024, 64 * 1024, 2048)?
+    let mut dispatcher = yuhaiin_tun::TunDispatcher::new(64 * 1024, 64 * 1024, 2048)?
         .with_skip_multicast(config.tun.skip_multicast);
     tun.run_dispatcher_until(
         &mut dispatcher,
@@ -855,7 +855,7 @@ mod tests {
         TunRuntimeConfig {
             inbound_id: None,
             enabled,
-            tun: yuhaiin_core::tun::TunConfig {
+            tun: yuhaiin_tun::TunConfig {
                 name: Some("platform-vpn".to_owned()),
                 ipv4: Some((Ipv4Addr::new(10, 42, 0, 1), 24)),
                 ..Default::default()

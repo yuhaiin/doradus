@@ -3,10 +3,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::yuubinsya::{decode_uot_frame, encode_uot_frame};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify, watch};
-use yuhaiin_core::yuubinsya::{decode_uot_frame, encode_uot_frame};
 use yuhaiin_core::{Endpoint, Error, ErrorKind, Result};
 
 const MAX_COALESCE_BYTES: usize = 64 * 1024;

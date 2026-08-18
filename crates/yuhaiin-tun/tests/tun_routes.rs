@@ -7,7 +7,7 @@ mod linux {
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
 
-    use yuhaiin_core::tun::{
+    use yuhaiin_tun::{
         LinuxTunRouteBackend, TunConfig, TunRoute, TunRouteLease, TunRuntime,
         probe_linux_capabilities,
     };
@@ -28,9 +28,9 @@ mod linux {
         let capabilities = probe_linux_capabilities();
         assert!(matches!(
             capabilities.route_control,
-            yuhaiin_core::tun::CapabilityState::Available
-                | yuhaiin_core::tun::CapabilityState::Unavailable
-                | yuhaiin_core::tun::CapabilityState::Unknown
+            yuhaiin_tun::CapabilityState::Available
+                | yuhaiin_tun::CapabilityState::Unavailable
+                | yuhaiin_tun::CapabilityState::Unknown
         ));
         let route = TunRoute::new("198.18.0.0".parse::<IpAddr>().unwrap(), 15).unwrap();
         let backend = LinuxTunRouteBackend::new("lo").unwrap();
@@ -126,7 +126,7 @@ mod linux {
         let capabilities = probe_linux_capabilities();
         assert!(matches!(
             capabilities.route_control,
-            yuhaiin_core::tun::CapabilityState::Available
+            yuhaiin_tun::CapabilityState::Available
         ));
 
         let mut route = TunRoute::new("198.18.0.0".parse::<IpAddr>().unwrap(), 15).unwrap();

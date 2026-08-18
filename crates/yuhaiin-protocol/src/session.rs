@@ -7,18 +7,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use crate::yuubinsya::{
+    YuubinsyaHeader, YuubinsyaProtocol, decode_header, decode_header_any, decode_uot_frame,
+    encode_header, encode_uot_frame,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split};
 use tokio::sync::{Mutex, Notify, mpsc};
 use yuhaiin_core::flow::{Flow, FlowDirection, FlowKey, FlowObserver, FlowObserverGuard};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy};
-use yuhaiin_core::yuubinsya::{
-    YuubinsyaHeader, YuubinsyaProtocol, decode_header, decode_header_any, decode_uot_frame,
-    encode_header, encode_uot_frame,
-};
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Result};
 
-pub(crate) const MAX_UOT_COALESCE_BYTES: usize = 64 * 1024;
-pub(crate) const MAX_UOT_COALESCE_FRAMES: usize = 32;
+pub const MAX_UOT_COALESCE_BYTES: usize = 64 * 1024;
+pub const MAX_UOT_COALESCE_FRAMES: usize = 32;
 // Go's coalescer receives one queued packet and drains the packets already
 // waiting behind it before writing. A short scheduling window gives the async
 // sender the same opportunity without flushing every notification separately.
@@ -1273,7 +1273,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncYuubinsyaUotServerSession<S> {
     }
 }
 
-pub(crate) async fn read_uot_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
+pub async fn read_uot_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
     let mut endpoint = read_endpoint_bytes(stream).await?;
     let mut length = [0u8; 2];
     stream.read_exact(&mut length).await.map_err(io_error)?;
@@ -1538,8 +1538,7 @@ mod tests {
         });
         let mut header = vec![0u8; 1 + 32 + 1 + 4 + 2];
         server.read_exact(&mut header).await.unwrap();
-        let (decoded, consumed) =
-            yuhaiin_core::yuubinsya::decode_header(&password, &header).unwrap();
+        let (decoded, consumed) = crate::yuubinsya::decode_header(&password, &header).unwrap();
         assert_eq!(decoded.protocol, YuubinsyaProtocol::Tcp);
         assert_eq!(consumed, header.len());
         let mut payload = [0u8; 5];
@@ -2011,7 +2010,7 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let mut header = vec![0u8; 1 + 32 + 1 + 4 + 2];
             server.read_exact(&mut header).await.unwrap();
-            let (header, _) = yuhaiin_core::yuubinsya::decode_header(&password, &header).unwrap();
+            let (header, _) = crate::yuubinsya::decode_header(&password, &header).unwrap();
             assert_eq!(header.protocol, YuubinsyaProtocol::Ping);
             server.write_all(&1u64.to_be_bytes()).await.unwrap();
             let mut probe = [0u8; 8];
@@ -2069,7 +2068,7 @@ mod tests {
         });
         let mut header = vec![0u8; 1 + 8 + 32];
         server.read_exact(&mut header).await.unwrap();
-        let (decoded, _) = yuhaiin_core::yuubinsya::decode_header(&password, &header).unwrap();
+        let (decoded, _) = crate::yuubinsya::decode_header(&password, &header).unwrap();
         assert_eq!(decoded.protocol, YuubinsyaProtocol::UdpWithMigrateId);
         server.write_all(&99u64.to_be_bytes()).await.unwrap();
         let mut endpoint = [0u8; 1 + 1 + 11 + 2 + 2 + 5];
@@ -2088,7 +2087,7 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let mut header = vec![0u8; 1 + 8 + 32];
             server.read_exact(&mut header).await.unwrap();
-            let (decoded, _) = yuhaiin_core::yuubinsya::decode_header(&password, &header).unwrap();
+            let (decoded, _) = crate::yuubinsya::decode_header(&password, &header).unwrap();
             assert_eq!(decoded.protocol, YuubinsyaProtocol::UdpWithMigrateId);
             server.write_all(&77u64.to_be_bytes()).await.unwrap();
             let mut frame = vec![0u8; expected.len()];
