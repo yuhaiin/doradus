@@ -5,3 +5,8 @@
 # same packet contract instead of silently dropping datagrams above 1500.
 [env]
 SMOLTCP_FRAGMENTATION_BUFFER_SIZE = "65535"
+
+# Keep GCC's system-library/startup-file discovery, but use lld for the final
+# link on the native GNU target. The build environment must provide lld.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
