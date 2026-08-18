@@ -158,7 +158,7 @@ struct PersistedTelemetryBucket {
     failures: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PersistedMonitor {
     version: u32,
     next_id: u64,
@@ -173,6 +173,41 @@ struct PersistedMonitor {
     failed_history: Vec<FailedEntry>,
     #[serde(default)]
     block_history: Vec<BlockEntry>,
+}
+
+#[derive(Serialize)]
+struct PersistedTelemetryRef<'a> {
+    dimension: &'a str,
+    value: &'a str,
+    download: u64,
+    upload: u64,
+    failures: u64,
+}
+
+#[derive(Serialize)]
+struct PersistedTelemetryBucketRef<'a> {
+    bucket: i64,
+    span_seconds: i64,
+    dimension: &'a str,
+    value: &'a str,
+    download: u64,
+    upload: u64,
+    failures: u64,
+}
+
+#[derive(Serialize)]
+struct PersistedMonitorRef<'a> {
+    version: u32,
+    next_id: u64,
+    total_upload: u64,
+    total_download: u64,
+    counters: &'a BTreeMap<String, (u64, u64)>,
+    buckets: &'a BTreeMap<i64, (u64, u64)>,
+    telemetry: Vec<PersistedTelemetryRef<'a>>,
+    telemetry_buckets: Vec<PersistedTelemetryBucketRef<'a>>,
+    history: &'a [Value],
+    failed_history: Vec<&'a FailedEntry>,
+    block_history: Vec<&'a BlockEntry>,
 }
 
 #[derive(Clone)]
@@ -315,8 +350,7 @@ impl ConnectionMonitor {
                 if !dirty && !projection_due && !periodic_projection_due {
                     continue;
                 }
-                let value = writer_monitor.persisted_json();
-                if let Ok(bytes) = serde_json::to_vec(&value) {
+                if let Ok(bytes) = writer_monitor.persisted_json() {
                     let store = worker_persistence.store.clone();
                     let checkpoint_written = tokio::task::spawn_blocking(move || {
                         store.try_put_config(PERSISTENCE_KEY, &bytes).is_ok()
@@ -391,7 +425,7 @@ impl ConnectionMonitor {
         let Some(persistence) = self.persistence.clone() else {
             return Ok(());
         };
-        let bytes = serde_json::to_vec(&self.persisted_json()).map_err(|error| {
+        let bytes = self.persisted_json().map_err(|error| {
             yuhaiin_core::Error::new(
                 yuhaiin_core::ErrorKind::Storage,
                 format!("statistics state serialization: {error}"),
@@ -1317,49 +1351,52 @@ impl ConnectionMonitor {
         }
     }
 
-    fn persisted_json(&self) -> PersistedMonitor {
-        let state = self.lock();
-        PersistedMonitor {
+    fn persisted_json(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let mut state = self.lock();
+        coalesce_history_in_place(&mut state.history);
+        let telemetry = state
+            .telemetry
+            .iter()
+            .map(
+                |((dimension, value), (download, upload, failures))| PersistedTelemetryRef {
+                    dimension,
+                    value,
+                    download: *download,
+                    upload: *upload,
+                    failures: *failures,
+                },
+            )
+            .collect();
+        let telemetry_buckets = state
+            .telemetry_buckets
+            .iter()
+            .map(
+                |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
+                    PersistedTelemetryBucketRef {
+                        bucket: *bucket,
+                        span_seconds: *span_seconds,
+                        dimension,
+                        value,
+                        download: *download,
+                        upload: *upload,
+                        failures: *failures,
+                    }
+                },
+            )
+            .collect();
+        serde_json::to_vec(&PersistedMonitorRef {
             version: PERSISTENCE_VERSION,
             next_id: state.next_id,
             total_upload: state.total_upload,
             total_download: state.total_download,
-            counters: state.counters.clone(),
-            buckets: state.buckets.clone(),
-            telemetry: state
-                .telemetry
-                .iter()
-                .map(
-                    |((dimension, value), (download, upload, failures))| PersistedTelemetry {
-                        dimension: dimension.clone(),
-                        value: value.clone(),
-                        download: *download,
-                        upload: *upload,
-                        failures: *failures,
-                    },
-                )
-                .collect(),
-            telemetry_buckets: state
-                .telemetry_buckets
-                .iter()
-                .map(
-                    |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
-                        PersistedTelemetryBucket {
-                            bucket: *bucket,
-                            span_seconds: *span_seconds,
-                            dimension: dimension.clone(),
-                            value: value.clone(),
-                            download: *download,
-                            upload: *upload,
-                            failures: *failures,
-                        }
-                    },
-                )
-                .collect(),
-            history: coalesce_history(state.history.clone()),
-            failed_history: state.failed_history.values().cloned().collect(),
-            block_history: state.block_history.values().cloned().collect(),
-        }
+            counters: &state.counters,
+            buckets: &state.buckets,
+            telemetry,
+            telemetry_buckets,
+            history: &state.history,
+            failed_history: state.failed_history.values().collect(),
+            block_history: state.block_history.values().collect(),
+        })
     }
 }
 
@@ -1819,6 +1856,11 @@ fn coalesce_history(items: Vec<Value>) -> Vec<Value> {
             .then_with(|| history_key(left).cmp(&history_key(right)))
     });
     items
+}
+
+fn coalesce_history_in_place(items: &mut Vec<Value>) {
+    let current = std::mem::take(items);
+    *items = coalesce_history(current);
 }
 
 fn normalize_history_time(mut item: Value) -> Value {

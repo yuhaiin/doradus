@@ -33,7 +33,7 @@ fn proxy_runtime_enriches_context_with_injected_process_metadata() {
         bypass: Arc::clone(&direct),
         drop: Arc::new(crate::proxy::DropAsyncProxy),
     });
-    let runtime = TunProxyRuntime::new(selector, 4)
+    let mut runtime = TunProxyRuntime::new(selector, 4)
         .unwrap()
         .with_process_resolver(FixedResolver);
     let flow = TunFlow {
@@ -48,6 +48,70 @@ fn proxy_runtime_enriches_context_with_injected_process_metadata() {
     assert_eq!(context.process.as_deref(), Some("/usr/bin/test-client"));
     assert_eq!(context.process_id, Some(42));
     assert_eq!(context.user_id, Some(1000));
+}
+
+#[cfg(feature = "async-proxy")]
+#[test]
+fn proxy_runtime_reuses_process_metadata_for_one_local_udp_socket() {
+    use crate::process::{ProcessInfo, ProcessResolver};
+    use crate::proxy::{AsyncProxy, DirectAsyncProxy, StaticProxySelector};
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingResolver {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ProcessResolver for CountingResolver {
+        fn resolve(
+            &self,
+            _network: Network,
+            _source: SocketAddr,
+            _destination: SocketAddr,
+        ) -> io::Result<Option<ProcessInfo>> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Ok(Some(ProcessInfo {
+                path: "/usr/bin/test-client".to_owned(),
+                pid: 42,
+                uid: 1000,
+            }))
+        }
+    }
+
+    let direct: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy {
+        timeout: Duration::from_secs(1),
+    });
+    let selector = Arc::new(StaticProxySelector {
+        direct: Arc::clone(&direct),
+        proxy: Arc::clone(&direct),
+        bypass: Arc::clone(&direct),
+        drop: Arc::new(crate::proxy::DropAsyncProxy),
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut runtime = TunProxyRuntime::new(selector, 4)
+        .unwrap()
+        .with_process_resolver(CountingResolver {
+            calls: Arc::clone(&calls),
+        });
+    let source = "10.0.0.2:40000".parse().unwrap();
+    let first = TunFlow {
+        key: TunFlowKey {
+            network: Network::Udp,
+            source,
+            destination: "192.0.2.1:53".parse().unwrap(),
+        },
+    };
+    let second = TunFlow {
+        key: TunFlowKey {
+            network: Network::Udp,
+            source,
+            destination: "192.0.2.2:53".parse().unwrap(),
+        },
+    };
+
+    assert!(runtime.context_for_flow(first).process.is_some());
+    assert!(runtime.context_for_flow(second).process.is_some());
+    assert_eq!(calls.load(Ordering::Acquire), 1);
 }
 
 #[cfg(feature = "async-proxy")]

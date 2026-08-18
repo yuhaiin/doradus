@@ -444,7 +444,7 @@ impl TunRuntime {
                 proxy_runtime.close();
                 return Err(io::Error::other(error.to_string()));
             }
-            for event in dispatcher.events().collect::<Vec<_>>() {
+            while let Some(event) = dispatcher.next_event() {
                 let flow = event_flow_key(&event);
                 if let Err(error) = proxy_runtime.handle_event_async(event).await {
                     // A transport can finish between smoltcp emitting a

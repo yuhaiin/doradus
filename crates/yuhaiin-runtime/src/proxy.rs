@@ -1759,7 +1759,7 @@ pub struct RuntimeProxySelector {
 #[derive(Clone, Default)]
 struct ProxyContextMetadata {
     hosts: yuhaiin_core::dns_hosts::HostsTable,
-    route_lists: RouteListSnapshot,
+    route_lists: Arc<RouteListSnapshot>,
     geo: Option<Arc<dyn GeoLookup>>,
     fakeip_view: Option<FakeIpViewStore>,
     fakeip_pools: Option<FakeIpPools>,
@@ -2292,7 +2292,7 @@ impl RuntimeSnapshot {
             .cloned();
         Ok(ProxyContextMetadata {
             hosts: self.hosts.clone(),
-            route_lists: self.route_lists.clone(),
+            route_lists: Arc::clone(&self.route_lists),
             geo: self.geo.clone(),
             fakeip_view,
             fakeip_pools,
@@ -3218,7 +3218,7 @@ mod tests {
             route: None,
             route_rules: Vec::new(),
             node_tags: Vec::new(),
-            route_lists: crate::RouteListSnapshot::default(),
+            route_lists: Arc::new(crate::RouteListSnapshot::default()),
             router: RouterRuntime::new(
                 Router::compile(
                     Vec::new(),

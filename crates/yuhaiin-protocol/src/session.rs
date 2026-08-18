@@ -288,7 +288,7 @@ struct ServerUdpSession {
 }
 
 impl ServerUdpSession {
-    async fn spawn(datagram: Box<dyn AsyncDatagram>) -> Arc<Self> {
+    async fn spawn(datagram: Box<dyn AsyncDatagram>, udp_buffer_size: usize) -> Arc<Self> {
         let session = Arc::new(Self {
             datagram: Arc::from(datagram),
             routes: Mutex::new(HashMap::new()),
@@ -298,14 +298,14 @@ impl ServerUdpSession {
         });
         let worker_session = Arc::clone(&session);
         let worker = tokio::spawn(async move {
-            worker_session.run_reader().await;
+            worker_session.run_reader(udp_buffer_size).await;
         });
         *session.worker.lock().await = Some(worker);
         session
     }
 
-    async fn run_reader(self: Arc<Self>) {
-        let mut buffer = vec![0u8; 65_535];
+    async fn run_reader(self: Arc<Self>, udp_buffer_size: usize) {
+        let mut buffer = vec![0u8; udp_buffer_size];
         loop {
             let result = tokio::time::timeout(
                 SERVER_UDP_RESPONSE_TIMEOUT,
@@ -431,6 +431,7 @@ impl ServerUdpSession {
 pub struct YuubinsyaServerProxy {
     password_hashes: Arc<[[u8; 32]]>,
     upstream: Arc<dyn AsyncProxy>,
+    udp_buffer_size: usize,
     next_migrate_id: AtomicU64,
     udp_sessions: Mutex<HashMap<u64, Arc<ServerUdpSession>>>,
     udp_open_lock: Mutex<()>,
@@ -456,6 +457,21 @@ impl YuubinsyaServerProxy {
         password_hashes: Vec<[u8; 32]>,
         upstream: Arc<dyn AsyncProxy>,
     ) -> Self {
+        Self::new_with_password_hashes_and_udp_buffer_size(
+            password_hashes,
+            upstream,
+            u16::MAX as usize,
+        )
+    }
+
+    /// Construct a server with the payload buffer retained by each migrated
+    /// UDP session. The legacy constructor keeps the maximum-sized default;
+    /// runtime callers pass their configured `udpBufferSize` here.
+    pub fn new_with_password_hashes_and_udp_buffer_size(
+        password_hashes: Vec<[u8; 32]>,
+        upstream: Arc<dyn AsyncProxy>,
+        udp_buffer_size: usize,
+    ) -> Self {
         let password_hashes = if password_hashes.is_empty() {
             vec![[0u8; 32]]
         } else {
@@ -464,6 +480,7 @@ impl YuubinsyaServerProxy {
         Self {
             password_hashes: password_hashes.into(),
             upstream,
+            udp_buffer_size: udp_buffer_size.min(u16::MAX as usize).max(512),
             next_migrate_id: AtomicU64::new(1),
             udp_sessions: Mutex::new(HashMap::new()),
             udp_open_lock: Mutex::new(()),
@@ -827,7 +844,7 @@ impl YuubinsyaServerProxy {
             return Ok(Arc::clone(session));
         }
         let datagram = self.upstream.open_datagram(context).await?;
-        let session = ServerUdpSession::spawn(datagram).await;
+        let session = ServerUdpSession::spawn(datagram, self.udp_buffer_size).await;
         self.udp_sessions
             .lock()
             .await

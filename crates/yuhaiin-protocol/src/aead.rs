@@ -23,6 +23,7 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{PublicKey, SecretKey};
 use sha2_10::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::Mutex as AsyncMutex;
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
@@ -171,6 +172,7 @@ impl AsyncProxy for AeadProxy {
                     server,
                     password: self.password.clone(),
                     method: self.method,
+                    receive_buffer: AsyncMutex::new(Vec::new()),
                 }) as Box<dyn AsyncDatagram>);
             }
             let upstream = self.upstream.open_datagram(context).await?;
@@ -178,6 +180,7 @@ impl AsyncProxy for AeadProxy {
                 upstream,
                 password: self.password.clone(),
                 method: self.method,
+                receive_buffer: AsyncMutex::new(Vec::new()),
             }) as Box<dyn AsyncDatagram>)
         })
     }
@@ -242,6 +245,7 @@ struct AeadUdpDatagram {
     server: std::net::SocketAddr,
     password: Vec<u8>,
     method: CryptoMethod,
+    receive_buffer: AsyncMutex<Vec<u8>>,
 }
 
 /// Server-side authenticated UDP socket for an outer Go AEAD transport.
@@ -252,6 +256,7 @@ pub struct AeadUdpServer {
     socket: tokio::net::UdpSocket,
     password: Vec<u8>,
     method: CryptoMethod,
+    receive_buffer: AsyncMutex<Vec<u8>>,
 }
 
 impl AeadUdpServer {
@@ -264,6 +269,7 @@ impl AeadUdpServer {
             socket,
             password: password.as_ref().to_vec(),
             method,
+            receive_buffer: AsyncMutex::new(Vec::new()),
         }
     }
 }
@@ -288,7 +294,8 @@ impl AsyncDatagram for AeadUdpServer {
 
     fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
         Box::pin(async move {
-            let mut packet = vec![0u8; 65_535];
+            let mut packet = self.receive_buffer.lock().await;
+            ensure_receive_buffer(&mut packet, buffer.len(), self.method);
             let (length, peer) =
                 self.socket.recv_from(&mut packet).await.map_err(|error| {
                     Error::new(ErrorKind::Io, format!("AEAD UDP receive: {error}"))
@@ -331,7 +338,8 @@ impl AsyncDatagram for AeadUdpDatagram {
 
     fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
         Box::pin(async move {
-            let mut packet = vec![0u8; 65_535];
+            let mut packet = self.receive_buffer.lock().await;
+            ensure_receive_buffer(&mut packet, buffer.len(), self.method);
             let (length, peer) =
                 self.socket.recv_from(&mut packet).await.map_err(|error| {
                     Error::new(ErrorKind::Io, format!("AEAD UDP receive: {error}"))
@@ -364,6 +372,7 @@ struct AeadDatagram {
     upstream: Box<dyn AsyncDatagram>,
     password: Vec<u8>,
     method: CryptoMethod,
+    receive_buffer: AsyncMutex<Vec<u8>>,
 }
 
 impl AsyncDatagram for AeadDatagram {
@@ -377,7 +386,8 @@ impl AsyncDatagram for AeadDatagram {
 
     fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
         Box::pin(async move {
-            let mut packet = vec![0u8; 65_535];
+            let mut packet = self.receive_buffer.lock().await;
+            ensure_receive_buffer(&mut packet, buffer.len(), self.method);
             let (length, target) = self.upstream.recv_from(&mut packet).await?;
             let plaintext = decrypt_packet(&packet[..length], &self.password, self.method)?;
             if buffer.len() < plaintext.len() {
@@ -397,6 +407,16 @@ impl AsyncDatagram for AeadDatagram {
 
     fn close(&self) -> BoxFuture<'_, Result<()>> {
         self.upstream.close()
+    }
+}
+
+fn ensure_receive_buffer(packet: &mut Vec<u8>, payload_capacity: usize, method: CryptoMethod) {
+    let required = payload_capacity
+        .saturating_add(method.nonce_size())
+        .saturating_add(FRAME_TAG_SIZE)
+        .min(MAX_PAYLOAD_SIZE);
+    if packet.len() < required {
+        packet.resize(required, 0);
     }
 }
 

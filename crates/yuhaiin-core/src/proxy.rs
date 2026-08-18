@@ -36,6 +36,8 @@ use crate::{BoxFuture, FlowContext, Network};
 #[cfg(feature = "async-proxy")]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 #[cfg(feature = "async-proxy")]
+use tokio::sync::Mutex as AsyncMutex;
+#[cfg(feature = "async-proxy")]
 use tokio::sync::Notify;
 #[cfg(feature = "async-proxy")]
 use tokio::time::Sleep;
@@ -1930,6 +1932,7 @@ impl AsyncProxy for Socks5AsyncProxy {
                     socket,
                     relay,
                     control: Mutex::new(Some(control)),
+                    receive_buffer: AsyncMutex::new(Vec::new()),
                 })
             })
             .await
@@ -2069,6 +2072,10 @@ struct Socks5UdpDatagram {
     // satisfy the shared AsyncDatagram Send + Sync contract; no I/O is done
     // through it after the handshake.
     control: Mutex<Option<tokio::net::TcpStream>>,
+    // Keep the SOCKS5 header scratch space with the association. The TUN
+    // caller's buffer is payload-sized, so a maximum-sized allocation here
+    // would multiply memory by the number of live UDP associations.
+    receive_buffer: AsyncMutex<Vec<u8>>,
 }
 
 #[cfg(feature = "async-proxy")]
@@ -2094,22 +2101,33 @@ impl AsyncDatagram for Socks5UdpDatagram {
 
     fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
         Box::pin(async move {
-            let mut packet = vec![0; 64 * 1024];
+            // The TUN UDP relay already supplies the maximum legal UDP
+            // datagram buffer. Read the SOCKS5 packet directly into it so a
+            // high-rate relay does not allocate a fresh 64 KiB Vec for every
+            // response. Smaller callers retain the historical fallback so
+            // the output buffer can remain payload-sized.
+            if buffer.len() >= u16::MAX as usize {
+                let length = self.socket.recv(buffer).await.map_err(|error| {
+                    Error::new(ErrorKind::Io, format!("SOCKS5 UDP receive: {error}"))
+                })?;
+                let (target, offset) = decode_socks5_udp_endpoint(&buffer[..length])?;
+                let payload_len = length.saturating_sub(offset);
+                buffer.copy_within(offset..length, 0);
+                return Ok((payload_len, target));
+            }
+
+            const SOCKS5_UDP_MAX_HEADER_SIZE: usize = 262;
+            let mut packet = self.receive_buffer.lock().await;
+            let required = buffer
+                .len()
+                .saturating_add(SOCKS5_UDP_MAX_HEADER_SIZE)
+                .min(u16::MAX as usize);
+            if packet.len() < required {
+                packet.resize(required, 0);
+            }
             let length = self.socket.recv(&mut packet).await.map_err(|error| {
                 Error::new(ErrorKind::Io, format!("SOCKS5 UDP receive: {error}"))
             })?;
-            if length < 4 || packet[0..2] != [0, 0] {
-                return Err(Error::new(
-                    ErrorKind::Protocol,
-                    "invalid SOCKS5 UDP response header",
-                ));
-            }
-            if packet[2] != 0 {
-                return Err(Error::new(
-                    ErrorKind::Unsupported,
-                    "fragmented SOCKS5 UDP responses are not supported",
-                ));
-            }
             let (target, offset) = decode_socks5_udp_endpoint(&packet[..length])?;
             let payload = &packet[offset..length];
             if buffer.len() < payload.len() {
@@ -2142,10 +2160,16 @@ impl AsyncDatagram for Socks5UdpDatagram {
 
 #[cfg(feature = "async-proxy")]
 fn decode_socks5_udp_endpoint(packet: &[u8]) -> Result<(Endpoint, usize)> {
-    if packet.len() < 4 {
+    if packet.len() < 4 || packet[0..2] != [0, 0] {
         return Err(Error::new(
             ErrorKind::Protocol,
-            "SOCKS5 UDP packet is too short",
+            "invalid SOCKS5 UDP response header",
+        ));
+    }
+    if packet[2] != 0 {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "fragmented SOCKS5 UDP responses are not supported",
         ));
     }
     let atyp = packet[3];

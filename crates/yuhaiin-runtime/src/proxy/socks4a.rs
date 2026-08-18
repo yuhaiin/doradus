@@ -2,26 +2,22 @@
 //!
 //! Go exposes SOCKS4A as a standalone inbound and also as one branch of the
 //! mixed listener. The protocol has no UDP mode and no outbound node in the Go
-//! contract, so this module owns the server framing and feeds successful
-//! CONNECT requests into the shared runtime selector.
+//! contract. Wire framing lives in `yuhaiin-protocol`; this module feeds
+//! successful CONNECT requests into the shared runtime selector.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use yuhaiin_core::flow::FlowKey as TunFlowKey;
 use yuhaiin_core::proxy::AsyncProxySelector;
-use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use yuhaiin_protocol::socks4a_server::{read_request, write_reply};
 
 use super::common::{io_error, record_outbound_stream, relay_counted_with_buffer};
 use crate::inbound::InboundSpec;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
-
-const VERSION: u8 = 4;
-const CONNECT: u8 = 1;
-const REQUEST_LEN: usize = 8;
-const MAX_FIELD_LEN: usize = 4096;
 
 /// Serve one SOCKS4/SOCKS4A connection.
 pub(crate) async fn serve<S>(
@@ -93,99 +89,6 @@ where
     .map_err(io_error)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Request {
-    port: u16,
-    address: [u8; 4],
-    user_id: Vec<u8>,
-    host: Option<String>,
-}
-
-impl Request {
-    fn destination(&self) -> Result<Endpoint> {
-        if let Some(host) = &self.host {
-            return Ok(Endpoint::domain(
-                Network::Tcp,
-                DomainName::new(host)?,
-                self.port,
-            ));
-        }
-        Ok(Endpoint::ip(
-            Network::Tcp,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::from(self.address)), self.port),
-        ))
-    }
-}
-
-async fn read_request<S>(stream: &mut S) -> Result<Request>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut header = [0u8; REQUEST_LEN];
-    stream.read_exact(&mut header).await.map_err(io_error)?;
-    if header[0] != VERSION {
-        return Err(Error::new(
-            ErrorKind::Protocol,
-            format!("SOCKS4A version is not 4: {}", header[0]),
-        ));
-    }
-    if header[1] != CONNECT {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            format!("SOCKS4A command is not CONNECT: {}", header[1]),
-        ));
-    }
-
-    let user_id = read_cstring(stream, "SOCKS4A user id").await?;
-    let host =
-        if header[4] == 0 && header[5] == 0 && header[6] == 0 && header[7] != 0 {
-            let bytes = read_cstring(stream, "SOCKS4A domain").await?;
-            Some(String::from_utf8(bytes).map_err(|error| {
-                Error::new(ErrorKind::Protocol, format!("SOCKS4A domain: {error}"))
-            })?)
-        } else {
-            None
-        };
-    Ok(Request {
-        port: u16::from_be_bytes([header[2], header[3]]),
-        address: [header[4], header[5], header[6], header[7]],
-        user_id,
-        host,
-    })
-}
-
-async fn read_cstring<S>(stream: &mut S, field: &str) -> Result<Vec<u8>>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut value = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        stream.read_exact(&mut byte).await.map_err(io_error)?;
-        if byte[0] == 0 {
-            return Ok(value);
-        }
-        if value.len() == MAX_FIELD_LEN {
-            return Err(Error::new(
-                ErrorKind::Protocol,
-                format!("{field} exceeds {MAX_FIELD_LEN} bytes"),
-            ));
-        }
-        value.push(byte[0]);
-    }
-}
-
-async fn write_reply<S>(stream: &mut S, status: u8, address: [u8; 4], port: u16) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
-    let mut reply = [0u8; REQUEST_LEN];
-    reply[1] = status;
-    reply[2..4].copy_from_slice(&port.to_be_bytes());
-    reply[4..].copy_from_slice(&address);
-    stream.write_all(&reply).await.map_err(io_error)
-}
-
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut difference = left.len() ^ right.len();
     for index in 0..left.len().max(right.len()) {
@@ -199,6 +102,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 mod tests {
     use super::*;
     use tokio::io::{AsyncWriteExt, duplex};
+    use yuhaiin_protocol::socks4a_server::MAX_FIELD_LEN;
 
     #[test]
     fn parses_ipv4_and_socks4a_domain_requests() {

@@ -169,6 +169,10 @@ impl TunPcapCapture {
 pub const DEFAULT_MTU: usize = 1500;
 pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
 const MAX_TCP_EVENT_BYTES_PER_POLL: usize = 64 * 1024;
+// Most TCP reads are smaller than the socket's full receive capacity. Keep
+// the owned event buffer bounded independently so a short read does not
+// retain a 64 KiB allocation until the async proxy consumes it.
+const MAX_TCP_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
 const IPV6_FRAGMENT_MAX_ENTRIES: usize = 32;
 const IPV6_FRAGMENT_MAX_FRAGMENTS: usize = 128;
 const IPV6_FRAGMENT_MAX_PACKET: usize = MAX_SMOLTCP_PACKET_SIZE;

@@ -346,7 +346,8 @@ impl RuntimeController {
         }
         let (nat, idle_timeout) = snapshot.new_full_cone_nat()?;
         let mut runtime = yuhaiin_tun::TunProxyRuntime::new(selector.clone(), channel_capacity)?
-            .with_nat(nat, idle_timeout)?;
+            .with_nat(nat, idle_timeout)?
+            .with_udp_buffer_size(snapshot.settings.udp_buffer_size)?;
         runtime = runtime.with_observer(self.monitor.clone());
         if let Some(handler) = async_dns_handler {
             runtime = runtime.with_async_dns_handler(handler);

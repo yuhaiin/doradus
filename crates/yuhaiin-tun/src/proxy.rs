@@ -1,6 +1,7 @@
 //! Async proxy task runtime for TUN flows.
 
 use super::*;
+use yuhaiin_core::process::ProcessInfo;
 
 #[cfg(feature = "async-proxy")]
 pub(crate) enum ProxyCommand {
@@ -165,6 +166,9 @@ pub struct TunProxyRuntime {
     pub(crate) dns_tasks: Vec<SyncDnsTask>,
     async_dns_tasks: FuturesUnordered<AsyncDnsTask>,
     tracked_flows: HashSet<TunFlowKey>,
+    process_cache: HashMap<UdpSourceKey, Option<ProcessInfo>>,
+    process_cache_refs: HashMap<UdpSourceKey, usize>,
+    udp_buffer_size: usize,
     pub(crate) output_tx: mpsc::Sender<ProxyOutput>,
     output_rx: mpsc::Receiver<ProxyOutput>,
     icmp_output_tx: mpsc::Sender<ProxyOutput>,
@@ -200,6 +204,9 @@ impl TunProxyRuntime {
             dns_tasks: Vec::new(),
             async_dns_tasks: FuturesUnordered::new(),
             tracked_flows: HashSet::new(),
+            process_cache: HashMap::new(),
+            process_cache_refs: HashMap::new(),
+            udp_buffer_size: u16::MAX as usize,
             output_tx,
             output_rx,
             icmp_output_tx,
@@ -245,6 +252,7 @@ impl TunProxyRuntime {
 
     pub fn set_process_resolver(&mut self, resolver: Option<Arc<dyn ProcessResolver>>) {
         self.process_resolver = resolver;
+        self.process_cache.clear();
     }
 
     /// Replace the read-only flow context snapshot at a lifecycle boundary.
@@ -282,6 +290,17 @@ impl TunProxyRuntime {
         Ok(self)
     }
 
+    /// Set the payload buffer retained by each live UDP proxy task. This is
+    /// normally the runtime's `advanced.udpBufferSize`; keep the standalone
+    /// TUN API's historical maximum as the constructor default.
+    pub fn with_udp_buffer_size(mut self, size: usize) -> Result<Self> {
+        if size == 0 {
+            return Err(Error::invalid("TUN UDP buffer size must be non-zero"));
+        }
+        self.udp_buffer_size = size.min(u16::MAX as usize).max(512);
+        Ok(self)
+    }
+
     pub fn nat_len(&self) -> Result<usize> {
         self.nat.as_ref().map_or(Ok(0), |nat| nat.table.len())
     }
@@ -299,18 +318,28 @@ impl TunProxyRuntime {
             + self.async_dns_tasks.len()
     }
 
-    pub(crate) fn context_for_flow(&self, flow: TunFlow) -> crate::FlowContext {
+    pub(crate) fn context_for_flow(&mut self, flow: TunFlow) -> crate::FlowContext {
         let mut context = (self.context_provider)(flow);
         if context.component.is_none() {
             context.component = Some("tun".to_owned());
         }
         let needs_process =
             context.process.is_none() || context.process_id.is_none() || context.user_id.is_none();
-        if needs_process
-            && let Some(resolver) = &self.process_resolver
-            && let Ok(Some(process)) =
-                resolver.resolve(flow.key.network, flow.key.source, flow.key.destination)
-        {
+        let process = needs_process.then(|| {
+            let source = udp_source_key(flow.key);
+            if let Some(process) = self.process_cache.get(&source) {
+                return process.clone();
+            }
+            let process = self.process_resolver.as_ref().and_then(|resolver| {
+                resolver
+                    .resolve(flow.key.network, flow.key.source, flow.key.destination)
+                    .ok()
+                    .flatten()
+            });
+            self.process_cache.insert(source, process.clone());
+            process
+        });
+        if let Some(Some(process)) = process {
             if context.process.is_none() {
                 context.process = Some(process.path);
             }
@@ -453,9 +482,17 @@ impl TunProxyRuntime {
                     let output = self.output_tx.clone();
                     let timeouts = self.timeouts;
                     let observer = self.observer.clone();
+                    let udp_buffer_size = self.udp_buffer_size;
                     let join = tokio::spawn(async move {
                         run_udp_proxy(
-                            proxy, context, flow.key, commands, output, timeouts, observer,
+                            proxy,
+                            context,
+                            flow.key,
+                            commands,
+                            output,
+                            timeouts,
+                            observer,
+                            udp_buffer_size,
                         )
                         .await;
                     });
@@ -1042,7 +1079,10 @@ impl TunProxyRuntime {
                 nat.table.insert(key, flow.source, nat.idle_timeout)?;
             }
         }
-        self.tracked_flows.insert(flow);
+        if self.tracked_flows.insert(flow) {
+            let source = udp_source_key(flow);
+            *self.process_cache_refs.entry(source).or_default() += 1;
+        }
         Ok(())
     }
 
@@ -1059,6 +1099,7 @@ impl TunProxyRuntime {
         if !self.tracked_flows.remove(flow) {
             return Ok(());
         }
+        self.release_process_cache(*flow);
         let Some(nat) = &self.nat else {
             if let Some(observer) = &self.observer {
                 observer.closed(*flow);
@@ -1075,12 +1116,25 @@ impl TunProxyRuntime {
     fn clear_tracked_flows(&mut self) {
         let flows = self.tracked_flows.drain().collect::<Vec<_>>();
         for flow in flows {
+            self.release_process_cache(flow);
             if let Some(nat) = &self.nat {
                 let _ = nat.table.remove(&nat_key(flow));
             }
             if let Some(observer) = &self.observer {
                 observer.closed(flow);
             }
+        }
+    }
+
+    fn release_process_cache(&mut self, flow: TunFlowKey) {
+        let source = udp_source_key(flow);
+        let Some(references) = self.process_cache_refs.get_mut(&source) else {
+            return;
+        };
+        *references = references.saturating_sub(1);
+        if *references == 0 {
+            self.process_cache_refs.remove(&source);
+            self.process_cache.remove(&source);
         }
     }
 }
@@ -1268,6 +1322,7 @@ async fn run_udp_proxy(
     output: mpsc::Sender<ProxyOutput>,
     timeouts: ProxyTimeouts,
     observer: Option<Arc<dyn TunFlowObserver>>,
+    udp_buffer_size: usize,
 ) {
     let datagram = match tokio::time::timeout(timeouts.connect, proxy.open_datagram(&context)).await
     {
@@ -1320,7 +1375,7 @@ async fn run_udp_proxy(
         let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
         return;
     }
-    let mut buffer = vec![0u8; 65_535];
+    let mut buffer = vec![0u8; udp_buffer_size];
     let mut routes = HashMap::<Endpoint, TunFlowKey>::new();
     let mut last_flow = None;
     let mut idle = Box::pin(tokio::time::sleep(timeouts.idle));

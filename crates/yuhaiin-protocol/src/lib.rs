@@ -12,10 +12,13 @@ pub mod h2_tunnel;
 pub mod http;
 pub mod http_mock;
 pub mod http_obfs;
+pub mod http_server;
 pub mod proxy_factory;
+pub mod reverse_http;
 pub mod session;
 pub mod shadowsocks;
 pub mod shadowsocksr;
+pub mod socks4a_server;
 pub mod socks5;
 pub mod socks5_server;
 #[cfg(feature = "tls-ring")]
@@ -29,6 +32,8 @@ pub mod vmess;
 pub mod websocket;
 #[cfg(feature = "websocket")]
 mod websocket_io;
+#[cfg(feature = "websocket")]
+pub mod websocket_server;
 pub mod yuubinsya;
 pub mod yuubinsya_udp;
 

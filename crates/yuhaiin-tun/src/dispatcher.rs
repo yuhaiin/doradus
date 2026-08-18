@@ -104,6 +104,10 @@ pub struct TunDispatcher {
     udp_by_local: HashMap<SocketAddr, SocketHandle>,
     events: VecDeque<TunEvent>,
     pending_icmp_tx: VecDeque<Vec<u8>>,
+    tcp_handles: Vec<SocketHandle>,
+    closed_tcp: Vec<(SocketHandle, TunFlowKey)>,
+    udp_handles: Vec<SocketHandle>,
+    closed_udp: Vec<(SocketHandle, SocketAddr)>,
     rx_buffer_size: usize,
     tx_buffer_size: usize,
     udp_packet_capacity: usize,
@@ -127,6 +131,10 @@ impl TunDispatcher {
             udp_by_local: HashMap::new(),
             events: VecDeque::new(),
             pending_icmp_tx: VecDeque::new(),
+            tcp_handles: Vec::new(),
+            closed_tcp: Vec::new(),
+            udp_handles: Vec::new(),
+            closed_udp: Vec::new(),
             rx_buffer_size,
             tx_buffer_size,
             udp_packet_capacity,
@@ -149,6 +157,15 @@ impl TunDispatcher {
 
     pub fn events(&mut self) -> impl Iterator<Item = TunEvent> + '_ {
         self.events.drain(..)
+    }
+
+    /// Remove one queued event without allocating a temporary collection.
+    ///
+    /// The async runtime needs to consume an event before it can call back
+    /// into the dispatcher to close a failed flow, so draining the queue into
+    /// a `Vec` would add one allocation per dispatcher tick.
+    pub fn next_event(&mut self) -> Option<TunEvent> {
+        self.events.pop_front()
     }
 
     pub fn poll(
@@ -423,9 +440,11 @@ impl TunDispatcher {
     }
 
     fn collect_events(&mut self) -> Result<()> {
-        let tcp_handles: Vec<_> = self.tcp.keys().copied().collect();
-        let mut closed_tcp = Vec::new();
-        for handle in tcp_handles {
+        self.tcp_handles.clear();
+        self.tcp_handles.extend(self.tcp.keys().copied());
+        self.closed_tcp.clear();
+        for index in 0..self.tcp_handles.len() {
+            let handle = self.tcp_handles[index];
             let Some(state) = self.tcp.get_mut(&handle) else {
                 continue;
             };
@@ -453,8 +472,12 @@ impl TunDispatcher {
             while socket.can_recv() && event_bytes < MAX_TCP_EVENT_BYTES_PER_POLL {
                 // `recv_capacity` is the remaining socket buffer, not the
                 // size of the next packet. Keep each event bounded so a fast
-                // TUN stream cannot allocate one large Vec per segment.
-                let mut payload = vec![0; socket.recv_capacity().min(64 * 1024)];
+                // TUN stream cannot retain one large Vec for a short read.
+                let payload_capacity = socket
+                    .recv_capacity()
+                    .min(MAX_TCP_EVENT_PAYLOAD_BYTES)
+                    .min(MAX_TCP_EVENT_BYTES_PER_POLL - event_bytes);
+                let mut payload = vec![0; payload_capacity];
                 match socket.recv_slice(&mut payload) {
                     Ok(length) if length != 0 => {
                         payload.truncate(length);
@@ -480,18 +503,20 @@ impl TunDispatcher {
                 self.events.push_back(TunEvent::TcpClosed { flow });
             }
             if !socket.is_open() {
-                closed_tcp.push((handle, key));
+                self.closed_tcp.push((handle, key));
             }
         }
-        for (handle, key) in closed_tcp {
+        for (handle, key) in self.closed_tcp.drain(..) {
             self.tcp.remove(&handle);
             self.tcp_by_key.remove(&key);
             self.sockets.remove(handle);
         }
 
-        let udp_handles: Vec<_> = self.udp.keys().copied().collect();
-        let mut closed_udp = Vec::new();
-        for handle in udp_handles {
+        self.udp_handles.clear();
+        self.udp_handles.extend(self.udp.keys().copied());
+        self.closed_udp.clear();
+        for index in 0..self.udp_handles.len() {
+            let handle = self.udp_handles[index];
             let Some(state) = self.udp.get(&handle) else {
                 continue;
             };
@@ -536,10 +561,10 @@ impl TunDispatcher {
                 });
             }
             if closing {
-                closed_udp.push((handle, local));
+                self.closed_udp.push((handle, local));
             }
         }
-        for (handle, local) in closed_udp {
+        for (handle, local) in self.closed_udp.drain(..) {
             self.udp_by_local.remove(&local);
             self.udp.remove(&handle);
             self.sockets.remove(handle);

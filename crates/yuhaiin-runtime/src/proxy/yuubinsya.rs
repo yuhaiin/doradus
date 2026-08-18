@@ -27,6 +27,7 @@ pub(crate) fn new_server(
     spec: &InboundSpec,
     selector: Arc<RuntimeProxySelector>,
 ) -> Option<Arc<YuubinsyaServerProxy>> {
+    let udp_buffer_size = selector.udp_buffer_size().max(512);
     let upstream: Arc<dyn AsyncProxy> = Arc::new(RoutedProxy { selector });
     let password_hashes = if let Some(auth) = spec.auth.as_ref() {
         auth.inbound_passwords()
@@ -39,10 +40,13 @@ pub(crate) fn new_server(
     if password_hashes.is_empty() {
         return None;
     }
-    Some(Arc::new(YuubinsyaServerProxy::new_with_password_hashes(
-        password_hashes,
-        upstream,
-    )))
+    Some(Arc::new(
+        YuubinsyaServerProxy::new_with_password_hashes_and_udp_buffer_size(
+            password_hashes,
+            upstream,
+            udp_buffer_size,
+        ),
+    ))
 }
 
 struct ChainDnsHandler(Arc<dyn crate::monitor::SocketDnsHandler>);

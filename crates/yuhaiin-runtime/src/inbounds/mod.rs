@@ -17,8 +17,6 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-#[cfg(feature = "websocket")]
-use base64::Engine as _;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -1290,7 +1288,7 @@ impl InboundSpec {
                         "reverse_tcp inbound target is missing",
                     )
                 })?;
-            Some(crate::proxy::http::parse_authority(
+            Some(yuhaiin_protocol::http_server::parse_authority(
                 target,
                 yuhaiin_core::Network::Tcp,
             )?)
@@ -1555,7 +1553,7 @@ fn parse_reverse_http_config(value: &str) -> Result<ReverseHttpConfig> {
         ));
     }
     let default_port = if https { 443 } else { 80 };
-    let target = crate::proxy::http::parse_authority_with_default(
+    let target = yuhaiin_protocol::http_server::parse_authority_with_default(
         authority,
         yuhaiin_core::Network::Tcp,
         Some(default_port),
@@ -2109,44 +2107,7 @@ async fn accept_websocket_stream<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let mut early_data = Vec::new();
-    let websocket = tokio_tungstenite::accept_hdr_async(
-        stream,
-        |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-         mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-            let wants_early_data = request
-                .headers()
-                .get("early_data")
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.eq_ignore_ascii_case("base64"));
-            if !wants_early_data {
-                return Ok(response);
-            }
-            let Some(key) = request.headers().get("Sec-WebSocket-Key") else {
-                return Ok(response);
-            };
-            let Ok(decoded) =
-                base64::engine::general_purpose::STANDARD_NO_PAD.decode(key.as_bytes())
-            else {
-                return Ok(response);
-            };
-            if decoded.len() > 2048 {
-                return Ok(response);
-            }
-            early_data = decoded;
-            response.headers_mut().insert(
-                "early_data",
-                tokio_tungstenite::tungstenite::http::HeaderValue::from_static("true"),
-            );
-            Ok(response)
-        },
-    )
-    .await
-    .map_err(|error| Error::new(ErrorKind::Protocol, format!("WebSocket handshake: {error}")))?;
-    Ok((
-        crate::proxy::websocket::WebSocketIo::new(websocket),
-        early_data,
-    ))
+    crate::proxy::websocket::accept_stream(stream).await
 }
 
 #[cfg(all(feature = "websocket", feature = "http2"))]

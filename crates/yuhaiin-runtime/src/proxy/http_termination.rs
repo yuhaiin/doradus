@@ -28,7 +28,7 @@ use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, 
 use yuhaiin_store::{GoProxyLayer, GoProxyRuntimeConfig};
 use yuhaiin_trie::DomainTrie;
 
-use super::http::parse_authority_with_default;
+use yuhaiin_protocol::http_server::parse_authority_with_default;
 
 const PIPE_BUFFER_SIZE: usize = 128 * 1024;
 type ResponseBody = BoxBody<Bytes, hyper::Error>;

@@ -282,6 +282,7 @@ pub(crate) struct AeadUdpSocket {
     socket: UdpSocket,
     password: Vec<u8>,
     method: yuhaiin_protocol::aead::CryptoMethod,
+    packet: Vec<u8>,
 }
 
 impl AeadUdpSocket {
@@ -294,6 +295,7 @@ impl AeadUdpSocket {
             socket,
             password: password.into(),
             method,
+            packet: Vec::new(),
         }
     }
 }
@@ -304,10 +306,17 @@ impl InboundUdpSocket for AeadUdpSocket {
         buffer: &'a mut [u8],
     ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>> {
         Box::pin(async move {
-            let mut packet = vec![0u8; 65_535];
-            let (length, peer) = self.socket.recv_from(&mut packet).await?;
+            const AEAD_UDP_MAX_OVERHEAD: usize = 24 + 16;
+            let required = buffer
+                .len()
+                .saturating_add(AEAD_UDP_MAX_OVERHEAD)
+                .min(u16::MAX as usize);
+            if self.packet.len() < required {
+                self.packet.resize(required, 0);
+            }
+            let (length, peer) = self.socket.recv_from(&mut self.packet).await?;
             let plaintext = yuhaiin_protocol::aead::decrypt_packet(
-                &packet[..length],
+                &self.packet[..length],
                 &self.password,
                 self.method,
             )

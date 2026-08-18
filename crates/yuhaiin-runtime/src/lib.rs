@@ -154,7 +154,9 @@ pub struct RuntimeSnapshot {
     /// Go node tags are part of routing, not only a management/API view. A
     /// route rule's tag can select a node or a mirrored tag at flow time.
     pub node_tags: Vec<GoNodeTagRecord>,
-    pub route_lists: RouteListSnapshot,
+    /// Immutable route-list data shared with proxy selectors instead of
+    /// being deep-cloned for every selector metadata snapshot.
+    pub route_lists: Arc<RouteListSnapshot>,
     pub router: RouterRuntime,
     pub resolver_by_id: BTreeMap<String, Arc<dyn AsyncIpResolver>>,
     /// Configured resolvers wrapped with the inbound FakeIP policy.
@@ -420,7 +422,7 @@ impl RuntimeBuilder {
         let route_rules = repository.list_go_route_rules().await?;
         let node_tags = repository.list_go_node_tags().await?;
         let route_list_records = repository.list_go_route_lists().await?;
-        let route_lists = load_route_lists(&route_list_records);
+        let route_lists = Arc::new(load_route_lists(&route_list_records));
         let proxies = repository.list_go_proxy_runtime_configs().await?;
         let geo_metadata = repository.list_maxmind_metadata().await?;
         let geo_manager = GeoDatabaseManager::new();
@@ -1282,7 +1284,7 @@ mod tests {
             }),
             route_rules: Vec::new(),
             node_tags: Vec::new(),
-            route_lists: RouteListSnapshot::default(),
+            route_lists: Arc::new(RouteListSnapshot::default()),
             router,
             resolver_by_id,
             inbound_resolver_by_id: BTreeMap::new(),
