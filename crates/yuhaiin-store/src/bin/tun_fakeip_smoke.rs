@@ -282,17 +282,12 @@ async fn async_main() -> io::Result<()> {
         .with_async_dns_handler(Arc::new(dns_handler));
     let mut dispatcher =
         TunDispatcher::new(2048, 2048, 16).map_err(|error| io::Error::other(error.to_string()))?;
-    tun.run_dispatcher_until(
-        &mut dispatcher,
-        &mut proxy_runtime,
-        Duration::from_millis(1),
-        async move {
-            let result = done_rx
-                .await
-                .unwrap_or_else(|_| Err("DNS client stopped".into()));
-            let _ = result_tx.send(result);
-        },
-    )
+    tun.run_dispatcher_until(&mut dispatcher, &mut proxy_runtime, async move {
+        let result = done_rx
+            .await
+            .unwrap_or_else(|_| Err("DNS client stopped".into()));
+        let _ = result_tx.send(result);
+    })
     .await
     .map_err(|error| io::Error::other(format!("TUN dispatcher: {error}")))?;
     proxy_runtime.close();

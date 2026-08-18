@@ -180,6 +180,19 @@ impl TunDispatcher {
         )
     }
 
+    /// Return smoltcp's next timer deadline without polling the device.
+    ///
+    /// The async runtime uses this as a precise timer fallback for TCP
+    /// retransmits and delayed ACKs. Data-plane events wake it immediately,
+    /// so callers do not need a fixed-rate polling interval.
+    pub(crate) fn poll_delay(
+        &mut self,
+        interface: &mut Interface,
+        timestamp: Instant,
+    ) -> Option<smoltcp::time::Duration> {
+        interface.poll_delay(timestamp, &self.sockets)
+    }
+
     pub fn poll_with(
         &mut self,
         interface: &mut Interface,

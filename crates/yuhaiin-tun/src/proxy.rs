@@ -101,6 +101,37 @@ pub(crate) enum ProxyOutput {
 }
 
 #[cfg(feature = "async-proxy")]
+#[derive(Clone)]
+pub(crate) struct ProxyOutputSender {
+    sender: mpsc::Sender<ProxyOutput>,
+    notify: Arc<Notify>,
+}
+
+#[cfg(feature = "async-proxy")]
+impl ProxyOutputSender {
+    #[allow(dead_code)]
+    pub(crate) fn try_send(
+        &self,
+        value: ProxyOutput,
+    ) -> std::result::Result<(), tokio::sync::mpsc::error::TrySendError<ProxyOutput>> {
+        self.sender.try_send(value).map(|()| {
+            self.notify.notify_one();
+        })
+    }
+
+    async fn send(&self, value: ProxyOutput, timeout: Duration) -> bool {
+        let sent = matches!(
+            tokio::time::timeout(timeout, self.sender.send(value)).await,
+            Ok(Ok(()))
+        );
+        if sent {
+            self.notify.notify_one();
+        }
+        sent
+    }
+}
+
+#[cfg(feature = "async-proxy")]
 pub(crate) struct ProxyTask {
     pub(crate) command: mpsc::Sender<ProxyCommand>,
     pub(crate) join: tokio::task::JoinHandle<()>,
@@ -169,9 +200,9 @@ pub struct TunProxyRuntime {
     process_cache: HashMap<UdpSourceKey, Option<ProcessInfo>>,
     process_cache_refs: HashMap<UdpSourceKey, usize>,
     udp_buffer_size: usize,
-    pub(crate) output_tx: mpsc::Sender<ProxyOutput>,
+    pub(crate) output_tx: ProxyOutputSender,
     output_rx: mpsc::Receiver<ProxyOutput>,
-    icmp_output_tx: mpsc::Sender<ProxyOutput>,
+    icmp_output_tx: ProxyOutputSender,
     icmp_output_rx: mpsc::Receiver<ProxyOutput>,
     channel_capacity: usize,
     timeouts: ProxyTimeouts,
@@ -185,8 +216,9 @@ impl TunProxyRuntime {
                 "proxy flow channel capacity must be non-zero",
             ));
         }
-        let (output_tx, output_rx) = mpsc::channel(channel_capacity);
-        let (icmp_output_tx, icmp_output_rx) = mpsc::channel(channel_capacity);
+        let (output_sender, output_rx) = mpsc::channel(channel_capacity);
+        let (icmp_output_sender, icmp_output_rx) = mpsc::channel(channel_capacity);
+        let notify = Arc::new(Notify::new());
         Ok(Self {
             selector,
             context_provider: Arc::new(|flow| flow.context()),
@@ -207,13 +239,23 @@ impl TunProxyRuntime {
             process_cache: HashMap::new(),
             process_cache_refs: HashMap::new(),
             udp_buffer_size: u16::MAX as usize,
-            output_tx,
+            output_tx: ProxyOutputSender {
+                sender: output_sender,
+                notify: notify.clone(),
+            },
             output_rx,
-            icmp_output_tx,
+            icmp_output_tx: ProxyOutputSender {
+                sender: icmp_output_sender,
+                notify,
+            },
             icmp_output_rx,
             channel_capacity,
             timeouts: ProxyTimeouts::default(),
         })
+    }
+
+    pub(crate) fn output_notify(&self) -> Arc<Notify> {
+        self.output_tx.notify.clone()
     }
 
     pub fn with_dns_handler(mut self, handler: Arc<dyn DnsHandler>) -> Self {
@@ -390,8 +432,10 @@ impl TunProxyRuntime {
                 let key = flow.key;
                 let timeouts = self.timeouts;
                 let observer = self.observer.clone();
+                let notify = self.output_notify();
                 let join = tokio::spawn(async move {
                     run_tcp_proxy(proxy, context, key, commands, output, timeouts, observer).await;
+                    notify.notify_one();
                 });
                 self.tasks.insert(key, ProxyTask { command, join });
             }
@@ -440,8 +484,10 @@ impl TunProxyRuntime {
                 };
                 let output = self.icmp_output_tx.clone();
                 let timeouts = self.timeouts;
+                let notify = self.output_notify();
                 let join = tokio::spawn(async move {
                     run_icmp_proxy(proxy, context, id, flow.key, packet, output, timeouts).await;
+                    notify.notify_one();
                 });
                 self.icmp_tasks.insert(
                     id,
@@ -466,8 +512,12 @@ impl TunProxyRuntime {
                     && let Some(handler) = self.dns_handler.clone()
                 {
                     let timeout = self.timeouts.read;
-                    let join =
-                        tokio::spawn(async move { run_dns_query(handler, payload, timeout).await });
+                    let notify = self.output_notify();
+                    let join = tokio::spawn(async move {
+                        let answer = run_dns_query(handler, payload, timeout).await;
+                        notify.notify_one();
+                        answer
+                    });
                     self.dns_tasks.push(SyncDnsTask {
                         flow: flow.key,
                         join,
@@ -483,6 +533,7 @@ impl TunProxyRuntime {
                     let timeouts = self.timeouts;
                     let observer = self.observer.clone();
                     let udp_buffer_size = self.udp_buffer_size;
+                    let notify = self.output_notify();
                     let join = tokio::spawn(async move {
                         run_udp_proxy(
                             proxy,
@@ -495,6 +546,7 @@ impl TunProxyRuntime {
                             udp_buffer_size,
                         )
                         .await;
+                        notify.notify_one();
                     });
                     self.udp_tasks.insert(
                         source,
@@ -534,6 +586,7 @@ impl TunProxyRuntime {
             {
                 self.track_flow(flow.key)?;
                 let timeout = self.timeouts.read;
+                let notify = self.output_notify();
                 self.async_dns_tasks.push(Box::pin(async move {
                     let answer = match tokio::time::timeout(timeout, handler.answer(&payload)).await
                     {
@@ -543,6 +596,7 @@ impl TunProxyRuntime {
                             "TUN async DNS resolver timed out",
                         )),
                     };
+                    notify.notify_one();
                     (flow.key, answer)
                 }));
                 return Ok(());
@@ -1200,7 +1254,7 @@ async fn run_tcp_proxy(
     mut context: crate::FlowContext,
     flow: TunFlowKey,
     mut commands: mpsc::Receiver<ProxyCommand>,
-    output: mpsc::Sender<ProxyOutput>,
+    output: ProxyOutputSender,
     timeouts: ProxyTimeouts,
     observer: Option<Arc<dyn TunFlowObserver>>,
 ) {
@@ -1319,7 +1373,7 @@ async fn run_udp_proxy(
     mut context: crate::FlowContext,
     initial_flow: TunFlowKey,
     mut commands: mpsc::Receiver<UdpProxyCommand>,
-    output: mpsc::Sender<ProxyOutput>,
+    output: ProxyOutputSender,
     timeouts: ProxyTimeouts,
     observer: Option<Arc<dyn TunFlowObserver>>,
     udp_buffer_size: usize,
@@ -1470,15 +1524,8 @@ async fn run_udp_proxy(
 }
 
 #[cfg(feature = "async-proxy")]
-async fn emit_output(
-    output: &mpsc::Sender<ProxyOutput>,
-    value: ProxyOutput,
-    timeout: Duration,
-) -> bool {
-    matches!(
-        tokio::time::timeout(timeout, output.send(value)).await,
-        Ok(Ok(()))
-    )
+async fn emit_output(output: &ProxyOutputSender, value: ProxyOutput, timeout: Duration) -> bool {
+    output.send(value, timeout).await
 }
 
 #[cfg(feature = "async-proxy")]
@@ -1504,7 +1551,7 @@ async fn run_icmp_proxy(
     id: u64,
     flow: TunFlowKey,
     packet: Vec<u8>,
-    output: mpsc::Sender<ProxyOutput>,
+    output: ProxyOutputSender,
     timeouts: ProxyTimeouts,
 ) {
     // Routing and telemetry selected this flow as ICMP. The existing

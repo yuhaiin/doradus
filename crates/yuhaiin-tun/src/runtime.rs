@@ -373,27 +373,21 @@ impl TunRuntime {
             .poll(timestamp, &mut self.smoltcp_device, sockets)
     }
 
-    /// Run the complete first-generation TUN data-plane loop.
+    /// Run the event-driven TUN data-plane loop.
     ///
-    /// The loop has one packet-reader future and one timer branch.  Both paths
-    /// advance smoltcp, drain proxy outputs, dispatch owned flow events, and
-    /// flush all available TX packets.  The proxy runtime remains injectable;
-    /// this method only owns lifecycle ordering and never selects a route by
-    /// itself.
+    /// Kernel packets and proxy task completions wake the loop immediately.
+    /// smoltcp contributes only its own next protocol deadline, such as a TCP
+    /// retransmission or delayed ACK timer.  The proxy runtime remains
+    /// injectable; this method only owns lifecycle ordering and never selects
+    /// a route by itself.
     #[cfg(feature = "async-proxy")]
     pub async fn run_dispatcher(
         &mut self,
         dispatcher: &mut TunDispatcher,
         proxy_runtime: &mut TunProxyRuntime,
-        tick: Duration,
     ) -> io::Result<()> {
-        self.run_dispatcher_until(
-            dispatcher,
-            proxy_runtime,
-            tick,
-            std::future::pending::<()>(),
-        )
-        .await
+        self.run_dispatcher_until(dispatcher, proxy_runtime, std::future::pending::<()>())
+            .await
     }
 
     /// Run the TUN data plane until the caller's shutdown future completes.
@@ -406,22 +400,26 @@ impl TunRuntime {
         &mut self,
         dispatcher: &mut TunDispatcher,
         proxy_runtime: &mut TunProxyRuntime,
-        tick: Duration,
         shutdown: F,
     ) -> io::Result<()>
     where
         F: std::future::Future<Output = ()>,
     {
-        if tick.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "TUN dispatcher tick must be non-zero",
-            ));
-        }
         let started = std::time::Instant::now();
-        let mut ticker = tokio::time::interval(tick);
         tokio::pin!(shutdown);
         loop {
+            let elapsed = started.elapsed();
+            let timestamp = Instant::from_micros(elapsed.as_micros().min(i64::MAX as u128) as i64);
+            let next_poll_delay = dispatcher.poll_delay(&mut self.interface, timestamp);
+            let output_notify = proxy_runtime.output_notify();
+            let poll_timer = async move {
+                if let Some(delay) = next_poll_delay {
+                    tokio::time::sleep(Duration::from_micros(delay.total_micros())).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(poll_timer);
             tokio::select! {
                 result = self.recv_from_tun() => {
                     if let Err(error) = result {
@@ -429,7 +427,8 @@ impl TunRuntime {
                         return Err(error);
                     }
                 }
-                _ = ticker.tick() => {}
+                _ = output_notify.notified() => {}
+                _ = &mut poll_timer => {}
                 _ = &mut shutdown => {
                     proxy_runtime
                         .close_graceful(DEFAULT_GRACEFUL_CLOSE_TIMEOUT)
@@ -439,7 +438,7 @@ impl TunRuntime {
             }
             let elapsed = started.elapsed();
             self.expire_ipv6_fragments();
-            let timestamp = Instant::from_millis(elapsed.as_millis().min(i64::MAX as u128) as i64);
+            let timestamp = Instant::from_micros(elapsed.as_micros().min(i64::MAX as u128) as i64);
             if let Err(error) = dispatcher.poll(self, timestamp) {
                 proxy_runtime.close();
                 return Err(io::Error::other(error.to_string()));

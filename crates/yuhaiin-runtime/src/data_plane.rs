@@ -603,19 +603,14 @@ pub async fn run_tun_device_until_ref(
     controller.monitor().info("TUN inbound ready");
     let mut dispatcher = yuhaiin_tun::TunDispatcher::new(64 * 1024, 64 * 1024, 2048)?
         .with_skip_multicast(config.tun.skip_multicast);
-    tun.run_dispatcher_until(
-        &mut dispatcher,
-        &mut proxy_runtime,
-        Duration::from_millis(10),
-        async {
-            let _ = wait_for_shutdown_or_matching_inbound_reload(
-                &controller,
-                shutdown.clone(),
-                config.inbound_id.as_deref(),
-            )
-            .await;
-        },
-    )
+    tun.run_dispatcher_until(&mut dispatcher, &mut proxy_runtime, async {
+        let _ = wait_for_shutdown_or_matching_inbound_reload(
+            &controller,
+            shutdown.clone(),
+            config.inbound_id.as_deref(),
+        )
+        .await;
+    })
     .await
     .map_err(io_error)?;
     if *shutdown.borrow() {

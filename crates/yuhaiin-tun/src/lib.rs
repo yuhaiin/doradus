@@ -36,7 +36,7 @@ pub use platform::DeviceBuilder;
 pub use platform::{AsyncDevice, async_device_from_owned_fd, enable_loopback};
 
 #[cfg(feature = "async-proxy")]
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 #[cfg(feature = "async-proxy")]
 use futures_util::stream::FuturesUnordered;
