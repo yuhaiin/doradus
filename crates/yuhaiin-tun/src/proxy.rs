@@ -1,7 +1,19 @@
 //! Async proxy task runtime for TUN flows.
 
+#[cfg(feature = "async-proxy")]
 use super::*;
+#[cfg(feature = "async-proxy")]
 use yuhaiin_core::process::ProcessInfo;
+
+#[cfg(feature = "async-proxy")]
+#[path = "proxy_output.rs"]
+mod proxy_output;
+#[cfg(feature = "async-proxy")]
+#[path = "proxy_tasks.rs"]
+mod proxy_tasks;
+
+#[cfg(feature = "async-proxy")]
+use proxy_tasks::{run_dns_query, run_icmp_proxy, run_tcp_proxy, run_udp_proxy};
 
 #[cfg(feature = "async-proxy")]
 pub(crate) enum ProxyCommand {
@@ -194,6 +206,7 @@ pub struct TunProxyRuntime {
     pub(crate) udp_tasks: HashMap<UdpSourceKey, UdpProxyTask>,
     pub(crate) udp_flow_sources: HashMap<TunFlowKey, UdpSourceKey>,
     pending_tcp: HashMap<TunFlowKey, VecDeque<Vec<u8>>>,
+    pending_tcp_keys: Vec<TunFlowKey>,
     pub(crate) dns_tasks: Vec<SyncDnsTask>,
     async_dns_tasks: FuturesUnordered<AsyncDnsTask>,
     tracked_flows: HashSet<TunFlowKey>,
@@ -233,6 +246,7 @@ impl TunProxyRuntime {
             udp_tasks: HashMap::new(),
             udp_flow_sources: HashMap::new(),
             pending_tcp: HashMap::new(),
+            pending_tcp_keys: Vec::new(),
             dns_tasks: Vec::new(),
             async_dns_tasks: FuturesUnordered::new(),
             tracked_flows: HashSet::new(),
@@ -418,164 +432,190 @@ impl TunProxyRuntime {
 
     pub fn handle_event(&mut self, event: TunEvent) -> Result<()> {
         match event {
-            TunEvent::TcpOpened { flow } => {
-                self.track_flow(flow.key)?;
-                self.remove_task(&flow.key);
-                let mut context = self.context_for_flow(flow);
-                self.selector.route_context(&mut context);
-                if let Some(observer) = &self.observer {
-                    observer.opened(flow, context.clone());
-                }
-                let proxy = self.selector.select(&context);
-                let (command, commands) = mpsc::channel(self.channel_capacity);
-                let output = self.output_tx.clone();
-                let key = flow.key;
-                let timeouts = self.timeouts;
-                let observer = self.observer.clone();
-                let notify = self.output_notify();
-                let join = tokio::spawn(async move {
-                    run_tcp_proxy(proxy, context, key, commands, output, timeouts, observer).await;
-                    notify.notify_one();
-                });
-                self.tasks.insert(key, ProxyTask { command, join });
-            }
-            TunEvent::TcpData { flow, payload } => {
-                self.touch_flow(flow.key)?;
-                if let Some(observer) = &self.observer {
-                    observer.bytes(flow.key, TunFlowDirection::Upload, payload.len());
-                }
-                self.send_command_or_cleanup(&flow.key, ProxyCommand::Data(payload))?;
-            }
-            TunEvent::TcpHalfClosed { flow } => {
-                tun_debug(format!("TUN TCP half-closed flow={:?}", flow.key));
-                self.touch_flow(flow.key)?;
-                self.send_command_or_cleanup(&flow.key, ProxyCommand::Shutdown)?;
-            }
-            TunEvent::TcpClosed { flow } => {
-                tun_debug(format!("TUN TCP socket closed flow={:?}", flow.key));
-                self.remove_task(&flow.key);
-                self.untrack_flow(&flow.key)?;
-            }
-            TunEvent::IcmpEchoRequest { flow, packet } => {
-                self.track_flow(flow.key)?;
-                let mut context = self.context_for_flow(flow);
-                // Go's tun2socket ping path enters route.Ping, which selects
-                // the UDP node set before it invokes the protocol-level ping
-                // method. Keep the ICMP flow key for telemetry/NAT, but use a
-                // UDP routing context so the same selected chain is used.
-                context.network = Network::Udp;
-                context.destination = match context.destination {
-                    Endpoint::Ip { addr, .. } => Endpoint::ip(Network::Udp, addr),
-                    Endpoint::Domain { host, port, .. } => {
-                        Endpoint::domain(Network::Udp, host, port)
-                    }
-                };
-                self.selector.route_context(&mut context);
-                if let Some(observer) = &self.observer {
-                    observer.opened(flow, context.clone());
-                    observer.bytes(flow.key, TunFlowDirection::Upload, packet.len());
-                }
-                let proxy = self.selector.select(&context);
-                let id = loop {
-                    self.next_icmp_id = self.next_icmp_id.wrapping_add(1);
-                    if !self.icmp_tasks.contains_key(&self.next_icmp_id) {
-                        break self.next_icmp_id;
-                    }
-                };
-                let output = self.icmp_output_tx.clone();
-                let timeouts = self.timeouts;
-                let notify = self.output_notify();
-                let join = tokio::spawn(async move {
-                    run_icmp_proxy(proxy, context, id, flow.key, packet, output, timeouts).await;
-                    notify.notify_one();
-                });
-                self.icmp_tasks.insert(
-                    id,
-                    IcmpProxyTask {
-                        flow: flow.key,
-                        join,
-                    },
-                );
-            }
-            TunEvent::UdpDatagram { flow, payload } => {
-                let first = !self.tracked_flows.contains(&flow.key);
-                self.track_flow(flow.key)?;
-                let mut context = self.context_for_flow(flow);
-                self.selector.route_context(&mut context);
-                if first && let Some(observer) = &self.observer {
-                    observer.opened(flow, context.clone());
-                }
-                if let Some(observer) = &self.observer {
-                    observer.bytes(flow.key, TunFlowDirection::Upload, payload.len());
-                }
-                if flow.key.destination.port() == 53
-                    && let Some(handler) = self.dns_handler.clone()
-                {
-                    let timeout = self.timeouts.read;
-                    let notify = self.output_notify();
-                    let join = tokio::spawn(async move {
-                        let answer = run_dns_query(handler, payload, timeout).await;
-                        notify.notify_one();
-                        answer
-                    });
-                    self.dns_tasks.push(SyncDnsTask {
-                        flow: flow.key,
-                        join,
-                    });
-                    return Ok(());
-                }
-                let target = context.effective_destination();
-                let source = udp_source_key(flow.key);
-                if !self.udp_tasks.contains_key(&source) {
-                    let proxy = self.selector.select(&context);
-                    let (command, commands) = mpsc::channel(self.channel_capacity);
-                    let output = self.output_tx.clone();
-                    let timeouts = self.timeouts;
-                    let observer = self.observer.clone();
-                    let udp_buffer_size = self.udp_buffer_size;
-                    let notify = self.output_notify();
-                    let join = tokio::spawn(async move {
-                        run_udp_proxy(
-                            proxy,
-                            context,
-                            flow.key,
-                            commands,
-                            output,
-                            timeouts,
-                            observer,
-                            udp_buffer_size,
-                        )
-                        .await;
-                        notify.notify_one();
-                    });
-                    self.udp_tasks.insert(
-                        source,
-                        UdpProxyTask {
-                            command,
-                            join,
-                            flows: HashSet::from([flow.key]),
-                        },
-                    );
-                } else if let Some(task) = self.udp_tasks.get_mut(&source) {
-                    task.flows.insert(flow.key);
-                }
-                self.udp_flow_sources.insert(flow.key, source);
-                if let Err(error) = self.send_udp_command(
-                    &source,
-                    UdpProxyCommand::Data {
-                        flow: flow.key,
-                        target,
-                        payload,
-                    },
-                ) {
-                    let flows = self.remove_udp_source_task(source);
-                    for flow in flows {
-                        self.untrack_flow(&flow)?;
-                    }
-                    return Err(error);
-                }
+            TunEvent::TcpOpened { flow } => self.open_tcp_flow(flow)?,
+            TunEvent::TcpData { flow, payload } => self.send_tcp_data(flow, payload)?,
+            TunEvent::TcpHalfClosed { flow } => self.half_close_tcp(flow)?,
+            TunEvent::TcpClosed { flow } => self.close_tcp_flow(flow)?,
+            TunEvent::IcmpEchoRequest { flow, packet } => self.open_icmp_flow(flow, packet)?,
+            TunEvent::UdpDatagram { flow, payload } => self.handle_udp_datagram(flow, payload)?,
+        }
+        Ok(())
+    }
+
+    fn open_tcp_flow(&mut self, flow: TunFlow) -> Result<()> {
+        self.track_flow(flow.key)?;
+        self.remove_task(&flow.key);
+        let mut context = self.context_for_flow(flow);
+        self.selector.route_context(&mut context);
+        if let Some(observer) = &self.observer {
+            observer.opened(flow, context.clone());
+        }
+        let proxy = self.selector.select(&context);
+        let (command, commands) = mpsc::channel(self.channel_capacity);
+        let output = self.output_tx.clone();
+        let key = flow.key;
+        let timeouts = self.timeouts;
+        let observer = self.observer.clone();
+        let notify = self.output_notify();
+        let join = tokio::spawn(async move {
+            run_tcp_proxy(proxy, context, key, commands, output, timeouts, observer).await;
+            notify.notify_one();
+        });
+        self.tasks.insert(key, ProxyTask { command, join });
+        Ok(())
+    }
+
+    fn send_tcp_data(&mut self, flow: TunFlow, payload: Vec<u8>) -> Result<()> {
+        self.touch_flow(flow.key)?;
+        if let Some(observer) = &self.observer {
+            observer.bytes(flow.key, TunFlowDirection::Upload, payload.len());
+        }
+        self.send_command_or_cleanup(&flow.key, ProxyCommand::Data(payload))
+    }
+
+    fn half_close_tcp(&mut self, flow: TunFlow) -> Result<()> {
+        tun_debug(format!("TUN TCP half-closed flow={:?}", flow.key));
+        self.touch_flow(flow.key)?;
+        self.send_command_or_cleanup(&flow.key, ProxyCommand::Shutdown)
+    }
+
+    fn close_tcp_flow(&mut self, flow: TunFlow) -> Result<()> {
+        tun_debug(format!("TUN TCP socket closed flow={:?}", flow.key));
+        self.remove_task(&flow.key);
+        self.untrack_flow(&flow.key)
+    }
+
+    fn open_icmp_flow(&mut self, flow: TunFlow, packet: Vec<u8>) -> Result<()> {
+        self.track_flow(flow.key)?;
+        let mut context = self.context_for_flow(flow);
+        // ICMP follows the UDP route selection, while retaining its ICMP flow
+        // key for telemetry and NAT bookkeeping.
+        context.network = Network::Udp;
+        context.destination = match context.destination {
+            Endpoint::Ip { addr, .. } => Endpoint::ip(Network::Udp, addr),
+            Endpoint::Domain { host, port, .. } => Endpoint::domain(Network::Udp, host, port),
+        };
+        self.selector.route_context(&mut context);
+        if let Some(observer) = &self.observer {
+            observer.opened(flow, context.clone());
+            observer.bytes(flow.key, TunFlowDirection::Upload, packet.len());
+        }
+        let proxy = self.selector.select(&context);
+        let id = self.next_icmp_id();
+        let output = self.icmp_output_tx.clone();
+        let timeouts = self.timeouts;
+        let notify = self.output_notify();
+        let join = tokio::spawn(async move {
+            run_icmp_proxy(proxy, context, id, flow.key, packet, output, timeouts).await;
+            notify.notify_one();
+        });
+        self.icmp_tasks.insert(
+            id,
+            IcmpProxyTask {
+                flow: flow.key,
+                join,
+            },
+        );
+        Ok(())
+    }
+
+    fn next_icmp_id(&mut self) -> u64 {
+        loop {
+            self.next_icmp_id = self.next_icmp_id.wrapping_add(1);
+            if !self.icmp_tasks.contains_key(&self.next_icmp_id) {
+                return self.next_icmp_id;
             }
         }
+    }
+
+    fn handle_udp_datagram(&mut self, flow: TunFlow, payload: Vec<u8>) -> Result<()> {
+        let first = !self.tracked_flows.contains(&flow.key);
+        self.track_flow(flow.key)?;
+        let mut context = self.context_for_flow(flow);
+        self.selector.route_context(&mut context);
+        if first && let Some(observer) = &self.observer {
+            observer.opened(flow, context.clone());
+        }
+        if let Some(observer) = &self.observer {
+            observer.bytes(flow.key, TunFlowDirection::Upload, payload.len());
+        }
+        if flow.key.destination.port() == 53
+            && let Some(handler) = self.dns_handler.clone()
+        {
+            let timeout = self.timeouts.read;
+            let notify = self.output_notify();
+            let join = tokio::spawn(async move {
+                let answer = run_dns_query(handler, payload, timeout).await;
+                notify.notify_one();
+                answer
+            });
+            self.dns_tasks.push(SyncDnsTask {
+                flow: flow.key,
+                join,
+            });
+            return Ok(());
+        }
+
+        let target = context.effective_destination();
+        let source = udp_source_key(flow.key);
+        self.ensure_udp_proxy(source, context, flow.key)?;
+        self.udp_flow_sources.insert(flow.key, source);
+        if let Err(error) = self.send_udp_command(
+            &source,
+            UdpProxyCommand::Data {
+                flow: flow.key,
+                target,
+                payload,
+            },
+        ) {
+            let flows = self.remove_udp_source_task(source);
+            for flow in flows {
+                self.untrack_flow(&flow)?;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn ensure_udp_proxy(
+        &mut self,
+        source: UdpSourceKey,
+        context: FlowContext,
+        flow: TunFlowKey,
+    ) -> Result<()> {
+        if let Some(task) = self.udp_tasks.get_mut(&source) {
+            task.flows.insert(flow);
+            return Ok(());
+        }
+        let proxy = self.selector.select(&context);
+        let (command, commands) = mpsc::channel(self.channel_capacity);
+        let output = self.output_tx.clone();
+        let timeouts = self.timeouts;
+        let observer = self.observer.clone();
+        let udp_buffer_size = self.udp_buffer_size;
+        let notify = self.output_notify();
+        let join = tokio::spawn(async move {
+            run_udp_proxy(
+                proxy,
+                context,
+                flow,
+                commands,
+                output,
+                timeouts,
+                observer,
+                udp_buffer_size,
+            )
+            .await;
+            notify.notify_one();
+        });
+        self.udp_tasks.insert(
+            source,
+            UdpProxyTask {
+                command,
+                join,
+                flows: HashSet::from([flow]),
+            },
+        );
         Ok(())
     }
 
@@ -604,330 +644,6 @@ impl TunProxyRuntime {
             return self.handle_event(TunEvent::UdpDatagram { flow, payload });
         }
         self.handle_event(event)
-    }
-
-    pub fn poll_outputs(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
-        self.apply_close_requests(dispatcher)?;
-        let mut count = 0;
-        let pending_flows = self.pending_tcp.keys().copied().collect::<Vec<_>>();
-        for flow in pending_flows {
-            let mut drained = false;
-            while let Some(payload) = self
-                .pending_tcp
-                .get_mut(&flow)
-                .and_then(VecDeque::pop_front)
-            {
-                match dispatcher.write_tcp(flow, &payload) {
-                    Ok(written) if written == payload.len() => {
-                        drained = true;
-                    }
-                    Ok(written) => {
-                        self.pending_tcp
-                            .entry(flow)
-                            .or_default()
-                            .push_front(payload[written..].to_vec());
-                        break;
-                    }
-                    Err(_) => {
-                        self.pending_tcp
-                            .entry(flow)
-                            .or_default()
-                            .push_front(payload);
-                        break;
-                    }
-                }
-            }
-            if drained && self.pending_tcp.get(&flow).is_some_and(VecDeque::is_empty) {
-                self.pending_tcp.remove(&flow);
-            }
-        }
-        // ICMP has its own bounded completion queue.  A blocked TCP/UDP
-        // payload must not delay a completed ping response behind unrelated
-        // stream data; Go writes the ping result back independently of those
-        // relays.
-        while let Ok(output) = self.icmp_output_rx.try_recv() {
-            count += 1;
-            if let ProxyOutput::IcmpData { id, flow, packet } = output {
-                self.handle_icmp_output(dispatcher, id, flow, packet)?;
-            }
-        }
-        while let Ok(output) = self.output_rx.try_recv() {
-            count += 1;
-            match output {
-                ProxyOutput::TcpData { flow, payload } => {
-                    self.touch_flow(flow)?;
-                    if let Some(observer) = &self.observer {
-                        observer.bytes(flow, TunFlowDirection::Download, payload.len());
-                    }
-                    match dispatcher.write_tcp(flow, &payload) {
-                        Ok(written) if written == payload.len() => {}
-                        Ok(written) => {
-                            tun_debug(format!(
-                                "TCP output backpressure flow={flow:?}: wrote {written} of {}",
-                                payload.len()
-                            ));
-                            self.pending_tcp
-                                .entry(flow)
-                                .or_default()
-                                .push_back(payload[written..].to_vec());
-                            break;
-                        }
-                        Err(error) => {
-                            tun_debug(format!(
-                                "TCP output backpressure/close flow={flow:?}: {error}"
-                            ));
-                            self.pending_tcp.entry(flow).or_default().push_back(payload);
-                            break;
-                        }
-                    }
-                }
-                ProxyOutput::UdpData { flow, payload } => {
-                    self.touch_flow(flow)?;
-                    if let Some(observer) = &self.observer {
-                        observer.bytes(flow, TunFlowDirection::Download, payload.len());
-                    }
-                    match dispatcher.write_udp(flow, &payload) {
-                        Ok(()) => tun_debug(format!(
-                            "TUN UDP output queued flow={flow:?} bytes={}",
-                            payload.len()
-                        )),
-                        Err(error) => {
-                            tun_debug(format!(
-                                "TUN UDP output dropped flow={flow:?} bytes={} error={error}",
-                                payload.len()
-                            ));
-                            self.remove_flow_task(&flow);
-                            self.untrack_flow(&flow)?;
-                        }
-                    }
-                }
-                ProxyOutput::IcmpData { id, flow, packet } => {
-                    self.handle_icmp_output(dispatcher, id, flow, packet)?;
-                }
-                ProxyOutput::UdpClosed { flow } => {
-                    let source = self.udp_flow_sources.get(&flow).copied();
-                    let flows = source
-                        .map(|source| self.remove_udp_source_task(source))
-                        .unwrap_or_else(|| {
-                            self.remove_flow_task(&flow);
-                            vec![flow]
-                        });
-                    for flow in flows {
-                        let _ = dispatcher.close_udp(flow);
-                        self.untrack_flow(&flow)?;
-                    }
-                }
-                ProxyOutput::TcpClosed { flow } => {
-                    tun_debug(format!("TCP proxy task closed flow={flow:?}"));
-                    let _ = dispatcher.close_tcp(flow);
-                    self.pending_tcp.remove(&flow);
-                    self.remove_task(&flow);
-                    self.untrack_flow(&flow)?;
-                }
-                ProxyOutput::UdpBound { source, translated } => {
-                    let Some(nat) = &self.nat else {
-                        continue;
-                    };
-                    if let Err(error) =
-                        nat.table
-                            .bind_translated(source.network, source.source, translated)
-                    {
-                        tun_debug(format!(
-                            "TUN UDP translated endpoint rejected source={source:?} translated={translated}: {error}"
-                        ));
-                        let flows = self.remove_udp_source_task(source);
-                        for flow in flows {
-                            let _ = dispatcher.close_udp(flow);
-                            self.untrack_flow(&flow)?;
-                        }
-                        // A translated endpoint collision belongs to this
-                        // UDP source.  Drop that source and keep the owner
-                        // alive for unrelated TCP/UDP/DNS flows.
-                        continue;
-                    }
-                }
-            }
-        }
-        // Drain the shared proxy output queue before polling DNS completions.
-        // DNS responses are delivered directly below, so a full proxy queue
-        // can never turn a completed DNS query into an inbound-fatal error.
-        count += self.poll_async_dns(dispatcher)?;
-        count += self.poll_sync_dns(dispatcher)?;
-        let finished_tcp: Vec<_> = self
-            .tasks
-            .iter()
-            .filter(|(_, task)| task.join.is_finished())
-            .map(|(flow, _)| *flow)
-            .collect();
-        for flow in finished_tcp {
-            if let Some(task) = self.tasks.remove(&flow) {
-                if let Some(Err(error)) = task.join.now_or_never() {
-                    tun_debug(format!(
-                        "TCP proxy task ended with join error flow={flow:?}: {error}"
-                    ));
-                }
-                let _ = dispatcher.close_tcp(flow);
-                self.untrack_flow(&flow)?;
-            }
-        }
-        let finished_icmp: Vec<_> = self
-            .icmp_tasks
-            .iter()
-            .filter(|(_, task)| task.join.is_finished())
-            .map(|(id, _)| *id)
-            .collect();
-        for id in finished_icmp {
-            if let Some(task) = self.icmp_tasks.remove(&id) {
-                if let Some(Err(error)) = task.join.now_or_never() {
-                    tun_debug(format!(
-                        "ICMP proxy task ended with join error flow={:?}: {error}",
-                        task.flow
-                    ));
-                }
-                self.untrack_icmp_flow_if_idle(task.flow)?;
-            }
-        }
-        let finished: Vec<_> = self
-            .udp_tasks
-            .iter()
-            .filter(|(_, task)| task.join.is_finished())
-            .map(|(source, _)| *source)
-            .collect();
-        for source in finished {
-            let flows = self.remove_udp_source_task(source);
-            for flow in flows {
-                let _ = dispatcher.close_udp(flow);
-                self.untrack_flow(&flow)?;
-            }
-        }
-        Ok(count)
-    }
-
-    fn handle_icmp_output(
-        &mut self,
-        dispatcher: &mut TunDispatcher,
-        id: u64,
-        flow: TunFlowKey,
-        packet: Vec<u8>,
-    ) -> Result<()> {
-        self.icmp_tasks.remove(&id);
-        self.touch_flow(flow)?;
-        if let Some(observer) = &self.observer {
-            observer.bytes(flow, TunFlowDirection::Download, packet.len());
-        }
-        if let Err(error) = dispatcher.write_icmp(packet) {
-            tun_debug(format!(
-                "TUN ICMP output dropped flow={flow:?} error={error}"
-            ));
-        }
-        self.untrack_icmp_flow_if_idle(flow)
-    }
-
-    fn untrack_icmp_flow_if_idle(&mut self, flow: TunFlowKey) -> Result<()> {
-        if self.icmp_tasks.values().any(|task| task.flow == flow) {
-            return Ok(());
-        }
-        self.untrack_flow(&flow)
-    }
-
-    fn apply_close_requests(&mut self, dispatcher: &mut TunDispatcher) -> Result<()> {
-        let Some(observer) = &self.observer else {
-            return Ok(());
-        };
-        let requested = self
-            .tracked_flows
-            .iter()
-            .copied()
-            .filter(|flow| observer.close_requested(*flow))
-            .collect::<Vec<_>>();
-        for flow in requested {
-            self.remove_flow_task(&flow);
-            if flow.network == Network::Tcp {
-                let _ = dispatcher.abort_tcp(flow);
-            } else if flow.network == Network::Udp {
-                let _ = dispatcher.close_udp(flow);
-            }
-            self.untrack_flow(&flow)?;
-        }
-        Ok(())
-    }
-
-    /// Deliver a DNS response through the dispatcher-owned UDP socket.
-    ///
-    /// DNS interception is part of the TUN packet path, not a proxy task. It
-    /// must therefore not compete with proxy task output for the bounded
-    /// `output_tx` queue: a busy proxy queue is normal backpressure and must
-    /// not stop the whole TUN owner.
-    fn deliver_dns_output(
-        &mut self,
-        dispatcher: &mut TunDispatcher,
-        flow: TunFlowKey,
-        payload: Option<Vec<u8>>,
-    ) -> Result<()> {
-        match payload {
-            Some(payload) => {
-                self.touch_flow(flow)?;
-                if let Some(observer) = &self.observer {
-                    observer.bytes(flow, TunFlowDirection::Download, payload.len());
-                }
-                if let Err(error) = dispatcher.write_udp(flow, &payload) {
-                    tun_debug(format!(
-                        "TUN DNS output dropped flow={flow:?} bytes={} error={error}",
-                        payload.len()
-                    ));
-                    self.remove_flow_task(&flow);
-                    let _ = dispatcher.close_udp(flow);
-                    self.untrack_flow(&flow)?;
-                }
-            }
-            None => {
-                self.remove_flow_task(&flow);
-                let _ = dispatcher.close_udp(flow);
-                self.untrack_flow(&flow)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Poll locally-owned async DNS futures without awaiting a pending
-    /// resolver. This keeps the TUN packet loop responsive while preserving
-    /// `LocalBoxFuture` support for handlers that do not require `Send`.
-    fn poll_async_dns(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
-        let mut count = 0;
-        while let Some(Some((flow, answer))) = self.async_dns_tasks.next().now_or_never() {
-            count += 1;
-            self.deliver_dns_output(dispatcher, flow, answer.ok())?;
-        }
-        Ok(count)
-    }
-
-    fn poll_sync_dns(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
-        let finished = self
-            .dns_tasks
-            .iter()
-            .enumerate()
-            .filter(|(_, task)| task.join.is_finished())
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let mut count = 0;
-        for index in finished.into_iter().rev() {
-            let SyncDnsTask { flow, join } = self.dns_tasks.swap_remove(index);
-            let answer = match join
-                .now_or_never()
-                .expect("finished DNS join handle must be ready")
-            {
-                Ok(answer) => answer,
-                Err(error) => {
-                    tun_debug(format!(
-                        "TUN synchronous DNS task ended with join error flow={flow:?}: {error}"
-                    ));
-                    None
-                }
-            };
-            count += 1;
-            self.deliver_dns_output(dispatcher, flow, answer)?;
-        }
-        Ok(count)
     }
 
     pub fn close(&mut self) {
@@ -1246,346 +962,4 @@ pub(crate) fn udp_source_key(flow: TunFlowKey) -> UdpSourceKey {
         network: flow.network,
         source: flow.source,
     }
-}
-
-#[cfg(feature = "async-proxy")]
-async fn run_tcp_proxy(
-    proxy: Arc<dyn AsyncProxy>,
-    mut context: crate::FlowContext,
-    flow: TunFlowKey,
-    mut commands: mpsc::Receiver<ProxyCommand>,
-    output: ProxyOutputSender,
-    timeouts: ProxyTimeouts,
-    observer: Option<Arc<dyn TunFlowObserver>>,
-) {
-    let stream = match tokio::time::timeout(timeouts.connect, proxy.connect(&context)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => {
-            tun_debug(format!("TCP proxy connect failed flow={flow:?}: {error}"));
-            let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
-            return;
-        }
-        Err(_) => {
-            tun_debug(format!("TCP proxy connect timed out flow={flow:?}"));
-            let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
-            return;
-        }
-    };
-    if let Some(local_addr) = stream_local_addr(&*stream) {
-        context.outbound_local_addr = Some(Endpoint::ip(context.network, local_addr));
-    }
-    if let Some(remote_addr) = stream_remote_addr(&*stream) {
-        context.outbound_addr = Some(Endpoint::ip(context.network, remote_addr));
-        // For direct/bypass flows the stream peer is the actual resolved
-        // destination.  A proxy-mode stream peer is the proxy node itself,
-        // not the user's target, so exposing it as `resolved_destination`
-        // would make connection metadata lie in the opposite direction.
-        if matches!(context.route_mode, RouteMode::Direct | RouteMode::Bypass) {
-            context.resolved_destination = Some(Endpoint::ip(context.network, remote_addr));
-        }
-    }
-    if let Some(observer) = observer {
-        // TUN opens are published before the async connect so the management
-        // plane can show a pending flow. Publish the same flow once more after
-        // connect so the monitor can merge socket metadata without allocating
-        // a second connection ID.
-        observer.opened(TunFlow { key: flow }, context.clone());
-    }
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let mut buffer = vec![0u8; 16 * 1024];
-    let mut write_closed = false;
-    let mut idle = Box::pin(tokio::time::sleep(timeouts.idle));
-    loop {
-        tokio::select! {
-            result = tokio::time::timeout(timeouts.read, tokio::io::AsyncReadExt::read(&mut reader, &mut buffer)) => {
-                match result {
-                    Ok(Ok(0)) => {
-                        tun_debug(format!("TCP proxy remote EOF flow={flow:?}"));
-                        let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
-                        return;
-                    }
-                    Ok(Err(_)) => {
-                        tun_debug(format!("TCP proxy remote read failed flow={flow:?}"));
-                        let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
-                        return;
-                    }
-                    Err(_) => {
-                        tun_debug(format!("TCP proxy remote read timed out flow={flow:?}"));
-                        let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
-                        return;
-                    }
-                    Ok(Ok(length)) => {
-                        idle.as_mut().reset(tokio::time::Instant::now() + timeouts.idle);
-                        if !emit_output(
-                            &output,
-                            ProxyOutput::TcpData { flow, payload: buffer[..length].to_vec() },
-                            timeouts.idle,
-                        ).await {
-                            tun_debug(format!("TCP proxy output channel timed out flow={flow:?}"));
-                            let _ = tokio::time::timeout(
-                                timeouts.write,
-                                tokio::io::AsyncWriteExt::shutdown(&mut writer),
-                            )
-                            .await;
-                            return;
-                        }
-                    }
-                }
-            }
-            command = commands.recv() => {
-                match command {
-                    Some(ProxyCommand::Data(payload)) if !write_closed => {
-                        let write = tokio::time::timeout(
-                            timeouts.write,
-                            tokio::io::AsyncWriteExt::write_all(&mut writer, &payload),
-                        )
-                        .await;
-                        if !matches!(write, Ok(Ok(()))) {
-                            tun_debug(format!("TCP proxy remote write failed flow={flow:?}"));
-                            let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
-                            return;
-                        }
-                        idle.as_mut().reset(tokio::time::Instant::now() + timeouts.idle);
-                    }
-                    Some(ProxyCommand::Shutdown) | None if !write_closed => {
-                        let _ = tokio::time::timeout(
-                            timeouts.write,
-                            tokio::io::AsyncWriteExt::shutdown(&mut writer),
-                        ).await;
-                        write_closed = true;
-                        idle.as_mut().reset(tokio::time::Instant::now() + timeouts.idle);
-                    }
-                    Some(ProxyCommand::Data(_)) | Some(ProxyCommand::Shutdown) | None => {}
-                }
-            }
-            _ = &mut idle => {
-                tun_debug(format!("TCP proxy idle timeout flow={flow:?}"));
-                let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
-                return;
-            }
-        }
-    }
-}
-
-#[cfg(feature = "async-proxy")]
-async fn run_udp_proxy(
-    proxy: Arc<dyn AsyncProxy>,
-    mut context: crate::FlowContext,
-    initial_flow: TunFlowKey,
-    mut commands: mpsc::Receiver<UdpProxyCommand>,
-    output: ProxyOutputSender,
-    timeouts: ProxyTimeouts,
-    observer: Option<Arc<dyn TunFlowObserver>>,
-    udp_buffer_size: usize,
-) {
-    let datagram = match tokio::time::timeout(timeouts.connect, proxy.open_datagram(&context)).await
-    {
-        Ok(Ok(datagram)) => datagram,
-        Ok(Err(error)) => {
-            tun_debug(format!(
-                "UDP proxy open failed flow={initial_flow:?}: {error}"
-            ));
-            let _ = emit_output(
-                &output,
-                ProxyOutput::UdpClosed { flow: initial_flow },
-                timeouts.idle,
-            )
-            .await;
-            return;
-        }
-        Err(_) => {
-            tun_debug(format!("UDP proxy open timed out flow={initial_flow:?}"));
-            let _ = emit_output(
-                &output,
-                ProxyOutput::UdpClosed { flow: initial_flow },
-                timeouts.idle,
-            )
-            .await;
-            return;
-        }
-    };
-    if let Ok(endpoint) = datagram.local_addr()
-        && endpoint.addr().is_some()
-    {
-        context.outbound_local_addr = Some(endpoint);
-    }
-    if let Some(observer) = observer {
-        observer.opened(TunFlow { key: initial_flow }, context.clone());
-    }
-    if let Ok(Endpoint::Ip {
-        network: Network::Udp,
-        addr: translated,
-    }) = datagram.local_addr()
-        && !emit_output(
-            &output,
-            ProxyOutput::UdpBound {
-                source: udp_source_key(initial_flow),
-                translated,
-            },
-            timeouts.idle,
-        )
-        .await
-    {
-        let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
-        return;
-    }
-    let mut buffer = vec![0u8; udp_buffer_size];
-    let mut routes = HashMap::<Endpoint, TunFlowKey>::new();
-    let mut last_flow = None;
-    let mut idle = Box::pin(tokio::time::sleep(timeouts.idle));
-    loop {
-        tokio::select! {
-            command = commands.recv() => {
-                match command {
-                    Some(UdpProxyCommand::Data {
-                        flow,
-                        target,
-                        payload,
-                    }) => {
-                        let destination = target;
-                        routes.insert(destination.clone(), flow);
-                        last_flow = Some(flow);
-                        let send = tokio::time::timeout(
-                            timeouts.write,
-                            datagram.send_to(&payload, destination.clone()),
-                        )
-                        .await;
-                        if !matches!(send, Ok(Ok(_))) {
-                            tun_debug(format!(
-                                "UDP proxy send failed flow={flow:?} target={destination:?} result={send:?}"
-                            ));
-                            let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
-                            for flow in routes.values().copied().collect::<HashSet<_>>() {
-                                let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
-                            }
-                            return;
-                        }
-                        idle.as_mut().reset(tokio::time::Instant::now() + timeouts.idle);
-                    }
-                    Some(UdpProxyCommand::CloseFlow(flow)) => {
-                        routes.retain(|_, current| *current != flow);
-                        if last_flow == Some(flow) {
-                            last_flow = routes.values().next().copied();
-                        }
-                        if routes.is_empty() {
-                            let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
-                            let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
-                            return;
-                        }
-                    }
-                    Some(UdpProxyCommand::Shutdown) | None => {
-                        let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
-                        for flow in routes.values().copied().collect::<HashSet<_>>() {
-                            let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
-                        }
-                        return;
-                    }
-                }
-            }
-            result = tokio::time::timeout(timeouts.read, datagram.recv_from(&mut buffer)) => {
-                let Ok(Ok((length, source))) = result else {
-                    tun_debug(format!("UDP proxy receive ended flow={initial_flow:?} result={result:?}"));
-                    let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
-                    for flow in routes.values().copied().collect::<HashSet<_>>() {
-                        let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
-                    }
-                    return;
-                };
-                idle.as_mut().reset(tokio::time::Instant::now() + timeouts.idle);
-                let flow = routes
-                    .get(&source)
-                    .copied()
-                    .or(last_flow);
-                let Some(flow) = flow else {
-                    continue;
-                };
-                routes.entry(source).or_insert(flow);
-                if !emit_output(
-                    &output,
-                    ProxyOutput::UdpData {
-                        flow,
-                        payload: buffer[..length].to_vec(),
-                    },
-                    timeouts.idle,
-                ).await {
-                    let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
-                    return;
-                }
-            }
-            _ = &mut idle => {
-                let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
-                for flow in routes.values().copied().collect::<HashSet<_>>() {
-                    let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
-                }
-                return;
-            }
-        }
-    }
-}
-
-#[cfg(feature = "async-proxy")]
-async fn emit_output(output: &ProxyOutputSender, value: ProxyOutput, timeout: Duration) -> bool {
-    output.send(value, timeout).await
-}
-
-#[cfg(feature = "async-proxy")]
-async fn run_dns_query(
-    handler: Arc<dyn DnsHandler>,
-    payload: Vec<u8>,
-    timeout: Duration,
-) -> Option<Vec<u8>> {
-    let mut task = tokio::task::spawn_blocking(move || answer_query(&payload, handler.as_ref()));
-    match tokio::time::timeout(timeout, &mut task).await {
-        Ok(Ok(answer)) => answer.ok(),
-        Ok(Err(_)) | Err(_) => {
-            task.abort();
-            None
-        }
-    }
-}
-
-#[cfg(feature = "async-proxy")]
-async fn run_icmp_proxy(
-    proxy: Arc<dyn AsyncProxy>,
-    mut context: crate::FlowContext,
-    id: u64,
-    flow: TunFlowKey,
-    packet: Vec<u8>,
-    output: ProxyOutputSender,
-    timeouts: ProxyTimeouts,
-) {
-    // Routing and telemetry selected this flow as ICMP. The existing
-    // ChainProxy ping contract deliberately accepts a TCP endpoint, however,
-    // and its effective-destination helper uses `context.network` when a
-    // FakeIP reverse lookup restored a domain. Convert only the task-local
-    // context after selection so that both IP and restored-domain pings use
-    // the same protocol-level probe as the Go TUN path.
-    let destination = context.effective_destination();
-    context.network = Network::Tcp;
-    context.destination = match destination {
-        Endpoint::Ip { addr, .. } => Endpoint::ip(Network::Tcp, addr),
-        Endpoint::Domain { host, port, .. } => Endpoint::domain(Network::Tcp, host, port),
-    };
-    let result = tokio::time::timeout(timeouts.connect, proxy.ping(&context)).await;
-    let success = matches!(result, Ok(Ok(_)));
-    if !success {
-        tun_debug(format!(
-            "ICMP proxy ping failed flow={flow:?} result={result:?}"
-        ));
-    }
-    let packet = match rewrite_icmp_echo_reply(packet, success) {
-        Ok(packet) => packet,
-        Err(error) => {
-            tun_debug(format!(
-                "ICMP proxy reply rewrite failed flow={flow:?}: {error}"
-            ));
-            return;
-        }
-    };
-    let _ = emit_output(
-        &output,
-        ProxyOutput::IcmpData { id, flow, packet },
-        timeouts.idle,
-    )
-    .await;
 }

@@ -81,6 +81,7 @@ pub(crate) fn should_proxy_icmp_request(
     source_is_local && !destination_is_local
 }
 
+#[cfg_attr(not(feature = "async-proxy"), allow(dead_code))]
 pub(crate) fn rewrite_icmp_echo_reply(packet: Vec<u8>, success: bool) -> Result<Vec<u8>> {
     let version = IpVersion::of_packet(&packet)
         .map_err(|_| Error::invalid("TUN ICMP packet is not IPv4 or IPv6"))?;
@@ -991,6 +992,18 @@ impl SmoltcpTunDevice {
         self.queue
             .lock()
             .map(|queue| queue.rx.front().cloned())
+            .map_err(|_| Error::new(crate::ErrorKind::Io, "TUN packet queue poisoned"))
+    }
+
+    /// Inspect the next RX packet without cloning it or removing it.
+    ///
+    /// The dispatcher only needs a classification before smoltcp consumes the
+    /// packet. Keeping the callback under the short queue lock avoids copying
+    /// every ordinary TUN packet on the hot path.
+    pub(crate) fn with_rx_packet<T>(&self, inspect: impl FnOnce(&[u8]) -> T) -> Result<Option<T>> {
+        self.queue
+            .lock()
+            .map(|queue| queue.rx.front().map(|packet| inspect(packet)))
             .map_err(|_| Error::new(crate::ErrorKind::Io, "TUN packet queue poisoned"))
     }
 

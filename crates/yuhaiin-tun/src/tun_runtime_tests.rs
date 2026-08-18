@@ -1,4 +1,6 @@
+#[cfg(feature = "async-proxy")]
 use super::tun_test_support::*;
+#[cfg(feature = "async-proxy")]
 use super::*;
 
 #[cfg(feature = "async-proxy")]

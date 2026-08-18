@@ -408,8 +408,7 @@ impl TunRuntime {
         let started = std::time::Instant::now();
         tokio::pin!(shutdown);
         loop {
-            let elapsed = started.elapsed();
-            let timestamp = Instant::from_micros(elapsed.as_micros().min(i64::MAX as u128) as i64);
+            let timestamp = elapsed_timestamp(started);
             let next_poll_delay = dispatcher.poll_delay(&mut self.interface, timestamp);
             let output_notify = proxy_runtime.output_notify();
             let poll_timer = async move {
@@ -436,78 +435,92 @@ impl TunRuntime {
                     return Ok(());
                 }
             }
-            let elapsed = started.elapsed();
-            self.expire_ipv6_fragments();
-            let timestamp = Instant::from_micros(elapsed.as_micros().min(i64::MAX as u128) as i64);
-            if let Err(error) = dispatcher.poll(self, timestamp) {
+            if let Err(error) = self
+                .drive_dispatcher_once(dispatcher, proxy_runtime, started)
+                .await
+            {
                 proxy_runtime.close();
-                return Err(io::Error::other(error.to_string()));
+                return Err(error);
             }
-            while let Some(event) = dispatcher.next_event() {
-                let flow = event_flow_key(&event);
-                if let Err(error) = proxy_runtime.handle_event_async(event).await {
-                    // A transport can finish between smoltcp emitting a
-                    // packet and the next command being delivered to its
-                    // bounded flow queue.  That is a per-flow failure, not a
-                    // reason to tear down the TUN supervisor and all other
-                    // flows.  Close the kernel flow here and continue with
-                    // the next packet; protocol/IO/timeout errors still fail
-                    // the dispatcher as before.
-                    if is_recoverable_proxy_flow_error(&error) {
-                        tun_debug(format!(
-                            "TUN proxy flow ended before event {:?}: {error}",
-                            flow
-                        ));
-                        match flow.network {
-                            Network::Tcp => {
-                                let _ = dispatcher.abort_tcp(flow);
-                            }
-                            Network::Udp => {
-                                let _ = dispatcher.close_udp(flow);
-                            }
-                            Network::Icmp | Network::Any => {}
-                        }
-                        continue;
-                    }
-                    proxy_runtime.close();
-                    return Err(io::Error::other(error.to_string()));
-                }
-            }
-            if let Err(error) = proxy_runtime.poll_outputs(dispatcher) {
-                proxy_runtime.close();
-                return Err(io::Error::other(error.to_string()));
-            }
-            // ICMP replies are queued by `poll_outputs`, while TCP/UDP
-            // replies are emitted through smoltcp's normal poll path. Flush
-            // the raw ICMP queue before handing packets back to the kernel so
-            // an echo request does not wait for another TUN tick (or get lost
-            // if the runtime is stopped immediately after the proxy reply).
-            if let Err(error) = dispatcher.flush_pending_icmp_tx(&self.smoltcp_device) {
-                proxy_runtime.close();
-                return Err(io::Error::other(error.to_string()));
-            }
-            if let Err(error) = proxy_runtime.sweep(dispatcher) {
-                proxy_runtime.close();
-                return Err(io::Error::other(error.to_string()));
-            }
-            loop {
-                match self.send_to_tun().await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(error) => {
-                        proxy_runtime.close();
-                        return Err(error);
-                    }
-                }
-            }
-            // A current-thread runtime can keep the TUN reader ready while a
-            // newly opened proxy is still connecting. Yield once per loop so
-            // flow tasks get a chance to consume their bounded command queue;
-            // otherwise a large upload can fill that queue before the proxy
-            // task is ever polled.
-            tokio::task::yield_now().await;
         }
     }
+
+    #[cfg(feature = "async-proxy")]
+    async fn drive_dispatcher_once(
+        &mut self,
+        dispatcher: &mut TunDispatcher,
+        proxy_runtime: &mut TunProxyRuntime,
+        started: std::time::Instant,
+    ) -> io::Result<()> {
+        self.expire_ipv6_fragments();
+        dispatcher
+            .poll(self, elapsed_timestamp(started))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.dispatch_events(dispatcher, proxy_runtime).await?;
+        proxy_runtime
+            .poll_outputs(dispatcher)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        dispatcher
+            .flush_pending_icmp_tx(&self.smoltcp_device)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        proxy_runtime
+            .sweep(dispatcher)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.flush_to_tun().await?;
+
+        // A current-thread runtime can keep the TUN reader ready while a
+        // newly opened proxy is still connecting. Yield once per loop so flow
+        // tasks get a chance to consume their bounded command queue.
+        tokio::task::yield_now().await;
+        Ok(())
+    }
+
+    #[cfg(feature = "async-proxy")]
+    async fn dispatch_events(
+        &mut self,
+        dispatcher: &mut TunDispatcher,
+        proxy_runtime: &mut TunProxyRuntime,
+    ) -> io::Result<()> {
+        while let Some(event) = dispatcher.next_event() {
+            let flow = event_flow_key(&event);
+            if let Err(error) = proxy_runtime.handle_event_async(event).await {
+                // A transport can finish between smoltcp emitting a packet
+                // and the next command being delivered to its bounded flow
+                // queue. Close only that kernel flow and keep the supervisor
+                // alive for unrelated flows.
+                if is_recoverable_proxy_flow_error(&error) {
+                    tun_debug(format!(
+                        "TUN proxy flow ended before event {:?}: {error}",
+                        flow
+                    ));
+                    match flow.network {
+                        Network::Tcp => {
+                            let _ = dispatcher.abort_tcp(flow);
+                        }
+                        Network::Udp => {
+                            let _ = dispatcher.close_udp(flow);
+                        }
+                        Network::Icmp | Network::Any => {}
+                    }
+                    continue;
+                }
+                return Err(io::Error::other(error.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "async-proxy")]
+    async fn flush_to_tun(&self) -> io::Result<()> {
+        while let Some(_) = self.send_to_tun().await? {}
+        Ok(())
+    }
+}
+
+#[cfg(feature = "async-proxy")]
+fn elapsed_timestamp(started: std::time::Instant) -> Instant {
+    let elapsed = started.elapsed();
+    Instant::from_micros(elapsed.as_micros().min(i64::MAX as u128) as i64)
 }
 
 impl Drop for TunRuntime {

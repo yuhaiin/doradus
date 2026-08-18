@@ -6,13 +6,14 @@
 //! stack to keep in sync with this one.
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, ChecksumCapabilities, DeviceCapabilities, Medium};
-use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
+#[cfg(test)]
+use smoltcp::wire::IpEndpoint;
 use smoltcp::wire::{
-    HardwareAddress, Icmpv4Message, Icmpv4Packet, Icmpv4Repr, Icmpv6Message, Icmpv6Packet,
-    Icmpv6Repr, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion, Ipv4Packet,
-    Ipv6Packet, TcpPacket, UdpPacket,
+    HardwareAddress, Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpCidr,
+    IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket,
 };
+use smoltcp::wire::{Icmpv4Message, Icmpv6Message};
 use std::borrow::Cow;
 #[cfg(feature = "async-proxy")]
 use std::collections::HashSet;
@@ -26,7 +27,7 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "async-proxy")]
 use std::time::Duration;
 use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
@@ -78,13 +79,15 @@ mod runtime;
 pub use config::*;
 pub use dispatcher::*;
 pub use packet::*;
+#[cfg(feature = "async-proxy")]
 pub use proxy_runtime::*;
 pub use runtime::*;
 #[allow(unused_imports)]
 pub(crate) use {config::*, dispatcher::*, packet::*, proxy_runtime::*, runtime::*};
 
 fn tun_debug(message: impl std::fmt::Display) {
-    if std::env::var_os("YUHAIIN_TUN_DEBUG").is_some() {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("YUHAIIN_TUN_DEBUG").is_some()) {
         eprintln!("yuhaiin-rust: tun-debug: {message}");
     }
 }

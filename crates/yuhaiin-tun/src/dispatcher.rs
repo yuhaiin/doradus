@@ -2,6 +2,11 @@
 
 use super::*;
 
+#[path = "dispatcher_events.rs"]
+mod dispatcher_events;
+#[path = "dispatcher_sockets.rs"]
+mod dispatcher_sockets;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpPacketVersion {
     V4,
@@ -54,6 +59,7 @@ pub enum TunEvent {
     },
 }
 
+#[cfg_attr(not(feature = "async-proxy"), allow(dead_code))]
 pub(crate) fn event_flow_key(event: &TunEvent) -> TunFlowKey {
     match event {
         TunEvent::TcpOpened { flow }
@@ -65,6 +71,7 @@ pub(crate) fn event_flow_key(event: &TunEvent) -> TunFlowKey {
     }
 }
 
+#[cfg_attr(not(feature = "async-proxy"), allow(dead_code))]
 pub(crate) fn is_recoverable_proxy_flow_error(error: &Error) -> bool {
     // A bounded per-flow command queue being full is backpressure on one
     // flow. The event loop cleans up that flow and continues serving all
@@ -73,6 +80,15 @@ pub(crate) fn is_recoverable_proxy_flow_error(error: &Error) -> bool {
         error.kind,
         ErrorKind::Closed | ErrorKind::NotFound | ErrorKind::Timeout
     )
+}
+
+enum PreparedRx {
+    Ignore,
+    IcmpEcho {
+        source: SocketAddr,
+        destination: SocketAddr,
+    },
+    Transport(Option<TransportTuple>),
 }
 
 #[derive(Debug)]
@@ -185,6 +201,7 @@ impl TunDispatcher {
     /// The async runtime uses this as a precise timer fallback for TCP
     /// retransmits and delayed ACKs. Data-plane events wake it immediately,
     /// so callers do not need a fixed-rate polling interval.
+    #[cfg(feature = "async-proxy")]
     pub(crate) fn poll_delay(
         &mut self,
         interface: &mut Interface,
@@ -244,44 +261,59 @@ impl TunDispatcher {
         interface: Option<&Interface>,
         device: &SmoltcpTunDevice,
     ) -> Result<()> {
-        let Some(packet) = device.peek_rx_packet()? else {
-            return Ok(());
-        };
-        tun_debug(format!("TUN prepare RX packet length={}", packet.len()));
-        // smoltcp performs IPv4 reassembly after this hook. A non-initial
-        // fragment has no transport header at its payload offset, so trying
-        // to parse it here would turn a valid datagram into a malformed-packet
-        // error. IPv6 fragments have already been reassembled at the TUN
-        // receive boundary; this guard remains for directly injected device
-        // packets and prevents extension fragments from reaching this hook.
-        if is_non_initial_fragment(&packet)? {
-            return Ok(());
-        }
-        if let Some(interface) = interface
-            && let Ok(Some((source, destination))) = parse_icmp_echo_request(&packet)
-            && should_proxy_icmp_request(interface, source, destination)
-        {
-            let packet = device.take_rx_packet()?.ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Io,
-                    "TUN ICMP request disappeared before dispatch",
-                )
-            })?;
-            let flow = TunFlow {
-                key: TunFlowKey {
-                    network: Network::Icmp,
+        let Some(prepared) = device.with_rx_packet(|packet| {
+            tun_debug(format!("TUN prepare RX packet length={}", packet.len()));
+            // smoltcp performs IPv4 reassembly after this hook. A non-initial
+            // fragment has no transport header at its payload offset, so do
+            // not try to create a socket from it.
+            if is_non_initial_fragment(packet)? {
+                return Ok(PreparedRx::Ignore);
+            }
+            if let Some(interface) = interface
+                && let Ok(Some((source, destination))) = parse_icmp_echo_request(packet)
+                && should_proxy_icmp_request(interface, source, destination)
+            {
+                return Ok(PreparedRx::IcmpEcho {
                     source,
                     destination,
-                },
-            };
-            tun_debug(format!("TUN external ICMP echo request flow={flow:?}"));
-            self.events
-                .push_back(TunEvent::IcmpEchoRequest { flow, packet });
+                });
+            }
+            Ok(PreparedRx::Transport(parse_dispatch_transport_tuple(
+                packet,
+            )?))
+        })?
+        else {
             return Ok(());
-        }
-        let Some(tuple) = parse_dispatch_transport_tuple(&packet)? else {
-            tun_debug("TUN prepare RX packet has no transport tuple");
-            return Ok(());
+        };
+        let tuple = match prepared? {
+            PreparedRx::Ignore => return Ok(()),
+            PreparedRx::IcmpEcho {
+                source,
+                destination,
+            } => {
+                let packet = device.take_rx_packet()?.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Io,
+                        "TUN ICMP request disappeared before dispatch",
+                    )
+                })?;
+                let flow = TunFlow {
+                    key: TunFlowKey {
+                        network: Network::Icmp,
+                        source,
+                        destination,
+                    },
+                };
+                tun_debug(format!("TUN external ICMP echo request flow={flow:?}"));
+                self.events
+                    .push_back(TunEvent::IcmpEchoRequest { flow, packet });
+                return Ok(());
+            }
+            PreparedRx::Transport(Some(tuple)) => tuple,
+            PreparedRx::Transport(None) => {
+                tun_debug("TUN prepare RX packet has no transport tuple");
+                return Ok(());
+            }
         };
         tun_debug(format!("TUN prepare RX tuple={tuple:?}"));
         match tuple.protocol {
@@ -289,301 +321,6 @@ impl TunDispatcher {
             IpProtocol::Udp => self.ensure_udp_socket(tuple.destination),
             _ => Ok(()),
         }
-    }
-
-    /// Queue as much TCP payload as the smoltcp TX buffer accepts.
-    ///
-    /// `send_slice` is intentionally allowed to return a short write when the
-    /// bounded socket buffer is nearly full. Callers must retain and retry
-    /// `payload[written..]`; treating `Ok(written)` as an all-or-nothing
-    /// result silently drops bytes under sustained TUN output.
-    pub fn write_tcp(&mut self, flow: TunFlowKey, payload: &[u8]) -> Result<usize> {
-        let handle = self
-            .tcp_by_key
-            .get(&flow)
-            .copied()
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, "TUN TCP flow is not registered"))?;
-        self.sockets
-            .get_mut::<tcp::Socket>(handle)
-            .send_slice(payload)
-            .map_err(|error| Error::new(ErrorKind::Closed, format!("TUN TCP write: {error:?}")))
-    }
-
-    pub fn close_tcp(&mut self, flow: TunFlowKey) -> Result<()> {
-        let handle = self
-            .tcp_by_key
-            .get(&flow)
-            .copied()
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, "TUN TCP flow is not registered"))?;
-        self.sockets.get_mut::<tcp::Socket>(handle).close();
-        Ok(())
-    }
-
-    pub fn abort_tcp(&mut self, flow: TunFlowKey) -> Result<()> {
-        let handle = self
-            .tcp_by_key
-            .get(&flow)
-            .copied()
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, "TUN TCP flow is not registered"))?;
-        self.sockets.get_mut::<tcp::Socket>(handle).abort();
-        Ok(())
-    }
-
-    pub fn write_udp(&mut self, flow: TunFlowKey, payload: &[u8]) -> Result<()> {
-        if flow.source.is_ipv4() != flow.destination.is_ipv4() {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "TUN UDP flow has mixed IP versions: source={} destination={}",
-                    flow.source, flow.destination
-                ),
-            ));
-        }
-        let handle = self
-            .udp_by_local
-            .get(&flow.destination)
-            .copied()
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, "TUN UDP socket is not registered"))?;
-        self.sockets
-            .get_mut::<udp::Socket>(handle)
-            .send_slice(payload, IpEndpoint::from(flow.source))
-            .map_err(|error| Error::new(ErrorKind::Closed, format!("TUN UDP write: {error:?}")))
-    }
-
-    /// Queue a raw ICMP packet for the next TUN poll.
-    ///
-    /// ICMP echo replies do not belong to a smoltcp socket. They are produced
-    /// by the proxy-level ping path and therefore bypass the socket set while
-    /// still crossing the same bounded TX queue as ordinary TUN output.
-    pub fn write_icmp(&mut self, packet: Vec<u8>) -> Result<()> {
-        inspect_ip_packet(&packet)?;
-        if self.pending_icmp_tx.len() >= self.udp_packet_capacity {
-            return Err(Error::new(
-                ErrorKind::Timeout,
-                "TUN ICMP output queue is full",
-            ));
-        }
-        self.pending_icmp_tx.push_back(packet);
-        Ok(())
-    }
-
-    pub fn close_udp(&mut self, flow: TunFlowKey) -> Result<()> {
-        let Some(handle) = self.udp_by_local.get(&flow.destination).copied() else {
-            return Ok(());
-        };
-        if let Some(state) = self.udp.get_mut(&handle) {
-            // Keep the socket until the next smoltcp poll. A preceding
-            // UdpData output may already be queued in its TX packet buffer;
-            // removing it here would silently drop that packet.
-            state.closing = true;
-        }
-        Ok(())
-    }
-
-    fn ensure_tcp_listener(&mut self, tuple: TransportTuple) -> Result<()> {
-        let key = TunFlowKey {
-            network: Network::Tcp,
-            source: tuple.source,
-            destination: tuple.destination,
-        };
-        if self.tcp_by_key.contains_key(&key)
-            || self.tcp.values().any(|state| state.key == Some(key))
-        {
-            return Ok(());
-        }
-        let mut socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; self.rx_buffer_size]),
-            tcp::SocketBuffer::new(vec![0; self.tx_buffer_size]),
-        );
-        socket.set_congestion_control(tcp::CongestionControl::Cubic);
-        socket
-            .listen(IpListenEndpoint {
-                // A TUN gateway must accept destinations that are not local
-                // interface addresses. smoltcp keeps the packet's actual
-                // local endpoint on the established socket, so a wildcard
-                // listener preserves the original destination in the flow
-                // key while allowing ordinary Internet routes.
-                addr: None,
-                port: tuple.destination.port(),
-            })
-            .map_err(|error| {
-                Error::new(ErrorKind::Unsupported, format!("TUN TCP listen: {error:?}"))
-            })?;
-        let handle = self.sockets.add(socket);
-        self.tcp.insert(
-            handle,
-            TcpFlowState {
-                key: Some(key),
-                opened: false,
-                half_closed: false,
-            },
-        );
-        Ok(())
-    }
-
-    pub(crate) fn ensure_udp_socket(&mut self, local: SocketAddr) -> Result<()> {
-        if self.udp_by_local.contains_key(&local) {
-            return Ok(());
-        }
-        tun_debug(format!("TUN UDP socket prepare local={local}"));
-        let mut socket = udp::Socket::new(
-            udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; self.udp_packet_capacity],
-                vec![0; self.rx_buffer_size],
-            ),
-            udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; self.udp_packet_capacity],
-                vec![0; self.tx_buffer_size],
-            ),
-        );
-        socket
-            .bind(IpListenEndpoint::from(local))
-            .map_err(|error| {
-                Error::new(ErrorKind::Unsupported, format!("TUN UDP bind: {error:?}"))
-            })?;
-        let handle = self.sockets.add(socket);
-        self.udp.insert(
-            handle,
-            UdpSocketState {
-                local,
-                closing: false,
-            },
-        );
-        self.udp_by_local.insert(local, handle);
-        Ok(())
-    }
-
-    fn collect_events(&mut self) -> Result<()> {
-        self.tcp_handles.clear();
-        self.tcp_handles.extend(self.tcp.keys().copied());
-        self.closed_tcp.clear();
-        for index in 0..self.tcp_handles.len() {
-            let handle = self.tcp_handles[index];
-            let Some(state) = self.tcp.get_mut(&handle) else {
-                continue;
-            };
-            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-            let key = state.key.or_else(|| {
-                let local = socket.local_endpoint()?;
-                let remote = socket.remote_endpoint()?;
-                Some(TunFlowKey {
-                    network: Network::Tcp,
-                    source: remote.into(),
-                    destination: local.into(),
-                })
-            });
-            state.key = key;
-            let Some(key) = key else {
-                continue;
-            };
-            self.tcp_by_key.insert(key, handle);
-            let flow = TunFlow { key };
-            if socket.is_active() && socket.may_send() && !state.opened {
-                state.opened = true;
-                self.events.push_back(TunEvent::TcpOpened { flow });
-            }
-            let mut event_bytes = 0usize;
-            while socket.can_recv() && event_bytes < MAX_TCP_EVENT_BYTES_PER_POLL {
-                // `recv_capacity` is the remaining socket buffer, not the
-                // size of the next packet. Keep each event bounded so a fast
-                // TUN stream cannot retain one large Vec for a short read.
-                let payload_capacity = socket
-                    .recv_capacity()
-                    .min(MAX_TCP_EVENT_PAYLOAD_BYTES)
-                    .min(MAX_TCP_EVENT_BYTES_PER_POLL - event_bytes);
-                let mut payload = vec![0; payload_capacity];
-                match socket.recv_slice(&mut payload) {
-                    Ok(length) if length != 0 => {
-                        payload.truncate(length);
-                        event_bytes = event_bytes.saturating_add(length);
-                        self.events.push_back(TunEvent::TcpData { flow, payload });
-                    }
-                    Ok(_) => break,
-                    Err(tcp::RecvError::Finished) => {
-                        if !state.half_closed {
-                            state.half_closed = true;
-                            self.events.push_back(TunEvent::TcpHalfClosed { flow });
-                        }
-                        break;
-                    }
-                    Err(_) => break,
-                }
-            }
-            if state.opened && socket.is_active() && !socket.may_recv() && !state.half_closed {
-                state.half_closed = true;
-                self.events.push_back(TunEvent::TcpHalfClosed { flow });
-            }
-            if !socket.is_open() && state.opened {
-                self.events.push_back(TunEvent::TcpClosed { flow });
-            }
-            if !socket.is_open() {
-                self.closed_tcp.push((handle, key));
-            }
-        }
-        for (handle, key) in self.closed_tcp.drain(..) {
-            self.tcp.remove(&handle);
-            self.tcp_by_key.remove(&key);
-            self.sockets.remove(handle);
-        }
-
-        self.udp_handles.clear();
-        self.udp_handles.extend(self.udp.keys().copied());
-        self.closed_udp.clear();
-        for index in 0..self.udp_handles.len() {
-            let handle = self.udp_handles[index];
-            let Some(state) = self.udp.get(&handle) else {
-                continue;
-            };
-            let local = state.local;
-            let closing = state.closing;
-            let socket = self.sockets.get_mut::<udp::Socket>(handle);
-            while socket.can_recv() {
-                let (payload, metadata) = socket.recv().map_err(|error| {
-                    Error::new(ErrorKind::Protocol, format!("TUN UDP read: {error:?}"))
-                })?;
-                // smoltcp intentionally lets a socket bound to a multicast
-                // address accept multicast packets without comparing the
-                // exact destination.  With both IP families enabled that can
-                // deliver an IPv6 multicast datagram to an IPv4 socket (or
-                // vice versa).  Never expose that as a mixed-family flow;
-                // doing so would make smoltcp panic while constructing the
-                // response IP header.
-                if metadata.local_address.is_some_and(|address| {
-                    matches!(address, IpAddress::Ipv4(_)) != local.ip().is_ipv4()
-                }) {
-                    tun_debug(format!(
-                        "TUN UDP packet dropped for IP family mismatch socket={} packet_destination={:?}",
-                        local, metadata.local_address
-                    ));
-                    continue;
-                }
-                let flow = TunFlow {
-                    key: TunFlowKey {
-                        network: Network::Udp,
-                        source: metadata.endpoint.into(),
-                        destination: local,
-                    },
-                };
-                tun_debug(format!(
-                    "TUN UDP datagram flow={:?} bytes={}",
-                    flow.key,
-                    payload.len()
-                ));
-                self.events.push_back(TunEvent::UdpDatagram {
-                    flow,
-                    payload: payload.to_vec(),
-                });
-            }
-            if closing {
-                self.closed_udp.push((handle, local));
-            }
-        }
-        for (handle, local) in self.closed_udp.drain(..) {
-            self.udp_by_local.remove(&local);
-            self.udp.remove(&handle);
-            self.sockets.remove(handle);
-        }
-        Ok(())
     }
 }
 
