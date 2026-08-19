@@ -13,6 +13,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 
 use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection, FlowKey as TunFlowKey, FlowObserver as TunFlowObserver,
@@ -83,42 +84,73 @@ impl InboundDnsHandler for InboundDnsPolicy {
 #[cfg(feature = "tun")]
 pub(crate) struct InboundInputInterceptor {
     dns: InboundDnsPolicy,
+    dns_tasks: JoinSet<yuhaiin_tun::ProxyInputAction>,
+    max_pending_dns: usize,
 }
 
 #[cfg(feature = "tun")]
 impl InboundInputInterceptor {
-    pub(crate) fn new(monitor: Arc<ConnectionMonitor>) -> Self {
+    pub(crate) fn new(monitor: Arc<ConnectionMonitor>, max_pending_dns: usize) -> Self {
         Self {
             dns: InboundDnsPolicy::new(monitor),
+            dns_tasks: JoinSet::new(),
+            max_pending_dns: max_pending_dns.clamp(16, 512),
         }
     }
 }
 
 #[cfg(feature = "tun")]
 impl yuhaiin_tun::ProxyInputInterceptor for InboundInputInterceptor {
-    fn intercept<'a>(
-        &'a mut self,
+    fn intercept(
+        &mut self,
         input: yuhaiin_tun::ProxyInput,
-    ) -> BoxFuture<'a, Result<yuhaiin_tun::ProxyInputAction>> {
-        Box::pin(async move {
-            match input {
-                yuhaiin_tun::ProxyInput::UdpDatagram { flow, payload } => {
-                    match self
-                        .dns
-                        .answer_datagram(Some(flow.key.destination.port()), &payload)
-                        .await
-                    {
-                        Some(Ok(response)) => Ok(yuhaiin_tun::ProxyInputAction::Reply {
-                            flow: flow.key,
-                            payload: response,
-                        }),
-                        Some(Err(_)) => Ok(yuhaiin_tun::ProxyInputAction::Drop),
-                        None => Ok(yuhaiin_tun::ProxyInputAction::Forward(
-                            yuhaiin_tun::ProxyInput::UdpDatagram { flow, payload },
-                        )),
-                    }
+    ) -> Result<yuhaiin_tun::ProxyInputAction> {
+        match input {
+            yuhaiin_tun::ProxyInput::UdpDatagram { flow, payload } => {
+                let destination_port = Some(flow.key.destination.port());
+                if !self.dns.should_hijack(destination_port, &payload) {
+                    return Ok(yuhaiin_tun::ProxyInputAction::Forward(
+                        yuhaiin_tun::ProxyInput::UdpDatagram { flow, payload },
+                    ));
                 }
-                other => Ok(yuhaiin_tun::ProxyInputAction::Forward(other)),
+
+                if self.dns_tasks.len() >= self.max_pending_dns {
+                    return Ok(yuhaiin_tun::ProxyInputAction::Drop);
+                }
+
+                let dns = self.dns.clone();
+                let flow_key = flow.key;
+                self.dns_tasks.spawn(async move {
+                    let result =
+                        tokio::time::timeout(Duration::from_secs(10), dns.answer(&payload)).await;
+
+                    match result {
+                        Ok(Some(Ok(response))) => yuhaiin_tun::ProxyInputAction::Reply {
+                            flow: flow_key,
+                            payload: response,
+                        },
+                        Ok(Some(Err(_))) | Ok(None) | Err(_) => yuhaiin_tun::ProxyInputAction::Drop,
+                    }
+                });
+
+                Ok(yuhaiin_tun::ProxyInputAction::Deferred)
+            }
+            other => Ok(yuhaiin_tun::ProxyInputAction::Forward(other)),
+        }
+    }
+
+    fn wait_for_output<'a>(&'a mut self) -> BoxFuture<'a, yuhaiin_tun::ProxyInputAction> {
+        Box::pin(async move {
+            loop {
+                match self.dns_tasks.join_next().await {
+                    Some(Ok(action)) => return action,
+                    Some(Err(error)) => {
+                        self.dns
+                            .monitor
+                            .warn(format!("TUN DNS interceptor task failed: {error}"));
+                    }
+                    None => return std::future::pending().await,
+                }
             }
         })
     }

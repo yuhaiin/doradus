@@ -439,47 +439,78 @@ async fn run_desktop_tun_supervisor(
             break;
         }
         tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
-                }
-            }
-            changed = reload.recv() => {
-                let Ok(event) = changed else { break; };
-                match event {
-                    crate::controller::InboundReload::All => {
-                        abort_tun_owners(&mut tasks).await;
-                        let Some(new_configs) = load_tun_configs_for_supervisor(&controller, &mut reload, shutdown.clone()).await else { break; };
-                        configs = new_configs;
-                        for config in configs.iter().filter(|config| config.enabled) {
-                            spawn_tun_owner(&mut tasks, config.clone(), &controller, &shutdown, monitor.clone(), completed_tx.clone());
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
                         }
                     }
-                    crate::controller::InboundReload::One(id) => {
-                        if !tasks.contains_key(&id) {
-                            let Some(new_configs) = load_tun_configs_for_supervisor(&controller, &mut reload, shutdown.clone()).await else { break; };
-                            configs = new_configs;
-                            if let Some(config) = configs.iter().find(|config| config.inbound_id.as_deref() == Some(id.as_str()) && config.enabled) {
-                                spawn_tun_owner(&mut tasks, config.clone(), &controller, &shutdown, monitor.clone(), completed_tx.clone());
+                    changed = reload.recv() => {
+                        let Ok(event) = changed else { break; };
+                        match event {
+                            crate::controller::InboundReload::All => {
+                                abort_tun_owners(&mut tasks).await;
+                                let Some(new_configs) = load_tun_configs_for_supervisor(&controller, &mut reload, shutdown.clone()).await else { break; };
+                                configs = new_configs;
+                                for config in configs.iter().filter(|config| config.enabled) {
+                                    spawn_tun_owner(&mut tasks, config.clone(), &controller, &shutdown, monitor.clone(), completed_tx.clone());
+                                }
+                            }
+                            crate::controller::InboundReload::One(id) => {
+                                if !tasks.contains_key(&id) {
+                                    let Some(new_configs) = load_tun_configs_for_supervisor(&controller, &mut reload, shutdown.clone()).await else { break; };
+                                    configs = new_configs;
+                                    if let Some(config) = configs.iter().find(|config| config.inbound_id.as_deref() == Some(id.as_str()) && config.enabled) {
+                                        spawn_tun_owner(&mut tasks, config.clone(), &controller, &shutdown, monitor.clone(), completed_tx.clone());
+                                    }
+                                }
                             }
                         }
                     }
-                }
+              completed = completed_rx.recv() => {
+            let Some((id, result)) = completed else { break; };
+            tasks.remove(&id);
+
+            if let Err(error) = result {
+                monitor.error(format!(
+                    "TUN inbound owner stopped id={id}: {error}; restarting"
+                ));
+
+                // 避免 runtime 出现持续错误时疯狂创建/销毁 TUN。
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            completed = completed_rx.recv() => {
-                let Some((id, result)) = completed else { break; };
-                tasks.remove(&id);
-                if let Err(error) = result {
-                    monitor.error(format!("TUN inbound owner stopped id={id}: {error}"));
-                    continue;
-                }
-                let Some(new_configs) = load_tun_configs_for_supervisor(&controller, &mut reload, shutdown.clone()).await else { break; };
-                configs = new_configs;
-                if let Some(config) = configs.iter().find(|config| config.inbound_id.as_deref() == Some(id.as_str()) && config.enabled) {
-                    spawn_tun_owner(&mut tasks, config.clone(), &controller, &shutdown, monitor.clone(), completed_tx.clone());
-                }
+
+            if *shutdown.borrow() {
+                break;
+            }
+
+            let Some(new_configs) =
+                load_tun_configs_for_supervisor(
+                    &controller,
+                    &mut reload,
+                    shutdown.clone(),
+                ).await
+            else {
+                break;
+            };
+
+            configs = new_configs;
+
+            if let Some(config) = configs.iter().find(
+                |config|
+                    config.inbound_id.as_deref() == Some(id.as_str())
+                    && config.enabled
+            ) {
+                spawn_tun_owner(
+                    &mut tasks,
+                    config.clone(),
+                    &controller,
+                    &shutdown,
+                    monitor.clone(),
+                    completed_tx.clone(),
+                );
             }
         }
+                }
     }
     abort_tun_owners(&mut tasks).await;
 }

@@ -1064,7 +1064,7 @@ async fn proxy_runtime_hijacks_dns_udp_flow_without_entering_proxy() {
         .poll_with(&mut interface, &mut device, Instant::from_millis(1))
         .unwrap();
     for event in dispatcher.proxy_inputs().collect::<Vec<_>>() {
-        proxy_runtime.handle_proxy_input_async(event).await.unwrap();
+        proxy_runtime.handle_proxy_input(event).unwrap();
     }
 
     // Keep the shared proxy output queue full while the DNS future completes.
@@ -1226,11 +1226,10 @@ async fn pending_async_dns_does_not_block_tun_shutdown_and_releases_full_cone_fl
     };
 
     runtime
-        .handle_proxy_input_async(ProxyInput::UdpDatagram {
+        .handle_proxy_input(ProxyInput::UdpDatagram {
             flow,
             payload: b"pending-dns".to_vec(),
         })
-        .await
         .unwrap();
     assert_eq!(runtime.task_len(), 1);
     assert_eq!(runtime.nat_len().unwrap(), 1);
@@ -1304,11 +1303,10 @@ async fn async_dns_upstream_timeout_closes_flow_and_releases_full_cone_mapping()
         },
     };
     runtime
-        .handle_proxy_input_async(ProxyInput::UdpDatagram {
+        .handle_proxy_input(ProxyInput::UdpDatagram {
             flow,
             payload: b"timeout-dns".to_vec(),
         })
-        .await
         .unwrap();
     let mut dispatcher = TunDispatcher::new(32, 32, 4).unwrap();
     for _ in 0..20 {

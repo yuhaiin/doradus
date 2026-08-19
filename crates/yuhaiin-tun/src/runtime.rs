@@ -7,11 +7,8 @@ struct PassthroughInputInterceptor;
 
 #[cfg(feature = "async-proxy")]
 impl ProxyInputInterceptor for PassthroughInputInterceptor {
-    fn intercept<'a>(
-        &'a mut self,
-        input: ProxyInput,
-    ) -> yuhaiin_core::BoxFuture<'a, Result<ProxyInputAction>> {
-        Box::pin(async move { Ok(ProxyInputAction::Forward(input)) })
+    fn intercept(&mut self, input: ProxyInput) -> Result<ProxyInputAction> {
+        Ok(ProxyInputAction::Forward(input))
     }
 }
 
@@ -334,10 +331,10 @@ impl TunRuntime {
             .enqueue_rx_reassembled(packet)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         if !accepted {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "TUN RX queue is full",
+            tun_debug(format!(
+                "TUN RX queue is full, dropping packet length={length}"
             ));
+            return Ok(length);
         }
         Ok(length)
     }
@@ -471,21 +468,26 @@ impl TunRuntime {
             let timestamp = elapsed_timestamp(started);
             let next_poll_delay = dispatcher.poll_delay(&mut self.interface, timestamp);
 
-            tokio::select! {
+            let interceptor_output = tokio::select! {
                 result = self.recv_from_tun() => {
                     if let Err(error) = result {
                         proxy_runtime.close();
                         return Err(error);
                     }
+                    None
                 }
-                _ = proxy_runtime.wait_for_output() => {}
-                _ = TunRuntime::wait_smoltcp_timer(next_poll_delay) => {}
+                _ = proxy_runtime.wait_for_output() => None,
+                output = interceptor.wait_for_output() => Some(output),
+                _ = TunRuntime::wait_smoltcp_timer(next_poll_delay) => None,
                 _ = &mut shutdown => {
                     proxy_runtime
                         .close_graceful(DEFAULT_GRACEFUL_CLOSE_TIMEOUT)
                         .await;
                     return Ok(());
                 }
+            };
+            if let Some(output) = interceptor_output {
+                self.apply_proxy_input_action(dispatcher, proxy_runtime, output)?;
             }
             if let Err(error) = self
                 .drive_data_plane_once(dispatcher, proxy_runtime, started, interceptor)
@@ -514,8 +516,7 @@ impl TunRuntime {
         dispatcher
             .poll(self, elapsed_timestamp(started))
             .map_err(|error| io::Error::other(error.to_string()))?;
-        self.dispatch_proxy_inputs(dispatcher, proxy_runtime, interceptor)
-            .await?;
+        self.dispatch_proxy_inputs(dispatcher, proxy_runtime, interceptor)?;
 
         // proxy -> smoltcp / TUN
         proxy_runtime
@@ -542,7 +543,7 @@ impl TunRuntime {
     }
 
     #[cfg(feature = "async-proxy")]
-    async fn dispatch_proxy_inputs<I>(
+    fn dispatch_proxy_inputs<I>(
         &mut self,
         dispatcher: &mut TunDispatcher,
         proxy_runtime: &mut TunProxyRuntime,
@@ -554,43 +555,55 @@ impl TunRuntime {
         while let Some(event) = dispatcher.next_proxy_input() {
             let action = interceptor
                 .intercept(event)
-                .await
                 .map_err(|error| io::Error::other(error.to_string()))?;
-            let event = match action {
-                ProxyInputAction::Forward(event) => event,
-                ProxyInputAction::Reply { flow, payload } => {
-                    proxy_runtime
-                        .enqueue_udp_data(flow, payload)
-                        .await
-                        .map_err(|error| io::Error::other(error.to_string()))?;
-                    continue;
-                }
-                ProxyInputAction::Drop => continue,
-            };
-            let flow = proxy_input_flow_key(&event);
-            if let Err(error) = proxy_runtime.handle_proxy_input_async(event).await {
-                // A transport can finish between smoltcp emitting a packet
-                // and the next command being delivered to its bounded flow
-                // queue. Close only that kernel flow and keep the supervisor
-                // alive for unrelated flows.
-                if is_recoverable_proxy_flow_error(&error) {
-                    tun_debug(format!(
-                        "TUN proxy flow ended before event {:?}: {error}",
-                        flow
-                    ));
-                    match flow.network {
-                        Network::Tcp => {
-                            let _ = dispatcher.abort_tcp(flow);
+            self.apply_proxy_input_action(dispatcher, proxy_runtime, action)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "async-proxy")]
+    fn apply_proxy_input_action(
+        &mut self,
+        dispatcher: &mut TunDispatcher,
+        proxy_runtime: &mut TunProxyRuntime,
+        action: ProxyInputAction,
+    ) -> io::Result<()> {
+        match action {
+            ProxyInputAction::Forward(event) => {
+                let flow = proxy_input_flow_key(&event);
+                if let Err(error) = proxy_runtime.handle_proxy_input(event) {
+                    // A transport can finish between smoltcp emitting a packet
+                    // and the next command being delivered to its bounded flow
+                    // queue. Close only that kernel flow and keep the supervisor
+                    // alive for unrelated flows.
+                    if is_recoverable_proxy_flow_error(&error) {
+                        tun_debug(format!(
+                            "TUN proxy flow ended before event {:?}: {error}",
+                            flow
+                        ));
+                        match flow.network {
+                            Network::Tcp => {
+                                let _ = dispatcher.abort_tcp(flow);
+                            }
+                            Network::Udp => {
+                                let _ = dispatcher.close_udp(flow);
+                            }
+                            Network::Icmp | Network::Any => {}
                         }
-                        Network::Udp => {
-                            let _ = dispatcher.close_udp(flow);
-                        }
-                        Network::Icmp | Network::Any => {}
+                        return Ok(());
                     }
-                    continue;
+                    return Err(io::Error::other(error.to_string()));
                 }
-                return Err(io::Error::other(error.to_string()));
             }
+            ProxyInputAction::Reply { flow, payload } => {
+                if let Err(error) = dispatcher.write_udp(flow, &payload) {
+                    tun_debug(format!(
+                        "TUN interceptor UDP reply dropped flow={flow:?} bytes={} error={error}",
+                        payload.len()
+                    ));
+                }
+            }
+            ProxyInputAction::Deferred | ProxyInputAction::Drop => {}
         }
         Ok(())
     }

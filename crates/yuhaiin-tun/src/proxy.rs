@@ -27,16 +27,30 @@ pub(crate) enum ProxyCommand {
 #[cfg(feature = "async-proxy")]
 pub enum ProxyInputAction {
     Forward(ProxyInput),
-    Reply { flow: TunFlowKey, payload: Vec<u8> },
+
+    Reply {
+        flow: TunFlowKey,
+        payload: Vec<u8>,
+    },
+
+    /// Input has been consumed and asynchronous work was started.
+    /// A completion may later be returned by `wait_for_output`.
+    Deferred,
+
     Drop,
 }
 
 #[cfg(feature = "async-proxy")]
 pub trait ProxyInputInterceptor: Send {
-    fn intercept<'a>(
-        &'a mut self,
-        input: ProxyInput,
-    ) -> yuhaiin_core::BoxFuture<'a, Result<ProxyInputAction>>;
+    /// Must not perform asynchronous I/O.
+    fn intercept(&mut self, input: ProxyInput) -> Result<ProxyInputAction>;
+
+    /// Wait for an asynchronously produced interceptor result.
+    ///
+    /// Interceptors without asynchronous work simply never complete.
+    fn wait_for_output<'a>(&'a mut self) -> yuhaiin_core::BoxFuture<'a, ProxyInputAction> {
+        Box::pin(std::future::pending())
+    }
 }
 
 /// Independent deadlines for one TUN proxy flow.
@@ -549,24 +563,6 @@ impl TunProxyRuntime {
             },
         );
         Ok(())
-    }
-
-    pub async fn handle_proxy_input_async(&mut self, input: ProxyInput) -> Result<()> {
-        self.handle_proxy_input(input)
-    }
-
-    /// Enqueue an output produced by an input interceptor on the same bounded
-    /// queue used by ordinary proxy tasks.
-    pub async fn enqueue_udp_data(&self, flow: TunFlowKey, payload: Vec<u8>) -> Result<()> {
-        self.proxy_output_tx
-            .send(ProxyOutput::UdpData { flow, payload })
-            .await
-            .map_err(|error| {
-                Error::new(
-                    ErrorKind::Closed,
-                    format!("TUN proxy output queue: {error}"),
-                )
-            })
     }
 
     pub fn close(&mut self) {

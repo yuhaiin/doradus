@@ -596,7 +596,7 @@ pub async fn run_tun_device_until_ref(
         )
         .await?;
     let mut inbound_interceptor =
-        crate::inbound::InboundInputInterceptor::new(controller.monitor());
+        crate::inbound::InboundInputInterceptor::new(controller.monitor(), config.channel_capacity);
     controller.monitor().info("TUN inbound ready");
     let mut dispatcher = yuhaiin_tun::TunDispatcher::new(64 * 1024, 64 * 1024, 2048)?
         .with_skip_multicast(config.tun.skip_multicast);

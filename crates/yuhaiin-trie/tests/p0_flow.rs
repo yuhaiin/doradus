@@ -1003,10 +1003,7 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
         other => panic!("unexpected DNS event: {other:?}"),
     };
     let dns_response = dns_handler.answer(&dns_payload).await.unwrap();
-    runtime
-        .enqueue_udp_data(dns_flow, dns_response)
-        .await
-        .unwrap();
+    dispatcher.write_udp(dns_flow, &dns_response).unwrap();
     let mut dns_response = None;
     for tick in 2..100 {
         tokio::time::sleep(Duration::from_millis(1)).await;
