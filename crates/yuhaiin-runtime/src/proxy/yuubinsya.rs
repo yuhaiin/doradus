@@ -1,27 +1,18 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
-
 use yuhaiin_chain::{YuubinsyaDnsHandler, YuubinsyaServerProxy};
-use yuhaiin_core::flow::{
-    Flow as TunFlow, FlowDirection as TunFlowDirection, FlowObserver as TunFlowObserver,
-    FlowObserverGuard,
-};
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncProxySelector};
-use yuhaiin_core::{BoxFuture, Error, FlowContext, Result};
+use yuhaiin_core::proxy::{AsyncProxy, AsyncProxySelector, BoxAsyncStream};
+use yuhaiin_core::{BoxFuture, Error, Result};
 use yuhaiin_protocol::yuubinsya::derive_salt;
 use yuhaiin_protocol::yuubinsya_udp::YuubinsyaUdpServer;
 
-use super::common::{
-    RoutedProxy, UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows,
-    reap_expired_udp_flows_with_timeout, record_outbound_datagram, shutdown_udp_flow, udp_flow_key,
-    udp_idle_timeout,
+use super::common::{RoutedProxy, UdpFlowId};
+use crate::RuntimeProxySelector;
+use crate::inbound::{
+    InboundDnsHandler, InboundDnsPolicy, InboundHandler, InboundSpec, InboundUdpCodec,
+    InboundUdpRequest, InboundUdpResponse, InboundUdpSession,
 };
-use crate::inbound::InboundSpec;
-use crate::{ConnectionMonitor, RuntimeProxySelector};
 
 pub(crate) fn new_server(
     spec: &InboundSpec,
@@ -49,49 +40,48 @@ pub(crate) fn new_server(
     ))
 }
 
-struct ChainDnsHandler(Arc<dyn crate::monitor::SocketDnsHandler>);
+impl YuubinsyaDnsHandler for InboundDnsPolicy {
+    fn should_hijack(&self, destination_port: Option<u16>, packet: &[u8]) -> bool {
+        InboundDnsHandler::should_hijack(self, destination_port, packet)
+    }
 
-impl YuubinsyaDnsHandler for ChainDnsHandler {
     fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
-        self.0.answer(packet)
+        Box::pin(async move {
+            InboundDnsHandler::answer(self, packet)
+                .await
+                .ok_or_else(|| {
+                    Error::new(yuhaiin_core::ErrorKind::Closed, "DNS hijacking disabled")
+                })?
+        })
     }
 }
 
-pub(crate) async fn serve<S>(
-    stream: S,
+pub(crate) async fn handle(
+    stream: BoxAsyncStream,
     peer: SocketAddr,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let server = new_server(&spec, Arc::clone(&selector)).ok_or_else(|| {
+    inbound: Arc<InboundHandler>,
+) -> Result<()> {
+    let server = new_server(inbound.spec(), Arc::clone(inbound.selector())).ok_or_else(|| {
         Error::new(
             yuhaiin_core::ErrorKind::Unsupported,
             "Yuubinsya inbound has no concrete password hash",
         )
     })?;
-    serve_with_server(stream, peer, spec, selector, server, monitor).await
+    handle_with_server(stream, peer, inbound, server).await
 }
 
-pub(crate) async fn serve_with_server<S>(
-    stream: S,
+pub(crate) async fn handle_with_server(
+    stream: BoxAsyncStream,
     peer: SocketAddr,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
+    inbound: Arc<InboundHandler>,
     server: Arc<YuubinsyaServerProxy>,
-    monitor: Arc<ConnectionMonitor>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let annotate = spec.clone();
-    let route = selector;
+) -> Result<()> {
+    let annotate = inbound.spec().clone();
+    let route = Arc::clone(inbound.selector());
+    let monitor = Arc::clone(inbound.monitor());
     let dns_handler = monitor
-        .socket_dns_handler()
-        .map(|handler| Arc::new(ChainDnsHandler(handler)) as Arc<dyn YuubinsyaDnsHandler>);
+        .dns_hijack_enabled()
+        .then(|| Arc::new(inbound.dns_policy()) as Arc<dyn YuubinsyaDnsHandler>);
     server
         .serve_observed_with_dns(
             stream,
@@ -108,123 +98,60 @@ where
         .await
 }
 
-pub(crate) async fn serve_udp(
+pub(crate) async fn handle_udp(
     server: YuubinsyaUdpServer,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
+    inbound: Arc<InboundHandler>,
 ) -> Result<()> {
-    let udp_buffer_size = selector.udp_buffer_size().max(512);
-    let udp_ringbuffer_size = selector.udp_ringbuffer_size().max(1);
-    let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
-    let mut flows = HashMap::<UdpFlowId, UdpFlowState>::new();
-    let mut close_events = monitor.subscribe_close_requests();
-    let idle_timeout = udp_idle_timeout();
-    let mut idle_tick = tokio::time::interval(idle_timeout);
-    let mut packet = vec![0u8; udp_buffer_size];
-    loop {
-        tokio::select! {
-            received = server.recv_from_authenticated(&mut packet) => {
-                let (length, target, peer, password_hash) = received?;
-                let peer_addr = peer.addr().ok_or_else(|| Error::invalid("Yuubinsya UDP peer has no IP address"))?;
-                if target.port() == Some(53)
-                    && let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await
-                {
-                    if let Ok(response) = answer {
-                        server
-                            .send_to_with_password_hash(
-                                &response,
-                                target,
-                                peer.clone(),
-                                password_hash,
-                            )
-                            .await?;
-                    }
-                    continue;
-                }
-                let id = UdpFlowId {
+    let codec = YuubinsyaUdpCodec {
+        server,
+        packet: vec![0u8; inbound.selector().udp_buffer_size().max(512)],
+    };
+    InboundUdpSession::new(codec, inbound).run().await
+}
+
+struct YuubinsyaUdpCodec {
+    server: YuubinsyaUdpServer,
+    packet: Vec<u8>,
+}
+
+impl InboundUdpCodec for YuubinsyaUdpCodec {
+    fn recv<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<InboundUdpRequest>>> {
+        Box::pin(async move {
+            let (length, target, peer, password_hash) = self
+                .server
+                .recv_from_authenticated(&mut self.packet)
+                .await?;
+            let peer_addr = peer
+                .addr()
+                .ok_or_else(|| Error::invalid("Yuubinsya UDP peer has no IP address"))?;
+            Ok(Some(InboundUdpRequest {
+                id: UdpFlowId {
                     peer: peer_addr,
                     target: target.clone(),
                     authentication: Some(password_hash),
-                };
-                let state = if let Some(state) = flows.get(&id) {
-                    state
-                } else {
-                    let mut context = FlowContext::new(target.clone());
-                    context.source = Some(peer.clone());
-                    context.original_domain = target.host().cloned();
-                    spec.annotate_context(&mut context);
-                    selector.route_context(&mut context);
-                    let key = udp_flow_key(peer_addr, &target);
-                    let datagram = selector.select(&context).open_datagram(&context).await?;
-                    record_outbound_datagram(&mut context, &*datagram);
-                    let datagram: Arc<dyn AsyncDatagram> = Arc::from(datagram);
-                    let observation =
-                        FlowObserverGuard::open(monitor.clone(), TunFlow { key }, context);
-                    let receiver = Arc::clone(&datagram);
-                    let reply_tx = reply_tx.clone();
-                    let id_for_task = id.clone();
-                    let receiver_task = tokio::spawn(async move {
-                        let mut buffer = vec![0u8; udp_buffer_size];
-                        while let Ok((length, target)) = receiver.recv_from(&mut buffer).await {
-                            if reply_tx.send(UdpReply {
-                                id: id_for_task.clone(),
-                                target,
-                                payload: buffer[..length].to_vec(),
-                            }).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    flows.entry(id.clone()).or_insert(UdpFlowState {
-                        datagram,
-                        receiver_task,
-                        key,
-                        peer,
-                        last_seen: std::time::Instant::now(),
-                        _observation: observation,
-                    })
-                };
-                state.datagram.send_to(&packet[..length], target).await?;
-                monitor.bytes(state.key, TunFlowDirection::Upload, length);
-                if let Some(state) = flows.get_mut(&id) {
-                    state.last_seen = std::time::Instant::now();
-                }
-            }
-            close_event = close_events.recv() => {
-                match close_event {
-                    Ok(flow) => {
-                        close_udp_flows(&mut flows, flow).await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            Some(reply) = reply_rx.recv() => {
-                let Some(state) = flows.get(&reply.id) else { continue; };
-                let Some(password_hash) = reply.id.authentication else { continue; };
-                server
-                    .send_to_with_password_hash(
-                        &reply.payload,
-                        reply.target,
-                        state.peer.clone(),
-                        password_hash,
-                    )
-                    .await?;
-                monitor.bytes(state.key, TunFlowDirection::Download, reply.payload.len());
-                if let Some(state) = flows.get_mut(&reply.id) {
-                    state.last_seen = std::time::Instant::now();
-                }
-            }
-            _ = idle_tick.tick() => {
-                reap_expired_udp_flows_with_timeout(&mut flows, idle_timeout).await;
-            }
-            else => break,
-        }
+                },
+                peer,
+                target,
+                payload: self.packet[..length].to_vec(),
+            }))
+        })
     }
-    for state in flows.into_values() {
-        shutdown_udp_flow(state).await;
+
+    fn send<'a>(&'a mut self, response: InboundUdpResponse) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let password_hash = response
+                .id
+                .authentication
+                .ok_or_else(|| Error::invalid("Yuubinsya UDP response has no password hash"))?;
+            self.server
+                .send_to_with_password_hash(
+                    &response.payload,
+                    response.target,
+                    response.peer,
+                    password_hash,
+                )
+                .await?;
+            Ok(())
+        })
     }
-    let _ = spec;
-    Ok(())
 }

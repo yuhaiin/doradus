@@ -25,10 +25,15 @@ pub const MAX_UOT_COALESCE_FRAMES: usize = 32;
 const UOT_COALESCE_FLUSH_DELAY: Duration = Duration::from_micros(100);
 const SERVER_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SERVER_UDP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_DNS_TCP_PACKET: usize = 4096;
 
 /// Optional DNS boundary for the Yuubinsya inbound session. The chain crate
 /// owns Yuubinsya framing; the embedding runtime owns resolver policy.
 pub trait YuubinsyaDnsHandler: Send + Sync {
+    fn should_hijack(&self, destination_port: Option<u16>, packet: &[u8]) -> bool {
+        destination_port == Some(53) || yuhaiin_core::dns::decode_query(packet).is_ok()
+    }
+
     fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>>;
 }
 
@@ -575,10 +580,8 @@ impl YuubinsyaServerProxy {
                     }
                 });
                 let mut prefix = Vec::new();
-                if destination.port() == Some(53)
-                    && let Some(handler) = dns_handler.as_deref()
-                {
-                    match intercept_dns_tcp(&mut inbound, handler).await? {
+                if let Some(handler) = dns_handler.as_deref() {
+                    match intercept_dns_tcp(&mut inbound, handler, destination.port()).await? {
                         DnsTcpDecision::Answered { upload, download } => {
                             if let (Some(observed), Some(flow)) = (observed.as_ref(), flow) {
                                 let _observation = FlowObserverGuard::open(
@@ -687,13 +690,12 @@ impl YuubinsyaServerProxy {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let (mut destination, mut payload) = session.recv_from().await?;
-        while destination.port() == Some(53) {
+        while dns_handler.is_some_and(|handler| handler.should_hijack(destination.port(), &payload))
+        {
             let Some(handler) = dns_handler else {
                 break;
             };
-            let Some(response) = answer_dns_packet(handler, &payload).await? else {
-                break;
-            };
+            let response = answer_dns_packet(handler, destination.port(), &payload).await?;
             session.send_to(&destination, &response).await?;
             (destination, payload) = session.recv_from().await?;
         }
@@ -740,10 +742,11 @@ impl YuubinsyaServerProxy {
                 tokio::select! {
                     incoming = session.recv_from() => {
                         let (destination, payload) = incoming?;
-                        if destination.port() == Some(53)
-                            && let Some(handler) = dns_handler
-                            && let Some(response) = answer_dns_packet(handler, &payload).await?
+                        if let Some(handler) = dns_handler
+                            && handler.should_hijack(destination.port(), &payload)
                         {
+                            let response =
+                                answer_dns_packet(handler, destination.port(), &payload).await?;
                             session.send_to(&destination, &response).await?;
                             continue;
                         }
@@ -876,6 +879,7 @@ enum DnsTcpDecision {
 async fn intercept_dns_tcp<S>(
     stream: &mut S,
     handler: &dyn YuubinsyaDnsHandler,
+    destination_port: Option<u16>,
 ) -> Result<DnsTcpDecision>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -886,12 +890,21 @@ where
         .map_err(|_| Error::new(ErrorKind::Timeout, "Yuubinsya DNS over TCP query timed out"))?
         .map_err(io_error)?;
     let length = usize::from(u16::from_be_bytes(length));
+    // A Yuubinsya TCP payload is not necessarily DNS over TCP.  If its first
+    // two bytes describe an implausibly large DNS frame, forward the prefix
+    // immediately instead of waiting for a full frame that belongs to the
+    // normal application stream.
+    if length > MAX_DNS_TCP_PACKET {
+        return Ok(DnsTcpDecision::Forward(
+            (length as u16).to_be_bytes().to_vec(),
+        ));
+    }
     let mut packet = vec![0u8; length];
     stream.read_exact(&mut packet).await.map_err(io_error)?;
     let mut framed = Vec::with_capacity(length + 2);
     framed.extend_from_slice(&(length as u16).to_be_bytes());
     framed.extend_from_slice(&packet);
-    if yuhaiin_core::dns::decode_query(&packet).is_err() {
+    if !handler.should_hijack(destination_port, &packet) {
         return Ok(DnsTcpDecision::Forward(framed));
     }
     let response = handler.answer(&packet).await?;
@@ -915,12 +928,16 @@ where
 
 async fn answer_dns_packet(
     handler: &dyn YuubinsyaDnsHandler,
+    destination_port: Option<u16>,
     packet: &[u8],
-) -> Result<Option<Vec<u8>>> {
-    if yuhaiin_core::dns::decode_query(packet).is_err() {
-        return Ok(None);
+) -> Result<Vec<u8>> {
+    if !handler.should_hijack(destination_port, packet) {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "Yuubinsya DNS packet was not selected for hijacking",
+        ));
     }
-    Ok(Some(handler.answer(packet).await?))
+    handler.answer(packet).await
 }
 
 fn endpoint_socket_addr(endpoint: &Endpoint, source: SocketAddr) -> SocketAddr {

@@ -270,13 +270,6 @@ impl ConnectionMonitor {
             .is_some()
     }
 
-    pub(crate) fn socket_dns_handler(&self) -> Option<Arc<dyn SocketDnsHandler>> {
-        self.dns_handler
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
     pub(crate) async fn answer_dns(&self, packet: &[u8]) -> Option<yuhaiin_core::Result<Vec<u8>>> {
         let handler = self
             .dns_handler

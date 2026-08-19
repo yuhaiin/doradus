@@ -8,28 +8,19 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncWrite};
-
-use yuhaiin_core::flow::FlowKey as TunFlowKey;
-use yuhaiin_core::proxy::AsyncProxySelector;
-use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use yuhaiin_core::proxy::BoxAsyncStream;
+use yuhaiin_core::{Error, ErrorKind, Result};
 use yuhaiin_protocol::socks4a_server::{read_request, write_reply};
 
-use super::common::{io_error, record_outbound_stream, relay_counted_with_buffer};
-use crate::inbound::InboundSpec;
-use crate::{ConnectionMonitor, RuntimeProxySelector};
+use super::super::inbound::InboundHandler;
+use super::common::io_error;
 
 /// Serve one SOCKS4/SOCKS4A connection.
-pub(crate) async fn serve<S>(
-    mut stream: S,
+pub(crate) async fn handle(
+    mut stream: BoxAsyncStream,
     peer: SocketAddr,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+    inbound: Arc<InboundHandler>,
+) -> Result<()> {
     let request = match read_request(&mut stream).await {
         Ok(request) => request,
         Err(error) => {
@@ -38,55 +29,28 @@ where
         }
     };
 
+    let spec = inbound.spec();
     if !spec.username.is_empty() && !constant_time_eq(spec.username.as_bytes(), &request.user_id) {
         write_reply(&mut stream, 91, request.address, request.port).await?;
         return Err(Error::new(ErrorKind::Protocol, "SOCKS4A username mismatch"));
     }
 
     let destination = request.destination()?;
-    let source = Endpoint::ip(Network::Tcp, peer);
-    let mut context = FlowContext::new(destination.clone());
-    context.source = Some(source);
-    context.original_domain = destination.host().cloned();
-    spec.annotate_context(&mut context);
-    selector.route_context(&mut context);
-    let process = context.process.clone();
-
-    let proxy = selector.select(&context);
-    let outbound = match proxy.connect(&context).await {
-        Ok(outbound) => outbound,
+    let connection = match inbound.open_stream("socks4a", peer, destination).await {
+        Ok(connection) => connection,
         Err(error) => {
             let _ = write_reply(&mut stream, 91, request.address, request.port).await;
-            monitor.record_failure_with_process(
-                "socks4a",
-                &destination.to_string(),
-                &error.to_string(),
-                process.as_deref(),
-            );
             return Err(error);
         }
     };
-    record_outbound_stream(&mut context, &outbound);
 
     // Preserve the original port/address bytes, including the 0.0.0.x marker
     // used by SOCKS4A domain requests, just like the Go server.
     write_reply(&mut stream, 90, request.address, request.port).await?;
-    relay_counted_with_buffer(
-        stream,
-        outbound,
-        TunFlowKey {
-            network: Network::Tcp,
-            source: peer,
-            destination: destination
-                .addr()
-                .unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid fallback address")),
-        },
-        context,
-        monitor,
-        selector.relay_buffer_size(),
-    )
-    .await
-    .map_err(io_error)
+    inbound
+        .relay(stream, connection, peer)
+        .await
+        .map_err(io_error)
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

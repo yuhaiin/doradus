@@ -5,7 +5,7 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::IpAddress;
 
 impl TunDispatcher {
-    pub(super) fn collect_events(&mut self) -> Result<()> {
+    pub(super) fn collect_proxy_inputs(&mut self) -> Result<()> {
         self.tcp_handles.clear();
         self.tcp_handles.extend(self.tcp.keys().copied());
         self.closed_tcp.clear();
@@ -32,7 +32,7 @@ impl TunDispatcher {
             let flow = TunFlow { key };
             if socket.is_active() && socket.may_send() && !state.opened {
                 state.opened = true;
-                self.events.push_back(TunEvent::TcpOpened { flow });
+                self.proxy_inputs.push_back(ProxyInput::TcpOpened { flow });
             }
             let mut event_bytes = 0usize;
             while socket.can_recv() && event_bytes < MAX_TCP_EVENT_BYTES_PER_POLL {
@@ -45,13 +45,15 @@ impl TunDispatcher {
                     Ok(length) if length != 0 => {
                         payload.truncate(length);
                         event_bytes = event_bytes.saturating_add(length);
-                        self.events.push_back(TunEvent::TcpData { flow, payload });
+                        self.proxy_inputs
+                            .push_back(ProxyInput::TcpData { flow, payload });
                     }
                     Ok(_) => break,
                     Err(tcp::RecvError::Finished) => {
                         if !state.half_closed {
                             state.half_closed = true;
-                            self.events.push_back(TunEvent::TcpHalfClosed { flow });
+                            self.proxy_inputs
+                                .push_back(ProxyInput::TcpHalfClosed { flow });
                         }
                         break;
                     }
@@ -60,10 +62,11 @@ impl TunDispatcher {
             }
             if state.opened && socket.is_active() && !socket.may_recv() && !state.half_closed {
                 state.half_closed = true;
-                self.events.push_back(TunEvent::TcpHalfClosed { flow });
+                self.proxy_inputs
+                    .push_back(ProxyInput::TcpHalfClosed { flow });
             }
             if !socket.is_open() && state.opened {
-                self.events.push_back(TunEvent::TcpClosed { flow });
+                self.proxy_inputs.push_back(ProxyInput::TcpClosed { flow });
             }
             if !socket.is_open() {
                 self.closed_tcp.push((handle, key));
@@ -114,7 +117,7 @@ impl TunDispatcher {
                     flow.key,
                     payload.len()
                 ));
-                self.events.push_back(TunEvent::UdpDatagram {
+                self.proxy_inputs.push_back(ProxyInput::UdpDatagram {
                     flow,
                     payload: payload.to_vec(),
                 });

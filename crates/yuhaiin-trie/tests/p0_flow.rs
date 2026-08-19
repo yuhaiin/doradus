@@ -30,7 +30,7 @@ use yuhaiin_store::ConfigStore;
 use yuhaiin_store::fakeip::{
     AsyncDomainResolver, FakeIpAnswerTransform, FakeIpAsyncDnsHandler, FakeIpConfig, FakeIpPool,
 };
-use yuhaiin_tun::{SmoltcpTunDevice, TunDispatcher, TunEvent, TunFlowKey, TunProxyRuntime};
+use yuhaiin_tun::{ProxyInput, SmoltcpTunDevice, TunDispatcher, TunFlowKey, TunProxyRuntime};
 
 use yuhaiin_trie::router::{
     RouteDecision, RouteRule, Router, RouterRuntime, RuleAction, RuntimeRoutedProxySelector,
@@ -259,7 +259,7 @@ impl AsyncDomainResolver for Resolver {
         &'a self,
         _domain: &'a DomainName,
         _record_type: DnsRecordType,
-    ) -> yuhaiin_core::LocalBoxFuture<'a, Result<DnsResponse>> {
+    ) -> yuhaiin_core::BoxFuture<'a, Result<DnsResponse>> {
         Box::pin(async {
             Ok(DnsResponse {
                 addresses: IpSet {
@@ -537,7 +537,7 @@ async fn run_stream_proxy_tun(kind: StreamProxyKind) {
         .unwrap()
         .seq_number()
         .0 as u32;
-    assert!(dispatcher.events().next().is_none());
+    assert!(dispatcher.proxy_inputs().next().is_none());
 
     device
         .enqueue_rx(tcp_data_packet(
@@ -551,8 +551,8 @@ async fn run_stream_proxy_tun(kind: StreamProxyKind) {
         ))
         .unwrap();
     poll(&mut dispatcher, &mut interface, &mut device, 2).unwrap();
-    for event in dispatcher.events().collect::<Vec<_>>() {
-        runtime.handle_event(event).unwrap();
+    for event in dispatcher.proxy_inputs().collect::<Vec<_>>() {
+        runtime.handle_proxy_input(event).unwrap();
     }
 
     let request = b"request";
@@ -568,14 +568,14 @@ async fn run_stream_proxy_tun(kind: StreamProxyKind) {
         ))
         .unwrap();
     poll(&mut dispatcher, &mut interface, &mut device, 3).unwrap();
-    for event in dispatcher.events().collect::<Vec<_>>() {
-        runtime.handle_event(event).unwrap();
+    for event in dispatcher.proxy_inputs().collect::<Vec<_>>() {
+        runtime.handle_proxy_input(event).unwrap();
     }
 
     let mut response = None;
     for tick in 4..250 {
         tokio::time::sleep(Duration::from_millis(1)).await;
-        runtime.poll_outputs(&mut dispatcher).unwrap();
+        runtime.process_proxy_outputs(&mut dispatcher).unwrap();
         poll(&mut dispatcher, &mut interface, &mut device, tick).unwrap();
         while let Some(packet) = device.take_tx().unwrap() {
             let is_response = {
@@ -693,8 +693,8 @@ async fn fixed_async_proxy_runs_through_tun_tcp_runtime() {
         ))
         .unwrap();
     poll(&mut dispatcher, &mut interface, &mut device, 2).unwrap();
-    for event in dispatcher.events().collect::<Vec<_>>() {
-        runtime.handle_event(event).unwrap();
+    for event in dispatcher.proxy_inputs().collect::<Vec<_>>() {
+        runtime.handle_proxy_input(event).unwrap();
     }
     let request = b"fixed-p";
     device
@@ -709,13 +709,13 @@ async fn fixed_async_proxy_runs_through_tun_tcp_runtime() {
         ))
         .unwrap();
     poll(&mut dispatcher, &mut interface, &mut device, 3).unwrap();
-    for event in dispatcher.events().collect::<Vec<_>>() {
-        runtime.handle_event(event).unwrap();
+    for event in dispatcher.proxy_inputs().collect::<Vec<_>>() {
+        runtime.handle_proxy_input(event).unwrap();
     }
     let mut response = None;
     for tick in 4..250 {
         tokio::time::sleep(Duration::from_millis(1)).await;
-        runtime.poll_outputs(&mut dispatcher).unwrap();
+        runtime.process_proxy_outputs(&mut dispatcher).unwrap();
         poll(&mut dispatcher, &mut interface, &mut device, tick).unwrap();
         while let Some(packet) = device.take_tx().unwrap() {
             let ip = Ipv4Packet::new_checked(&packet).unwrap();
@@ -790,12 +790,12 @@ async fn drop_proxy_closes_established_tun_tcp_flow() {
         ))
         .unwrap();
     poll(&mut dispatcher, &mut interface, &mut device, 2).unwrap();
-    for event in dispatcher.events().collect::<Vec<_>>() {
-        runtime.handle_event(event).unwrap();
+    for event in dispatcher.proxy_inputs().collect::<Vec<_>>() {
+        runtime.handle_proxy_input(event).unwrap();
     }
     for tick in 3..50 {
         tokio::time::sleep(Duration::from_millis(1)).await;
-        runtime.poll_outputs(&mut dispatcher).unwrap();
+        runtime.process_proxy_outputs(&mut dispatcher).unwrap();
         poll(&mut dispatcher, &mut interface, &mut device, tick).unwrap();
         if runtime.task_len() == 0 {
             break;
@@ -829,15 +829,17 @@ async fn tcp_half_close_forwards_eof_and_close_releases_task() {
             destination: "192.0.2.1:443".parse().unwrap(),
         },
     };
-    runtime.handle_event(TunEvent::TcpOpened { flow }).unwrap();
     runtime
-        .handle_event(TunEvent::TcpData {
+        .handle_proxy_input(ProxyInput::TcpOpened { flow })
+        .unwrap();
+    runtime
+        .handle_proxy_input(ProxyInput::TcpData {
             flow,
             payload: b"request".to_vec(),
         })
         .unwrap();
     runtime
-        .handle_event(TunEvent::TcpHalfClosed { flow })
+        .handle_proxy_input(ProxyInput::TcpHalfClosed { flow })
         .unwrap();
 
     for _ in 0..50 {
@@ -879,11 +881,13 @@ async fn tcp_connect_timeout_drops_pending_future_and_task() {
             destination: "192.0.2.2:443".parse().unwrap(),
         },
     };
-    runtime.handle_event(TunEvent::TcpOpened { flow }).unwrap();
+    runtime
+        .handle_proxy_input(ProxyInput::TcpOpened { flow })
+        .unwrap();
     let mut dispatcher = TunDispatcher::new(1024, 1024, 2).unwrap();
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(2)).await;
-        runtime.poll_outputs(&mut dispatcher).unwrap();
+        runtime.process_proxy_outputs(&mut dispatcher).unwrap();
         if runtime.task_len() == 0 {
             break;
         }
@@ -917,7 +921,9 @@ async fn dropping_proxy_runtime_aborts_owned_flow_tasks() {
                 destination: "192.0.2.3:443".parse().unwrap(),
             },
         };
-        runtime.handle_event(TunEvent::TcpOpened { flow }).unwrap();
+        runtime
+            .handle_proxy_input(ProxyInput::TcpOpened { flow })
+            .unwrap();
         tokio::task::yield_now().await;
         assert_eq!(runtime.task_len(), 1);
     }
@@ -964,9 +970,7 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
         bypass: Arc::clone(&drop),
         drop,
     };
-    let mut runtime = TunProxyRuntime::new(Arc::new(selector), 8)
-        .unwrap()
-        .with_async_dns_handler(Arc::clone(&dns_handler));
+    let mut runtime = TunProxyRuntime::new(Arc::new(selector), 8).unwrap();
 
     let local = Ipv4Address::new(10, 0, 0, 1);
     let application = Ipv4Address::new(10, 0, 0, 2);
@@ -993,12 +997,20 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
         .enqueue_rx(udp_packet(application, local, 41000, 53, &query))
         .unwrap();
     poll(&mut dispatcher, &mut interface, &mut device, 1).unwrap();
-    let dns_event = dispatcher.events().next().expect("DNS event");
-    runtime.handle_event_async(dns_event).await.unwrap();
+    let dns_event = dispatcher.proxy_inputs().next().expect("DNS event");
+    let (dns_flow, dns_payload) = match dns_event {
+        ProxyInput::UdpDatagram { flow, payload } => (flow.key, payload),
+        other => panic!("unexpected DNS event: {other:?}"),
+    };
+    let dns_response = dns_handler.answer(&dns_payload).await.unwrap();
+    runtime
+        .enqueue_udp_data(dns_flow, dns_response)
+        .await
+        .unwrap();
     let mut dns_response = None;
     for tick in 2..100 {
         tokio::time::sleep(Duration::from_millis(1)).await;
-        runtime.poll_outputs(&mut dispatcher).unwrap();
+        runtime.process_proxy_outputs(&mut dispatcher).unwrap();
         poll(&mut dispatcher, &mut interface, &mut device, tick).unwrap();
         if device.queued_tx().unwrap() > 0 {
             dns_response =
@@ -1043,9 +1055,9 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
         .enqueue_rx(udp_packet(application, destination, 41001, 443, payload))
         .unwrap();
     poll(&mut dispatcher, &mut interface, &mut device, 3).unwrap();
-    let event = dispatcher.events().next().expect("FakeIP UDP event");
+    let event = dispatcher.proxy_inputs().next().expect("FakeIP UDP event");
     let flow = match event {
-        TunEvent::UdpDatagram { flow, .. } => flow,
+        ProxyInput::UdpDatagram { flow, .. } => flow,
         other => panic!("unexpected event: {other:?}"),
     };
     assert_eq!(
@@ -1057,7 +1069,7 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
         }
     );
     runtime
-        .handle_event(TunEvent::UdpDatagram {
+        .handle_proxy_input(ProxyInput::UdpDatagram {
             flow: yuhaiin_tun::TunFlow { key: flow.key },
             payload: payload.to_vec(),
         })
@@ -1065,7 +1077,7 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
     let mut echoed = None;
     for tick in 4..100 {
         tokio::time::sleep(Duration::from_millis(1)).await;
-        runtime.poll_outputs(&mut dispatcher).unwrap();
+        runtime.process_proxy_outputs(&mut dispatcher).unwrap();
         poll(&mut dispatcher, &mut interface, &mut device, tick).unwrap();
         if device.queued_tx().unwrap() > 0 {
             echoed = Some(take_udp_payload(&device));
@@ -1085,14 +1097,17 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
         ))
         .unwrap();
     poll(&mut dispatcher, &mut interface, &mut device, 5).unwrap();
-    let second_event = dispatcher.events().next().expect("second FakeIP UDP event");
+    let second_event = dispatcher
+        .proxy_inputs()
+        .next()
+        .expect("second FakeIP UDP event");
     runtime
-        .handle_event(second_event)
+        .handle_proxy_input(second_event)
         .expect("second FakeIP flow should share the source task");
     let mut second_echoed = None;
     for tick in 6..100 {
         tokio::time::sleep(Duration::from_millis(1)).await;
-        runtime.poll_outputs(&mut dispatcher).unwrap();
+        runtime.process_proxy_outputs(&mut dispatcher).unwrap();
         poll(&mut dispatcher, &mut interface, &mut device, tick).unwrap();
         if device.queued_tx().unwrap() > 0 {
             second_echoed = Some(take_udp_payload(&device));

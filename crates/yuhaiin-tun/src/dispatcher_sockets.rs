@@ -66,13 +66,13 @@ impl TunDispatcher {
     /// Queue a raw ICMP packet for the next TUN poll.
     pub fn write_icmp(&mut self, packet: Vec<u8>) -> Result<()> {
         inspect_ip_packet(&packet)?;
-        if self.pending_icmp_tx.len() >= self.udp_packet_capacity {
+        if self.pending_icmp_to_tun.len() >= self.udp_packet_capacity {
             return Err(Error::new(
                 ErrorKind::Timeout,
                 "TUN ICMP output queue is full",
             ));
         }
-        self.pending_icmp_tx.push_back(packet);
+        self.pending_icmp_to_tun.push_back(packet);
         Ok(())
     }
 

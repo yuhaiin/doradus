@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -16,8 +16,9 @@ use yuhaiin_core::flow::{
 use yuhaiin_core::proxy::{
     AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream, stream_local_addr,
 };
-use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Result};
 
+use crate::inbound::{InboundDnsHandler, InboundDnsPolicy};
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
 /// Matches Go's `configuration.UDPIdleTimeout` (90 seconds).
@@ -175,7 +176,9 @@ where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    relay_counted_with_buffer(left, right, flow, context, monitor, 16 * 1024).await
+    let dns = InboundDnsPolicy::new(Arc::clone(&monitor));
+    relay_counted_with_prefix_and_buffer(left, right, flow, context, monitor, &dns, &[], 16 * 1024)
+        .await
 }
 
 pub(crate) async fn relay_counted_with_buffer<A, B>(
@@ -184,29 +187,14 @@ pub(crate) async fn relay_counted_with_buffer<A, B>(
     flow: TunFlowKey,
     context: FlowContext,
     monitor: Arc<ConnectionMonitor>,
+    dns: &dyn InboundDnsHandler,
     buffer_size: usize,
 ) -> std::io::Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    relay_counted_with_prefix_and_buffer(left, right, flow, context, monitor, &[], buffer_size)
-        .await
-}
-
-pub(crate) async fn relay_counted_with_prefix<A, B>(
-    left: A,
-    right: B,
-    flow: TunFlowKey,
-    context: FlowContext,
-    monitor: Arc<ConnectionMonitor>,
-    prefix: &[u8],
-) -> std::io::Result<()>
-where
-    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    relay_counted_with_prefix_and_buffer(left, right, flow, context, monitor, prefix, 16 * 1024)
+    relay_counted_with_prefix_and_buffer(left, right, flow, context, monitor, dns, &[], buffer_size)
         .await
 }
 
@@ -216,6 +204,7 @@ pub(crate) async fn relay_counted_with_prefix_and_buffer<A, B>(
     flow: TunFlowKey,
     mut context: FlowContext,
     monitor: Arc<ConnectionMonitor>,
+    dns: &dyn InboundDnsHandler,
     prefix: &[u8],
     buffer_size: usize,
 ) -> std::io::Result<()>
@@ -224,8 +213,8 @@ where
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut sniffed = Vec::new();
-    if context.destination.port() == Some(53) && monitor.dns_hijack_enabled() {
-        match intercept_dns_tcp(&mut left, &monitor).await? {
+    if context.destination.port() == Some(53) && dns.should_hijack(Some(53), &[]) {
+        match intercept_dns_tcp(&mut left, dns).await? {
             DnsTcpDecision::Intercepted { upload, download } => {
                 let _observation =
                     FlowObserverGuard::open(monitor.clone(), TunFlow { key: flow }, context);
@@ -234,11 +223,28 @@ where
                 return Ok(());
             }
             DnsTcpDecision::Forward(prefix) => sniffed = prefix,
-            DnsTcpDecision::NotApplicable => {}
         }
     }
     if sniffed.is_empty() && monitor.sniff_enabled() {
         sniffed = sniff_stream(&mut left).await;
+    }
+    if context.destination.port() != Some(53)
+        && let Some(frame) = dns_tcp_frame(&sniffed)
+        && dns.should_hijack(None, frame)
+        && let Some(answer) = dns.answer(frame).await
+    {
+        let response = answer.map_err(|error| std::io::Error::other(error.to_string()))?;
+        if response.len() > usize::from(u16::MAX) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "DNS over TCP response is too large",
+            ));
+        }
+        left.write_all(&(response.len() as u16).to_be_bytes())
+            .await?;
+        left.write_all(&response).await?;
+        left.flush().await?;
+        return Ok(());
     }
     let metadata = yuhaiin_core::sniff::inspect(&sniffed);
     if context.tls_server_name.is_none() {
@@ -284,11 +290,18 @@ where
 }
 
 const DNS_TCP_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_DNS_TCP_PACKET: usize = 4096;
 
 enum DnsTcpDecision {
-    NotApplicable,
     Forward(Vec<u8>),
     Intercepted { upload: usize, download: usize },
+}
+
+fn dns_tcp_frame(bytes: &[u8]) -> Option<&[u8]> {
+    let length = usize::from(u16::from_be_bytes(bytes.get(..2)?.try_into().ok()?));
+    let packet = bytes.get(2..2 + length)?;
+    yuhaiin_core::dns::decode_query(packet).ok()?;
+    Some(packet)
 }
 
 /// Return a locally-generated DNS answer when the packet is a DNS query. A
@@ -296,14 +309,11 @@ enum DnsTcpDecision {
 /// normal outbound relay can still forward it, matching Go's IsRequest gate.
 async fn intercept_dns_tcp<S>(
     stream: &mut S,
-    monitor: &ConnectionMonitor,
+    dns: &dyn InboundDnsHandler,
 ) -> std::io::Result<DnsTcpDecision>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if !monitor.dns_hijack_enabled() {
-        return Ok(DnsTcpDecision::NotApplicable);
-    }
     let mut length = [0u8; 2];
     tokio::time::timeout(DNS_TCP_TIMEOUT, stream.read_exact(&mut length))
         .await
@@ -311,13 +321,21 @@ where
             std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS over TCP query timed out")
         })??;
     let length = usize::from(u16::from_be_bytes(length));
+    if length > MAX_DNS_TCP_PACKET {
+        return Ok(DnsTcpDecision::Forward(
+            (length as u16).to_be_bytes().to_vec(),
+        ));
+    }
     let mut packet = vec![0u8; length];
     stream.read_exact(&mut packet).await?;
     let mut framed = Vec::with_capacity(length + 2);
     framed.extend_from_slice(&(length as u16).to_be_bytes());
     framed.extend_from_slice(&packet);
 
-    let Some(answer) = answer_dns_packet(monitor, &packet).await else {
+    if !dns.should_hijack(Some(53), &packet) {
+        return Ok(DnsTcpDecision::Forward(framed));
+    }
+    let Some(answer) = dns.answer(&packet).await else {
         return Ok(DnsTcpDecision::Forward(framed));
     };
     let response = answer.map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -336,16 +354,6 @@ where
         upload: framed.len(),
         download: response.len() + 2,
     })
-}
-
-/// Apply the shared Go-compatible DNS request predicate before invoking the
-/// runtime handler. Protocol adapters call this and only own response framing.
-pub(crate) async fn answer_dns_packet(
-    monitor: &ConnectionMonitor,
-    packet: &[u8],
-) -> Option<yuhaiin_core::Result<Vec<u8>>> {
-    yuhaiin_core::dns::decode_query(packet).ok()?;
-    monitor.answer_dns(packet).await
 }
 
 const SNIFF_TIMEOUT: Duration = Duration::from_millis(55);
@@ -429,6 +437,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use tokio::io::duplex;
+    use yuhaiin_core::Network;
 
     #[test]
     fn udp_flow_expiration_matches_idle_timeout_boundary() {
@@ -582,9 +591,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_dns_over_tcp_is_forwarded_without_local_answer() {
+    async fn malformed_dns_over_tcp_at_dns_port_is_handled_by_inbound_policy() {
         let (mut client, relay_left) = duplex(4096);
-        let (relay_right, mut remote) = duplex(4096);
+        let (relay_right, _remote) = duplex(4096);
         let monitor = Arc::new(ConnectionMonitor::new());
         monitor.set_dns_handler(Some(
             Arc::new(EchoDnsHandler) as Arc<dyn crate::monitor::SocketDnsHandler>
@@ -605,12 +614,10 @@ mod tests {
         let query = b"not a DNS query";
         client.write_u16(query.len() as u16).await.unwrap();
         client.write_all(query).await.unwrap();
-        let mut forwarded = vec![0u8; query.len() + 2];
-        remote.read_exact(&mut forwarded).await.unwrap();
-        assert_eq!(&forwarded[..2], &(query.len() as u16).to_be_bytes());
-        assert_eq!(&forwarded[2..], query);
-        client.shutdown().await.unwrap();
-        remote.shutdown().await.unwrap();
+        let response_length = client.read_u16().await.unwrap();
+        let mut response = vec![0u8; usize::from(response_length)];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, query);
         relay.await.unwrap().unwrap();
     }
 
@@ -772,24 +779,6 @@ where
         }
         writer.write_all(&buffer[..read]).await?;
         monitor.bytes(flow, direction, read);
-    }
-}
-
-pub(crate) fn udp_flow_key(peer: SocketAddr, target: &Endpoint) -> TunFlowKey {
-    let destination = target.addr().unwrap_or_else(|| {
-        SocketAddr::new(
-            if peer.is_ipv4() {
-                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-            } else {
-                IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
-            },
-            target.port().unwrap_or(0),
-        )
-    });
-    TunFlowKey {
-        network: Network::Udp,
-        source: peer,
-        destination,
     }
 }
 

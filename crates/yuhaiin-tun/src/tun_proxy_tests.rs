@@ -176,15 +176,17 @@ async fn proxy_runtime_relays_udp_event_through_direct_proxy() {
     dispatcher
         .poll_with(&mut interface, &mut device, Instant::from_millis(1))
         .unwrap();
-    for event in dispatcher.events().collect::<Vec<_>>() {
-        proxy_runtime.handle_event(event).unwrap();
+    for event in dispatcher.proxy_inputs().collect::<Vec<_>>() {
+        proxy_runtime.handle_proxy_input(event).unwrap();
     }
     assert_eq!(proxy_runtime.nat_len().unwrap(), 1);
 
     let mut response = None;
     for tick in 2..100 {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        proxy_runtime.poll_outputs(&mut dispatcher).unwrap();
+        proxy_runtime
+            .process_proxy_outputs(&mut dispatcher)
+            .unwrap();
         dispatcher
             .poll_with(&mut interface, &mut device, Instant::from_millis(tick))
             .unwrap();
@@ -323,13 +325,13 @@ async fn proxy_runtime_shares_one_udp_proxy_per_source_for_full_cone_nat() {
         },
     };
     runtime
-        .handle_event(TunEvent::UdpDatagram {
+        .handle_proxy_input(ProxyInput::UdpDatagram {
             flow: first,
             payload: b"first".to_vec(),
         })
         .unwrap();
     runtime
-        .handle_event(TunEvent::UdpDatagram {
+        .handle_proxy_input(ProxyInput::UdpDatagram {
             flow: second,
             payload: b"second".to_vec(),
         })
@@ -346,7 +348,7 @@ async fn proxy_runtime_shares_one_udp_proxy_per_source_for_full_cone_nat() {
     assert_eq!(runtime.task_len(), 1);
 
     let mut dispatcher = TunDispatcher::new(32, 32, 4).unwrap();
-    runtime.poll_outputs(&mut dispatcher).unwrap();
+    runtime.process_proxy_outputs(&mut dispatcher).unwrap();
     assert_eq!(
         table
             .lookup_translated(
@@ -494,7 +496,7 @@ async fn full_cone_udp_long_flow_reuses_one_relay_and_force_close_releases_it() 
             },
         };
         runtime
-            .handle_event(TunEvent::UdpDatagram {
+            .handle_proxy_input(ProxyInput::UdpDatagram {
                 flow,
                 payload: format!("long-flow-{index}").into_bytes(),
             })
@@ -599,13 +601,13 @@ async fn full_cone_real_direct_tun_accepts_unseen_peer_and_force_closes_source()
     dispatcher
         .poll_with(&mut interface, &mut device, Instant::from_millis(1))
         .unwrap();
-    let first_event = dispatcher.events().next().expect("first UDP event");
-    runtime.handle_event(first_event).unwrap();
+    let first_event = dispatcher.proxy_inputs().next().expect("first UDP event");
+    runtime.handle_proxy_input(first_event).unwrap();
 
     let mut first_response = None;
     for tick in 2..200 {
         tokio::task::yield_now().await;
-        runtime.poll_outputs(&mut dispatcher).unwrap();
+        runtime.process_proxy_outputs(&mut dispatcher).unwrap();
         dispatcher
             .poll_with(&mut interface, &mut device, Instant::from_millis(tick))
             .unwrap();
@@ -652,13 +654,13 @@ async fn full_cone_real_direct_tun_accepts_unseen_peer_and_force_closes_source()
                 Instant::from_millis(1_000 + round * 4),
             )
             .unwrap();
-        let event = dispatcher.events().next().expect("long UDP event");
-        runtime.handle_event(event).unwrap();
+        let event = dispatcher.proxy_inputs().next().expect("long UDP event");
+        runtime.handle_proxy_input(event).unwrap();
 
         let mut response = None;
         for step in 0..200 {
             tokio::task::yield_now().await;
-            runtime.poll_outputs(&mut dispatcher).unwrap();
+            runtime.process_proxy_outputs(&mut dispatcher).unwrap();
             dispatcher
                 .poll_with(
                     &mut interface,
@@ -695,7 +697,7 @@ async fn full_cone_real_direct_tun_accepts_unseen_peer_and_force_closes_source()
     let mut unseen_response = None;
     for tick in 2_000..2_200 {
         tokio::task::yield_now().await;
-        runtime.poll_outputs(&mut dispatcher).unwrap();
+        runtime.process_proxy_outputs(&mut dispatcher).unwrap();
         dispatcher
             .poll_with(&mut interface, &mut device, Instant::from_millis(tick))
             .unwrap();
@@ -854,7 +856,7 @@ async fn full_cone_runtime_restarts_after_aborting_multiple_real_udp_sockets() {
         .unwrap();
     for (index, destination) in destinations.iter().copied().enumerate() {
         runtime
-            .handle_event(TunEvent::UdpDatagram {
+            .handle_proxy_input(ProxyInput::UdpDatagram {
                 flow: TunFlow {
                     key: TunFlowKey {
                         network: Network::Udp,
@@ -901,7 +903,7 @@ async fn full_cone_runtime_restarts_after_aborting_multiple_real_udp_sockets() {
         .unwrap();
     for (index, destination) in destinations.iter().copied().enumerate() {
         restarted
-            .handle_event(TunEvent::UdpDatagram {
+            .handle_proxy_input(ProxyInput::UdpDatagram {
                 flow: TunFlow {
                     key: TunFlowKey {
                         network: Network::Udp,

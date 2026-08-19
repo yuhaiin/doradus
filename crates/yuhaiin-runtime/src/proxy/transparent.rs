@@ -6,7 +6,6 @@
 //! dependent; after the destination is recovered, both protocols use the
 //! ordinary runtime router and outbound relay.
 
-use std::collections::HashMap;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
@@ -18,22 +17,16 @@ use nix::sys::socket::{
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::unix::AsyncFd;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use yuhaiin_core::flow::{
-    Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
-    FlowObserver as TunFlowObserver, FlowObserverGuard,
-};
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector, BoxAsyncStream};
-use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use yuhaiin_core::proxy::BoxAsyncStream;
+use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, Network, Result};
 
-use super::common::{
-    UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows, io_error,
-    reap_expired_udp_flows_with_timeout, record_outbound_datagram, record_outbound_stream,
-    relay_counted_with_buffer, shutdown_udp_flow, udp_flow_key, udp_idle_timeout,
+use super::common::io_error;
+use crate::inbound::{
+    InboundHandler, InboundSpec, InboundTlsAcceptor, InboundUdpCodec, InboundUdpRequest,
+    InboundUdpResponse, InboundUdpSession, prepare_inbound_stream,
 };
-use crate::inbound::{InboundSpec, InboundTlsAcceptor, prepare_inbound_stream};
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
 const BACKLOG: i32 = 256;
@@ -47,6 +40,7 @@ pub(crate) async fn serve_listener(
     tls_acceptor: Option<InboundTlsAcceptor>,
 ) -> Result<()> {
     let listener = bind_listener(listen, protocol.eq_ignore_ascii_case("tproxy"))?;
+    let inbound = InboundHandler::new(spec, Arc::clone(&selector), Arc::clone(&monitor));
     let mut connections = JoinSet::new();
     let result = async {
         loop {
@@ -54,18 +48,14 @@ pub(crate) async fn serve_listener(
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted.map_err(io_error)?;
                     let protocol = protocol.clone();
-                    let spec = spec.clone();
-                    let selector = selector.clone();
-                    let monitor = monitor.clone();
+                    let inbound = Arc::clone(&inbound);
                     let tls_acceptor = tls_acceptor.clone();
                     connections.spawn(async move {
                         handle_connection(
                             stream,
                             peer,
                             &protocol,
-                            spec,
-                            selector,
-                            monitor,
+                            inbound,
                             tls_acceptor,
                         )
                         .await
@@ -95,126 +85,51 @@ pub(crate) async fn serve_udp_listener(
 ) -> Result<()> {
     let socket = bind_udp_socket(listen)?;
     monitor.info(format!("transparent UDP listener ready at {listen}"));
-    let udp_buffer_size = selector.udp_buffer_size().max(512);
-    let udp_ringbuffer_size = selector.udp_ringbuffer_size().max(1);
-    let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
-    let mut flows = HashMap::<UdpFlowId, UdpFlowState>::new();
-    let mut close_events = monitor.subscribe_close_requests();
-    let idle_timeout = udp_idle_timeout();
-    let mut idle_tick = tokio::time::interval(idle_timeout);
-    let mut packet = vec![0u8; udp_buffer_size];
-    loop {
-        tokio::select! {
-            received = recv_udp(&socket, &mut packet) => {
-                let (length, peer, destination) = match received {
-                    Ok(received) => received,
-                    Err(error) => {
-                        monitor.error(format!("transparent UDP receive failed: {error}"));
-                        return Err(error);
-                    }
-                };
-                let target = Endpoint::ip(Network::Udp, destination);
-                if target.port() == Some(53)
-                    && let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await
-                {
-                    if let Ok(response) = answer {
-                        send_udp_reply(&response, destination, peer).await?;
-                    }
-                    continue;
-                }
-                let id = UdpFlowId {
+    let inbound = InboundHandler::new(spec, Arc::clone(&selector), Arc::clone(&monitor));
+    let codec = TransparentUdpCodec {
+        socket,
+        packet: vec![0u8; inbound.selector().udp_buffer_size().max(512)],
+    };
+    InboundUdpSession::new(codec, inbound).run().await
+}
+
+struct TransparentUdpCodec {
+    socket: AsyncFd<Socket>,
+    packet: Vec<u8>,
+}
+
+impl InboundUdpCodec for TransparentUdpCodec {
+    fn recv<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<InboundUdpRequest>>> {
+        Box::pin(async move {
+            let (length, peer, destination) = recv_udp(&self.socket, &mut self.packet).await?;
+            let target = Endpoint::ip(Network::Udp, destination);
+            Ok(Some(InboundUdpRequest {
+                id: crate::proxy::common::UdpFlowId {
                     peer,
                     target: target.clone(),
                     authentication: None,
-                };
-                let state = if let Some(state) = flows.get(&id) {
-                    state
-                } else {
-                    let source = Endpoint::ip(Network::Udp, peer);
-                    let mut context = FlowContext::new(target.clone());
-                    context.source = Some(source.clone());
-                    spec.annotate_context(&mut context);
-                    selector.route_context(&mut context);
-                    let key = udp_flow_key(peer, &target);
-                    let datagram: Arc<dyn AsyncDatagram> = match selector
-                        .select(&context)
-                        .open_datagram(&context)
-                        .await
-                    {
-                        Ok(datagram) => {
-                            record_outbound_datagram(&mut context, &*datagram);
-                            Arc::from(datagram)
-                        }
-                        Err(error) => {
-                            monitor.error(format!("transparent UDP open outbound failed: {error}"));
-                            return Err(error);
-                        }
-                    };
-                    let observation =
-                        FlowObserverGuard::open(monitor.clone(), TunFlow { key }, context);
-                    let receiver = Arc::clone(&datagram);
-                    let reply_tx = reply_tx.clone();
-                    let id_for_task = id.clone();
-                    let receiver_task = tokio::spawn(async move {
-                        let mut buffer = vec![0u8; udp_buffer_size];
-                        while let Ok((length, target)) = receiver.recv_from(&mut buffer).await {
-                            if reply_tx.send(UdpReply {
-                                id: id_for_task.clone(),
-                                target,
-                                payload: buffer[..length].to_vec(),
-                            }).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    flows.entry(id.clone()).or_insert(UdpFlowState {
-                        datagram,
-                        receiver_task,
-                        key,
-                        peer: source,
-                        last_seen: std::time::Instant::now(),
-                        _observation: observation,
-                    })
-                };
-                if let Err(error) = state.datagram.send_to(&packet[..length], target).await {
-                    monitor.error(format!("transparent UDP send outbound failed: {error}"));
-                    return Err(error);
-                }
-                monitor.bytes(state.key, TunFlowDirection::Upload, length);
-                if let Some(state) = flows.get_mut(&id) {
-                    state.last_seen = std::time::Instant::now();
-                }
-            }
-            close_event = close_events.recv() => {
-                match close_event {
-                    Ok(flow) => close_udp_flows(&mut flows, flow).await,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            Some(reply) = reply_rx.recv() => {
-                let Some(state) = flows.get(&reply.id) else { continue; };
-                let Some(client) = state.peer.addr() else { continue; };
-                let original_target = state.key.destination;
-                if let Err(error) = send_udp_reply(&reply.payload, original_target, client).await {
-                    monitor.error(format!("transparent UDP send reply failed: {error}"));
-                    return Err(error);
-                }
-                monitor.bytes(state.key, TunFlowDirection::Download, reply.payload.len());
-                if let Some(state) = flows.get_mut(&reply.id) {
-                    state.last_seen = std::time::Instant::now();
-                }
-            }
-            _ = idle_tick.tick() => {
-                reap_expired_udp_flows_with_timeout(&mut flows, idle_timeout).await;
-            }
-            else => break,
-        }
+                },
+                peer: Endpoint::ip(Network::Udp, peer),
+                target,
+                payload: self.packet[..length].to_vec(),
+            }))
+        })
     }
-    for state in flows.into_values() {
-        shutdown_udp_flow(state).await;
+
+    fn send<'a>(&'a mut self, response: InboundUdpResponse) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let client = response
+                .peer
+                .addr()
+                .ok_or_else(|| Error::invalid("transparent UDP peer has no IP address"))?;
+            let destination = response
+                .id
+                .target
+                .addr()
+                .ok_or_else(|| Error::invalid("transparent UDP target has no IP address"))?;
+            send_udp_reply(&response.payload, destination, client).await
+        })
     }
-    Ok(())
 }
 
 fn bind_listener(listen: SocketAddr, transparent: bool) -> Result<TcpListener> {
@@ -439,9 +354,7 @@ async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
     protocol: &str,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
+    inbound: Arc<InboundHandler>,
     tls_acceptor: Option<InboundTlsAcceptor>,
 ) -> Result<()> {
     let destination = if protocol.eq_ignore_ascii_case("tproxy") {
@@ -455,52 +368,19 @@ async fn handle_connection(
             format!("{protocol} did not provide a usable original destination"),
         ));
     }
-    let stream = prepare_inbound_stream(stream, &spec, tls_acceptor, false).await?;
-    handle_transparent_stream(stream, peer, protocol, spec, selector, monitor, destination).await
+    let stream = prepare_inbound_stream(stream, inbound.spec(), tls_acceptor, false).await?;
+    handle_transparent_stream(stream, peer, protocol, inbound, destination).await
 }
 
 async fn handle_transparent_stream(
     stream: BoxAsyncStream,
     peer: SocketAddr,
     protocol: &str,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
+    inbound: Arc<InboundHandler>,
     destination: SocketAddr,
 ) -> Result<()> {
     let endpoint = Endpoint::ip(Network::Tcp, destination);
-    let mut context = FlowContext::new(endpoint.clone());
-    context.source = Some(Endpoint::ip(Network::Tcp, peer));
-    spec.annotate_context(&mut context);
-    selector.route_context(&mut context);
-    let process = context.process.clone();
-    let outbound = selector
-        .select(&context)
-        .connect(&context)
-        .await
-        .inspect_err(|error| {
-            monitor.record_failure_with_process(
-                protocol,
-                &endpoint.to_string(),
-                &error.to_string(),
-                process.as_deref(),
-            );
-        })?;
-    record_outbound_stream(&mut context, &outbound);
-    relay_counted_with_buffer(
-        stream,
-        outbound,
-        TunFlowKey {
-            network: Network::Tcp,
-            source: peer,
-            destination,
-        },
-        context,
-        monitor,
-        selector.relay_buffer_size(),
-    )
-    .await
-    .map_err(io_error)
+    inbound.serve_stream(stream, peer, protocol, endpoint).await
 }
 
 fn original_destination(stream: &TcpStream) -> Result<SocketAddr> {
@@ -715,9 +595,15 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             let stream = prepare_inbound_stream(stream, &spec, None, false)
                 .await
                 .unwrap();
-            handle_transparent_stream(stream, peer, "redir", spec, selector, monitor, target)
-                .await
-                .unwrap();
+            handle_transparent_stream(
+                stream,
+                peer,
+                "redir",
+                InboundHandler::new(spec, selector, monitor),
+                target,
+            )
+            .await
+            .unwrap();
         });
 
         let mut client = yuhaiin_protocol::aead::client(
@@ -775,9 +661,15 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             let stream = prepare_inbound_stream(stream, &spec, Some(acceptor), false)
                 .await
                 .unwrap();
-            handle_transparent_stream(stream, peer, "redir", spec, selector, monitor, target)
-                .await
-                .unwrap();
+            handle_transparent_stream(
+                stream,
+                peer,
+                "redir",
+                InboundHandler::new(spec, selector, monitor),
+                target,
+            )
+            .await
+            .unwrap();
         });
 
         let connector = transparent_tls_connector();

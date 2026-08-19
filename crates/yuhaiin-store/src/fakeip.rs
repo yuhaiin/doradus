@@ -15,7 +15,7 @@ pub use yuhaiin_dns::{
 };
 
 #[cfg(feature = "async-dns")]
-use yuhaiin_core::LocalBoxFuture;
+use yuhaiin_core::BoxFuture;
 #[cfg(feature = "async-dns")]
 use yuhaiin_core::dns::{AsyncDnsHandler, decode_query, encode_response};
 
@@ -510,7 +510,7 @@ pub trait AsyncDomainResolver {
         &'a self,
         domain: &'a DomainName,
         record_type: DnsRecordType,
-    ) -> LocalBoxFuture<'a, Result<DnsResponse>>;
+    ) -> BoxFuture<'a, Result<DnsResponse>>;
 }
 
 #[cfg(feature = "async-dns")]
@@ -519,7 +519,7 @@ pub trait FakeIpResponseTransform {
         &'a self,
         _domain: &'a DomainName,
         _record_type: DnsRecordType,
-    ) -> LocalBoxFuture<'a, Result<Option<DnsResponse>>> {
+    ) -> BoxFuture<'a, Result<Option<DnsResponse>>> {
         Box::pin(async { Ok(None) })
     }
 
@@ -528,7 +528,7 @@ pub trait FakeIpResponseTransform {
         domain: &'a DomainName,
         record_type: DnsRecordType,
         response: DnsResponse,
-    ) -> LocalBoxFuture<'a, Result<DnsResponse>>;
+    ) -> BoxFuture<'a, Result<DnsResponse>>;
 }
 
 #[cfg(feature = "async-dns")]
@@ -538,7 +538,7 @@ impl FakeIpResponseTransform for FakeIpAnswerTransform {
         domain: &'a DomainName,
         record_type: DnsRecordType,
         response: DnsResponse,
-    ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
+    ) -> BoxFuture<'a, Result<DnsResponse>> {
         Box::pin(
             async move { FakeIpAnswerTransform::apply(self, domain, record_type, response).await },
         )
@@ -552,7 +552,7 @@ impl FakeIpResponseTransform for FakeIpV6AnswerTransform {
         domain: &'a DomainName,
         record_type: DnsRecordType,
         response: DnsResponse,
-    ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
+    ) -> BoxFuture<'a, Result<DnsResponse>> {
         Box::pin(async move {
             FakeIpV6AnswerTransform::apply(self, domain, record_type, response).await
         })
@@ -566,7 +566,7 @@ impl FakeIpResponseTransform for FakeIpDualStackAnswerTransform {
         domain: &'a DomainName,
         record_type: DnsRecordType,
         response: DnsResponse,
-    ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
+    ) -> BoxFuture<'a, Result<DnsResponse>> {
         Box::pin(async move { self.apply(domain, record_type, response).await })
     }
 }
@@ -577,7 +577,7 @@ impl FakeIpResponseTransform for FakeIpPtrTransform {
         &'a self,
         domain: &'a DomainName,
         record_type: DnsRecordType,
-    ) -> LocalBoxFuture<'a, Result<Option<DnsResponse>>> {
+    ) -> BoxFuture<'a, Result<Option<DnsResponse>>> {
         Box::pin(async move { FakeIpPtrTransform::local_response(self, domain, record_type).await })
     }
 
@@ -586,7 +586,7 @@ impl FakeIpResponseTransform for FakeIpPtrTransform {
         domain: &'a DomainName,
         record_type: DnsRecordType,
         response: DnsResponse,
-    ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
+    ) -> BoxFuture<'a, Result<DnsResponse>> {
         Box::pin(
             async move { FakeIpPtrTransform::apply(self, domain, record_type, response).await },
         )
@@ -602,10 +602,10 @@ pub struct FakeIpAsyncDnsHandler<R, T = FakeIpAnswerTransform> {
 #[cfg(feature = "async-dns")]
 impl<R, T> AsyncDnsHandler for FakeIpAsyncDnsHandler<R, T>
 where
-    R: AsyncDomainResolver,
-    T: FakeIpResponseTransform,
+    R: AsyncDomainResolver + Send + Sync,
+    T: FakeIpResponseTransform + Send + Sync,
 {
-    fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
             let question = decode_query(packet)?;
             let response = if let Some(response) = self

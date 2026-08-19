@@ -1307,7 +1307,7 @@ fn ptr_transform_answers_local_ipv4_and_ipv6_hits_before_upstream() {
             &'a self,
             _domain: &'a DomainName,
             _record_type: DnsRecordType,
-        ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
+        ) -> BoxFuture<'a, Result<DnsResponse>> {
             Box::pin(async {
                 Err(Error::new(
                     ErrorKind::Closed,
@@ -1364,7 +1364,7 @@ fn ptr_transform_falls_back_to_upstream_for_unknown_mapping() {
             &'a self,
             _domain: &'a DomainName,
             _record_type: DnsRecordType,
-        ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
+        ) -> BoxFuture<'a, Result<DnsResponse>> {
             Box::pin(async {
                 Ok(DnsResponse {
                     addresses: IpSet::default(),
@@ -1407,7 +1407,7 @@ fn async_dns_handler_runs_upstream_then_fakeip_transform() {
             &'a self,
             _domain: &'a DomainName,
             _record_type: DnsRecordType,
-        ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
+        ) -> BoxFuture<'a, Result<DnsResponse>> {
             Box::pin(async {
                 Ok(DnsResponse {
                     addresses: IpSet {
@@ -1452,7 +1452,7 @@ fn async_dns_handler_supports_ipv6_aaaa_transform() {
             &'a self,
             _domain: &'a DomainName,
             _record_type: DnsRecordType,
-        ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
+        ) -> BoxFuture<'a, Result<DnsResponse>> {
             Box::pin(async {
                 Ok(DnsResponse {
                     addresses: IpSet {
@@ -1501,7 +1501,7 @@ fn async_dns_handler_supports_https_hint_transform() {
             &'a self,
             _domain: &'a DomainName,
             _record_type: DnsRecordType,
-        ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
+        ) -> BoxFuture<'a, Result<DnsResponse>> {
             Box::pin(async {
                 Ok(DnsResponse {
                     addresses: IpSet::default(),

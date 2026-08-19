@@ -168,7 +168,7 @@ impl AsyncTcpDnsHandler {
 }
 
 impl AsyncDnsHandler for AsyncTcpDnsHandler {
-    fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move { self.client.query_packet(packet).await })
     }
 }
@@ -379,7 +379,7 @@ mod tests {
     struct StaticHandler;
 
     impl AsyncDnsHandler for StaticHandler {
-        fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+        fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
             Box::pin(async move {
                 let question = decode_query(packet)?;
                 encode_response(

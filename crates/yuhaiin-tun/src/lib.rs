@@ -37,7 +37,7 @@ pub use platform::DeviceBuilder;
 pub use platform::{AsyncDevice, async_device_from_owned_fd, enable_loopback};
 
 #[cfg(feature = "async-proxy")]
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 
 #[cfg(feature = "async-proxy")]
 use futures_util::stream::FuturesUnordered;
@@ -62,9 +62,6 @@ pub use yuhaiin_core::{dns, process, proxy};
 pub use yuhaiin_core::flow::{Flow as TunFlow, FlowKey as TunFlowKey};
 #[cfg(feature = "async-proxy")]
 pub use yuhaiin_core::flow::{FlowDirection as TunFlowDirection, FlowObserver as TunFlowObserver};
-
-#[cfg(feature = "async-proxy")]
-use yuhaiin_core::dns::{AsyncDnsHandler, DnsHandler, answer_query};
 
 #[cfg(feature = "async-proxy")]
 use yuhaiin_core::proxy::{AsyncProxy, AsyncProxySelector, stream_local_addr, stream_remote_addr};

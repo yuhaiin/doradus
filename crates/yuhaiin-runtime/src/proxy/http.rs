@@ -7,30 +7,24 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use base64::Engine;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use yuhaiin_core::flow::FlowObserver;
-use yuhaiin_core::flow::{
-    Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey, FlowObserverGuard,
-};
-use yuhaiin_core::proxy::AsyncProxySelector;
-use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use yuhaiin_core::flow::{Flow as TunFlow, FlowDirection as TunFlowDirection, FlowObserverGuard};
+use yuhaiin_core::proxy::BoxAsyncStream;
+use yuhaiin_core::{Endpoint, Error, ErrorKind, Network, Result};
 use yuhaiin_protocol::http_server::*;
 
-use super::common::{io_error, record_outbound_stream, relay_counted_with_buffer};
-use crate::inbound::{InboundAuth, InboundSpec};
-use crate::{ConnectionMonitor, RuntimeProxySelector};
+use super::common::io_error;
+use crate::inbound::{InboundAuth, InboundHandler};
 
-pub(crate) async fn serve<S>(
-    mut stream: S,
+pub(crate) async fn handle(
+    mut stream: BoxAsyncStream,
     peer: SocketAddr,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+    inbound: Arc<InboundHandler>,
+) -> Result<()> {
+    let spec = inbound.spec();
+    let monitor = Arc::clone(inbound.monitor());
     loop {
         let Some(headers) = read_headers(&mut stream).await? else {
             return Ok(());
@@ -81,33 +75,18 @@ where
         }
         if method.eq_ignore_ascii_case("CONNECT") {
             let destination = parse_authority(target, Network::Tcp)?;
-            return serve_connect(stream, peer, spec, selector, monitor, destination).await;
+            return serve_connect(stream, peer, Arc::clone(&inbound), destination).await;
         }
 
         let request_body = body_framing(&headers)?;
         let client_wants_close = request_wants_close(version, &headers);
         let (destination, origin_target, https) = parse_forward_target(target, &headers)?;
-        let source = Endpoint::ip(Network::Tcp, peer);
-        let mut context = FlowContext::new(destination.clone());
-        context.source = Some(source);
-        context.original_domain = destination.host().cloned();
+        let mut context = inbound.context(peer, Network::Tcp, destination.clone());
         context.http_host = yuhaiin_core::sniff::http_host(headers.as_bytes());
-        spec.annotate_context(&mut context);
-        selector.route_context(&mut context);
-        let process = context.process.clone();
-        let outbound = match selector.select(&context).connect(&context).await {
-            Ok(outbound) => outbound,
-            Err(error) => {
-                monitor.record_failure_with_process(
-                    "http",
-                    &destination.to_string(),
-                    &error.to_string(),
-                    process.as_deref(),
-                );
-                return Err(error);
-            }
-        };
-        let outbound = if https {
+        let connection = inbound.connect("http", context).await?;
+        let outbound = connection.outbound;
+        let context = connection.context;
+        let mut outbound = if https {
             #[cfg(feature = "doh-tls")]
             {
                 let server_name = destination
@@ -120,12 +99,6 @@ where
                 match crate::tls::wrap_system_tls_stream(&server_name, outbound).await {
                     Ok(stream) => stream,
                     Err(error) => {
-                        monitor.record_failure_with_process(
-                            "http",
-                            &destination.to_string(),
-                            &format!("HTTPS handshake: {error}"),
-                            process.as_deref(),
-                        );
                         return Err(error);
                     }
                 }
@@ -140,10 +113,8 @@ where
         } else {
             outbound
         };
-        record_outbound_stream(&mut context, &outbound);
-        let flow = flow_key(peer, &destination);
+        let flow = inbound.flow_key(&context, peer);
         let _observation = FlowObserverGuard::open(monitor.clone(), TunFlow { key: flow }, context);
-        let mut outbound = outbound;
         let request = rewrite_forward_request_with_options(
             method,
             &origin_target,
@@ -212,62 +183,26 @@ where
     }
 }
 
-async fn serve_connect<S>(
-    mut stream: S,
+async fn serve_connect(
+    mut stream: BoxAsyncStream,
     peer: SocketAddr,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
+    inbound: Arc<InboundHandler>,
     destination: Endpoint,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let source = Endpoint::ip(Network::Tcp, peer);
-    let mut context = FlowContext::new(destination.clone());
-    context.source = Some(source);
-    context.original_domain = destination.host().cloned();
-    spec.annotate_context(&mut context);
-    selector.route_context(&mut context);
-    let process = context.process.clone();
-    let proxy = selector.select(&context);
-    let outbound = match proxy.connect(&context).await {
-        Ok(outbound) => outbound,
+) -> Result<()> {
+    let connection = match inbound.open_stream("http", peer, destination).await {
+        Ok(connection) => connection,
         Err(error) => {
-            monitor.record_failure_with_process(
-                "http",
-                &destination.to_string(),
-                &error.to_string(),
-                process.as_deref(),
-            );
             return Err(error);
         }
     };
-    record_outbound_stream(&mut context, &outbound);
     stream
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await
         .map_err(io_error)?;
-    relay_counted_with_buffer(
-        stream,
-        outbound,
-        flow_key(peer, &destination),
-        context,
-        monitor,
-        selector.relay_buffer_size(),
-    )
-    .await
-    .map_err(io_error)
-}
-
-fn flow_key(peer: SocketAddr, target: &Endpoint) -> TunFlowKey {
-    TunFlowKey {
-        network: Network::Tcp,
-        source: peer,
-        destination: target
-            .addr()
-            .unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid fallback address")),
-    }
+    inbound
+        .relay(stream, connection, peer)
+        .await
+        .map_err(io_error)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

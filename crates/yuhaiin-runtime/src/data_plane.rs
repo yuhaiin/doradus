@@ -18,7 +18,7 @@ use yuhaiin_core::dns::{
 };
 use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
 use yuhaiin_core::dns_tcp_async::AsyncTcpDnsServer;
-use yuhaiin_core::{BoxFuture, LocalBoxFuture, Result, RouteMode};
+use yuhaiin_core::{BoxFuture, Result, RouteMode};
 #[cfg(feature = "tun")]
 use yuhaiin_core::{Error, ErrorKind};
 #[cfg(feature = "tun")]
@@ -65,7 +65,7 @@ impl ReloadableAsyncDnsHandler {
 }
 
 impl AsyncDnsHandler for ReloadableAsyncDnsHandler {
-    fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         let handler = self
             .current
             .read()
@@ -84,7 +84,7 @@ impl AsyncDnsHandler for ReloadableAsyncDnsHandler {
 }
 
 impl AsyncDnsHandler for RuntimeDnsHandler {
-    fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(self.answer_impl(packet))
     }
 }
@@ -546,8 +546,8 @@ pub(crate) fn open_tun(config: &TunRuntimeConfig) -> Result<yuhaiin_tun::TunRunt
 
 /// Run one already-created TUN device through the shared runtime snapshot.
 /// The caller owns device creation and can therefore inject a mobile VPN fd;
-/// this function owns dispatcher, proxy runtime, DNS handler and shutdown
-/// ordering only.
+/// this function owns dispatcher, proxy runtime, inbound input policy and
+/// shutdown ordering only.
 #[cfg(feature = "tun")]
 pub async fn run_tun_device_until(
     controller: RuntimeController,
@@ -583,11 +583,6 @@ pub async fn run_tun_device_until_ref(
         Some(proxy_id) if !proxy_id.trim().is_empty() => (proxy_id.clone(), proxy_id),
         _ => crate::inbound::selected_proxy_ids(&controller).await?,
     };
-    let snapshot = controller.handle().load();
-    let async_dns_handler = snapshot
-        .inbound_settings
-        .hijack_dns
-        .then(|| controller.tun_dns_handler() as Arc<dyn yuhaiin_core::dns::AsyncDnsHandler>);
     let mut proxy_runtime = controller
         .build_tun_proxy_runtime_with_dns_and_udp(
             &config.direct_id,
@@ -597,20 +592,27 @@ pub async fn run_tun_device_until_ref(
             &config.drop_id,
             Duration::from_secs(30),
             config.channel_capacity,
-            async_dns_handler,
+            None,
         )
         .await?;
+    let mut inbound_interceptor =
+        crate::inbound::InboundInputInterceptor::new(controller.monitor());
     controller.monitor().info("TUN inbound ready");
     let mut dispatcher = yuhaiin_tun::TunDispatcher::new(64 * 1024, 64 * 1024, 2048)?
         .with_skip_multicast(config.tun.skip_multicast);
-    tun.run_dispatcher_until(&mut dispatcher, &mut proxy_runtime, async {
-        let _ = wait_for_shutdown_or_matching_inbound_reload(
-            &controller,
-            shutdown.clone(),
-            config.inbound_id.as_deref(),
-        )
-        .await;
-    })
+    tun.run_dispatcher_until_with_input_interceptor(
+        &mut dispatcher,
+        &mut proxy_runtime,
+        &mut inbound_interceptor,
+        async {
+            let _ = wait_for_shutdown_or_matching_inbound_reload(
+                &controller,
+                shutdown.clone(),
+                config.inbound_id.as_deref(),
+            )
+            .await;
+        },
+    )
     .await
     .map_err(io_error)?;
     if *shutdown.borrow() {

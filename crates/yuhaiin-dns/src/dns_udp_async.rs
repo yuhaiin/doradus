@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, oneshot};
@@ -308,7 +309,7 @@ impl AsyncUdpDnsHandler {
 }
 
 impl AsyncDnsHandler for AsyncUdpDnsHandler {
-    fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move { self.client.query_packet(packet).await })
     }
 }
@@ -437,7 +438,7 @@ mod tests {
             struct StaticHandler;
 
             impl AsyncDnsHandler for StaticHandler {
-                fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+                fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
                     Box::pin(async move {
                         encode_response(
                             packet,
@@ -544,7 +545,7 @@ mod tests {
             struct StaticHandler;
 
             impl AsyncDnsHandler for StaticHandler {
-                fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+                fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
                     Box::pin(async move {
                         encode_response(
                             packet,

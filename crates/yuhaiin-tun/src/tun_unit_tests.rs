@@ -16,7 +16,7 @@ fn stale_proxy_flow_and_backpressure_errors_are_recoverable() {
         "flow command queue full",
     )));
     assert_eq!(
-        event_flow_key(&TunEvent::TcpData {
+        proxy_input_flow_key(&ProxyInput::TcpData {
             flow: TunFlow {
                 key: TunFlowKey {
                     network: Network::Tcp,
@@ -141,8 +141,8 @@ fn dispatcher_skips_ipv4_and_ipv6_multicast_before_smoltcp_dispatch() {
         .poll_with(&mut interface, &mut device, Instant::from_millis(1))
         .unwrap();
 
-    let events: Vec<_> = dispatcher.events().collect();
-    let [TunEvent::UdpDatagram { payload, .. }] = events.as_slice() else {
+    let events: Vec<_> = dispatcher.proxy_inputs().collect();
+    let [ProxyInput::UdpDatagram { payload, .. }] = events.as_slice() else {
         panic!("expected only the ordinary UDP packet, got {events:?}");
     };
     assert_eq!(payload, b"ordinary");
@@ -181,7 +181,7 @@ fn dispatcher_drops_cross_family_multicast_socket_matches_without_panicking() {
     dispatcher
         .poll_with(&mut interface, &mut device, Instant::from_millis(1))
         .unwrap();
-    assert_eq!(dispatcher.events().count(), 1);
+    assert_eq!(dispatcher.proxy_inputs().count(), 1);
 
     let mixed_flow = TunFlowKey {
         network: Network::Udp,
@@ -204,7 +204,7 @@ fn dispatcher_drops_cross_family_multicast_socket_matches_without_panicking() {
         .poll_with(&mut interface, &mut device, Instant::from_millis(2))
         .unwrap();
 
-    assert_eq!(dispatcher.events().count(), 0);
+    assert_eq!(dispatcher.proxy_inputs().count(), 0);
 }
 
 #[test]
@@ -1071,10 +1071,10 @@ fn dispatcher_intercepts_external_ipv4_echo_for_proxy_ping() {
         .poll_with(&mut interface, &mut device, Instant::from_millis(1))
         .unwrap();
 
-    let events: Vec<_> = dispatcher.events().collect();
+    let events: Vec<_> = dispatcher.proxy_inputs().collect();
     assert!(matches!(
         events.as_slice(),
-        [TunEvent::IcmpEchoRequest { flow, packet }]
+        [ProxyInput::IcmpEchoRequest { flow, packet }]
             if flow.key.network == Network::Icmp
                 && flow.key.source == SocketAddr::new(IpAddr::V4(remote), 0)
                 && flow.key.destination == SocketAddr::new(IpAddr::V4(destination), 0)
@@ -1117,10 +1117,10 @@ fn dispatcher_intercepts_external_ipv6_echo_for_proxy_ping() {
         .poll_with(&mut interface, &mut device, Instant::from_millis(1))
         .unwrap();
 
-    let events: Vec<_> = dispatcher.events().collect();
+    let events: Vec<_> = dispatcher.proxy_inputs().collect();
     assert!(matches!(
         events.as_slice(),
-        [TunEvent::IcmpEchoRequest { flow, packet }]
+        [ProxyInput::IcmpEchoRequest { flow, packet }]
             if flow.key.network == Network::Icmp
                 && flow.key.source == SocketAddr::new(IpAddr::V6(remote), 0)
                 && flow.key.destination == SocketAddr::new(IpAddr::V6(destination), 0)
@@ -1195,8 +1195,8 @@ fn dispatcher_emits_udp_flow_and_writes_response_back_to_tun() {
     dispatcher
         .poll_with(&mut interface, &mut device, Instant::from_millis(1))
         .unwrap();
-    let events: Vec<_> = dispatcher.events().collect();
-    let [TunEvent::UdpDatagram { flow, payload }] = events.as_slice() else {
+    let events: Vec<_> = dispatcher.proxy_inputs().collect();
+    let [ProxyInput::UdpDatagram { flow, payload }] = events.as_slice() else {
         panic!("expected one UDP datagram event, got {events:?}");
     };
     assert_eq!(payload, b"query");
@@ -1249,8 +1249,8 @@ fn dispatcher_udp_routed_destination_preserves_virtual_source_address() {
     dispatcher
         .poll_with(&mut interface, &mut device, Instant::from_millis(1))
         .unwrap();
-    let events: Vec<_> = dispatcher.events().collect();
-    let [TunEvent::UdpDatagram { flow, payload }] = events.as_slice() else {
+    let events: Vec<_> = dispatcher.proxy_inputs().collect();
+    let [ProxyInput::UdpDatagram { flow, payload }] = events.as_slice() else {
         panic!("expected one routed UDP datagram event");
     };
     assert_eq!(payload, b"virtual-destination");
@@ -1298,14 +1298,14 @@ fn dispatcher_reassembles_out_of_order_ipv4_udp_fragments() {
     dispatcher
         .poll_with(&mut interface, &mut device, Instant::from_millis(1))
         .unwrap();
-    assert!(dispatcher.events().next().is_none());
+    assert!(dispatcher.proxy_inputs().next().is_none());
 
     device.enqueue_rx(first).unwrap();
     dispatcher
         .poll_with(&mut interface, &mut device, Instant::from_millis(2))
         .unwrap();
-    let events: Vec<_> = dispatcher.events().collect();
-    let [TunEvent::UdpDatagram { flow, payload }] = events.as_slice() else {
+    let events: Vec<_> = dispatcher.proxy_inputs().collect();
+    let [ProxyInput::UdpDatagram { flow, payload }] = events.as_slice() else {
         panic!("expected one reassembled UDP event, got {events:?}");
     };
     assert_eq!(payload, b"fragmented-query");
@@ -1349,7 +1349,7 @@ fn dispatcher_registers_tcp_syn_and_emits_open_event() {
     dispatcher
         .poll_with(&mut interface, &mut device, Instant::from_millis(1))
         .unwrap();
-    let events: Vec<_> = dispatcher.events().collect();
+    let events: Vec<_> = dispatcher.proxy_inputs().collect();
     assert!(
         events.is_empty(),
         "SYN must not open a proxy flow: {events:?}"
@@ -1382,7 +1382,7 @@ fn dispatcher_relays_established_tcp_data_in_both_directions() {
     dispatcher
         .poll_with(&mut interface, &mut device, Instant::from_millis(1))
         .unwrap();
-    assert!(dispatcher.events().next().is_none());
+    assert!(dispatcher.proxy_inputs().next().is_none());
     let flow = TunFlow {
         key: TunFlowKey {
             network: Network::Tcp,
@@ -1412,8 +1412,8 @@ fn dispatcher_relays_established_tcp_data_in_both_directions() {
         .poll_with(&mut interface, &mut device, Instant::from_millis(2))
         .unwrap();
     assert!(matches!(
-        dispatcher.events().next(),
-        Some(TunEvent::TcpOpened { flow: event_flow }) if event_flow == flow
+        dispatcher.proxy_inputs().next(),
+        Some(ProxyInput::TcpOpened { flow: event_flow }) if event_flow == flow
     ));
 
     device
@@ -1431,8 +1431,8 @@ fn dispatcher_relays_established_tcp_data_in_both_directions() {
         .poll_with(&mut interface, &mut device, Instant::from_millis(3))
         .unwrap();
     assert!(matches!(
-        dispatcher.events().next(),
-        Some(TunEvent::TcpData { flow: event_flow, payload })
+        dispatcher.proxy_inputs().next(),
+        Some(ProxyInput::TcpData { flow: event_flow, payload })
             if event_flow == flow && payload == b"request"
     ));
 

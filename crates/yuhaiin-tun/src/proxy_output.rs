@@ -1,75 +1,88 @@
-//! Proxy completion queues, DNS delivery, and task reaping.
+//! Proxy completion queues and task reaping.
 
 use super::*;
 
 impl TunProxyRuntime {
-    pub fn poll_outputs(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
+    pub fn process_proxy_outputs(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
         self.apply_close_requests(dispatcher)?;
-        self.flush_pending_tcp(dispatcher);
+        self.flush_pending_tcp_to_tun(dispatcher)?;
 
-        // ICMP has its own bounded completion queue. A blocked TCP/UDP
-        // payload must not delay a completed ping response behind unrelated
-        // stream data.
-        let mut count = self.drain_icmp_outputs(dispatcher)?;
-        count += self.drain_proxy_outputs(dispatcher)?;
+        let count = self.drain_proxy_outputs(dispatcher)?;
 
-        // DNS responses are delivered directly below, so a full proxy queue
-        // can never turn a completed DNS query into an inbound-fatal error.
-        count += self.poll_async_dns(dispatcher)?;
-        count += self.poll_sync_dns(dispatcher)?;
         self.reap_finished_tasks(dispatcher)?;
         Ok(count)
     }
 
-    fn flush_pending_tcp(&mut self, dispatcher: &mut TunDispatcher) {
+    fn flush_pending_tcp_to_tun(&mut self, dispatcher: &mut TunDispatcher) -> Result<()> {
         self.pending_tcp_keys.clear();
         self.pending_tcp_keys
-            .extend(self.pending_tcp.keys().copied());
-        for &flow in &self.pending_tcp_keys {
+            .extend(self.pending_tcp_to_tun.keys().copied());
+        let pending_tcp_keys = self.pending_tcp_keys.clone();
+        for flow in pending_tcp_keys {
             let mut drained = false;
+            let mut failed = false;
             while let Some(payload) = self
-                .pending_tcp
+                .pending_tcp_to_tun
                 .get_mut(&flow)
                 .and_then(VecDeque::pop_front)
             {
                 match dispatcher.write_tcp(flow, &payload) {
                     Ok(written) if written == payload.len() => drained = true,
                     Ok(written) => {
-                        self.pending_tcp
+                        self.pending_tcp_to_tun
                             .entry(flow)
                             .or_default()
                             .push_front(payload[written..].to_vec());
                         break;
                     }
                     Err(_) => {
-                        self.pending_tcp
-                            .entry(flow)
-                            .or_default()
-                            .push_front(payload);
+                        if self.pending_tcp_closes.contains(&flow) {
+                            failed = true;
+                        } else {
+                            self.pending_tcp_to_tun
+                                .entry(flow)
+                                .or_default()
+                                .push_front(payload);
+                        }
                         break;
                     }
                 }
             }
-            if drained && self.pending_tcp.get(&flow).is_some_and(VecDeque::is_empty) {
-                self.pending_tcp.remove(&flow);
+            if failed {
+                self.finish_tcp_close(dispatcher, flow)?;
+            } else if drained
+                && self
+                    .pending_tcp_to_tun
+                    .get(&flow)
+                    .is_some_and(VecDeque::is_empty)
+            {
+                self.pending_tcp_to_tun.remove(&flow);
+                if self.pending_tcp_closes.contains(&flow) {
+                    self.finish_tcp_close(dispatcher, flow)?;
+                }
             }
         }
+        Ok(())
     }
 
-    fn drain_icmp_outputs(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
-        let mut count = 0;
-        while let Ok(output) = self.icmp_output_rx.try_recv() {
-            count += 1;
-            if let ProxyOutput::IcmpData { id, flow, packet } = output {
-                self.handle_icmp_output(dispatcher, id, flow, packet)?;
-            }
+    fn finish_tcp_close(&mut self, dispatcher: &mut TunDispatcher, flow: TunFlowKey) -> Result<()> {
+        tun_debug(format!("TCP proxy flow fully closed flow={flow:?}"));
+        let _ = dispatcher.close_tcp(flow);
+        if let Some(task) = self.tasks.remove(&flow) {
+            task.join.abort();
         }
-        Ok(count)
+        self.pending_tcp_to_tun.remove(&flow);
+        self.pending_tcp_closes.remove(&flow);
+        self.untrack_flow(&flow)
     }
 
     fn drain_proxy_outputs(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
         let mut count = 0;
-        while let Ok(output) = self.output_rx.try_recv() {
+        while let Some(output) = self
+            .pending_proxy_output
+            .take()
+            .or_else(|| self.proxy_output_rx.try_recv().ok())
+        {
             count += 1;
             if !self.handle_proxy_output(dispatcher, output)? {
                 break;
@@ -98,7 +111,7 @@ impl TunProxyRuntime {
                             "TCP output backpressure flow={flow:?}: wrote {written} of {}",
                             payload.len()
                         ));
-                        self.pending_tcp
+                        self.pending_tcp_to_tun
                             .entry(flow)
                             .or_default()
                             .push_back(payload[written..].to_vec());
@@ -108,14 +121,20 @@ impl TunProxyRuntime {
                         tun_debug(format!(
                             "TCP output backpressure/close flow={flow:?}: {error}"
                         ));
-                        self.pending_tcp.entry(flow).or_default().push_back(payload);
+                        self.pending_tcp_to_tun
+                            .entry(flow)
+                            .or_default()
+                            .push_back(payload);
                         Ok(false)
                     }
                 }
             }
             ProxyOutput::UdpData { flow, payload } => {
-                self.touch_flow(flow)?;
-                if let Some(observer) = &self.observer {
+                let tracked = self.tracked_flows.contains(&flow);
+                if tracked {
+                    self.touch_flow(flow)?;
+                }
+                if tracked && let Some(observer) = &self.observer {
                     observer.bytes(flow, TunFlowDirection::Download, payload.len());
                 }
                 match dispatcher.write_udp(flow, &payload) {
@@ -128,8 +147,10 @@ impl TunProxyRuntime {
                             "TUN UDP output dropped flow={flow:?} bytes={} error={error}",
                             payload.len()
                         ));
-                        self.remove_flow_task(&flow);
-                        self.untrack_flow(&flow)?;
+                        if tracked {
+                            self.remove_flow_task(&flow);
+                            self.untrack_flow(&flow)?;
+                        }
                     }
                 }
                 Ok(true)
@@ -154,10 +175,15 @@ impl TunProxyRuntime {
             }
             ProxyOutput::TcpClosed { flow } => {
                 tun_debug(format!("TCP proxy task closed flow={flow:?}"));
-                let _ = dispatcher.close_tcp(flow);
-                self.pending_tcp.remove(&flow);
-                self.remove_task(&flow);
-                self.untrack_flow(&flow)?;
+                if self
+                    .pending_tcp_to_tun
+                    .get(&flow)
+                    .is_some_and(|pending| !pending.is_empty())
+                {
+                    self.pending_tcp_closes.insert(flow);
+                } else {
+                    self.finish_tcp_close(dispatcher, flow)?;
+                }
                 Ok(true)
             }
             ProxyOutput::UdpBound { source, translated } => {
@@ -190,14 +216,19 @@ impl TunProxyRuntime {
             .map(|(flow, _)| *flow)
             .collect();
         for flow in finished_tcp {
-            if let Some(task) = self.tasks.remove(&flow) {
+            let pending = self
+                .pending_tcp_to_tun
+                .get(&flow)
+                .is_some_and(|pending| !pending.is_empty());
+            if pending {
+                self.pending_tcp_closes.insert(flow);
+            } else if let Some(task) = self.tasks.remove(&flow) {
                 if let Some(Err(error)) = task.join.now_or_never() {
                     tun_debug(format!(
                         "TCP proxy task ended with join error flow={flow:?}: {error}"
                     ));
                 }
-                let _ = dispatcher.close_tcp(flow);
-                self.untrack_flow(&flow)?;
+                self.finish_tcp_close(dispatcher, flow)?;
             }
         }
 
@@ -286,74 +317,5 @@ impl TunProxyRuntime {
             self.untrack_flow(&flow)?;
         }
         Ok(())
-    }
-
-    fn deliver_dns_output(
-        &mut self,
-        dispatcher: &mut TunDispatcher,
-        flow: TunFlowKey,
-        payload: Option<Vec<u8>>,
-    ) -> Result<()> {
-        match payload {
-            Some(payload) => {
-                self.touch_flow(flow)?;
-                if let Some(observer) = &self.observer {
-                    observer.bytes(flow, TunFlowDirection::Download, payload.len());
-                }
-                if let Err(error) = dispatcher.write_udp(flow, &payload) {
-                    tun_debug(format!(
-                        "TUN DNS output dropped flow={flow:?} bytes={} error={error}",
-                        payload.len()
-                    ));
-                    self.remove_flow_task(&flow);
-                    let _ = dispatcher.close_udp(flow);
-                    self.untrack_flow(&flow)?;
-                }
-            }
-            None => {
-                self.remove_flow_task(&flow);
-                let _ = dispatcher.close_udp(flow);
-                self.untrack_flow(&flow)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn poll_async_dns(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
-        let mut count = 0;
-        while let Some(Some((flow, answer))) = self.async_dns_tasks.next().now_or_never() {
-            count += 1;
-            self.deliver_dns_output(dispatcher, flow, answer.ok())?;
-        }
-        Ok(count)
-    }
-
-    fn poll_sync_dns(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
-        let finished = self
-            .dns_tasks
-            .iter()
-            .enumerate()
-            .filter(|(_, task)| task.join.is_finished())
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let mut count = 0;
-        for index in finished.into_iter().rev() {
-            let SyncDnsTask { flow, join } = self.dns_tasks.swap_remove(index);
-            let answer = match join
-                .now_or_never()
-                .expect("finished DNS join handle must be ready")
-            {
-                Ok(answer) => answer,
-                Err(error) => {
-                    tun_debug(format!(
-                        "TUN synchronous DNS task ended with join error flow={flow:?}: {error}"
-                    ));
-                    None
-                }
-            };
-            count += 1;
-            self.deliver_dns_output(dispatcher, flow, answer)?;
-        }
-        Ok(count)
     }
 }

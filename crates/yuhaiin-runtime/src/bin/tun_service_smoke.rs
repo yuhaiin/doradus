@@ -384,6 +384,14 @@ async fn run() -> Result<()> {
             )
             .await?;
     }
+    if udp_traffic && udp_traffic_bytes > 2048 {
+        let settings = json!({
+            "useDefaultInterface": false,
+            "advanced": {"udpBufferSize": udp_traffic_bytes.min(65_534)}
+        });
+        let settings = serde_json::to_vec(&settings).map_err(io_error)?;
+        store.put_config("settings", &settings).await?;
+    }
 
     let mut build_options = RuntimeBuildOptions::default();
     build_options.route_fallback.mode = RouteMode::Proxy;
@@ -499,7 +507,8 @@ async fn run() -> Result<()> {
             toggle_persisted_tun(&controller, &device_name, false).await?;
             println!("runtime-tun-disabled name={device_name} cycle={cycle}");
             if traffic {
-                assert_tun_target_unreachable(Duration::from_millis(750)).map_err(io_error)?;
+                assert_tun_target_unreachable(&device_name, Duration::from_millis(750))
+                    .map_err(io_error)?;
                 println!("runtime-tun-disabled-no-route-ok name={device_name} cycle={cycle}");
             }
             toggle_persisted_tun(&controller, &device_name, true).await?;
@@ -692,12 +701,7 @@ async fn run() -> Result<()> {
         task.abort();
     }
 
-    if device_is_present(&device_name) {
-        return Err(Error::new(
-            ErrorKind::Io,
-            format!("runtime TUN device remained after shutdown: {device_name}"),
-        ));
-    }
+    wait_for_tun_state(&device_name, false).await?;
     println!("runtime-tun-closed name={device_name}");
     Ok(())
 }
@@ -705,15 +709,18 @@ async fn run() -> Result<()> {
 fn run_tun_dns_client() -> std::io::Result<()> {
     use std::net::UdpSocket;
 
-    let target: std::net::SocketAddr = std::env::var("YUHAIIN_TUN_DNS_TARGET")
-        .unwrap_or_else(|_| "1.1.1.1:53".to_owned())
-        .parse()
-        .map_err(|error| {
+    let target = match std::env::var("YUHAIIN_TUN_DNS_TARGET") {
+        Ok(value) => value.parse().map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("invalid YUHAIIN_TUN_DNS_TARGET: {error}"),
             )
-        })?;
+        })?,
+        Err(_) => {
+            let configured = configured_tun_target()?;
+            SocketAddr::new(configured.ip(), 53)
+        }
+    };
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.set_read_timeout(Some(Duration::from_secs(5)))?;
     let domain = DomainName::new("tun-fakeip.example.test")
@@ -772,22 +779,7 @@ async fn toggle_persisted_tun(
         })
         .await?;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if device_is_present(device_name) == enabled {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::new(
-                ErrorKind::Timeout,
-                format!(
-                    "TUN reload did not reach enabled={enabled} for {}",
-                    device_name
-                ),
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_for_tun_state(device_name, enabled).await
 }
 
 /// `/sys/class/net` is not guaranteed to expose the current network
@@ -807,6 +799,54 @@ fn device_is_present(name: &str) -> bool {
         return true;
     }
     Path::new("/sys/class/net").join(name).exists()
+}
+
+fn route_uses_device(name: &str, target: SocketAddr) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(output) = std::process::Command::new("ip")
+            .args(["route", "get", &target.ip().to_string()])
+            .output()
+        else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let route = String::from_utf8_lossy(&output.stdout);
+        return route
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|parts| parts == ["dev", name]);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (name, target);
+        false
+    }
+}
+
+async fn wait_for_tun_state(device_name: &str, enabled: bool) -> Result<()> {
+    let target = configured_tun_target().map_err(io_error)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let present = device_is_present(device_name);
+        let route_present = !enabled && route_uses_device(device_name, target);
+        if present == enabled && !route_present {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::new(
+                ErrorKind::Timeout,
+                format!(
+                    "TUN state did not reach enabled={enabled} for {} (device_present={}, route_present={})",
+                    device_name, present, route_present
+                ),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn seed_runtime_fixture(
@@ -939,16 +979,20 @@ async fn seed_runtime_fixture(
     Ok(())
 }
 
-fn assert_tun_target_unreachable(timeout: Duration) -> std::io::Result<()> {
+fn assert_tun_target_unreachable(device_name: &str, timeout: Duration) -> std::io::Result<()> {
     let address = configured_tun_target()?;
-    match TcpStream::connect_timeout(&address, timeout) {
-        Ok(stream) => {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-            Err(std::io::Error::other(format!(
-                "TUN target {address} remained reachable while the inbound was disabled"
-            )))
+    let deadline = Instant::now() + timeout;
+    loop {
+        if device_is_present(device_name) || route_uses_device(device_name, address) {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other(format!(
+                    "TUN device or route for {address} remained while the inbound was disabled"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
         }
-        Err(_) => Ok(()),
+        return Ok(());
     }
 }
 

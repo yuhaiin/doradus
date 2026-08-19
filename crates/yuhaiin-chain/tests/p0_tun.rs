@@ -1057,8 +1057,8 @@ async fn chain_proxy_runs_tcp_and_uot_udp_through_tun_runtime() {
     tcp_dispatcher
         .poll_with(&mut tcp_interface, &mut tcp_device, Instant::from_millis(2))
         .unwrap();
-    for event in tcp_dispatcher.events().collect::<Vec<_>>() {
-        tcp_runtime.handle_event(event).unwrap();
+    for event in tcp_dispatcher.proxy_inputs().collect::<Vec<_>>() {
+        tcp_runtime.handle_proxy_input(event).unwrap();
     }
     let request = b"chain-tcp";
     tcp_device
@@ -1075,13 +1075,15 @@ async fn chain_proxy_runs_tcp_and_uot_udp_through_tun_runtime() {
     tcp_dispatcher
         .poll_with(&mut tcp_interface, &mut tcp_device, Instant::from_millis(3))
         .unwrap();
-    for event in tcp_dispatcher.events().collect::<Vec<_>>() {
-        tcp_runtime.handle_event(event).unwrap();
+    for event in tcp_dispatcher.proxy_inputs().collect::<Vec<_>>() {
+        tcp_runtime.handle_proxy_input(event).unwrap();
     }
     let mut tcp_response = None;
     for tick in 4..2000 {
         tokio::time::sleep(Duration::from_millis(1)).await;
-        tcp_runtime.poll_outputs(&mut tcp_dispatcher).unwrap();
+        tcp_runtime
+            .process_proxy_outputs(&mut tcp_dispatcher)
+            .unwrap();
         tcp_dispatcher
             .poll_with(
                 &mut tcp_interface,
@@ -1132,13 +1134,15 @@ async fn chain_proxy_runs_tcp_and_uot_udp_through_tun_runtime() {
     udp_dispatcher
         .poll_with(&mut udp_interface, &mut udp_device, Instant::from_millis(1))
         .unwrap();
-    for event in udp_dispatcher.events().collect::<Vec<_>>() {
-        udp_runtime.handle_event(event).unwrap();
+    for event in udp_dispatcher.proxy_inputs().collect::<Vec<_>>() {
+        udp_runtime.handle_proxy_input(event).unwrap();
     }
     let mut udp_response = None;
     for tick in 2..2000 {
         tokio::time::sleep(Duration::from_millis(1)).await;
-        udp_runtime.poll_outputs(&mut udp_dispatcher).unwrap();
+        udp_runtime
+            .process_proxy_outputs(&mut udp_dispatcher)
+            .unwrap();
         udp_dispatcher
             .poll_with(
                 &mut udp_interface,

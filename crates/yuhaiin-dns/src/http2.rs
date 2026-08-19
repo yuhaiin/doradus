@@ -11,8 +11,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 
 #[cfg(feature = "async-proxy")]
-use crate::LocalBoxFuture;
-#[cfg(feature = "async-proxy")]
 use crate::dns::AsyncDnsHandler;
 use crate::dns::{
     DnsRecordType, DnsResponse, decode_response, encode_query, validate_query_packet,
@@ -162,7 +160,7 @@ impl<C: H2DohConnector> H2DohClient<C> {
 
 #[cfg(feature = "async-proxy")]
 impl<C: H2DohConnector> AsyncDnsHandler for H2DohDnsHandler<C> {
-    fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move { self.client.query_packet(packet).await })
     }
 }

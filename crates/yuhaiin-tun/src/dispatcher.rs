@@ -2,8 +2,8 @@
 
 use super::*;
 
-#[path = "dispatcher_events.rs"]
-mod dispatcher_events;
+#[path = "dispatcher_input.rs"]
+mod dispatcher_input;
 #[path = "dispatcher_sockets.rs"]
 mod dispatcher_sockets;
 
@@ -32,7 +32,7 @@ pub struct PacketInfo {
 /// proxy task without borrowing the smoltcp socket set or holding a mutex
 /// across I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TunEvent {
+pub enum ProxyInput {
     TcpOpened {
         flow: TunFlow,
     },
@@ -60,14 +60,14 @@ pub enum TunEvent {
 }
 
 #[cfg_attr(not(feature = "async-proxy"), allow(dead_code))]
-pub(crate) fn event_flow_key(event: &TunEvent) -> TunFlowKey {
+pub(crate) fn proxy_input_flow_key(event: &ProxyInput) -> TunFlowKey {
     match event {
-        TunEvent::TcpOpened { flow }
-        | TunEvent::TcpData { flow, .. }
-        | TunEvent::TcpHalfClosed { flow }
-        | TunEvent::TcpClosed { flow }
-        | TunEvent::UdpDatagram { flow, .. }
-        | TunEvent::IcmpEchoRequest { flow, .. } => flow.key,
+        ProxyInput::TcpOpened { flow }
+        | ProxyInput::TcpData { flow, .. }
+        | ProxyInput::TcpHalfClosed { flow }
+        | ProxyInput::TcpClosed { flow }
+        | ProxyInput::UdpDatagram { flow, .. }
+        | ProxyInput::IcmpEchoRequest { flow, .. } => flow.key,
     }
 }
 
@@ -118,8 +118,8 @@ pub struct TunDispatcher {
     tcp_by_key: HashMap<TunFlowKey, SocketHandle>,
     udp: HashMap<SocketHandle, UdpSocketState>,
     udp_by_local: HashMap<SocketAddr, SocketHandle>,
-    events: VecDeque<TunEvent>,
-    pending_icmp_tx: VecDeque<Vec<u8>>,
+    proxy_inputs: VecDeque<ProxyInput>,
+    pending_icmp_to_tun: VecDeque<Vec<u8>>,
     tcp_handles: Vec<SocketHandle>,
     closed_tcp: Vec<(SocketHandle, TunFlowKey)>,
     udp_handles: Vec<SocketHandle>,
@@ -145,8 +145,8 @@ impl TunDispatcher {
             tcp_by_key: HashMap::new(),
             udp: HashMap::new(),
             udp_by_local: HashMap::new(),
-            events: VecDeque::new(),
-            pending_icmp_tx: VecDeque::new(),
+            proxy_inputs: VecDeque::new(),
+            pending_icmp_to_tun: VecDeque::new(),
             tcp_handles: Vec::new(),
             closed_tcp: Vec::new(),
             udp_handles: Vec::new(),
@@ -171,8 +171,8 @@ impl TunDispatcher {
         self.skip_multicast = skip_multicast;
     }
 
-    pub fn events(&mut self) -> impl Iterator<Item = TunEvent> + '_ {
-        self.events.drain(..)
+    pub fn proxy_inputs(&mut self) -> impl Iterator<Item = ProxyInput> + '_ {
+        self.proxy_inputs.drain(..)
     }
 
     /// Remove one queued event without allocating a temporary collection.
@@ -180,8 +180,8 @@ impl TunDispatcher {
     /// The async runtime needs to consume an event before it can call back
     /// into the dispatcher to close a failed flow, so draining the queue into
     /// a `Vec` would add one allocation per dispatcher tick.
-    pub fn next_event(&mut self) -> Option<TunEvent> {
-        self.events.pop_front()
+    pub fn next_proxy_input(&mut self) -> Option<ProxyInput> {
+        self.proxy_inputs.pop_front()
     }
 
     pub fn poll(
@@ -216,23 +216,23 @@ impl TunDispatcher {
         device: &mut SmoltcpTunDevice,
         timestamp: Instant,
     ) -> Result<smoltcp::iface::PollResult> {
-        self.flush_pending_icmp_tx(device)?;
+        self.flush_pending_icmp_to_tun(device)?;
         self.drop_skipped_multicast(device)?;
         self.prepare_rx_inner(Some(interface), device)?;
         let result = interface.poll(timestamp, device, &mut self.sockets);
-        self.collect_events()?;
+        self.collect_proxy_inputs()?;
         Ok(result)
     }
 
-    pub(crate) fn flush_pending_icmp_tx(&mut self, device: &SmoltcpTunDevice) -> Result<()> {
-        while let Some(packet) = self.pending_icmp_tx.front().cloned() {
+    pub(crate) fn flush_pending_icmp_to_tun(&mut self, device: &SmoltcpTunDevice) -> Result<()> {
+        while let Some(packet) = self.pending_icmp_to_tun.front().cloned() {
             if !device.enqueue_tx(packet)? {
                 // Leave the packet pending. The outer TUN loop drains the
                 // device TX queue independently, so a momentarily full queue
                 // is backpressure rather than an inbound-fatal error.
                 break;
             }
-            self.pending_icmp_tx.pop_front();
+            self.pending_icmp_to_tun.pop_front();
         }
         Ok(())
     }
@@ -305,8 +305,8 @@ impl TunDispatcher {
                     },
                 };
                 tun_debug(format!("TUN external ICMP echo request flow={flow:?}"));
-                self.events
-                    .push_back(TunEvent::IcmpEchoRequest { flow, packet });
+                self.proxy_inputs
+                    .push_back(ProxyInput::IcmpEchoRequest { flow, packet });
                 return Ok(());
             }
             PreparedRx::Transport(Some(tuple)) => tuple,

@@ -7,77 +7,41 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split};
-use tokio::sync::{Mutex, mpsc};
-use yuhaiin_core::flow::{
-    Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey, FlowObserver,
-    FlowObserverGuard,
-};
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
-use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, split};
+use yuhaiin_core::flow::FlowKey as TunFlowKey;
+use yuhaiin_core::proxy::BoxAsyncStream;
+use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, Network, Result};
 use yuhaiin_protocol::vless::{self, Command};
 
-use super::common::{
-    answer_dns_packet, record_outbound_datagram, record_outbound_stream, relay_counted_with_buffer,
-    udp_flow_key,
+use super::common::UdpFlowId;
+use crate::inbound::{
+    InboundHandler, InboundUdpCodec, InboundUdpRequest, InboundUdpResponse, InboundUdpSession,
 };
-use crate::inbound::InboundSpec;
-use crate::{ConnectionMonitor, RuntimeProxySelector};
 
-pub(crate) async fn serve<S>(
-    mut stream: S,
+pub(crate) async fn handle(
+    mut stream: BoxAsyncStream,
     peer: SocketAddr,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+    inbound: Arc<InboundHandler>,
+) -> Result<()> {
+    let spec = inbound.spec();
     let uuid = vless::parse_uuid(&spec.password)?;
     let request = vless::read_request(&mut stream, &uuid).await?;
     let destination = request.destination;
-    let mut context = FlowContext::new(destination.clone());
-    context.source = Some(Endpoint::ip(Network::Tcp, peer));
-    context.original_domain = destination.host().cloned();
-    spec.annotate_context(&mut context);
-    selector.route_context(&mut context);
-    let process = context.process.clone();
     match request.command {
         Command::Tcp => {
-            let flow = TunFlowKey {
-                network: Network::Tcp,
-                source: peer,
-                destination: destination
-                    .addr()
-                    .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
-            };
-            let outbound = match selector.select(&context).connect(&context).await {
-                Ok(stream) => stream,
+            let connection = match inbound.open_stream("vless", peer, destination).await {
+                Ok(connection) => connection,
                 Err(error) => {
-                    monitor.record_failure_with_process(
-                        "vless",
-                        &destination.to_string(),
-                        &error.to_string(),
-                        process.as_deref(),
-                    );
                     return Err(error);
                 }
             };
-            record_outbound_stream(&mut context, &outbound);
             vless::write_response(&mut stream, &[]).await?;
-            relay_counted_with_buffer(
-                stream,
-                outbound,
-                flow,
-                context,
-                monitor,
-                selector.relay_buffer_size(),
-            )
-            .await
-            .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))
+            inbound
+                .relay(stream, connection, peer)
+                .await
+                .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))
         }
-        Command::Udp => serve_udp(stream, peer, spec, selector, monitor, destination).await,
+        Command::Udp => handle_udp(stream, peer, inbound, destination).await,
     }
 }
 
@@ -85,88 +49,76 @@ where
 /// request; each subsequent packet is only length-prefixed. The UDP path does
 /// not emit a response header because Go's `PacketConn.ReadFrom` starts at the
 /// first packet length, while the TCP path still uses the response header.
-async fn serve_udp<S>(
-    stream: S,
+async fn handle_udp(
+    stream: BoxAsyncStream,
     peer: SocketAddr,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
+    inbound: Arc<InboundHandler>,
     destination: Endpoint,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let mut context = FlowContext::new(destination.clone());
-    context.source = Some(Endpoint::ip(Network::Udp, peer));
-    context.original_domain = destination.host().cloned();
-    spec.annotate_context(&mut context);
-    selector.route_context(&mut context);
-    let flow = udp_flow_key(peer, &destination);
-    let datagram = selector.select(&context).open_datagram(&context).await?;
-    record_outbound_datagram(&mut context, &*datagram);
-    let datagram: Arc<dyn AsyncDatagram> = Arc::from(datagram);
-    let _observation = FlowObserverGuard::open(monitor.clone(), TunFlow { key: flow }, context);
-    let (mut reader, writer) = split(stream);
-    let writer = Arc::new(Mutex::new(writer));
-    let udp_buffer_size = selector.udp_buffer_size().max(512);
-    let udp_ringbuffer_size = selector.udp_ringbuffer_size().max(1);
-    let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(udp_ringbuffer_size);
-    let receiver = Arc::clone(&datagram);
-    let receive_task = tokio::spawn(async move {
-        let mut buffer = vec![0u8; udp_buffer_size];
-        while let Ok((length, _target)) = receiver.recv_from(&mut buffer).await {
-            if reply_tx.send(buffer[..length].to_vec()).await.is_err() {
-                break;
+) -> Result<()> {
+    let (reader, writer) = split(stream);
+    let codec = VlessUdpCodec {
+        reader,
+        writer,
+        peer,
+        destination,
+        packet: vec![0u8; inbound.selector().udp_buffer_size().max(512)],
+        flow_key: None,
+    };
+    InboundUdpSession::new(codec, inbound).run().await
+}
+
+struct VlessUdpCodec {
+    reader: tokio::io::ReadHalf<BoxAsyncStream>,
+    writer: tokio::io::WriteHalf<BoxAsyncStream>,
+    peer: SocketAddr,
+    destination: Endpoint,
+    packet: Vec<u8>,
+    flow_key: Option<TunFlowKey>,
+}
+
+impl InboundUdpCodec for VlessUdpCodec {
+    fn recv<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<InboundUdpRequest>>> {
+        Box::pin(async move {
+            let length = usize::from(self.reader.read_u16().await.map_err(io_error)?);
+            if length > self.packet.len() {
+                return Err(Error::invalid("VLESS UDP payload is too large"));
             }
-        }
-    });
-    let mut close_events = monitor.subscribe_close_requests();
-    let result = async {
-        let mut packet = vec![0u8; udp_buffer_size];
-        loop {
-            tokio::select! {
-                length = reader.read_u16() => {
-                    let length = usize::from(length.map_err(io_error)?);
-                    if length > packet.len() {
-                        return Err(Error::invalid("VLESS UDP payload is too large"));
-                    }
-                    reader.read_exact(&mut packet[..length]).await.map_err(io_error)?;
-                    if destination.port() == Some(53)
-                        && let Some(answer) = answer_dns_packet(&monitor, &packet[..length]).await
-                    {
-                        if let Ok(response) = answer {
-                            let mut writer = writer.lock().await;
-                            writer.write_u16(response.len() as u16).await.map_err(io_error)?;
-                            writer.write_all(&response).await.map_err(io_error)?;
-                        }
-                        continue;
-                    }
-                    datagram.send_to(&packet[..length], destination.clone()).await?;
-                    monitor.bytes(flow, TunFlowDirection::Upload, length);
-                }
-                Some(payload) = reply_rx.recv() => {
-                    let mut writer = writer.lock().await;
-                    writer.write_u16(payload.len() as u16).await.map_err(io_error)?;
-                    writer.write_all(&payload).await.map_err(io_error)?;
-                    monitor.bytes(flow, TunFlowDirection::Download, payload.len());
-                }
-                close = close_events.recv() => {
-                    match close {
-                        Ok(requested) if requested == flow => break,
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-                else => break,
-            }
-        }
-        Ok(())
+            self.reader
+                .read_exact(&mut self.packet[..length])
+                .await
+                .map_err(io_error)?;
+            Ok(Some(InboundUdpRequest {
+                id: UdpFlowId {
+                    peer: self.peer,
+                    target: self.destination.clone(),
+                    authentication: None,
+                },
+                peer: Endpoint::ip(Network::Udp, self.peer),
+                target: self.destination.clone(),
+                payload: self.packet[..length].to_vec(),
+            }))
+        })
     }
-    .await;
-    receive_task.abort();
-    let _ = receive_task.await;
-    let _ = datagram.close().await;
-    result
+
+    fn send<'a>(&'a mut self, response: InboundUdpResponse) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let length = u16::try_from(response.payload.len())
+                .map_err(|_| Error::invalid("VLESS UDP response is too large"))?;
+            self.writer.write_u16(length).await.map_err(io_error)?;
+            self.writer
+                .write_all(&response.payload)
+                .await
+                .map_err(io_error)
+        })
+    }
+
+    fn note_flow(&mut self, flow: TunFlowKey) {
+        self.flow_key = Some(flow);
+    }
+
+    fn owns_flow(&self, flow: TunFlowKey) -> bool {
+        self.flow_key == Some(flow)
+    }
 }
 
 fn io_error(error: std::io::Error) -> Error {

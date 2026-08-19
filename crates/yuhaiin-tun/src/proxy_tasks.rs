@@ -8,7 +8,7 @@ pub(super) async fn run_tcp_proxy(
     mut context: crate::FlowContext,
     flow: TunFlowKey,
     mut commands: mpsc::Receiver<ProxyCommand>,
-    output: ProxyOutputSender,
+    output: mpsc::Sender<ProxyOutput>,
     timeouts: ProxyTimeouts,
     observer: Option<Arc<dyn TunFlowObserver>>,
 ) {
@@ -117,7 +117,7 @@ pub(super) async fn run_udp_proxy(
     mut context: crate::FlowContext,
     initial_flow: TunFlowKey,
     mut commands: mpsc::Receiver<UdpProxyCommand>,
-    output: ProxyOutputSender,
+    output: mpsc::Sender<ProxyOutput>,
     timeouts: ProxyTimeouts,
     observer: Option<Arc<dyn TunFlowObserver>>,
     udp_buffer_size: usize,
@@ -238,6 +238,7 @@ pub(super) async fn run_udp_proxy(
                     &output,
                     ProxyOutput::UdpData { flow, payload: buffer[..length].to_vec() },
                     timeouts.idle,
+
                 ).await {
                     let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
                     return;
@@ -255,24 +256,15 @@ pub(super) async fn run_udp_proxy(
 }
 
 #[cfg(feature = "async-proxy")]
-async fn emit_output(output: &ProxyOutputSender, value: ProxyOutput, timeout: Duration) -> bool {
-    output.send(value, timeout).await
-}
-
-#[cfg(feature = "async-proxy")]
-pub(super) async fn run_dns_query(
-    handler: Arc<dyn DnsHandler>,
-    payload: Vec<u8>,
+async fn emit_output(
+    output: &mpsc::Sender<ProxyOutput>,
+    value: ProxyOutput,
     timeout: Duration,
-) -> Option<Vec<u8>> {
-    let mut task = tokio::task::spawn_blocking(move || answer_query(&payload, handler.as_ref()));
-    match tokio::time::timeout(timeout, &mut task).await {
-        Ok(Ok(answer)) => answer.ok(),
-        Ok(Err(_)) | Err(_) => {
-            task.abort();
-            None
-        }
-    }
+) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, output.send(value)).await,
+        Ok(Ok(()))
+    )
 }
 
 #[cfg(feature = "async-proxy")]
@@ -282,7 +274,7 @@ pub(super) async fn run_icmp_proxy(
     id: u64,
     flow: TunFlowKey,
     packet: Vec<u8>,
-    output: ProxyOutputSender,
+    output: mpsc::Sender<ProxyOutput>,
     timeouts: ProxyTimeouts,
 ) {
     let destination = context.effective_destination();

@@ -34,7 +34,6 @@ pub struct RuntimeController {
     dns_reload_events: tokio::sync::broadcast::Sender<()>,
     inbound_reload_events: tokio::sync::broadcast::Sender<InboundReload>,
     dns_handler: Arc<ReloadableAsyncDnsHandler>,
-    tun_dns_handler: Arc<ReloadableAsyncDnsHandler>,
     restore_request: Arc<RwLock<Option<PathBuf>>>,
     resolver_proxy_bridge: Option<Arc<ResolverProxyBridge>>,
 }
@@ -65,9 +64,6 @@ impl RuntimeController {
                 .clone()
                 .map(|handler| handler as Arc<dyn SocketDnsHandler>),
         );
-        let tun_dns_handler = Arc::new(ReloadableAsyncDnsHandler::new(
-            initial_inbound_dns_handler.map(|handler| (*handler).clone()),
-        ));
         let dns_handler = Arc::new(ReloadableAsyncDnsHandler::new(Some(RuntimeDnsHandler {
             resolver: initial_snapshot.resolver.clone(),
             fakeip: initial_snapshot.fakeip.clone(),
@@ -84,7 +80,6 @@ impl RuntimeController {
             dns_reload_events,
             inbound_reload_events,
             dns_handler,
-            tun_dns_handler,
             restore_request: Arc::new(RwLock::new(None)),
             resolver_proxy_bridge,
         })
@@ -100,10 +95,6 @@ impl RuntimeController {
 
     pub fn monitor(&self) -> Arc<ConnectionMonitor> {
         self.monitor.clone()
-    }
-
-    pub(crate) fn tun_dns_handler(&self) -> Arc<ReloadableAsyncDnsHandler> {
-        self.tun_dns_handler.clone()
     }
 
     pub(crate) fn dns_handler(&self) -> Arc<ReloadableAsyncDnsHandler> {
@@ -325,7 +316,7 @@ impl RuntimeController {
         drop_id: &str,
         proxy_timeout: std::time::Duration,
         channel_capacity: usize,
-        async_dns_handler: Option<Arc<dyn yuhaiin_core::dns::AsyncDnsHandler>>,
+        _async_dns_handler: Option<Arc<dyn yuhaiin_core::dns::AsyncDnsHandler>>,
     ) -> Result<yuhaiin_tun::TunProxyRuntime> {
         let _guard = self.reload_lock.lock().await;
         let snapshot = self.handle.load();
@@ -349,9 +340,6 @@ impl RuntimeController {
             .with_nat(nat, idle_timeout)?
             .with_udp_buffer_size(snapshot.settings.udp_buffer_size)?;
         runtime = runtime.with_observer(self.monitor.clone());
-        if let Some(handler) = async_dns_handler {
-            runtime = runtime.with_async_dns_handler(handler);
-        }
         self.register_selector(&selector);
         Ok(runtime)
     }
@@ -495,8 +483,6 @@ impl RuntimeController {
                 .clone()
                 .map(|handler| handler as Arc<dyn SocketDnsHandler>),
         );
-        self.tun_dns_handler
-            .replace(next_inbound_dns_handler.map(|handler| (*handler).clone()));
         self.dns_handler.replace(Some(RuntimeDnsHandler {
             resolver: next.resolver.clone(),
             fakeip: next.fakeip.clone(),
@@ -1153,7 +1139,7 @@ mod tests {
         };
         block_on(async {
             runtime
-                .handle_event(yuhaiin_tun::TunEvent::TcpOpened { flow })
+                .handle_proxy_input(yuhaiin_tun::ProxyInput::TcpOpened { flow })
                 .unwrap();
 
             let v6_flow = yuhaiin_core::flow::Flow {
@@ -1164,7 +1150,7 @@ mod tests {
                 },
             };
             runtime
-                .handle_event(yuhaiin_tun::TunEvent::UdpDatagram {
+                .handle_proxy_input(yuhaiin_tun::ProxyInput::UdpDatagram {
                     flow: v6_flow,
                     payload: vec![0],
                 })
@@ -1203,7 +1189,7 @@ mod tests {
             fn answer<'a>(
                 &'a self,
                 _packet: &'a [u8],
-            ) -> yuhaiin_core::LocalBoxFuture<'a, yuhaiin_core::Result<Vec<u8>>> {
+            ) -> yuhaiin_core::BoxFuture<'a, yuhaiin_core::Result<Vec<u8>>> {
                 Box::pin(async {
                     Err(yuhaiin_core::Error::new(
                         yuhaiin_core::ErrorKind::Closed,

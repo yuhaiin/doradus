@@ -1086,9 +1086,9 @@ impl<Q: SendAsyncDnsQuery + 'static> AsyncIpResolver for AsyncDnsResolver<Q> {
     }
 }
 
-impl<Q: AsyncDnsQuery> AsyncDnsHandler for AsyncDnsResolver<Q> {
-    fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
-        self.query_packet_local(packet)
+impl<Q: SendAsyncDnsQuery + 'static> AsyncDnsHandler for AsyncDnsResolver<Q> {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        self.query_packet_send(packet)
     }
 }
 
@@ -1123,12 +1123,12 @@ mod tests {
         calls: Arc<Mutex<usize>>,
     }
 
-    impl AsyncDnsQuery for StaticQuery {
-        fn query<'a>(
+    impl SendAsyncDnsQuery for StaticQuery {
+        fn query_send<'a>(
             &'a self,
             _domain: &'a DomainName,
             _record_type: DnsRecordType,
-        ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
+        ) -> BoxFuture<'a, Result<DnsResponse>> {
             Box::pin(async move {
                 *self
                     .calls
@@ -1313,7 +1313,7 @@ mod tests {
         struct PtrHandler;
 
         impl AsyncDnsHandler for PtrHandler {
-            fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+            fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
                 Box::pin(async move {
                     encode_response(
                         packet,

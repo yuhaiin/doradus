@@ -1,43 +1,28 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use yuhaiin_core::proxy::BoxAsyncStream;
+use yuhaiin_core::{BoxFuture, Endpoint, Network, Result};
 
-use yuhaiin_core::flow::{
-    Flow as TunFlow, FlowDirection as TunFlowDirection, FlowKey as TunFlowKey,
-    FlowObserver as TunFlowObserver, FlowObserverGuard,
+use crate::inbound::{
+    InboundHandler, InboundUdpCodec, InboundUdpRequest, InboundUdpResponse, InboundUdpSession,
 };
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector};
-use yuhaiin_core::{Endpoint, FlowContext, Network, Result};
-
-use crate::inbound::InboundSpec;
-use crate::proxy::common::{
-    UdpFlowId, UdpFlowState, UdpReply, answer_dns_packet, close_udp_flows, io_error,
-    reap_expired_udp_flows_with_timeout, record_outbound_datagram, record_outbound_stream,
-    relay_counted_with_buffer, shutdown_udp_flow, udp_flow_key, udp_idle_timeout,
-};
-use crate::{ConnectionMonitor, RuntimeProxySelector};
+use crate::proxy::common::io_error;
 
 pub(crate) use yuhaiin_protocol::socks5_server::{
     encode_udp_packet as encode_socks_udp_packet, parse_udp_packet as parse_socks_udp_packet,
 };
 
-pub(crate) async fn serve<S>(
-    mut stream: S,
+pub(crate) async fn handle(
+    mut stream: BoxAsyncStream,
     peer: SocketAddr,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+    inbound: Arc<InboundHandler>,
+) -> Result<()> {
+    let spec = inbound.spec();
     let central_auth = spec.auth.as_deref().filter(|auth| auth.has_basic_users());
     let requires_auth =
         central_auth.is_some() || !spec.username.is_empty() || !spec.password.is_empty();
@@ -70,181 +55,121 @@ where
         let advertised_address = SocketAddr::new(peer.ip(), address.port());
         yuhaiin_protocol::socks5_server::write_reply_endpoint(&mut stream, 0, advertised_address)
             .await?;
-        return serve_socks5_udp_loop(socket, spec, selector, monitor, Some(peer.ip())).await;
+        return serve_socks5_udp_loop(Box::new(socket), Arc::clone(&inbound), Some(peer.ip()))
+            .await;
     }
     let destination = request.destination;
-    let source = Endpoint::ip(Network::Tcp, peer);
-    let mut context = FlowContext::new(destination.clone());
-    context.source = Some(source);
-    context.original_domain = destination.host().cloned();
-    spec.annotate_context(&mut context);
-    selector.route_context(&mut context);
-    let process = context.process.clone();
-    let proxy = selector.select(&context);
-    let outbound = match proxy.connect(&context).await {
-        Ok(outbound) => outbound,
+    let connection = match inbound.open_stream("socks5", peer, destination).await {
+        Ok(connection) => connection,
         Err(error) => {
             yuhaiin_protocol::socks5_server::write_reply(&mut stream, 5).await?;
-            monitor.record_failure_with_process(
-                "socks5",
-                &destination.to_string(),
-                &error.to_string(),
-                process.as_deref(),
-            );
             return Err(error);
         }
     };
-    record_outbound_stream(&mut context, &outbound);
     yuhaiin_protocol::socks5_server::write_reply(&mut stream, 0).await?;
-    relay_counted_with_buffer(
-        stream,
-        outbound,
-        TunFlowKey {
-            network: Network::Tcp,
-            source: peer,
-            destination: destination
-                .addr()
-                .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
-        },
-        context,
-        monitor,
-        selector.relay_buffer_size(),
-    )
-    .await
-    .map_err(io_error)
+    inbound
+        .relay(stream, connection, peer)
+        .await
+        .map_err(io_error)
 }
 
 pub(crate) async fn serve_udp_socket(
-    socket: impl InboundUdpSocket,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
+    socket: Box<dyn InboundUdpSocket>,
+    inbound: Arc<InboundHandler>,
 ) -> Result<()> {
-    serve_socks5_udp_loop(socket, spec, selector, monitor, None).await
+    serve_socks5_udp_loop(socket, inbound, None).await
 }
 
 pub(crate) async fn serve_socks5_udp_loop(
-    mut socket: impl InboundUdpSocket,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
+    socket: Box<dyn InboundUdpSocket>,
+    inbound: Arc<InboundHandler>,
     allowed_peer: Option<IpAddr>,
 ) -> Result<()> {
-    let udp_buffer_size = selector.udp_buffer_size().max(512);
-    let udp_ringbuffer_size = selector.udp_ringbuffer_size().max(1);
-    let (reply_tx, mut reply_rx) = mpsc::channel::<UdpReply>(udp_ringbuffer_size);
-    let mut flows = HashMap::<UdpFlowId, UdpFlowState>::new();
-    let mut close_events = monitor.subscribe_close_requests();
-    let idle_timeout = udp_idle_timeout();
-    let mut idle_tick = tokio::time::interval(idle_timeout);
-    let mut client = None;
-    let mut packet = vec![0u8; udp_buffer_size];
-    loop {
-        tokio::select! {
-            received = socket.recv_from(&mut packet) => {
-                let (length, peer) = received.map_err(io_error)?;
-                if allowed_peer.is_some_and(|allowed| allowed != peer.ip()) {
+    InboundUdpSession::new(
+        Socks5UdpCodec::new(
+            socket,
+            allowed_peer,
+            inbound.selector().udp_buffer_size().max(512),
+        ),
+        inbound,
+    )
+    .run()
+    .await
+}
+
+struct Socks5UdpCodec {
+    socket: Box<dyn InboundUdpSocket>,
+    allowed_peer: Option<IpAddr>,
+    client: Option<SocketAddr>,
+    packet: Vec<u8>,
+}
+
+impl Socks5UdpCodec {
+    fn new(
+        socket: Box<dyn InboundUdpSocket>,
+        allowed_peer: Option<IpAddr>,
+        buffer_size: usize,
+    ) -> Self {
+        Self {
+            socket,
+            allowed_peer,
+            client: None,
+            packet: vec![0u8; buffer_size],
+        }
+    }
+}
+
+impl InboundUdpCodec for Socks5UdpCodec {
+    fn recv<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<InboundUdpRequest>>> {
+        Box::pin(async move {
+            loop {
+                let (length, peer) = self
+                    .socket
+                    .recv_from(&mut self.packet)
+                    .await
+                    .map_err(io_error)?;
+                if self
+                    .allowed_peer
+                    .is_some_and(|allowed| allowed != peer.ip())
+                {
                     continue;
                 }
-                let Some((target, payload)) = parse_socks_udp_packet(&packet[..length])? else {
+                let Some((target, payload)) = parse_socks_udp_packet(&self.packet[..length])?
+                else {
                     continue;
                 };
-                if let Some(expected) = client {
+                if let Some(expected) = self.client {
                     if expected != peer {
                         continue;
                     }
                 } else {
-                    client = Some(peer);
+                    self.client = Some(peer);
                 }
-                if target.port() == Some(53)
-                    && let Some(answer) = answer_dns_packet(&monitor, payload).await
-                {
-                    if let Ok(response) = answer {
-                        let packet = encode_socks_udp_packet(&target, &response)?;
-                        socket.send_to(&packet, peer).await.map_err(io_error)?;
-                    }
-                    continue;
-                }
-                let id = UdpFlowId {
-                    peer,
-                    target: target.clone(),
-                    authentication: None,
-                };
-                let state = if let Some(state) = flows.get(&id) {
-                    state
-                } else {
-                    let source = Endpoint::ip(Network::Udp, peer);
-                    let mut context = FlowContext::new(target.clone());
-                    context.source = Some(source.clone());
-                    context.original_domain = target.host().cloned();
-                    spec.annotate_context(&mut context);
-                    selector.route_context(&mut context);
-                    let key = udp_flow_key(peer, &target);
-                    let datagram = selector.select(&context).open_datagram(&context).await?;
-                    record_outbound_datagram(&mut context, &*datagram);
-                    let datagram: Arc<dyn AsyncDatagram> = Arc::from(datagram);
-                    let observation =
-                        FlowObserverGuard::open(monitor.clone(), TunFlow { key }, context);
-                    let receiver = Arc::clone(&datagram);
-                    let reply_tx = reply_tx.clone();
-                    let id_for_task = id.clone();
-                    let receiver_task = tokio::spawn(async move {
-                        let mut buffer = vec![0u8; udp_buffer_size];
-                        while let Ok((length, target)) = receiver.recv_from(&mut buffer).await {
-                            if reply_tx.send(UdpReply {
-                                id: id_for_task.clone(),
-                                target,
-                                payload: buffer[..length].to_vec(),
-                            }).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    flows.entry(id.clone()).or_insert(UdpFlowState {
-                        datagram,
-                        receiver_task,
-                        key,
-                        peer: source,
-                        last_seen: std::time::Instant::now(),
-                        _observation: observation,
-                    })
-                };
-                state.datagram.send_to(payload, target).await?;
-                monitor.bytes(state.key, TunFlowDirection::Upload, payload.len());
-                if let Some(state) = flows.get_mut(&id) {
-                    state.last_seen = std::time::Instant::now();
-                }
+                return Ok(Some(InboundUdpRequest {
+                    id: crate::proxy::common::UdpFlowId {
+                        peer,
+                        target: target.clone(),
+                        authentication: None,
+                    },
+                    peer: Endpoint::ip(Network::Udp, peer),
+                    target,
+                    payload: payload.to_vec(),
+                }));
             }
-            close_event = close_events.recv() => {
-                match close_event {
-                    Ok(flow) => {
-                        close_udp_flows(&mut flows, flow).await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            Some(reply) = reply_rx.recv() => {
-                let Some(state) = flows.get(&reply.id) else { continue; };
-                let Some(client) = client else { continue; };
-                let packet = encode_socks_udp_packet(&reply.target, &reply.payload)?;
-                socket.send_to(&packet, client).await.map_err(io_error)?;
-                monitor.bytes(state.key, TunFlowDirection::Download, reply.payload.len());
-                if let Some(state) = flows.get_mut(&reply.id) {
-                    state.last_seen = std::time::Instant::now();
-                }
-            }
-            _ = idle_tick.tick() => {
-                reap_expired_udp_flows_with_timeout(&mut flows, idle_timeout).await;
-            }
-            else => break,
-        }
+        })
     }
-    for state in flows.into_values() {
-        shutdown_udp_flow(state).await;
+
+    fn send<'a>(&'a mut self, response: InboundUdpResponse) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let peer = response
+                .peer
+                .addr()
+                .ok_or_else(|| yuhaiin_core::Error::invalid("SOCKS5 UDP peer has no IP address"))?;
+            let packet = encode_socks_udp_packet(&response.target, &response.payload)?;
+            self.socket.send_to(&packet, peer).await.map_err(io_error)?;
+            Ok(())
+        })
     }
-    let _ = spec;
-    Ok(())
 }
 
 #[allow(clippy::type_complexity)]

@@ -2,6 +2,19 @@
 
 use super::*;
 
+#[cfg(feature = "async-proxy")]
+struct PassthroughInputInterceptor;
+
+#[cfg(feature = "async-proxy")]
+impl ProxyInputInterceptor for PassthroughInputInterceptor {
+    fn intercept<'a>(
+        &'a mut self,
+        input: ProxyInput,
+    ) -> yuhaiin_core::BoxFuture<'a, Result<ProxyInputAction>> {
+        Box::pin(async move { Ok(ProxyInputAction::Forward(input)) })
+    }
+}
+
 pub struct TunRuntime {
     #[cfg(feature = "tun-routes")]
     route_lease: Option<TunRouteLease>,
@@ -390,6 +403,17 @@ impl TunRuntime {
             .await
     }
 
+    async fn wait_smoltcp_timer(delay: Option<smoltcp::time::Duration>) {
+        match delay {
+            Some(delay) => {
+                tokio::time::sleep(Duration::from_micros(delay.total_micros())).await;
+            }
+            None => {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
     /// Run the TUN data plane until the caller's shutdown future completes.
     ///
     /// The shutdown branch is part of the runtime contract rather than an
@@ -405,20 +429,48 @@ impl TunRuntime {
     where
         F: std::future::Future<Output = ()>,
     {
+        let mut interceptor = PassthroughInputInterceptor;
+        self.run_dispatcher_until_inner(dispatcher, proxy_runtime, &mut interceptor, shutdown)
+            .await
+    }
+
+    /// Run the TUN data plane with a runtime-owned input policy boundary.
+    /// Protocol policy can consume an event or enqueue a reply without
+    /// teaching the TUN crate about DNS or any other inbound feature.
+    #[cfg(feature = "async-proxy")]
+    pub async fn run_dispatcher_until_with_input_interceptor<F, I>(
+        &mut self,
+        dispatcher: &mut TunDispatcher,
+        proxy_runtime: &mut TunProxyRuntime,
+        interceptor: &mut I,
+        shutdown: F,
+    ) -> io::Result<()>
+    where
+        F: std::future::Future<Output = ()>,
+        I: ProxyInputInterceptor,
+    {
+        self.run_dispatcher_until_inner(dispatcher, proxy_runtime, interceptor, shutdown)
+            .await
+    }
+
+    #[cfg(feature = "async-proxy")]
+    async fn run_dispatcher_until_inner<F, I>(
+        &mut self,
+        dispatcher: &mut TunDispatcher,
+        proxy_runtime: &mut TunProxyRuntime,
+        interceptor: &mut I,
+        shutdown: F,
+    ) -> io::Result<()>
+    where
+        F: std::future::Future<Output = ()>,
+        I: ProxyInputInterceptor,
+    {
         let started = std::time::Instant::now();
         tokio::pin!(shutdown);
         loop {
             let timestamp = elapsed_timestamp(started);
             let next_poll_delay = dispatcher.poll_delay(&mut self.interface, timestamp);
-            let output_notify = proxy_runtime.output_notify();
-            let poll_timer = async move {
-                if let Some(delay) = next_poll_delay {
-                    tokio::time::sleep(Duration::from_micros(delay.total_micros())).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            };
-            tokio::pin!(poll_timer);
+
             tokio::select! {
                 result = self.recv_from_tun() => {
                     if let Err(error) = result {
@@ -426,8 +478,8 @@ impl TunRuntime {
                         return Err(error);
                     }
                 }
-                _ = output_notify.notified() => {}
-                _ = &mut poll_timer => {}
+                _ = proxy_runtime.wait_for_output() => {}
+                _ = TunRuntime::wait_smoltcp_timer(next_poll_delay) => {}
                 _ = &mut shutdown => {
                     proxy_runtime
                         .close_graceful(DEFAULT_GRACEFUL_CLOSE_TIMEOUT)
@@ -436,7 +488,7 @@ impl TunRuntime {
                 }
             }
             if let Err(error) = self
-                .drive_dispatcher_once(dispatcher, proxy_runtime, started)
+                .drive_data_plane_once(dispatcher, proxy_runtime, started, interceptor)
                 .await
             {
                 proxy_runtime.close();
@@ -446,26 +498,40 @@ impl TunRuntime {
     }
 
     #[cfg(feature = "async-proxy")]
-    async fn drive_dispatcher_once(
+    async fn drive_data_plane_once<I>(
         &mut self,
         dispatcher: &mut TunDispatcher,
         proxy_runtime: &mut TunProxyRuntime,
         started: std::time::Instant,
-    ) -> io::Result<()> {
+        interceptor: &mut I,
+    ) -> io::Result<()>
+    where
+        I: ProxyInputInterceptor,
+    {
         self.expire_ipv6_fragments();
+
+        // TUN / smoltcp -> proxy
         dispatcher
             .poll(self, elapsed_timestamp(started))
             .map_err(|error| io::Error::other(error.to_string()))?;
-        self.dispatch_events(dispatcher, proxy_runtime).await?;
+        self.dispatch_proxy_inputs(dispatcher, proxy_runtime, interceptor)
+            .await?;
+
+        // proxy -> smoltcp / TUN
         proxy_runtime
-            .poll_outputs(dispatcher)
+            .process_proxy_outputs(dispatcher)
             .map_err(|error| io::Error::other(error.to_string()))?;
+
         dispatcher
-            .flush_pending_icmp_tx(&self.smoltcp_device)
+            .flush_pending_icmp_to_tun(&self.smoltcp_device)
             .map_err(|error| io::Error::other(error.to_string()))?;
+
+        // Lifecycle / maintenance
         proxy_runtime
             .sweep(dispatcher)
             .map_err(|error| io::Error::other(error.to_string()))?;
+
+        // smoltcp -> OS TUN
         self.flush_to_tun().await?;
 
         // A current-thread runtime can keep the TUN reader ready while a
@@ -476,14 +542,33 @@ impl TunRuntime {
     }
 
     #[cfg(feature = "async-proxy")]
-    async fn dispatch_events(
+    async fn dispatch_proxy_inputs<I>(
         &mut self,
         dispatcher: &mut TunDispatcher,
         proxy_runtime: &mut TunProxyRuntime,
-    ) -> io::Result<()> {
-        while let Some(event) = dispatcher.next_event() {
-            let flow = event_flow_key(&event);
-            if let Err(error) = proxy_runtime.handle_event_async(event).await {
+        interceptor: &mut I,
+    ) -> io::Result<()>
+    where
+        I: ProxyInputInterceptor,
+    {
+        while let Some(event) = dispatcher.next_proxy_input() {
+            let action = interceptor
+                .intercept(event)
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let event = match action {
+                ProxyInputAction::Forward(event) => event,
+                ProxyInputAction::Reply { flow, payload } => {
+                    proxy_runtime
+                        .enqueue_udp_data(flow, payload)
+                        .await
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    continue;
+                }
+                ProxyInputAction::Drop => continue,
+            };
+            let flow = proxy_input_flow_key(&event);
+            if let Err(error) = proxy_runtime.handle_proxy_input_async(event).await {
                 // A transport can finish between smoltcp emitting a packet
                 // and the next command being delivered to its bounded flow
                 // queue. Close only that kernel flow and keep the supervisor

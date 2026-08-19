@@ -309,7 +309,7 @@ struct AsyncStaticUpstream;
 
 #[cfg(feature = "async-proxy")]
 impl AsyncDnsHandler for AsyncStaticUpstream {
-    fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
             let DnsQuestion { .. } = decode_query(packet)?;
             crate::dns::encode_response(

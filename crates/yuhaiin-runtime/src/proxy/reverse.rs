@@ -13,61 +13,39 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use yuhaiin_core::flow::FlowKey as TunFlowKey;
-use yuhaiin_core::proxy::{AsyncProxySelector, BoxAsyncStream};
-use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use yuhaiin_core::proxy::BoxAsyncStream;
+use yuhaiin_core::{Endpoint, Error, ErrorKind, Network, Result};
 use yuhaiin_protocol::reverse_http;
 
-use super::common::{io_error, record_outbound_stream, relay_counted_with_prefix_and_buffer};
-use crate::inbound::{InboundSpec, ReverseHttpConfig};
-use crate::{ConnectionMonitor, RuntimeProxySelector};
+use super::common::io_error;
+use crate::inbound::{InboundHandler, InboundStream, ReverseHttpConfig};
 
 const HTTP_SNIFF_TIMEOUT: Duration = Duration::from_millis(55);
 
 /// Serve a Go `reverse_tcp` inbound through the shared outbound selector.
-pub(crate) async fn serve_tcp<S>(
-    stream: S,
+pub(crate) async fn handle_tcp(
+    stream: BoxAsyncStream,
     peer: SocketAddr,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let target = spec.reverse_target.clone().ok_or_else(|| {
+    inbound: Arc<InboundHandler>,
+) -> Result<()> {
+    let target = inbound.spec().reverse_target.clone().ok_or_else(|| {
         Error::new(
             ErrorKind::InvalidInput,
             "reverse_tcp inbound target is missing",
         )
     })?;
-    relay_to_target(
-        stream,
-        peer,
-        spec,
-        target,
-        selector,
-        monitor,
-        &[],
-        "reverse_tcp",
-    )
-    .await
+    relay_to_target(stream, peer, target, inbound, &[], "reverse_tcp").await
 }
 
 /// Serve a Go `reverse_http` inbound. HTTP requests are rewritten to the
 /// configured URL; non-HTTP bytes retain the raw reverse-TCP behavior used by
 /// the Go implementation and are sent to the URL authority.
-pub(crate) async fn serve_http<S>(
-    mut stream: S,
+pub(crate) async fn handle_http(
+    mut stream: BoxAsyncStream,
     peer: SocketAddr,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let config = spec.reverse_http.clone().ok_or_else(|| {
+    inbound: Arc<InboundHandler>,
+) -> Result<()> {
+    let config = inbound.spec().reverse_http.clone().ok_or_else(|| {
         Error::new(
             ErrorKind::InvalidInput,
             "reverse_http inbound URL is missing",
@@ -77,12 +55,10 @@ where
     if !is_http {
         let stream = BufferedIo::new(prefix, stream);
         return relay_to_target(
-            stream,
+            Box::new(stream),
             peer,
-            spec,
             config.target,
-            selector,
-            monitor,
+            inbound,
             &[],
             "reverse_http",
         )
@@ -97,98 +73,35 @@ where
     })?;
     let rewritten = reverse_http::rewrite_request(headers, &config.path, &config.authority)?;
     let destination = config.target.clone();
-    let mut context = new_context(&destination, peer, &spec);
+    let mut context = inbound.context(peer, Network::Tcp, destination.clone());
     context.http_host = reverse_http::request_host(headers);
-    selector.route_context(&mut context);
-    let process = context.process.clone();
-    let outbound = selector
-        .select(&context)
-        .connect(&context)
+    let connection = inbound.connect("reverse_http", context).await?;
+    let connection = InboundStream {
+        outbound: wrap_https_if_needed(connection.outbound, &config).await?,
+        context: connection.context,
+    };
+    inbound
+        .relay_with_prefix(
+            BufferedIo::new(Vec::new(), stream),
+            connection,
+            peer,
+            rewritten.as_bytes(),
+        )
         .await
-        .inspect_err(|error| {
-            monitor.record_failure_with_process(
-                "reverse_http",
-                &destination.to_string(),
-                &error.to_string(),
-                process.as_deref(),
-            );
-        })?;
-    record_outbound_stream(&mut context, &outbound);
-    let outbound = wrap_https_if_needed(outbound, &config).await?;
-    let flow = flow_key(peer, &destination);
-    relay_counted_with_prefix_and_buffer(
-        BufferedIo::new(Vec::new(), stream),
-        outbound,
-        flow,
-        context,
-        monitor,
-        rewritten.as_bytes(),
-        selector.relay_buffer_size(),
-    )
-    .await
-    .map_err(io_error)
+        .map_err(io_error)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn relay_to_target<S>(
-    stream: S,
+async fn relay_to_target(
+    stream: BoxAsyncStream,
     peer: SocketAddr,
-    spec: InboundSpec,
     target: Endpoint,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
+    inbound: Arc<InboundHandler>,
     prefix: &[u8],
     protocol: &str,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let mut context = new_context(&target, peer, &spec);
-    selector.route_context(&mut context);
-    let process = context.process.clone();
-    let outbound = selector
-        .select(&context)
-        .connect(&context)
+) -> Result<()> {
+    inbound
+        .serve_stream_with_prefix(stream, peer, protocol, target, prefix)
         .await
-        .inspect_err(|error| {
-            monitor.record_failure_with_process(
-                protocol,
-                &target.to_string(),
-                &error.to_string(),
-                process.as_deref(),
-            );
-        })?;
-    record_outbound_stream(&mut context, &outbound);
-    let flow = flow_key(peer, &target);
-    relay_counted_with_prefix_and_buffer(
-        stream,
-        outbound,
-        flow,
-        context,
-        monitor,
-        prefix,
-        selector.relay_buffer_size(),
-    )
-    .await
-    .map_err(io_error)
-}
-
-fn new_context(target: &Endpoint, peer: SocketAddr, spec: &InboundSpec) -> FlowContext {
-    let mut context = FlowContext::new(target.clone());
-    context.source = Some(Endpoint::ip(Network::Tcp, peer));
-    context.original_domain = target.host().cloned();
-    spec.annotate_context(&mut context);
-    context
-}
-
-fn flow_key(peer: SocketAddr, target: &Endpoint) -> TunFlowKey {
-    TunFlowKey {
-        network: Network::Tcp,
-        source: peer,
-        destination: target
-            .addr()
-            .unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid fallback address")),
-    }
 }
 
 #[cfg(feature = "doh-tls")]

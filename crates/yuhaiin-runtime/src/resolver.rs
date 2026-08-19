@@ -1256,10 +1256,7 @@ mod tests {
     struct StaticDnsHandler;
 
     impl AsyncDnsHandler for StaticDnsHandler {
-        fn answer<'a>(
-            &'a self,
-            packet: &'a [u8],
-        ) -> yuhaiin_core::LocalBoxFuture<'a, Result<Vec<u8>>> {
+        fn answer<'a>(&'a self, packet: &'a [u8]) -> yuhaiin_core::BoxFuture<'a, Result<Vec<u8>>> {
             Box::pin(async move {
                 let query = decode_query(packet)?;
                 assert_eq!(query.record_type, DnsRecordType::A);

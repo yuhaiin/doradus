@@ -9,6 +9,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "async-proxy")]
+use futures_util::future::BoxFuture;
 use hickory_proto::op::{Edns, Message, MessageType, Query};
 use hickory_proto::rr::rdata::svcb::{
     Alpn, EchConfigList, IpHint, Mandatory, SvcParamKey, SvcParamValue, Unknown,
@@ -21,8 +23,6 @@ use hickory_proto::rr::{
 use crate::{DomainName, Error, ErrorKind, IpSet, ResolveStrategy, Result};
 
 #[cfg(feature = "async-proxy")]
-use crate::LocalBoxFuture;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DnsRecordType {
     A,
@@ -929,10 +929,9 @@ pub trait DnsHandler: Send + Sync {
 }
 
 #[cfg(feature = "async-proxy")]
-pub trait AsyncDnsHandler {
-    fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>>;
+pub trait AsyncDnsHandler: Send + Sync {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>>;
 }
-
 #[cfg(feature = "async-proxy")]
 pub struct AsyncPolicyDnsHandler<H> {
     pub upstream: H,
@@ -941,7 +940,7 @@ pub struct AsyncPolicyDnsHandler<H> {
 
 #[cfg(feature = "async-proxy")]
 impl<H: AsyncDnsHandler> AsyncDnsHandler for AsyncPolicyDnsHandler<H> {
-    fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         match self.policy {
             DnsPolicy::Upstream => self.upstream.answer(packet),
             DnsPolicy::Block => Box::pin(async {
@@ -1437,7 +1436,7 @@ mod tests {
             dropped: Arc<AtomicBool>,
         }
         impl AsyncDnsHandler for PendingResolver {
-            fn answer<'a>(&'a self, _packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
+            fn answer<'a>(&'a self, _packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
                 let dropped = Arc::clone(&self.dropped);
                 Box::pin(async move {
                     struct Guard(Arc<AtomicBool>);

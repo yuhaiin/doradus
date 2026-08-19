@@ -27,7 +27,6 @@ fn main() -> std::io::Result<()> {
     let proxy_echo = env::var_os("YUHAIIN_TUN_PROXY_ECHO").is_some();
     let udp_proxy_echo = env::var_os("YUHAIIN_TUN_UDP_PROXY_ECHO").is_some();
     let proxy_throughput = env::var_os("YUHAIIN_TUN_PROXY_THROUGHPUT").is_some();
-    let dns_echo = env::var_os("YUHAIIN_TUN_DNS_ECHO").is_some();
     let route_smoke = env::var_os("YUHAIIN_TUN_ROUTE_SMOKE").is_some();
     let ipv6 = env::var("YUHAIIN_TUN_IPV6")
         .ok()
@@ -180,7 +179,8 @@ fn main() -> std::io::Result<()> {
             ));
         }
     }
-    if dns_echo {
+    #[cfg(any())]
+    if env::var_os("YUHAIIN_TUN_DNS_ECHO").is_some() {
         #[cfg(feature = "async-proxy")]
         {
             return run_dns_echo(runtime);
@@ -732,6 +732,7 @@ fn run_udp_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
 }
 
 #[cfg(feature = "async-proxy")]
+#[cfg(any())]
 fn run_dns_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
     use std::net::{SocketAddr, UdpSocket};
     use std::sync::Arc;
@@ -742,7 +743,7 @@ fn run_dns_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
         encode_query,
     };
     use yuhaiin_core::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
-    use yuhaiin_core::{DomainName, IpSet, LocalBoxFuture, Result as CoreResult};
+    use yuhaiin_core::{BoxFuture, DomainName, IpSet, Result as CoreResult};
     use yuhaiin_tun::{TunDispatcher, TunProxyRuntime};
 
     struct FixedDns;
@@ -764,7 +765,7 @@ fn run_dns_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
         }
     }
     impl AsyncDnsHandler for FixedDns {
-        fn answer<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, CoreResult<Vec<u8>>> {
+        fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, CoreResult<Vec<u8>>> {
             Box::pin(async move { answer_query(packet, self) })
         }
     }

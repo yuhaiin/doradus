@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use yuhaiin_core::process::{ProcessResolver, default_process_resolver};
 use yuhaiin_core::proxy::BoxAsyncStream;
-use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Result};
+use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Result};
 use yuhaiin_store::GoInboundRecord;
 
 use crate::{ConnectionMonitor, RuntimeController, RuntimeProxySelector};
@@ -31,6 +31,11 @@ use crate::{ConnectionMonitor, RuntimeController, RuntimeProxySelector};
 #[path = "auth.rs"]
 mod auth;
 pub(crate) use auth::InboundAuth;
+mod handler;
+pub(crate) use handler::{
+    InboundDnsHandler, InboundDnsPolicy, InboundHandler, InboundInputInterceptor, InboundStream,
+    InboundUdpCodec, InboundUdpRequest, InboundUdpResponse, InboundUdpSession,
+};
 
 // Outbound SOCKS5 lives in yuhaiin-protocol; this module owns inbound policy
 // and flow lifetime.
@@ -1026,13 +1031,14 @@ async fn start_listeners(
                     }
                 };
                 let logs = monitor.logs();
+                let inbound_handler =
+                    InboundHandler::new(spec.clone(), Arc::clone(&selector), Arc::clone(&monitor));
                 push_listener(
                     &mut listeners,
                     &spec.id.clone(),
                     tokio::spawn(async move {
                         if let Err(error) =
-                            crate::proxy::yuubinsya::serve_udp(socket, spec, selector, monitor)
-                                .await
+                            crate::proxy::yuubinsya::handle_udp(socket, inbound_handler).await
                         {
                             logs.error(format!("Yuubinsya UDP listener stopped: {error}"));
                         }
@@ -1067,6 +1073,8 @@ async fn start_listeners(
                     }
                 };
                 let logs = monitor.logs();
+                let inbound_handler =
+                    InboundHandler::new(spec.clone(), Arc::clone(&selector), Arc::clone(&monitor));
                 if let Some(password) = spec.aead_password.clone() {
                     let socket = crate::inbound::socks5::AeadUdpSocket::new(
                         socket,
@@ -1078,7 +1086,8 @@ async fn start_listeners(
                         &spec.id.clone(),
                         tokio::spawn(async move {
                             if let Err(error) = crate::inbound::socks5::serve_udp_socket(
-                                socket, spec, selector, monitor,
+                                Box::new(socket),
+                                inbound_handler,
                             )
                             .await
                             {
@@ -1092,7 +1101,8 @@ async fn start_listeners(
                         &spec.id.clone(),
                         tokio::spawn(async move {
                             if let Err(error) = crate::inbound::socks5::serve_udp_socket(
-                                socket, spec, selector, monitor,
+                                Box::new(socket),
+                                inbound_handler,
                             )
                             .await
                             {
@@ -1756,6 +1766,13 @@ async fn serve_h2_listener(
     let yuubinsya_server = (spec.protocol == "yuubinsya")
         .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()))
         .flatten();
+    let handler = protocol_handler(
+        spec.protocol.clone(),
+        spec.clone(),
+        selector,
+        monitor.clone(),
+        yuubinsya_server.clone(),
+    );
     let mut connections = JoinSet::new();
     let result = async {
         loop {
@@ -1763,24 +1780,14 @@ async fn serve_h2_listener(
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted.map_err(crate::proxy::common::io_error)?;
                     let spec = spec.clone();
-                    let selector = selector.clone();
-                    let monitor = monitor.clone();
                     let tls_acceptor = tls_acceptor.clone();
-                    let yuubinsya_server = yuubinsya_server.clone();
+                    let handler = handler.clone();
                     let logs = monitor.logs();
                     connections.spawn(async move {
                         let result: Result<()> = async {
                             let stream =
                                 prepare_inbound_stream(stream, &spec, tls_acceptor, true).await?;
-                            serve_h2_connection(
-                                stream,
-                                peer,
-                                spec,
-                                selector,
-                                monitor,
-                                yuubinsya_server,
-                            )
-                            .await
+                            serve_h2_connection(stream, peer, handler).await
                         }
                         .await;
                         if let Err(error) = result {
@@ -1809,10 +1816,7 @@ async fn serve_h2_listener(
 async fn serve_h2_connection<S>(
     stream: S,
     peer: SocketAddr,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-    yuubinsya_server: Option<Arc<yuhaiin_chain::YuubinsyaServerProxy>>,
+    handler: Arc<ProtocolHandler>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1836,27 +1840,15 @@ where
                         ));
                     }
                 };
-                let spec = spec.clone();
-                let selector = selector.clone();
-                let monitor = monitor.clone();
-                let yuubinsya_server = yuubinsya_server.clone();
+                let handler = handler.clone();
                 streams.spawn(async move {
-                    serve_h2_stream(
-                        request,
-                        respond,
-                        peer,
-                        spec,
-                        selector,
-                        monitor,
-                        yuubinsya_server,
-                    )
-                    .await
+                    serve_h2_stream(request, respond, peer, handler).await
                 });
             }
             Some(result) = streams.join_next(), if !streams.is_empty() => {
                 match result {
-                    Ok(Err(error)) => monitor.error(format!("HTTP/2 inbound stream error: {error}")),
-                    Err(error) => monitor.error(format!("HTTP/2 inbound stream task panicked: {error}")),
+                    Ok(Err(error)) => handler.inbound.monitor().error(format!("HTTP/2 inbound stream error: {error}")),
+                    Err(error) => handler.inbound.monitor().error(format!("HTTP/2 inbound stream task panicked: {error}")),
                     Ok(Ok(())) => {}
                 }
             }
@@ -1872,10 +1864,7 @@ async fn serve_h2_stream(
     request: http::Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<bytes::Bytes>,
     peer: SocketAddr,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-    yuubinsya_server: Option<Arc<yuhaiin_chain::YuubinsyaServerProxy>>,
+    handler: Arc<ProtocolHandler>,
 ) -> Result<()> {
     use http::{Response, StatusCode};
     use tokio::io::duplex;
@@ -1910,16 +1899,7 @@ async fn serve_h2_stream(
     })?;
     let (protocol_io, bridge_io) = duplex(16 * 1024);
     let bridge = tokio::spawn(bridge_h2_stream(request.into_body(), send, bridge_io));
-    let result = serve_connection(
-        protocol_io,
-        peer,
-        spec.protocol.clone(),
-        spec,
-        selector,
-        monitor,
-        yuubinsya_server,
-    )
-    .await;
+    let result = serve_connection(protocol_io, peer, handler).await;
     bridge.abort();
     let _ = bridge.await;
     result
@@ -1984,33 +1964,28 @@ async fn serve_listener(
     let yuubinsya_server = (protocol == "yuubinsya")
         .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()))
         .flatten();
+    let handler = protocol_handler(
+        protocol.clone(),
+        spec.clone(),
+        selector,
+        monitor.clone(),
+        yuubinsya_server.clone(),
+    );
     let mut connections = JoinSet::new();
     let result = async {
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted.map_err(crate::proxy::common::io_error)?;
-                    let selector = selector.clone();
-                    let monitor = monitor.clone();
                     let spec = spec.clone();
-                    let protocol = protocol.clone();
                     let tls_acceptor = tls_acceptor.clone();
-                    let yuubinsya_server = yuubinsya_server.clone();
+                    let handler = handler.clone();
                     let logs = monitor.logs();
                     connections.spawn(async move {
                         let result = async {
                             let stream =
                                 prepare_inbound_stream(stream, &spec, tls_acceptor, false).await?;
-                            serve_connection(
-                                stream,
-                                peer,
-                                protocol,
-                                spec,
-                                selector,
-                                monitor,
-                                yuubinsya_server,
-                            )
-                            .await
+                            serve_connection(stream, peer, handler).await
                         }
                         .await;
                         if let Err(error) = result {
@@ -2049,33 +2024,28 @@ async fn serve_websocket_listener(
     let yuubinsya_server = (protocol == "yuubinsya")
         .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()))
         .flatten();
+    let handler = protocol_handler(
+        protocol.clone(),
+        spec.clone(),
+        selector,
+        monitor.clone(),
+        yuubinsya_server.clone(),
+    );
     let mut connections = JoinSet::new();
     let result = async {
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted.map_err(crate::proxy::common::io_error)?;
-                    let selector = selector.clone();
-                    let monitor = monitor.clone();
                     let spec = spec.clone();
-                    let protocol = protocol.clone();
                     let tls_acceptor = tls_acceptor.clone();
-                    let yuubinsya_server = yuubinsya_server.clone();
+                    let handler = handler.clone();
                     let logs = monitor.logs();
                     connections.spawn(async move {
                         let result: Result<()> = async {
                             let stream =
                                 prepare_inbound_stream(stream, &spec, tls_acceptor, false).await?;
-                            serve_websocket_stream(
-                                stream,
-                                peer,
-                                protocol,
-                                spec,
-                                selector,
-                                monitor,
-                                yuubinsya_server,
-                            )
-                            .await
+                            serve_websocket_stream(stream, peer, handler).await
                         }
                         .await;
                         if let Err(error) = result {
@@ -2123,17 +2093,22 @@ async fn serve_websocket_h2_listener(
     let yuubinsya_server = (spec.protocol == "yuubinsya")
         .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()))
         .flatten();
+    let handler = protocol_handler(
+        spec.protocol.clone(),
+        spec.clone(),
+        selector,
+        monitor.clone(),
+        yuubinsya_server.clone(),
+    );
     let mut connections = JoinSet::new();
     let result = async {
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted.map_err(crate::proxy::common::io_error)?;
-                    let selector = selector.clone();
-                    let monitor = monitor.clone();
                     let spec = spec.clone();
                     let tls_acceptor = tls_acceptor.clone();
-                    let yuubinsya_server = yuubinsya_server.clone();
+                    let handler = handler.clone();
                     let logs = monitor.logs();
                     connections.spawn(async move {
                         let result = async {
@@ -2141,15 +2116,7 @@ async fn serve_websocket_h2_listener(
                                 prepare_inbound_stream(stream, &spec, tls_acceptor, false).await?;
                             let (stream, early_data) = accept_websocket_stream(stream).await?;
                             let stream = PrefixedIo::new(early_data, stream);
-                            serve_h2_connection(
-                                stream,
-                                peer,
-                                spec,
-                                selector,
-                                monitor,
-                                yuubinsya_server,
-                            )
-                            .await
+                            serve_h2_connection(stream, peer, handler).await
                         }
                         .await;
                         if let Err(error) = result {
@@ -2180,70 +2147,95 @@ async fn serve_websocket_h2_listener(
 async fn serve_websocket_stream<S>(
     stream: S,
     peer: SocketAddr,
-    protocol: String,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-    yuubinsya_server: Option<Arc<yuhaiin_chain::YuubinsyaServerProxy>>,
+    handler: Arc<ProtocolHandler>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (stream, early_data) = accept_websocket_stream(stream).await?;
     let stream = PrefixedIo::new(early_data, stream);
-    serve_connection(
-        stream,
-        peer,
-        protocol,
-        spec,
-        selector,
-        monitor,
-        yuubinsya_server,
-    )
-    .await
+    serve_connection(stream, peer, handler).await
 }
 
-async fn serve_connection<S>(
-    stream: S,
-    peer: SocketAddr,
+trait InboundProtocol: Send + Sync {
+    fn handle<'a>(&'a self, stream: BoxAsyncStream, peer: SocketAddr) -> BoxFuture<'a, Result<()>>;
+}
+
+struct ProtocolHandler {
+    protocol: String,
+    inbound: Arc<InboundHandler>,
+    yuubinsya_server: Option<Arc<yuhaiin_chain::YuubinsyaServerProxy>>,
+}
+
+impl InboundProtocol for ProtocolHandler {
+    fn handle<'a>(&'a self, stream: BoxAsyncStream, peer: SocketAddr) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            match self.protocol.as_str() {
+                "socks4a" => {
+                    crate::proxy::socks4a::handle(stream, peer, Arc::clone(&self.inbound)).await
+                }
+                "socks5" => {
+                    crate::inbound::socks5::handle(stream, peer, Arc::clone(&self.inbound)).await
+                }
+                "http" => crate::proxy::http::handle(stream, peer, Arc::clone(&self.inbound)).await,
+                "reverse_tcp" => {
+                    crate::proxy::reverse::handle_tcp(stream, peer, Arc::clone(&self.inbound)).await
+                }
+                "reverse_http" => {
+                    crate::proxy::reverse::handle_http(stream, peer, Arc::clone(&self.inbound))
+                        .await
+                }
+                "mixed" => serve_mixed(stream, peer, Arc::clone(&self.inbound)).await,
+                "trojan" => {
+                    crate::proxy::trojan::handle(stream, peer, Arc::clone(&self.inbound)).await
+                }
+                "vless" => {
+                    crate::proxy::vless::handle(stream, peer, Arc::clone(&self.inbound)).await
+                }
+                "yuubinsya" => {
+                    if let Some(server) = self.yuubinsya_server.clone() {
+                        crate::proxy::yuubinsya::handle_with_server(
+                            stream,
+                            peer,
+                            Arc::clone(&self.inbound),
+                            server,
+                        )
+                        .await
+                    } else {
+                        crate::proxy::yuubinsya::handle(stream, peer, Arc::clone(&self.inbound))
+                            .await
+                    }
+                }
+                "none" => Ok(()),
+                other => Err(Error::new(
+                    ErrorKind::Unsupported,
+                    format!("inbound protocol {other:?} is not implemented"),
+                )),
+            }
+        })
+    }
+}
+
+fn protocol_handler(
     protocol: String,
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
     yuubinsya_server: Option<Arc<yuhaiin_chain::YuubinsyaServerProxy>>,
-) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    match protocol.as_str() {
-        "socks4a" => crate::proxy::socks4a::serve(stream, peer, spec, selector, monitor).await,
-        "socks5" => crate::inbound::socks5::serve(stream, peer, spec, selector, monitor).await,
-        "http" => crate::proxy::http::serve(stream, peer, spec, selector, monitor).await,
-        "reverse_tcp" => {
-            crate::proxy::reverse::serve_tcp(stream, peer, spec, selector, monitor).await
-        }
-        "reverse_http" => {
-            crate::proxy::reverse::serve_http(stream, peer, spec, selector, monitor).await
-        }
-        "mixed" => serve_mixed(stream, peer, spec, selector, monitor).await,
-        "trojan" => crate::proxy::trojan::serve(stream, peer, spec, selector, monitor).await,
-        "vless" => crate::proxy::vless::serve(stream, peer, spec, selector, monitor).await,
-        "yuubinsya" => {
-            if let Some(server) = yuubinsya_server {
-                crate::proxy::yuubinsya::serve_with_server(
-                    stream, peer, spec, selector, server, monitor,
-                )
-                .await
-            } else {
-                crate::proxy::yuubinsya::serve(stream, peer, spec, selector, monitor).await
-            }
-        }
-        "none" => Ok(()),
-        other => Err(Error::new(
-            ErrorKind::Unsupported,
-            format!("inbound protocol {other:?} is not implemented"),
-        )),
-    }
+) -> Arc<ProtocolHandler> {
+    Arc::new(ProtocolHandler {
+        protocol,
+        inbound: InboundHandler::new(spec, selector, monitor),
+        yuubinsya_server,
+    })
+}
+
+async fn serve_connection(
+    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    peer: SocketAddr,
+    handler: Arc<ProtocolHandler>,
+) -> Result<()> {
+    handler.handle(Box::new(stream), peer).await
 }
 
 fn normalize_inbound_protocol(protocol: &str) -> String {
@@ -2255,16 +2247,11 @@ fn normalize_inbound_protocol(protocol: &str) -> String {
     }
 }
 
-async fn serve_mixed<S>(
-    mut stream: S,
+async fn serve_mixed(
+    mut stream: BoxAsyncStream,
     peer: SocketAddr,
-    spec: InboundSpec,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+    inbound: Arc<InboundHandler>,
+) -> Result<()> {
     let mut first = [0u8; 1];
     stream
         .read_exact(&mut first)
@@ -2272,11 +2259,11 @@ where
         .map_err(crate::proxy::common::io_error)?;
     let stream = PrefixedIo::new(vec![first[0]], stream);
     if first[0] == 4 {
-        crate::proxy::socks4a::serve(stream, peer, spec, selector, monitor).await
+        crate::proxy::socks4a::handle(Box::new(stream), peer, inbound).await
     } else if first[0] == 5 {
-        crate::inbound::socks5::serve(stream, peer, spec, selector, monitor).await
+        crate::inbound::socks5::handle(Box::new(stream), peer, inbound).await
     } else {
-        crate::proxy::http::serve(stream, peer, spec, selector, monitor).await
+        crate::proxy::http::handle(Box::new(stream), peer, inbound).await
     }
 }
 
@@ -2559,12 +2546,10 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             reverse_target: Some(Endpoint::ip(Network::Tcp, echo_address)),
             reverse_http: None,
         };
-        let task = tokio::spawn(crate::proxy::reverse::serve_tcp(
-            server,
+        let task = tokio::spawn(crate::proxy::reverse::handle_tcp(
+            Box::new(server),
             "127.0.0.1:41005".parse().unwrap(),
-            spec,
-            selector,
-            monitor,
+            InboundHandler::new(spec, selector, monitor),
         ));
         client.write_all(b"reverse-tcp-flow").await.unwrap();
         let mut echoed = [0u8; 16];
@@ -2615,12 +2600,10 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 https: false,
             }),
         };
-        let task = tokio::spawn(crate::proxy::reverse::serve_http(
-            server,
+        let task = tokio::spawn(crate::proxy::reverse::handle_http(
+            Box::new(server),
             "127.0.0.1:41006".parse().unwrap(),
-            spec,
-            selector,
-            monitor,
+            InboundHandler::new(spec, selector, monitor),
         ));
         client
             .write_all(b"GET /health HTTP/1.1\r\nHost: public.example\r\nConnection: close\r\n\r\n")
@@ -2767,30 +2750,28 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
     async fn none_inbound_accepts_and_closes_without_routing() {
         let (selector, monitor) = direct_runtime().await;
         let (mut client, server) = tokio::io::duplex(64);
+        let spec = InboundSpec {
+            id: "none".to_owned(),
+            name: "none".to_owned(),
+            protocol: "none".to_owned(),
+            listen: "127.0.0.1:12347".parse().unwrap(),
+            username: String::new(),
+            password: String::new(),
+            auth: None,
+            udp_mode: UdpMode::Disabled,
+            protocol_udp: false,
+            transports: Vec::new(),
+            aead_password: None,
+            aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
+            outbound_id: "direct".to_owned(),
+            reverse_target: None,
+            reverse_http: None,
+        };
+        let handler = protocol_handler("none".to_owned(), spec, selector, monitor, None);
         let task = tokio::spawn(serve_connection(
             server,
             "127.0.0.1:12347".parse().unwrap(),
-            "none".to_owned(),
-            InboundSpec {
-                id: "none".to_owned(),
-                name: "none".to_owned(),
-                protocol: "none".to_owned(),
-                listen: "127.0.0.1:12347".parse().unwrap(),
-                username: String::new(),
-                password: String::new(),
-                auth: None,
-                udp_mode: UdpMode::Disabled,
-                protocol_udp: false,
-                transports: Vec::new(),
-                aead_password: None,
-                aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
-                outbound_id: "direct".to_owned(),
-                reverse_target: None,
-                reverse_http: None,
-            },
-            selector,
-            monitor,
-            None,
+            handler,
         ));
         let mut byte = [0u8; 1];
         assert_eq!(client.read(&mut byte).await.unwrap(), 0);
@@ -2891,12 +2872,10 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             reverse_target: None,
             reverse_http: None,
         };
-        let task = tokio::spawn(crate::proxy::trojan::serve(
-            server,
+        let task = tokio::spawn(crate::proxy::trojan::handle(
+            Box::new(server),
             "127.0.0.1:41001".parse().unwrap(),
-            spec,
-            selector,
-            monitor,
+            InboundHandler::new(spec, selector, monitor),
         ));
         let destination = Endpoint::ip(Network::Tcp, echo_address);
         let hash = trojan::password_hash(b"secret");
@@ -2934,12 +2913,10 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             reverse_target: None,
             reverse_http: None,
         };
-        let task = tokio::spawn(crate::proxy::vless::serve(
-            server,
+        let task = tokio::spawn(crate::proxy::vless::handle(
+            Box::new(server),
             "127.0.0.1:41003".parse().unwrap(),
-            spec,
-            selector,
-            monitor,
+            InboundHandler::new(spec, selector, monitor),
         ));
         let destination = Endpoint::ip(Network::Tcp, echo_address);
         let uuid = vless::parse_uuid("00112233-4455-6677-8899-aabbccddeeff").unwrap();
@@ -2986,12 +2963,10 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             reverse_target: None,
             reverse_http: None,
         };
-        let task = tokio::spawn(crate::proxy::vless::serve(
-            server,
+        let task = tokio::spawn(crate::proxy::vless::handle(
+            Box::new(server),
             "127.0.0.1:41004".parse().unwrap(),
-            spec,
-            selector,
-            monitor,
+            InboundHandler::new(spec, selector, monitor),
         ));
         let destination = Endpoint::ip(Network::Udp, echo_address);
         let uuid = vless::parse_uuid("00112233-4455-6677-8899-aabbccddeeff").unwrap();
@@ -3037,12 +3012,10 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             reverse_target: None,
             reverse_http: None,
         };
-        let task = tokio::spawn(crate::proxy::trojan::serve(
-            server,
+        let task = tokio::spawn(crate::proxy::trojan::handle(
+            Box::new(server),
             "127.0.0.1:41002".parse().unwrap(),
-            spec,
-            selector,
-            monitor,
+            InboundHandler::new(spec, selector, monitor),
         ));
         let destination = Endpoint::ip(Network::Udp, echo_address);
         let hash = trojan::password_hash(b"secret");
@@ -3629,26 +3602,28 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let (selector, monitor) = direct_runtime().await;
             let listener_task = tokio::spawn(crate::inbound::socks5::serve_socks5_udp_loop(
-                server,
-                InboundSpec {
-                    id: "socks-udp-close-inbound".to_owned(),
-                    name: "socks-udp-close-inbound".to_owned(),
-                    protocol: "socks5".to_owned(),
-                    listen: server_address,
-                    username: String::new(),
-                    password: String::new(),
-                    auth: None,
-                    udp_mode: UdpMode::Enabled,
-                    protocol_udp: true,
-                    transports: vec!["normal".to_owned()],
-                    aead_password: None,
-                    aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
-                    outbound_id: "direct".to_owned(),
-                    reverse_target: None,
-                    reverse_http: None,
-                },
-                selector,
-                monitor.clone(),
+                Box::new(server),
+                InboundHandler::new(
+                    InboundSpec {
+                        id: "socks-udp-close-inbound".to_owned(),
+                        name: "socks-udp-close-inbound".to_owned(),
+                        protocol: "socks5".to_owned(),
+                        listen: server_address,
+                        username: String::new(),
+                        password: String::new(),
+                        auth: None,
+                        udp_mode: UdpMode::Enabled,
+                        protocol_udp: true,
+                        transports: vec!["normal".to_owned()],
+                        aead_password: None,
+                        aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
+                        outbound_id: "direct".to_owned(),
+                        reverse_target: None,
+                        reverse_http: None,
+                    },
+                    selector,
+                    monitor.clone(),
+                ),
                 None,
             ));
 
@@ -3721,28 +3696,30 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             let listener_monitor = monitor.clone();
             let listener_task = tokio::spawn(async move {
                 let (stream, peer) = inbound_listener.accept().await.unwrap();
-                let _ = crate::inbound::socks5::serve(
-                    stream,
+                let _ = crate::inbound::socks5::handle(
+                    Box::new(stream),
                     peer,
-                    InboundSpec {
-                        id: "socks-associate-inbound".to_owned(),
-                        name: "socks-associate-inbound".to_owned(),
-                        protocol: "socks5".to_owned(),
-                        listen: inbound_address,
-                        username: String::new(),
-                        password: String::new(),
-                        auth: None,
-                        udp_mode: UdpMode::Enabled,
-                        protocol_udp: true,
-                        transports: vec!["normal".to_owned()],
-                        aead_password: None,
-                        aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
-                        outbound_id: "direct".to_owned(),
-                        reverse_target: None,
-                        reverse_http: None,
-                    },
-                    selector,
-                    listener_monitor,
+                    InboundHandler::new(
+                        InboundSpec {
+                            id: "socks-associate-inbound".to_owned(),
+                            name: "socks-associate-inbound".to_owned(),
+                            protocol: "socks5".to_owned(),
+                            listen: inbound_address,
+                            username: String::new(),
+                            password: String::new(),
+                            auth: None,
+                            udp_mode: UdpMode::Enabled,
+                            protocol_udp: true,
+                            transports: vec!["normal".to_owned()],
+                            aead_password: None,
+                            aead_method: yuhaiin_protocol::aead::CryptoMethod::Chacha20Poly1305,
+                            outbound_id: "direct".to_owned(),
+                            reverse_target: None,
+                            reverse_http: None,
+                        },
+                        selector,
+                        listener_monitor,
+                    ),
                 )
                 .await;
             });
