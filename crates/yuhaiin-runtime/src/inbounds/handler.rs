@@ -8,10 +8,11 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use yuhaiin_core::flow::{
     Flow as TunFlow, FlowDirection, FlowKey as TunFlowKey, FlowObserver as TunFlowObserver,
@@ -21,9 +22,8 @@ use yuhaiin_core::{BoxFuture, Endpoint, FlowContext, Network, Result};
 
 use super::InboundSpec;
 use crate::proxy::common::{
-    UdpFlowId, UdpFlowState, UdpReply, reap_expired_udp_flows_with_timeout,
-    record_outbound_datagram, record_outbound_stream, relay_counted_with_buffer,
-    relay_counted_with_prefix_and_buffer, shutdown_udp_flow, udp_idle_timeout,
+    UdpFlowId, record_outbound_datagram, record_outbound_stream, relay_counted_with_buffer,
+    relay_counted_with_prefix_and_buffer, udp_idle_timeout,
 };
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
@@ -129,6 +129,7 @@ pub(crate) struct InboundHandler {
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
     dns: InboundDnsPolicy,
+    udp: Arc<InboundUdpManager>,
 }
 
 impl InboundHandler {
@@ -137,8 +138,12 @@ impl InboundHandler {
         selector: Arc<RuntimeProxySelector>,
         monitor: Arc<ConnectionMonitor>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|inbound| Self {
             dns: InboundDnsPolicy::new(Arc::clone(&monitor)),
+            udp: Arc::new(InboundUdpManager::new(
+                inbound.clone(),
+                selector.udp_ringbuffer_size().max(1),
+            )),
             spec,
             selector,
             monitor,
@@ -159,6 +164,10 @@ impl InboundHandler {
 
     pub(crate) fn dns_policy(&self) -> InboundDnsPolicy {
         self.dns.clone()
+    }
+
+    pub(crate) fn udp(&self) -> &Arc<InboundUdpManager> {
+        &self.udp
     }
 
     pub(crate) fn context(
@@ -359,20 +368,6 @@ pub(crate) struct ObservedDatagram {
     pub(crate) _observation: yuhaiin_core::flow::FlowObserverGuard,
 }
 
-pub(crate) enum InboundUdpPacket {
-    Drop,
-    Reply(Vec<u8>),
-    Forward { flow: TunFlowKey },
-}
-
-pub(crate) struct InboundUdpReply {
-    pub(crate) id: UdpFlowId,
-    pub(crate) peer: Endpoint,
-    pub(crate) target: Endpoint,
-    pub(crate) payload: Vec<u8>,
-    pub(crate) flow: TunFlowKey,
-}
-
 pub(crate) struct InboundUdpRequest {
     pub(crate) id: UdpFlowId,
     pub(crate) peer: Endpoint,
@@ -385,17 +380,7 @@ pub(crate) struct InboundUdpResponse {
     pub(crate) peer: Endpoint,
     pub(crate) target: Endpoint,
     pub(crate) payload: Vec<u8>,
-}
-
-impl InboundUdpReply {
-    fn into_response(self) -> InboundUdpResponse {
-        InboundUdpResponse {
-            id: self.id,
-            peer: self.peer,
-            target: self.target,
-            payload: self.payload,
-        }
-    }
+    pub(crate) flow: Option<TunFlowKey>,
 }
 
 /// Protocol adapters implement only wire framing. The shared session owns
@@ -413,169 +398,477 @@ pub(crate) trait InboundUdpCodec: Send {
     }
 }
 
-/// Shared UDP flow ownership for every inbound protocol.
-///
-/// Go's `inbound.Inbound` owns the packet channel, DNS gate, NAT/relay flow
-/// lifecycle and reply observation. Protocol adapters only decode/encode their
-/// wire format and call this service with a normalized packet.
-pub(crate) struct InboundUdpFlows {
-    inbound: Arc<InboundHandler>,
-    flows: HashMap<UdpFlowId, UdpFlowState>,
-    reply_tx: mpsc::Sender<UdpReply>,
-    reply_rx: mpsc::Receiver<UdpReply>,
-    udp_buffer_size: usize,
-    idle_timeout: std::time::Duration,
+/// A source-owned UDP flow. The destination is deliberately absent from the
+/// key so one client can use one full-cone datagram for multiple targets.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UdpSourceKey {
+    inbound_id: String,
+    session_id: u64,
+    source: SocketAddr,
+    authentication: Option<[u8; 32]>,
 }
 
-impl InboundUdpFlows {
-    pub(crate) fn new(inbound: Arc<InboundHandler>) -> Self {
-        let capacity = inbound.selector().udp_ringbuffer_size().max(1);
-        let (reply_tx, reply_rx) = mpsc::channel(capacity);
-        Self {
-            udp_buffer_size: inbound.selector().udp_buffer_size().max(512),
-            idle_timeout: udp_idle_timeout(),
-            inbound,
-            flows: HashMap::new(),
-            reply_tx,
-            reply_rx,
-        }
-    }
+struct UdpIngress {
+    session_id: u64,
+    id: UdpFlowId,
+    peer: Endpoint,
+    target: Endpoint,
+    payload: Vec<u8>,
+    reply_tx: mpsc::Sender<InboundUdpResponse>,
+    event_tx: mpsc::UnboundedSender<InboundUdpSessionEvent>,
+}
 
-    pub(crate) fn idle_timeout(&self) -> std::time::Duration {
-        self.idle_timeout
-    }
-
-    pub(crate) fn subscribe_close_requests(&self) -> tokio::sync::broadcast::Receiver<TunFlowKey> {
-        self.inbound.monitor().subscribe_close_requests()
-    }
-
-    pub(crate) async fn recv_reply(&mut self) -> Option<UdpReply> {
-        self.reply_rx.recv().await
-    }
-
-    pub(crate) async fn handle_packet(
-        &mut self,
-        id: UdpFlowId,
-        peer: Endpoint,
-        target: Endpoint,
-        payload: &[u8],
-    ) -> Result<InboundUdpPacket> {
-        if let Some(answer) = self.inbound.answer_datagram(&target, payload).await {
-            return Ok(match answer {
-                Ok(response) => InboundUdpPacket::Reply(response),
-                Err(_) => InboundUdpPacket::Drop,
-            });
-        }
-
-        let (datagram, flow) = if let Some(state) = self.flows.get_mut(&id) {
-            state.last_seen = Instant::now();
-            (Arc::clone(&state.datagram), state.key)
-        } else {
-            let source = peer.addr().ok_or_else(|| {
-                yuhaiin_core::Error::invalid("inbound UDP peer has no IP address")
-            })?;
-            let opened = self
-                .inbound
-                .open_datagram(
-                    self.inbound
-                        .context_with_source(peer.clone(), target.clone()),
-                    source,
-                )
-                .await?;
-            let flow = opened.flow;
-            let observed = self.inbound.observe_datagram(opened);
-            let datagram = observed.datagram;
-            let observation = observed._observation;
-            let receiver = Arc::clone(&datagram);
-            let reply_tx = self.reply_tx.clone();
-            let id_for_task = id.clone();
-            let udp_buffer_size = self.udp_buffer_size;
-            let receiver_task = tokio::spawn(async move {
-                let mut buffer = vec![0u8; udp_buffer_size];
-                while let Ok((length, target)) = receiver.recv_from(&mut buffer).await {
-                    if reply_tx
-                        .send(UdpReply {
-                            id: id_for_task.clone(),
-                            target,
-                            payload: buffer[..length].to_vec(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-            self.flows.insert(
-                id.clone(),
-                UdpFlowState {
-                    datagram: Arc::clone(&datagram),
-                    receiver_task,
-                    key: flow,
-                    peer,
-                    last_seen: Instant::now(),
-                    _observation: observation,
-                },
-            );
-            (datagram, flow)
-        };
-
-        if let Err(error) = datagram.send_to(payload, target).await {
-            if let Some(state) = self.flows.remove(&id) {
-                shutdown_udp_flow(state).await;
-            }
-            return Err(error);
-        }
-        self.inbound
-            .monitor()
-            .bytes(flow, FlowDirection::Upload, payload.len());
-        Ok(InboundUdpPacket::Forward { flow })
-    }
-
-    pub(crate) fn take_reply(&mut self, reply: UdpReply) -> Option<InboundUdpReply> {
-        let state = self.flows.get_mut(&reply.id)?;
-        state.last_seen = Instant::now();
-        self.inbound
-            .monitor()
-            .bytes(state.key, FlowDirection::Download, reply.payload.len());
-        Some(InboundUdpReply {
-            id: reply.id,
-            peer: state.peer.clone(),
-            target: reply.target,
-            payload: reply.payload,
-            flow: state.key,
+impl UdpIngress {
+    fn source_key(&self, inbound_id: &str) -> Option<UdpSourceKey> {
+        Some(UdpSourceKey {
+            inbound_id: inbound_id.to_owned(),
+            session_id: self.session_id,
+            source: self.peer.addr()?,
+            authentication: self.id.authentication,
         })
     }
+}
 
-    pub(crate) async fn close_flow(&mut self, flow: TunFlowKey) {
-        crate::proxy::common::close_udp_flows(&mut self.flows, flow).await;
-    }
+enum InboundUdpSessionEvent {
+    FlowOpened(TunFlowKey),
+}
 
-    pub(crate) async fn reap_expired(&mut self) {
-        reap_expired_udp_flows_with_timeout(&mut self.flows, self.idle_timeout).await;
-    }
+enum UdpManagerCommand {
+    CloseFlow(TunFlowKey),
+    CloseSession(u64),
+}
 
-    pub(crate) async fn shutdown(mut self) {
-        for state in std::mem::take(&mut self.flows).into_values() {
-            shutdown_udp_flow(state).await;
+struct UdpFlowHandle {
+    generation: u64,
+    data_tx: mpsc::Sender<UdpIngress>,
+    cancel_tx: watch::Sender<bool>,
+    join: tokio::task::JoinHandle<()>,
+    flow: Option<TunFlowKey>,
+    session_id: u64,
+}
+
+enum UdpFlowEvent {
+    Opened {
+        key: UdpSourceKey,
+        generation: u64,
+        flow: TunFlowKey,
+    },
+    Closed {
+        key: UdpSourceKey,
+        generation: u64,
+    },
+}
+
+/// The protocol-independent UDP ingress actor.
+///
+/// The actor owns the source-to-flow map, while every flow owns its outbound
+/// datagram and all potentially slow DNS/route/open/send/recv operations.
+/// Neither the protocol session nor this manager waits on a flow's data queue
+/// or network I/O.
+pub(crate) struct InboundUdpManager {
+    ingress_tx: mpsc::Sender<UdpIngress>,
+    command_tx: mpsc::UnboundedSender<UdpManagerCommand>,
+    next_session_id: AtomicU64,
+}
+
+struct InboundUdpSessionChannels {
+    session_id: u64,
+    reply_tx: mpsc::Sender<InboundUdpResponse>,
+    reply_rx: mpsc::Receiver<InboundUdpResponse>,
+    event_rx: mpsc::UnboundedReceiver<InboundUdpSessionEvent>,
+    event_tx: mpsc::UnboundedSender<InboundUdpSessionEvent>,
+}
+
+impl InboundUdpManager {
+    fn new(inbound: Weak<InboundHandler>, capacity: usize) -> Self {
+        let (ingress_tx, ingress_rx) = mpsc::channel(capacity.max(1));
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_udp_manager(
+            inbound.clone(),
+            ingress_rx,
+            command_rx,
+            capacity.max(1),
+        ));
+        Self {
+            ingress_tx,
+            command_tx,
+            next_session_id: AtomicU64::new(1),
         }
+    }
+
+    fn open_session(&self, capacity: usize) -> InboundUdpSessionChannels {
+        let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+        let (reply_tx, reply_rx) = mpsc::channel(capacity.max(1));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        InboundUdpSessionChannels {
+            session_id,
+            reply_tx,
+            reply_rx,
+            event_rx,
+            event_tx,
+        }
+    }
+
+    fn dispatch(&self, ingress: UdpIngress) -> UdpDispatchResult {
+        match self.ingress_tx.try_send(ingress) {
+            Ok(()) => UdpDispatchResult::Accepted,
+            Err(mpsc::error::TrySendError::Full(_)) => UdpDispatchResult::Dropped,
+            Err(mpsc::error::TrySendError::Closed(_)) => UdpDispatchResult::Closed,
+        }
+    }
+
+    fn close_flow(&self, flow: TunFlowKey) {
+        let _ = self.command_tx.send(UdpManagerCommand::CloseFlow(flow));
+    }
+
+    fn close_session(&self, session_id: u64) {
+        let _ = self
+            .command_tx
+            .send(UdpManagerCommand::CloseSession(session_id));
     }
 }
 
-impl Drop for InboundUdpFlows {
-    fn drop(&mut self) {
-        // An adapter can leave through a transport error before reaching its
-        // explicit async shutdown. Abort receiver tasks here so their cloned
-        // datagrams do not outlive the inbound session.
-        for state in self.flows.values() {
-            state.receiver_task.abort();
+enum UdpDispatchResult {
+    Accepted,
+    Dropped,
+    Closed,
+}
+
+async fn run_udp_manager(
+    inbound: Weak<InboundHandler>,
+    mut ingress_rx: mpsc::Receiver<UdpIngress>,
+    mut command_rx: mpsc::UnboundedReceiver<UdpManagerCommand>,
+    capacity: usize,
+) {
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let mut flows = HashMap::<UdpSourceKey, UdpFlowHandle>::new();
+    let mut pending_close = std::collections::HashSet::<TunFlowKey>::new();
+    let mut next_generation = 1u64;
+
+    loop {
+        tokio::select! {
+            Some(ingress) = ingress_rx.recv() => {
+                let Some(inbound_ref) = inbound.upgrade() else { break; };
+                let Some(key) = ingress.source_key(&inbound_ref.spec.id) else { continue; };
+                let generation = next_generation;
+                let handle = match flows.entry(key.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        match entry.get().data_tx.try_send(ingress) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
+                            Err(mpsc::error::TrySendError::Closed(ingress)) => {
+                                let old = entry.remove();
+                                let _ = old.cancel_tx.send(true);
+                                spawn_udp_flow(
+                                    Arc::downgrade(&inbound_ref),
+                                    key.clone(),
+                                    generation,
+                                    capacity,
+                                    ingress,
+                                    event_tx.clone(),
+                                )
+                            }
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(_) => {
+                        spawn_udp_flow(
+                            Arc::downgrade(&inbound_ref),
+                            key.clone(),
+                            generation,
+                            capacity,
+                            ingress,
+                            event_tx.clone(),
+                        )
+                    }
+                };
+                next_generation = next_generation.wrapping_add(1).max(1);
+                flows.insert(key, handle);
+            }
+            Some(command) = command_rx.recv() => {
+                match command {
+                    UdpManagerCommand::CloseFlow(flow) => {
+                        let mut matched = false;
+                        for handle in flows.values() {
+                            if handle.flow == Some(flow) {
+                                matched = true;
+                                let _ = handle.cancel_tx.send(true);
+                            }
+                        }
+                        if !matched {
+                            pending_close.insert(flow);
+                        }
+                    }
+                    UdpManagerCommand::CloseSession(session_id) => {
+                        let keys = flows
+                            .iter()
+                            .filter_map(|(key, handle)| (handle.session_id == session_id).then_some(key.clone()))
+                            .collect::<Vec<_>>();
+                        for key in keys {
+                            if let Some(handle) = flows.remove(&key) {
+                                let _ = handle.cancel_tx.send(true);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(event) = event_rx.recv() => {
+                match event {
+                    UdpFlowEvent::Opened { key, generation, flow } => {
+                        if let Some(handle) = flows.get_mut(&key)
+                            && handle.generation == generation
+                        {
+                            handle.flow = Some(flow);
+                            if pending_close.remove(&flow) {
+                                let _ = handle.cancel_tx.send(true);
+                            }
+                        }
+                    }
+                    UdpFlowEvent::Closed { key, generation } => {
+                        if flows.get(&key).is_some_and(|handle| handle.generation == generation) {
+                            flows.remove(&key);
+                        }
+                    }
+                }
+            }
+            else => break,
+        }
+    }
+
+    for handle in flows.into_values() {
+        let _ = handle.cancel_tx.send(true);
+        handle.join.abort();
+    }
+}
+
+fn spawn_udp_flow(
+    inbound: Weak<InboundHandler>,
+    key: UdpSourceKey,
+    generation: u64,
+    capacity: usize,
+    first: UdpIngress,
+    event_tx: mpsc::UnboundedSender<UdpFlowEvent>,
+) -> UdpFlowHandle {
+    let (data_tx, data_rx) = mpsc::channel(capacity.max(1));
+    let first_tx = data_tx.clone();
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let key_for_task = key.clone();
+    let join = tokio::spawn(async move {
+        let _ = first_tx.try_send(first);
+        UdpFlowWorker {
+            inbound,
+            key: key_for_task.clone(),
+            generation,
+            rx: data_rx,
+            cancel_rx,
+            event_tx: event_tx.clone(),
+            datagram: None,
+            flow: None,
+            reply_id: None,
+            reply_peer: None,
+            reply_tx: None,
+            observation: None,
+            last_seen: Instant::now(),
+        }
+        .run()
+        .await;
+        let _ = event_tx.send(UdpFlowEvent::Closed {
+            key: key_for_task,
+            generation,
+        });
+    });
+    UdpFlowHandle {
+        generation,
+        data_tx,
+        cancel_tx,
+        join,
+        flow: None,
+        session_id: key.session_id,
+    }
+}
+
+struct UdpFlowWorker {
+    inbound: Weak<InboundHandler>,
+    key: UdpSourceKey,
+    generation: u64,
+    rx: mpsc::Receiver<UdpIngress>,
+    cancel_rx: watch::Receiver<bool>,
+    event_tx: mpsc::UnboundedSender<UdpFlowEvent>,
+    datagram: Option<Arc<dyn AsyncDatagram>>,
+    flow: Option<TunFlowKey>,
+    reply_id: Option<UdpFlowId>,
+    reply_peer: Option<Endpoint>,
+    reply_tx: Option<mpsc::Sender<InboundUdpResponse>>,
+    observation: Option<yuhaiin_core::flow::FlowObserverGuard>,
+    last_seen: Instant,
+}
+
+impl UdpFlowWorker {
+    async fn run(mut self) {
+        let Some(inbound) = self.inbound.upgrade() else {
+            return;
+        };
+        let buffer_size = inbound.selector().udp_buffer_size().max(512);
+        let idle_timeout = udp_idle_timeout();
+        let mut buffer = vec![0u8; buffer_size];
+        let mut idle = Box::pin(tokio::time::sleep(idle_timeout));
+
+        loop {
+            if let Some(datagram) = self.datagram.clone() {
+                tokio::select! {
+                    packet = self.rx.recv() => {
+                        let Some(packet) = packet else { break; };
+                        if !self.process_packet(&inbound, packet).await { break; }
+                    }
+                    result = datagram.recv_from(&mut buffer) => {
+                        let Ok((length, target)) = result else { break; };
+                        self.last_seen = Instant::now();
+                        idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                        if !self.send_reply(target, buffer[..length].to_vec()) { break; }
+                    }
+                    _ = &mut idle => break,
+                    changed = self.cancel_rx.changed() => {
+                        if changed.is_err() || *self.cancel_rx.borrow() { break; }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    packet = self.rx.recv() => {
+                        let Some(packet) = packet else { break; };
+                        if !self.process_packet(&inbound, packet).await { break; }
+                    }
+                    _ = &mut idle => break,
+                    changed = self.cancel_rx.changed() => {
+                        if changed.is_err() || *self.cancel_rx.borrow() { break; }
+                    }
+                }
+            }
+            self.last_seen = Instant::now();
+            idle.as_mut()
+                .reset(tokio::time::Instant::now() + idle_timeout);
+        }
+
+        if let Some(datagram) = self.datagram.take() {
+            let _ = datagram.close().await;
+        }
+        drop(self.observation.take());
+    }
+
+    async fn process_packet(&mut self, inbound: &Arc<InboundHandler>, packet: UdpIngress) -> bool {
+        self.last_seen = Instant::now();
+        if let Some(answer) = inbound
+            .answer_datagram(&packet.target, &packet.payload)
+            .await
+        {
+            if let Ok(payload) = answer {
+                return Self::try_send_reply(
+                    &packet.reply_tx,
+                    InboundUdpResponse {
+                        id: packet.id,
+                        peer: packet.peer,
+                        target: packet.target,
+                        payload,
+                        flow: None,
+                    },
+                );
+            }
+            return true;
+        }
+
+        if self.datagram.is_none() {
+            let Some(source) = packet.peer.addr() else {
+                return false;
+            };
+            let opened = match inbound
+                .open_datagram(
+                    inbound.context_with_source(packet.peer.clone(), packet.target.clone()),
+                    source,
+                )
+                .await
+            {
+                Ok(opened) => opened,
+                Err(_) => return false,
+            };
+            let flow = opened.flow;
+            let observed = inbound.observe_datagram(opened);
+            self.datagram = Some(observed.datagram);
+            self.observation = Some(observed._observation);
+            self.flow = Some(flow);
+            self.reply_id = Some(packet.id.clone());
+            self.reply_peer = Some(packet.peer.clone());
+            self.reply_tx = Some(packet.reply_tx.clone());
+            let _ = self.event_tx.send(UdpFlowEvent::Opened {
+                key: self.key.clone(),
+                generation: self.generation,
+                flow,
+            });
+            let _ = packet
+                .event_tx
+                .send(InboundUdpSessionEvent::FlowOpened(flow));
+        }
+
+        let Some(datagram) = self.datagram.as_ref() else {
+            return false;
+        };
+        if datagram
+            .send_to(&packet.payload, packet.target)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        if let Some(flow) = self.flow {
+            inbound
+                .monitor()
+                .bytes(flow, FlowDirection::Upload, packet.payload.len());
+        }
+        true
+    }
+
+    fn send_reply(&mut self, target: Endpoint, payload: Vec<u8>) -> bool {
+        let (Some(reply_tx), Some(id), Some(peer), Some(flow)) = (
+            self.reply_tx.as_ref(),
+            self.reply_id.as_ref(),
+            self.reply_peer.as_ref(),
+            self.flow,
+        ) else {
+            return false;
+        };
+        if let Some(inbound) = self.inbound.upgrade() {
+            inbound
+                .monitor()
+                .bytes(flow, FlowDirection::Download, payload.len());
+        }
+        Self::try_send_reply(
+            reply_tx,
+            InboundUdpResponse {
+                id: id.clone(),
+                peer: peer.clone(),
+                target,
+                payload,
+                flow: Some(flow),
+            },
+        )
+    }
+
+    fn try_send_reply(
+        reply_tx: &mpsc::Sender<InboundUdpResponse>,
+        response: InboundUdpResponse,
+    ) -> bool {
+        match reply_tx.try_send(response) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 }
 
 pub(crate) struct InboundUdpSession<C> {
     codec: C,
-    flows: InboundUdpFlows,
+    inbound: Arc<InboundHandler>,
+    manager: Arc<InboundUdpManager>,
+    session_id: u64,
+    reply_rx: mpsc::Receiver<InboundUdpResponse>,
+    event_rx: mpsc::UnboundedReceiver<InboundUdpSessionEvent>,
+    reply_tx: mpsc::Sender<InboundUdpResponse>,
+    event_tx: mpsc::UnboundedSender<InboundUdpSessionEvent>,
 }
 
 impl<C> InboundUdpSession<C>
@@ -583,55 +876,67 @@ where
     C: InboundUdpCodec,
 {
     pub(crate) fn new(codec: C, inbound: Arc<InboundHandler>) -> Self {
+        let capacity = inbound.selector().udp_ringbuffer_size().max(1);
+        let channels = inbound.udp().open_session(capacity);
         Self {
             codec,
-            flows: InboundUdpFlows::new(inbound),
+            inbound: Arc::clone(&inbound),
+            manager: Arc::clone(inbound.udp()),
+            session_id: channels.session_id,
+            reply_rx: channels.reply_rx,
+            event_rx: channels.event_rx,
+            reply_tx: channels.reply_tx,
+            event_tx: channels.event_tx,
         }
     }
 
     pub(crate) async fn run(mut self) -> Result<()> {
-        let mut close_events = self.flows.subscribe_close_requests();
-        let idle_timeout = self.flows.idle_timeout();
-        let mut idle_tick = tokio::time::interval(idle_timeout);
+        let mut close_events = self.inbound.monitor().subscribe_close_requests();
+        let mut input_closed = false;
+        let mut pending_packets = 0usize;
+        let mut drain = Box::pin(tokio::time::sleep(Duration::from_secs(5)));
         let result = async {
             loop {
-                let (codec, flows) = (&mut self.codec, &mut self.flows);
                 tokio::select! {
-                    received = codec.recv() => {
-                        let Some(request) = received? else { break; };
-                        let response = InboundUdpResponse {
-                            id: request.id.clone(),
-                            peer: request.peer.clone(),
-                            target: request.target.clone(),
-                            payload: Vec::new(),
+                    received = self.codec.recv(), if !input_closed => {
+                        let Some(request) = received? else {
+                            input_closed = true;
+                            if pending_packets == 0 { break; }
+                            drain.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
+                            continue;
                         };
-                        match flows
-                            .handle_packet(
-                                request.id,
-                                request.peer,
-                                request.target,
-                                &request.payload,
-                            )
-                            .await?
-                        {
-                            InboundUdpPacket::Reply(payload) => {
-                                codec.send(InboundUdpResponse { payload, ..response }).await?;
-                            }
-                            InboundUdpPacket::Drop => {}
-                            InboundUdpPacket::Forward { flow } => codec.note_flow(flow),
+                        match self.manager.dispatch(UdpIngress {
+                            session_id: self.session_id,
+                            id: request.id,
+                            peer: request.peer,
+                            target: request.target,
+                            payload: request.payload,
+                            reply_tx: self.reply_tx.clone(),
+                            event_tx: self.event_tx.clone(),
+                        }) {
+                            UdpDispatchResult::Accepted => pending_packets += 1,
+                            UdpDispatchResult::Dropped => {}
+                            UdpDispatchResult::Closed => break,
                         }
                     }
-                    Some(reply) = flows.recv_reply() => {
-                        if let Some(reply) = flows.take_reply(reply) {
-                            codec.note_flow(reply.flow);
-                            codec.send(reply.into_response()).await?;
+                    Some(response) = self.reply_rx.recv() => {
+                        pending_packets = pending_packets.saturating_sub(1);
+                        if let Some(flow) = response.flow {
+                            self.codec.note_flow(flow);
+                        }
+                        self.codec.send(response).await?;
+                        if input_closed && pending_packets == 0 { break; }
+                    }
+                    Some(event) = self.event_rx.recv() => {
+                        match event {
+                            InboundUdpSessionEvent::FlowOpened(flow) => self.codec.note_flow(flow),
                         }
                     }
                     close_event = close_events.recv() => {
                         match close_event {
                             Ok(flow) => {
-                                let stop = codec.owns_flow(flow);
-                                flows.close_flow(flow).await;
+                                let stop = self.codec.owns_flow(flow);
+                                self.manager.close_flow(flow);
                                 if stop {
                                     break;
                                 }
@@ -640,13 +945,13 @@ where
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
-                    _ = idle_tick.tick() => flows.reap_expired().await,
+                    _ = &mut drain, if input_closed => break,
                 }
             }
             Ok(())
         }
         .await;
-        self.flows.shutdown().await;
+        self.manager.close_session(self.session_id);
         result
     }
 }

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -49,6 +48,7 @@ pub(crate) struct UdpFlowId {
     pub(crate) authentication: Option<[u8; 32]>,
 }
 
+#[allow(dead_code)]
 pub(crate) struct UdpFlowState {
     pub(crate) datagram: Arc<dyn AsyncDatagram>,
     pub(crate) receiver_task: tokio::task::JoinHandle<()>,
@@ -58,12 +58,7 @@ pub(crate) struct UdpFlowState {
     pub(crate) _observation: FlowObserverGuard,
 }
 
-pub(crate) struct UdpReply {
-    pub(crate) id: UdpFlowId,
-    pub(crate) target: Endpoint,
-    pub(crate) payload: Vec<u8>,
-}
-
+#[allow(dead_code)]
 pub(crate) async fn shutdown_udp_flow(state: UdpFlowState) {
     let UdpFlowState {
         datagram,
@@ -75,47 +70,13 @@ pub(crate) async fn shutdown_udp_flow(state: UdpFlowState) {
     let _ = datagram.close().await;
 }
 
-pub(crate) async fn close_udp_flows(
-    flows: &mut HashMap<UdpFlowId, UdpFlowState>,
-    flow: TunFlowKey,
-) {
-    let ids = flows
-        .iter()
-        .filter(|(_, state)| state.key == flow)
-        .map(|(id, _)| id.clone())
-        .collect::<Vec<_>>();
-    for id in ids {
-        if let Some(state) = flows.remove(&id) {
-            shutdown_udp_flow(state).await;
-        }
-    }
-}
-
+#[allow(dead_code)]
 pub(crate) fn udp_flow_expired(
     last_seen: std::time::Instant,
     now: std::time::Instant,
     timeout: Duration,
 ) -> bool {
     now.saturating_duration_since(last_seen) >= timeout
-}
-
-pub(crate) async fn reap_expired_udp_flows_with_timeout(
-    flows: &mut HashMap<UdpFlowId, UdpFlowState>,
-    timeout: Duration,
-) -> usize {
-    let now = std::time::Instant::now();
-    let ids = flows
-        .iter()
-        .filter(|(_, state)| udp_flow_expired(state.last_seen, now, timeout))
-        .map(|(id, _)| id.clone())
-        .collect::<Vec<_>>();
-    let count = ids.len();
-    for id in ids {
-        if let Some(state) = flows.remove(&id) {
-            shutdown_udp_flow(state).await;
-        }
-    }
-    count
 }
 
 #[derive(Clone)]
