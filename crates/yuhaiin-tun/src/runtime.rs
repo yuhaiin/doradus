@@ -12,16 +12,74 @@ impl ProxyInputInterceptor for PassthroughInputInterceptor {
     }
 }
 
+#[cfg(feature = "async-proxy")]
+const DEFAULT_TUN_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(feature = "async-proxy")]
+struct TunWrite {
+    packet: Vec<u8>,
+    identification: u32,
+}
+
+#[cfg(feature = "async-proxy")]
+struct TunWriter {
+    tx: mpsc::Sender<TunWrite>,
+    join: tokio::task::JoinHandle<io::Result<()>>,
+}
+
+#[cfg(feature = "async-proxy")]
+impl Drop for TunWriter {
+    fn drop(&mut self) {
+        self.join.abort();
+    }
+}
+
+#[cfg(feature = "async-proxy")]
+async fn write_tun_fragment(device: &AsyncDevice, packet: &[u8]) -> io::Result<()> {
+    let deadline = tokio::time::Instant::now() + DEFAULT_TUN_WRITE_STALL_TIMEOUT;
+
+    loop {
+        match device.try_send(packet) {
+            Ok(written) => {
+                if written != packet.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!("partial TUN write: {written}/{}", packet.len()),
+                    ));
+                }
+
+                return Ok(());
+            }
+
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                tokio::time::timeout_at(deadline, device.writable())
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TUN writer stalled"))??;
+            }
+
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                continue;
+            }
+
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub struct TunRuntime {
     #[cfg(feature = "tun-routes")]
     route_lease: Option<TunRouteLease>,
-    device: AsyncDevice,
+    device: Arc<AsyncDevice>,
     pub(crate) smoltcp_device: SmoltcpTunDevice,
     pub(crate) interface: Interface,
     buffer: Vec<u8>,
     ipv6_fragments: Ipv6FragmentReassembler,
     fragment_identification: AtomicU32,
     pcap_capture: Option<Arc<TunPcapCapture>>,
+
+    #[cfg(feature = "async-proxy")]
+    writer_queue_capacity: usize,
+
     #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
     configured_name: Option<String>,
 }
@@ -40,8 +98,10 @@ impl TunRuntime {
         let pcap_capture = TunPcapCapture::from_env()?;
         #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
         let configured_name = config.name.clone();
-        let mut smoltcp_device = SmoltcpTunDevice::new(config.mtu, config.queue_capacity)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let mut smoltcp_device =
+            SmoltcpTunDevice::new(config.mtu, config.queue_capacity).map_err(|error: Error| {
+                io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+            })?;
         let mut interface = Interface::new(
             Config::new(HardwareAddress::Ip),
             &mut smoltcp_device,
@@ -65,13 +125,17 @@ impl TunRuntime {
         Ok(Self {
             #[cfg(feature = "tun-routes")]
             route_lease: None,
-            device,
+            device: Arc::new(device),
             smoltcp_device,
             interface,
             buffer: vec![0; config.mtu.max(65535)],
             ipv6_fragments: Ipv6FragmentReassembler::default(),
             fragment_identification: AtomicU32::new(0),
             pcap_capture,
+
+            #[cfg(feature = "async-proxy")]
+            writer_queue_capacity: config.queue_capacity.max(1),
+
             #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
             configured_name,
         })
@@ -464,8 +528,12 @@ impl TunRuntime {
     {
         let started = std::time::Instant::now();
         tokio::pin!(shutdown);
+        let mut tun_writer = self.start_tun_writer();
+        let mut writer_backpressured = false;
+
         loop {
             let timestamp = elapsed_timestamp(started);
+
             let next_poll_delay = dispatcher.poll_delay(&mut self.interface, timestamp);
 
             let interceptor_output = tokio::select! {
@@ -474,28 +542,88 @@ impl TunRuntime {
                         proxy_runtime.close();
                         return Err(error);
                     }
+
                     None
                 }
-                _ = proxy_runtime.wait_for_output() => None,
-                output = interceptor.wait_for_output() => Some(output),
-                _ = TunRuntime::wait_smoltcp_timer(next_poll_delay) => None,
+
+                _ = proxy_runtime.wait_for_output() => {
+                    None
+                }
+
+                output = interceptor.wait_for_output() => {
+                    Some(output)
+                }
+
+                _ = TunRuntime::wait_smoltcp_timer(next_poll_delay) => {
+                    None
+                }
+
+                permit = tun_writer.tx.reserve(),
+                    if writer_backpressured =>
+                {
+                    if permit.is_err() {
+                        proxy_runtime.close();
+
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "TUN writer queue closed",
+                        ));
+                    }
+
+                    None
+                }
+
+                result = &mut tun_writer.join => {
+                    proxy_runtime.close();
+
+                    return match result {
+                        Ok(Ok(())) => Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "TUN writer stopped unexpectedly",
+                        )),
+
+                        Ok(Err(error)) => Err(error),
+
+                        Err(error) => Err(io::Error::other(
+                            format!(
+                                "TUN writer task failed: {error}"
+                            )
+                        )),
+                    };
+                }
+
                 _ = &mut shutdown => {
                     proxy_runtime
-                        .close_graceful(DEFAULT_GRACEFUL_CLOSE_TIMEOUT)
+                        .close_graceful(
+                            DEFAULT_GRACEFUL_CLOSE_TIMEOUT
+                        )
                         .await;
+
                     return Ok(());
                 }
             };
+
             if let Some(output) = interceptor_output {
                 self.apply_proxy_input_action(dispatcher, proxy_runtime, output)?;
             }
-            if let Err(error) = self
-                .drive_data_plane_once(dispatcher, proxy_runtime, started, interceptor)
+
+            writer_backpressured = match self
+                .drive_data_plane_once(
+                    dispatcher,
+                    proxy_runtime,
+                    started,
+                    interceptor,
+                    &tun_writer.tx,
+                )
                 .await
             {
-                proxy_runtime.close();
-                return Err(error);
-            }
+                Ok(backpressured) => backpressured,
+
+                Err(error) => {
+                    proxy_runtime.close();
+                    return Err(error);
+                }
+            };
         }
     }
 
@@ -506,7 +634,8 @@ impl TunRuntime {
         proxy_runtime: &mut TunProxyRuntime,
         started: std::time::Instant,
         interceptor: &mut I,
-    ) -> io::Result<()>
+        tun_writer: &mpsc::Sender<TunWrite>,
+    ) -> io::Result<bool>
     where
         I: ProxyInputInterceptor,
     {
@@ -533,13 +662,13 @@ impl TunRuntime {
             .map_err(|error| io::Error::other(error.to_string()))?;
 
         // smoltcp -> OS TUN
-        self.flush_to_tun().await?;
+        let writer_backpressured = self.flush_to_tun(tun_writer)?;
 
         // A current-thread runtime can keep the TUN reader ready while a
         // newly opened proxy is still connecting. Yield once per loop so flow
         // tasks get a chance to consume their bounded command queue.
         tokio::task::yield_now().await;
-        Ok(())
+        Ok(writer_backpressured)
     }
 
     #[cfg(feature = "async-proxy")]
@@ -609,9 +738,75 @@ impl TunRuntime {
     }
 
     #[cfg(feature = "async-proxy")]
-    async fn flush_to_tun(&self) -> io::Result<()> {
-        while let Some(_) = self.send_to_tun().await? {}
-        Ok(())
+    fn flush_to_tun(&self, writer: &mpsc::Sender<TunWrite>) -> io::Result<bool> {
+        loop {
+            let permit = match writer.try_reserve() {
+                Ok(permit) => permit,
+
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // true = writer backpressured
+                    return Ok(true);
+                }
+
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "TUN writer stopped",
+                    ));
+                }
+            };
+
+            let Some(packet) = self
+                .smoltcp_device
+                .take_tx()
+                .map_err(|error| io::Error::other(error.to_string()))?
+            else {
+                return Ok(false);
+            };
+
+            permit.send(TunWrite {
+                packet,
+                identification: self
+                    .fragment_identification
+                    .fetch_add(1, AtomicOrdering::Relaxed),
+            });
+        }
+    }
+
+    #[cfg(feature = "async-proxy")]
+    fn start_tun_writer(&self) -> TunWriter {
+        let (tx, mut rx) = mpsc::channel::<TunWrite>(self.writer_queue_capacity);
+
+        let device = Arc::clone(&self.device);
+        let capture = self.pcap_capture.clone();
+        let mtu = self.smoltcp_device.mtu();
+
+        let join = tokio::spawn(async move {
+            while let Some(write) = rx.recv().await {
+                let fragments = fragment_ip_packet(&write.packet, mtu, write.identification)
+                    .map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+
+                for fragment in fragments {
+                    if let Some(capture) = &capture {
+                        capture.record(&fragment);
+                    }
+
+                    tun_debug(format!(
+                        "TUN packet sending length={} prefix={:02x?}",
+                        fragment.len(),
+                        &fragment[..fragment.len().min(32)]
+                    ));
+
+                    write_tun_fragment(&device, &fragment).await?;
+                }
+            }
+
+            Ok(())
+        });
+
+        TunWriter { tx, join }
     }
 }
 

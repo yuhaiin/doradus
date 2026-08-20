@@ -529,24 +529,24 @@ fn spawn_tun_owner(
         .clone()
         .or_else(|| config.tun.name.clone())
         .unwrap_or_else(|| "tun".to_owned());
-    let name = config.tun.name.as_deref().unwrap_or("<unnamed>").to_owned();
-    monitor.info(format!("TUN inbound started name={name}"));
-    let Some(tun) = (match crate::data_plane::open_tun(&config) {
-        Ok(tun) => Some(tun),
-        Err(error) => {
-            monitor.error(format!("TUN inbound open failed name={name}: {error}"));
-            None
-        }
-    }) else {
-        return;
-    };
     let controller = controller.clone();
     let shutdown = shutdown.clone();
     let task_id = id.clone();
     tasks.insert(
         id,
         tokio::task::spawn_local(async move {
-            let result = crate::run_tun_device_until(controller, tun, config, shutdown).await;
+            let result = async {
+                let tun = crate::data_plane::open_tun(&config)?;
+
+                monitor.info(format!(
+                    "TUN inbound started name={}",
+                    config.tun.name.as_deref().unwrap_or("<unnamed>")
+                ));
+
+                crate::run_tun_device_until(controller, tun, config, shutdown).await
+            }
+            .await;
+
             let _ = completed_tx.send((task_id, result));
         }),
     );
