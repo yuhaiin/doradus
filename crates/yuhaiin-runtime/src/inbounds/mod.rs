@@ -8,18 +8,16 @@
 //! direct/proxy/bypass/drop changes after a reload without duplicating proxy
 //! construction logic.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::net::TcpListener;
+use tokio::sync::{oneshot, watch};
 
 use yuhaiin_core::process::{ProcessResolver, default_process_resolver};
 use yuhaiin_core::proxy::BoxAsyncStream;
@@ -39,7 +37,9 @@ pub(crate) use handler::{
 
 // Outbound SOCKS5 lives in yuhaiin-protocol; this module owns inbound policy
 // and flow lifetime.
+mod listeners;
 mod socks5;
+use listeners::{InboundOwners, InboundStartOptions, start_inbounds};
 
 #[cfg(feature = "doh-tls")]
 pub(crate) type InboundTlsAcceptor = tokio_rustls::TlsAcceptor;
@@ -78,7 +78,7 @@ pub fn fill_generated_fields(value: &mut serde_json::Value) -> Result<()> {
 /// wrappers: their `NewServer` functions return the supplied listener and do
 /// not alter accepted connections.  They therefore deliberately share the
 /// normal TCP listener path here.  Keeping the allow-list in one function
-/// prevents the compatibility check in `start_listeners` from drifting away
+/// prevents the compatibility check in `start_inbounds` from drifting away
 /// from the actual dispatch branches below.
 fn is_supported_inbound_transport(transport: &str) -> bool {
     transport.eq_ignore_ascii_case("normal")
@@ -188,9 +188,9 @@ impl UdpMode {
     }
 }
 
-/// Run all enabled inbounds and restart their socket listener set after a
-/// successful configuration reload. Desktop TUN has its own persistent
-/// supervisor so a socket reload cannot race device teardown and re-open.
+/// Run all enabled inbounds and restart the affected owner after a successful
+/// configuration reload. TUN, TProxy, Redir and normal socket protocols all
+/// use the same owner map, matching Go's `SaveContract` lifecycle.
 pub async fn run_until(
     controller: RuntimeController,
     shutdown: watch::Receiver<bool>,
@@ -215,24 +215,13 @@ async fn run_until_with_ready_signal(
     shutdown: watch::Receiver<bool>,
     selector_ready: Option<oneshot::Sender<()>>,
 ) -> Result<()> {
-    #[cfg(feature = "tun")]
-    {
-        let tun_controller = controller.clone();
-        let tun_shutdown = shutdown.clone();
-        let tun_task = tokio::task::spawn_local(async move {
-            run_desktop_tun_supervisor(tun_controller, tun_shutdown).await;
-        });
-
-        let result = run_until_inner(controller, shutdown, selector_ready).await;
-        if !tun_task.is_finished() {
-            tun_task.abort();
-        }
-        let _ = tun_task.await;
-        result
-    }
-
-    #[cfg(not(feature = "tun"))]
-    run_until_inner(controller, shutdown, selector_ready).await
+    run_until_inner(
+        controller,
+        shutdown,
+        selector_ready,
+        InboundStartOptions::default(),
+    )
+    .await
 }
 
 /// Run normal inbounds together with a TUN device created by the platform
@@ -270,90 +259,17 @@ pub async fn run_until_with_tun_runtime_selector_ready(
 async fn run_until_with_tun_runtime_ready(
     controller: RuntimeController,
     shutdown: watch::Receiver<bool>,
-    mut tun: yuhaiin_tun::TunRuntime,
+    tun: yuhaiin_tun::TunRuntime,
     config: crate::TunRuntimeConfig,
     selector_ready: Option<oneshot::Sender<()>>,
 ) -> Result<()> {
-    let tun_controller = controller.clone();
-    let tun_shutdown = shutdown.clone();
-    let tun_monitor = controller.monitor();
-    let tun_task = tokio::task::spawn_local(async move {
-        let mut config = config;
-        loop {
-            if config.enabled {
-                tun_monitor.info("TUN inbound started");
-                match crate::run_tun_device_until_ref(
-                    tun_controller.clone(),
-                    &mut tun,
-                    config.clone(),
-                    tun_shutdown.clone(),
-                )
-                .await
-                {
-                    Ok(()) if *tun_shutdown.borrow() => break,
-                    Ok(()) => {}
-                    Err(error) => {
-                        // A mobile host can start the supervisor before the
-                        // first usable proxy snapshot is available.  Keep
-                        // the inbound owner alive in that case: the next
-                        // API mutation/reload can make the runtime buildable
-                        // without requiring VpnService to recreate its fd.
-                        tun_monitor.error(format!(
-                            "injected TUN inbound stopped; waiting for reload: {error}"
-                        ));
-                        if crate::wait_for_shutdown_or_inbound_reload(
-                            &tun_controller,
-                            tun_shutdown.clone(),
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                        continue;
-                    }
-                }
-            } else {
-                tun_monitor.info("TUN inbound disabled");
-            }
-            if *tun_shutdown.borrow() {
-                break;
-            }
-
-            config = match crate::data_plane::load_tun_config_for_supervisor(
-                tun_controller.store(),
-                config.clone(),
-            )
-            .await
-            {
-                Ok(config) => config,
-                Err(error) => {
-                    tun_monitor.error(format!("reload TUN inbound config failed: {error}"));
-                    if crate::wait_for_shutdown_or_inbound_reload(
-                        &tun_controller,
-                        tun_shutdown.clone(),
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                    continue;
-                }
-            };
-            if !config.enabled
-                && crate::wait_for_shutdown_or_inbound_reload(&tun_controller, tun_shutdown.clone())
-                    .await
-            {
-                break;
-            }
-        }
-    });
-
-    let result = run_until_inner(controller, shutdown, selector_ready).await;
-    if !tun_task.is_finished() {
-        tun_task.abort();
-    }
-    let _ = tun_task.await;
-    result
+    run_until_inner(
+        controller,
+        shutdown,
+        selector_ready,
+        InboundStartOptions::with_injected_tun(tun, config),
+    )
+    .await
 }
 
 /// Run all normal inbounds together with a TUN descriptor created by the
@@ -392,246 +308,59 @@ pub async fn run_until_with_tun_fd_selector_ready(
         .await
 }
 
-/// Own desktop TUN devices independently from TCP/UDP listener reloads.
-///
-/// Go creates one listener owner per enabled TUN inbound. The desktop Rust
-/// owner mirrors that shape with one task/device/route lease per config while
-/// keeping the same shared proxy snapshot and reload boundary. Failed opens
-/// and failed dispatcher starts wait for a future reload instead of repeatedly
-/// retrying the same broken configuration.
-#[cfg(feature = "tun")]
-async fn run_desktop_tun_supervisor(
-    controller: RuntimeController,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let monitor = controller.monitor();
-    let mut reload = controller.subscribe_inbound_reload();
-    let mut configs = loop {
-        match crate::data_plane::load_tun_configs_for_desktop(controller.store()).await {
-            Ok(configs) => break configs,
-            Err(error) => {
-                monitor.error(format!("load TUN inbound config failed: {error}"));
-                if wait_for_shutdown_or_reload(&mut reload, shutdown.clone()).await {
-                    return;
-                }
-            }
-        }
-    };
-
-    let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
-    let mut tasks = HashMap::new();
-    for config in configs.iter().filter(|config| config.enabled) {
-        spawn_tun_owner(
-            &mut tasks,
-            config.clone(),
-            &controller,
-            &shutdown,
-            monitor.clone(),
-            completed_tx.clone(),
-        );
-    }
-    if tasks.is_empty() {
-        monitor.info("TUN inbound disabled");
-    }
-
-    loop {
-        if *shutdown.borrow() {
-            break;
-        }
-        tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break;
-                        }
-                    }
-                    changed = reload.recv() => {
-                        let Ok(event) = changed else { break; };
-                        match event {
-                            crate::controller::InboundReload::All => {
-                                abort_tun_owners(&mut tasks).await;
-                                let Some(new_configs) = load_tun_configs_for_supervisor(&controller, &mut reload, shutdown.clone()).await else { break; };
-                                configs = new_configs;
-                                for config in configs.iter().filter(|config| config.enabled) {
-                                    spawn_tun_owner(&mut tasks, config.clone(), &controller, &shutdown, monitor.clone(), completed_tx.clone());
-                                }
-                            }
-                            crate::controller::InboundReload::One(id) => {
-                                if !tasks.contains_key(&id) {
-                                    let Some(new_configs) = load_tun_configs_for_supervisor(&controller, &mut reload, shutdown.clone()).await else { break; };
-                                    configs = new_configs;
-                                    if let Some(config) = configs.iter().find(|config| config.inbound_id.as_deref() == Some(id.as_str()) && config.enabled) {
-                                        spawn_tun_owner(&mut tasks, config.clone(), &controller, &shutdown, monitor.clone(), completed_tx.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-              completed = completed_rx.recv() => {
-            let Some((id, result)) = completed else { break; };
-            tasks.remove(&id);
-
-            if let Err(error) = result {
-                monitor.error(format!(
-                    "TUN inbound owner stopped id={id}: {error}; restarting"
-                ));
-
-                // 避免 runtime 出现持续错误时疯狂创建/销毁 TUN。
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-
-            if *shutdown.borrow() {
-                break;
-            }
-
-            let Some(new_configs) =
-                load_tun_configs_for_supervisor(
-                    &controller,
-                    &mut reload,
-                    shutdown.clone(),
-                ).await
-            else {
-                break;
-            };
-
-            configs = new_configs;
-
-            if let Some(config) = configs.iter().find(
-                |config|
-                    config.inbound_id.as_deref() == Some(id.as_str())
-                    && config.enabled
-            ) {
-                spawn_tun_owner(
-                    &mut tasks,
-                    config.clone(),
-                    &controller,
-                    &shutdown,
-                    monitor.clone(),
-                    completed_tx.clone(),
-                );
-            }
-        }
-                }
-    }
-    abort_tun_owners(&mut tasks).await;
-}
-
-#[cfg(feature = "tun")]
-fn spawn_tun_owner(
-    tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
-    config: crate::data_plane::TunRuntimeConfig,
-    controller: &RuntimeController,
-    shutdown: &watch::Receiver<bool>,
-    monitor: Arc<ConnectionMonitor>,
-    completed_tx: mpsc::UnboundedSender<(String, Result<()>)>,
-) {
-    let id = config
-        .inbound_id
-        .clone()
-        .or_else(|| config.tun.name.clone())
-        .unwrap_or_else(|| "tun".to_owned());
-    let controller = controller.clone();
-    let shutdown = shutdown.clone();
-    let task_id = id.clone();
-    tasks.insert(
-        id,
-        tokio::task::spawn_local(async move {
-            let result = async {
-                let tun = crate::data_plane::open_tun(&config)?;
-
-                monitor.info(format!(
-                    "TUN inbound started name={}",
-                    config.tun.name.as_deref().unwrap_or("<unnamed>")
-                ));
-
-                crate::run_tun_device_until(controller, tun, config, shutdown).await
-            }
-            .await;
-
-            let _ = completed_tx.send((task_id, result));
-        }),
-    );
-}
-
-#[cfg(feature = "tun")]
-async fn abort_tun_owners(tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>) {
-    for (_, task) in tasks.drain() {
-        task.abort();
-        let _ = task.await;
-    }
-}
-
-#[cfg(feature = "tun")]
-async fn load_tun_configs_for_supervisor(
-    controller: &RuntimeController,
-    reload: &mut tokio::sync::broadcast::Receiver<crate::controller::InboundReload>,
-    shutdown: watch::Receiver<bool>,
-) -> Option<Vec<crate::data_plane::TunRuntimeConfig>> {
-    loop {
-        match crate::data_plane::load_tun_configs_for_desktop(controller.store()).await {
-            Ok(configs) => return Some(configs),
-            Err(error) => {
-                controller
-                    .monitor()
-                    .error(format!("reload TUN inbound config failed: {error}"));
-                if wait_for_shutdown_or_reload(reload, shutdown.clone()).await {
-                    return None;
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "tun")]
-async fn wait_for_shutdown_or_reload(
-    reload: &mut tokio::sync::broadcast::Receiver<crate::controller::InboundReload>,
-    mut shutdown: watch::Receiver<bool>,
-) -> bool {
-    if *shutdown.borrow() {
-        return true;
-    }
-    tokio::select! {
-        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
-        changed = reload.recv() => changed.is_err() && *shutdown.borrow(),
-    }
-}
-
 async fn run_until_inner(
     controller: RuntimeController,
     mut shutdown: watch::Receiver<bool>,
     mut selector_ready: Option<oneshot::Sender<()>>,
+    mut options: InboundStartOptions,
 ) -> Result<()> {
     let mut reload = controller.subscribe_inbound_reload();
-    let mut listeners = ListenerOwners::new();
+    let mut listeners = InboundOwners::new();
     let result = async {
-        'supervisor: loop {
-            abort_listeners(&mut listeners).await;
-            listeners = start_listeners(&controller, None).await?;
-            if let Some(selector_ready) = selector_ready.take() {
-                let _ = selector_ready.send(());
-            }
-            if *shutdown.borrow() {
-                break;
-            }
-            'listeners: loop {
-                tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break 'supervisor;
-                        }
+        abort_inbounds(&mut listeners).await;
+        listeners = start_inbounds(&controller, &shutdown, None, &mut options).await?;
+        if let Some(selector_ready) = selector_ready.take() {
+            let _ = selector_ready.send(());
+        }
+        if *shutdown.borrow() {
+            return Ok::<(), Error>(());
+        }
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
                     }
-                    changed = reload.recv() => {
-                        let Ok(event) = changed else { break 'supervisor; };
-                        match event {
-                            crate::controller::InboundReload::All => {
-                                // A single API operation can publish several
-                                // compatible reloads; the store and snapshot
-                                // are latest-wins, so discard intermediates.
-                                while reload.try_recv().is_ok() {}
-                                break 'listeners;
-                            }
-                            crate::controller::InboundReload::One(id) => {
-                                abort_listener_owner(&mut listeners, &id).await;
-                                let owner = start_listeners(&controller, Some(&id)).await?;
+                }
+                changed = reload.recv() => {
+                    let Ok(event) = changed else { break; };
+                    match event {
+                        crate::controller::InboundReload::All => {
+                            // A single API operation can publish several
+                            // compatible reloads; the store and snapshot
+                            // are latest-wins, so discard intermediates.
+                            while reload.try_recv().is_ok() {}
+                            let injected_id = options.injected_owner_id();
+                            abort_inbounds_except(&mut listeners, injected_id.as_deref()).await;
+                            let owners = start_inbounds(
+                                &controller,
+                                &shutdown,
+                                None,
+                                &mut options,
+                            )
+                            .await?;
+                            listeners.extend(owners);
+                        }
+                        crate::controller::InboundReload::One(id) => {
+                            if !options.is_injected_owner(&id) {
+                                abort_inbound_owner(&mut listeners, &id).await;
+                                let owner = start_inbounds(
+                                    &controller,
+                                    &shutdown,
+                                    Some(&id),
+                                    &mut options,
+                                )
+                                .await?;
                                 listeners.extend(owner);
                             }
                         }
@@ -642,515 +371,9 @@ async fn run_until_inner(
         Ok::<(), Error>(())
     }
     .await;
-    abort_listeners(&mut listeners).await;
+    abort_inbounds(&mut listeners).await;
 
     result
-}
-
-type ListenerOwners = HashMap<String, Vec<tokio::task::JoinHandle<()>>>;
-
-fn push_listener(listeners: &mut ListenerOwners, id: &str, listener: tokio::task::JoinHandle<()>) {
-    listeners.entry(id.to_owned()).or_default().push(listener);
-}
-
-async fn start_listeners(
-    controller: &RuntimeController,
-    only_id: Option<&str>,
-) -> Result<ListenerOwners> {
-    let records = controller.store().repository().list_go_inbounds().await?;
-    let inbound_auth = Arc::new(InboundAuth::from_users(
-        controller
-            .store()
-            .repository()
-            .list_go_user_records_for_runtime()
-            .await?,
-    ));
-    let (tcp_proxy_id, udp_proxy_id) = selected_proxy_ids(controller).await?;
-    let selector = controller
-        .build_proxy_selector_with_udp(
-            "",
-            &tcp_proxy_id,
-            &udp_proxy_id,
-            "",
-            "",
-            Duration::from_secs(30),
-        )
-        .await?;
-    let monitor = controller.monitor();
-    let mut listeners = HashMap::new();
-
-    async fn bind_tcp_listener(
-        listen: SocketAddr,
-        id: &str,
-        monitor: &ConnectionMonitor,
-    ) -> Option<TcpListener> {
-        match TcpListener::bind(listen).await {
-            Ok(listener) => Some(listener),
-            Err(error) => {
-                monitor.error(format!("skip inbound {id}: bind TCP {listen}: {error}"));
-                None
-            }
-        }
-    }
-
-    for record in records
-        .into_iter()
-        .filter(|record| record.enabled && !record.protocol_type.eq_ignore_ascii_case("tun"))
-    {
-        if only_id.is_some_and(|id| id != record.id) {
-            continue;
-        }
-        let mut spec = match InboundSpec::from_record(record.clone()) {
-            Ok(spec) => spec,
-            Err(error) => {
-                monitor.error(format!("skip inbound: {error}"));
-                continue;
-            }
-        };
-        spec.outbound_id = tcp_proxy_id.clone();
-        if inbound_auth.has_basic_users() || !inbound_auth.inbound_passwords().is_empty() {
-            spec.username.clear();
-            if inbound_auth.has_basic_users() {
-                spec.password.clear();
-            }
-            spec.auth = Some(Arc::clone(&inbound_auth));
-        }
-        if matches!(spec.protocol.as_str(), "yuubinsya" | "trojan")
-            && spec
-                .auth
-                .as_ref()
-                .is_some_and(|auth| auth.has_unrepresentable_password())
-        {
-            monitor.warn(format!(
-                "skip inbound {}: central user allowAnyPassword cannot be represented by {} password hashes",
-                spec.id, spec.protocol
-            ));
-            continue;
-        }
-        if !spec.transports.is_empty()
-            && spec
-                .transports
-                .iter()
-                .any(|transport| !is_supported_inbound_transport(transport))
-        {
-            monitor.warn(format!(
-                "skip inbound {}: configured transport is not implemented",
-                spec.id
-            ));
-            continue;
-        }
-        let tls_acceptor = match build_inbound_tls_acceptor(&record.data_json, &spec.transports) {
-            Ok(acceptor) => acceptor,
-            Err(error) => {
-                monitor.error(format!("skip inbound {}: {error}", spec.id));
-                continue;
-            }
-        };
-        if spec.protocol.eq_ignore_ascii_case("tproxy")
-            || spec.protocol.eq_ignore_ascii_case("redir")
-        {
-            if spec.udp_mode.udp_enabled() && spec.protocol.eq_ignore_ascii_case("tproxy") {
-                monitor.warn(format!(
-                    "start UDP inbound {}: Linux transparent UDP requires TPROXY ancillary data and CAP_NET_ADMIN",
-                    spec.id
-                ));
-            } else if spec.udp_mode.udp_enabled() {
-                monitor.warn(format!(
-                    "ignore UDP inbound {}: Go redir contract disables UDP",
-                    spec.id
-                ));
-            }
-            if spec
-                .transports
-                .iter()
-                .any(|transport| !is_supported_transparent_transport(transport))
-            {
-                monitor.warn(format!(
-                    "skip inbound {}: transparent listener transport is not implemented",
-                    spec.id
-                ));
-                continue;
-            }
-            #[cfg(target_os = "linux")]
-            {
-                let is_tproxy = spec.protocol.eq_ignore_ascii_case("tproxy");
-                let udp_enabled = spec.udp_mode.udp_enabled();
-                let udp_spec = spec.clone();
-                let protocol = spec.protocol.clone();
-                let listener_spec = spec;
-                let listener_selector = selector.clone();
-                let listener_monitor = monitor.clone();
-                let listener_tls_acceptor = tls_acceptor.clone();
-                let logs = listener_monitor.logs();
-                push_listener(
-                    &mut listeners,
-                    &listener_spec.id.clone(),
-                    tokio::spawn(async move {
-                        if let Err(error) = crate::proxy::transparent::serve_listener(
-                            listener_spec.listen,
-                            protocol,
-                            listener_spec,
-                            listener_selector,
-                            listener_monitor,
-                            listener_tls_acceptor,
-                        )
-                        .await
-                        {
-                            logs.error(format!("transparent inbound listener stopped: {error}"));
-                        }
-                    }),
-                );
-                if udp_enabled && is_tproxy {
-                    let selector = selector.clone();
-                    let monitor = monitor.clone();
-                    let spec = udp_spec;
-                    let logs = monitor.logs();
-                    push_listener(
-                        &mut listeners,
-                        &spec.id.clone(),
-                        tokio::spawn(async move {
-                            if let Err(error) = crate::proxy::transparent::serve_udp_listener(
-                                spec.listen,
-                                spec,
-                                selector,
-                                monitor,
-                            )
-                            .await
-                            {
-                                logs.error(format!("transparent UDP listener stopped: {error}"));
-                            }
-                        }),
-                    );
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            monitor.warn(format!(
-                "skip inbound {}: tproxy/redir require Linux socket support",
-                spec.id
-            ));
-            continue;
-        }
-        if has_transport(&spec.transports, "websocket") {
-            if spec.udp_mode.udp_enabled() {
-                monitor.warn(format!(
-                    "skip UDP inbound {}: WebSocket transport only wraps TCP listeners",
-                    spec.id
-                ));
-            }
-            if spec.udp_mode.tcp_enabled() {
-                let Some(listener) = bind_tcp_listener(spec.listen, &spec.id, &monitor).await
-                else {
-                    continue;
-                };
-                spec.listen = listener.local_addr().unwrap_or(spec.listen);
-                let selector = selector.clone();
-                let monitor = monitor.clone();
-                let spec = spec.clone();
-                let tls_acceptor = tls_acceptor.clone();
-                let logs = monitor.logs();
-                #[cfg(all(feature = "websocket", feature = "http2"))]
-                {
-                    if has_transport(&spec.transports, "http2") {
-                        push_listener(
-                            &mut listeners,
-                            &spec.id.clone(),
-                            tokio::spawn(async move {
-                                if let Err(error) = serve_websocket_h2_listener(
-                                    listener,
-                                    spec,
-                                    selector,
-                                    monitor,
-                                    tls_acceptor,
-                                )
-                                .await
-                                {
-                                    logs.error(format!(
-                                        "WebSocket+HTTP/2 inbound listener stopped: {error}"
-                                    ));
-                                }
-                            }),
-                        );
-                    } else {
-                        push_listener(
-                            &mut listeners,
-                            &spec.id.clone(),
-                            tokio::spawn(async move {
-                                if let Err(error) = serve_websocket_listener(
-                                    listener,
-                                    spec,
-                                    selector,
-                                    monitor,
-                                    tls_acceptor,
-                                )
-                                .await
-                                {
-                                    logs.error(format!(
-                                        "WebSocket inbound listener stopped: {error}"
-                                    ));
-                                }
-                            }),
-                        );
-                    }
-                }
-                #[cfg(all(feature = "websocket", not(feature = "http2")))]
-                {
-                    if has_transport(&spec.transports, "http2") {
-                        let _ = (listener, spec, selector, monitor, tls_acceptor);
-                        logs.warn(
-                            "skip inbound: WebSocket+HTTP/2 requires both websocket and http2 features",
-                        );
-                    } else {
-                        push_listener(
-                            &mut listeners,
-                            &spec.id.clone(),
-                            tokio::spawn(async move {
-                                if let Err(error) = serve_websocket_listener(
-                                    listener,
-                                    spec,
-                                    selector,
-                                    monitor,
-                                    tls_acceptor,
-                                )
-                                .await
-                                {
-                                    logs.error(format!(
-                                        "WebSocket inbound listener stopped: {error}"
-                                    ));
-                                }
-                            }),
-                        );
-                    }
-                }
-                #[cfg(not(feature = "websocket"))]
-                {
-                    let _ = (listener, spec, selector, monitor, tls_acceptor);
-                    logs.warn("skip inbound: WebSocket transport requires the websocket feature");
-                }
-            }
-            continue;
-        }
-        if has_transport(&spec.transports, "http2") {
-            if spec.udp_mode.udp_enabled() {
-                monitor.warn(format!(
-                    "skip UDP inbound {}: HTTP/2 transport only wraps TCP listeners",
-                    spec.id
-                ));
-            }
-            if spec.udp_mode.tcp_enabled() {
-                let Some(listener) = bind_tcp_listener(spec.listen, &spec.id, &monitor).await
-                else {
-                    continue;
-                };
-                spec.listen = listener.local_addr().unwrap_or(spec.listen);
-                let selector = selector.clone();
-                let monitor = monitor.clone();
-                let spec = spec.clone();
-                let tls_acceptor = tls_acceptor.clone();
-                let logs = monitor.logs();
-                #[cfg(feature = "http2")]
-                push_listener(
-                    &mut listeners,
-                    &spec.id.clone(),
-                    tokio::spawn(async move {
-                        if let Err(error) =
-                            serve_h2_listener(listener, spec, selector, monitor, tls_acceptor).await
-                        {
-                            logs.error(format!("HTTP/2 inbound listener stopped: {error}"));
-                        }
-                    }),
-                );
-                #[cfg(not(feature = "http2"))]
-                {
-                    let _ = (listener, spec, selector, monitor, tls_acceptor);
-                    logs.warn("skip inbound: HTTP/2 transport requires the http2 feature");
-                }
-            }
-            continue;
-        }
-        if spec.udp_mode.tcp_enabled()
-            || (spec.protocol.eq_ignore_ascii_case("vless") && spec.udp_mode.udp_enabled())
-        {
-            let Some(listener) = bind_tcp_listener(spec.listen, &spec.id, &monitor).await else {
-                continue;
-            };
-            spec.listen = listener.local_addr().unwrap_or(spec.listen);
-            let selector = selector.clone();
-            let monitor = monitor.clone();
-            let spec = spec.clone();
-            let tls_acceptor = tls_acceptor.clone();
-            let logs = monitor.logs();
-            push_listener(
-                &mut listeners,
-                &spec.id.clone(),
-                tokio::spawn(async move {
-                    if let Err(error) =
-                        serve_listener(listener, spec, selector, monitor, tls_acceptor).await
-                    {
-                        logs.error(format!("inbound listener stopped: {error}"));
-                    }
-                }),
-            );
-        }
-        if spec.udp_mode.udp_enabled() {
-            let selector = selector.clone();
-            let monitor = monitor.clone();
-            let spec = spec.clone();
-            let protocol = spec.protocol.trim();
-            if protocol.eq_ignore_ascii_case("yuubinsya") {
-                if tls_acceptor.is_some() {
-                    monitor.warn(format!(
-                        "skip UDP inbound {}: TLS transport only wraps TCP listeners",
-                        spec.id
-                    ));
-                    continue;
-                }
-                let password_hashes = spec
-                    .auth
-                    .as_ref()
-                    .map(|auth| {
-                        auth.inbound_passwords()
-                            .into_iter()
-                            .map(|password| yuhaiin_protocol::yuubinsya::derive_salt(&password))
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|passwords| !passwords.is_empty())
-                    .unwrap_or_else(|| {
-                        vec![yuhaiin_protocol::yuubinsya::derive_salt(
-                            spec.password.as_bytes(),
-                        )]
-                    });
-                let socket = if let Some(password) = spec.aead_password.clone() {
-                    let raw = match UdpSocket::bind(spec.listen).await {
-                        Ok(socket) => socket,
-                        Err(error) => {
-                            monitor.error(format!(
-                                "skip UDP inbound {}: bind AEAD Yuubinsya UDP {}: {error}",
-                                spec.id, spec.listen
-                            ));
-                            continue;
-                        }
-                    };
-                    yuhaiin_protocol::yuubinsya_udp::YuubinsyaUdpServer::new(
-                        Box::new(yuhaiin_protocol::aead::AeadUdpServer::new(
-                            raw,
-                            password,
-                            spec.aead_method,
-                        )),
-                        password_hashes[0],
-                        false,
-                    )
-                } else {
-                    // Go's Yuubinsya inbound uses the native packet
-                    // format without the SOCKS5 three-byte prefix.  The
-                    // prefix is only used when Yuubinsya wraps a SOCKS5
-                    // UDP association.
-                    match yuhaiin_protocol::yuubinsya_udp::YuubinsyaUdpServer::bind_with_password_hashes(
-                        spec.listen,
-                        password_hashes,
-                        false,
-                    )
-                    .await
-                    {
-                        Ok(socket) => socket,
-                        Err(error) => {
-                            monitor.error(format!(
-                                "skip UDP inbound {}: bind Yuubinsya UDP {}: {error}",
-                                spec.id, spec.listen
-                            ));
-                            continue;
-                        }
-                    }
-                };
-                let logs = monitor.logs();
-                let inbound_handler =
-                    InboundHandler::new(spec.clone(), Arc::clone(&selector), Arc::clone(&monitor));
-                push_listener(
-                    &mut listeners,
-                    &spec.id.clone(),
-                    tokio::spawn(async move {
-                        if let Err(error) =
-                            crate::proxy::yuubinsya::handle_udp(socket, inbound_handler).await
-                        {
-                            logs.error(format!("Yuubinsya UDP listener stopped: {error}"));
-                        }
-                    }),
-                );
-            } else if protocol.eq_ignore_ascii_case("socks5")
-                || protocol.eq_ignore_ascii_case("mixed")
-                || protocol.eq_ignore_ascii_case("mix")
-            {
-                if !supports_socks5_udp(&spec.protocol, spec.protocol_udp) {
-                    monitor.warn(format!(
-                        "skip UDP inbound {}: protocol {:?} has no UDP mode",
-                        spec.id, spec.protocol
-                    ));
-                    continue;
-                }
-                if tls_acceptor.is_some() {
-                    monitor.warn(format!(
-                        "skip UDP inbound {}: TLS transport only wraps TCP listeners",
-                        spec.id
-                    ));
-                    continue;
-                }
-                let socket = match UdpSocket::bind(spec.listen).await {
-                    Ok(socket) => socket,
-                    Err(error) => {
-                        monitor.error(format!(
-                            "skip UDP inbound {}: bind SOCKS5 UDP {}: {error}",
-                            spec.id, spec.listen
-                        ));
-                        continue;
-                    }
-                };
-                let logs = monitor.logs();
-                let inbound_handler =
-                    InboundHandler::new(spec.clone(), Arc::clone(&selector), Arc::clone(&monitor));
-                if let Some(password) = spec.aead_password.clone() {
-                    let socket = crate::inbound::socks5::AeadUdpSocket::new(
-                        socket,
-                        password,
-                        spec.aead_method,
-                    );
-                    push_listener(
-                        &mut listeners,
-                        &spec.id.clone(),
-                        tokio::spawn(async move {
-                            if let Err(error) = crate::inbound::socks5::serve_udp_socket(
-                                Box::new(socket),
-                                inbound_handler,
-                            )
-                            .await
-                            {
-                                logs.error(format!("AEAD SOCKS5 UDP listener stopped: {error}"));
-                            }
-                        }),
-                    );
-                } else {
-                    push_listener(
-                        &mut listeners,
-                        &spec.id.clone(),
-                        tokio::spawn(async move {
-                            if let Err(error) = crate::inbound::socks5::serve_udp_socket(
-                                Box::new(socket),
-                                inbound_handler,
-                            )
-                            .await
-                            {
-                                logs.error(format!("SOCKS5 UDP listener stopped: {error}"));
-                            }
-                        }),
-                    );
-                }
-            } else {
-                monitor.warn(format!(
-                    "skip UDP inbound {}: protocol {:?} has no UDP mode",
-                    spec.id, spec.protocol
-                ));
-            }
-        }
-    }
-    Ok(listeners)
 }
 
 pub async fn selected_proxy_ids(controller: &RuntimeController) -> Result<(String, String)> {
@@ -1217,7 +440,7 @@ pub async fn selected_proxy_id(controller: &RuntimeController) -> Result<String>
     Ok(selected_proxy_ids(controller).await?.0)
 }
 
-async fn abort_listeners(listeners: &mut ListenerOwners) {
+async fn abort_inbounds(listeners: &mut InboundOwners) {
     for (_, owner) in listeners.drain() {
         for listener in owner {
             listener.abort();
@@ -1226,12 +449,23 @@ async fn abort_listeners(listeners: &mut ListenerOwners) {
     }
 }
 
-async fn abort_listener_owner(listeners: &mut ListenerOwners, id: &str) {
+async fn abort_inbound_owner(listeners: &mut InboundOwners, id: &str) {
     if let Some(owner) = listeners.remove(id) {
         for listener in owner {
             listener.abort();
             let _ = listener.await;
         }
+    }
+}
+
+async fn abort_inbounds_except(listeners: &mut InboundOwners, keep_id: Option<&str>) {
+    let ids = listeners
+        .keys()
+        .filter(|id| Some(id.as_str()) != keep_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    for id in ids {
+        abort_inbound_owner(listeners, &id).await;
     }
 }
 
@@ -2355,7 +1589,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<S> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     #[cfg(feature = "websocket")]
     use futures_util::{SinkExt, StreamExt};
