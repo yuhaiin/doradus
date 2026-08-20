@@ -59,7 +59,6 @@ pub enum ProxyInput {
     },
 }
 
-#[cfg_attr(not(feature = "async-proxy"), allow(dead_code))]
 pub(crate) fn proxy_input_flow_key(event: &ProxyInput) -> TunFlowKey {
     match event {
         ProxyInput::TcpOpened { flow }
@@ -71,7 +70,6 @@ pub(crate) fn proxy_input_flow_key(event: &ProxyInput) -> TunFlowKey {
     }
 }
 
-#[cfg_attr(not(feature = "async-proxy"), allow(dead_code))]
 pub(crate) fn is_recoverable_proxy_flow_error(error: &Error) -> bool {
     // A bounded per-flow command queue being full is backpressure on one
     // flow. The event loop cleans up that flow and continues serving all
@@ -201,7 +199,6 @@ impl TunDispatcher {
     /// The async runtime uses this as a precise timer fallback for TCP
     /// retransmits and delayed ACKs. Data-plane events wake it immediately,
     /// so callers do not need a fixed-rate polling interval.
-    #[cfg(feature = "async-proxy")]
     pub(crate) fn poll_delay(
         &mut self,
         interface: &mut Interface,

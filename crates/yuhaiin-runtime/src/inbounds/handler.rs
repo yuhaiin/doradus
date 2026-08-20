@@ -33,14 +33,7 @@ use crate::{ConnectionMonitor, RuntimeProxySelector};
 /// Go evaluates this predicate in inbound.Inbound before dispatching to a
 /// protocol handler. Rust protocol adapters only own their wire framing and
 /// call this policy; they must not each decide whether a packet is DNS.
-pub(crate) trait InboundDnsHandler: Send + Sync {
-    fn should_hijack(&self, destination_port: Option<u16>, packet: &[u8]) -> bool;
-
-    fn answer<'a>(
-        &'a self,
-        packet: &'a [u8],
-    ) -> BoxFuture<'a, Option<yuhaiin_core::Result<Vec<u8>>>>;
-}
+pub(crate) use yuhaiin_types::inbound::InboundDnsHandler;
 
 #[derive(Clone)]
 pub(crate) struct InboundDnsPolicy {

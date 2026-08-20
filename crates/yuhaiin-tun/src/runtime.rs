@@ -2,39 +2,32 @@
 
 use super::*;
 
-#[cfg(feature = "async-proxy")]
 struct PassthroughInputInterceptor;
 
-#[cfg(feature = "async-proxy")]
 impl ProxyInputInterceptor for PassthroughInputInterceptor {
     fn intercept(&mut self, input: ProxyInput) -> Result<ProxyInputAction> {
         Ok(ProxyInputAction::Forward(input))
     }
 }
 
-#[cfg(feature = "async-proxy")]
 const DEFAULT_TUN_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[cfg(feature = "async-proxy")]
 struct TunWrite {
     packet: Vec<u8>,
     identification: u32,
 }
 
-#[cfg(feature = "async-proxy")]
 struct TunWriter {
     tx: mpsc::Sender<TunWrite>,
     join: tokio::task::JoinHandle<io::Result<()>>,
 }
 
-#[cfg(feature = "async-proxy")]
 impl Drop for TunWriter {
     fn drop(&mut self) {
         self.join.abort();
     }
 }
 
-#[cfg(feature = "async-proxy")]
 async fn write_tun_fragment(device: &AsyncDevice, packet: &[u8]) -> io::Result<()> {
     let deadline = tokio::time::Instant::now() + DEFAULT_TUN_WRITE_STALL_TIMEOUT;
 
@@ -77,7 +70,6 @@ pub struct TunRuntime {
     fragment_identification: AtomicU32,
     pcap_capture: Option<Arc<TunPcapCapture>>,
 
-    #[cfg(feature = "async-proxy")]
     writer_queue_capacity: usize,
 
     #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
@@ -133,7 +125,6 @@ impl TunRuntime {
             fragment_identification: AtomicU32::new(0),
             pcap_capture,
 
-            #[cfg(feature = "async-proxy")]
             writer_queue_capacity: config.queue_capacity.max(1),
 
             #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
@@ -403,7 +394,6 @@ impl TunRuntime {
         Ok(length)
     }
 
-    #[cfg(feature = "async-proxy")]
     fn expire_ipv6_fragments(&mut self) {
         self.ipv6_fragments.expire(StdInstant::now());
     }
@@ -454,7 +444,6 @@ impl TunRuntime {
     /// retransmission or delayed ACK timer.  The proxy runtime remains
     /// injectable; this method only owns lifecycle ordering and never selects
     /// a route by itself.
-    #[cfg(feature = "async-proxy")]
     pub async fn run_dispatcher(
         &mut self,
         dispatcher: &mut TunDispatcher,
@@ -480,7 +469,6 @@ impl TunRuntime {
     /// The shutdown branch is part of the runtime contract rather than an
     /// outer task convention: it closes all proxy flow tasks before returning
     /// so graceful stop and force-cancel have the same ownership boundary.
-    #[cfg(feature = "async-proxy")]
     pub async fn run_dispatcher_until<F>(
         &mut self,
         dispatcher: &mut TunDispatcher,
@@ -498,7 +486,6 @@ impl TunRuntime {
     /// Run the TUN data plane with a runtime-owned input policy boundary.
     /// Protocol policy can consume an event or enqueue a reply without
     /// teaching the TUN crate about DNS or any other inbound feature.
-    #[cfg(feature = "async-proxy")]
     pub async fn run_dispatcher_until_with_input_interceptor<F, I>(
         &mut self,
         dispatcher: &mut TunDispatcher,
@@ -514,7 +501,6 @@ impl TunRuntime {
             .await
     }
 
-    #[cfg(feature = "async-proxy")]
     async fn run_dispatcher_until_inner<F, I>(
         &mut self,
         dispatcher: &mut TunDispatcher,
@@ -627,7 +613,6 @@ impl TunRuntime {
         }
     }
 
-    #[cfg(feature = "async-proxy")]
     async fn drive_data_plane_once<I>(
         &mut self,
         dispatcher: &mut TunDispatcher,
@@ -671,7 +656,6 @@ impl TunRuntime {
         Ok(writer_backpressured)
     }
 
-    #[cfg(feature = "async-proxy")]
     fn dispatch_proxy_inputs<I>(
         &mut self,
         dispatcher: &mut TunDispatcher,
@@ -690,7 +674,6 @@ impl TunRuntime {
         Ok(())
     }
 
-    #[cfg(feature = "async-proxy")]
     fn apply_proxy_input_action(
         &mut self,
         dispatcher: &mut TunDispatcher,
@@ -737,7 +720,6 @@ impl TunRuntime {
         Ok(())
     }
 
-    #[cfg(feature = "async-proxy")]
     fn flush_to_tun(&self, writer: &mpsc::Sender<TunWrite>) -> io::Result<bool> {
         loop {
             let permit = match writer.try_reserve() {
@@ -773,7 +755,6 @@ impl TunRuntime {
         }
     }
 
-    #[cfg(feature = "async-proxy")]
     fn start_tun_writer(&self) -> TunWriter {
         let (tx, mut rx) = mpsc::channel::<TunWrite>(self.writer_queue_capacity);
 
@@ -810,7 +791,6 @@ impl TunRuntime {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 fn elapsed_timestamp(started: std::time::Instant) -> Instant {
     let elapsed = started.elapsed();
     Instant::from_micros(elapsed.as_micros().min(i64::MAX as u128) as i64)

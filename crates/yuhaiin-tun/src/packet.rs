@@ -81,7 +81,6 @@ pub(crate) fn should_proxy_icmp_request(
     source_is_local && !destination_is_local
 }
 
-#[cfg_attr(not(feature = "async-proxy"), allow(dead_code))]
 pub(crate) fn rewrite_icmp_echo_reply(packet: Vec<u8>, success: bool) -> Result<Vec<u8>> {
     let version = IpVersion::of_packet(&packet)
         .map_err(|_| Error::invalid("TUN ICMP packet is not IPv4 or IPv6"))?;

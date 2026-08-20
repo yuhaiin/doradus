@@ -17,36 +17,25 @@ pub use fakeip::{
 pub mod dns;
 pub use dns::*;
 pub mod dns_hosts;
-#[cfg(feature = "async-proxy")]
 pub use dns_hosts::AsyncHostsDnsHandler;
 pub use dns_hosts::{
     HostsDispatchTarget, HostsDnsHandler, HostsTable, HostsTarget, host_without_port,
 };
 pub mod dns_resolver;
 pub use dns_resolver::{DnsResolver, ResolverTransport};
-#[cfg(feature = "async-proxy")]
 pub mod dns_resolver_async;
-#[cfg(feature = "async-proxy")]
 pub use dns_resolver_async::{
     AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, SendAsyncDnsQuery, SystemAsyncIpResolver,
 };
-#[cfg(feature = "async-proxy")]
 pub mod dns_resolver_stack;
-#[cfg(feature = "async-proxy")]
 pub use dns_resolver_stack::AsyncHostsResolver;
-#[cfg(feature = "async-proxy")]
 mod dns_datagram;
-#[cfg(feature = "async-proxy")]
 pub use dns_datagram::{AsyncDnsDatagram, DnsDatagramConnector, probe_dns_udp};
 pub mod dns_tcp;
 pub use dns_tcp::{TcpDnsClient, TcpDnsServer};
-#[cfg(feature = "async-proxy")]
 pub mod dns_tcp_async;
-#[cfg(feature = "async-proxy")]
 pub use dns_tcp_async::{AsyncTcpDnsClient, AsyncTcpDnsHandler, AsyncTcpDnsServer};
-#[cfg(feature = "async-proxy")]
 pub mod dns_udp_async;
-#[cfg(feature = "async-proxy")]
 pub use dns_udp_async::{AsyncUdpDnsClient, AsyncUdpDnsHandler, AsyncUdpDnsServer};
 #[cfg(feature = "http2")]
 pub mod http2;
@@ -63,5 +52,4 @@ pub use dns_tls::{
     DnsIoStream, DnsStreamConnector, DnsTlsConnector, DnsTlsResolverConfig, DohResolverFactory,
     DotResolverFactory, RustCryptoH2Connector, RustCryptoTlsConnector, webpki_client_config,
 };
-#[cfg(feature = "async-proxy")]
 mod transport;

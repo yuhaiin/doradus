@@ -6,7 +6,6 @@ license.workspace = true
 
 [features]
 default = []
-async-proxy = ["yuhaiin-core/async-proxy"]
 
 [dependencies]
 memmap2 = "0.9.11"
@@ -15,14 +14,14 @@ yuhaiin-core = { path = "../yuhaiin-core" }
 [dev-dependencies]
 smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp"] }
 tokio = { version = "1.50.0", default-features = false, features = ["macros", "net", "rt", "sync", "time"] }
-yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
-yuhaiin-tun = { path = "../yuhaiin-tun", features = ["async-proxy"] }
-yuhaiin-store = { path = "../yuhaiin-store", features = ["async-dns"] }
+yuhaiin-core = { path = "../yuhaiin-core" }
+yuhaiin-protocol = { path = "../yuhaiin-protocol" }
+yuhaiin-tun = { path = "../yuhaiin-tun" }
+yuhaiin-store = { path = "../yuhaiin-store" }
 
 [[test]]
 name = "p0_flow"
 path = "tests/p0_flow.rs"
-required-features = ["async-proxy"]
 
 # Mapping immutable index files is the one deliberate unsafe boundary in this
 # crate; memmap2 validates the OS mapping and the rest of the trie remains safe.

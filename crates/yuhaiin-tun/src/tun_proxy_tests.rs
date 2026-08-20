@@ -1,9 +1,6 @@
-#[cfg(feature = "async-proxy")]
 use super::tun_test_support::*;
-#[cfg(feature = "async-proxy")]
 use super::*;
 
-#[cfg(feature = "async-proxy")]
 #[test]
 fn proxy_runtime_enriches_context_with_injected_process_metadata() {
     use crate::process::{ProcessInfo, ProcessResolver};
@@ -52,7 +49,6 @@ fn proxy_runtime_enriches_context_with_injected_process_metadata() {
     assert_eq!(context.user_id, Some(1000));
 }
 
-#[cfg(feature = "async-proxy")]
 #[test]
 fn proxy_runtime_reuses_process_metadata_for_one_local_udp_socket() {
     use crate::process::{ProcessInfo, ProcessResolver};
@@ -116,7 +112,6 @@ fn proxy_runtime_reuses_process_metadata_for_one_local_udp_socket() {
     assert_eq!(calls.load(Ordering::Acquire), 1);
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn proxy_runtime_relays_udp_event_through_direct_proxy() {
     use crate::proxy::{AsyncProxy, DirectAsyncProxy, StaticProxySelector};
@@ -207,7 +202,6 @@ async fn proxy_runtime_relays_udp_event_through_direct_proxy() {
     assert_eq!(udp.payload(), b"through-runtime");
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn proxy_runtime_shares_one_udp_proxy_per_source_for_full_cone_nat() {
     use crate::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, StaticProxySelector};
@@ -366,7 +360,6 @@ async fn proxy_runtime_shares_one_udp_proxy_per_source_for_full_cone_nat() {
     assert_eq!(table.len().unwrap(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn full_cone_udp_long_flow_reuses_one_relay_and_force_close_releases_it() {
     use crate::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, StaticProxySelector};
@@ -524,7 +517,6 @@ async fn full_cone_udp_long_flow_reuses_one_relay_and_force_close_releases_it() 
     assert_eq!(table.len().unwrap(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn full_cone_real_direct_tun_accepts_unseen_peer_and_force_closes_source() {
     use crate::proxy::{AsyncProxy, DirectAsyncProxy, StaticProxySelector};
@@ -727,7 +719,6 @@ async fn full_cone_real_direct_tun_accepts_unseen_peer_and_force_closes_source()
     let _ = server_b.await;
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn full_cone_runtime_restarts_after_aborting_multiple_real_udp_sockets() {
     use crate::proxy::{

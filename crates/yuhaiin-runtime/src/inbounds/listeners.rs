@@ -632,6 +632,7 @@ pub(super) async fn start_inbounds(
 }
 
 #[cfg(feature = "tun")]
+#[allow(clippy::large_enum_variant)]
 enum TunSource {
     Desktop,
     Injected(yuhaiin_tun::TunRuntime),

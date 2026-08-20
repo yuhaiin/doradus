@@ -8,7 +8,6 @@ use yuhaiin_core::{
     RouteMode,
 };
 
-#[cfg(feature = "async-proxy")]
 use yuhaiin_core::proxy::{AsyncProxy, AsyncProxySelector};
 
 use crate::{CombinedTrie, HostTrie};
@@ -582,7 +581,6 @@ impl RouterRuntime {
 /// router snapshot.  The selector deliberately lives in the trie crate rather
 /// than in `yuhaiin-core`, so the core packet/proxy contracts do not depend on
 /// a particular rule index implementation.
-#[cfg(feature = "async-proxy")]
 pub struct RoutedProxySelector {
     pub router: Arc<Router>,
     pub direct: Arc<dyn AsyncProxy>,
@@ -591,7 +589,6 @@ pub struct RoutedProxySelector {
     pub drop: Arc<dyn AsyncProxy>,
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncProxySelector for RoutedProxySelector {
     fn route_context(&self, context: &mut FlowContext) {
         self.router.apply_to_context(context);
@@ -613,7 +610,6 @@ impl AsyncProxySelector for RoutedProxySelector {
 /// for existing flows.  New TUN flows should use this selector so a published
 /// route update is observed at selection time, while an already selected
 /// proxy/session continues to own the old snapshot and is not retargeted.
-#[cfg(feature = "async-proxy")]
 pub struct RuntimeRoutedProxySelector {
     pub router: RouterRuntime,
     pub direct: Arc<dyn AsyncProxy>,
@@ -622,7 +618,6 @@ pub struct RuntimeRoutedProxySelector {
     pub drop: Arc<dyn AsyncProxy>,
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncProxySelector for RuntimeRoutedProxySelector {
     fn route_context(&self, context: &mut FlowContext) {
         self.router.apply_to_context(context);
@@ -638,7 +633,6 @@ impl AsyncProxySelector for RuntimeRoutedProxySelector {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 fn select_proxy(
     mode: RouteMode,
     direct: &Arc<dyn AsyncProxy>,
@@ -1159,7 +1153,6 @@ mod tests {
         assert!(decision.mode == RouteMode::Proxy || decision.mode == RouteMode::Direct);
     }
 
-    #[cfg(feature = "async-proxy")]
     #[test]
     fn routed_proxy_selector_uses_snapshot_and_honors_skip_route() {
         use std::sync::Arc;
@@ -1201,7 +1194,6 @@ mod tests {
         assert!(Arc::ptr_eq(&selected, &bypass));
     }
 
-    #[cfg(feature = "async-proxy")]
     #[test]
     fn runtime_routed_proxy_selector_observes_new_snapshots_without_retargeting_old_flows() {
         use yuhaiin_core::FlowContext;
@@ -1244,7 +1236,6 @@ mod tests {
         assert!(Arc::ptr_eq(&selector.select(&skipped), &bypass));
     }
 
-    #[cfg(feature = "async-proxy")]
     #[test]
     fn runtime_selector_keeps_old_flow_and_selects_whole_snapshots_under_pressure() {
         use yuhaiin_core::FlowContext;

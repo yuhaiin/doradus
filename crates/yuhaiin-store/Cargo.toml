@@ -6,10 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-async-proxy = ["yuhaiin-core/async-proxy"]
-async-dns = ["async-proxy"]
 tun-fakeip-smoke = [
-    "async-dns",
     "dep:bytes",
     "dep:h2",
     "dep:http",
@@ -17,7 +14,6 @@ tun-fakeip-smoke = [
     "dep:tokio",
     "yuhaiin-core/http2",
     "dep:yuhaiin-tun",
-    "yuhaiin-tun/async-proxy",
 ]
 sqlite-rusqlite-probe = []
 

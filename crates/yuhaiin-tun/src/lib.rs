@@ -15,7 +15,6 @@ use smoltcp::wire::{
 };
 use smoltcp::wire::{Icmpv4Message, Icmpv6Message};
 use std::borrow::Cow;
-#[cfg(feature = "async-proxy")]
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -28,7 +27,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
-#[cfg(feature = "async-proxy")]
 use std::time::Duration;
 use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 mod platform;
@@ -36,21 +34,14 @@ mod platform;
 pub use platform::DeviceBuilder;
 pub use platform::{AsyncDevice, async_device_from_owned_fd, enable_loopback};
 
-#[cfg(feature = "async-proxy")]
 use tokio::sync::mpsc;
 
-#[cfg(feature = "async-proxy")]
 use futures_util::stream::FuturesUnordered;
-#[cfg(feature = "async-proxy")]
 use futures_util::{FutureExt, StreamExt};
 
-#[cfg(feature = "async-proxy")]
 use yuhaiin_core::Endpoint;
-#[cfg(feature = "async-proxy")]
 use yuhaiin_core::RouteMode;
-#[cfg(feature = "async-proxy")]
 use yuhaiin_core::nat::{NatKey, NatTable};
-#[cfg(feature = "async-proxy")]
 use yuhaiin_core::process::{ProcessResolver, default_process_resolver};
 #[cfg(test)]
 pub use yuhaiin_core::{BoxFuture, DomainName, IpSet};
@@ -60,10 +51,8 @@ pub use yuhaiin_core::{FlowContext, LocalBoxFuture};
 pub use yuhaiin_core::{dns, process, proxy};
 
 pub use yuhaiin_core::flow::{Flow as TunFlow, FlowKey as TunFlowKey};
-#[cfg(feature = "async-proxy")]
 pub use yuhaiin_core::flow::{FlowDirection as TunFlowDirection, FlowObserver as TunFlowObserver};
 
-#[cfg(feature = "async-proxy")]
 use yuhaiin_core::proxy::{AsyncProxy, AsyncProxySelector, stream_local_addr, stream_remote_addr};
 
 mod config;
@@ -76,7 +65,6 @@ mod runtime;
 pub use config::*;
 pub use dispatcher::*;
 pub use packet::*;
-#[cfg(feature = "async-proxy")]
 pub use proxy_runtime::*;
 pub use runtime::*;
 #[allow(unused_imports)]
@@ -182,7 +170,6 @@ const IPV6_FRAGMENT_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 // datagram crosses the OS TUN boundary.
 const MAX_SMOLTCP_PACKET_SIZE: usize = 40 + u16::MAX as usize;
 
-#[cfg(feature = "async-proxy")]
 const DEFAULT_GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(test)]

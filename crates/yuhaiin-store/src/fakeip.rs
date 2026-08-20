@@ -14,9 +14,7 @@ pub use yuhaiin_dns::{
     reverse_name_to_ip,
 };
 
-#[cfg(feature = "async-dns")]
 use yuhaiin_core::BoxFuture;
-#[cfg(feature = "async-dns")]
 use yuhaiin_core::dns::{AsyncDnsHandler, decode_query, encode_response};
 
 use crate::{ConfigStore, FakeIpCursorRecord, FakeIpEntryRecord};
@@ -504,7 +502,6 @@ impl FakeIpAnswerTransform {
     }
 }
 
-#[cfg(feature = "async-dns")]
 pub trait AsyncDomainResolver {
     fn resolve<'a>(
         &'a self,
@@ -513,7 +510,6 @@ pub trait AsyncDomainResolver {
     ) -> BoxFuture<'a, Result<DnsResponse>>;
 }
 
-#[cfg(feature = "async-dns")]
 pub trait FakeIpResponseTransform {
     fn local_response<'a>(
         &'a self,
@@ -531,7 +527,6 @@ pub trait FakeIpResponseTransform {
     ) -> BoxFuture<'a, Result<DnsResponse>>;
 }
 
-#[cfg(feature = "async-dns")]
 impl FakeIpResponseTransform for FakeIpAnswerTransform {
     fn apply<'a>(
         &'a self,
@@ -545,7 +540,6 @@ impl FakeIpResponseTransform for FakeIpAnswerTransform {
     }
 }
 
-#[cfg(feature = "async-dns")]
 impl FakeIpResponseTransform for FakeIpV6AnswerTransform {
     fn apply<'a>(
         &'a self,
@@ -559,7 +553,6 @@ impl FakeIpResponseTransform for FakeIpV6AnswerTransform {
     }
 }
 
-#[cfg(feature = "async-dns")]
 impl FakeIpResponseTransform for FakeIpDualStackAnswerTransform {
     fn apply<'a>(
         &'a self,
@@ -571,7 +564,6 @@ impl FakeIpResponseTransform for FakeIpDualStackAnswerTransform {
     }
 }
 
-#[cfg(feature = "async-dns")]
 impl FakeIpResponseTransform for FakeIpPtrTransform {
     fn local_response<'a>(
         &'a self,
@@ -593,13 +585,11 @@ impl FakeIpResponseTransform for FakeIpPtrTransform {
     }
 }
 
-#[cfg(feature = "async-dns")]
 pub struct FakeIpAsyncDnsHandler<R, T = FakeIpAnswerTransform> {
     pub upstream: R,
     pub transform: T,
 }
 
-#[cfg(feature = "async-dns")]
 impl<R, T> AsyncDnsHandler for FakeIpAsyncDnsHandler<R, T>
 where
     R: AsyncDomainResolver + Send + Sync,

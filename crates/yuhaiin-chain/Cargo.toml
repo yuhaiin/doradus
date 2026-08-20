@@ -19,7 +19,7 @@ tokio = { version = "1.50.0", default-features = false, features = ["io-util", "
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["tls12"] }
 tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["handshake"] }
 webpki-roots = "1.0.3"
-yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
+yuhaiin-core = { path = "../yuhaiin-core" }
 yuhaiin-protocol = { path = "../yuhaiin-protocol", features = ["websocket"] }
 
 [lints]
@@ -28,8 +28,8 @@ workspace = true
 [dev-dependencies]
 smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp"] }
 sha2 = { version = "0.11.0", default-features = false }
-yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
-yuhaiin-tun = { path = "../yuhaiin-tun", features = ["async-proxy"] }
+yuhaiin-core = { path = "../yuhaiin-core" }
+yuhaiin-tun = { path = "../yuhaiin-tun" }
 
 [[bin]]
 name = "chain-smoke"

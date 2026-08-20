@@ -16,13 +16,20 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{Response, StatusCode, header};
 use tokio::io::DuplexStream;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 use yuhaiin_core::dns::{
-    DnsRecordType, DnsResponse, decode_query, decode_response, encode_query, encode_response,
+    AsyncDnsHandler, DnsRecordType, DnsResponse, decode_query, decode_response, encode_query,
+    encode_response,
 };
 use yuhaiin_core::http2::{H2DohClient, H2DohConnector};
-use yuhaiin_core::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
-use yuhaiin_core::{BoxFuture, DomainName, IpSet, LocalBoxFuture, Result as CoreResult};
+use yuhaiin_core::proxy::{
+    AsyncDatagram, AsyncProxy, BoxAsyncStream, DropAsyncProxy, StaticProxySelector,
+};
+use yuhaiin_core::{
+    BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, IpSet, Network,
+    Result as CoreResult,
+};
 use yuhaiin_store::ConfigStore;
 use yuhaiin_store::fakeip::{
     AsyncDomainResolver, FakeIpAnswerTransform, FakeIpAsyncDnsHandler, FakeIpConfig, FakeIpPool,
@@ -61,8 +68,98 @@ impl AsyncDomainResolver for DohResolver {
         &'a self,
         domain: &'a DomainName,
         record_type: DnsRecordType,
-    ) -> LocalBoxFuture<'a, CoreResult<DnsResponse>> {
+    ) -> BoxFuture<'a, CoreResult<DnsResponse>> {
         Box::pin(async move { self.client.query(domain, record_type).await })
+    }
+}
+
+struct FakeIpDnsProxy {
+    handler: Arc<dyn AsyncDnsHandler>,
+}
+
+struct FakeIpDnsDatagram {
+    handler: Arc<dyn AsyncDnsHandler>,
+    responses: Mutex<mpsc::Receiver<(Vec<u8>, Endpoint)>>,
+    response_tx: mpsc::Sender<(Vec<u8>, Endpoint)>,
+    local_addr: Endpoint,
+}
+
+impl AsyncProxy for FakeIpDnsProxy {
+    fn connect<'a>(
+        &'a self,
+        _context: &'a FlowContext,
+    ) -> BoxFuture<'a, CoreResult<BoxAsyncStream>> {
+        Box::pin(async {
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "fake-IP DNS proxy only supports UDP",
+            ))
+        })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        _context: &'a FlowContext,
+    ) -> BoxFuture<'a, CoreResult<Box<dyn AsyncDatagram>>> {
+        let (response_tx, response_rx) = mpsc::channel(16);
+        let datagram = FakeIpDnsDatagram {
+            handler: Arc::clone(&self.handler),
+            responses: Mutex::new(response_rx),
+            response_tx,
+            local_addr: Endpoint::ip(Network::Udp, "127.0.0.1:0".parse().expect("loopback")),
+        };
+        Box::pin(async move { Ok(Box::new(datagram) as Box<dyn AsyncDatagram>) })
+    }
+
+    fn close(&self) -> BoxFuture<'_, CoreResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl AsyncDatagram for FakeIpDnsDatagram {
+    fn send_to<'a>(
+        &'a self,
+        payload: &'a [u8],
+        target: Endpoint,
+    ) -> BoxFuture<'a, CoreResult<usize>> {
+        let handler = Arc::clone(&self.handler);
+        let response_tx = self.response_tx.clone();
+        Box::pin(async move {
+            let response = handler.answer(payload).await?;
+            response_tx
+                .send((response, target))
+                .await
+                .map_err(|_| Error::new(ErrorKind::Closed, "fake-IP DNS proxy closed"))?;
+            Ok(payload.len())
+        })
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buffer: &'a mut [u8],
+    ) -> BoxFuture<'a, CoreResult<(usize, Endpoint)>> {
+        Box::pin(async move {
+            let mut responses = self.responses.lock().await;
+            let Some((payload, source)) = responses.recv().await else {
+                return Err(Error::new(ErrorKind::Closed, "fake-IP DNS proxy closed"));
+            };
+            if payload.len() > buffer.len() {
+                return Err(Error::new(
+                    ErrorKind::Io,
+                    "fake-IP DNS response buffer is too small",
+                ));
+            }
+            buffer[..payload.len()].copy_from_slice(&payload);
+            Ok((payload.len(), source))
+        })
+    }
+
+    fn local_addr(&self) -> CoreResult<Endpoint> {
+        Ok(self.local_addr.clone())
+    }
+
+    fn close(&self) -> BoxFuture<'_, CoreResult<()>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -200,13 +297,6 @@ async fn async_main() -> io::Result<()> {
             InProcessDohConnector,
         ),
     };
-    let dns_handler = FakeIpAsyncDnsHandler {
-        upstream: resolver,
-        transform: FakeIpAnswerTransform {
-            pool: Arc::clone(&pool),
-        },
-    };
-
     let mut tun = TunRuntime::open(TunConfig {
         name: env::var("YUHAIIN_TUN_NAME").ok(),
         ipv4: Some((
@@ -270,16 +360,23 @@ async fn async_main() -> io::Result<()> {
         result.map(|_| ())
     });
 
+    let dns_proxy: Arc<dyn AsyncProxy> = Arc::new(FakeIpDnsProxy {
+        handler: Arc::new(FakeIpAsyncDnsHandler {
+            upstream: resolver,
+            transform: FakeIpAnswerTransform {
+                pool: Arc::clone(&pool),
+            },
+        }),
+    });
     let drop_proxy: Arc<dyn AsyncProxy> = Arc::new(DropAsyncProxy);
     let selector = Arc::new(StaticProxySelector {
         direct: Arc::clone(&drop_proxy),
-        proxy: Arc::clone(&drop_proxy),
+        proxy: dns_proxy,
         bypass: Arc::clone(&drop_proxy),
         drop: drop_proxy,
     });
-    let mut proxy_runtime = TunProxyRuntime::new(selector, 32)
-        .map_err(|error| io::Error::other(error.to_string()))?
-        .with_async_dns_handler(Arc::new(dns_handler));
+    let mut proxy_runtime =
+        TunProxyRuntime::new(selector, 32).map_err(|error| io::Error::other(error.to_string()))?;
     let mut dispatcher =
         TunDispatcher::new(2048, 2048, 16).map_err(|error| io::Error::other(error.to_string()))?;
     tun.run_dispatcher_until(&mut dispatcher, &mut proxy_runtime, async move {

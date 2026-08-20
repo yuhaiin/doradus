@@ -9,7 +9,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[cfg(feature = "async-proxy")]
 use futures_util::future::BoxFuture;
 use hickory_proto::op::{Edns, Message, MessageType, Query};
 use hickory_proto::rr::rdata::svcb::{
@@ -21,17 +20,15 @@ use hickory_proto::rr::{
 };
 
 use crate::{DomainName, Error, ErrorKind, IpSet, ResolveStrategy, Result};
+pub use yuhaiin_types::dns::{
+    AsyncDnsHandler, DnsHandler, DnsRecordType, DnsResponse, DnsServiceBinding, DnsServiceParam,
+};
 
-#[cfg(feature = "async-proxy")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DnsRecordType {
-    A,
-    Aaaa,
-    Ptr,
-    Https,
-    Svcb,
+trait DnsRecordTypeCodec {
+    fn hickory(self) -> RecordType;
 }
-impl DnsRecordType {
+
+impl DnsRecordTypeCodec for DnsRecordType {
     fn hickory(self) -> RecordType {
         match self {
             Self::A => RecordType::A,
@@ -43,31 +40,15 @@ impl DnsRecordType {
     }
 }
 
-/// A pure-Rust, protocol-neutral representation of an RFC 9460 service
-/// binding.  `target == None` represents the root name (`.`), which is a
-/// meaningful value in SVCB alias/service mode.  Keeping this model outside
-/// Hickory lets the resolver, FakeIP policy and persistent configuration
-/// remain independent of the wire codec while preserving unknown parameters.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsServiceBinding {
-    pub priority: u16,
-    pub target: Option<DomainName>,
-    pub params: Vec<DnsServiceParam>,
+trait DnsServiceParamCodec {
+    fn key(&self) -> u16;
+    fn from_hickory(key: SvcParamKey, value: &SvcParamValue) -> Result<Self>
+    where
+        Self: Sized;
+    fn to_hickory(&self) -> Result<(SvcParamKey, SvcParamValue)>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DnsServiceParam {
-    Mandatory(Vec<u16>),
-    Alpn(Vec<String>),
-    NoDefaultAlpn,
-    Port(u16),
-    Ipv4Hint(Vec<Ipv4Addr>),
-    Ech(Vec<u8>),
-    Ipv6Hint(Vec<Ipv6Addr>),
-    Unknown { key: u16, value: Vec<u8> },
-}
-
-impl DnsServiceParam {
+impl DnsServiceParamCodec for DnsServiceParam {
     fn key(&self) -> u16 {
         match self {
             Self::Mandatory(_) => 0,
@@ -174,7 +155,7 @@ fn service_binding_from_hickory(value: &SVCB) -> Result<DnsServiceBinding> {
     let params = value
         .svc_params
         .iter()
-        .map(|(key, value)| DnsServiceParam::from_hickory(*key, value))
+        .map(|(key, value)| <DnsServiceParam as DnsServiceParamCodec>::from_hickory(*key, value))
         .collect::<Result<Vec<_>>>()?;
     Ok(DnsServiceBinding {
         priority: value.svc_priority,
@@ -191,10 +172,10 @@ fn service_binding_to_hickory(binding: &DnsServiceBinding) -> Result<SVCB> {
             .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?,
     };
     let mut parameters = binding.params.clone();
-    parameters.sort_by_key(DnsServiceParam::key);
+    parameters.sort_by_key(|parameter| parameter.key());
     let mut params = parameters
         .iter()
-        .map(DnsServiceParam::to_hickory)
+        .map(|parameter| parameter.to_hickory())
         .collect::<Result<Vec<_>>>()?;
     params.sort_by_key(|(key, _)| u16::from(*key));
     if params
@@ -204,14 +185,6 @@ fn service_binding_to_hickory(binding: &DnsServiceBinding) -> Result<SVCB> {
         return Err(Error::invalid("SVCB parameter keys must be unique"));
     }
     Ok(SVCB::new(binding.priority, target, params))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsResponse {
-    pub addresses: IpSet,
-    pub ptr_names: Vec<DomainName>,
-    pub service_bindings: Vec<DnsServiceBinding>,
-    pub minimum_ttl: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -924,21 +897,11 @@ impl UdpDnsClient {
     }
 }
 
-pub trait DnsHandler: Send + Sync {
-    fn resolve(&self, domain: &DomainName, record_type: DnsRecordType) -> Result<DnsResponse>;
-}
-
-#[cfg(feature = "async-proxy")]
-pub trait AsyncDnsHandler: Send + Sync {
-    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>>;
-}
-#[cfg(feature = "async-proxy")]
 pub struct AsyncPolicyDnsHandler<H> {
     pub upstream: H,
     pub policy: DnsPolicy,
 }
 
-#[cfg(feature = "async-proxy")]
 impl<H: AsyncDnsHandler> AsyncDnsHandler for AsyncPolicyDnsHandler<H> {
     fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         match self.policy {
@@ -1084,7 +1047,7 @@ mod tests {
             ],
         };
         let mut expected = binding.clone();
-        expected.params.sort_by_key(DnsServiceParam::key);
+        expected.params.sort_by_key(|parameter| parameter.key());
         let alias = DnsServiceBinding {
             priority: 0,
             target: None,
@@ -1426,7 +1389,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "async-proxy")]
     #[tokio::test(flavor = "current_thread")]
     async fn async_dns_policy_is_cancellable_when_owner_drops_future() {
         use std::sync::Arc;

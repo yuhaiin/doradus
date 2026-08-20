@@ -159,6 +159,7 @@ where
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn relay_counted_with_prefix_and_buffer<A, B>(
     mut left: A,
     right: B,

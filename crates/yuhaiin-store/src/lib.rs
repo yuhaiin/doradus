@@ -13,12 +13,10 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod compat_proxy;
-#[cfg(feature = "async-proxy")]
 mod compat_proxy_async;
 mod compat_runtime;
 mod migration;
 mod repository;
-#[cfg(feature = "async-dns")]
 mod resolver;
 mod schema;
 mod sqlite;
@@ -46,7 +44,6 @@ pub use compat_runtime::{
     GoFakeIpRuntimeConfig, GoResolverRuntimeConfig, GoResolverTransport, GoRouteRuntimeConfig,
     GoUdpProxyFqdnStrategy,
 };
-#[cfg(feature = "async-dns")]
 pub use resolver::{FakeIpPolicy, FakeIpPools, FakeIpResolver};
 pub use statistics::{
     GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsSnapshot,

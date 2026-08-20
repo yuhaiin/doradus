@@ -13,6 +13,17 @@ use std::pin::Pin;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
+pub mod dns;
+pub use dns::{
+    AsyncDnsHandler, AsyncIpResolver, DnsHandler, DnsRecordType, DnsResponse, DnsServiceBinding,
+    DnsServiceParam,
+};
+
+pub mod inbound;
+pub use inbound::InboundDnsHandler;
+pub mod net;
+pub use net::{Endpoint, Network};
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DomainName(String);
 

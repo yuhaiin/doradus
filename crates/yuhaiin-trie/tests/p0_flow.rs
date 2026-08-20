@@ -19,13 +19,14 @@ use yuhaiin_core::dns::{
     AsyncDnsHandler, DnsRecordType, DnsResponse, decode_response, encode_query,
 };
 use yuhaiin_core::proxy::{
-    AsyncDatagram, AsyncProxy, BlockingStreamProxy, BoxAsyncStream, FixedAsyncProxy,
-    HttpProxyConnector, Socks5Connector, StaticProxySelector,
+    AsyncDatagram, AsyncProxy, BoxAsyncStream, FixedAsyncProxy, Socks5AsyncProxy,
+    StaticProxySelector,
 };
 use yuhaiin_core::{
     BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, IpSet, Network, ResolverPolicy,
     Result, RouteMode,
 };
+use yuhaiin_protocol::http::HttpProxy;
 use yuhaiin_store::ConfigStore;
 use yuhaiin_store::fakeip::{
     AsyncDomainResolver, FakeIpAnswerTransform, FakeIpAsyncDnsHandler, FakeIpConfig, FakeIpPool,
@@ -475,21 +476,22 @@ async fn run_stream_proxy_tun(kind: StreamProxyKind) {
         std::net::IpAddr::V4(address) => address,
         std::net::IpAddr::V6(_) => panic!("stream fixture unexpectedly used IPv6"),
     };
-    let connector: Arc<dyn yuhaiin_core::proxy::StreamConnector> = match kind {
-        StreamProxyKind::Http => Arc::new(HttpProxyConnector {
-            proxy: proxy_address,
-            timeout: Duration::from_secs(2),
-            username: None,
-            password: None,
-        }),
-        StreamProxyKind::Socks5 => Arc::new(Socks5Connector {
+    let proxy: Arc<dyn AsyncProxy> = match kind {
+        StreamProxyKind::Http => Arc::new(HttpProxy::new(
+            Arc::new(FixedAsyncProxy {
+                address: proxy_address,
+                timeout: Duration::from_secs(2),
+            }),
+            "",
+            "",
+        )),
+        StreamProxyKind::Socks5 => Arc::new(Socks5AsyncProxy {
             proxy: proxy_address,
             timeout: Duration::from_secs(2),
             username: None,
             password: None,
         }),
     };
-    let proxy: Arc<dyn AsyncProxy> = Arc::new(BlockingStreamProxy { connector });
     let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_core::proxy::DropAsyncProxy);
     let selector = Arc::new(yuhaiin_core::proxy::StaticProxySelector {
         direct: Arc::clone(&drop),

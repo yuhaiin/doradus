@@ -10,7 +10,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 
-#[cfg(feature = "async-proxy")]
 use crate::dns::AsyncDnsHandler;
 use crate::dns::{
     DnsRecordType, DnsResponse, decode_response, encode_query, validate_query_packet,
@@ -33,12 +32,10 @@ pub struct H2DohClient<C> {
 /// asynchronous DNS/TUN pipeline. The upstream query gets a fresh internal
 /// transaction ID, while the response is rebuilt from the original packet so
 /// callers keep their own ID and question flags.
-#[cfg(feature = "async-proxy")]
 pub struct H2DohDnsHandler<C> {
     pub client: H2DohClient<C>,
 }
 
-#[cfg(feature = "async-proxy")]
 impl<C> H2DohDnsHandler<C> {
     pub fn new(client: H2DohClient<C>) -> Self {
         Self { client }
@@ -158,7 +155,6 @@ impl<C: H2DohConnector> H2DohClient<C> {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl<C: H2DohConnector> AsyncDnsHandler for H2DohDnsHandler<C> {
     fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move { self.client.query_packet(packet).await })
@@ -266,7 +262,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "async-proxy")]
     #[test]
     fn async_doh_handler_preserves_the_original_dns_transaction() {
         use crate::IpSet;

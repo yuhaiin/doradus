@@ -1296,7 +1296,6 @@ fn https_and_svcb_hints_use_fakeip_without_losing_service_metadata() {
     );
 }
 
-#[cfg(feature = "async-dns")]
 #[test]
 fn ptr_transform_answers_local_ipv4_and_ipv6_hits_before_upstream() {
     use yuhaiin_core::dns::{AsyncDnsHandler, DnsRecordType, decode_response, encode_query};
@@ -1353,7 +1352,6 @@ fn ptr_transform_answers_local_ipv4_and_ipv6_hits_before_upstream() {
     }
 }
 
-#[cfg(feature = "async-dns")]
 #[test]
 fn ptr_transform_falls_back_to_upstream_for_unknown_mapping() {
     use yuhaiin_core::dns::{AsyncDnsHandler, DnsRecordType, decode_response, encode_query};
@@ -1396,7 +1394,6 @@ fn ptr_transform_falls_back_to_upstream_for_unknown_mapping() {
     assert_eq!(response.minimum_ttl, Some(12));
 }
 
-#[cfg(feature = "async-dns")]
 #[test]
 fn async_dns_handler_runs_upstream_then_fakeip_transform() {
     use yuhaiin_core::dns::{AsyncDnsHandler, DnsRecordType, decode_response, encode_query};
@@ -1441,7 +1438,6 @@ fn async_dns_handler_runs_upstream_then_fakeip_transform() {
     assert_eq!(response.addresses.v4, vec![Ipv4Addr::new(198, 18, 0, 1)]);
 }
 
-#[cfg(feature = "async-dns")]
 #[test]
 fn async_dns_handler_supports_ipv6_aaaa_transform() {
     use yuhaiin_core::dns::{AsyncDnsHandler, DnsRecordType, decode_response, encode_query};
@@ -1490,7 +1486,6 @@ fn async_dns_handler_supports_ipv6_aaaa_transform() {
     assert_eq!(response.minimum_ttl, Some(35));
 }
 
-#[cfg(feature = "async-dns")]
 #[test]
 fn async_dns_handler_supports_https_hint_transform() {
     use yuhaiin_core::dns::{AsyncDnsHandler, DnsRecordType, decode_response, encode_query};

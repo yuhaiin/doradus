@@ -26,9 +26,9 @@ echo "[tun-throughput] building release TUN smoke benchmark in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   cargo build \
-  -p yuhaiin-core \
+  -p yuhaiin-tun \
   --bin tun-smoke \
-  --features tun,async-proxy \
+  --features tun-routes \
   --release \
   >"${scenario_dir}/build.log"
 test -x "${binary}"

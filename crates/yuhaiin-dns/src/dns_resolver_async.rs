@@ -15,6 +15,7 @@ use crate::{BoxFuture, DomainName, IpSet, LocalBoxFuture, ResolveStrategy, Resul
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Notify;
+pub use yuhaiin_types::dns::AsyncIpResolver;
 
 type DnsFlightKey = (DomainName, u16);
 
@@ -36,58 +37,6 @@ impl AsyncDnsFlight {
 struct AsyncDnsResolverState {
     in_flight: Mutex<HashMap<DnsFlightKey, Arc<AsyncDnsFlight>>>,
     refreshing: Mutex<HashSet<DnsFlightKey>>,
-}
-
-/// Send-safe address resolution boundary shared by chain and base proxies.
-///
-/// The resolver owns policy, hosts overrides, FakeIP and upstream transport;
-/// consumers only receive addresses and never need to know whether the query
-/// used UDP, DoH or the system resolver.
-pub trait AsyncIpResolver: Send + Sync {
-    fn resolve<'a>(
-        &'a self,
-        domain: &'a DomainName,
-        strategy: ResolveStrategy,
-    ) -> BoxFuture<'a, Result<IpSet>>;
-
-    /// Resolve one DNS record while retaining non-address data such as PTR
-    /// names and HTTPS/SVCB service bindings.  Address-only consumers keep
-    /// using [`Self::resolve`]; packet-facing DNS servers use this method so
-    /// the runtime does not erase records at a trait-object boundary.
-    fn query<'a>(
-        &'a self,
-        domain: &'a DomainName,
-        record_type: DnsRecordType,
-    ) -> BoxFuture<'a, Result<DnsResponse>> {
-        Box::pin(async move {
-            let strategy = match record_type {
-                DnsRecordType::A => ResolveStrategy::OnlyIpv4,
-                DnsRecordType::Aaaa => ResolveStrategy::OnlyIpv6,
-                DnsRecordType::Ptr | DnsRecordType::Https | DnsRecordType::Svcb => {
-                    ResolveStrategy::Default
-                }
-            };
-            Ok(DnsResponse {
-                addresses: self.resolve(domain, strategy).await?,
-                ptr_names: Vec::new(),
-                service_bindings: Vec::new(),
-                minimum_ttl: Some(30),
-            })
-        })
-    }
-
-    /// Forward a complete DNS message without converting its QTYPE or
-    /// answer records into the address-oriented model above.  Implementations
-    /// backed by UDP/TCP/DoH override this method; policy layers forward it so
-    /// uncommon records remain usable through the runtime DNS server.
-    fn query_packet<'a>(&'a self, _packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
-        Box::pin(async {
-            Err(crate::Error::new(
-                crate::ErrorKind::Unsupported,
-                "resolver does not support raw DNS packet queries",
-            ))
-        })
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -236,7 +185,7 @@ impl SystemDnsClient {
         #[cfg(unix)]
         {
             let SystemDnsClientKey::Unix(server) = key;
-            return Ok(Self {
+            Ok(Self {
                 client: Arc::new(AsyncUdpDnsClient::new(
                     server,
                     std::time::Duration::from_secs(5),
@@ -246,7 +195,7 @@ impl SystemDnsClient {
                     Arc::from(Vec::new().into_boxed_slice()),
                     None,
                 )),
-            });
+            })
         }
         #[cfg(not(unix))]
         {

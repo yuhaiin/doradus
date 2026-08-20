@@ -4416,6 +4416,7 @@ dependencies = [
  "yuhaiin-store",
  "yuhaiin-trie",
  "yuhaiin-tun",
+ "yuhaiin-types",
  "yuhaiin-wireguard",
 ]
 
@@ -4448,6 +4449,7 @@ dependencies = [
  "smoltcp",
  "tokio",
  "yuhaiin-core",
+ "yuhaiin-protocol",
  "yuhaiin-store",
  "yuhaiin-tun",
 ]

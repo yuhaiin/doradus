@@ -9,14 +9,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 
-#[cfg(feature = "async-proxy")]
 use futures_util::future::BoxFuture;
 
 use crate::dns::{DnsHandler, DnsRecordType, DnsResponse};
 use crate::{DomainName, Error, ErrorKind, IpSet, Result};
 
-#[cfg(feature = "async-proxy")]
-#[cfg(feature = "async-proxy")]
 use crate::dns::{AsyncDnsHandler, decode_query, encode_response};
 
 /// Mutable owner for an immutable-at-read hosts snapshot.
@@ -524,13 +521,11 @@ impl<H: DnsHandler> DnsHandler for HostsDnsHandler<H> {
 }
 
 /// Async packet-level equivalent of [`HostsDnsHandler`].
-#[cfg(feature = "async-proxy")]
 pub struct AsyncHostsDnsHandler<H> {
     pub hosts: HostsTable,
     pub upstream: H,
 }
 
-#[cfg(feature = "async-proxy")]
 impl<H: AsyncDnsHandler> AsyncDnsHandler for AsyncHostsDnsHandler<H> {
     fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {

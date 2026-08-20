@@ -2,7 +2,6 @@
 
 use super::*;
 
-#[cfg(feature = "async-proxy")]
 pub(super) async fn run_tcp_proxy(
     proxy: Arc<dyn AsyncProxy>,
     mut context: crate::FlowContext,
@@ -111,7 +110,7 @@ pub(super) async fn run_tcp_proxy(
     }
 }
 
-#[cfg(feature = "async-proxy")]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_udp_proxy(
     proxy: Arc<dyn AsyncProxy>,
     mut context: crate::FlowContext,
@@ -255,7 +254,6 @@ pub(super) async fn run_udp_proxy(
     }
 }
 
-#[cfg(feature = "async-proxy")]
 async fn emit_output(
     output: &mpsc::Sender<ProxyOutput>,
     value: ProxyOutput,
@@ -267,7 +265,6 @@ async fn emit_output(
     )
 }
 
-#[cfg(feature = "async-proxy")]
 pub(super) async fn run_icmp_proxy(
     proxy: Arc<dyn AsyncProxy>,
     mut context: crate::FlowContext,

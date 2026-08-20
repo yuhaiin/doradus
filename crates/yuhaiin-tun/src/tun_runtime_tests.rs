@@ -1,9 +1,6 @@
-#[cfg(feature = "async-proxy")]
 use super::tun_test_support::*;
-#[cfg(feature = "async-proxy")]
 use super::*;
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn external_icmp_flow_uses_proxy_ping_and_writes_back_echo_reply() {
     use crate::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, StaticProxySelector};
@@ -137,7 +134,6 @@ async fn external_icmp_flow_uses_proxy_ping_and_writes_back_echo_reply() {
     ));
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn dropping_proxy_runtime_releases_full_cone_nat_tracking() {
     use crate::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
@@ -168,7 +164,6 @@ async fn dropping_proxy_runtime_releases_full_cone_nat_tracking() {
     assert_eq!(table.len().unwrap(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn graceful_proxy_runtime_close_signals_owned_tasks_then_releases_nat() {
     use crate::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
@@ -205,7 +200,6 @@ async fn graceful_proxy_runtime_close_signals_owned_tasks_then_releases_nat() {
     assert_eq!(table.len().unwrap(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn graceful_proxy_runtime_broadcasts_shutdown_when_one_command_queue_is_full() {
     use crate::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
@@ -258,7 +252,6 @@ async fn graceful_proxy_runtime_broadcasts_shutdown_when_one_command_queue_is_fu
     assert_eq!(runtime.task_len(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn tcp_input_backpressure_releases_only_the_affected_flow() {
     use crate::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
@@ -301,7 +294,6 @@ async fn tcp_input_backpressure_releases_only_the_affected_flow() {
     assert_eq!(table.len().unwrap(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn idle_timeout_closes_quiet_tcp_flow_and_releases_nat() {
     use crate::proxy::{AsyncProxy, DirectAsyncProxy, StaticProxySelector};
@@ -357,7 +349,6 @@ async fn idle_timeout_closes_quiet_tcp_flow_and_releases_nat() {
     let _ = server.await;
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn idle_timeout_closes_quiet_udp_source_and_releases_full_cone_nat() {
     use crate::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, StaticProxySelector};
@@ -459,7 +450,6 @@ async fn idle_timeout_closes_quiet_udp_source_and_releases_full_cone_nat() {
     assert_eq!(table.len().unwrap(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn full_cone_udp_input_backpressure_releases_the_shared_source() {
     use crate::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, StaticProxySelector};
@@ -537,7 +527,6 @@ async fn full_cone_udp_input_backpressure_releases_the_shared_source() {
     assert_eq!(table.len().unwrap(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn full_cone_udp_output_backpressure_closes_datagram_and_releases_nat() {
     use crate::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, StaticProxySelector};
@@ -669,7 +658,6 @@ async fn full_cone_udp_output_backpressure_closes_datagram_and_releases_nat() {
     assert_eq!(table.len().unwrap(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn full_cone_udp_repeated_transport_errors_release_shared_sources() {
     use crate::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, StaticProxySelector};
@@ -815,7 +803,6 @@ async fn full_cone_udp_repeated_transport_errors_release_shared_sources() {
     assert_eq!(closed.load(Ordering::Acquire), 32);
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn polling_finished_tcp_task_releases_nat_tracking() {
     use crate::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
@@ -851,7 +838,6 @@ async fn polling_finished_tcp_task_releases_nat_tracking() {
     assert_eq!(table.len().unwrap(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[cfg(any())]
 #[tokio::test(flavor = "current_thread")]
 async fn sync_dns_task_is_owned_and_releases_full_cone_mapping_on_force_close() {
@@ -914,7 +900,6 @@ async fn sync_dns_task_is_owned_and_releases_full_cone_mapping_on_force_close() 
     assert_eq!(table.len().unwrap(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[cfg(any())]
 #[tokio::test(flavor = "current_thread")]
 async fn sync_dns_completion_does_not_use_shared_proxy_output_queue() {
@@ -993,7 +978,6 @@ async fn sync_dns_completion_does_not_use_shared_proxy_output_queue() {
     assert_eq!(table.len().unwrap(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[cfg(any())]
 #[tokio::test(flavor = "current_thread")]
 async fn proxy_runtime_hijacks_dns_udp_flow_without_entering_proxy() {
@@ -1104,7 +1088,6 @@ async fn proxy_runtime_hijacks_dns_udp_flow_without_entering_proxy() {
     assert_eq!(response.addresses.v4, vec![Ipv4Addr::new(192, 0, 2, 1)]);
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn translated_udp_endpoint_conflict_releases_only_the_conflicting_source() {
     use crate::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
@@ -1172,7 +1155,6 @@ async fn translated_udp_endpoint_conflict_releases_only_the_conflicting_source()
     assert_eq!(table.len().unwrap(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[cfg(any())]
 #[tokio::test(flavor = "current_thread")]
 async fn pending_async_dns_does_not_block_tun_shutdown_and_releases_full_cone_flow() {
@@ -1249,7 +1231,6 @@ async fn pending_async_dns_does_not_block_tun_shutdown_and_releases_full_cone_fl
     assert_eq!(table.len().unwrap(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[cfg(any())]
 #[tokio::test(flavor = "current_thread")]
 async fn async_dns_upstream_timeout_closes_flow_and_releases_full_cone_mapping() {
@@ -1322,7 +1303,6 @@ async fn async_dns_upstream_timeout_closes_flow_and_releases_full_cone_mapping()
     assert_eq!(table.len().unwrap(), 0);
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn proxy_runtime_relays_established_tcp_flow_through_direct_proxy() {
     use crate::proxy::{AsyncProxy, DirectAsyncProxy, StaticProxySelector};

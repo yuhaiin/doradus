@@ -1,5 +1,4 @@
 use super::*;
-#[cfg(feature = "async-proxy")]
 use crate::dns::{DnsQuestion, decode_query, decode_response, encode_query};
 
 struct StaticUpstream;
@@ -304,10 +303,8 @@ fn hosts_ptr_reverse_lookup_matches_go_hosts_dispatch() {
     assert_eq!(v6.ptr_names, vec![v6_domain]);
 }
 
-#[cfg(feature = "async-proxy")]
 struct AsyncStaticUpstream;
 
-#[cfg(feature = "async-proxy")]
 impl AsyncDnsHandler for AsyncStaticUpstream {
     fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
@@ -328,7 +325,6 @@ impl AsyncDnsHandler for AsyncStaticUpstream {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 #[tokio::test(flavor = "current_thread")]
 async fn async_hosts_handler_answers_hosts_before_upstream() {
     let (hosts, domain) = hosts();

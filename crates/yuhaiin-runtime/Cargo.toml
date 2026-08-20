@@ -26,7 +26,7 @@ http-termination = [
     "hyper-util/server-auto",
     "hyper-util/tokio",
 ]
-tun = ["yuhaiin-tun/async-proxy"]
+tun = []
 tun-routes = ["tun", "yuhaiin-tun/tun-routes"]
 doh-tls = [
     "http2",
@@ -80,13 +80,14 @@ uuid = { version = "1.24.0", default-features = false, features = ["std", "v4"] 
 rand = { version = "0.10.2", default-features = false, features = ["std", "thread_rng"] }
 reqwest = { version = "0.12.28", optional = true, default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots-no-provider"] }
 yuhaiin-chain = { path = "../yuhaiin-chain" }
-yuhaiin-dns = { path = "../yuhaiin-dns", features = ["async-proxy"] }
-yuhaiin-core = { path = "../yuhaiin-core", features = ["async-proxy"] }
+yuhaiin-dns = { path = "../yuhaiin-dns" }
+yuhaiin-core = { path = "../yuhaiin-core" }
 yuhaiin-geo = { path = "../yuhaiin-geo" }
 yuhaiin-protocol = { path = "../yuhaiin-protocol" }
-yuhaiin-store = { path = "../yuhaiin-store", features = ["async-dns"] }
+yuhaiin-store = { path = "../yuhaiin-store" }
 yuhaiin-tun = { path = "../yuhaiin-tun" }
-yuhaiin-trie = { path = "../yuhaiin-trie", features = ["async-proxy"] }
+yuhaiin-trie = { path = "../yuhaiin-trie" }
+yuhaiin-types = { path = "../yuhaiin-types" }
 yuhaiin-wireguard = { path = "../yuhaiin-wireguard" }
 socket2 = { version = "0.6.5", features = ["all"] }
 

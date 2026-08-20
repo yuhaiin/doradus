@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::YuubinsyaUdpProxy;
+use crate::http::HttpProxy;
 use yuhaiin_core::proxy::{
-    AsyncProxy, BindInterfaceProxy, BlockingStreamProxy, DelayedDropAsyncProxy, DirectAsyncProxy,
-    DropAsyncProxy, FallbackAsyncProxy, FixedAsyncProxy, HttpProxyConnector, Socks5AsyncProxy,
-    StreamConnector,
+    AsyncProxy, BindInterfaceProxy, DelayedDropAsyncProxy, DirectAsyncProxy, DropAsyncProxy,
+    FallbackAsyncProxy, FixedAsyncProxy, Socks5AsyncProxy,
 };
 use yuhaiin_core::{Error, ErrorKind, Result};
 
@@ -96,12 +96,7 @@ impl BaseProxyConfig {
                 proxy,
                 username,
                 password,
-            } => Arc::new(blocking_connector(HttpProxyConnector {
-                proxy: *proxy,
-                timeout: self.timeout,
-                username: username.clone(),
-                password: password.clone(),
-            })),
+            } => http_proxy(*proxy, self.timeout, username.clone(), password.clone()),
             BaseProxyKind::HttpMany {
                 endpoints,
                 username,
@@ -177,12 +172,12 @@ fn fallback_http(
         .iter()
         .map(|endpoint| {
             bind_endpoint(
-                Arc::new(blocking_connector(HttpProxyConnector {
-                    proxy: endpoint.address,
+                http_proxy(
+                    endpoint.address,
                     timeout,
-                    username: username.clone(),
-                    password: password.clone(),
-                })),
+                    username.clone(),
+                    password.clone(),
+                ),
                 endpoint,
             )
         })
@@ -234,10 +229,24 @@ fn fallback_yuubinsya(
     Ok(Arc::new(FallbackAsyncProxy::new(proxies)?))
 }
 
-fn blocking_connector(connector: impl StreamConnector + 'static) -> BlockingStreamProxy {
-    BlockingStreamProxy {
-        connector: Arc::new(connector),
-    }
+fn http_proxy(
+    proxy: SocketAddr,
+    timeout: Duration,
+    username: Option<String>,
+    password: Option<String>,
+) -> Arc<dyn AsyncProxy> {
+    let (username, password) = match (username, password) {
+        (Some(username), Some(password)) => (username, password),
+        _ => (String::new(), String::new()),
+    };
+    Arc::new(HttpProxy::new(
+        Arc::new(FixedAsyncProxy {
+            address: proxy,
+            timeout,
+        }),
+        username,
+        password,
+    ))
 }
 
 #[cfg(test)]

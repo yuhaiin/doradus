@@ -1,21 +1,15 @@
 //! Async proxy task runtime for TUN flows.
 
-#[cfg(feature = "async-proxy")]
 use super::*;
-#[cfg(feature = "async-proxy")]
 use yuhaiin_core::process::ProcessInfo;
 
-#[cfg(feature = "async-proxy")]
 #[path = "proxy_output.rs"]
 mod proxy_output;
-#[cfg(feature = "async-proxy")]
 #[path = "proxy_tasks.rs"]
 mod proxy_tasks;
 
-#[cfg(feature = "async-proxy")]
 use proxy_tasks::{run_icmp_proxy, run_tcp_proxy, run_udp_proxy};
 
-#[cfg(feature = "async-proxy")]
 pub(crate) enum ProxyCommand {
     Data(Vec<u8>),
     Shutdown,
@@ -24,7 +18,6 @@ pub(crate) enum ProxyCommand {
 /// Result of a generic input interception boundary. The TUN crate does not
 /// know why an input was intercepted; protocol policy stays in the owning
 /// runtime (for example, inbound-wide DNS handling).
-#[cfg(feature = "async-proxy")]
 pub enum ProxyInputAction {
     Forward(ProxyInput),
 
@@ -40,7 +33,6 @@ pub enum ProxyInputAction {
     Drop,
 }
 
-#[cfg(feature = "async-proxy")]
 pub trait ProxyInputInterceptor: Send {
     /// Must not perform asynchronous I/O.
     fn intercept(&mut self, input: ProxyInput) -> Result<ProxyInputAction>;
@@ -60,7 +52,6 @@ pub trait ProxyInputInterceptor: Send {
 /// period in which a flow may make no progress at all.  Keeping these
 /// meanings separate lets callers tune UDP idle expiry without accidentally
 /// shortening a TLS/HTTP2 connect or a large backpressured write.
-#[cfg(feature = "async-proxy")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProxyTimeouts {
     pub connect: Duration,
@@ -69,7 +60,6 @@ pub struct ProxyTimeouts {
     pub idle: Duration,
 }
 
-#[cfg(feature = "async-proxy")]
 impl ProxyTimeouts {
     pub fn all(timeout: Duration) -> Result<Self> {
         let timeouts = Self {
@@ -94,7 +84,6 @@ impl ProxyTimeouts {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl Default for ProxyTimeouts {
     fn default() -> Self {
         Self {
@@ -106,7 +95,6 @@ impl Default for ProxyTimeouts {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 pub(crate) enum UdpProxyCommand {
     Data {
         flow: TunFlowKey,
@@ -117,7 +105,6 @@ pub(crate) enum UdpProxyCommand {
     Shutdown,
 }
 
-#[cfg(feature = "async-proxy")]
 pub(crate) enum ProxyOutput {
     TcpData {
         flow: TunFlowKey,
@@ -144,39 +131,33 @@ pub(crate) enum ProxyOutput {
     },
 }
 
-#[cfg(feature = "async-proxy")]
 pub(crate) struct ProxyTask {
     pub(crate) command: mpsc::Sender<ProxyCommand>,
     pub(crate) join: tokio::task::JoinHandle<()>,
 }
 
-#[cfg(feature = "async-proxy")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UdpSourceKey {
     network: Network,
     source: SocketAddr,
 }
 
-#[cfg(feature = "async-proxy")]
 pub(crate) struct UdpProxyTask {
     pub(crate) command: mpsc::Sender<UdpProxyCommand>,
     pub(crate) join: tokio::task::JoinHandle<()>,
     pub(crate) flows: HashSet<TunFlowKey>,
 }
 
-#[cfg(feature = "async-proxy")]
 pub(crate) struct IcmpProxyTask {
     flow: TunFlowKey,
     join: tokio::task::JoinHandle<()>,
 }
 
-#[cfg(feature = "async-proxy")]
 pub(crate) struct NatBinding {
     table: NatTable,
     idle_timeout: Duration,
 }
 
-#[cfg(feature = "async-proxy")]
 /// Bridges owned TUN events to async proxy tasks.
 ///
 /// The dispatcher remains the owner of smoltcp sockets.  Each flow task owns
@@ -184,7 +165,6 @@ pub(crate) struct NatBinding {
 /// channels.  This gives the packet side a visible backpressure boundary and
 /// ensures no blocking connector or async read/write is performed while
 /// `Interface::poll` holds mutable access to the packet engine.
-#[cfg(feature = "async-proxy")]
 pub struct TunProxyRuntime {
     selector: Arc<dyn AsyncProxySelector>,
     context_provider: Arc<dyn Fn(TunFlow) -> crate::FlowContext + Send + Sync>,
@@ -210,7 +190,6 @@ pub struct TunProxyRuntime {
     timeouts: ProxyTimeouts,
 }
 
-#[cfg(feature = "async-proxy")]
 impl TunProxyRuntime {
     pub fn new(selector: Arc<dyn AsyncProxySelector>, channel_capacity: usize) -> Result<Self> {
         if channel_capacity == 0 {
@@ -238,8 +217,8 @@ impl TunProxyRuntime {
             process_cache: HashMap::new(),
             process_cache_refs: HashMap::new(),
             udp_buffer_size: u16::MAX as usize,
-            proxy_output_tx: proxy_output_tx,
-            proxy_output_rx: proxy_output_rx,
+            proxy_output_tx,
+            proxy_output_rx,
             channel_capacity,
             timeouts: ProxyTimeouts::default(),
         })
@@ -823,7 +802,6 @@ impl TunProxyRuntime {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl Drop for TunProxyRuntime {
     fn drop(&mut self) {
         let flows: Vec<_> = self.tasks.keys().copied().collect();
@@ -858,7 +836,6 @@ impl Drop for TunProxyRuntime {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 pub(crate) fn nat_key(flow: TunFlowKey) -> NatKey {
     NatKey {
         network: flow.network,
@@ -867,7 +844,6 @@ pub(crate) fn nat_key(flow: TunFlowKey) -> NatKey {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 pub(crate) fn udp_source_key(flow: TunFlowKey) -> UdpSourceKey {
     UdpSourceKey {
         network: flow.network,

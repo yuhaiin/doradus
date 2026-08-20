@@ -584,7 +584,6 @@ fn go_node_runtime_keeps_unknown_protocols_but_rejects_malformed_json() {
     assert!(malformed.to_proxy_runtime_config().is_err());
 }
 
-#[cfg(feature = "async-proxy")]
 #[test]
 fn go_proxy_runtime_converts_core_base_transports_and_rejects_chain_layers() {
     use std::time::Duration;

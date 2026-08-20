@@ -1,45 +1,25 @@
-//! Synchronous stream proxy connectors.
-//!
-//! The connector is deliberately small: runtime-specific adapters can execute
-//! it on a blocking pool, while protocol-specific handshakes remain testable
-//! without Tokio. UDP/Yuubinsya are separate boundaries and do not share this
-//! TCP handshake state.
+//! Asynchronous stream and datagram proxy primitives.
 
-#[cfg(feature = "async-proxy")]
 use std::any::Any;
-#[cfg(feature = "async-proxy")]
 use std::collections::HashMap;
-use std::io::{Read, Write};
-#[cfg(feature = "async-proxy")]
 use std::net::Ipv6Addr;
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-#[cfg(feature = "async-proxy")]
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-#[cfg(feature = "async-proxy")]
 use std::sync::Mutex;
-#[cfg(feature = "async-proxy")]
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-#[cfg(feature = "async-proxy")]
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
-#[cfg(feature = "async-proxy")]
 use crate::DomainName;
+use crate::{BoxFuture, FlowContext, Network};
 use crate::{Endpoint, Error, ErrorKind, Result};
 
-#[cfg(feature = "async-proxy")]
-use crate::{BoxFuture, FlowContext, Network};
-
-#[cfg(feature = "async-proxy")]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-#[cfg(feature = "async-proxy")]
 use tokio::sync::Mutex as AsyncMutex;
-#[cfg(feature = "async-proxy")]
 use tokio::sync::Notify;
-#[cfg(feature = "async-proxy")]
 use tokio::time::Sleep;
 
 /// Internal marker used by the runtime for Go's `useDefaultInterface` mode.
@@ -48,176 +28,6 @@ use tokio::time::Sleep;
 /// is built.
 pub const DEFAULT_INTERFACE: &str = "__yuhaiin_default_interface__";
 
-pub trait StreamConnector: Send + Sync {
-    fn connect(&self, destination: &Endpoint) -> Result<TcpStream>;
-
-    fn connect_with_local(
-        &self,
-        destination: &Endpoint,
-        local_bind: Option<SocketAddr>,
-    ) -> Result<TcpStream> {
-        if local_bind.is_some() {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                "stream connector does not support a local bind address",
-            ));
-        }
-        self.connect(destination)
-    }
-
-    /// Connect while applying a node-level operating-system interface.
-    /// Implementations that do not create the socket themselves retain the
-    /// safe default and reject a non-empty interface rather than silently
-    /// dropping the setting.
-    fn connect_with_options(
-        &self,
-        destination: &Endpoint,
-        local_bind: Option<SocketAddr>,
-        bind_interface: Option<&str>,
-    ) -> Result<TcpStream> {
-        if bind_interface.is_some_and(|interface| !interface.trim().is_empty()) {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                "stream connector does not support a network interface",
-            ));
-        }
-        self.connect_with_local(destination, local_bind)
-    }
-
-    fn connect_target(&self) -> Option<SocketAddr> {
-        None
-    }
-}
-
-fn connect_std_tcp(
-    address: SocketAddr,
-    local_bind: Option<SocketAddr>,
-    timeout: Duration,
-) -> Result<TcpStream> {
-    connect_std_tcp_with_interface(address, local_bind, None, timeout)
-}
-
-fn connect_std_tcp_with_interface(
-    address: SocketAddr,
-    local_bind: Option<SocketAddr>,
-    bind_interface: Option<&str>,
-    timeout: Duration,
-) -> Result<TcpStream> {
-    let Some(local_bind) = local_bind else {
-        if bind_interface.is_none_or(|interface| interface.trim().is_empty()) {
-            return TcpStream::connect_timeout(&address, timeout)
-                .map_err(|error| Error::new(ErrorKind::Io, error.to_string()));
-        }
-        let socket = Socket::new(
-            if address.is_ipv4() {
-                Domain::IPV4
-            } else {
-                Domain::IPV6
-            },
-            Type::STREAM,
-            Some(Protocol::TCP),
-        )
-        .map_err(|error| Error::new(ErrorKind::Io, format!("create TCP socket: {error}")))?;
-        bind_socket_to_interface(&socket, interface_for_address(address, bind_interface))?;
-        socket
-            .connect_timeout(&address.into(), timeout)
-            .map_err(|error| Error::new(ErrorKind::Io, format!("connect TCP socket: {error}")))?;
-        return Ok(socket.into());
-    };
-    if local_bind.is_ipv4() != address.is_ipv4() {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            "local bind address and TCP destination use different address families",
-        ));
-    }
-    let socket = Socket::new(
-        if address.is_ipv4() {
-            Domain::IPV4
-        } else {
-            Domain::IPV6
-        },
-        Type::STREAM,
-        Some(Protocol::TCP),
-    )
-    .map_err(|error| Error::new(ErrorKind::Io, format!("create TCP socket: {error}")))?;
-    bind_socket_to_interface(&socket, interface_for_address(address, bind_interface))?;
-    socket
-        .bind(&local_bind.into())
-        .map_err(|error| Error::new(ErrorKind::Io, format!("bind TCP socket: {error}")))?;
-    socket
-        .connect_timeout(&address.into(), timeout)
-        .map_err(|error| Error::new(ErrorKind::Io, format!("connect TCP socket: {error}")))?;
-    Ok(socket.into())
-}
-
-fn resolve_std_tcp_addresses(destination: &Endpoint) -> Result<Vec<SocketAddr>> {
-    if let Some(address) = destination.addr() {
-        return Ok(vec![address]);
-    }
-    let host = destination
-        .host()
-        .ok_or_else(|| Error::invalid("direct destination has no host"))?;
-    let port = destination
-        .port()
-        .ok_or_else(|| Error::invalid("direct destination has no port"))?;
-    let addresses = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|error| {
-            Error::new(
-                ErrorKind::Io,
-                format!("resolve direct destination {host}:{port}: {error}"),
-            )
-        })?
-        .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        return Err(Error::new(
-            ErrorKind::Io,
-            format!("resolve direct destination {host}:{port}: no addresses"),
-        ));
-    }
-    Ok(addresses)
-}
-
-fn connect_direct_tcp(
-    destination: &Endpoint,
-    local_bind: Option<SocketAddr>,
-    timeout: Duration,
-) -> Result<TcpStream> {
-    connect_direct_tcp_with_interface(destination, local_bind, None, timeout)
-}
-
-fn connect_direct_tcp_with_interface(
-    destination: &Endpoint,
-    local_bind: Option<SocketAddr>,
-    bind_interface: Option<&str>,
-    timeout: Duration,
-) -> Result<TcpStream> {
-    let addresses = resolve_std_tcp_addresses(destination)?;
-    let mut last_error = None;
-    let mut family_mismatch = false;
-    for address in addresses {
-        if local_bind.is_some_and(|local| local.is_ipv4() != address.is_ipv4()) {
-            family_mismatch = true;
-            continue;
-        }
-        match connect_std_tcp_with_interface(address, local_bind, bind_interface, timeout) {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    if let Some(error) = last_error {
-        return Err(error);
-    }
-    if family_mismatch {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            "local bind address and TCP destination use different address families",
-        ));
-    }
-    Err(Error::invalid("direct destination has no usable address"))
-}
-
-#[cfg(feature = "async-proxy")]
 pub async fn connect_tokio_tcp(
     address: SocketAddr,
     local_bind: Option<SocketAddr>,
@@ -226,7 +36,6 @@ pub async fn connect_tokio_tcp(
     connect_tokio_tcp_with_interface(address, local_bind, None, timeout).await
 }
 
-#[cfg(feature = "async-proxy")]
 pub async fn connect_tokio_tcp_with_interface(
     address: SocketAddr,
     local_bind: Option<SocketAddr>,
@@ -360,7 +169,6 @@ fn bind_socket_to_interface_platform(_socket: &Socket, _interface: &str) -> Resu
     Ok(())
 }
 
-#[cfg(feature = "async-proxy")]
 fn bind_tokio_tcp_socket_to_interface(
     socket: &tokio::net::TcpSocket,
     bind_interface: Option<&str>,
@@ -371,10 +179,7 @@ fn bind_tokio_tcp_socket_to_interface(
     bind_tokio_tcp_socket_to_interface_platform(socket, &interface)
 }
 
-#[cfg(all(
-    feature = "async-proxy",
-    any(target_os = "android", target_os = "fuchsia", target_os = "linux")
-))]
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
 fn bind_tokio_tcp_socket_to_interface_platform(
     socket: &tokio::net::TcpSocket,
     interface: &str,
@@ -389,10 +194,7 @@ fn bind_tokio_tcp_socket_to_interface_platform(
         })
 }
 
-#[cfg(all(
-    feature = "async-proxy",
-    not(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))
-))]
+#[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
 fn bind_tokio_tcp_socket_to_interface_platform(
     _socket: &tokio::net::TcpSocket,
     _interface: &str,
@@ -400,7 +202,6 @@ fn bind_tokio_tcp_socket_to_interface_platform(
     Ok(())
 }
 
-#[cfg(feature = "async-proxy")]
 pub async fn bind_tokio_udp_socket_for_target(
     bind_address: SocketAddr,
     target: SocketAddr,
@@ -410,7 +211,6 @@ pub async fn bind_tokio_udp_socket_for_target(
     bind_tokio_udp_socket_with_target(bind_address, Some(target), bind_interface, label).await
 }
 
-#[cfg(feature = "async-proxy")]
 async fn bind_tokio_udp_socket_with_target(
     bind_address: SocketAddr,
     target: Option<SocketAddr>,
@@ -430,10 +230,7 @@ async fn bind_tokio_udp_socket_with_target(
     Ok(socket)
 }
 
-#[cfg(all(
-    feature = "async-proxy",
-    any(target_os = "android", target_os = "fuchsia", target_os = "linux")
-))]
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
 fn bind_tokio_udp_socket_to_interface(
     socket: &tokio::net::UdpSocket,
     interface: &str,
@@ -449,10 +246,7 @@ fn bind_tokio_udp_socket_to_interface(
         })
 }
 
-#[cfg(all(
-    feature = "async-proxy",
-    not(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))
-))]
+#[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
 fn bind_tokio_udp_socket_to_interface(
     _socket: &tokio::net::UdpSocket,
     _interface: &str,
@@ -460,330 +254,10 @@ fn bind_tokio_udp_socket_to_interface(
 ) -> Result<()> {
     Ok(())
 }
-pub trait SecureStream: Read + Write + Send {}
-impl<T: Read + Write + Send> SecureStream for T {}
-
-/// TLS is an injected protocol layer rather than a hard-coded crypto backend.
-/// A platform crate can implement this with rustls plus its selected provider
-/// and still reuse all direct/proxy handshakes from this crate.
-pub trait TlsClient: Send + Sync {
-    type Stream: SecureStream + 'static;
-
-    fn connect(&self, stream: TcpStream, server_name: &str) -> Result<Self::Stream>;
-}
-
-pub struct TlsStreamConnector<T> {
-    pub upstream: Arc<dyn StreamConnector>,
-    pub tls: T,
-}
-
-impl<T: TlsClient> TlsStreamConnector<T> {
-    pub fn connect_secure(&self, destination: &Endpoint) -> Result<T::Stream> {
-        let stream = self.upstream.connect(destination)?;
-        let server_name = destination
-            .host()
-            .map(|host| host.as_str().to_owned())
-            .or_else(|| destination.addr().map(|addr| addr.ip().to_string()))
-            .ok_or_else(|| Error::invalid("TLS destination has no server name"))?;
-        self.tls.connect(stream, &server_name)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct DirectConnector {
-    pub timeout: Duration,
-}
-
-impl StreamConnector for DirectConnector {
-    fn connect(&self, destination: &Endpoint) -> Result<TcpStream> {
-        connect_direct_tcp(destination, None, self.timeout)
-    }
-
-    fn connect_with_local(
-        &self,
-        destination: &Endpoint,
-        local_bind: Option<SocketAddr>,
-    ) -> Result<TcpStream> {
-        connect_direct_tcp(destination, local_bind, self.timeout)
-    }
-
-    fn connect_with_options(
-        &self,
-        destination: &Endpoint,
-        local_bind: Option<SocketAddr>,
-        bind_interface: Option<&str>,
-    ) -> Result<TcpStream> {
-        connect_direct_tcp_with_interface(destination, local_bind, bind_interface, self.timeout)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DropConnector;
-
-impl StreamConnector for DropConnector {
-    fn connect(&self, _destination: &Endpoint) -> Result<TcpStream> {
-        Err(Error::new(
-            ErrorKind::Closed,
-            "connection dropped by route policy",
-        ))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct FixedConnector {
-    pub address: SocketAddr,
-    pub timeout: Duration,
-}
-
-impl StreamConnector for FixedConnector {
-    fn connect(&self, _destination: &Endpoint) -> Result<TcpStream> {
-        connect_std_tcp(self.address, None, self.timeout)
-    }
-
-    fn connect_with_local(
-        &self,
-        _destination: &Endpoint,
-        local_bind: Option<SocketAddr>,
-    ) -> Result<TcpStream> {
-        connect_std_tcp(self.address, local_bind, self.timeout)
-    }
-
-    fn connect_with_options(
-        &self,
-        _destination: &Endpoint,
-        local_bind: Option<SocketAddr>,
-        bind_interface: Option<&str>,
-    ) -> Result<TcpStream> {
-        connect_std_tcp_with_interface(self.address, local_bind, bind_interface, self.timeout)
-    }
-
-    fn connect_target(&self) -> Option<SocketAddr> {
-        Some(self.address)
-    }
-}
-
-pub struct HttpProxyConnector {
-    pub proxy: SocketAddr,
-    pub timeout: Duration,
-    pub username: Option<String>,
-    pub password: Option<String>,
-}
-
-impl StreamConnector for HttpProxyConnector {
-    fn connect(&self, destination: &Endpoint) -> Result<TcpStream> {
-        self.connect_with_local(destination, None)
-    }
-
-    fn connect_with_local(
-        &self,
-        destination: &Endpoint,
-        local_bind: Option<SocketAddr>,
-    ) -> Result<TcpStream> {
-        self.connect_with_options(destination, local_bind, None)
-    }
-
-    fn connect_with_options(
-        &self,
-        destination: &Endpoint,
-        local_bind: Option<SocketAddr>,
-        bind_interface: Option<&str>,
-    ) -> Result<TcpStream> {
-        let mut stream =
-            connect_std_tcp_with_interface(self.proxy, local_bind, bind_interface, self.timeout)?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .and_then(|_| stream.set_write_timeout(Some(self.timeout)))
-            .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?;
-        let authority = authority(destination)?;
-        let mut request = format!(
-            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n"
-        );
-        if let (Some(username), Some(password)) = (&self.username, &self.password) {
-            request.push_str("Proxy-Authorization: Basic ");
-            request.push_str(&base64_basic(username, password));
-            request.push_str("\r\n");
-        }
-        request.push_str("\r\n");
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?;
-        let response = read_headers(&mut stream)?;
-        let status = response
-            .split_whitespace()
-            .nth(1)
-            .and_then(|value| value.parse::<u16>().ok())
-            .ok_or_else(|| Error::new(ErrorKind::Protocol, "invalid HTTP proxy response"))?;
-        if status / 100 != 2 {
-            return Err(Error::new(
-                ErrorKind::Protocol,
-                format!("HTTP proxy CONNECT failed with status {status}"),
-            ));
-        }
-        Ok(stream)
-    }
-
-    fn connect_target(&self) -> Option<SocketAddr> {
-        Some(self.proxy)
-    }
-}
-
-pub struct Socks5Connector {
-    pub proxy: SocketAddr,
-    pub timeout: Duration,
-    pub username: Option<String>,
-    pub password: Option<String>,
-}
-
-impl StreamConnector for Socks5Connector {
-    fn connect(&self, destination: &Endpoint) -> Result<TcpStream> {
-        self.connect_with_local(destination, None)
-    }
-
-    fn connect_with_local(
-        &self,
-        destination: &Endpoint,
-        local_bind: Option<SocketAddr>,
-    ) -> Result<TcpStream> {
-        self.connect_with_options(destination, local_bind, None)
-    }
-
-    fn connect_with_options(
-        &self,
-        destination: &Endpoint,
-        local_bind: Option<SocketAddr>,
-        bind_interface: Option<&str>,
-    ) -> Result<TcpStream> {
-        let mut stream =
-            connect_std_tcp_with_interface(self.proxy, local_bind, bind_interface, self.timeout)?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .and_then(|_| stream.set_write_timeout(Some(self.timeout)))
-            .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?;
-
-        let has_auth = self.username.is_some() && self.password.is_some();
-        let methods = if has_auth { vec![0, 2] } else { vec![0] };
-        stream
-            .write_all(&[5, methods.len() as u8])
-            .and_then(|_| stream.write_all(&methods))
-            .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?;
-        let mut selected = [0; 2];
-        stream
-            .read_exact(&mut selected)
-            .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?;
-        match selected[1] {
-            0 => {}
-            2 if has_auth => {
-                let username = self.username.as_deref().unwrap_or_default();
-                let password = self.password.as_deref().unwrap_or_default();
-                if username.len() > 255 || password.len() > 255 {
-                    return Err(Error::invalid("SOCKS5 credentials are too long"));
-                }
-                let mut auth = vec![1, username.len() as u8];
-                auth.extend_from_slice(username.as_bytes());
-                auth.push(password.len() as u8);
-                auth.extend_from_slice(password.as_bytes());
-                stream
-                    .write_all(&auth)
-                    .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?;
-                let mut response = [0; 2];
-                stream
-                    .read_exact(&mut response)
-                    .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?;
-                if response != [1, 0] {
-                    return Err(Error::new(
-                        ErrorKind::Protocol,
-                        "SOCKS5 authentication failed",
-                    ));
-                }
-            }
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::Protocol,
-                    "SOCKS5 no acceptable method",
-                ));
-            }
-        }
-
-        let (atyp, address) = socks_address(destination)?;
-        let mut request = vec![5, 1, 0, atyp];
-        request.extend_from_slice(&address);
-        request.extend_from_slice(&destination.port().unwrap_or_default().to_be_bytes());
-        stream
-            .write_all(&request)
-            .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?;
-        let mut head = [0; 4];
-        stream
-            .read_exact(&mut head)
-            .map_err(|error| Error::new(ErrorKind::Io, error.to_string()))?;
-        if head[1] != 0 {
-            return Err(Error::new(
-                ErrorKind::Protocol,
-                format!("SOCKS5 CONNECT failed with code {}", head[1]),
-            ));
-        }
-        let remaining = match head[3] {
-            1 => 4 + 2,
-            4 => 16 + 2,
-            3 => {
-                let mut length = [0; 1];
-                stream.read_exact(&mut length).map_err(io_error)?;
-                usize::from(length[0]) + 2
-            }
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::Protocol,
-                    "invalid SOCKS5 address type",
-                ));
-            }
-        };
-        let mut discard = vec![0; remaining];
-        stream.read_exact(&mut discard).map_err(io_error)?;
-        Ok(stream)
-    }
-
-    fn connect_target(&self) -> Option<SocketAddr> {
-        Some(self.proxy)
-    }
-}
-
-pub struct FixedProxy {
-    pub inner: Arc<dyn StreamConnector>,
-}
-
-impl StreamConnector for FixedProxy {
-    fn connect(&self, destination: &Endpoint) -> Result<TcpStream> {
-        self.inner.connect(destination)
-    }
-
-    fn connect_with_local(
-        &self,
-        destination: &Endpoint,
-        local_bind: Option<SocketAddr>,
-    ) -> Result<TcpStream> {
-        self.inner.connect_with_local(destination, local_bind)
-    }
-
-    fn connect_with_options(
-        &self,
-        destination: &Endpoint,
-        local_bind: Option<SocketAddr>,
-        bind_interface: Option<&str>,
-    ) -> Result<TcpStream> {
-        self.inner
-            .connect_with_options(destination, local_bind, bind_interface)
-    }
-
-    fn connect_target(&self) -> Option<SocketAddr> {
-        self.inner.connect_target()
-    }
-}
-
-#[cfg(feature = "async-proxy")]
 pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send + Any {
     fn as_any(&self) -> &dyn Any;
 }
 
-#[cfg(feature = "async-proxy")]
 impl<T> AsyncStream for T
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + Any,
@@ -793,21 +267,18 @@ where
     }
 }
 
-#[cfg(feature = "async-proxy")]
 pub type BoxAsyncStream = Box<dyn AsyncStream>;
 
 /// Preserve the socket's local endpoint while protocol layers replace the
 /// concrete stream type (TLS, HTTP/2, Yuubinsya, and WebSocket all do this).
 /// The runtime uses this metadata for loopback protection; it is deliberately
 /// optional because in-memory test streams do not have a socket endpoint.
-#[cfg(feature = "async-proxy")]
 pub struct LocalAddrStream {
     inner: BoxAsyncStream,
     local_addr: Option<SocketAddr>,
     remote_addr: Option<SocketAddr>,
 }
 
-#[cfg(feature = "async-proxy")]
 impl LocalAddrStream {
     pub fn new(inner: BoxAsyncStream, local_addr: SocketAddr) -> Self {
         Self {
@@ -838,7 +309,6 @@ impl LocalAddrStream {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncRead for LocalAddrStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -849,7 +319,6 @@ impl AsyncRead for LocalAddrStream {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncWrite for LocalAddrStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -868,7 +337,6 @@ impl AsyncWrite for LocalAddrStream {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 pub fn stream_local_addr(stream: &dyn AsyncStream) -> Option<SocketAddr> {
     stream
         .as_any()
@@ -876,7 +344,6 @@ pub fn stream_local_addr(stream: &dyn AsyncStream) -> Option<SocketAddr> {
         .and_then(LocalAddrStream::local_addr)
 }
 
-#[cfg(feature = "async-proxy")]
 pub fn stream_remote_addr(stream: &dyn AsyncStream) -> Option<SocketAddr> {
     stream
         .as_any()
@@ -884,7 +351,6 @@ pub fn stream_remote_addr(stream: &dyn AsyncStream) -> Option<SocketAddr> {
         .and_then(LocalAddrStream::remote_addr)
 }
 
-#[cfg(feature = "async-proxy")]
 pub fn with_stream_local_addr(
     stream: BoxAsyncStream,
     local_addr: Option<SocketAddr>,
@@ -892,7 +358,6 @@ pub fn with_stream_local_addr(
     with_stream_socket_addrs(stream, local_addr, None)
 }
 
-#[cfg(feature = "async-proxy")]
 pub fn with_stream_socket_addrs(
     stream: BoxAsyncStream,
     local_addr: Option<SocketAddr>,
@@ -910,7 +375,6 @@ pub fn with_stream_socket_addrs(
     ))
 }
 
-#[cfg(feature = "async-proxy")]
 pub trait AsyncDatagram: Send + Sync {
     fn send_to<'a>(&'a self, payload: &'a [u8], target: Endpoint) -> BoxFuture<'a, Result<usize>>;
     fn recv_from<'a>(&'a self, buffer: &'a mut [u8]) -> BoxFuture<'a, Result<(usize, Endpoint)>>;
@@ -918,7 +382,6 @@ pub trait AsyncDatagram: Send + Sync {
     fn close(&self) -> BoxFuture<'_, Result<()>>;
 }
 
-#[cfg(feature = "async-proxy")]
 pub trait AsyncProxy: Send + Sync {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>>;
     fn open_datagram<'a>(
@@ -936,7 +399,6 @@ pub trait AsyncProxy: Send + Sync {
     fn close(&self) -> BoxFuture<'_, Result<()>>;
 }
 
-#[cfg(feature = "async-proxy")]
 pub trait AsyncProxySelector: Send + Sync {
     /// Annotate a mutable flow with the route snapshot used for selection.
     /// Static selectors intentionally leave this as a no-op; runtime-backed
@@ -946,7 +408,6 @@ pub trait AsyncProxySelector: Send + Sync {
     fn select(&self, context: &FlowContext) -> Arc<dyn AsyncProxy>;
 }
 
-#[cfg(feature = "async-proxy")]
 pub struct StaticProxySelector {
     pub direct: Arc<dyn AsyncProxy>,
     pub proxy: Arc<dyn AsyncProxy>,
@@ -954,7 +415,6 @@ pub struct StaticProxySelector {
     pub drop: Arc<dyn AsyncProxy>,
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncProxySelector for StaticProxySelector {
     fn select(&self, context: &FlowContext) -> Arc<dyn AsyncProxy> {
         match context.route_mode {
@@ -966,16 +426,13 @@ impl AsyncProxySelector for StaticProxySelector {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 #[derive(Debug, Clone, Copy)]
 pub struct DirectAsyncProxy {
     pub timeout: Duration,
 }
 
-#[cfg(feature = "async-proxy")]
 static NEXT_ICMP_SEQUENCE: AtomicU16 = AtomicU16::new(1);
 
-#[cfg(feature = "async-proxy")]
 impl AsyncProxy for DirectAsyncProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         let destination = context.proxy_destination();
@@ -1094,7 +551,6 @@ impl AsyncProxy for DirectAsyncProxy {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 async fn direct_icmp_ping_once(
     target: SocketAddr,
     local_bind: Option<SocketAddr>,
@@ -1156,7 +612,6 @@ async fn direct_icmp_ping_once(
     }
 }
 
-#[cfg(feature = "async-proxy")]
 fn icmp_ping_payload(identifier: u16, sequence: u16) -> Vec<u8> {
     [
         b'y',
@@ -1179,7 +634,6 @@ fn icmp_ping_payload(identifier: u16, sequence: u16) -> Vec<u8> {
     .to_vec()
 }
 
-#[cfg(feature = "async-proxy")]
 fn build_icmp_echo_request(
     source: IpAddr,
     destination: IpAddr,
@@ -1208,7 +662,6 @@ fn build_icmp_echo_request(
     Ok(packet)
 }
 
-#[cfg(feature = "async-proxy")]
 fn icmp_echo_reply_matches(
     packet: &[u8],
     destination: IpAddr,
@@ -1236,7 +689,6 @@ fn icmp_echo_reply_matches(
         && packet[8..] == *payload
 }
 
-#[cfg(feature = "async-proxy")]
 fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0u32;
     for chunk in bytes.chunks(2) {
@@ -1248,7 +700,6 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-#[cfg(feature = "async-proxy")]
 fn icmpv6_checksum(source: Ipv6Addr, destination: Ipv6Addr, packet: &[u8]) -> u16 {
     let mut pseudo = Vec::with_capacity(40 + packet.len());
     pseudo.extend_from_slice(&source.octets());
@@ -1264,7 +715,6 @@ fn icmpv6_checksum(source: Ipv6Addr, destination: Ipv6Addr, packet: &[u8]) -> u1
 /// resolves through `ResolvingProxy` first, so hosts/FakeIP/route resolver
 /// policy remain authoritative; this fallback prevents standalone direct
 /// users from failing merely because they supplied a domain endpoint.
-#[cfg(feature = "async-proxy")]
 async fn resolve_direct_addresses(
     destination: &Endpoint,
     preferred_ipv4: Option<bool>,
@@ -1303,11 +753,9 @@ async fn resolve_direct_addresses(
     )))
 }
 
-#[cfg(feature = "async-proxy")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DropAsyncProxy;
 
-#[cfg(feature = "async-proxy")]
 impl AsyncProxy for DropAsyncProxy {
     fn connect<'a>(&'a self, _context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         Box::pin(async {
@@ -1340,19 +788,16 @@ impl AsyncProxy for DropAsyncProxy {
 /// attempts do not immediately consume CPU or create observable connection
 /// errors.  This is deliberately separate from [`DropAsyncProxy`], which is
 /// the internal fail-closed placeholder used while a runtime slot is closed.
-#[cfg(feature = "async-proxy")]
 pub struct DelayedDropAsyncProxy {
     state: Arc<DelayedDropState>,
 }
 
-#[cfg(feature = "async-proxy")]
 impl Default for DelayedDropAsyncProxy {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl DelayedDropAsyncProxy {
     pub fn new() -> Self {
         Self {
@@ -1361,29 +806,23 @@ impl DelayedDropAsyncProxy {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 const DROP_CACHE_CAPACITY: usize = 512;
 
-#[cfg(feature = "async-proxy")]
 const DROP_CACHE_EXPIRY: Duration = Duration::from_secs(5);
 
-#[cfg(feature = "async-proxy")]
 const DROP_MAX_DELAY: Duration = Duration::from_secs(30);
 
-#[cfg(feature = "async-proxy")]
 #[derive(Debug, Clone, Copy)]
 struct DelayedDropEntry {
     delay: Duration,
     last_seen: std::time::Instant,
 }
 
-#[cfg(feature = "async-proxy")]
 #[derive(Default)]
 struct DelayedDropState {
     entries: Mutex<HashMap<u64, DelayedDropEntry>>,
 }
 
-#[cfg(feature = "async-proxy")]
 impl DelayedDropState {
     fn next_delay(&self, destination: &Endpoint) -> Duration {
         let key = destination.comparable_key();
@@ -1430,12 +869,10 @@ impl DelayedDropState {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 struct DelayedDropStream {
     sleep: Option<Pin<Box<Sleep>>>,
 }
 
-#[cfg(feature = "async-proxy")]
 impl DelayedDropStream {
     fn new(delay: Duration) -> Self {
         Self {
@@ -1444,7 +881,6 @@ impl DelayedDropStream {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncRead for DelayedDropStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -1461,7 +897,6 @@ impl AsyncRead for DelayedDropStream {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncWrite for DelayedDropStream {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -1481,19 +916,16 @@ impl AsyncWrite for DelayedDropStream {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 struct DelayedDropDatagram {
     delay: Duration,
     closed: Arc<DelayedDropDatagramState>,
 }
 
-#[cfg(feature = "async-proxy")]
 struct DelayedDropDatagramState {
     closed: AtomicBool,
     notify: Notify,
 }
 
-#[cfg(feature = "async-proxy")]
 impl DelayedDropDatagramState {
     fn new() -> Self {
         Self {
@@ -1503,7 +935,6 @@ impl DelayedDropDatagramState {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncDatagram for DelayedDropDatagram {
     fn send_to<'a>(&'a self, payload: &'a [u8], _target: Endpoint) -> BoxFuture<'a, Result<usize>> {
         Box::pin(async move { Ok(payload.len()) })
@@ -1548,7 +979,6 @@ impl AsyncDatagram for DelayedDropDatagram {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncProxy for DelayedDropAsyncProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         let delay = self.state.next_delay(&context.effective_destination());
@@ -1582,7 +1012,6 @@ impl AsyncProxy for DelayedDropAsyncProxy {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 #[derive(Debug, Clone, Copy)]
 pub struct FixedAsyncProxy {
     pub address: SocketAddr,
@@ -1593,13 +1022,11 @@ pub struct FixedAsyncProxy {
 /// proxy implementation.  Go's fixedv2 model allows alternate addresses to
 /// carry their own interface, while the common `FlowContext` keeps the
 /// policy at the flow boundary; this adapter bridges those two shapes.
-#[cfg(feature = "async-proxy")]
 pub struct BindInterfaceProxy {
     pub inner: Arc<dyn AsyncProxy>,
     pub interface: Option<String>,
 }
 
-#[cfg(feature = "async-proxy")]
 impl BindInterfaceProxy {
     pub fn new(inner: Arc<dyn AsyncProxy>, interface: Option<String>) -> Self {
         Self { inner, interface }
@@ -1612,7 +1039,6 @@ impl BindInterfaceProxy {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncProxy for BindInterfaceProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         let context = self.context(context);
@@ -1640,12 +1066,10 @@ impl AsyncProxy for BindInterfaceProxy {
 /// Try the endpoints of one Go fixedv2 node in order.  The first successful
 /// endpoint is enough for a flow; failures during a protocol handshake (not
 /// just the TCP connect) are deliberately included in the fallback boundary.
-#[cfg(feature = "async-proxy")]
 pub struct FallbackAsyncProxy {
     pub proxies: Vec<Arc<dyn AsyncProxy>>,
 }
 
-#[cfg(feature = "async-proxy")]
 impl FallbackAsyncProxy {
     pub fn new(proxies: Vec<Arc<dyn AsyncProxy>>) -> Result<Self> {
         if proxies.is_empty() {
@@ -1655,7 +1079,6 @@ impl FallbackAsyncProxy {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncProxy for FallbackAsyncProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         let proxies = self.proxies.clone();
@@ -1718,7 +1141,6 @@ impl AsyncProxy for FallbackAsyncProxy {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncProxy for FixedAsyncProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         let local_bind = context.local_bind_for(self.address);
@@ -1769,68 +1191,10 @@ impl AsyncProxy for FixedAsyncProxy {
     }
 }
 
-/// Run an existing synchronous handshake on Tokio's blocking pool.  This is
-/// an explicit adapter for HTTP CONNECT/SOCKS5; it prevents the sync parser
-/// from blocking the TUN or async proxy executor and makes its boundary easy
-/// to replace with a native async implementation later.
-#[cfg(feature = "async-proxy")]
-pub struct BlockingStreamProxy {
-    pub connector: Arc<dyn StreamConnector>,
-}
-
-#[cfg(feature = "async-proxy")]
-impl AsyncProxy for BlockingStreamProxy {
-    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
-        let connector = Arc::clone(&self.connector);
-        let destination = context.effective_destination();
-        let local_bind = connector
-            .connect_target()
-            .and_then(|address| context.local_bind_for(address));
-        let bind_interface = context.bind_interface.clone();
-        Box::pin(async move {
-            let stream = tokio::task::spawn_blocking(move || {
-                connector.connect_with_options(&destination, local_bind, bind_interface.as_deref())
-            })
-            .await
-            .map_err(|error| Error::new(ErrorKind::Closed, format!("proxy task: {error}")))??;
-            stream.set_nonblocking(true).map_err(|error| {
-                Error::new(ErrorKind::Io, format!("proxy nonblocking mode: {error}"))
-            })?;
-            let stream = tokio::net::TcpStream::from_std(stream).map_err(|error| {
-                Error::new(ErrorKind::Io, format!("proxy Tokio stream: {error}"))
-            })?;
-            let local_addr = stream.local_addr().ok();
-            Ok(with_stream_local_addr(
-                Box::new(stream) as BoxAsyncStream,
-                local_addr,
-            ))
-        })
-    }
-
-    fn open_datagram<'a>(
-        &'a self,
-        _context: &'a FlowContext,
-    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
-        Box::pin(async {
-            Err(Error::new(
-                ErrorKind::Unsupported,
-                "synchronous stream proxy has no datagram transport",
-            ))
-        })
-    }
-
-    fn close(&self) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
 /// Native asynchronous SOCKS5 proxy.
 ///
-/// The synchronous connector above remains the small reusable TCP handshake
-/// boundary used by callers that only need a blocking stream. Runtime
-/// outbound proxies use this implementation so SOCKS5 UDP ASSOCIATE shares
-/// the same `AsyncProxy` contract as direct and Yuubinsya datagrams.
-#[cfg(feature = "async-proxy")]
+/// Runtime outbound proxies use this implementation so SOCKS5 UDP ASSOCIATE
+/// shares the same `AsyncProxy` contract as direct and Yuubinsya datagrams.
 #[derive(Clone)]
 pub struct Socks5AsyncProxy {
     pub proxy: SocketAddr,
@@ -1839,7 +1203,6 @@ pub struct Socks5AsyncProxy {
     pub password: Option<String>,
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncProxy for Socks5AsyncProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         let destination = context.effective_destination();
@@ -1946,7 +1309,6 @@ impl AsyncProxy for Socks5AsyncProxy {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 async fn socks5_authenticate(
     stream: &mut tokio::net::TcpStream,
     username: Option<&str>,
@@ -1993,7 +1355,6 @@ async fn socks5_authenticate(
     Ok(())
 }
 
-#[cfg(feature = "async-proxy")]
 async fn socks5_request(
     stream: &mut tokio::net::TcpStream,
     command: u8,
@@ -2056,14 +1417,12 @@ async fn socks5_request(
         .ok_or_else(|| Error::new(ErrorKind::Protocol, "SOCKS5 relay resolved to no address"))
 }
 
-#[cfg(feature = "async-proxy")]
 async fn read_u16(stream: &mut tokio::net::TcpStream) -> Result<u16> {
     let mut bytes = [0; 2];
     stream.read_exact(&mut bytes).await.map_err(io_error)?;
     Ok(u16::from_be_bytes(bytes))
 }
 
-#[cfg(feature = "async-proxy")]
 struct Socks5UdpDatagram {
     socket: tokio::net::UdpSocket,
     relay: SocketAddr,
@@ -2078,7 +1437,6 @@ struct Socks5UdpDatagram {
     receive_buffer: AsyncMutex<Vec<u8>>,
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncDatagram for Socks5UdpDatagram {
     fn send_to<'a>(&'a self, payload: &'a [u8], target: Endpoint) -> BoxFuture<'a, Result<usize>> {
         Box::pin(async move {
@@ -2158,7 +1516,6 @@ impl AsyncDatagram for Socks5UdpDatagram {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 fn decode_socks5_udp_endpoint(packet: &[u8]) -> Result<(Endpoint, usize)> {
     if packet.len() < 4 || packet[0..2] != [0, 0] {
         return Err(Error::new(
@@ -2230,18 +1587,15 @@ fn decode_socks5_udp_endpoint(packet: &[u8]) -> Result<(Endpoint, usize)> {
     Ok((endpoint, offset))
 }
 
-#[cfg(feature = "async-proxy")]
 struct TokioDatagram {
     socket: tokio::net::UdpSocket,
 }
 
-#[cfg(feature = "async-proxy")]
 struct FixedDatagram {
     socket: tokio::net::UdpSocket,
     target: SocketAddr,
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncDatagram for TokioDatagram {
     fn send_to<'a>(&'a self, payload: &'a [u8], target: Endpoint) -> BoxFuture<'a, Result<usize>> {
         Box::pin(async move {
@@ -2294,7 +1648,6 @@ impl AsyncDatagram for TokioDatagram {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl AsyncDatagram for FixedDatagram {
     fn send_to<'a>(&'a self, payload: &'a [u8], target: Endpoint) -> BoxFuture<'a, Result<usize>> {
         Box::pin(async move {
@@ -2334,13 +1687,6 @@ impl AsyncDatagram for FixedDatagram {
     }
 }
 
-fn authority(destination: &Endpoint) -> Result<String> {
-    match destination {
-        Endpoint::Ip { addr, .. } => Ok(addr.to_string()),
-        Endpoint::Domain { host, port, .. } => Ok(format!("{host}:{port}")),
-    }
-}
-
 fn socks_address(destination: &Endpoint) -> Result<(u8, Vec<u8>)> {
     match destination {
         Endpoint::Ip { addr, .. } => match addr.ip() {
@@ -2358,47 +1704,6 @@ fn socks_address(destination: &Endpoint) -> Result<(u8, Vec<u8>)> {
     }
 }
 
-fn read_headers(stream: &mut TcpStream) -> Result<String> {
-    let mut response = Vec::with_capacity(512);
-    let mut byte = [0; 1];
-    while response.len() < 16 * 1024 {
-        stream.read_exact(&mut byte).map_err(io_error)?;
-        response.push(byte[0]);
-        if response.ends_with(b"\r\n\r\n") {
-            return String::from_utf8(response)
-                .map_err(|_| Error::new(ErrorKind::Protocol, "proxy response is not UTF-8"));
-        }
-    }
-    Err(Error::new(
-        ErrorKind::Protocol,
-        "proxy headers are too large",
-    ))
-}
-
-fn base64_basic(username: &str, password: &str) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes = format!("{username}:{password}").into_bytes();
-    let mut output = String::new();
-    for chunk in bytes.chunks(3) {
-        let value = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        output.push(TABLE[((value >> 18) & 63) as usize] as char);
-        output.push(TABLE[((value >> 12) & 63) as usize] as char);
-        output.push(if chunk.len() > 1 {
-            TABLE[((value >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        output.push(if chunk.len() > 2 {
-            TABLE[(value & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    output
-}
-
 fn io_error(error: std::io::Error) -> Error {
     Error::new(ErrorKind::Io, error.to_string())
 }
@@ -2407,18 +1712,13 @@ fn io_error(error: std::io::Error) -> Error {
 mod tests {
     use super::*;
     use crate::{DomainName, Network};
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::thread;
 
-    #[cfg(feature = "async-proxy")]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn endpoint() -> Endpoint {
         Endpoint::domain(Network::Tcp, DomainName::new("example.com").unwrap(), 443)
     }
 
-    #[cfg(feature = "async-proxy")]
     #[test]
     fn delayed_drop_escalates_per_destination() {
         let state = DelayedDropState::default();
@@ -2433,7 +1733,6 @@ mod tests {
         assert_eq!(state.next_delay(&destination), Duration::from_secs(4));
     }
 
-    #[cfg(feature = "async-proxy")]
     #[tokio::test(flavor = "current_thread")]
     async fn local_stream_metadata_survives_async_io_delegation() {
         let (mut peer, stream) = tokio::io::duplex(64);
@@ -2447,7 +1746,6 @@ mod tests {
         assert_eq!(&buffer, b"ping");
     }
 
-    #[cfg(feature = "async-proxy")]
     #[tokio::test(flavor = "current_thread")]
     async fn fixed_async_proxy_routes_datagrams_to_fixed_endpoint() {
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2485,21 +1783,6 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn direct_connector_applies_linux_network_interface() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = thread::spawn(move || listener.accept().unwrap().0.peer_addr().unwrap());
-        let connector = DirectConnector {
-            timeout: Duration::from_secs(1),
-        };
-        let stream = connector
-            .connect_with_options(&Endpoint::ip(Network::Tcp, address), None, Some("lo"))
-            .unwrap();
-        assert_eq!(handle.join().unwrap(), stream.local_addr().unwrap());
-    }
-
-    #[cfg(all(feature = "async-proxy", target_os = "linux"))]
     #[tokio::test(flavor = "current_thread")]
     async fn fixed_async_proxy_applies_linux_network_interface_to_udp() {
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2549,67 +1832,6 @@ enp0s5 00000000 0100370A 0001 0 0 100 00000000 0 0 0"#;
         );
     }
 
-    #[test]
-    fn drop_and_fixed_have_expected_boundaries() {
-        assert_eq!(
-            DropConnector.connect(&endpoint()).unwrap_err().kind,
-            ErrorKind::Closed
-        );
-        let listener = match TcpListener::bind("127.0.0.1:0") {
-            Ok(listener) => listener,
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(error) => panic!("bind test listener: {error}"),
-        };
-        let address = listener.local_addr().unwrap();
-        let handle = thread::spawn(move || listener.accept().unwrap());
-        let connector = FixedConnector {
-            address,
-            timeout: Duration::from_secs(1),
-        };
-        let _stream = connector.connect(&endpoint()).unwrap();
-        assert!(handle.join().is_ok());
-    }
-
-    #[test]
-    fn direct_connector_honors_local_bind_address() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = thread::spawn(move || listener.accept().unwrap().0.peer_addr().unwrap());
-        let connector = DirectConnector {
-            timeout: Duration::from_secs(1),
-        };
-        let stream = connector
-            .connect_with_local(
-                &Endpoint::ip(Network::Tcp, address),
-                Some("127.0.0.2:0".parse().unwrap()),
-            )
-            .unwrap();
-        assert_eq!(
-            stream.local_addr().unwrap().ip(),
-            "127.0.0.2".parse::<std::net::IpAddr>().unwrap()
-        );
-        assert_eq!(handle.join().unwrap(), stream.local_addr().unwrap());
-    }
-
-    #[test]
-    fn direct_connector_resolves_domain_endpoint_and_tries_available_families() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = thread::spawn(move || listener.accept().unwrap().0.peer_addr().unwrap());
-        let connector = DirectConnector {
-            timeout: Duration::from_secs(1),
-        };
-        let destination = Endpoint::domain(
-            Network::Tcp,
-            DomainName::new("localhost").unwrap(),
-            address.port(),
-        );
-        let stream = connector.connect(&destination).unwrap();
-        assert_eq!(stream.peer_addr().unwrap(), address);
-        assert_eq!(handle.join().unwrap(), stream.local_addr().unwrap());
-    }
-
-    #[cfg(feature = "async-proxy")]
     #[tokio::test(flavor = "current_thread")]
     async fn direct_async_proxy_resolves_domain_when_called_without_runtime_wrapper() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2634,7 +1856,6 @@ enp0s5 00000000 0100370A 0001 0 0 100 00000000 0 0 0"#;
         assert_eq!(server.await.unwrap(), *b"direct-domain");
     }
 
-    #[cfg(feature = "async-proxy")]
     #[tokio::test(flavor = "current_thread")]
     async fn direct_async_datagram_resolves_domain_targets_on_send() {
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2702,169 +1923,6 @@ enp0s5 00000000 0100370A 0001 0 0 100 00000000 0 0 0"#;
         assert_eq!(socks_address(&ip).unwrap(), (1, vec![192, 0, 2, 1]));
     }
 
-    fn run_socks5_case<F>(username: Option<&str>, password: Option<&str>, handler: F) -> ErrorKind
-    where
-        F: FnOnce(&mut std::net::TcpStream) + Send + 'static,
-    {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut greeting = [0u8; 2];
-            stream.read_exact(&mut greeting).unwrap();
-            let mut methods = vec![0u8; usize::from(greeting[1])];
-            stream.read_exact(&mut methods).unwrap();
-            handler(&mut stream);
-        });
-        let connector = Socks5Connector {
-            proxy: address,
-            timeout: Duration::from_secs(1),
-            username: username.map(str::to_owned),
-            password: password.map(str::to_owned),
-        };
-        let error = connector.connect(&endpoint()).unwrap_err();
-        server.join().unwrap();
-        error.kind
-    }
-
-    #[test]
-    fn socks5_rejects_malformed_method_auth_and_reply_matrix() {
-        assert_eq!(
-            run_socks5_case(None, None, |stream| {
-                stream.write_all(&[5, 0xff]).unwrap();
-            }),
-            ErrorKind::Protocol
-        );
-        assert_eq!(
-            run_socks5_case(None, None, |stream| {
-                stream.write_all(&[5, 2]).unwrap();
-            }),
-            ErrorKind::Protocol
-        );
-        assert_eq!(
-            run_socks5_case(None, None, |stream| {
-                stream.write_all(&[5, 0]).unwrap();
-                stream.write_all(&[5, 0, 0, 9]).unwrap();
-            }),
-            ErrorKind::Protocol
-        );
-        assert_eq!(
-            run_socks5_case(Some("user"), Some("pass"), |stream| {
-                stream.write_all(&[5, 2]).unwrap();
-                let mut auth_header = [0u8; 2];
-                stream.read_exact(&mut auth_header).unwrap();
-                let mut auth_body = vec![0u8; usize::from(auth_header[1]) + 1];
-                stream.read_exact(&mut auth_body).unwrap();
-                stream.write_all(&[1, 1]).unwrap();
-            }),
-            ErrorKind::Protocol
-        );
-    }
-
-    #[test]
-    fn basic_auth_encoding_is_rfc4648_base64() {
-        assert_eq!(base64_basic("user", "pass"), "dXNlcjpwYXNz");
-    }
-
-    #[test]
-    fn http_proxy_rejects_headers_without_an_end_before_the_limit() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let response = vec![b'x'; 16 * 1024];
-            std::io::Write::write_all(&mut stream, &response).unwrap();
-        });
-        let connector = HttpProxyConnector {
-            proxy: address,
-            timeout: Duration::from_secs(1),
-            username: None,
-            password: None,
-        };
-        let error = connector.connect(&endpoint()).unwrap_err();
-        assert_eq!(error.kind, ErrorKind::Protocol);
-        server.join().unwrap();
-    }
-
-    #[cfg(feature = "async-proxy")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn blocking_http_connect_enters_async_stream_runtime() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0u8; 1];
-            while !request.ends_with(b"\r\n\r\n") {
-                std::io::Read::read_exact(&mut stream, &mut byte).unwrap();
-                request.push(byte[0]);
-            }
-            assert!(request.starts_with(b"CONNECT example.com:443 HTTP/1.1"));
-            std::io::Write::write_all(&mut stream, b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .unwrap();
-            let mut payload = [0u8; 5];
-            std::io::Read::read_exact(&mut stream, &mut payload).unwrap();
-            std::io::Write::write_all(&mut stream, &payload).unwrap();
-        });
-        let connector = BlockingStreamProxy {
-            connector: Arc::new(HttpProxyConnector {
-                proxy: address,
-                timeout: Duration::from_secs(1),
-                username: None,
-                password: None,
-            }),
-        };
-        let context = FlowContext::new(Endpoint::domain(
-            Network::Tcp,
-            DomainName::new("example.com").unwrap(),
-            443,
-        ));
-        let mut stream = connector.connect(&context).await.unwrap();
-        stream.write_all(b"hello").await.unwrap();
-        let mut response = [0u8; 5];
-        stream.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"hello");
-        server.join().unwrap();
-    }
-
-    #[cfg(feature = "async-proxy")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn blocking_socks5_enters_async_stream_runtime() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut greeting = [0u8; 3];
-            std::io::Read::read_exact(&mut stream, &mut greeting).unwrap();
-            assert_eq!(greeting, [5, 1, 0]);
-            std::io::Write::write_all(&mut stream, &[5, 0]).unwrap();
-            let mut request = [0u8; 10];
-            std::io::Read::read_exact(&mut stream, &mut request).unwrap();
-            assert_eq!(&request[..4], &[5, 1, 0, 1]);
-            std::io::Write::write_all(&mut stream, &[5, 0, 0, 1, 127, 0, 0, 1, 0, 80]).unwrap();
-            let mut payload = [0u8; 5];
-            std::io::Read::read_exact(&mut stream, &mut payload).unwrap();
-            std::io::Write::write_all(&mut stream, &payload).unwrap();
-        });
-        let connector = BlockingStreamProxy {
-            connector: Arc::new(Socks5Connector {
-                proxy: address,
-                timeout: Duration::from_secs(1),
-                username: None,
-                password: None,
-            }),
-        };
-        let context =
-            FlowContext::new(Endpoint::ip(Network::Tcp, "192.0.2.1:443".parse().unwrap()));
-        let mut stream = connector.connect(&context).await.unwrap();
-        stream.write_all(b"hello").await.unwrap();
-        let mut response = [0u8; 5];
-        stream.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"hello");
-        server.join().unwrap();
-    }
-
-    #[cfg(feature = "async-proxy")]
     #[tokio::test(flavor = "current_thread")]
     async fn native_socks5_udp_associate_round_trips_authenticated_domain() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

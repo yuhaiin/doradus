@@ -54,7 +54,7 @@ impl GeoDb {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         #[cfg(unix)]
         {
-            return Self::open_mmap(path);
+            Self::open_mmap(path)
         }
 
         #[cfg(not(unix))]

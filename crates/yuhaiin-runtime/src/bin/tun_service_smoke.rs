@@ -814,11 +814,11 @@ fn route_uses_device(name: &str, target: SocketAddr) -> bool {
             return false;
         }
         let route = String::from_utf8_lossy(&output.stdout);
-        return route
+        route
             .split_whitespace()
             .collect::<Vec<_>>()
             .windows(2)
-            .any(|parts| parts == ["dev", name]);
+            .any(|parts| parts == ["dev", name])
     }
     #[cfg(not(target_os = "linux"))]
     {

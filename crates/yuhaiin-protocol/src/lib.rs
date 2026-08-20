@@ -23,8 +23,6 @@ pub mod socks5;
 pub mod socks5_server;
 #[cfg(feature = "tls-ring")]
 pub mod tls;
-#[cfg(feature = "tls-ring")]
-mod tls_sync;
 pub mod trojan;
 pub mod vless;
 pub mod vmess;

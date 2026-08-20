@@ -645,6 +645,10 @@ impl H2Pool {
         self.connections.lock().await.values().map(Vec::len).sum()
     }
 
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
+
     pub async fn active_streams(&self) -> usize {
         let connections = self.connections.lock().await;
         connections

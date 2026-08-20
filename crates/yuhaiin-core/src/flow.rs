@@ -1,7 +1,6 @@
 //! Transport-independent flow metadata and lifecycle observation.
 
 use std::net::SocketAddr;
-#[cfg(feature = "async-proxy")]
 use std::sync::Arc;
 
 use crate::{Endpoint, Network};
@@ -37,14 +36,12 @@ impl Flow {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowDirection {
     Upload,
     Download,
 }
 
-#[cfg(feature = "async-proxy")]
 pub trait FlowObserver: Send + Sync {
     fn opened(&self, flow: Flow, context: crate::FlowContext);
     fn bytes(&self, flow: FlowKey, direction: FlowDirection, bytes: usize);
@@ -62,13 +59,11 @@ pub trait FlowObserver: Send + Sync {
 /// a live connection in the monitor when Tokio aborts that future.  Keeping
 /// this guard beside the relay makes normal completion, force cancellation
 /// and task abort all publish exactly one effective close event.
-#[cfg(feature = "async-proxy")]
 pub struct FlowObserverGuard {
     observer: Arc<dyn FlowObserver>,
     flow: FlowKey,
 }
 
-#[cfg(feature = "async-proxy")]
 impl FlowObserverGuard {
     pub fn open(observer: Arc<dyn FlowObserver>, flow: Flow, context: crate::FlowContext) -> Self {
         observer.opened(flow, context);
@@ -79,7 +74,6 @@ impl FlowObserverGuard {
     }
 }
 
-#[cfg(feature = "async-proxy")]
 impl Drop for FlowObserverGuard {
     fn drop(&mut self) {
         self.observer.closed(self.flow);

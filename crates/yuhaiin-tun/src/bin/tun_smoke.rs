@@ -141,57 +141,17 @@ fn main() -> std::io::Result<()> {
         yuhaiin_tun::enable_loopback()?;
     }
     if proxy_throughput {
-        #[cfg(feature = "async-proxy")]
-        {
-            return run_proxy_throughput(runtime);
-        }
-        #[cfg(not(feature = "async-proxy"))]
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "YUHAIIN_TUN_PROXY_THROUGHPUT requires the async-proxy feature",
-            ));
-        }
+        return run_proxy_throughput(runtime);
     }
     if proxy_echo {
-        #[cfg(feature = "async-proxy")]
-        {
-            return run_proxy_echo(runtime);
-        }
-        #[cfg(not(feature = "async-proxy"))]
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "YUHAIIN_TUN_PROXY_ECHO requires the async-proxy feature",
-            ));
-        }
+        return run_proxy_echo(runtime);
     }
     if udp_proxy_echo {
-        #[cfg(feature = "async-proxy")]
-        {
-            return run_udp_proxy_echo(runtime);
-        }
-        #[cfg(not(feature = "async-proxy"))]
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "YUHAIIN_TUN_UDP_PROXY_ECHO requires the async-proxy feature",
-            ));
-        }
+        return run_udp_proxy_echo(runtime);
     }
     #[cfg(any())]
     if env::var_os("YUHAIIN_TUN_DNS_ECHO").is_some() {
-        #[cfg(feature = "async-proxy")]
-        {
-            return run_dns_echo(runtime);
-        }
-        #[cfg(not(feature = "async-proxy"))]
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "YUHAIIN_TUN_DNS_ECHO requires the async-proxy feature",
-            ));
-        }
+        return run_dns_echo(runtime);
     }
     println!("tun-opened");
     println!(
@@ -384,7 +344,6 @@ fn read_process_usage() -> Option<ProcessReading> {
     })
 }
 
-#[cfg(feature = "async-proxy")]
 fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
     use std::io::{Read, Write};
     use std::sync::{Arc, mpsc};
@@ -555,7 +514,6 @@ fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
     })
 }
 
-#[cfg(feature = "async-proxy")]
 fn run_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
     use std::io::{Read, Write};
     use std::sync::Arc;
@@ -644,7 +602,6 @@ fn run_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
     })
 }
 
-#[cfg(feature = "async-proxy")]
 fn run_udp_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
     use std::net::UdpSocket;
     use std::sync::Arc;
@@ -731,7 +688,6 @@ fn run_udp_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
     })
 }
 
-#[cfg(feature = "async-proxy")]
 #[cfg(any())]
 fn run_dns_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
     use std::net::{SocketAddr, UdpSocket};
