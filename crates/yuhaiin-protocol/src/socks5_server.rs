@@ -4,10 +4,14 @@
 //! This module owns only the bytes exchanged with a SOCKS5 client, so the
 //! same server implementation can be reused by another inbound frontend.
 
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, Network, Result};
+use yuhaiin_types::{InboundUdpCodec, InboundUdpFlowId, InboundUdpRequest, InboundUdpResponse};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Socks5Command {
@@ -19,6 +23,194 @@ pub enum Socks5Command {
 pub struct Socks5Request {
     pub command: Socks5Command,
     pub destination: Endpoint,
+}
+
+/// The small socket port needed by the SOCKS5 UDP server codec.
+///
+/// Listener setup remains a runtime concern; defining this port here lets
+/// SOCKS5 packet framing and client-peer pinning live with the protocol.
+pub trait UdpTransport: Send + Unpin + 'static {
+    fn recv_from<'a>(
+        &'a mut self,
+        buffer: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>>;
+
+    fn send_to<'a>(
+        &'a mut self,
+        buffer: &'a [u8],
+        peer: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>>;
+}
+
+impl UdpTransport for Box<dyn UdpTransport> {
+    fn recv_from<'a>(
+        &'a mut self,
+        buffer: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>> {
+        (**self).recv_from(buffer)
+    }
+
+    fn send_to<'a>(
+        &'a mut self,
+        buffer: &'a [u8],
+        peer: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+        (**self).send_to(buffer, peer)
+    }
+}
+
+/// AEAD packet transport layered on top of a UDP socket adapter.
+///
+/// The runtime supplies only the socket operations.  Encryption, packet
+/// overhead and the conversion between wire errors and `io::Error` belong to
+/// this protocol layer and can therefore be reused by every SOCKS5 UDP
+/// listener.
+pub struct AeadUdpTransport<S> {
+    inner: S,
+    password: Vec<u8>,
+    method: crate::aead::CryptoMethod,
+    packet: Vec<u8>,
+}
+
+impl<S> AeadUdpTransport<S> {
+    pub fn new(inner: S, password: impl Into<Vec<u8>>, method: crate::aead::CryptoMethod) -> Self {
+        Self {
+            inner,
+            password: password.into(),
+            method,
+            packet: Vec::new(),
+        }
+    }
+}
+
+impl<S> UdpTransport for AeadUdpTransport<S>
+where
+    S: UdpTransport,
+{
+    fn recv_from<'a>(
+        &'a mut self,
+        buffer: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>> {
+        Box::pin(async move {
+            const AEAD_UDP_MAX_OVERHEAD: usize = 24 + 16;
+            let required = buffer
+                .len()
+                .saturating_add(AEAD_UDP_MAX_OVERHEAD)
+                .min(u16::MAX as usize);
+            if self.packet.len() < required {
+                self.packet.resize(required, 0);
+            }
+            let (length, peer) = self.inner.recv_from(&mut self.packet).await?;
+            let plaintext =
+                crate::aead::decrypt_packet(&self.packet[..length], &self.password, self.method)
+                    .map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+            if buffer.len() < plaintext.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "AEAD UDP payload exceeds receive buffer",
+                ));
+            }
+            buffer[..plaintext.len()].copy_from_slice(&plaintext);
+            Ok((plaintext.len(), peer))
+        })
+    }
+
+    fn send_to<'a>(
+        &'a mut self,
+        buffer: &'a [u8],
+        peer: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            let packet = crate::aead::encrypt_packet(buffer, &self.password, self.method)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+            self.inner
+                .send_to(&packet, peer)
+                .await
+                .map(|_| buffer.len())
+        })
+    }
+}
+
+/// SOCKS5 UDP associate server codec.
+pub struct UdpServer<S> {
+    socket: S,
+    allowed_peer: Option<IpAddr>,
+    client: Option<SocketAddr>,
+    packet: Vec<u8>,
+}
+
+impl<S> UdpServer<S> {
+    pub fn new(socket: S, allowed_peer: Option<IpAddr>, buffer_size: usize) -> Self {
+        Self {
+            socket,
+            allowed_peer,
+            client: None,
+            packet: vec![0u8; buffer_size.max(512)],
+        }
+    }
+}
+
+impl<S> InboundUdpCodec for UdpServer<S>
+where
+    S: UdpTransport,
+{
+    type Request = InboundUdpRequest;
+    type Response = InboundUdpResponse;
+
+    fn recv<'a>(&'a mut self) -> yuhaiin_types::BoxFuture<'a, Result<Option<InboundUdpRequest>>> {
+        Box::pin(async move {
+            loop {
+                let (length, peer) = self
+                    .socket
+                    .recv_from(&mut self.packet)
+                    .await
+                    .map_err(io_error)?;
+                if self
+                    .allowed_peer
+                    .is_some_and(|allowed| allowed != peer.ip())
+                {
+                    continue;
+                }
+                let Some((target, payload)) = parse_udp_packet(&self.packet[..length])? else {
+                    continue;
+                };
+                if let Some(expected) = self.client {
+                    if expected != peer {
+                        continue;
+                    }
+                } else {
+                    self.client = Some(peer);
+                }
+                return Ok(Some(InboundUdpRequest {
+                    id: InboundUdpFlowId {
+                        peer,
+                        target: target.clone(),
+                        authentication: None,
+                    },
+                    peer: Endpoint::ip(Network::Udp, peer),
+                    target,
+                    payload: payload.to_vec(),
+                }));
+            }
+        })
+    }
+
+    fn send<'a>(
+        &'a mut self,
+        response: InboundUdpResponse,
+    ) -> yuhaiin_types::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let peer = response
+                .peer
+                .addr()
+                .ok_or_else(|| Error::invalid("SOCKS5 UDP peer has no IP address"))?;
+            let packet = encode_udp_packet(&response.target, &response.payload)?;
+            self.socket.send_to(&packet, peer).await.map_err(io_error)?;
+            Ok(())
+        })
+    }
 }
 
 /// Complete the SOCKS5 greeting, optional username/password exchange and

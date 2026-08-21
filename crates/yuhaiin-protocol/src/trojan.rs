@@ -6,6 +6,7 @@
 //! for UDP associate frames.  The codec is deliberately independent of TLS;
 //! TLS is another composable transport layer in the runtime.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use crate::yuubinsya::{decode_endpoint, encode_endpoint};
@@ -14,6 +15,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, Wr
 use tokio::sync::Mutex;
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use yuhaiin_types::{
+    InboundStreamHandler, InboundUdpCodec, InboundUdpFlowId, InboundUdpRequest, InboundUdpResponse,
+};
 
 pub const MAX_PACKET_SIZE: usize = 8 * 1024;
 pub const PASSWORD_HASH_LENGTH: usize = 56;
@@ -42,6 +46,97 @@ impl Command {
 pub struct Request {
     pub command: Command,
     pub destination: Endpoint,
+}
+
+/// Trojan UDP-over-stream server codec.
+///
+/// The runtime supplies the accepted stream and owns routing/flow lifetime;
+/// this type owns only the protocol framing and peer identity.
+pub struct UdpServer<R, W> {
+    reader: R,
+    writer: W,
+    peer: std::net::SocketAddr,
+    packet: Vec<u8>,
+}
+
+impl<R, W> UdpServer<R, W> {
+    pub fn new(reader: R, writer: W, peer: std::net::SocketAddr, buffer_size: usize) -> Self {
+        Self {
+            reader,
+            writer,
+            peer,
+            packet: vec![0u8; buffer_size.max(512)],
+        }
+    }
+}
+
+impl<R, W> InboundUdpCodec for UdpServer<R, W>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    type Request = InboundUdpRequest;
+    type Response = InboundUdpResponse;
+
+    fn recv<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<InboundUdpRequest>>> {
+        Box::pin(async move {
+            let (length, target) = read_udp_frame(&mut self.reader, &mut self.packet).await?;
+            Ok(Some(InboundUdpRequest {
+                id: InboundUdpFlowId {
+                    peer: self.peer,
+                    target: target.clone(),
+                    authentication: None,
+                },
+                peer: Endpoint::ip(Network::Udp, self.peer),
+                target,
+                payload: self.packet[..length].to_vec(),
+            }))
+        })
+    }
+
+    fn send<'a>(&'a mut self, response: InboundUdpResponse) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            write_udp_frame(&mut self.writer, &response.target, &response.payload).await
+        })
+    }
+}
+
+/// Serve one Trojan inbound stream.
+///
+/// Authentication, command parsing and UDP framing are protocol concerns.
+/// TCP routing is delegated through [`InboundStreamHandler`].  UDP session
+/// ownership remains with the caller because flow tables and lifecycle are
+/// application concerns; the protocol server only constructs its codec.
+pub async fn handle<S, H, U, F>(
+    mut stream: S,
+    peer: std::net::SocketAddr,
+    expected_hashes: &[[u8; PASSWORD_HASH_LENGTH]],
+    udp_buffer_size: usize,
+    handler: &H,
+    udp_handler: U,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    H: InboundStreamHandler<S> + ?Sized,
+    U: FnOnce(UdpServer<ReadHalf<S>, WriteHalf<S>>) -> F + Send + 'static,
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    let request = read_request_any(&mut stream, expected_hashes).await?;
+    match request.command {
+        Command::Connect => {
+            handler
+                .handle_stream(stream, peer, request.destination, "trojan")
+                .await
+        }
+        Command::Associate => {
+            let (reader, writer) = split(stream);
+            udp_handler(UdpServer::new(reader, writer, peer, udp_buffer_size)).await
+        }
+        Command::Mux => Err(Error::new(
+            ErrorKind::Unsupported,
+            "Trojan MUX inbound is not implemented",
+        )),
+    }
 }
 
 pub fn password_hash(password: &[u8]) -> [u8; PASSWORD_HASH_LENGTH] {

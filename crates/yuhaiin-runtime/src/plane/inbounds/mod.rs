@@ -9,20 +9,20 @@
 //! construction logic.
 
 use std::net::SocketAddr;
-#[cfg(unix)]
+#[cfg(all(feature = "tun", unix))]
 use std::os::fd::OwnedFd;
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 
 use yuhaiin_core::process::{ProcessResolver, default_process_resolver};
-use yuhaiin_core::proxy::BoxAsyncStream;
+use yuhaiin_core::proxy::{AsyncProxySelector, BoxAsyncStream};
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Result};
+use yuhaiin_protocol::stream::PrefixedIo;
 use yuhaiin_store::GoInboundRecord;
+use yuhaiin_types::InboundBasicAuth;
 
 use crate::{ConnectionMonitor, RuntimeController, RuntimeProxySelector};
 
@@ -30,10 +30,14 @@ use crate::{ConnectionMonitor, RuntimeController, RuntimeProxySelector};
 mod auth;
 pub(crate) use auth::InboundAuth;
 mod handler;
+#[cfg(feature = "tun")]
+pub(crate) use handler::InboundInputInterceptor;
 pub(crate) use handler::{
-    InboundDnsHandler, InboundDnsPolicy, InboundHandler, InboundInputInterceptor, InboundStream,
-    InboundUdpCodec, InboundUdpRequest, InboundUdpResponse, InboundUdpSession,
+    InboundDnsHandler, InboundDnsPolicy, InboundHandler, InboundStream, InboundUdpCodec,
+    InboundUdpFlowPolicy, InboundUdpRequest, InboundUdpResponse, InboundUdpSession,
 };
+
+pub(crate) mod adapters;
 
 // Outbound SOCKS5 lives in yuhaiin-protocol; this module owns inbound policy
 // and flow lifetime.
@@ -42,12 +46,9 @@ mod socks5;
 use listeners::{InboundOwners, InboundStartOptions, start_inbounds};
 
 #[cfg(feature = "doh-tls")]
-pub(crate) type InboundTlsAcceptor = tokio_rustls::TlsAcceptor;
+pub(crate) type InboundTlsAcceptor = yuhaiin_protocol::tls_server::TlsAcceptor;
 #[cfg(not(feature = "doh-tls"))]
 pub(crate) type InboundTlsAcceptor = ();
-
-#[cfg(feature = "doh-tls")]
-mod tls_auto;
 
 fn has_transport(transports: &[String], kind: &str) -> bool {
     transports
@@ -62,7 +63,7 @@ fn has_transport(transports: &[String], kind: &str) -> bool {
 pub fn fill_generated_fields(value: &mut serde_json::Value) -> Result<()> {
     #[cfg(feature = "doh-tls")]
     {
-        tls_auto::fill_generated_fields(value)
+        yuhaiin_protocol::tls_server::fill_generated_fields(value)
     }
     #[cfg(not(feature = "doh-tls"))]
     {
@@ -846,176 +847,22 @@ fn build_inbound_tls_acceptor(
     data_json: &[u8],
     transports: &[String],
 ) -> Result<Option<InboundTlsAcceptor>> {
-    if has_transport(transports, "tls_auto") {
-        #[cfg(not(feature = "doh-tls"))]
-        {
-            let _ = data_json;
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                "inbound TLS-auto transport requires the doh-tls feature",
-            ));
-        }
-
-        #[cfg(feature = "doh-tls")]
-        {
-            return tls_auto::build(data_json, transports);
-        }
-    }
-
-    let enabled = transports
-        .iter()
-        .any(|transport| transport.eq_ignore_ascii_case("tls"));
-    if !enabled {
-        return Ok(None);
-    }
-
     #[cfg(not(feature = "doh-tls"))]
     {
         let _ = data_json;
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            "inbound TLS transport requires the doh-tls feature",
-        ));
+        if has_transport(transports, "tls") || has_transport(transports, "tls_auto") {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "inbound TLS transport requires the doh-tls feature",
+            ));
+        }
+        return Ok(None);
     }
 
     #[cfg(feature = "doh-tls")]
     {
-        use std::io::Cursor;
-
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-        use tokio_rustls::TlsAcceptor;
-
-        let value: serde_json::Value = serde_json::from_slice(data_json).map_err(|error| {
-            Error::new(
-                ErrorKind::Protocol,
-                format!("inbound TLS configuration JSON: {error}"),
-            )
-        })?;
-        let transport = value
-            .get("transport")
-            .or_else(|| value.get("transports"))
-            .and_then(serde_json::Value::as_array)
-            .and_then(|items| {
-                items.iter().find(|item| {
-                    item.get("type")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|kind| kind.eq_ignore_ascii_case("tls"))
-                })
-            })
-            .ok_or_else(|| Error::invalid("inbound TLS transport configuration is missing"))?;
-        let config = transport
-            .get("tls")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|value| value.get("tls"))
-            .and_then(serde_json::Value::as_object)
-            .or_else(|| transport.get("tls").and_then(serde_json::Value::as_object))
-            .ok_or_else(|| Error::invalid("inbound TLS server config is missing"))?;
-        let certificate = config
-            .get("certificates")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|certificates| certificates.first())
-            .and_then(serde_json::Value::as_object)
-            .ok_or_else(|| Error::invalid("inbound TLS certificate is missing"))?;
-        let cert_bytes = tls_file_or_base64(certificate, "certBase64", "certFile")?;
-        let key_bytes = tls_file_or_base64(certificate, "keyBase64", "keyFile")?;
-        let certificates = if cert_bytes.starts_with(b"-----BEGIN") {
-            rustls_pemfile::certs(&mut Cursor::new(cert_bytes))
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|error| {
-                    Error::new(ErrorKind::Protocol, format!("inbound TLS cert: {error}"))
-                })?
-        } else {
-            vec![CertificateDer::from(cert_bytes)]
-        };
-        if certificates.is_empty() {
-            return Err(Error::invalid("inbound TLS certificate chain is empty"));
-        }
-        let key = if key_bytes.starts_with(b"-----BEGIN") {
-            rustls_pemfile::private_key(&mut Cursor::new(key_bytes))
-                .map_err(|error| {
-                    Error::new(ErrorKind::Protocol, format!("inbound TLS key: {error}"))
-                })?
-                .ok_or_else(|| Error::invalid("inbound TLS private key is missing"))?
-        } else {
-            PrivateKeyDer::try_from(key_bytes).map_err(|error| {
-                Error::new(ErrorKind::Protocol, format!("inbound TLS DER key: {error}"))
-            })?
-        };
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut server = rustls::ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-            .map_err(|error| {
-                Error::new(
-                    ErrorKind::Protocol,
-                    format!("inbound TLS provider: {error}"),
-                )
-            })?
-            .with_no_client_auth()
-            .with_single_cert(certificates, key)
-            .map_err(|error| {
-                Error::new(
-                    ErrorKind::Protocol,
-                    format!("inbound TLS cert/key: {error}"),
-                )
-            })?;
-        if let Some(protocols) = config
-            .get("nextProtos")
-            .and_then(serde_json::Value::as_array)
-        {
-            server.alpn_protocols = protocols
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::as_bytes)
-                .map(ToOwned::to_owned)
-                .collect();
-        }
-        if has_transport(transports, "http2")
-            && !has_transport(transports, "websocket")
-            && server.alpn_protocols.is_empty()
-        {
-            server.alpn_protocols.push(b"h2".to_vec());
-        }
-        Ok(Some(TlsAcceptor::from(Arc::new(server))))
+        yuhaiin_protocol::tls_server::build(data_json, transports)
     }
-}
-
-#[cfg(feature = "doh-tls")]
-fn tls_file_or_base64(
-    value: &serde_json::Map<String, serde_json::Value>,
-    encoded_key: &str,
-    file_key: &str,
-) -> Result<Vec<u8>> {
-    use base64::Engine;
-
-    if let Some(encoded) = value.get(encoded_key).and_then(serde_json::Value::as_str) {
-        return base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|error| {
-                Error::new(ErrorKind::InvalidInput, format!("{encoded_key}: {error}"))
-            });
-    }
-    if let Some(bytes) = value.get(encoded_key).and_then(serde_json::Value::as_array) {
-        return bytes
-            .iter()
-            .map(|value| {
-                value
-                    .as_u64()
-                    .and_then(|value| u8::try_from(value).ok())
-                    .ok_or_else(|| Error::invalid(format!("{encoded_key} contains a non-byte")))
-            })
-            .collect();
-    }
-    let path = value
-        .get(file_key)
-        .and_then(serde_json::Value::as_str)
-        .filter(|path| !path.trim().is_empty())
-        .ok_or_else(|| {
-            Error::invalid(format!(
-                "TLS certificate requires {encoded_key} or {file_key}"
-            ))
-        })?;
-    std::fs::read(path)
-        .map_err(|error| Error::new(ErrorKind::Io, format!("read TLS file {path:?}: {error}")))
 }
 
 #[cfg(feature = "http2")]
@@ -1029,7 +876,7 @@ async fn serve_h2_listener(
     use tokio::task::JoinSet;
 
     let yuubinsya_server = (spec.protocol == "yuubinsya")
-        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()))
+        .then(|| crate::inbound::adapters::yuubinsya::new_server(&spec, selector.clone()))
         .flatten();
     let handler = protocol_handler(
         spec.protocol.clone(),
@@ -1043,7 +890,7 @@ async fn serve_h2_listener(
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
-                    let (stream, peer) = accepted.map_err(crate::proxy::common::io_error)?;
+                    let (stream, peer) = accepted.map_err(crate::inbound::adapters::common::io_error)?;
                     let spec = spec.clone();
                     let tls_acceptor = tls_acceptor.clone();
                     let handler = handler.clone();
@@ -1227,7 +1074,7 @@ async fn serve_listener(
 
     let protocol = spec.protocol.clone();
     let yuubinsya_server = (protocol == "yuubinsya")
-        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()))
+        .then(|| crate::inbound::adapters::yuubinsya::new_server(&spec, selector.clone()))
         .flatten();
     let handler = protocol_handler(
         protocol.clone(),
@@ -1241,7 +1088,7 @@ async fn serve_listener(
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
-                    let (stream, peer) = accepted.map_err(crate::proxy::common::io_error)?;
+                    let (stream, peer) = accepted.map_err(crate::inbound::adapters::common::io_error)?;
                     let spec = spec.clone();
                     let tls_acceptor = tls_acceptor.clone();
                     let handler = handler.clone();
@@ -1287,7 +1134,7 @@ async fn serve_websocket_listener(
 
     let protocol = spec.protocol.clone();
     let yuubinsya_server = (protocol == "yuubinsya")
-        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()))
+        .then(|| crate::inbound::adapters::yuubinsya::new_server(&spec, selector.clone()))
         .flatten();
     let handler = protocol_handler(
         protocol.clone(),
@@ -1301,7 +1148,7 @@ async fn serve_websocket_listener(
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
-                    let (stream, peer) = accepted.map_err(crate::proxy::common::io_error)?;
+                    let (stream, peer) = accepted.map_err(crate::inbound::adapters::common::io_error)?;
                     let spec = spec.clone();
                     let tls_acceptor = tls_acceptor.clone();
                     let handler = handler.clone();
@@ -1338,11 +1185,11 @@ async fn serve_websocket_listener(
 #[allow(clippy::result_large_err)]
 async fn accept_websocket_stream<S>(
     stream: S,
-) -> Result<(crate::proxy::websocket::WebSocketIo<S>, Vec<u8>)>
+) -> Result<(yuhaiin_protocol::websocket::WebSocketIo<S>, Vec<u8>)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    crate::proxy::websocket::accept_stream(stream).await
+    yuhaiin_protocol::websocket_server::accept_stream(stream).await
 }
 
 #[cfg(all(feature = "websocket", feature = "http2"))]
@@ -1356,7 +1203,7 @@ async fn serve_websocket_h2_listener(
     use tokio::task::JoinSet;
 
     let yuubinsya_server = (spec.protocol == "yuubinsya")
-        .then(|| crate::proxy::yuubinsya::new_server(&spec, selector.clone()))
+        .then(|| crate::inbound::adapters::yuubinsya::new_server(&spec, selector.clone()))
         .flatten();
     let handler = protocol_handler(
         spec.protocol.clone(),
@@ -1370,7 +1217,7 @@ async fn serve_websocket_h2_listener(
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
-                    let (stream, peer) = accepted.map_err(crate::proxy::common::io_error)?;
+                    let (stream, peer) = accepted.map_err(crate::inbound::adapters::common::io_error)?;
                     let spec = spec.clone();
                     let tls_acceptor = tls_acceptor.clone();
                     let handler = handler.clone();
@@ -1437,39 +1284,110 @@ impl InboundProtocol for ProtocolHandler {
         Box::pin(async move {
             match self.protocol.as_str() {
                 "socks4a" => {
-                    crate::proxy::socks4a::handle(stream, peer, Arc::clone(&self.inbound)).await
+                    let username = self.inbound.spec().username.clone();
+                    yuhaiin_protocol::socks4a_server::handle(
+                        stream,
+                        peer,
+                        username.as_bytes(),
+                        self.inbound.as_ref(),
+                    )
+                    .await
                 }
                 "socks5" => {
                     crate::inbound::socks5::handle(stream, peer, Arc::clone(&self.inbound)).await
                 }
-                "http" => crate::proxy::http::handle(stream, peer, Arc::clone(&self.inbound)).await,
+                "http" => {
+                    let stream = crate::inbound::adapters::http::HttpInboundStream(stream);
+                    serve_http(stream, peer, Arc::clone(&self.inbound)).await
+                }
                 "reverse_tcp" => {
-                    crate::proxy::reverse::handle_tcp(stream, peer, Arc::clone(&self.inbound)).await
+                    crate::inbound::adapters::reverse::handle_tcp(
+                        stream,
+                        peer,
+                        Arc::clone(&self.inbound),
+                    )
+                    .await
                 }
                 "reverse_http" => {
-                    crate::proxy::reverse::handle_http(stream, peer, Arc::clone(&self.inbound))
-                        .await
+                    crate::inbound::adapters::reverse::handle_http(
+                        stream,
+                        peer,
+                        Arc::clone(&self.inbound),
+                    )
+                    .await
                 }
                 "mixed" => serve_mixed(stream, peer, Arc::clone(&self.inbound)).await,
                 "trojan" => {
-                    crate::proxy::trojan::handle(stream, peer, Arc::clone(&self.inbound)).await
+                    let hashes =
+                        crate::inbound::adapters::trojan::password_hashes(self.inbound.spec());
+                    let udp_inbound = Arc::clone(&self.inbound);
+                    yuhaiin_protocol::trojan::handle(
+                        stream,
+                        peer,
+                        &hashes,
+                        self.inbound.selector().udp_buffer_size(),
+                        self.inbound.as_ref(),
+                        move |codec| async move {
+                            InboundUdpSession::new(codec, udp_inbound).run().await
+                        },
+                    )
+                    .await
                 }
                 "vless" => {
-                    crate::proxy::vless::handle(stream, peer, Arc::clone(&self.inbound)).await
+                    let uuid = yuhaiin_protocol::vless::parse_uuid(&self.inbound.spec().password)?;
+                    let udp_inbound = Arc::clone(&self.inbound);
+                    yuhaiin_protocol::vless::handle(
+                        stream,
+                        peer,
+                        &uuid,
+                        self.inbound.selector().udp_buffer_size(),
+                        self.inbound.as_ref(),
+                        move |server| async move {
+                            let codec = crate::inbound::adapters::vless::VlessUdpCodec {
+                                server,
+                                flow_key: None,
+                            };
+                            InboundUdpSession::new(codec, udp_inbound).run().await
+                        },
+                    )
+                    .await
                 }
                 "yuubinsya" => {
-                    if let Some(server) = self.yuubinsya_server.clone() {
-                        crate::proxy::yuubinsya::handle_with_server(
+                    let server = self
+                        .yuubinsya_server
+                        .clone()
+                        .or_else(|| {
+                            crate::inbound::adapters::yuubinsya::new_server(
+                                self.inbound.spec(),
+                                Arc::clone(self.inbound.selector()),
+                            )
+                        })
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::Unsupported,
+                                "Yuubinsya inbound has no concrete password hash",
+                            )
+                        })?;
+                    let annotate = self.inbound.spec().clone();
+                    let route = Arc::clone(self.inbound.selector());
+                    let monitor = Arc::clone(self.inbound.monitor());
+                    let dns_handler = monitor.dns_hijack_enabled().then(|| {
+                        Arc::new(self.inbound.dns_policy())
+                            as Arc<dyn yuhaiin_types::InboundDnsHandler>
+                    });
+                    server
+                        .serve_with_handler(
                             stream,
                             peer,
-                            Arc::clone(&self.inbound),
-                            server,
+                            self.inbound.as_ref(),
+                            monitor,
+                            move |context| {
+                                annotate.annotate_context(context);
+                                route.route_context(context);
+                            },
+                            dns_handler,
                         )
                         .await
-                    } else {
-                        crate::proxy::yuubinsya::handle(stream, peer, Arc::clone(&self.inbound))
-                            .await
-                    }
                 }
                 "none" => Ok(()),
                 other => Err(Error::new(
@@ -1479,6 +1397,28 @@ impl InboundProtocol for ProtocolHandler {
             }
         })
     }
+}
+
+async fn serve_http(
+    stream: crate::inbound::adapters::http::HttpInboundStream,
+    peer: SocketAddr,
+    inbound: Arc<InboundHandler>,
+) -> Result<()> {
+    let spec = inbound.spec().clone();
+    let handler = crate::inbound::adapters::http::HttpInboundHandler { inbound };
+    let central_auth: Option<&dyn InboundBasicAuth> = spec
+        .auth
+        .as_deref()
+        .map(|auth| auth as &dyn InboundBasicAuth);
+    yuhaiin_protocol::http_server::handle::<crate::inbound::adapters::http::HttpInboundStream, _>(
+        stream,
+        peer,
+        &spec.username,
+        &spec.password,
+        central_auth,
+        &handler,
+    )
+    .await
 }
 
 fn protocol_handler(
@@ -1521,69 +1461,37 @@ async fn serve_mixed(
     stream
         .read_exact(&mut first)
         .await
-        .map_err(crate::proxy::common::io_error)?;
+        .map_err(crate::inbound::adapters::common::io_error)?;
     let stream = PrefixedIo::new(vec![first[0]], stream);
     if first[0] == 4 {
-        crate::proxy::socks4a::handle(Box::new(stream), peer, inbound).await
+        let username = inbound.spec().username.clone();
+        let stream: BoxAsyncStream = Box::new(stream);
+        yuhaiin_protocol::socks4a_server::handle(
+            stream,
+            peer,
+            username.as_bytes(),
+            inbound.as_ref(),
+        )
+        .await
     } else if first[0] == 5 {
         crate::inbound::socks5::handle(Box::new(stream), peer, inbound).await
     } else {
-        crate::proxy::http::handle(Box::new(stream), peer, inbound).await
-    }
-}
-
-/// Re-inject the protocol discriminator consumed by a mixed inbound before
-/// handing the connection to the normal protocol server. The wrapper keeps
-/// protocol detection separate from SOCKS5/HTTP framing and preserves writes
-/// on the original stream.
-struct PrefixedIo<S> {
-    prefix: Vec<u8>,
-    prefix_offset: usize,
-    inner: S,
-}
-
-impl<S> PrefixedIo<S> {
-    fn new(prefix: Vec<u8>, inner: S) -> Self {
-        Self {
-            prefix,
-            prefix_offset: 0,
-            inner,
-        }
-    }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for PrefixedIo<S> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.as_mut().get_mut();
-        if this.prefix_offset < this.prefix.len() && buffer.remaining() > 0 {
-            let count = (this.prefix.len() - this.prefix_offset).min(buffer.remaining());
-            buffer.put_slice(&this.prefix[this.prefix_offset..this.prefix_offset + count]);
-            this.prefix_offset += count;
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut this.inner).poll_read(cx, buffer)
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<S> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bytes: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, bytes)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let stream: BoxAsyncStream = Box::new(stream);
+        let spec = inbound.spec().clone();
+        let handler = crate::inbound::adapters::http::HttpInboundHandler { inbound };
+        let central_auth: Option<&dyn InboundBasicAuth> = spec
+            .auth
+            .as_deref()
+            .map(|auth| auth as &dyn InboundBasicAuth);
+        yuhaiin_protocol::http_server::handle::<crate::inbound::adapters::http::HttpInboundStream, _>(
+            crate::inbound::adapters::http::HttpInboundStream(stream),
+            peer,
+            &spec.username,
+            &spec.password,
+            central_auth,
+            &handler,
+        )
+        .await
     }
 }
 
@@ -1811,7 +1719,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             reverse_target: Some(Endpoint::ip(Network::Tcp, echo_address)),
             reverse_http: None,
         };
-        let task = tokio::spawn(crate::proxy::reverse::handle_tcp(
+        let task = tokio::spawn(crate::inbound::adapters::reverse::handle_tcp(
             Box::new(server),
             "127.0.0.1:41005".parse().unwrap(),
             InboundHandler::new(spec, selector, monitor),
@@ -1865,7 +1773,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                 https: false,
             }),
         };
-        let task = tokio::spawn(crate::proxy::reverse::handle_http(
+        let task = tokio::spawn(crate::inbound::adapters::reverse::handle_http(
             Box::new(server),
             "127.0.0.1:41006".parse().unwrap(),
             InboundHandler::new(spec, selector, monitor),
@@ -2137,11 +2045,20 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             reverse_target: None,
             reverse_http: None,
         };
-        let task = tokio::spawn(crate::proxy::trojan::handle(
-            Box::new(server),
-            "127.0.0.1:41001".parse().unwrap(),
-            InboundHandler::new(spec, selector, monitor),
-        ));
+        let task = tokio::spawn(async move {
+            let inbound = InboundHandler::new(spec, selector, monitor);
+            let hashes = crate::inbound::adapters::trojan::password_hashes(inbound.spec());
+            let udp_inbound = Arc::clone(&inbound);
+            yuhaiin_protocol::trojan::handle(
+                Box::new(server) as BoxAsyncStream,
+                "127.0.0.1:41001".parse().unwrap(),
+                &hashes,
+                inbound.selector().udp_buffer_size(),
+                inbound.as_ref(),
+                move |codec| async move { InboundUdpSession::new(codec, udp_inbound).run().await },
+            )
+            .await
+        });
         let destination = Endpoint::ip(Network::Tcp, echo_address);
         let hash = trojan::password_hash(b"secret");
         trojan::write_request(&mut client, &hash, Command::Connect, &destination)
@@ -2178,11 +2095,26 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             reverse_target: None,
             reverse_http: None,
         };
-        let task = tokio::spawn(crate::proxy::vless::handle(
-            Box::new(server),
-            "127.0.0.1:41003".parse().unwrap(),
-            InboundHandler::new(spec, selector, monitor),
-        ));
+        let task = tokio::spawn(async move {
+            let inbound = InboundHandler::new(spec, selector, monitor);
+            let uuid = yuhaiin_protocol::vless::parse_uuid(&inbound.spec().password)?;
+            let udp_inbound = Arc::clone(&inbound);
+            yuhaiin_protocol::vless::handle(
+                Box::new(server) as BoxAsyncStream,
+                "127.0.0.1:41003".parse().unwrap(),
+                &uuid,
+                inbound.selector().udp_buffer_size(),
+                inbound.as_ref(),
+                move |server| async move {
+                    let codec = crate::inbound::adapters::vless::VlessUdpCodec {
+                        server,
+                        flow_key: None,
+                    };
+                    InboundUdpSession::new(codec, udp_inbound).run().await
+                },
+            )
+            .await
+        });
         let destination = Endpoint::ip(Network::Tcp, echo_address);
         let uuid = vless::parse_uuid("00112233-4455-6677-8899-aabbccddeeff").unwrap();
         vless::write_request(&mut client, &uuid, VlessCommand::Tcp, &destination)
@@ -2228,11 +2160,26 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             reverse_target: None,
             reverse_http: None,
         };
-        let task = tokio::spawn(crate::proxy::vless::handle(
-            Box::new(server),
-            "127.0.0.1:41004".parse().unwrap(),
-            InboundHandler::new(spec, selector, monitor),
-        ));
+        let task = tokio::spawn(async move {
+            let inbound = InboundHandler::new(spec, selector, monitor);
+            let uuid = yuhaiin_protocol::vless::parse_uuid(&inbound.spec().password)?;
+            let udp_inbound = Arc::clone(&inbound);
+            yuhaiin_protocol::vless::handle(
+                Box::new(server) as BoxAsyncStream,
+                "127.0.0.1:41004".parse().unwrap(),
+                &uuid,
+                inbound.selector().udp_buffer_size(),
+                inbound.as_ref(),
+                move |server| async move {
+                    let codec = crate::inbound::adapters::vless::VlessUdpCodec {
+                        server,
+                        flow_key: None,
+                    };
+                    InboundUdpSession::new(codec, udp_inbound).run().await
+                },
+            )
+            .await
+        });
         let destination = Endpoint::ip(Network::Udp, echo_address);
         let uuid = vless::parse_uuid("00112233-4455-6677-8899-aabbccddeeff").unwrap();
         vless::write_request(&mut client, &uuid, VlessCommand::Udp, &destination)
@@ -2277,11 +2224,20 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             reverse_target: None,
             reverse_http: None,
         };
-        let task = tokio::spawn(crate::proxy::trojan::handle(
-            Box::new(server),
-            "127.0.0.1:41002".parse().unwrap(),
-            InboundHandler::new(spec, selector, monitor),
-        ));
+        let task = tokio::spawn(async move {
+            let inbound = InboundHandler::new(spec, selector, monitor);
+            let hashes = crate::inbound::adapters::trojan::password_hashes(inbound.spec());
+            let udp_inbound = Arc::clone(&inbound);
+            yuhaiin_protocol::trojan::handle(
+                Box::new(server) as BoxAsyncStream,
+                "127.0.0.1:41002".parse().unwrap(),
+                &hashes,
+                inbound.selector().udp_buffer_size(),
+                inbound.as_ref(),
+                move |codec| async move { InboundUdpSession::new(codec, udp_inbound).run().await },
+            )
+            .await
+        });
         let destination = Endpoint::ip(Network::Udp, echo_address);
         let hash = trojan::password_hash(b"secret");
         trojan::write_request(&mut client, &hash, Command::Associate, &destination)
@@ -2867,7 +2823,9 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let (selector, monitor) = direct_runtime().await;
             let listener_task = tokio::spawn(crate::inbound::socks5::serve_socks5_udp_loop(
-                Box::new(server),
+                Box::new(crate::inbound::socks5::RuntimeUdpTransport(Box::new(
+                    server,
+                ))),
                 InboundHandler::new(
                     InboundSpec {
                         id: "socks-udp-close-inbound".to_owned(),
@@ -2895,13 +2853,15 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             let result = tokio::time::timeout(Duration::from_secs(2), async {
                 let target = Endpoint::ip(Network::Udp, target_address);
                 let packet =
-                    crate::inbound::socks5::encode_socks_udp_packet(&target, b"udp-close").unwrap();
+                    yuhaiin_protocol::socks5_server::encode_udp_packet(&target, b"udp-close")
+                        .unwrap();
                 client.send_to(&packet, server_address).await.unwrap();
                 let mut reply = [0u8; 2048];
                 let (length, _) = client.recv_from(&mut reply).await.unwrap();
-                let (_, payload) = crate::inbound::socks5::parse_socks_udp_packet(&reply[..length])
-                    .unwrap()
-                    .unwrap();
+                let (_, payload) =
+                    yuhaiin_protocol::socks5_server::parse_udp_packet(&reply[..length])
+                        .unwrap()
+                        .unwrap();
                 assert_eq!(payload, b"udp-close");
 
                 let connection_id = tokio::time::timeout(Duration::from_secs(1), async {
@@ -3017,7 +2977,8 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
             let client = UdpSocket::bind("127.0.0.2:0").await.unwrap();
             let target = Endpoint::ip(Network::Udp, target_address);
             let packet =
-                crate::inbound::socks5::encode_socks_udp_packet(&target, b"udp-associate").unwrap();
+                yuhaiin_protocol::socks5_server::encode_udp_packet(&target, b"udp-associate")
+                    .unwrap();
             client.send_to(&packet, relay_address).await.unwrap();
             let mut reply = [0u8; 2048];
             let (length, _) =
@@ -3025,7 +2986,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                     .await
                     .unwrap()
                     .unwrap();
-            let (_, payload) = crate::inbound::socks5::parse_socks_udp_packet(&reply[..length])
+            let (_, payload) = yuhaiin_protocol::socks5_server::parse_udp_packet(&reply[..length])
                 .unwrap()
                 .unwrap();
             assert_eq!(payload, b"udp-associate");
@@ -3410,7 +3371,7 @@ clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
                         .await
                         .unwrap();
                 let (mut client, connection) =
-                    h2::client::handshake(crate::proxy::websocket::WebSocketIo::new(websocket))
+                    h2::client::handshake(yuhaiin_protocol::websocket::WebSocketIo::new(websocket))
                         .await
                         .unwrap();
                 let connection_task = tokio::spawn(async move {

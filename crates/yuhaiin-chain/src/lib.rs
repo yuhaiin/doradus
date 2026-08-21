@@ -21,8 +21,7 @@ pub use go_node::parse_go_node;
 pub use yuhaiin_protocol::YuubinsyaH2Server;
 pub use yuhaiin_protocol::{
     AsyncYuubinsyaPingServerSession, AsyncYuubinsyaPingSession, AsyncYuubinsyaTcpSession,
-    AsyncYuubinsyaUotServerSession, AsyncYuubinsyaUotSession, YuubinsyaDnsHandler,
-    YuubinsyaServerProxy,
+    AsyncYuubinsyaUotServerSession, AsyncYuubinsyaUotSession, YuubinsyaServerProxy,
 };
 pub use yuhaiin_protocol::{H2Connection, H2PoolStats};
 

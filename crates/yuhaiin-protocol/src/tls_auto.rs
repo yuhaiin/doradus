@@ -14,12 +14,12 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use base64::Engine as _;
-use ed25519_tls_auto::pkcs8::DecodePrivateKey as _;
-use ed25519_tls_auto::{SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey};
-use p256_tls_auto::ecdsa::{DerSignature, SigningKey};
-use p256_tls_auto::elliptic_curve::rand_core::{OsRng, RngCore};
-use p256_tls_auto::pkcs8::EncodePrivateKey as _;
-use p256_tls_auto::{PublicKey, SecretKey};
+use ed25519_dalek::pkcs8::DecodePrivateKey as _;
+use ed25519_dalek::{SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey};
+use p256::ecdsa::{DerSignature, SigningKey};
+use p256::elliptic_curve::rand_core::{OsRng, RngCore};
+use p256::pkcs8::EncodePrivateKey as _;
+use p256::{PublicKey, SecretKey};
 use rsa_tls_auto::RsaPrivateKey;
 use rsa_tls_auto::pkcs1v15::{Signature as RsaSignature, SigningKey as RsaSigningKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -87,8 +87,8 @@ pub(crate) fn build(data_json: &[u8], transports: &[String]) -> Result<Option<Tl
         .into_iter()
         .map(|protocol| protocol.into_bytes())
         .collect();
-    if super::has_transport(transports, "http2")
-        && !super::has_transport(transports, "websocket")
+    if has_transport(transports, "http2")
+        && !has_transport(transports, "websocket")
         && server.alpn_protocols.is_empty()
     {
         server.alpn_protocols.push(b"h2".to_vec());
@@ -114,6 +114,12 @@ pub(crate) fn build(data_json: &[u8], transports: &[String]) -> Result<Option<Tl
     }
 
     Ok(Some(TlsAcceptor::from(Arc::new(server))))
+}
+
+fn has_transport(transports: &[String], kind: &str) -> bool {
+    transports
+        .iter()
+        .any(|transport| transport.eq_ignore_ascii_case(kind))
 }
 
 /// Fill the generated TLS-auto CA fields at the same boundary as Go's

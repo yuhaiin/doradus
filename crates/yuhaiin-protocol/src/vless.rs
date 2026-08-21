@@ -5,16 +5,22 @@
 //! destination, then a two-byte response header. TCP payloads are raw after
 //! the response; UDP payloads use a big-endian u16 length prefix.
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, split};
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf, split,
+};
 use tokio::sync::Mutex;
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{
     BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, Result,
+};
+use yuhaiin_types::{
+    InboundStreamHandler, InboundUdpCodec, InboundUdpFlowId, InboundUdpRequest, InboundUdpResponse,
 };
 
 pub const VERSION: u8 = 0;
@@ -44,6 +50,122 @@ pub struct Request {
     pub command: Command,
     pub destination: Endpoint,
     pub addons: Vec<u8>,
+}
+
+/// VLESS UDP-over-stream server codec.
+///
+/// VLESS v0 fixes the destination in the initial request.  Subsequent
+/// packets are length-prefixed and do not repeat the destination.
+pub struct UdpServer<R, W> {
+    reader: R,
+    writer: W,
+    peer: std::net::SocketAddr,
+    destination: Endpoint,
+    packet: Vec<u8>,
+}
+
+impl<R, W> UdpServer<R, W> {
+    pub fn new(
+        reader: R,
+        writer: W,
+        peer: std::net::SocketAddr,
+        destination: Endpoint,
+        buffer_size: usize,
+    ) -> Self {
+        Self {
+            reader,
+            writer,
+            peer,
+            destination,
+            packet: vec![0u8; buffer_size.max(512)],
+        }
+    }
+}
+
+/// Serve one VLESS inbound stream.
+///
+/// The protocol crate authenticates and parses the initial request, emits the
+/// response header for TCP, and constructs the UDP framing codec.  Route
+/// selection and UDP flow/session lifetime are supplied by the application
+/// layer through the two handler ports.
+pub async fn handle<S, H, U, F>(
+    mut stream: S,
+    peer: std::net::SocketAddr,
+    uuid: &[u8; 16],
+    udp_buffer_size: usize,
+    handler: &H,
+    udp_handler: U,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    H: InboundStreamHandler<S> + ?Sized,
+    U: FnOnce(UdpServer<ReadHalf<S>, WriteHalf<S>>) -> F + Send + 'static,
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    let request = read_request(&mut stream, uuid).await?;
+    match request.command {
+        Command::Tcp => {
+            write_response(&mut stream, &[]).await?;
+            handler
+                .handle_stream(stream, peer, request.destination, "vless")
+                .await
+        }
+        Command::Udp => {
+            let (reader, writer) = split(stream);
+            udp_handler(UdpServer::new(
+                reader,
+                writer,
+                peer,
+                request.destination,
+                udp_buffer_size,
+            ))
+            .await
+        }
+    }
+}
+
+impl<R, W> InboundUdpCodec for UdpServer<R, W>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    type Request = InboundUdpRequest;
+    type Response = InboundUdpResponse;
+
+    fn recv<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<InboundUdpRequest>>> {
+        Box::pin(async move {
+            let length = usize::from(self.reader.read_u16().await.map_err(io_error)?);
+            if length > self.packet.len() {
+                return Err(Error::invalid("VLESS UDP payload is too large"));
+            }
+            self.reader
+                .read_exact(&mut self.packet[..length])
+                .await
+                .map_err(io_error)?;
+            Ok(Some(InboundUdpRequest {
+                id: InboundUdpFlowId {
+                    peer: self.peer,
+                    target: self.destination.clone(),
+                    authentication: None,
+                },
+                peer: Endpoint::ip(Network::Udp, self.peer),
+                target: self.destination.clone(),
+                payload: self.packet[..length].to_vec(),
+            }))
+        })
+    }
+
+    fn send<'a>(&'a mut self, response: InboundUdpResponse) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let length = u16::try_from(response.payload.len())
+                .map_err(|_| Error::invalid("VLESS UDP response is too large"))?;
+            self.writer.write_u16(length).await.map_err(io_error)?;
+            self.writer
+                .write_all(&response.payload)
+                .await
+                .map_err(io_error)
+        })
+    }
 }
 
 /// Parse the canonical VLESS UUID form. Hyphens are optional so both the

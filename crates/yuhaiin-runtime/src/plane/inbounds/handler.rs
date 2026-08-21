@@ -22,7 +22,7 @@ use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector, BoxAsyncStream};
 use yuhaiin_core::{BoxFuture, Endpoint, FlowContext, Network, Result};
 
 use super::InboundSpec;
-use crate::proxy::common::{
+use crate::inbound::adapters::common::{
     UdpFlowId, record_outbound_datagram, record_outbound_stream, relay_counted_with_buffer,
     relay_counted_with_prefix_and_buffer, udp_idle_timeout,
 };
@@ -261,27 +261,33 @@ impl InboundHandler {
             .await
     }
 
-    pub(crate) async fn serve_stream(
+    pub(crate) async fn serve_stream<S>(
         &self,
-        stream: BoxAsyncStream,
+        stream: S,
         peer: SocketAddr,
         protocol: &str,
         destination: Endpoint,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let connection = self.open_stream(protocol, peer, destination).await?;
         self.relay(stream, connection, peer).await.map_err(|error| {
             yuhaiin_core::Error::new(yuhaiin_core::ErrorKind::Io, error.to_string())
         })
     }
 
-    pub(crate) async fn serve_stream_with_prefix(
+    pub(crate) async fn serve_stream_with_prefix<S>(
         &self,
-        stream: BoxAsyncStream,
+        stream: S,
         peer: SocketAddr,
         protocol: &str,
         destination: Endpoint,
         prefix: &[u8],
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let connection = self.open_stream(protocol, peer, destination).await?;
         self.relay_with_prefix(stream, connection, peer, prefix)
             .await
@@ -377,6 +383,39 @@ impl InboundHandler {
     }
 }
 
+/// Runtime implementation of the protocol crate's stream hand-off port.
+///
+/// The protocol server has already authenticated and parsed the destination
+/// when this is called.  From here on, route selection, outbound creation,
+/// flow accounting and relay lifetime are runtime responsibilities.
+impl yuhaiin_types::InboundStreamHandler<BoxAsyncStream> for InboundHandler {
+    fn handle_stream<'a>(
+        &'a self,
+        stream: BoxAsyncStream,
+        peer: SocketAddr,
+        destination: Endpoint,
+        protocol: &'static str,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.serve_stream(stream, peer, protocol, destination).await })
+    }
+}
+
+impl<S> yuhaiin_types::InboundStreamHandler<yuhaiin_protocol::reverse_http::PrefixedIo<S>>
+    for InboundHandler
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    fn handle_stream<'a>(
+        &'a self,
+        stream: yuhaiin_protocol::reverse_http::PrefixedIo<S>,
+        peer: SocketAddr,
+        destination: Endpoint,
+        protocol: &'static str,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.serve_stream(stream, peer, protocol, destination).await })
+    }
+}
+
 pub(crate) struct InboundStream {
     pub(crate) outbound: BoxAsyncStream,
     pub(crate) context: FlowContext,
@@ -393,35 +432,18 @@ pub(crate) struct ObservedDatagram {
     pub(crate) _observation: yuhaiin_core::flow::FlowObserverGuard,
 }
 
-pub(crate) struct InboundUdpRequest {
-    pub(crate) id: UdpFlowId,
-    pub(crate) peer: Endpoint,
-    pub(crate) target: Endpoint,
-    pub(crate) payload: Vec<u8>,
-}
-
-pub(crate) struct InboundUdpResponse {
-    pub(crate) id: UdpFlowId,
-    pub(crate) peer: Endpoint,
-    pub(crate) target: Endpoint,
-    pub(crate) payload: Vec<u8>,
-    pub(crate) flow: Option<TunFlowKey>,
-}
-
-/// Protocol adapters implement only wire framing. The shared session owns
-/// DNS interception, outbound datagrams, flow accounting, close requests and
-/// idle cleanup, matching Go's `inbound.Inbound` packet loop.
-pub(crate) trait InboundUdpCodec: Send {
-    fn recv<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<InboundUdpRequest>>>;
-
-    fn send<'a>(&'a mut self, response: InboundUdpResponse) -> BoxFuture<'a, Result<()>>;
-
+/// Runtime-only flow lifecycle hooks.  A protocol codec must not depend on
+/// the TUN flow key, but a stream-scoped inbound (currently VLESS) still needs
+/// to close when its one outbound flow is closed.
+pub(crate) trait InboundUdpFlowPolicy: InboundUdpCodec {
     fn note_flow(&mut self, _flow: TunFlowKey) {}
 
     fn owns_flow(&self, _flow: TunFlowKey) -> bool {
         false
     }
 }
+
+pub(crate) use yuhaiin_types::{InboundUdpCodec, InboundUdpRequest, InboundUdpResponse};
 
 /// A source-owned UDP flow. The destination is deliberately absent from the
 /// key so one client can use one full-cone datagram for multiple targets.
@@ -791,7 +813,6 @@ impl UdpFlowWorker {
                         peer: packet.peer,
                         target: packet.target,
                         payload,
-                        flow: None,
                     },
                 );
             }
@@ -869,7 +890,6 @@ impl UdpFlowWorker {
                 peer: peer.clone(),
                 target,
                 payload,
-                flow: Some(flow),
             },
         )
     }
@@ -898,7 +918,8 @@ pub(crate) struct InboundUdpSession<C> {
 
 impl<C> InboundUdpSession<C>
 where
-    C: InboundUdpCodec,
+    C: InboundUdpCodec<Request = InboundUdpRequest, Response = InboundUdpResponse>
+        + InboundUdpFlowPolicy,
 {
     pub(crate) fn new(codec: C, inbound: Arc<InboundHandler>) -> Self {
         let capacity = inbound.selector().udp_ringbuffer_size().max(1);
@@ -946,9 +967,6 @@ where
                     }
                     Some(response) = self.reply_rx.recv() => {
                         pending_packets = pending_packets.saturating_sub(1);
-                        if let Some(flow) = response.flow {
-                            self.codec.note_flow(flow);
-                        }
                         self.codec.send(response).await?;
                         if input_closed && pending_packets == 0 { break; }
                     }

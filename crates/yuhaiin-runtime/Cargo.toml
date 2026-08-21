@@ -56,12 +56,6 @@ doh-tls = [
     "dep:rustls",
     "dep:rustls-pemfile",
     "dep:tokio-rustls",
-    "dep:x509-cert",
-    "dep:p256-tls-auto",
-    "dep:sha2_10",
-    "dep:ed25519-tls-auto",
-    "dep:rsa-tls-auto",
-    "dep:signature-tls-auto",
     "yuhaiin-protocol/tls-ring",
     "dep:webpki-roots",
     "yuhaiin-dns/tls",
@@ -89,12 +83,6 @@ hyper = { version = "1.11.0", default-features = false, optional = true }
 hyper-util = { version = "0.1.20", default-features = false, optional = true }
 rustls = { version = "0.23.41", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
 rustls-pemfile = { version = "2.2.0", optional = true }
-p256-tls-auto = { package = "p256", version = "0.13.2", optional = true, default-features = false, features = ["ecdsa", "pem", "pkcs8", "std"] }
-sha2_10 = { package = "sha2", version = "0.10.9", optional = true, features = ["oid"] }
-x509-cert = { version = "0.2.5", optional = true, default-features = false, features = ["builder", "std"] }
-ed25519-tls-auto = { package = "ed25519-dalek", version = "2.2.0", optional = true, default-features = false, features = ["std", "pkcs8"] }
-rsa-tls-auto = { package = "rsa", version = "0.9.10", optional = true, default-features = false, features = ["std", "pem", "sha2"] }
-signature-tls-auto = { package = "signature", version = "2.2.0", optional = true, default-features = false, features = ["alloc", "rand_core"] }
 tokio = { version = "1.50.0", default-features = false, features = ["fs", "io-util", "net", "rt", "sync", "time"] }
 webpki-roots = { version = "1.0.3", optional = true }
 tokio-rustls = { version = "0.26.4", optional = true, default-features = false, features = ["tls12"] }

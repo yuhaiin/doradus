@@ -21,8 +21,15 @@ pub mod shadowsocksr;
 pub mod socks4a_server;
 pub mod socks5;
 pub mod socks5_server;
+pub mod stream;
 #[cfg(feature = "tls-ring")]
 pub mod tls;
+#[cfg(feature = "tls-ring")]
+pub mod tls_auto;
+#[cfg(feature = "tls-ring")]
+pub mod tls_server;
+#[cfg(target_os = "linux")]
+pub mod transparent;
 pub mod trojan;
 pub mod vless;
 pub mod vmess;
@@ -39,7 +46,6 @@ pub use h2_server::YuubinsyaH2Server;
 pub use h2_tunnel::{H2Connection, H2Pool, H2PoolEndpoint, H2PoolStats};
 pub use session::{
     AsyncYuubinsyaPingServerSession, AsyncYuubinsyaPingSession, AsyncYuubinsyaTcpSession,
-    AsyncYuubinsyaUotServerSession, AsyncYuubinsyaUotSession, YuubinsyaDnsHandler,
-    YuubinsyaServerProxy,
+    AsyncYuubinsyaUotServerSession, AsyncYuubinsyaUotSession, YuubinsyaServerProxy,
 };
 pub use yuubinsya_udp::{YuubinsyaUdpDatagram, YuubinsyaUdpProxy, YuubinsyaUdpServer};

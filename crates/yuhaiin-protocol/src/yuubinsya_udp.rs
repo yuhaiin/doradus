@@ -7,6 +7,7 @@ use yuhaiin_core::proxy::{
     AsyncDatagram, AsyncProxy, BoxAsyncStream, bind_tokio_udp_socket_for_target,
 };
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use yuhaiin_types::{InboundUdpCodec, InboundUdpFlowId, InboundUdpRequest, InboundUdpResponse};
 
 struct TokioDatagram {
     socket: tokio::net::UdpSocket,
@@ -122,6 +123,70 @@ pub struct YuubinsyaUdpServer {
     transport: Box<dyn AsyncDatagram>,
     password_hashes: Arc<[[u8; 32]]>,
     socks5_prefix: bool,
+}
+
+/// Yuubinsya inbound UDP protocol codec.
+///
+/// [`YuubinsyaUdpServer`] owns authenticated wire transport.  This adapter
+/// turns it into the shared inbound UDP contract while leaving routing and
+/// flow management to the runtime.
+pub struct InboundUdpServer {
+    server: YuubinsyaUdpServer,
+    packet: Vec<u8>,
+}
+
+impl InboundUdpServer {
+    pub fn new(server: YuubinsyaUdpServer, buffer_size: usize) -> Self {
+        Self {
+            server,
+            packet: vec![0u8; buffer_size.max(512)],
+        }
+    }
+}
+
+impl InboundUdpCodec for InboundUdpServer {
+    type Request = InboundUdpRequest;
+    type Response = InboundUdpResponse;
+
+    fn recv<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<InboundUdpRequest>>> {
+        Box::pin(async move {
+            let (length, target, peer, password_hash) = self
+                .server
+                .recv_from_authenticated(&mut self.packet)
+                .await?;
+            let peer_addr = peer
+                .addr()
+                .ok_or_else(|| Error::invalid("Yuubinsya UDP peer has no IP address"))?;
+            Ok(Some(InboundUdpRequest {
+                id: InboundUdpFlowId {
+                    peer: peer_addr,
+                    target: target.clone(),
+                    authentication: Some(password_hash),
+                },
+                peer,
+                target,
+                payload: self.packet[..length].to_vec(),
+            }))
+        })
+    }
+
+    fn send<'a>(&'a mut self, response: InboundUdpResponse) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let password_hash = response
+                .id
+                .authentication
+                .ok_or_else(|| Error::invalid("Yuubinsya UDP response has no password hash"))?;
+            self.server
+                .send_to_with_password_hash(
+                    &response.payload,
+                    response.target,
+                    response.peer,
+                    password_hash,
+                )
+                .await?;
+            Ok(())
+        })
+    }
 }
 
 impl YuubinsyaUdpServer {

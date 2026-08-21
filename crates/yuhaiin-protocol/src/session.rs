@@ -15,7 +15,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, Wr
 use tokio::sync::{Mutex, Notify, mpsc};
 use yuhaiin_core::flow::{Flow, FlowDirection, FlowKey, FlowObserver, FlowObserverGuard};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy};
-use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Result};
+use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Result};
+use yuhaiin_types::{InboundDnsHandler, InboundStreamHandler};
 
 pub const MAX_UOT_COALESCE_BYTES: usize = 64 * 1024;
 pub const MAX_UOT_COALESCE_FRAMES: usize = 32;
@@ -26,16 +27,6 @@ const UOT_COALESCE_FLUSH_DELAY: Duration = Duration::from_micros(100);
 const SERVER_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SERVER_UDP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DNS_TCP_PACKET: usize = 4096;
-
-/// Optional DNS boundary for the Yuubinsya inbound session. The chain crate
-/// owns Yuubinsya framing; the embedding runtime owns resolver policy.
-pub trait YuubinsyaDnsHandler: Send + Sync {
-    fn should_hijack(&self, destination_port: Option<u16>, packet: &[u8]) -> bool {
-        destination_port == Some(53) || yuhaiin_core::dns::decode_query(packet).is_ok()
-    }
-
-    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>>;
-}
 
 /// A Yuubinsya TCP stream after the authenticated destination header has been
 /// sent. The remaining bytes are transparent TCP payload.
@@ -494,11 +485,11 @@ impl YuubinsyaServerProxy {
 
     /// Serve one Yuubinsya stream. A closed stream returns its underlying I/O
     /// error; the listener may treat that as normal per-stream cleanup.
-    pub async fn serve<S>(&self, mut stream: S) -> Result<()>
+    pub async fn serve<S>(&self, stream: S) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_inner(&mut stream, None, None).await
+        self.serve_inner(stream, None, None).await
     }
 
     /// Serve an inbound stream while publishing the same lifecycle and byte
@@ -522,18 +513,63 @@ impl YuubinsyaServerProxy {
 
     pub async fn serve_observed_with_dns<S, F>(
         &self,
-        mut stream: S,
+        stream: S,
         source: SocketAddr,
         observer: Arc<dyn FlowObserver>,
         annotate: F,
-        dns_handler: Option<Arc<dyn YuubinsyaDnsHandler>>,
+        dns_handler: Option<Arc<dyn InboundDnsHandler>>,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
         F: Fn(&mut FlowContext) + Send + Sync + 'static,
     {
         self.serve_inner(
-            &mut stream,
+            stream,
+            Some(ObservedInbound {
+                source,
+                observer,
+                annotate: Arc::new(annotate),
+            }),
+            dns_handler,
+        )
+        .await
+    }
+
+    /// Serve the TCP part of one Yuubinsya stream through the shared inbound
+    /// handler. Ping and UOT still use the server's protocol-local upstream;
+    /// only the authenticated TCP payload is handed to the application seam.
+    pub async fn serve_with_handler<S, H, F>(
+        &self,
+        mut stream: S,
+        source: SocketAddr,
+        handler: &H,
+        observer: Arc<dyn FlowObserver>,
+        annotate: F,
+        dns_handler: Option<Arc<dyn InboundDnsHandler>>,
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        H: InboundStreamHandler<S> + ?Sized,
+        F: Fn(&mut FlowContext) + Send + Sync + 'static,
+    {
+        let header_bytes = read_header_bytes(&mut stream).await?;
+        let (header, _, password_hash) = decode_header_any(&self.password_hashes, &header_bytes)?;
+        if header.protocol == YuubinsyaProtocol::Tcp {
+            let destination = header.destination.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Protocol,
+                    "Yuubinsya TCP header has no destination",
+                )
+            })?;
+            return handler
+                .handle_stream(stream, source, destination, "yuubinsya")
+                .await;
+        }
+
+        self.serve_decoded(
+            stream,
+            header,
+            password_hash,
             Some(ObservedInbound {
                 source,
                 observer,
@@ -546,15 +582,30 @@ impl YuubinsyaServerProxy {
 
     async fn serve_inner<S>(
         &self,
-        stream: &mut S,
+        mut stream: S,
         observed: Option<ObservedInbound>,
-        dns_handler: Option<Arc<dyn YuubinsyaDnsHandler>>,
+        dns_handler: Option<Arc<dyn InboundDnsHandler>>,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let header_bytes = read_header_bytes(&mut *stream).await?;
+        let header_bytes = read_header_bytes(&mut stream).await?;
         let (header, _, password_hash) = decode_header_any(&self.password_hashes, &header_bytes)?;
+        self.serve_decoded(stream, header, password_hash, observed, dns_handler)
+            .await
+    }
+
+    async fn serve_decoded<S>(
+        &self,
+        stream: S,
+        header: YuubinsyaHeader,
+        password_hash: [u8; 32],
+        observed: Option<ObservedInbound>,
+        dns_handler: Option<Arc<dyn InboundDnsHandler>>,
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         match header.protocol {
             YuubinsyaProtocol::Tcp => {
                 let destination = header.destination.ok_or_else(|| {
@@ -684,18 +735,19 @@ impl YuubinsyaServerProxy {
         &self,
         session: &mut AsyncYuubinsyaUotServerSession<S>,
         observed: Option<&ObservedInbound>,
-        dns_handler: Option<&dyn YuubinsyaDnsHandler>,
+        dns_handler: Option<&dyn InboundDnsHandler>,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let (mut destination, mut payload) = session.recv_from().await?;
-        while dns_handler.is_some_and(|handler| handler.should_hijack(destination.port(), &payload))
+        while let Some(handler) = dns_handler
+            && handler.should_hijack(destination.port(), &payload)
         {
-            let Some(handler) = dns_handler else {
+            let Some(response) = answer_dns_packet(handler, destination.port(), &payload).await?
+            else {
                 break;
             };
-            let response = answer_dns_packet(handler, destination.port(), &payload).await?;
             session.send_to(&destination, &response).await?;
             (destination, payload) = session.recv_from().await?;
         }
@@ -744,9 +796,9 @@ impl YuubinsyaServerProxy {
                         let (destination, payload) = incoming?;
                         if let Some(handler) = dns_handler
                             && handler.should_hijack(destination.port(), &payload)
+                            && let Some(response) =
+                                answer_dns_packet(handler, destination.port(), &payload).await?
                         {
-                            let response =
-                                answer_dns_packet(handler, destination.port(), &payload).await?;
                             session.send_to(&destination, &response).await?;
                             continue;
                         }
@@ -878,7 +930,7 @@ enum DnsTcpDecision {
 
 async fn intercept_dns_tcp<S>(
     stream: &mut S,
-    handler: &dyn YuubinsyaDnsHandler,
+    handler: &dyn InboundDnsHandler,
     destination_port: Option<u16>,
 ) -> Result<DnsTcpDecision>
 where
@@ -907,7 +959,10 @@ where
     if !handler.should_hijack(destination_port, &packet) {
         return Ok(DnsTcpDecision::Forward(framed));
     }
-    let response = handler.answer(&packet).await?;
+    let Some(response) = handler.answer(&packet).await else {
+        return Ok(DnsTcpDecision::Forward(framed));
+    };
+    let response = response?;
     if response.len() > usize::from(u16::MAX) {
         return Err(Error::new(
             ErrorKind::Protocol,
@@ -927,17 +982,17 @@ where
 }
 
 async fn answer_dns_packet(
-    handler: &dyn YuubinsyaDnsHandler,
+    handler: &dyn InboundDnsHandler,
     destination_port: Option<u16>,
     packet: &[u8],
-) -> Result<Vec<u8>> {
+) -> Result<Option<Vec<u8>>> {
     if !handler.should_hijack(destination_port, packet) {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            "Yuubinsya DNS packet was not selected for hijacking",
-        ));
+        return Ok(None);
     }
-    handler.answer(packet).await
+    match handler.answer(packet).await {
+        Some(response) => response.map(Some),
+        None => Ok(None),
+    }
 }
 
 fn endpoint_socket_addr(endpoint: &Endpoint, source: SocketAddr) -> SocketAddr {
@@ -1412,10 +1467,26 @@ mod tests {
 
     struct EchoDnsHandler;
 
-    impl YuubinsyaDnsHandler for EchoDnsHandler {
-        fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+    impl InboundDnsHandler for EchoDnsHandler {
+        fn should_hijack(&self, _destination_port: Option<u16>, _packet: &[u8]) -> bool {
+            true
+        }
+
+        fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Option<Result<Vec<u8>>>> {
             let response = packet.to_vec();
-            Box::pin(async move { Ok(response) })
+            Box::pin(async move { Some(Ok(response)) })
+        }
+    }
+
+    struct ForwardDnsHandler;
+
+    impl InboundDnsHandler for ForwardDnsHandler {
+        fn should_hijack(&self, _destination_port: Option<u16>, _packet: &[u8]) -> bool {
+            true
+        }
+
+        fn answer<'a>(&'a self, _packet: &'a [u8]) -> BoxFuture<'a, Option<Result<Vec<u8>>>> {
+            Box::pin(async { None })
         }
     }
 
@@ -1491,6 +1562,35 @@ mod tests {
 
         fn closed(&self, _flow: FlowKey) {
             self.events.lock().unwrap().push("close");
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingInboundStreamHandler {
+        destination: StdMutex<Option<Endpoint>>,
+        protocol: StdMutex<Option<&'static str>>,
+        payload: StdMutex<Vec<u8>>,
+    }
+
+    impl<S> InboundStreamHandler<S> for RecordingInboundStreamHandler
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        fn handle_stream<'a>(
+            &'a self,
+            mut stream: S,
+            _peer: SocketAddr,
+            destination: Endpoint,
+            protocol: &'static str,
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                *self.destination.lock().unwrap() = Some(destination);
+                *self.protocol.lock().unwrap() = Some(protocol);
+                let mut payload = Vec::new();
+                stream.read_to_end(&mut payload).await.map_err(io_error)?;
+                *self.payload.lock().unwrap() = payload;
+                Ok(())
+            })
         }
     }
 
@@ -1942,6 +2042,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn server_proxy_hands_authenticated_tcp_to_inbound_stream_handler() {
+        let password = [20u8; 32];
+        let upstream = Arc::new(EchoUpstream {
+            opens: Arc::new(AtomicUsize::new(0)),
+            tcp_echo: false,
+            ping_ok: false,
+        });
+        let server = Arc::new(YuubinsyaServerProxy::new(password, upstream));
+        let handler = Arc::new(RecordingInboundStreamHandler::default());
+        let observer = Arc::new(RecordingObserver::default());
+        let (client_io, server_io) = duplex(4096);
+        let server_task = {
+            let server = Arc::clone(&server);
+            let handler = Arc::clone(&handler);
+            let observer = Arc::clone(&observer);
+            tokio::spawn(async move {
+                server
+                    .serve_with_handler(
+                        server_io,
+                        "10.0.0.2:12348".parse().unwrap(),
+                        handler.as_ref(),
+                        observer,
+                        |_| {},
+                        None,
+                    )
+                    .await
+            })
+        };
+        let destination = Endpoint::ip(Network::Tcp, "192.0.2.10:443".parse().unwrap());
+        let mut client =
+            AsyncYuubinsyaTcpSession::connect(client_io, password, destination.clone())
+                .await
+                .unwrap();
+        client.write_all(b"handled-by-runtime").await.unwrap();
+        client.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
+
+        assert_eq!(*handler.destination.lock().unwrap(), Some(destination));
+        assert_eq!(*handler.protocol.lock().unwrap(), Some("yuubinsya"));
+        assert_eq!(&*handler.payload.lock().unwrap(), b"handled-by-runtime");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn observed_yuubinsya_tcp_hijacks_dns_before_upstream_connect() {
         let password = [21u8; 32];
         let upstream = Arc::new(EchoUpstream {
@@ -1987,6 +2130,52 @@ mod tests {
         let mut response = vec![0u8; usize::from(u16::from_be_bytes(length))];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(response, query);
+        assert!(server_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observed_yuubinsya_tcp_forwards_dns_when_handler_returns_none() {
+        let password = [23u8; 32];
+        let upstream = Arc::new(EchoUpstream {
+            opens: Arc::new(AtomicUsize::new(0)),
+            tcp_echo: true,
+            ping_ok: false,
+        });
+        let server = Arc::new(YuubinsyaServerProxy::new(password, upstream));
+        let observer = Arc::new(RecordingObserver::default());
+        let (client_io, server_io) = duplex(4096);
+        let server_task = {
+            let server = Arc::clone(&server);
+            let observer = Arc::clone(&observer);
+            tokio::spawn(async move {
+                server
+                    .serve_observed_with_dns(
+                        server_io,
+                        "10.0.0.2:12349".parse().unwrap(),
+                        observer,
+                        |_| {},
+                        Some(Arc::new(ForwardDnsHandler)),
+                    )
+                    .await
+            })
+        };
+        let destination = Endpoint::ip(Network::Tcp, "192.0.2.10:53".parse().unwrap());
+        let mut client = AsyncYuubinsyaTcpSession::connect(client_io, password, destination)
+            .await
+            .unwrap();
+        let query = b"forward-this-dns-packet";
+        client
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(query).await.unwrap();
+        let mut echoed = vec![0; query.len() + 2];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(
+            &echoed,
+            &[&(query.len() as u16).to_be_bytes()[..], query].concat()
+        );
+        client.shutdown().await.unwrap();
         assert!(server_task.await.unwrap().is_ok());
     }
 

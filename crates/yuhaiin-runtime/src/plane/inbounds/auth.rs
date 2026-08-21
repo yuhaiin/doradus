@@ -70,6 +70,16 @@ impl InboundAuth {
     }
 }
 
+impl yuhaiin_types::InboundBasicAuth for InboundAuth {
+    fn has_basic_users(&self) -> bool {
+        self.has_basic_users()
+    }
+
+    fn authenticate_basic(&self, username: &[u8], password: &[u8]) -> bool {
+        self.authenticate_basic(username, password)
+    }
+}
+
 impl InboundBasicUser {
     fn is_active(&self) -> bool {
         (self.username.is_some() || self.allow_any_username)

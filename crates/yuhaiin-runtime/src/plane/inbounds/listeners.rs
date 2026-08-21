@@ -9,11 +9,16 @@ use tokio::net::{TcpListener, UdpSocket};
 
 use yuhaiin_core::Result;
 
+#[cfg(feature = "http2")]
+use super::serve_h2_listener;
+#[cfg(all(feature = "websocket", feature = "http2"))]
+use super::serve_websocket_h2_listener;
+#[cfg(feature = "websocket")]
+use super::serve_websocket_listener;
 use super::{
     ConnectionMonitor, InboundAuth, InboundHandler, InboundSpec, RuntimeController,
     build_inbound_tls_acceptor, has_transport, is_supported_inbound_transport,
-    is_supported_transparent_transport, selected_proxy_ids, serve_h2_listener, serve_listener,
-    serve_websocket_h2_listener, serve_websocket_listener, supports_socks5_udp,
+    is_supported_transparent_transport, selected_proxy_ids, serve_listener, supports_socks5_udp,
 };
 
 pub(super) type InboundOwners = HashMap<String, Vec<tokio::task::JoinHandle<()>>>;
@@ -204,7 +209,7 @@ pub(super) async fn start_inbounds(
                     &mut listeners,
                     &listener_spec.id.clone(),
                     tokio::spawn(async move {
-                        if let Err(error) = crate::proxy::transparent::serve_listener(
+                        if let Err(error) = crate::inbound::adapters::transparent::serve_listener(
                             listener_spec.listen,
                             protocol,
                             listener_spec,
@@ -227,13 +232,14 @@ pub(super) async fn start_inbounds(
                         &mut listeners,
                         &spec.id.clone(),
                         tokio::spawn(async move {
-                            if let Err(error) = crate::proxy::transparent::serve_udp_listener(
-                                spec.listen,
-                                spec,
-                                selector,
-                                monitor,
-                            )
-                            .await
+                            if let Err(error) =
+                                crate::inbound::adapters::transparent::serve_udp_listener(
+                                    spec.listen,
+                                    spec,
+                                    selector,
+                                    monitor,
+                                )
+                                .await
                             {
                                 logs.error(format!("transparent UDP listener stopped: {error}"));
                             }
@@ -487,7 +493,8 @@ pub(super) async fn start_inbounds(
                     &spec.id.clone(),
                     tokio::spawn(async move {
                         if let Err(error) =
-                            crate::proxy::yuubinsya::handle_udp(socket, inbound_handler).await
+                            crate::inbound::adapters::yuubinsya::handle_udp(socket, inbound_handler)
+                                .await
                         {
                             logs.error(format!("Yuubinsya UDP listener stopped: {error}"));
                         }
@@ -525,8 +532,8 @@ pub(super) async fn start_inbounds(
                 let inbound_handler =
                     InboundHandler::new(spec.clone(), Arc::clone(&selector), Arc::clone(&monitor));
                 if let Some(password) = spec.aead_password.clone() {
-                    let socket = crate::inbound::socks5::AeadUdpSocket::new(
-                        socket,
+                    let socket = yuhaiin_protocol::socks5_server::AeadUdpTransport::new(
+                        crate::inbound::socks5::RuntimeUdpTransport(Box::new(socket)),
                         password,
                         spec.aead_method,
                     );
@@ -545,6 +552,7 @@ pub(super) async fn start_inbounds(
                         }),
                     );
                 } else {
+                    let socket = crate::inbound::socks5::RuntimeUdpTransport(Box::new(socket));
                     push_listener(
                         &mut listeners,
                         &spec.id.clone(),

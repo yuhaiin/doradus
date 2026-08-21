@@ -1,4 +1,9 @@
-//! Proxy construction from the shared runtime snapshot.
+//! Outbound proxy construction from the shared runtime snapshot.
+//!
+//! Wire codecs live in `yuhaiin-protocol`; the sibling
+//! `inbounds/adapters/` directory contains runtime adapters for accepted
+//! inbound streams. This file owns runtime proxy selection and Go-layer
+//! assembly, which depend on the immutable runtime snapshot.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -684,29 +689,9 @@ impl AsyncProxy for LoopbackTrackingProxy {
     }
 }
 
-#[path = "proxy/common.rs"]
-pub(crate) mod common;
-#[path = "proxy/http.rs"]
-pub(crate) mod http;
 #[cfg(feature = "http-termination")]
-#[path = "proxy/http_termination.rs"]
+#[path = "outbound_layers/http_termination.rs"]
 pub(crate) mod http_termination;
-#[path = "proxy/reverse.rs"]
-pub(crate) mod reverse;
-#[path = "proxy/socks4a.rs"]
-pub(crate) mod socks4a;
-#[cfg(target_os = "linux")]
-#[path = "proxy/transparent.rs"]
-pub(crate) mod transparent;
-#[path = "proxy/trojan.rs"]
-pub(crate) mod trojan;
-#[path = "proxy/vless.rs"]
-pub(crate) mod vless;
-#[cfg(feature = "websocket")]
-#[path = "proxy/websocket.rs"]
-pub(crate) mod websocket;
-#[path = "proxy/yuubinsya.rs"]
-pub(crate) mod yuubinsya;
 
 /// The selected runtime proxy plus its persisted public configuration.
 /// Keeping both together makes future HTTP handlers able to expose stable

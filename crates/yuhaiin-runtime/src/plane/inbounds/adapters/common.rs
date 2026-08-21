@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -16,6 +15,8 @@ use yuhaiin_core::proxy::{
     AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream, stream_local_addr,
 };
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Result};
+
+pub(crate) type UdpFlowId = yuhaiin_types::InboundUdpFlowId;
 
 use crate::inbound::{InboundDnsHandler, InboundDnsPolicy};
 use crate::{ConnectionMonitor, RuntimeProxySelector};
@@ -36,16 +37,6 @@ pub(crate) fn udp_idle_timeout() -> Duration {
 fn parse_udp_idle_timeout(value: &str) -> Option<Duration> {
     let milliseconds = value.parse::<u64>().ok()?;
     (milliseconds > 0).then(|| Duration::from_millis(milliseconds))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct UdpFlowId {
-    pub(crate) peer: SocketAddr,
-    pub(crate) target: Endpoint,
-    /// Optional inbound authentication identity. Native Yuubinsya UDP needs
-    /// this because one socket can serve several passwords while preserving
-    /// the matching password for asynchronous replies.
-    pub(crate) authentication: Option<[u8; 32]>,
 }
 
 #[allow(dead_code)]

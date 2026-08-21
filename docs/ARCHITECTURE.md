@@ -18,8 +18,9 @@
 | --- | --- | --- |
 | 公共 trait、地址、DNS 返回值 | `yuhaiin-types` | 不要在 `runtime` 里再定义第二套等价 trait |
 | DNS wire/cache/UDP/TCP/DoH/DoT | `yuhaiin-dns` | 不要把 DNS 编码塞进 API 或 inbound |
-| 流上下文、异步 socket/proxy 基础能力、NAT | `yuhaiin-core` | 不要让协议 crate 直接依赖 runtime 配置；不要为了“去 Tokio”再恢复一套同步 proxy API |
-| 路由规则和 trie | `yuhaiin-trie` + `yuhaiin-runtime/src/route.rs` | 不要在每个 inbound 自己匹配规则 |
+| 流上下文、路由模式/解析策略 | `yuhaiin-types`（`yuhaiin-core` 兼容 re-export） | 不要把 Tokio socket/proxy trait 下沉到 types |
+| 异步 socket/proxy 基础能力、NAT | `yuhaiin-core` | 不要让协议 crate 直接依赖 runtime 配置；不要为了“去 Tokio”再恢复一套同步 proxy API |
+| 路由规则和 trie | `yuhaiin-trie` + `yuhaiin-runtime/src/policy/route.rs` | 不要在每个 inbound 自己匹配规则 |
 | 节点、链、协议组合 | `yuhaiin-chain` + `yuhaiin-protocol` | 不要在 HTTP API handler 里拼接握手 |
 | 配置加载、迁移、Go 兼容 | `yuhaiin-store` | 不要在 handler 里直接写 SQLite 表 |
 | 运行时快照、reload、selector、inbound owner | `yuhaiin-runtime` | 不要在 store 里持有 live socket/task |
@@ -75,9 +76,9 @@ graph TD
 
 | crate | 负责什么 | 建议阅读顺序 |
 | --- | --- | --- |
-| [`yuhaiin-types`](../crates/yuhaiin-types/src/lib.rs) | 公共 `DomainName`、`Endpoint`、`Network`、错误、future alias、DNS/inbound contract | `lib.rs` → `dns.rs` → `net.rs` → `inbound.rs` |
+| [`yuhaiin-types`](../crates/yuhaiin-types/src/lib.rs) | 公共 `DomainName`、`Endpoint`、`Network`、`FlowContext`、路由策略、错误、future alias、DNS/inbound contract | `lib.rs` → `dns.rs` → `net.rs` → `inbound.rs` |
 | [`yuhaiin-dns`](../crates/yuhaiin-dns/src/lib.rs) | DNS 模型的 wire 编解码、缓存、hosts、FakeIP 视图、UDP/TCP/QUIC/DoH/DoT 传输 | `dns.rs`/`cache.rs` → `dns_resolver.rs` → `transport.rs` → 各 transport |
-| [`yuhaiin-core`](../crates/yuhaiin-core/src/lib.rs) | `FlowContext`、路由模式/解析策略、异步 socket/proxy 基础、NAT、进程信息、sniff | `lib.rs` → `flow.rs` → `proxy.rs` → `nat.rs` → `process.rs` |
+| [`yuhaiin-core`](../crates/yuhaiin-core/src/lib.rs) | 异步 socket/proxy 基础、NAT、进程信息、sniff；兼容 re-export types 的 flow data | `lib.rs` → `flow.rs` → `proxy.rs` → `nat.rs` → `process.rs` |
 | [`yuhaiin-trie`](../crates/yuhaiin-trie/src/lib.rs) | 域名、CIDR、磁盘 trie 和组合路由索引 | `router.rs` → `ondisk.rs` → `lib.rs` |
 | [`yuhaiin-protocol`](../crates/yuhaiin-protocol/src/lib.rs) | 异步 base proxy factory、SOCKS、HTTP、VLESS、VMess、Trojan、Shadowsocks、H2、WebSocket、Yuubinsya 等协议层 | `proxy_factory.rs` → `session.rs`/`tls.rs` → 具体协议文件 |
 | [`yuhaiin-chain`](../crates/yuhaiin-chain/src/lib.rs) | 把一个或多个 node/transport/protocol 组合成出站链，处理 TLS/WebSocket/H2/UOT、重试和 UDP | `config.rs` → `go_node.rs` → `lib.rs` |
@@ -86,7 +87,7 @@ graph TD
 | [`yuhaiin-geo`](../crates/yuhaiin-geo/src/lib.rs) | GeoIP/Geo metadata 的读取和查询接口 | `lib.rs` |
 | [`yuhaiin-wireguard`](../crates/yuhaiin-wireguard/src/lib.rs) | WireGuard engine、driver 和代理适配 | `config.rs` → `engine.rs` → `proxy.rs` |
 | [`yuhaiin-backup`](../crates/yuhaiin-backup/src/lib.rs) | backup 数据格式和传输辅助 | `lib.rs` |
-| [`yuhaiin-runtime`](../crates/yuhaiin-runtime/src/lib.rs) | 运行时 snapshot、controller、selector、resolver bridge、inbound、TUN/DNS supervisor | `lib.rs` → `controller.rs` → `inbounds/` → `data_plane.rs` |
+| [`yuhaiin-runtime`](../crates/yuhaiin-runtime/src/lib.rs) | 运行时 snapshot、controller、selector、resolver bridge、inbound、TUN/DNS supervisor | `lib.rs` → `control/` → `plane/` → `policy/` |
 | [`yuhaiin-api`](../crates/yuhaiin-api/src/lib.rs) | 服务进程入口、HTTP router、认证、API handler、runtime 生命周期 | `bin/yuhaiin.rs` → `service/runtime.rs` → `api.rs` |
 
 ## 3. 公共 trait 应该放在哪里
@@ -104,7 +105,8 @@ graph TD
 | `Network`、`Endpoint` | [`types/src/net.rs`](../crates/yuhaiin-types/src/net.rs#L9) | 地址/网络类型的共同语言 |
 | `DnsHandler`、`AsyncDnsHandler`、`AsyncIpResolver` | [`types/src/dns.rs`](../crates/yuhaiin-types/src/dns.rs#L48) | DNS consumer 不应该依赖具体 UDP/DoH 实现 |
 | `DnsRecordType`、`DnsResponse`、SVCB/HTTPS model | [`types/src/dns.rs`](../crates/yuhaiin-types/src/dns.rs#L11) | 保留地址以外的 DNS 数据，避免 resolver 只能返回 IP |
-| `InboundDnsHandler` | [`types/src/inbound.rs`](../crates/yuhaiin-types/src/inbound.rs#L6) | socket inbound 和 TUN 都可能拦截 DNS |
+| `InboundDnsHandler`、`InboundBasicAuth` | [`types/src/inbound.rs`](../crates/yuhaiin-types/src/inbound.rs#L7) | socket inbound 和 TUN 都可能拦截 DNS；HTTP server 不应知道用户存储 |
+| `InboundStreamHandler`、`HttpForwardHandler`、`InboundUdpCodec` | [`types/src/inbound.rs`](../crates/yuhaiin-types/src/inbound.rs#L29)、[`http_server.rs`](../crates/yuhaiin-protocol/src/http_server.rs) | protocol 负责 wire server，runtime 只接收解析后的请求并提供 route/relay |
 
 当前 `yuhaiin-types` 只有 `lib.rs`、`dns.rs`、`net.rs`、`inbound.rs` 四个源码模块，
 不包含 proxy module。`AsyncProxy`、`AsyncDatagram`、`AsyncStream` 仍然位于
@@ -132,9 +134,9 @@ connector 和 `yuhaiin-protocol/src/tls_sync.rs`。项目不再为了 runtime-ne
 下面这些 contract 的参数已经携带 runtime 语义，继续放到 `types` 会把低层 crate
 重新绑到高层：
 
-- `FlowContext` 相关的异步 `AsyncProxy`/`AsyncDatagram`：它们需要完整 flow metadata、Tokio stream、取消和路由上下文，属于 `yuhaiin-core` 的异步能力层；不要因为它们是 trait 就继续下沉到 `yuhaiin-types`。
+- `AsyncProxy`/`AsyncDatagram`：它们需要 Tokio stream、取消和异步代理生命周期，属于 `yuhaiin-core` 的异步能力层；`FlowContext` 本身是纯数据，已下沉到 `yuhaiin-types`。
 - `RuntimeProxySelector`、`ProxyBuild`：它们依赖 `RuntimeSnapshot`、store 配置、node tag 和 reload slot，属于 `yuhaiin-runtime`。
-- inbound protocol handler：它们需要 `InboundSpec`、monitor、DNS policy、UDP session/worker，属于 runtime 的 inbound 组件。
+- runtime inbound adapter：它们需要 `InboundSpec`、monitor、DNS policy、UDP session/worker，属于 runtime 的 inbound 组件；协议 server 本身应通过 `yuhaiin-types` 的 handler port 交接。
 - `ResolverTransportFactory`、`ResolverProxyBridge`：它们必须知道 resolver endpoint、selector、NAT/UDP 传输和失败记录，属于 runtime resolver adapter。
 - `FlowObserver`：虽然是抽象接口，但它和 `FlowKey` 的生命周期/统计语义绑定，当前仍应在 `yuhaiin-core::flow`，由 runtime monitor 实现。
 
@@ -240,9 +242,9 @@ spawn”信号，而是“selector 已经可以被 resolver bridge 使用”的�
 
 | 对象 | 位置 | 生命周期/职责 |
 | --- | --- | --- |
-| `RuntimeSnapshot` | [`runtime/src/lib.rs`](../crates/yuhaiin-runtime/src/lib.rs#L125) | 一次完整配置加载的不可变视图；包含 settings、resolver registry、hosts/FakeIP、route、geo、proxy config、NAT policy |
-| `RuntimeBuilder` | [`runtime/src/lib.rs`](../crates/yuhaiin-runtime/src/lib.rs#L363) | 从 store + 注入的 upstream resolver 构造一个 snapshot；构造失败时不发布半成品 |
-| `RuntimeController` | [`runtime/src/controller.rs`](../crates/yuhaiin-runtime/src/controller.rs#L26) | 持有 store、`RuntimeHandle`、monitor、reload channels 和 live selector；串行化 rebuild 与 owner 生命周期 |
+| `RuntimeSnapshot` | [`runtime/src/assembly.rs`](../crates/yuhaiin-runtime/src/assembly.rs#L125) | 一次完整配置加载的不可变视图；包含 settings、resolver registry、hosts/FakeIP、route、geo、proxy config、NAT policy |
+| `RuntimeBuilder` | [`runtime/src/assembly.rs`](../crates/yuhaiin-runtime/src/assembly.rs#L363) | 从 store + 注入的 upstream resolver 构造一个 snapshot；构造失败时不发布半成品 |
+| `RuntimeController` | [`runtime/src/control/controller.rs`](../crates/yuhaiin-runtime/src/control/controller.rs#L26) | 持有 store、`RuntimeHandle`、monitor、reload channels 和 live selector；串行化 rebuild 与 owner 生命周期 |
 
 snapshot 的核心不变量是：旧 flow 可以继续持有旧 snapshot，新 flow 在成功 build 后看到
 新 snapshot。因此配置 reload 不应在原地修改一组被所有 flow 共享的可变对象。
@@ -298,8 +300,8 @@ sequenceDiagram
     participant O as start_inbounds
     participant S as serve_listener
     participant H as ProtocolHandler
-    participant P as InboundProtocol
-    participant IH as InboundHandler
+    participant P as yuhaiin-protocol server
+    participant IH as runtime handler port
     participant X as RuntimeProxySelector
     participant C as Chain/Protocol proxy
     participant T as target
@@ -310,28 +312,29 @@ sequenceDiagram
     S->>S: prepare_inbound_stream()
     S->>H: serve_connection(stream, peer, handler)
     H->>H: ProtocolHandler::handle()
-    H->>P: InboundProtocol::handle()
-    P->>IH: parse destination/auth/headers
+    H->>P: protocol server handle()
+    P->>P: parse destination/auth/headers
+    P->>IH: InboundStreamHandler/HttpForwardHandler hand-off
     IH->>IH: create FlowContext
     IH->>X: select/connect(context)
     X->>C: selected proxy connect(context)
     C->>T: protocol handshake + TCP connect
     IH->>IH: relay_counted_with_*()
-    IH-->>P: response/close
+    IH-->>P: relay/close
 ```
 
 实际入口：
 
-1. [`run_until`](../crates/yuhaiin-runtime/src/inbounds/mod.rs#L194) / `run_until_with_selector_ready` 进入 inbound supervisor。
-2. [`run_until_inner`](../crates/yuhaiin-runtime/src/inbounds/mod.rs#L311) 调用 [`start_inbounds`](../crates/yuhaiin-runtime/src/inbounds/listeners.rs)；后者读取 Go inbound records、构建 auth/selector/monitor 并保存 owner。
-3. [`serve_listener`](../crates/yuhaiin-runtime/src/inbounds/mod.rs#L1219) 接受 socket，必要时执行 TLS acceptor 和 protocol-specific preparation。
-4. [`serve_connection`](../crates/yuhaiin-runtime/src/inbounds/mod.rs#L1498) 把 socket 交给 `ProtocolHandler::handle`。
-5. `ProtocolHandler` 根据 normalized protocol 进入 `InboundProtocol::handle`，或进入 mixed、reverse HTTP、Yuubinsya 等特殊分支。
-6. `InboundHandler` 负责把“线上的协议输入”变成统一的 `FlowContext`、`InboundStream`/`InboundDatagram`，再交给 runtime selector。
+1. [`run_until`](../crates/yuhaiin-runtime/src/plane/inbounds/mod.rs#L194) / `run_until_with_selector_ready` 进入 inbound supervisor。
+2. [`run_until_inner`](../crates/yuhaiin-runtime/src/plane/inbounds/mod.rs#L311) 调用 [`start_inbounds`](../crates/yuhaiin-runtime/src/plane/inbounds/listeners.rs)；后者读取 Go inbound records、构建 auth/selector/monitor 并保存 owner。
+3. [`serve_listener`](../crates/yuhaiin-runtime/src/plane/inbounds/mod.rs#L1219) 接受 socket，必要时执行 TLS acceptor 和 protocol-specific preparation。
+4. [`serve_connection`](../crates/yuhaiin-runtime/src/plane/inbounds/mod.rs#L1498) 把 socket 交给 `ProtocolHandler::handle`。
+5. `ProtocolHandler` 根据 normalized protocol 调用 `yuhaiin-protocol` 的 server API；mixed、reverse HTTP、透明代理和 Yuubinsya 仍有 runtime-specific 分支。
+6. protocol server 通过 `InboundStreamHandler` 或 HTTP 的 `HttpForwardHandler` 把已解析请求交给 runtime；`InboundHandler` 再创建统一的 `FlowContext`、`InboundStream`/`InboundDatagram` 并交给 selector。
 
 ### 7.2 FlowContext 是跨层的“连接信封"
 
-[`FlowContext`](../crates/yuhaiin-core/src/lib.rs#L84) 不只是目标地址，主要字段的来源如下：
+[`FlowContext`](../crates/yuhaiin-types/src/lib.rs#L161) 不只是目标地址，主要字段的来源如下：
 
 | 字段 | 谁填写 | 谁消费 |
 | --- | --- | --- |
@@ -393,10 +396,13 @@ flowchart TD
     MANAGER -->|reliable close command| WORKER
 ```
 
-关键类型在 [`inbounds/handler.rs`](../crates/yuhaiin-runtime/src/inbounds/handler.rs)：
+协议消息和契约在 [`yuhaiin-types/src/inbound.rs`](../crates/yuhaiin-types/src/inbound.rs)；protocol server 在 [`yuhaiin-protocol`](../crates/yuhaiin-protocol/src)；runtime actor 在 [`inbounds/handler.rs`](../crates/yuhaiin-runtime/src/plane/inbounds/handler.rs)：
 
 - `InboundUdpRequest`/`InboundUdpResponse`：codec 与通用 session 之间的 wire-neutral message。
 - `InboundUdpCodec`：只定义 `recv`、`send`，不负责 DNS、route、proxy 或网络 I/O。
+- `InboundUdpFlowPolicy`：runtime-only 的 close/flow hook，避免把 `TunFlowKey` 放进协议 crate。
+- `InboundStreamHandler`：Trojan/VLESS/SOCKS4A/Yuubinsya 等 protocol 完成握手和请求解析后，向 runtime 交接 TCP stream；HTTP 的完整 server loop 在 `http_server.rs`，通过 `HttpForwardHandler` 请求 runtime route/connect 和记录 flow bytes。
+- `yuhaiin-protocol::transparent`：Linux TPROXY/REDIRECT socket setup、`SO_ORIGINAL_DST`、UDP ancillary original-destination 和透明 UDP codec；runtime 只负责 listener owner、transport preparation 和 flow session。
 - `UdpSourceKey`：`inbound_id + session_id + source + authentication`，故意不包含 target；这才支持 full-cone UDP 一个 source 对多个目标。
 - `InboundUdpManager`：维护 source 到 worker 的 map，入口 `dispatch` 使用 bounded `try_send`。
 - `UdpFlowWorker`：自己持有 `AsyncDatagram`、flow observer、idle timer、reply metadata，负责所有可能阻塞的 DNS/route/open/send/recv。
@@ -444,7 +450,7 @@ sequenceDiagram
 
 - [`TunRuntime`](../crates/yuhaiin-tun/src/runtime.rs#L69)：持有平台 device、smoltcp device、读写队列和可选 route setup。
 - [`TunDispatcher`](../crates/yuhaiin-tun/src/dispatcher.rs#L115)：处理 IP version、TCP/UDP tuple、ICMP、fragment/extension header 和写回前 packet。
-- [`run_tun_device_until_ref`](../crates/yuhaiin-runtime/src/data_plane.rs#L570)：runtime 侧 supervisor，选择 proxy ids、构建 `TunProxyRuntime`、创建 interceptor/dispatcher，并等待 shutdown 或匹配的 inbound reload。
+- [`run_tun_device_until_ref`](../crates/yuhaiin-runtime/src/plane/data_plane.rs#L570)：runtime 侧 supervisor，选择 proxy ids、构建 `TunProxyRuntime`、创建 interceptor/dispatcher，并等待 shutdown 或匹配的 inbound reload。
 - `controller.build_tun_proxy_runtime_with_dns_and_udp`：把 TUN 连接、DNS hijack、UDP/full-cone NAT 和 selector 接在一起。
 
 ### 9.2 TUN 与 socket inbound 的共同点
@@ -503,7 +509,7 @@ TTL；具体 transport 可以覆盖它，保留 `ptr_names`、`service_bindings`
 
 ### 10.3 `RoutedDnsClient` 的查询流程
 
-[`RoutedDnsClient`](../crates/yuhaiin-runtime/src/resolver.rs) 负责将 runtime 的 resolver
+[`RoutedDnsClient`](../crates/yuhaiin-runtime/src/policy/resolver.rs) 负责将 runtime 的 resolver
 配置转换成具体查询：
 
 1. `query`/`query_packet` 经过 `TimeoutResolver` 施加超时。
@@ -518,7 +524,7 @@ TTL；具体 transport 可以覆盖它，保留 `ptr_names`、`service_bindings`
 
 ### 10.4 DNS listener supervisor
 
-[`run_dns_supervisor`](../crates/yuhaiin-runtime/src/data_plane.rs#L628) 在每轮循环：
+[`run_dns_supervisor`](../crates/yuhaiin-runtime/src/plane/data_plane.rs#L628) 在每轮循环：
 
 1. 读取 configured DNS listen address。
 2. 从 controller handle 取得当前 snapshot 和 `dns_handler`。
@@ -565,7 +571,7 @@ flowchart LR
 - `yuhaiin-protocol::proxy_factory::BaseProxyConfig::build` 负责把 Direct/Reject/Drop/Fixed/HTTP/SOCKS5/Yuubinsya UDP 等基础出站配置变成 `Arc<dyn AsyncProxy>`；HTTP CONNECT 现在也是异步 `HttpProxy` 套在 `FixedAsyncProxy` 上。
 - `yuhaiin-protocol::tls::RustCryptoTlsProxy` 只包装已有的 `AsyncProxy`，负责异步 TLS 握手和 ALPN；旧的 `tls_sync.rs` 已删除。
 - `yuhaiin-chain` 负责把多个 node、TLS、WebSocket、H2、UOT/UDP 阶段组合起来；`ChainClient` 是链的连接/缓存/重试核心，`ChainProxy`/`ChainDatagram` 把链暴露成 runtime 可用的 proxy capability。
-- `yuhaiin-runtime/src/proxy.rs` 根据 Go node/proxy config 构造上面这些对象，并把它们注册到 `RuntimeProxySelector`。
+- `yuhaiin-runtime/src/plane/outbound.rs` 根据 Go node/proxy config 构造上面这些对象，并把它们注册到 `RuntimeProxySelector`。
 
 这次调整后的关键调用关系是：
 
@@ -589,7 +595,7 @@ DNS policy、endpoint/network model 才进入 `types`。
 1. 在 `yuhaiin-protocol/src/proxy_factory.rs` 增加 config/variant 的解析和工厂分派。
 2. 在新的 protocol 文件中实现 handshake/session；不要读取 store 或 runtime controller。
 3. 如果需要新 transport（H2/WebSocket/TLS/UOT），优先复用 `yuhaiin-chain` 的阶段。
-4. 在 `yuhaiin-runtime/src/proxy.rs` 的 `build_protocol_proxy` 或对应 helper 中把 persisted config 映射到 protocol factory。
+4. 在 `yuhaiin-runtime/src/plane/outbound.rs` 的 `build_protocol_proxy` 或对应 helper 中把 persisted config 映射到 protocol factory。
 5. 在 `yuhaiin-chain/src/config.rs`/`go_node.rs` 补齐 Go node 的兼容转换。
 6. 加 protocol unit test、chain integration test、runtime selector test；最后跑 workspace check。
 
@@ -684,7 +690,7 @@ flowchart TD
     SERVICE[service/runtime.rs]
     STATE[ApiState]
     AUTH[ApiAuth / authenticate]
-    ROUTER[router() / serve_until]
+    ROUTER["router() / serve_until"]
     HANDLERS[api.rs handlers]
     CTRL[RuntimeController]
     STORE[ConfigStore]
@@ -821,8 +827,8 @@ TUN/socket inbound 填写字段，通常会造成规则永远不命中。
 - IP header/tuple/fragment：`yuhaiin-tun/src/packet.rs`、`dispatcher.rs`。
 - OS fd、device、route install：`yuhaiin-tun/src/runtime.rs`、`platform/`。
 - TCP/UDP flow 到 proxy：`yuhaiin-tun/src/proxy.rs`、`proxy_tasks.rs`、`proxy_output.rs`。
-- store config 兼容和 supervisor：`yuhaiin-runtime/src/data_plane.rs`。
-- route/proxy/DNS 选择：`yuhaiin-runtime/src/controller.rs` 和 snapshot/selector。
+- store config 兼容和 supervisor：`yuhaiin-runtime/src/plane/data_plane.rs`。
+- route/proxy/DNS 选择：`yuhaiin-runtime/src/control/controller.rs` 和 snapshot/selector。
 
 修改 TUN 时至少验证：IPv4/IPv6、TCP close、UDP multi-target、DNS hijack、FakeIP reverse
 lookup、shutdown/reload、写回队列背压。
@@ -1133,15 +1139,15 @@ negative constraints 的完整判断。`Router::apply_to_context` 写入 `route_
 | --- | --- | --- | --- |
 | proxy factory | [`proxy_factory.rs`](../crates/yuhaiin-protocol/src/proxy_factory.rs) | `BaseProxyConfig::build`、`BaseProxyKind` | persisted base endpoint/kind → Direct/Reject/Drop/Fixed/HTTP/SOCKS5/Yuubinsya UDP 等 `AsyncProxy`；fallback 通过 `FixedAsyncProxy` 或对应 wrapper 组合 |
 | TLS wrapper | [`tls.rs`](../crates/yuhaiin-protocol/src/tls.rs) | `RustCryptoTlsProxy::new_with_options`、`AsyncProxy::connect` | 在已有 `AsyncProxy` 上做异步 rustls 握手，保留 local address，设置 SNI/ALPN 和证书校验策略；没有同步 TLS sibling |
-| SOCKS/HTTP | `socks5.rs`、`socks5_server.rs`、`socks4a_server.rs`、`http.rs`、`http_server.rs` | `Socks5Proxy::new`、`server_handshake`、`read_endpoint`、`parse_udp_packet` | client/server framing；server 把 destination 交给 `InboundHandler` |
-| VLESS | [`vless.rs`](../crates/yuhaiin-protocol/src/vless.rs) | `parse_uuid`、`encode_request`、`read_request`、`VlessProxy::new` | UUID + command + endpoint；UDP 使用 length-delimited datagram |
+| SOCKS/HTTP | `socks5.rs`、`socks5_server.rs`、`socks4a_server.rs`、`http.rs`、`http_server.rs` | `Socks5Proxy::new`、`server_handshake`、`UdpServer`、`read_endpoint`、`parse_udp_packet`、`HttpForwardHandler` | client/server framing；SOCKS 等把 stream 交给 runtime，HTTP 通过 forward callback 请求 runtime route/connect |
+| VLESS | [`vless.rs`](../crates/yuhaiin-protocol/src/vless.rs) | `parse_uuid`、`encode_request`、`read_request`、`UdpServer`、`VlessProxy::new` | UUID + command + endpoint；UDP 使用 length-delimited datagram |
 | VMess | [`vmess.rs`](../crates/yuhaiin-protocol/src/vmess.rs) | `command_key`、`encode_request`、`decode_request`、`read_body_frame`、`VmessProxy::new` | request/response header、security mode、body frame、UDP datagram |
-| Trojan | [`trojan.rs`](../crates/yuhaiin-protocol/src/trojan.rs) | `password_hash`、`write_request`、`read_request`、`encode_udp_frame`、`TrojanProxy::new` | password hash + command + endpoint；UDP frame 独立于 TCP |
+| Trojan | [`trojan.rs`](../crates/yuhaiin-protocol/src/trojan.rs) | `password_hash`、`write_request`、`read_request`、`UdpServer`、`encode_udp_frame`、`TrojanProxy::new` | password hash + command + endpoint；UDP frame 独立于 TCP |
 | Shadowsocks | `shadowsocks.rs` | `Method::parse`、`encrypt_udp_packet`、`decrypt_udp_packet`、`ShadowsocksProxy::new` | cipher state、stream payload、UDP AEAD packet |
 | ShadowsocksR | `shadowsocksr.rs` | `CipherMethod::parse`、`ShadowsocksrConfig::new`、`ShadowsocksrProxy::new` | protocol/obfs/cipher 三段配置和 session state |
 | H2 | [`h2_tunnel.rs`](../crates/yuhaiin-protocol/src/h2_tunnel.rs) | `H2Pool::open`、`H2Connection::handshake_with_limits`、`open_connect_stream` | Hyper HTTP/2 CONNECT upgrade；endpoint identity → reusable connection → bounded concurrent streams |
 | WebSocket/HTTP obfs | `websocket.rs`、`websocket_io.rs`、`http_obfs.rs` | `WebSocketProxy::new`、`WebSocketIo::new`、`HttpObfsProxy::new` | stream wrapping，不改变上层 `FlowContext` |
-| Yuubinsya | [`yuubinsya.rs`](../crates/yuhaiin-protocol/src/yuubinsya.rs)、`session.rs` | `encode_header`、`decode_header`、`YuubinsyaTcpSession::connect/accept`、`YuubinsyaServerProxy::serve_observed_with_dns` | custom auth/header、TCP stream、UOT、server UDP session、DNS observation |
+| Yuubinsya | [`yuubinsya.rs`](../crates/yuhaiin-protocol/src/yuubinsya.rs)、`session.rs`、`yuubinsya_udp.rs` | `encode_header`、`decode_header`、`YuubinsyaTcpSession::connect/accept`、`YuubinsyaServerProxy::serve_with_handler`、`InboundUdpServer` | custom auth/header、TCP hand-off、UOT、server UDP session、DNS observation |
 | direct UOT | `direct_uot.rs`、`direct_uot_session.rs` | `parse_go_direct_uot`、`DirectUotProxy` | direct UDP over a stream-like UOT session |
 
 #### 20.5.1 一次 outbound TCP handshake
@@ -1161,7 +1167,7 @@ IP 的 `resolved_destination`。
 
 #### 20.5.2 Yuubinsya/H2 的生命周期
 
-- `YuubinsyaTcpSession` 的 `connect`/`accept` 只做 header/session framing；上层 `YuubinsyaServerProxy` 才负责观察 inbound、DNS 识别和 UDP session。
+- `YuubinsyaTcpSession` 的 `connect`/`accept` 只做 header/session framing；`YuubinsyaServerProxy::serve_with_handler` 完成认证后把 TCP payload 交给公共 `InboundStreamHandler`，而 Ping/UOT 仍由 server 持有协议会话和 UDP session。
 - `H2Pool` 按 endpoint/identity 复用 connection；`open_connect_stream` 增加 active stream 计数，`drain`/`close` 负责 reload/shutdown。
 - 任何新建 pool/cache 都要提供 idle reap/close；否则 runtime snapshot reload 可能只换 selector 而旧 H2 connection 永不释放。
 
@@ -1313,8 +1319,9 @@ runtime 不只有 `lib.rs/controller.rs`。下面是组件边界：
 | `proxy.rs` | `ProxyBuild::build_proxy`、`build_proxy_selector*`、`RuntimeProxySelector` | node config → protocol/chain/base proxy；再加 resolver、socket policy、connect budget、loopback tracking 和可替换 selector slot |
 | `inbounds/mod.rs` | `run_until*`、`start_inbounds`、`ProtocolHandler`、`serve_listener`、`serve_connection` | listener owner、protocol dispatch、TLS/mixed/reverse 分支 |
 | `inbounds/handler.rs` | `InboundHandler`、`InboundUdpManager`、`UdpFlowWorker` | 统一 flow context、DNS interception、stream relay、UDP actor |
-| `inbounds/socks5.rs` | `Socks5UdpCodec` | SOCKS5 UDP wire framing，交给通用 UDP manager |
-| `inbounds/tls_auto.rs` | `TlsAutoAuthority`、`TlsAutoResolver` | SNI → 动态/缓存证书，不参与 outbound route |
+| `inbounds/socks5.rs` | `RuntimeUdpTransport`、`serve_udp_socket` | Tokio UDP socket 适配、监听生命周期和 runtime UDP flow 接线；SOCKS5 framing、CONNECT response、AEAD packet transport 在 `yuhaiin-protocol::socks5_server` |
+| `yuhaiin-protocol/tls_auto.rs`、`tls_server.rs` | `TlsAutoAuthority`、`TlsAutoResolver`、TLS server config | SNI → 动态/缓存证书、证书/私钥解析、ALPN 和 TLS acceptor；runtime 只负责选择 transport、生成字段持久化和 listener 生命周期 |
+| `yuhaiin-protocol/stream.rs` | `PrefixedIo` | protocol sniff/early-data 已消费前缀的恢复；被 reverse HTTP、mixed 和 WebSocket 入口共享 |
 | `data_plane.rs` | `load_tun_config`、`run_tun_device_until_ref`、`run_dns_supervisor` | TUN/DNS owner 和 reload wait |
 | `monitor.rs` | `ConnectionMonitor`、`FlowObserver` implementation、`request_close`、`persist` | live connection、traffic/telemetry/history、SSE event、close request |
 | `latency.rs` | `probe`、`probe_with_resolver` | node latency/HTTP/STUN/UDP probe；不改变普通 flow selector |
@@ -1326,20 +1333,20 @@ runtime 不只有 `lib.rs/controller.rs`。下面是组件边界：
 
 #### 20.9.1 runtime proxy 子模块
 
-`runtime/src/proxy.rs` 只做 config-to-capability 的组装和 selector wrapper；inbound 适配器
-按协议拆在 `runtime/src/proxy/`，共享 relay、sniff、统计和 UDP flow 生命周期：
+`runtime/src/plane/outbound.rs` 只做 config-to-capability 的组装和 selector wrapper；inbound 适配器
+按协议拆在 `runtime/src/plane/inbounds/adapters/`，共享 relay、sniff、统计和 UDP flow 生命周期：
 
 | 文件 | 作用 |
 | --- | --- |
-| `proxy/common.rs` | `RoutedProxy`、stream sniff/record、relay accounting、UDP flow idle state 和共享 I/O helper |
-| `proxy/http.rs` | HTTP inbound adapter；认证、CONNECT/forward 后进入通用 stream relay |
-| `proxy/http_termination.rs` | 可选的 Hyper HTTP/1/2 termination，接到已经构造好的 upstream `AsyncProxy` |
-| `proxy/reverse.rs` | reverse TCP/HTTP inbound，复用 selector 和通用 relay |
-| `proxy/socks4a.rs` | SOCKS4/4A inbound framing、认证和 upstream dispatch |
-| `proxy/transparent.rs` | Linux tproxy/redir TCP/UDP listener 和 original-destination 处理 |
-| `proxy/trojan.rs` / `proxy/vless.rs` | Trojan/VLESS inbound adapter、认证和 UDP codec/session |
-| `proxy/websocket.rs` | shared WebSocket I/O/server acceptor 的 runtime 适配 |
-| `proxy/yuubinsya.rs` | Yuubinsya inbound server、DNS handler adapter 和 UDP codec |
+| `plane/inbounds/adapters/common.rs` | `RoutedProxy`、stream sniff/record、relay accounting、UDP flow idle state 和共享 I/O helper |
+| `plane/inbounds/adapters/http.rs` | HTTP runtime forward capability；提供 route/connect、TLS、FlowObserver 和 byte accounting；HTTP server loop 在 `yuhaiin-protocol/http_server.rs` |
+| `plane/outbound_layers/http_termination.rs` | 可选的 Hyper HTTP/1/2 termination，接到已经构造好的 upstream `AsyncProxy` |
+| `plane/inbounds/adapters/reverse.rs` | reverse TCP/HTTP runtime route/connect/TLS/relay adapter；sniff、raw fallback、Host/path rewrite 在 `yuhaiin-protocol/reverse_http.rs` |
+| `yuhaiin-protocol/socks4a_server.rs` | SOCKS4/4A server framing；runtime 只提供 `InboundStreamHandler` |
+| `plane/inbounds/adapters/transparent.rs` | Linux transparent listener owner、runtime transport preparation 和 `InboundUdpSession` 接线；socket/original-destination codec 在 `yuhaiin-protocol/transparent.rs` |
+| `plane/inbounds/adapters/trojan.rs` / `vless.rs` | Trojan/VLESS inbound adapter、认证和 runtime flow policy；framing/UDP server 在 `yuhaiin-protocol` |
+| `plane/inbounds/socks5.rs` | SOCKS5 auth policy、CONNECT route/open/relay、Tokio UDP socket adapter、UDP flow session 接线；`server_handshake`、reply bytes、UDP framing 和 `AeadUdpTransport` 在 `yuhaiin-protocol` |
+| `plane/inbounds/adapters/yuubinsya.rs` | Yuubinsya server construction/UDP adapter；TCP framing、DNS `Option` contract and `InboundStreamHandler` hand-off 在 `yuhaiin-protocol` |
 
 #### 20.9.2 `RuntimeProxySelector` 的构造和选择
 
@@ -1536,7 +1543,7 @@ OS TUN packet
 
 ```text
 client datagram
-  -> Socks5UdpCodec/TrojanUdpCodec/TransparentUdpCodec::recv
+  -> Socks5UdpCodec/TrojanUdpCodec/yuhaiin_protocol::transparent::UdpServer::recv
   -> InboundUdpRequest{id, peer, target, payload}
   -> InboundUdpManager::dispatch (try_send)
   -> UdpSourceKey lookup
