@@ -18,7 +18,7 @@
 | --- | --- | --- |
 | 公共 trait、地址、DNS 返回值 | `yuhaiin-types` | 不要在 `runtime` 里再定义第二套等价 trait |
 | DNS wire/cache/UDP/TCP/DoH/DoT | `yuhaiin-dns` | 不要把 DNS 编码塞进 API 或 inbound |
-| 流上下文、同步连接、异步代理基础能力、NAT | `yuhaiin-core` | 不要让协议 crate 直接依赖 runtime 配置 |
+| 流上下文、异步 socket/proxy 基础能力、NAT | `yuhaiin-core` | 不要让协议 crate 直接依赖 runtime 配置；不要为了“去 Tokio”再恢复一套同步 proxy API |
 | 路由规则和 trie | `yuhaiin-trie` + `yuhaiin-runtime/src/route.rs` | 不要在每个 inbound 自己匹配规则 |
 | 节点、链、协议组合 | `yuhaiin-chain` + `yuhaiin-protocol` | 不要在 HTTP API handler 里拼接握手 |
 | 配置加载、迁移、Go 兼容 | `yuhaiin-store` | 不要在 handler 里直接写 SQLite 表 |
@@ -75,11 +75,11 @@ graph TD
 
 | crate | 负责什么 | 建议阅读顺序 |
 | --- | --- | --- |
-| [`yuhaiin-types`](../crates/yuhaiin-types/src/lib.rs) | 公共 `DomainName`、`Endpoint`、`Network`、错误、future alias、DNS/inbound/proxy contract | `lib.rs` → `dns.rs` → `net.rs` → `proxy.rs` → `inbound.rs` |
-| [`yuhaiin-dns`](../crates/yuhaiin-dns/src/lib.rs) | DNS 模型的 wire 编解码、缓存、hosts、FakeIP 视图、UDP/TCP/QUIC/DoH/DoT 传输 | `dns.rs` → `dns_resolver_async.rs` → `transport.rs` → 各 transport |
-| [`yuhaiin-core`](../crates/yuhaiin-core/src/lib.rs) | `FlowContext`、路由模式/解析策略、同步/异步 socket/proxy 基础、NAT、进程信息、sniff | `lib.rs` → `flow.rs` → `proxy.rs` → `nat.rs` → `process.rs` |
+| [`yuhaiin-types`](../crates/yuhaiin-types/src/lib.rs) | 公共 `DomainName`、`Endpoint`、`Network`、错误、future alias、DNS/inbound contract | `lib.rs` → `dns.rs` → `net.rs` → `inbound.rs` |
+| [`yuhaiin-dns`](../crates/yuhaiin-dns/src/lib.rs) | DNS 模型的 wire 编解码、缓存、hosts、FakeIP 视图、UDP/TCP/QUIC/DoH/DoT 传输 | `dns.rs`/`cache.rs` → `dns_resolver.rs` → `transport.rs` → 各 transport |
+| [`yuhaiin-core`](../crates/yuhaiin-core/src/lib.rs) | `FlowContext`、路由模式/解析策略、异步 socket/proxy 基础、NAT、进程信息、sniff | `lib.rs` → `flow.rs` → `proxy.rs` → `nat.rs` → `process.rs` |
 | [`yuhaiin-trie`](../crates/yuhaiin-trie/src/lib.rs) | 域名、CIDR、磁盘 trie 和组合路由索引 | `router.rs` → `ondisk.rs` → `lib.rs` |
-| [`yuhaiin-protocol`](../crates/yuhaiin-protocol/src/lib.rs) | SOCKS、HTTP、VLESS、VMess、Trojan、Shadowsocks、H2、WebSocket、Yuubinsya 等协议层 | `proxy_factory.rs` → `session.rs` → 具体协议文件 |
+| [`yuhaiin-protocol`](../crates/yuhaiin-protocol/src/lib.rs) | 异步 base proxy factory、SOCKS、HTTP、VLESS、VMess、Trojan、Shadowsocks、H2、WebSocket、Yuubinsya 等协议层 | `proxy_factory.rs` → `session.rs`/`tls.rs` → 具体协议文件 |
 | [`yuhaiin-chain`](../crates/yuhaiin-chain/src/lib.rs) | 把一个或多个 node/transport/protocol 组合成出站链，处理 TLS/WebSocket/H2/UOT、重试和 UDP | `config.rs` → `go_node.rs` → `lib.rs` |
 | [`yuhaiin-store`](../crates/yuhaiin-store/src/lib.rs) | typed repository、SQLite、schema、Go v6/legacy 兼容、FakeIP mapping、统计与状态 | `lib.rs` → `sqlite.rs`/`schema.rs` → `repository.rs` → `migration.rs` |
 | [`yuhaiin-tun`](../crates/yuhaiin-tun/src/lib.rs) | OS TUN fd、smoltcp packet/socket、dispatcher、proxy runtime、写回 TUN | `runtime.rs` → `dispatcher.rs` → `packet.rs` → `proxy.rs` |
@@ -105,19 +105,27 @@ graph TD
 | `DnsHandler`、`AsyncDnsHandler`、`AsyncIpResolver` | [`types/src/dns.rs`](../crates/yuhaiin-types/src/dns.rs#L48) | DNS consumer 不应该依赖具体 UDP/DoH 实现 |
 | `DnsRecordType`、`DnsResponse`、SVCB/HTTPS model | [`types/src/dns.rs`](../crates/yuhaiin-types/src/dns.rs#L11) | 保留地址以外的 DNS 数据，避免 resolver 只能返回 IP |
 | `InboundDnsHandler` | [`types/src/inbound.rs`](../crates/yuhaiin-types/src/inbound.rs#L6) | socket inbound 和 TUN 都可能拦截 DNS |
-| `StreamConnector` | [`types/src/lib.rs`](../crates/yuhaiin-types/src/lib.rs) 的 canonical export（实现模块为 `types/src/proxy.rs`） | 同步协议握手可以在无 Tokio 环境测试 |
 
-`yuhaiin-core` 和 `yuhaiin-dns` 目前通过 re-export 保持旧路径可用。例如：
+当前 `yuhaiin-types` 只有 `lib.rs`、`dns.rs`、`net.rs`、`inbound.rs` 四个源码模块，
+不包含 proxy module。`AsyncProxy`、`AsyncDatagram`、`AsyncStream` 仍然位于
+`yuhaiin-core::proxy`，因为它们携带 `FlowContext`、Tokio I/O stream 和异步生命周期；
+把它们继续下沉到 `types` 会让底层公共 crate 反而暴露 runtime-specific contract。
+
+`yuhaiin-core` 和 `yuhaiin-dns` 通过 re-export 保持 `Endpoint`、DNS model 等旧路径可用，
+但新代码应优先使用 canonical path：
 
 ```rust
 // 新的 canonical path
-use yuhaiin_types::{AsyncIpResolver, Endpoint, InboundDnsHandler};
+use yuhaiin_types::{AsyncDnsHandler, AsyncIpResolver, Endpoint, InboundDnsHandler};
 
-// 兼容旧调用方；实现仍然只有一份
-use yuhaiin_core::Endpoint;
-use yuhaiin_core::proxy::StreamConnector;
-use yuhaiin_dns::{AsyncIpResolver, DnsResponse};
+// 运行时 proxy contract 仍在 core；它不是 types contract
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncStream};
 ```
+
+本次 commit 明确删除了 `StreamConnector`、`BlockingStreamProxy`、同步 HTTP/SOCKS
+connector 和 `yuhaiin-protocol/src/tls_sync.rs`。项目不再为了 runtime-neutrality 维护
+一套 blocking proxy；需要替换 runtime 或测试时，应注入 `AsyncProxy`/`AsyncDatagram`
+实现，或者在真正的 OS/同步边界单独写 adapter。
 
 ### 3.2 哪些 trait 不应继续下沉
 
@@ -146,9 +154,14 @@ tun, tun-routes, doh-tls, websocket, http-termination
 
 ```mermaid
 graph LR
-    TUN[tun] --> TUNCRATE[yuhaiin-tun runtime]
+    API[api default] --> HTTPAPI[http-api]
+    HTTPAPI --> UPDATE[update]
+    API --> TUN[tun]
+    TUN --> RUNTIME_TUN[runtime/tun]
+    RUNTIME_TUN --> TUNCRATE[yuhaiin-tun async runtime]
     ROUTES[tun-routes] --> TUN
-    ROUTES --> LINUX[Linux route install]
+    ROUTES --> TUNROUTES[yuhaiin-tun/tun-routes]
+    TUNROUTES --> LINUX[Linux route install]
     DOH[doh-tls] --> H2[http2]
     DOH --> DNS_TLS[yuhaiin-dns/tls + quic]
     DOH --> RUSTLS[ring based TLS protocol support]
@@ -157,10 +170,16 @@ graph LR
     TERM --> HYPER[Hyper HTTP termination]
 ```
 
-修改 feature-gated 代码时，要同时确认：
+`yuhaiin-api` 的默认 feature 是 `http-api, tun, tun-routes, doh-tls, websocket,
+http-termination`；`yuhaiin-runtime` 自己的默认 feature 不包含管理 API，但包含同一组
+数据面能力（不含 `http-api`）。`tun` 现在是 runtime 的兼容/组装 feature，真正的
+`yuhaiin-tun` async 实现始终编译；只有 `tun-routes` 才额外启用 route_manager。
+
+`async-proxy`、`async-dns` 和同步 TLS feature 已从 workspace feature 图中删除。修改
+feature-gated 代码时，要同时确认：
 
 1. 代码在默认 feature 下是否编译。
-2. `--no-default-features` 是否仍然能编译；如果不能，错误是新改动还是现有的条件编译缺口。当前异步 proxy/TUN 实现已经是 crate 的常规代码，不再通过旧的 `async-proxy` feature 开关。
+2. `--no-default-features` 是否仍然能编译；如果不能，错误是新改动还是现有的条件编译缺口。异步 proxy/TUN 实现已经是 crate 的常规代码，不再通过旧的 `async-proxy` feature 开关。
 3. TUN 代码的 `tun` 和 `tun-routes` 是否混用了：打开 TUN 不一定意味着可以安装 Linux route。
 4. async boundary 的 future 类型是否应为 `BoxFuture` 还是 `LocalBoxFuture`。只有真正跨线程的 handler 才需要 `Send`。
 
@@ -450,8 +469,8 @@ flowchart TD
     WIRE[yuhaiin-dns::dns<br/>encode/decode/validate]
     HOSTS[yuhaiin-dns::dns_hosts<br/>hosts lookup]
     FAKE[yuhaiin-dns::fakeip<br/>FakeIP view/transform]
-    UDP[yuhaiin-dns::dns_udp_async]
-    TCP[yuhaiin-dns::dns_tcp_async]
+    UDP[yuhaiin-dns::dns]
+    TCP[yuhaiin-dns::dns_tcp]
     DOH[yuhaiin-dns::http2 + runtime resolver]
     DOT[yuhaiin-dns::dns_tls + rustls]
     ROUTED[yuhaiin-runtime::RoutedDnsClient]
@@ -529,7 +548,7 @@ flowchart LR
     CHAIN[ChainProxy / ChainDatagram]
     FACTORY[Protocol ProxyFactory]
     SESSION[Protocol session]
-    SOCKET[core socket connector]
+    SOCKET[core async socket/proxy primitives]
     TARGET[remote target]
 
     FLOW --> SELECTOR
@@ -541,10 +560,27 @@ flowchart LR
     SOCKET --> TARGET
 ```
 
-- `yuhaiin-core` 提供最底层的 socket connect、stream/datagram 基础和 `FlowContext`。
+- `yuhaiin-core` 提供最底层的 async socket connect、stream/datagram 基础和 `FlowContext`；当前不再提供同步 connector。
 - `yuhaiin-protocol` 负责“如何在一个已获得的底层 stream/datagram 上做协议握手”，例如 SOCKS5、VLESS、VMess、Trojan、Shadowsocks、H2、WebSocket、Yuubinsya。
+- `yuhaiin-protocol::proxy_factory::BaseProxyConfig::build` 负责把 Direct/Reject/Drop/Fixed/HTTP/SOCKS5/Yuubinsya UDP 等基础出站配置变成 `Arc<dyn AsyncProxy>`；HTTP CONNECT 现在也是异步 `HttpProxy` 套在 `FixedAsyncProxy` 上。
+- `yuhaiin-protocol::tls::RustCryptoTlsProxy` 只包装已有的 `AsyncProxy`，负责异步 TLS 握手和 ALPN；旧的 `tls_sync.rs` 已删除。
 - `yuhaiin-chain` 负责把多个 node、TLS、WebSocket、H2、UOT/UDP 阶段组合起来；`ChainClient` 是链的连接/缓存/重试核心，`ChainProxy`/`ChainDatagram` 把链暴露成 runtime 可用的 proxy capability。
 - `yuhaiin-runtime/src/proxy.rs` 根据 Go node/proxy config 构造上面这些对象，并把它们注册到 `RuntimeProxySelector`。
+
+这次调整后的关键调用关系是：
+
+```text
+RuntimeProxySelector
+  -> RuntimeProxySelector/ProxyBuild
+  -> BaseProxyConfig::build 或 ChainClient
+  -> AsyncProxy / AsyncDatagram
+  -> RustCryptoTlsProxy、HTTP、协议 session 等 wrapper
+  -> runtime relay 或 TUN proxy task
+```
+
+`AsyncProxy` 是 core 的 runtime-facing capability；它不应因为“公共 trait”这个名字就被
+继续移动到 `yuhaiin-types`。只有不携带 Tokio、socket、FlowContext 生命周期的 DNS、inbound
+DNS policy、endpoint/network model 才进入 `types`。
 
 ### 11.2 添加一个新的 outbound protocol
 
@@ -712,16 +748,21 @@ WireGuard handshake/packet engine 不应混入通用 TCP proxy。
 
 ## 15. 常见修改任务：应该改哪些文件
 
-### 15.1 添加一个公共 DNS/proxy/inbound trait
+### 15.1 添加一个公共 DNS/inbound/net trait
 
 先判断 trait 是否满足“零 runtime/平台依赖”。如果满足：
 
-1. 在 `crates/yuhaiin-types/src/{dns,proxy,inbound,net}.rs` 中定义最小 contract。
+1. 在 `crates/yuhaiin-types/src/{dns,inbound,net}.rs` 或 `lib.rs` 中定义最小 contract；这里没有 `proxy.rs`。
 2. 只使用 `DomainName`、`Endpoint`、`IpSet`、`BoxFuture`、`Result` 等 types 内类型。
 3. 在 `types/src/lib.rs` re-export。
 4. 在旧 crate re-export，保持旧路径源码兼容。
 5. 将 codec/transport 的实现留在 `yuhaiin-dns` 或 `runtime`。
 6. 为 `Send` 做明确判断：跨 Tokio task/线程才要求 `BoxFuture`；本地单线程边界用 `LocalBoxFuture`。
+
+如果新增的是 `AsyncProxy`、`AsyncDatagram`、`AsyncStream` 或需要 `FlowContext`/Tokio I/O
+的 wrapper，应留在 `yuhaiin-core::proxy`；如果新增的是协议 framing 或 TLS/HTTP session，
+应留在 `yuhaiin-protocol`。不要为了复用一个名字而把 runtime-specific capability 塞进
+无依赖的 `yuhaiin-types`。
 
 ### 15.2 添加新的 inbound protocol
 
@@ -856,6 +897,7 @@ cargo test -p yuhaiin-types
 cargo test -p yuhaiin-dns --features tls,quic
 cargo test -p yuhaiin-core --features http2,tls-ring
 cargo test -p yuhaiin-runtime
+cargo test -p yuhaiin-tun --features tun-routes
 git diff --check
 ```
 
@@ -868,17 +910,21 @@ git diff --check
 | route/trie | trie unit tests + runtime route tests + TUN/socket context tests |
 | inbound TCP | runtime inbound tests、协议握手、reload/close |
 | inbound UDP | multi-target、bounded queue drop、close-before-open、generation、idle cleanup |
-| TUN | runtime tun tests、dispatcher/packet tests、真实平台 smoke |
+| TUN | runtime tun tests、dispatcher/packet tests、`yuhaiin-tun --features tun-routes`、真实平台 smoke |
 | store/migration | empty/legacy/partial/repeat DB fixture tests |
 | chain/protocol | protocol unit + chain integration + runtime selector build |
 | API | handler tests、round-trip/default shape、mutation publishes reload |
+| async/feature 边界 | 确认没有重新引入 `async-proxy`/`async-dns`；检查默认 feature 和 `--no-default-features` 的条件编译 |
+| TUN throughput | `bash scripts/benchmark/tun-throughput.sh`；脚本会构建 `yuhaiin-tun/src/bin/tun_smoke.rs`，需要 `tun-routes` 时显式打开 |
 
 验证时要把“代码基线”和“当前工作树”分开记录：公共 trait 抽取完成后应先跑上面的默认
 workspace check，再跑 DNS/core 的可选 feature 测试；如果工作树正处在移除旧 feature 或
 整理 re-export 的中间状态，`cargo check` 的错误可能来自未完成的条件编译/导出迁移，而
-不是业务逻辑回归。另有历史上的 `cargo check -p yuhaiin-runtime --no-default-features`
-缺口：`inbounds/mod.rs` 和 `listeners.rs` 有部分 tun/协议 imports 未完全条件化。修改相关
-feature 时应把它作为独立问题确认，不要把它误判成公共 trait 抽取造成的回归。
+不是业务逻辑回归。当前 checkout 的 `cargo check -p yuhaiin-runtime --no-default-features`
+仍有已知缺口：`inbounds/mod.rs` 无条件 re-export 了 tun 专属
+`InboundInputInterceptor`，`listeners.rs` 无条件导入了 http2/websocket listener；它们
+需要单独条件化。修改相关 feature 时应把它作为独立问题确认，不要把它误判成公共 trait
+抽取造成的回归。
 
 ## 18. 快速代码索引
 
@@ -922,18 +968,18 @@ feature 时应把它作为独立问题确认，不要把它误判成公共 trait
 
 ### 20.1 `yuhaiin-types`：最底层公共语言
 
-源码目录只有五个文件，依赖故意保持为空：
+源码目录只有四个文件，依赖故意保持为空：
 
 | 文件 | 关键内容 | 内部逻辑 |
 | --- | --- | --- |
 | [`lib.rs`](../crates/yuhaiin-types/src/lib.rs) | `BoxFuture`、`LocalBoxFuture`、`DomainName`、`IpSet`、`Error`、`ResolveStrategy` | `DomainName::new` 做规范化/长度/label 校验；`IpSet::iter` 以 v4 后 v6 顺序暴露地址；错误只携带 kind/message |
 | [`net.rs`](../crates/yuhaiin-types/src/net.rs) | `Network`、`Endpoint` | 统一表达 TCP/UDP/ICMP/Any 和 IP/domain endpoint；不做 socket 连接 |
 | [`dns.rs`](../crates/yuhaiin-types/src/dns.rs) | DNS model 和 `DnsHandler`、`AsyncDnsHandler`、`AsyncIpResolver` | `AsyncIpResolver::query`/`query_packet` 有最小默认实现，具体 resolver 可以保留 PTR/SVCB/HTTPS/raw packet |
-| [`lib.rs`](../crates/yuhaiin-types/src/lib.rs) → `proxy.rs` | `StreamConnector` | 同步连接能力；local bind/interface 不支持时返回 `Unsupported`，而不是静默忽略 |
 | [`inbound.rs`](../crates/yuhaiin-types/src/inbound.rs) | `InboundDnsHandler` | 只定义 DNS 是否拦截和异步回答，不知道 inbound listener 或 TUN 具体实现 |
 
 修改这里的原则是“只新增可复用语义，不新增运行时策略”。例如 `Endpoint` 可以增加
-一个地址转换方法；但“应该使用哪个 proxy id”必须留在 runtime。
+一个地址转换方法；但“应该使用哪个 proxy id”必须留在 runtime。`AsyncProxy` 等异步
+出站能力不属于这个 crate 的公共语言层。
 
 ### 20.2 `yuhaiin-dns`：DNS 的模型、编解码和传输实现
 
@@ -941,15 +987,14 @@ feature 时应把它作为独立问题确认，不要把它误判成公共 trait
 
 | 文件 | 组件 | 关键函数/类型 | 作用 |
 | --- | --- | --- | --- |
-| [`dns.rs`](../crates/yuhaiin-dns/src/dns.rs) | wire/model/cache | `encode_query`、`decode_query`、`encode_response`、`decode_response`、`validate_*`、`DnsCache` | Hickory message 与 types model 的边界；同时维护 typed cache 和 raw packet cache |
+| [`dns.rs`](../crates/yuhaiin-dns/src/dns.rs) | wire/model/UDP | `encode_query`、`decode_query`、`encode_response`、`decode_response`、`validate_*`、`AsyncUdpDnsClient` | Hickory message 与 types model 的边界；同时提供 UDP transport |
+| [`cache.rs`](../crates/yuhaiin-dns/src/cache.rs) | cache | `DnsCache`、`CachingDnsHandler` | bounded LRU、TTL 和 raw packet cache |
 | `dns_hosts.rs` | hosts | `HostsTable`、`HostsDnsHandler`、`AsyncHostsDnsHandler` | 先按 domain/IP 查静态 hosts，再决定 passthrough/upstream |
 | `fakeip.rs` | FakeIP view | `FakeIpView`、`FakeIpViewStore` | 只提供回答转换/反查视图；持久化 pool 的 owner 在 store |
-| `dns_resolver.rs` | blocking resolver | `DnsResolver`、`ResolverTransport` | 同步 API 的 transport 组合 |
-| `dns_resolver_async.rs` | async resolver | `AsyncDnsResolver`、`AsyncDnsFlight`、`SendAsyncDnsQuery` | cache、singleflight、raw packet、A/AAAA 合并 |
+| `dns_resolver.rs` | resolver | `DnsResolver`、`AsyncDnsResolver`、`AsyncDnsFlight`、`SendAsyncDnsQuery` | 同步兼容与异步 runtime 的 transport 组合；cache、singleflight、raw packet、A/AAAA 合并 |
 | `dns_resolver_stack.rs` | resolver stack | `AsyncHostsResolver` | 把 hosts 层包在异步 resolver 上 |
 | `dns_datagram.rs` | datagram abstraction | `AsyncDnsDatagram`、`DnsDatagramConnector` | 给 UDP/QUIC/代理 resolver 提供统一 datagram |
-| `dns_udp_async.rs` | async UDP | `AsyncUdpDnsClient`、`AsyncUdpDnsServer` | pending request map、receiver task、timeout、truncation fallback、并发 server |
-| `dns_tcp_async.rs` | async TCP | `AsyncTcpDnsClient`、`AsyncTcpDnsServer` | 两字节 length-prefix 的 DNS over TCP 和 listener loop |
+| `dns_tcp.rs` | async TCP | `AsyncTcpDnsClient`、`AsyncTcpDnsServer` | 两字节 length-prefix 的 DNS over TCP 和 listener loop |
 | `dns_tls.rs` | DoT/DoH TLS glue | `DnsTlsConnector`、`DotResolverFactory`、`DohResolverFactory` | TLS stream、SNI/证书、resolver factory |
 | `http2.rs` | H2 DoH | `H2DohClient`、`H2DohDnsHandler` | 通过 H2 stream 发送 DNS POST/响应 |
 | `dns_quic.rs` | DoQ | `DoqClient`、`DoqResolverFactory` | QUIC stream/datagram 的 DNS framing |
@@ -1021,7 +1066,7 @@ AsyncUdpDnsClient` 唤醒 receiver，避免 reload 后遗留一个 task/socket�
 | --- | --- | --- | --- |
 | [`lib.rs`](../crates/yuhaiin-core/src/lib.rs) | `RouteMode`、`ResolverPolicy`、`FlowContext` | `FlowContext::new`、`effective_destination`、`proxy_destination`、`local_bind_for` | 原始目标、FakeIP 恢复域名、最终解析 socket 是三种不同地址，不能覆盖混用 |
 | [`flow.rs`](../crates/yuhaiin-core/src/flow.rs) | flow identity/observer | `FlowKey::endpoint`、`Flow::context`、`FlowObserverGuard::open`/`Drop` | RAII close 保证 task 被 abort 时也发布一次 close |
-| [`proxy.rs`](../crates/yuhaiin-core/src/proxy.rs) | sync/async proxy capability | `connect_tokio_tcp_with_interface`、`AsyncStream`、`AsyncDatagram`、`AsyncProxy`、`AsyncProxySelector` | socket 连接、stream metadata、datagram 和 proxy selection 是不同接口 |
+| [`proxy.rs`](../crates/yuhaiin-core/src/proxy.rs) | async proxy capability | `connect_tokio_tcp_with_interface`、`AsyncStream`、`AsyncDatagram`、`AsyncProxy`、`AsyncProxySelector` | socket 连接、stream metadata、datagram 和 proxy selection 是不同接口；同步 connector 已移除 |
 | [`nat.rs`](../crates/yuhaiin-core/src/nat.rs) | endpoint-independent NAT | `NatTable::insert`、`touch`、`bind_translated`、`lookup_*`、`sweep`、`UdpNatRelay` | source/translated/remote 的 key 关系和 idle timeout 决定 full-cone 行为 |
 | [`process.rs`](../crates/yuhaiin-core/src/process.rs) | socket → process | `ProcessResolver`、`default_process_resolver`、`LinuxProcResolver::resolve_with_error` | TUN context 可以补 process/path/pid/uid；平台不支持时保持 None |
 | [`sniff.rs`](../crates/yuhaiin-core/src/sniff.rs) | protocol metadata | `inspect`、`tls_server_name`、`http_host` | 只从已读 prefix 推断协议，不应消耗原始 stream |
@@ -1086,7 +1131,8 @@ negative constraints 的完整判断。`Router::apply_to_context` 写入 `route_
 
 | 类别 | 文件 | 入口符号 | 内部流程 |
 | --- | --- | --- | --- |
-| proxy factory | [`proxy_factory.rs`](../crates/yuhaiin-protocol/src/proxy_factory.rs) | `BaseProxyConfig::build` | persisted base endpoint/kind → 具体 `AsyncProxy` |
+| proxy factory | [`proxy_factory.rs`](../crates/yuhaiin-protocol/src/proxy_factory.rs) | `BaseProxyConfig::build`、`BaseProxyKind` | persisted base endpoint/kind → Direct/Reject/Drop/Fixed/HTTP/SOCKS5/Yuubinsya UDP 等 `AsyncProxy`；fallback 通过 `FixedAsyncProxy` 或对应 wrapper 组合 |
+| TLS wrapper | [`tls.rs`](../crates/yuhaiin-protocol/src/tls.rs) | `RustCryptoTlsProxy::new_with_options`、`AsyncProxy::connect` | 在已有 `AsyncProxy` 上做异步 rustls 握手，保留 local address，设置 SNI/ALPN 和证书校验策略；没有同步 TLS sibling |
 | SOCKS/HTTP | `socks5.rs`、`socks5_server.rs`、`socks4a_server.rs`、`http.rs`、`http_server.rs` | `Socks5Proxy::new`、`server_handshake`、`read_endpoint`、`parse_udp_packet` | client/server framing；server 把 destination 交给 `InboundHandler` |
 | VLESS | [`vless.rs`](../crates/yuhaiin-protocol/src/vless.rs) | `parse_uuid`、`encode_request`、`read_request`、`VlessProxy::new` | UUID + command + endpoint；UDP 使用 length-delimited datagram |
 | VMess | [`vmess.rs`](../crates/yuhaiin-protocol/src/vmess.rs) | `command_key`、`encode_request`、`decode_request`、`read_body_frame`、`VmessProxy::new` | request/response header、security mode、body frame、UDP datagram |
@@ -1118,6 +1164,10 @@ IP 的 `resolved_destination`。
 - `YuubinsyaTcpSession` 的 `connect`/`accept` 只做 header/session framing；上层 `YuubinsyaServerProxy` 才负责观察 inbound、DNS 识别和 UDP session。
 - `H2Pool` 按 endpoint/identity 复用 connection；`open_connect_stream` 增加 active stream 计数，`drain`/`close` 负责 reload/shutdown。
 - 任何新建 pool/cache 都要提供 idle reap/close；否则 runtime snapshot reload 可能只换 selector 而旧 H2 connection 永不释放。
+
+本次 commit 后 protocol 的旧同步入口不再是兼容层：`StreamConnector`、blocking HTTP/SOCKS
+connector 和 `tls_sync.rs` 均已删除。新增协议 client 应实现/包装 `AsyncProxy`；新增协议
+server 则只负责 framing/auth，再把 flow 交给 runtime 的 inbound handler。
 
 ### 20.6 `yuhaiin-chain`：节点链的验证、建连和 UDP
 
@@ -1259,7 +1309,7 @@ runtime 不只有 `lib.rs/controller.rs`。下面是组件边界：
 | `route.rs` | `RouteListSnapshot::matching_names`、`load_route_lists`、`compile_go_route_rules*`、`refresh_route_list_caches*` | list 内容与 rule compiler 分开；远端 list refresh 通过 transport/proxy，不直接改 live router |
 | `resolver.rs` | `ResolverProxyBridge::connect/open_datagram`、`TimeoutResolver`、`BuiltinResolverFactory`、`RoutedDnsClient` | resolver endpoint 的 direct/proxy 传输，超时、cache、raw query |
 | `rustcrypto_resolver.rs` | `RustCryptoResolverFactory`、`RuntimeDnsDatagram` | rustls/rustcrypto resolver transport adapter |
-| `proxy.rs` | `ProxyBuild::build_proxy`、`build_proxy_selector*`、`RuntimeProxySelector` | node config → protocol/chain proxy；加 socket policy/connect budget/loopback tracking |
+| `proxy.rs` | `ProxyBuild::build_proxy`、`build_proxy_selector*`、`RuntimeProxySelector` | node config → protocol/chain/base proxy；再加 resolver、socket policy、connect budget、loopback tracking 和可替换 selector slot |
 | `inbounds/mod.rs` | `run_until*`、`start_inbounds`、`ProtocolHandler`、`serve_listener`、`serve_connection` | listener owner、protocol dispatch、TLS/mixed/reverse 分支 |
 | `inbounds/handler.rs` | `InboundHandler`、`InboundUdpManager`、`UdpFlowWorker` | 统一 flow context、DNS interception、stream relay、UDP actor |
 | `inbounds/socks5.rs` | `Socks5UdpCodec` | SOCKS5 UDP wire framing，交给通用 UDP manager |
@@ -1273,7 +1323,24 @@ runtime 不只有 `lib.rs/controller.rs`。下面是组件边界：
 | `defaults.rs` | `DefaultAddressPlan` | default inbound/TUN/DNS address 计划，不代表已 bind |
 | `update.rs` | `Channel`、release/status types | update control plane；不应该参与数据面 proxy |
 
-#### 20.9.1 `RuntimeProxySelector` 的构造和选择
+#### 20.9.1 runtime proxy 子模块
+
+`runtime/src/proxy.rs` 只做 config-to-capability 的组装和 selector wrapper；inbound 适配器
+按协议拆在 `runtime/src/proxy/`，共享 relay、sniff、统计和 UDP flow 生命周期：
+
+| 文件 | 作用 |
+| --- | --- |
+| `proxy/common.rs` | `RoutedProxy`、stream sniff/record、relay accounting、UDP flow idle state 和共享 I/O helper |
+| `proxy/http.rs` | HTTP inbound adapter；认证、CONNECT/forward 后进入通用 stream relay |
+| `proxy/http_termination.rs` | 可选的 Hyper HTTP/1/2 termination，接到已经构造好的 upstream `AsyncProxy` |
+| `proxy/reverse.rs` | reverse TCP/HTTP inbound，复用 selector 和通用 relay |
+| `proxy/socks4a.rs` | SOCKS4/4A inbound framing、认证和 upstream dispatch |
+| `proxy/transparent.rs` | Linux tproxy/redir TCP/UDP listener 和 original-destination 处理 |
+| `proxy/trojan.rs` / `proxy/vless.rs` | Trojan/VLESS inbound adapter、认证和 UDP codec/session |
+| `proxy/websocket.rs` | shared WebSocket I/O/server acceptor 的 runtime 适配 |
+| `proxy/yuubinsya.rs` | Yuubinsya inbound server、DNS handler adapter 和 UDP codec |
+
+#### 20.9.2 `RuntimeProxySelector` 的构造和选择
 
 ```mermaid
 flowchart TD
@@ -1518,11 +1585,16 @@ DNS policy resolver”。
 | H2/WebSocket/UOT | `yuhaiin-chain/tests/http2_*`、`yuhaiin-protocol/src/h2_tunnel.rs` tests |
 | store schema/migration | `yuhaiin-store/src/tests/{schema,go_import,snapshot,storage}.rs`、`tests/fixtures/` |
 | FakeIP | `yuhaiin-store/src/fakeip_tests.rs`、FakeIP fixture NDJSON/SQL |
-| TUN packet/proxy | `yuhaiin-tun/src/tun_unit_tests.rs`、`tun_proxy_tests.rs`、`tests/tun_routes.rs` |
+| TUN packet/proxy | `yuhaiin-tun/src/tun_unit_tests.rs`、`tun_proxy_tests.rs`、`tests/tun_routes.rs`、`yuhaiin-tun/src/bin/tun_smoke.rs` |
 | runtime resolver/TUN/reload | `yuhaiin-runtime/tests/{doh_tls,legacy_v1_runtime}.rs`、controller/data_plane tests |
 | API contract/reload | `yuhaiin-api/tests/{api_contract,api_reload_flow,startup_logs,stats_concurrency}.rs` |
 | backup | `yuhaiin-backup/tests/s3_local.rs`、API backup tests |
 | wireguard | `yuhaiin-wireguard/src/tests.rs`、`tests/external.rs`、API `wireguard_chain.rs` |
+
+`yuhaiin-store/src/bin/tun_fakeip_smoke.rs` 还覆盖了一个重要边界：FakeIP DNS 不再通过
+TUN 专属 handler 直接注入，而是用 `FakeIpDnsProxy`/`FakeIpDnsDatagram` 把
+`FakeIpAsyncDnsHandler` 接入统一的 `AsyncProxy` datagram 路径。它是验证 adapter 的 smoke
+入口，不应被误读成新的公共 `yuhaiin-types` trait。
 
 测试名称经常直接表达兼容性约束，例如 `reloadable_tun_dns_handler_switches_snapshots_without_rebuilding_owner` 表明 DNS handler 可以换 snapshot，但 TUN owner 不应因此被重建；这类测试比注释更能说明当前设计。
 
@@ -1579,3 +1651,23 @@ trivial getter 逐行抄进文档。
 源码行号会随着后续编辑变化；函数名和文件路径是稳定索引，行号只作为当前 checkout
 的快速跳转提示。任何行号与当前源码不一致时，以同一文件中的函数定义为准，并在修改
 文档时顺便更新链接。
+
+## 25. `add0b04` 之后的迁移速查
+
+最近一次大更新把“公共 contract”“异步运行时能力”“协议 wrapper”和“TUN smoke 入口”
+重新分层。后续修改可以按下面的替换关系定位：
+
+| 旧位置/旧入口 | 当前入口 | 迁移含义 |
+| --- | --- | --- |
+| `yuhaiin-core`/各 crate 自己定义 `Endpoint`、`Network` | `yuhaiin-types::{Endpoint, Network}` | 地址和网络类型只有一份 canonical definition；core 只 re-export |
+| DNS model/handler 分散在 `yuhaiin-dns`、runtime | `yuhaiin-types::{DnsResponse, DnsHandler, AsyncDnsHandler, AsyncIpResolver}` | DNS wire codec、transport、cache 仍留在 `yuhaiin-dns`，types 只保留 contract/model |
+| runtime/TUN 各自的 inbound DNS contract | `yuhaiin-types::InboundDnsHandler` | hijack 判断和回答接口共享；具体 handler 仍由 runtime/store/dns 实现 |
+| `StreamConnector`、`BlockingStreamProxy`、同步 HTTP/SOCKS connector | `yuhaiin-core::proxy::{AsyncProxy, AsyncDatagram, AsyncStream}` | outbound 能力统一为 async；不再维护 parallel blocking API |
+| `yuhaiin-protocol/src/tls_sync.rs` | `yuhaiin-protocol/src/tls.rs::RustCryptoTlsProxy` | TLS 作为已有 `AsyncProxy` 的异步 wrapper；证书/SNI/ALPN 逻辑集中在一个入口 |
+| runtime 自己拼基础 HTTP/SOCKS/direct proxy | `yuhaiin-protocol::proxy_factory::BaseProxyConfig::build` | protocol 负责可复用 base async proxy，runtime 负责把 persisted config 映射进去 |
+| `cargo build -p yuhaiin-core --features tun,async-proxy` 的 TUN benchmark | `cargo build -p yuhaiin-tun --bin tun-smoke --features tun-routes --release` | TUN async implementation 归 `yuhaiin-tun`；route install 是独立 feature |
+| TUN smoke 直接注入 DNS handler | `FakeIpDnsProxy` + `FakeIpDnsDatagram` | DNS hijack 通过统一 datagram proxy capability 验证，而不是创建 TUN 专属旁路 |
+
+因此，“新增公共 trait”不再是把所有 proxy trait 都放进 `yuhaiin-types`：先判断它是否
+只表达平台无关的值/contract；若它需要 `FlowContext`、Tokio I/O、socket metadata 或
+异步资源生命周期，就应该留在 core/protocol/runtime 的对应层。

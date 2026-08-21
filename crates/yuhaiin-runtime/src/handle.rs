@@ -120,7 +120,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
     use yuhaiin_store::ConfigStore;
 
     fn empty_snapshot() -> RuntimeSnapshot {

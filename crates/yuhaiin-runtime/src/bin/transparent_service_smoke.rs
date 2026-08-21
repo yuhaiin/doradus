@@ -22,7 +22,7 @@ use tokio::sync::watch;
 use nix::sys::socket::{setsockopt, sockopt};
 #[cfg(target_os = "linux")]
 use socket2::{Domain, Protocol, Socket, Type};
-use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
 use yuhaiin_core::{Error, ErrorKind, Result, RouteMode};
 use yuhaiin_runtime::{RuntimeBuildOptions, RuntimeBuilder, RuntimeController, inbound};
 use yuhaiin_store::{ConfigStore, GoInboundRecord, GoNodeRecord};

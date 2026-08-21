@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::dns::{DnsRecordType, DnsResponse};
 use crate::dns_hosts::HostsTable;
-use crate::dns_resolver_async::AsyncIpResolver;
+use crate::dns_resolver::AsyncIpResolver;
 use crate::{BoxFuture, DomainName, IpSet, ResolveStrategy, Result};
 
 /// Resolve static hosts entries before consulting the configured upstream.

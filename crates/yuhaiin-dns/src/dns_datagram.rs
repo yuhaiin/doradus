@@ -2,7 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use crate::dns::{DnsRecordType, decode_response, encode_query};
-use crate::dns_resolver_async::AsyncIpResolver;
+use crate::dns_resolver::AsyncIpResolver;
 use crate::{BoxFuture, DomainName, Error, ErrorKind, ResolveStrategy, Result};
 
 pub trait AsyncDnsDatagram: Send + Sync {
@@ -94,7 +94,7 @@ pub(crate) async fn resolve_server_with_resolver(
         ));
     }
 
-    crate::dns_resolver_async::resolve_internet_server(host, port).await
+    crate::dns_resolver::resolve_internet_server(host, port).await
 }
 
 #[cfg(test)]

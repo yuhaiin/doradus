@@ -39,7 +39,7 @@ use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{Mutex, Notify, watch};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use yuhaiin_core::dns_resolver_async::{AsyncIpResolver, SystemAsyncIpResolver};
+use yuhaiin_core::dns_resolver::{AsyncIpResolver, SystemAsyncIpResolver};
 use yuhaiin_core::proxy::{
     AsyncDatagram, AsyncProxy, BoxAsyncStream, connect_tokio_tcp_with_interface, stream_local_addr,
     with_stream_local_addr,

@@ -1452,10 +1452,10 @@ Full-cone 约束：同一 `source`/`MigrateID` 的不同 logical destination 共
 
 - 先写 hickory-proto adapter 和 raw message model。
 - 实现 UDP single socket/pending dispatcher。
-- 实现 TCP length-prefix fallback，再实现 DoH2。Rust 版同时提供同步 `dns_tcp::TcpDnsClient`/`TcpDnsServer` 和纯 Tokio 的 `dns_tcp_async::AsyncTcpDnsClient`/`AsyncTcpDnsServer`/`AsyncTcpDnsHandler`；异步 server 支持同一连接多 frame、多个连接并发 accept 与 owner shutdown；runtime TCP resolver 使用异步实现，复用 DNS wire codec，并通过 loopback framing 与 runtime factory 查询回归。
+- 实现 TCP length-prefix fallback，再实现 DoH2。Rust 版在 `dns_tcp` 中同时提供同步 `TcpDnsClient`/`TcpDnsServer` 和纯 Tokio 的 `AsyncTcpDnsClient`/`AsyncTcpDnsServer`/`AsyncTcpDnsHandler`；异步 server 支持同一连接多 frame、多个连接并发 accept 与 owner shutdown；runtime TCP resolver 使用异步实现，复用 DNS wire codec，并通过 loopback framing 与 runtime factory 查询回归。
 - 实现 UDP/TCP DNS server，接入 FakeIP。
 - UDP/TCP/DoH client 由 `dns_resolver::DnsResolver` 统一暴露，缓存和具体 DoH HTTP/proxy transport 通过注入边界组合；不把同步 socket 或 HTTP client 细节带入 Router/TUN。
-- `dns_resolver_async::AsyncDnsResolver` 以 query-level `AsyncDnsQuery` 组合异步 UDP 与 HTTP/2 DoH，并输出现有 packet-level `AsyncDnsHandler`；缓存、hosts、policy、FakeIP 可以继续按 handler 链组合。
+- `dns_resolver::AsyncDnsResolver` 以 query-level `AsyncDnsQuery` 组合异步 UDP 与 HTTP/2 DoH，并输出现有 packet-level `AsyncDnsHandler`；缓存、hosts、policy、FakeIP 可以继续按 handler 链组合。
 - 交付标准：Rust resolver/server 互通；Go resolver/server 互通；TC、超时、取消和并发限制通过。
 
 ### Phase 3：Router
@@ -2173,8 +2173,8 @@ runtime-tun-closed name=yrtun0
 实际执行结果：
 
 ```text
-test dns_udp_async::tests::async_udp_client_and_handler_round_trip_with_original_transaction ... ok
-test dns_tcp_async::tests::async_tcp_client_and_server_round_trip_preserves_transaction ... ok
+test dns::async_udp::tests::async_udp_client_and_handler_round_trip_with_original_transaction ... ok
+test dns_tcp::async_tcp::tests::async_tcp_client_and_server_round_trip_preserves_transaction ... ok
 [dns-source-bind] passed
 ```
 

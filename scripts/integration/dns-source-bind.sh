@@ -34,10 +34,10 @@ podman run --rm \
   -ec '
     set -eu
     /usr/local/bin/yuhaiin-core-test \
-      dns_udp_async::tests::async_udp_client_and_handler_round_trip_with_original_transaction \
+      dns::async_udp::tests::async_udp_client_and_handler_round_trip_with_original_transaction \
       --exact --nocapture
     /usr/local/bin/yuhaiin-core-test \
-      dns_tcp_async::tests::async_tcp_client_and_server_round_trip_preserves_transaction \
+      dns_tcp::async_tcp::tests::async_tcp_client_and_server_round_trip_preserves_transaction \
       --exact --nocapture
   ' \
   | tee "${scenario_dir}/podman.log"

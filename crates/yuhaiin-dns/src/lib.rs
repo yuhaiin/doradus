@@ -16,27 +16,25 @@ pub use fakeip::{
 
 pub mod dns;
 pub use dns::*;
+pub mod cache;
 pub mod dns_hosts;
 pub use dns_hosts::AsyncHostsDnsHandler;
 pub use dns_hosts::{
     HostsDispatchTarget, HostsDnsHandler, HostsTable, HostsTarget, host_without_port,
 };
 pub mod dns_resolver;
-pub use dns_resolver::{DnsResolver, ResolverTransport};
-pub mod dns_resolver_async;
-pub use dns_resolver_async::{
-    AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, SendAsyncDnsQuery, SystemAsyncIpResolver,
+pub use dns_resolver::{
+    AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, DnsResolver, ResolverTransport,
+    SendAsyncDnsQuery, SystemAsyncIpResolver,
 };
 pub mod dns_resolver_stack;
 pub use dns_resolver_stack::AsyncHostsResolver;
 mod dns_datagram;
 pub use dns_datagram::{AsyncDnsDatagram, DnsDatagramConnector, probe_dns_udp};
 pub mod dns_tcp;
-pub use dns_tcp::{TcpDnsClient, TcpDnsServer};
-pub mod dns_tcp_async;
-pub use dns_tcp_async::{AsyncTcpDnsClient, AsyncTcpDnsHandler, AsyncTcpDnsServer};
-pub mod dns_udp_async;
-pub use dns_udp_async::{AsyncUdpDnsClient, AsyncUdpDnsHandler, AsyncUdpDnsServer};
+pub use dns_tcp::{
+    AsyncTcpDnsClient, AsyncTcpDnsHandler, AsyncTcpDnsServer, TcpDnsClient, TcpDnsServer,
+};
 #[cfg(feature = "http2")]
 pub mod http2;
 #[cfg(feature = "http2")]

@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
-use yuhaiin_core::dns_resolver_async::{AsyncIpResolver, SystemAsyncIpResolver};
+use yuhaiin_core::dns_resolver::{AsyncIpResolver, SystemAsyncIpResolver};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{
     DomainName, Endpoint, Error, ErrorKind, FlowContext, IpSet, Network, ResolveStrategy, Result,

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod compat_proxy;
-mod compat_proxy_async;
+
 mod compat_runtime;
 mod migration;
 mod repository;

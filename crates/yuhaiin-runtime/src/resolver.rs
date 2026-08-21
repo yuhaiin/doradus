@@ -15,15 +15,15 @@ use std::time::Duration;
 use std::marker::PhantomData;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use yuhaiin_core::dns::AsyncUdpDnsClient;
 use yuhaiin_core::dns::{
     DnsCache, DnsRecordType, DnsResponse, decode_response, encode_query, response_is_truncated,
     validate_query_packet, validate_response_packet,
 };
-use yuhaiin_core::dns_resolver_async::{
+use yuhaiin_core::dns_resolver::{
     AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, SendAsyncDnsQuery, SystemAsyncIpResolver,
 };
-use yuhaiin_core::dns_tcp_async::AsyncTcpDnsClient;
-use yuhaiin_core::dns_udp_async::AsyncUdpDnsClient;
+use yuhaiin_core::dns_tcp::AsyncTcpDnsClient;
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxySelector, BoxAsyncStream};
 use yuhaiin_core::{
     BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, IpSet, Network,
@@ -1058,7 +1058,7 @@ mod tests {
     use yuhaiin_core::dns::{
         AsyncDnsHandler, DnsRecordType, DnsResponse, decode_query, encode_response,
     };
-    use yuhaiin_core::dns_tcp_async::AsyncTcpDnsServer;
+    use yuhaiin_core::dns_tcp::AsyncTcpDnsServer;
     use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncProxySelector};
     use yuhaiin_core::{BoxFuture, DomainName, IpSet, ResolveStrategy};
 

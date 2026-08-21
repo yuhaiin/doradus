@@ -16,7 +16,7 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use smoltcp::wire::{IpAddress, IpCidr};
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::mpsc;
-use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+use yuhaiin_core::dns_resolver::AsyncIpResolver;
 use yuhaiin_core::proxy::{AsyncProxy, DEFAULT_INTERFACE};
 use yuhaiin_core::{
     BoxFuture, DomainName, Endpoint, ErrorKind, FlowContext, IpSet, Network, ResolveStrategy,

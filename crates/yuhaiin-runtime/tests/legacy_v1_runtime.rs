@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
 use yuhaiin_runtime::{RuntimeBuilder, RuntimeController};
 use yuhaiin_store::ConfigStore;
 

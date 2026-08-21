@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use yuhaiin_core::dns::{DnsRecordType, DnsResponse, DnsServiceParam};
-use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+use yuhaiin_core::dns_resolver::AsyncIpResolver;
 use yuhaiin_core::{BoxFuture, DomainName, IpSet, ResolveStrategy, Result};
 use yuhaiin_store::{ConfigStore, GoSettingsKvRecord};
 
@@ -438,7 +438,7 @@ impl AsyncIpResolver for Ipv6PolicyResolver {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
-    use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+    use yuhaiin_core::dns_resolver::AsyncIpResolver;
 
     struct StaticResolver;
 

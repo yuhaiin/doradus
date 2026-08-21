@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use yuhaiin_core::GeoLookup;
-use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+use yuhaiin_core::dns_resolver::AsyncIpResolver;
 use yuhaiin_core::proxy::{AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{
     BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, ResolveStrategy,
@@ -1651,7 +1651,7 @@ fn invalid_port(id: &str) -> Error {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
     use yuhaiin_core::proxy::FixedAsyncProxy;
     use yuhaiin_core::{Endpoint, Network};
     use yuhaiin_store::GoRouteListRecord;

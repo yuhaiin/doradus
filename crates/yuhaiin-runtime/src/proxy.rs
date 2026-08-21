@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use yuhaiin_chain::ChainProxy;
-use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+use yuhaiin_core::dns_resolver::AsyncIpResolver;
 use yuhaiin_core::proxy::{
     AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream, DelayedDropAsyncProxy,
     DirectAsyncProxy, DropAsyncProxy, stream_local_addr, stream_remote_addr,
@@ -1682,7 +1682,7 @@ impl AsyncProxy for ConnectBudgetProxy {
 async fn build_aead_proxy(
     config: &GoProxyRuntimeConfig,
     timeout: Duration,
-    resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
+    resolver: Arc<dyn yuhaiin_core::dns_resolver::AsyncIpResolver>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     let base = config
         .to_base_proxy_config_with_resolver(timeout, resolver)
@@ -2573,7 +2573,7 @@ fn is_trojan_websocket_config(config: &GoProxyRuntimeConfig) -> bool {
 async fn build_stream_transport_upstream(
     config: &GoProxyRuntimeConfig,
     timeout: Duration,
-    resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
+    resolver: Arc<dyn yuhaiin_core::dns_resolver::AsyncIpResolver>,
     protocol_name: &str,
 ) -> Result<Arc<dyn AsyncProxy>> {
     #[cfg(feature = "doh-tls")]
@@ -2637,7 +2637,7 @@ async fn build_wireguard_proxy(
 async fn build_protocol_h2_proxy(
     config: &GoProxyRuntimeConfig,
     _timeout: Duration,
-    resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
+    resolver: Arc<dyn yuhaiin_core::dns_resolver::AsyncIpResolver>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     let protocol = match config.transport {
         yuhaiin_store::GoProxyTransport::Vless => "vless",
@@ -2745,7 +2745,7 @@ fn build_protocol_proxy(
 async fn build_vless_transport_proxy(
     config: &GoProxyRuntimeConfig,
     timeout: Duration,
-    resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
+    resolver: Arc<dyn yuhaiin_core::dns_resolver::AsyncIpResolver>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     let upstream = build_stream_transport_upstream(config, timeout, resolver, "VLESS").await?;
     build_protocol_proxy(config, upstream)
@@ -2754,7 +2754,7 @@ async fn build_vless_transport_proxy(
 async fn build_vmess_transport_proxy(
     config: &GoProxyRuntimeConfig,
     timeout: Duration,
-    resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
+    resolver: Arc<dyn yuhaiin_core::dns_resolver::AsyncIpResolver>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     let upstream = build_stream_transport_upstream(config, timeout, resolver, "VMess").await?;
     build_protocol_proxy(config, upstream)
@@ -2763,7 +2763,7 @@ async fn build_vmess_transport_proxy(
 async fn build_trojan_transport_proxy(
     config: &GoProxyRuntimeConfig,
     timeout: Duration,
-    resolver: Arc<dyn yuhaiin_core::dns_resolver_async::AsyncIpResolver>,
+    resolver: Arc<dyn yuhaiin_core::dns_resolver::AsyncIpResolver>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     let upstream = build_stream_transport_upstream(config, timeout, resolver, "Trojan").await?;
     build_protocol_proxy(config, upstream)
@@ -3184,7 +3184,7 @@ mod tests {
     use crate::RuntimeSnapshot;
     use base64::Engine;
     use std::sync::Arc;
-    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
     use yuhaiin_core::proxy::FixedAsyncProxy;
     use yuhaiin_core::{FlowContext, GeoLookup, RouteMode};
     use yuhaiin_protocol::YuubinsyaUdpServer;

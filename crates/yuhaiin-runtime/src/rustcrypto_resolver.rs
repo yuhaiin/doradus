@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustls::ClientConfig;
-use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+use yuhaiin_core::dns_resolver::AsyncIpResolver;
 use yuhaiin_core::proxy::AsyncDatagram;
 use yuhaiin_core::{Endpoint, Error, ErrorKind, Network, Result};
 use yuhaiin_dns::{AsyncDnsDatagram, DnsDatagramConnector, DoqResolverConfig, DoqResolverFactory};

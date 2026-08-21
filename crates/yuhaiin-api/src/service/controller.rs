@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use yuhaiin_core::dns_resolver_async::{AsyncIpResolver, SystemAsyncIpResolver};
+use yuhaiin_core::dns_resolver::{AsyncIpResolver, SystemAsyncIpResolver};
 use yuhaiin_core::{Error, ErrorKind, Result};
 #[cfg(not(feature = "doh-tls"))]
 use yuhaiin_runtime::BuiltinResolverFactory;

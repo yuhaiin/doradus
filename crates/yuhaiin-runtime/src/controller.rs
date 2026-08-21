@@ -527,7 +527,7 @@ impl RuntimeController {
 mod tests {
     use std::sync::Arc;
 
-    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
     use yuhaiin_core::proxy::AsyncProxySelector;
     use yuhaiin_core::{Endpoint, ErrorKind, FlowContext, Network, RouteMode};
     use yuhaiin_store::{

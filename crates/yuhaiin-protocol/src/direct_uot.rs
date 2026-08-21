@@ -14,7 +14,7 @@ use std::time::Duration;
 use crate::yuubinsya::derive_salt;
 use serde_json::Value;
 use tokio::sync::Mutex;
-use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+use yuhaiin_core::dns_resolver::AsyncIpResolver;
 use yuhaiin_core::proxy::{
     AsyncDatagram, AsyncProxy, BoxAsyncStream, connect_tokio_tcp_with_interface,
 };
@@ -569,7 +569,7 @@ mod tests {
         });
         let parsed = parse_go_direct_uot(
             &json.to_string(),
-            Arc::new(yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver),
+            Arc::new(yuhaiin_core::dns_resolver::SystemAsyncIpResolver),
         )
         .unwrap();
         assert!(parsed.is_none());

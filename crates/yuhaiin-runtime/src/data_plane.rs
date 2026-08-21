@@ -16,8 +16,8 @@ use tokio::sync::watch;
 use yuhaiin_core::dns::{
     AsyncDnsHandler, DnsRecordType, DnsResponse, decode_query, encode_response,
 };
-use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
-use yuhaiin_core::dns_tcp_async::AsyncTcpDnsServer;
+use yuhaiin_core::dns_resolver::AsyncIpResolver;
+use yuhaiin_core::dns_tcp::AsyncTcpDnsServer;
 use yuhaiin_core::{BoxFuture, Result, RouteMode};
 #[cfg(feature = "tun")]
 use yuhaiin_core::{Error, ErrorKind};
@@ -652,7 +652,7 @@ pub async fn run_dns_supervisor(
         // process, another service, or a partial reload may occupy either
         // one, so keep the available transport alive instead of terminating
         // the whole DNS supervisor on the first bind error.
-        let udp = match yuhaiin_core::dns_udp_async::AsyncUdpDnsServer::bind(
+        let udp = match yuhaiin_core::dns::AsyncUdpDnsServer::bind(
             address,
             handler.clone(),
             snapshot.settings.udp_buffer_size.max(512),
@@ -841,9 +841,9 @@ mod tests {
         AsyncDnsHandler, DnsRecordType, DnsResponse, DnsServiceBinding, DnsServiceParam,
         decode_query, decode_response, encode_query, encode_raw_query,
     };
-    use yuhaiin_core::dns_resolver_async::{AsyncIpResolver, SystemAsyncIpResolver};
-    use yuhaiin_core::dns_tcp_async::{AsyncTcpDnsClient, AsyncTcpDnsServer};
-    use yuhaiin_core::dns_udp_async::{AsyncUdpDnsClient, AsyncUdpDnsServer};
+    use yuhaiin_core::dns::{AsyncUdpDnsClient, AsyncUdpDnsServer};
+    use yuhaiin_core::dns_resolver::{AsyncIpResolver, SystemAsyncIpResolver};
+    use yuhaiin_core::dns_tcp::{AsyncTcpDnsClient, AsyncTcpDnsServer};
     use yuhaiin_core::{BoxFuture, DomainName, ErrorKind, IpSet, ResolveStrategy};
     use yuhaiin_store::fakeip::{FakeIpConfig, FakeIpPool, FakeIpV6Config, FakeIpV6Pool};
     use yuhaiin_store::{ConfigStore, FakeIpPools, FakeIpResolver};
@@ -1316,10 +1316,9 @@ mod tests {
             resolver: Arc::new(SystemAsyncIpResolver),
             fakeip: None,
         };
-        let udp =
-            yuhaiin_core::dns_udp_async::AsyncUdpDnsServer::bind(address, handler.clone(), 4096)
-                .await
-                .unwrap();
+        let udp = yuhaiin_core::dns::AsyncUdpDnsServer::bind(address, handler.clone(), 4096)
+            .await
+            .unwrap();
         let tcp = AsyncTcpDnsServer::bind(address, handler, 65535, Duration::from_secs(5))
             .await
             .unwrap();

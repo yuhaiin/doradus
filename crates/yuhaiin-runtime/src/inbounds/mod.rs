@@ -1602,7 +1602,7 @@ mod tests {
     use crate::{RuntimeBuilder, RuntimeController};
     use serde_json::json;
     use yuhaiin_chain::AsyncYuubinsyaTcpSession;
-    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
     use yuhaiin_core::process::ProcessInfo;
     use yuhaiin_core::{Endpoint, Network};
     use yuhaiin_protocol::trojan::{self, Command};

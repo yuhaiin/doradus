@@ -19,9 +19,7 @@ use crate::dns::{
     validate_response_packet,
 };
 use crate::dns_datagram::{AsyncDnsDatagram, DnsDatagramConnector, resolve_server_with_resolver};
-use crate::dns_resolver_async::{
-    AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, SendAsyncDnsQuery,
-};
+use crate::dns_resolver::{AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, SendAsyncDnsQuery};
 use crate::transport::bind_udp_socket;
 use crate::{BoxFuture, DomainName, Error, ErrorKind, LocalBoxFuture, Result};
 use rustls::{ClientConfig, RootCertStore};

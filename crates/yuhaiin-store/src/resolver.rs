@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use yuhaiin_core::dns::{DnsRecordType, DnsResponse, DnsServiceParam};
-use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+use yuhaiin_core::dns_resolver::AsyncIpResolver;
 use yuhaiin_core::{BoxFuture, DomainName, IpSet, ResolveStrategy, Result};
 pub use yuhaiin_dns::FakeIpPolicy;
 

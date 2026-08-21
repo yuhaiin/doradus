@@ -425,7 +425,7 @@ mod tests {
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
     use yuhaiin_store::{ConfigStore, GoNodeRecord};
 
     #[cfg(feature = "doh-tls")]

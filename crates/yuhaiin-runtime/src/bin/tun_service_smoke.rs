@@ -23,7 +23,7 @@ use yuhaiin_chain::{YuubinsyaH2Server, YuubinsyaServerProxy};
 use yuhaiin_core::dns::{
     DnsRecordType, DnsResponse, decode_response, encode_query, encode_response,
 };
-use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, DirectAsyncProxy};
 use yuhaiin_core::{
     BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, IpSet, Network, Result,

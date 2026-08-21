@@ -33,7 +33,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use yuhaiin_core::dns_hosts::HostsTable;
-use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+use yuhaiin_core::dns_resolver::AsyncIpResolver;
 use yuhaiin_core::dns_resolver_stack::AsyncHostsResolver;
 use yuhaiin_core::nat::NatTable;
 use yuhaiin_core::{
@@ -833,7 +833,7 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
-    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
     use yuhaiin_core::{BoxFuture, DomainName, IpSet, ResolveStrategy};
     use yuhaiin_store::{GoRouteListRecord, GoUdpProxyFqdnStrategy};
     use yuhaiin_trie::router::Router;

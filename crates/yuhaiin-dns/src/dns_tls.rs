@@ -19,9 +19,7 @@ use crate::dns::{
     DnsRecordType, DnsResponse, decode_response, encode_query, validate_query_packet,
     validate_response_packet,
 };
-use crate::dns_resolver_async::{
-    AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, SendAsyncDnsQuery,
-};
+use crate::dns_resolver::{AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, SendAsyncDnsQuery};
 use crate::http2::{H2DohClient, H2DohConnector};
 use crate::transport::connect_tcp;
 use crate::{BoxFuture, DomainName, Error, ErrorKind, LocalBoxFuture, Result};
@@ -470,7 +468,7 @@ async fn direct_stream(
     bind_interface: Option<&str>,
     timeout: Duration,
 ) -> Result<DnsIoStream> {
-    let addresses = crate::dns_resolver_async::resolve_internet_addresses(host, port).await?;
+    let addresses = crate::dns_resolver::resolve_internet_addresses(host, port).await?;
     let mut last_error = None;
     for address in addresses {
         let local_bind = local_bind_addresses

@@ -8,7 +8,7 @@ use base64::{
 };
 use serde::Deserialize;
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
-use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+use yuhaiin_core::dns_resolver::AsyncIpResolver;
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, Network, ResolveStrategy, Result};
 
 /// Go-compatible WireGuard node configuration.

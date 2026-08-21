@@ -16,20 +16,11 @@ pub mod dns_hosts {
 pub mod dns_resolver {
     pub use yuhaiin_dns::dns_resolver::*;
 }
-pub mod dns_resolver_async {
-    pub use yuhaiin_dns::dns_resolver_async::*;
-}
 pub mod dns_resolver_stack {
     pub use yuhaiin_dns::dns_resolver_stack::*;
 }
 pub mod dns_tcp {
     pub use yuhaiin_dns::dns_tcp::*;
-}
-pub mod dns_tcp_async {
-    pub use yuhaiin_dns::dns_tcp_async::*;
-}
-pub mod dns_udp_async {
-    pub use yuhaiin_dns::dns_udp_async::*;
 }
 pub mod flow;
 pub mod geo;

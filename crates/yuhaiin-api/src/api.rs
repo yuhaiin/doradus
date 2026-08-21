@@ -4661,7 +4661,7 @@ mod tests {
     use tokio::net::UdpSocket;
     use tower::ServiceExt;
     use yuhaiin_core::dns::{DnsResponse, encode_response};
-    use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+    use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
     use yuhaiin_runtime::{RuntimeBuilder, RuntimeController};
     use yuhaiin_store::ConfigStore;
 

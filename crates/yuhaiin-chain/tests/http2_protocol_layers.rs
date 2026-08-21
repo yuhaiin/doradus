@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 use yuhaiin_chain::ChainProxy;
-use yuhaiin_core::dns_resolver_async::SystemAsyncIpResolver;
+use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
 use yuhaiin_core::proxy::AsyncProxy;
 use yuhaiin_core::{DomainName, Endpoint, FlowContext, Network};
 use yuhaiin_protocol::{trojan, vless, vmess};

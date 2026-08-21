@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
-use yuhaiin_core::dns_resolver_async::AsyncIpResolver;
+use yuhaiin_core::dns_resolver::AsyncIpResolver;
 use yuhaiin_core::proxy::{
     AsyncDatagram, AsyncProxy, BoxAsyncStream, DEFAULT_INTERFACE, bind_socket_to_interface,
 };
