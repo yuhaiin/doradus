@@ -479,6 +479,7 @@ fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
             .run_dispatcher_until(
                 &mut dispatcher,
                 &mut proxy_runtime,
+                None,
                 async move {
                     let result = done_rx.await.unwrap_or_else(|_| Err("shutdown".into()));
                     let _ = result_tx.send(result);
@@ -578,7 +579,7 @@ fn run_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
         let mut dispatcher = TunDispatcher::new(16 * 1024, 16 * 1024, 16)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         runtime
-            .run_dispatcher_until(&mut dispatcher, &mut proxy_runtime, async move {
+            .run_dispatcher_until(&mut dispatcher, &mut proxy_runtime, None, async move {
                 let result = done_rx.await.unwrap_or_else(|_| Err("shutdown".into()));
                 let _ = result_tx.send(result);
             })
@@ -664,7 +665,7 @@ fn run_udp_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
         let mut dispatcher = TunDispatcher::new(2048, 2048, 16)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         runtime
-            .run_dispatcher_until(&mut dispatcher, &mut proxy_runtime, async move {
+            .run_dispatcher_until(&mut dispatcher, &mut proxy_runtime, None, async move {
                 let result = done_rx.await.unwrap_or_else(|_| Err("shutdown".into()));
                 let _ = result_tx.send(result);
             })
@@ -784,7 +785,7 @@ fn run_dns_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
         let mut dispatcher = TunDispatcher::new(2048, 2048, 16)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         runtime
-            .run_dispatcher_until(&mut dispatcher, &mut proxy_runtime, async move {
+            .run_dispatcher_until(&mut dispatcher, &mut proxy_runtime, None, async move {
                 let result = done_rx.await.unwrap_or_else(|_| Err("shutdown".into()));
                 let _ = result_tx.send(result);
             })

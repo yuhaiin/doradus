@@ -34,7 +34,7 @@ podman run --rm \
   -ec '
     set -eu
     /usr/local/bin/yuhaiin-doh-test \
-      rustcrypto_encrypted_resolvers_honor_local_bind_address \
+      rustls_encrypted_resolvers_honor_local_bind_address \
       --exact --nocapture
   ' \
   | tee "${scenario_dir}/podman.log"

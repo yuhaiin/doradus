@@ -18,7 +18,7 @@ pub(super) async fn build_controller(store: ConfigStore) -> Result<RuntimeContro
         let config = yuhaiin_dns::webpki_client_config()
             .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
         builder = builder.with_resolver_factory(Arc::new(
-            yuhaiin_runtime::RustCryptoResolverFactory::from_client_config_with_webpki_roots(
+            yuhaiin_runtime::RuntimeResolverRegistry::from_client_config_with_webpki_roots(
                 config,
                 Duration::from_secs(15),
                 256,

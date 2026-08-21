@@ -15,17 +15,17 @@ use yuhaiin_core::proxy::{
 };
 use yuhaiin_core::{Error, ErrorKind, Result};
 
-pub type RustCryptoTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
+pub type RustlsTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 
 #[derive(Clone)]
-pub struct RustCryptoTlsDialer {
+pub struct RustlsTlsDialer {
     tls: TlsConnector,
     timeout: Duration,
     local_bind_addresses: Arc<[IpAddr]>,
     bind_interface: Option<String>,
 }
 
-impl RustCryptoTlsDialer {
+impl RustlsTlsDialer {
     pub fn from_root_store(root_store: RootCertStore, timeout: Duration) -> Result<Self> {
         Ok(Self::from_config(client_config(root_store)?, timeout))
     }
@@ -93,7 +93,7 @@ impl RustCryptoTlsDialer {
         host: &str,
         port: u16,
         server_name: &str,
-    ) -> Result<RustCryptoTlsStream> {
+    ) -> Result<RustlsTlsStream> {
         let stream = self.connect_tcp(host, port).await?;
         self.connect_stream(server_name, stream).await
     }
@@ -137,7 +137,7 @@ pub(crate) async fn wrap_system_tls_stream(
 ) -> Result<BoxAsyncStream> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let dialer = RustCryptoTlsDialer::from_root_store(roots, Duration::from_secs(10))?;
+    let dialer = RustlsTlsDialer::from_root_store(roots, Duration::from_secs(10))?;
     let local_addr = stream_local_addr(&*stream);
     let stream = dialer.connect_boxed_stream(server_name, stream).await?;
     Ok(with_stream_local_addr(Box::new(stream), local_addr))

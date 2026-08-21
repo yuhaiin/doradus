@@ -257,7 +257,7 @@ flowchart LR
     CTRL[RuntimeController] --> HANDLE
     CTRL --> OWNER[InboundOwners / DNS owners / TUN owner]
     EVENT[API mutation] --> CTRL
-    CTRL --> RELOAD[InboundReload::{All,One,Dns}]
+    CTRL --> RELOAD["InboundReload::{All,One,Dns}"]
 ```
 
 ### 6.2 入口函数的意义
@@ -431,7 +431,7 @@ sequenceDiagram
     RS->>DP: load/open TUN config
     DP->>RS: controller.build_tun_proxy_runtime_with_dns_and_udp()
     DP->>TD: TunDispatcher::new()
-    DP->>TR: run_dispatcher_until_with_input_interceptor()
+    DP->>TR: run_dispatcher_until(..., interceptor?, shutdown)
     TR->>TD: recv_from_tun / parse packet
     TD->>PI: optional DNS/interception/process enrichment
     TD->>PR: ProxyInput::TcpOpened/UdpDatagram/...
@@ -1264,7 +1264,7 @@ sequenceDiagram
 | --- | --- | --- | --- |
 | [`config.rs`](../crates/yuhaiin-tun/src/config.rs) | `TunConfig`、`TunRouteLease` | `validate`、`TunRouteLease::apply/close` | 配置合法性和系统 route 生命周期 |
 | [`platform.rs`](../crates/yuhaiin-tun/src/platform.rs) | `AsyncDevice` glue | `async_device_from_owned_fd`、`enable_loopback` | OS fd/loopback 能力，不解析 IP packet |
-| [`runtime.rs`](../crates/yuhaiin-tun/src/runtime.rs) | `TunRuntime` | `open`、`from_owned_fd`、`recv_from_tun`、`send_to_tun`、`run_dispatcher_until_with_input_interceptor` | 连接 OS TUN 和 smoltcp/dispatcher/proxy runtime |
+| [`runtime.rs`](../crates/yuhaiin-tun/src/runtime.rs) | `TunRuntime` | `open`、`from_owned_fd`、`recv_from_tun`、`send_to_tun`、`run_dispatcher_until` | 连接 OS TUN 和 smoltcp/dispatcher/proxy runtime |
 | [`packet.rs`](../crates/yuhaiin-tun/src/packet.rs) | packet queue/fragment | `inspect_ip_packet`、`fragment_ip_packet`、`Ipv6FragmentReassembler::push`、`SmoltcpTunDevice` | 解析 tuple、分片/重组、收发队列 |
 | [`dispatcher.rs`](../crates/yuhaiin-tun/src/dispatcher.rs) | `TunDispatcher` | `poll`、`poll_with`、`prepare_rx`、`next_proxy_input` | smoltcp socket event → `ProxyInput` |
 | `dispatcher_input.rs` | socket input | TCP/UDP/ICMP 输入准备 | 把 socket 状态变化转成 dispatcher event |
@@ -1275,7 +1275,8 @@ sequenceDiagram
 
 #### 20.8.1 TUN loop 的每一轮
 
-`TunRuntime::run_dispatcher_until_with_input_interceptor` 的核心迭代可以按下面理解：
+`TunRuntime::run_dispatcher_until` 的核心迭代可以按下面理解；普通调用传入
+`None`，需要 runtime-owned policy 时传入 `Some(&mut interceptor)`：
 
 ```text
 recv_from_tun / smoltcp poll
@@ -1308,7 +1309,7 @@ runtime 不只有 `lib.rs/controller.rs`。下面是组件边界：
 | `settings.rs` | `RuntimeSettings::load/from_value/from_go_settings_kv/to_json`、`Ipv6PolicyResolver` | Go settings KV/native JSON 双向转换；IPv6 策略包裹 upstream resolver |
 | `route.rs` | `RouteListSnapshot::matching_names`、`load_route_lists`、`compile_go_route_rules*`、`refresh_route_list_caches*` | list 内容与 rule compiler 分开；远端 list refresh 通过 transport/proxy，不直接改 live router |
 | `resolver.rs` | `ResolverProxyBridge::connect/open_datagram`、`TimeoutResolver`、`BuiltinResolverFactory`、`RoutedDnsClient` | resolver endpoint 的 direct/proxy 传输，超时、cache、raw query |
-| `rustcrypto_resolver.rs` | `RustCryptoResolverFactory`、`RuntimeDnsDatagram` | rustls/rustcrypto resolver transport adapter |
+| `resolver_registry.rs` | `RuntimeResolverRegistry`、`RuntimeDnsDatagram` | rustls resolver registry and transport adapter |
 | `proxy.rs` | `ProxyBuild::build_proxy`、`build_proxy_selector*`、`RuntimeProxySelector` | node config → protocol/chain/base proxy；再加 resolver、socket policy、connect budget、loopback tracking 和可替换 selector slot |
 | `inbounds/mod.rs` | `run_until*`、`start_inbounds`、`ProtocolHandler`、`serve_listener`、`serve_connection` | listener owner、protocol dispatch、TLS/mixed/reverse 分支 |
 | `inbounds/handler.rs` | `InboundHandler`、`InboundUdpManager`、`UdpFlowWorker` | 统一 flow context、DNS interception、stream relay、UDP actor |

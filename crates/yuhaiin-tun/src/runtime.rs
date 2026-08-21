@@ -437,22 +437,6 @@ impl TunRuntime {
             .poll(timestamp, &mut self.smoltcp_device, sockets)
     }
 
-    /// Run the event-driven TUN data-plane loop.
-    ///
-    /// Kernel packets and proxy task completions wake the loop immediately.
-    /// smoltcp contributes only its own next protocol deadline, such as a TCP
-    /// retransmission or delayed ACK timer.  The proxy runtime remains
-    /// injectable; this method only owns lifecycle ordering and never selects
-    /// a route by itself.
-    pub async fn run_dispatcher(
-        &mut self,
-        dispatcher: &mut TunDispatcher,
-        proxy_runtime: &mut TunProxyRuntime,
-    ) -> io::Result<()> {
-        self.run_dispatcher_until(dispatcher, proxy_runtime, std::future::pending::<()>())
-            .await
-    }
-
     async fn wait_smoltcp_timer(delay: Option<smoltcp::time::Duration>) {
         match delay {
             Some(delay) => {
@@ -469,49 +453,22 @@ impl TunRuntime {
     /// The shutdown branch is part of the runtime contract rather than an
     /// outer task convention: it closes all proxy flow tasks before returning
     /// so graceful stop and force-cancel have the same ownership boundary.
+    /// An input interceptor is optional because most callers only need the
+    /// normal forward path; runtime-owned policy such as inbound DNS handling
+    /// can provide one without requiring a second dispatcher entry point.
     pub async fn run_dispatcher_until<F>(
         &mut self,
         dispatcher: &mut TunDispatcher,
         proxy_runtime: &mut TunProxyRuntime,
+        input_interceptor: Option<&mut dyn ProxyInputInterceptor>,
         shutdown: F,
     ) -> io::Result<()>
     where
         F: std::future::Future<Output = ()>,
     {
-        let mut interceptor = PassthroughInputInterceptor;
-        self.run_dispatcher_until_inner(dispatcher, proxy_runtime, &mut interceptor, shutdown)
-            .await
-    }
-
-    /// Run the TUN data plane with a runtime-owned input policy boundary.
-    /// Protocol policy can consume an event or enqueue a reply without
-    /// teaching the TUN crate about DNS or any other inbound feature.
-    pub async fn run_dispatcher_until_with_input_interceptor<F, I>(
-        &mut self,
-        dispatcher: &mut TunDispatcher,
-        proxy_runtime: &mut TunProxyRuntime,
-        interceptor: &mut I,
-        shutdown: F,
-    ) -> io::Result<()>
-    where
-        F: std::future::Future<Output = ()>,
-        I: ProxyInputInterceptor,
-    {
-        self.run_dispatcher_until_inner(dispatcher, proxy_runtime, interceptor, shutdown)
-            .await
-    }
-
-    async fn run_dispatcher_until_inner<F, I>(
-        &mut self,
-        dispatcher: &mut TunDispatcher,
-        proxy_runtime: &mut TunProxyRuntime,
-        interceptor: &mut I,
-        shutdown: F,
-    ) -> io::Result<()>
-    where
-        F: std::future::Future<Output = ()>,
-        I: ProxyInputInterceptor,
-    {
+        let mut passthrough = PassthroughInputInterceptor;
+        let interceptor: &mut dyn ProxyInputInterceptor =
+            input_interceptor.unwrap_or(&mut passthrough);
         let started = std::time::Instant::now();
         tokio::pin!(shutdown);
         let mut tun_writer = self.start_tun_writer();
@@ -613,17 +570,14 @@ impl TunRuntime {
         }
     }
 
-    async fn drive_data_plane_once<I>(
+    async fn drive_data_plane_once(
         &mut self,
         dispatcher: &mut TunDispatcher,
         proxy_runtime: &mut TunProxyRuntime,
         started: std::time::Instant,
-        interceptor: &mut I,
+        interceptor: &mut dyn ProxyInputInterceptor,
         tun_writer: &mpsc::Sender<TunWrite>,
-    ) -> io::Result<bool>
-    where
-        I: ProxyInputInterceptor,
-    {
+    ) -> io::Result<bool> {
         self.expire_ipv6_fragments();
 
         // TUN / smoltcp -> proxy
@@ -656,15 +610,12 @@ impl TunRuntime {
         Ok(writer_backpressured)
     }
 
-    fn dispatch_proxy_inputs<I>(
+    fn dispatch_proxy_inputs(
         &mut self,
         dispatcher: &mut TunDispatcher,
         proxy_runtime: &mut TunProxyRuntime,
-        interceptor: &mut I,
-    ) -> io::Result<()>
-    where
-        I: ProxyInputInterceptor,
-    {
+        interceptor: &mut dyn ProxyInputInterceptor,
+    ) -> io::Result<()> {
         while let Some(event) = dispatcher.next_proxy_input() {
             let action = interceptor
                 .intercept(event)

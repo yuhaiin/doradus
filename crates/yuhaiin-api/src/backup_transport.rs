@@ -220,7 +220,7 @@ async fn tls_stream(host: &str, stream: BoxAsyncStream) -> Result<BoxAsyncStream
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let dialer =
-            yuhaiin_runtime::RustCryptoTlsDialer::from_root_store(roots, Duration::from_secs(10))
+            yuhaiin_runtime::RustlsTlsDialer::from_root_store(roots, Duration::from_secs(10))
                 .map_err(|error| Error::Transport(format!("build S3 TLS config: {error}")))?;
         let stream = dialer
             .connect_boxed_stream(host, stream)

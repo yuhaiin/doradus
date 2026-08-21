@@ -17,8 +17,8 @@ use yuhaiin_core::dns::{DnsResponse, encode_response};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream};
 use yuhaiin_core::{BoxFuture, DomainName, Error, ErrorKind, FlowContext, IpSet, ResolveStrategy};
 use yuhaiin_runtime::{
-    ResolverProxyBridge, ResolverTransportFactory, RustCryptoDohResolverFactory,
-    RustCryptoDotResolverFactory, RustCryptoResolverFactory,
+    ResolverProxyBridge, ResolverTransportFactory, RuntimeResolverRegistry,
+    RustlsDohResolverFactory, RustlsDotResolverFactory,
 };
 use yuhaiin_store::{GoResolverRuntimeConfig, GoResolverTransport};
 
@@ -262,7 +262,7 @@ impl AsyncProxySelector for FixedTargetSelector {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rustcrypto_doh_factory_resolves_over_real_tls_and_http2() {
+async fn rustls_doh_factory_resolves_over_real_tls_and_http2() {
     let (address, done) = spawn_doh_server(
         true,
         http::StatusCode::OK,
@@ -270,7 +270,7 @@ async fn rustcrypto_doh_factory_resolves_over_real_tls_and_http2() {
         Duration::ZERO,
     )
     .await;
-    let factory = RustCryptoDohResolverFactory::new(
+    let factory = RustlsDohResolverFactory::new(
         &[certificate_der(CA_CERTIFICATE_PEM)],
         Duration::from_secs(2),
         8,
@@ -292,7 +292,7 @@ async fn rustcrypto_doh_factory_resolves_over_real_tls_and_http2() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rustcrypto_doh_proxy_resolver_uses_the_runtime_selector_before_tls() {
+async fn rustls_doh_proxy_resolver_uses_the_runtime_selector_before_tls() {
     let (address, done) = spawn_doh_server(
         true,
         http::StatusCode::OK,
@@ -309,7 +309,7 @@ async fn rustcrypto_doh_proxy_resolver_uses_the_runtime_selector_before_tls() {
             calls: calls.clone(),
         }),
     }));
-    let factory = RustCryptoDohResolverFactory::new(
+    let factory = RustlsDohResolverFactory::new(
         &[certificate_der(CA_CERTIFICATE_PEM)],
         Duration::from_secs(2),
         8,
@@ -336,9 +336,9 @@ async fn rustcrypto_doh_proxy_resolver_uses_the_runtime_selector_before_tls() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rustcrypto_dot_factory_resolves_over_real_tls_and_tcp_framing() {
+async fn rustls_dot_factory_resolves_over_real_tls_and_tcp_framing() {
     let (address, done) = spawn_dot_server().await;
-    let factory = RustCryptoDotResolverFactory::new(
+    let factory = RustlsDotResolverFactory::new(
         &[certificate_der(CA_CERTIFICATE_PEM)],
         Duration::from_secs(2),
         8,
@@ -360,7 +360,7 @@ async fn rustcrypto_dot_factory_resolves_over_real_tls_and_tcp_framing() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rustcrypto_encrypted_resolvers_honor_local_bind_address() {
+async fn rustls_encrypted_resolvers_honor_local_bind_address() {
     let (doh_address, doh_done) = spawn_doh_server(
         true,
         http::StatusCode::OK,
@@ -369,7 +369,7 @@ async fn rustcrypto_encrypted_resolvers_honor_local_bind_address() {
     )
     .await;
     let (dot_address, dot_done) = spawn_dot_server().await;
-    let factory = RustCryptoResolverFactory::new(
+    let factory = RuntimeResolverRegistry::new(
         &[certificate_der(CA_CERTIFICATE_PEM)],
         Duration::from_secs(2),
         8,
@@ -418,7 +418,7 @@ async fn rustcrypto_encrypted_resolvers_honor_local_bind_address() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rustcrypto_registry_resolves_mixed_doh_and_dot_configs() {
+async fn rustls_registry_resolves_mixed_doh_and_dot_configs() {
     let (doh_address, doh_done) = spawn_doh_server(
         true,
         http::StatusCode::OK,
@@ -427,7 +427,7 @@ async fn rustcrypto_registry_resolves_mixed_doh_and_dot_configs() {
     )
     .await;
     let (dot_address, dot_done) = spawn_dot_server().await;
-    let factory = RustCryptoResolverFactory::new(
+    let factory = RuntimeResolverRegistry::new(
         &[certificate_der(CA_CERTIFICATE_PEM)],
         Duration::from_secs(2),
         8,
@@ -464,7 +464,7 @@ async fn rustcrypto_registry_resolves_mixed_doh_and_dot_configs() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rustcrypto_doh_rejects_bad_certificate_and_missing_h2() {
+async fn rustls_doh_rejects_bad_certificate_and_missing_h2() {
     let (address, _) = spawn_doh_server(
         true,
         http::StatusCode::OK,
@@ -472,7 +472,7 @@ async fn rustcrypto_doh_rejects_bad_certificate_and_missing_h2() {
         Duration::ZERO,
     )
     .await;
-    let factory = RustCryptoDohResolverFactory::new(&[], Duration::from_secs(2), 8).unwrap();
+    let factory = RustlsDohResolverFactory::new(&[], Duration::from_secs(2), 8).unwrap();
     let error = factory
         .build(&resolver_config(address))
         .unwrap()
@@ -491,7 +491,7 @@ async fn rustcrypto_doh_rejects_bad_certificate_and_missing_h2() {
         Duration::ZERO,
     )
     .await;
-    let factory = RustCryptoDohResolverFactory::new(
+    let factory = RustlsDohResolverFactory::new(
         &[certificate_der(CA_CERTIFICATE_PEM)],
         Duration::from_secs(2),
         8,
@@ -510,7 +510,7 @@ async fn rustcrypto_doh_rejects_bad_certificate_and_missing_h2() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rustcrypto_doh_rejects_non_dns_http_response() {
+async fn rustls_doh_rejects_non_dns_http_response() {
     let (address, _) = spawn_doh_server(
         true,
         http::StatusCode::BAD_GATEWAY,
@@ -518,7 +518,7 @@ async fn rustcrypto_doh_rejects_non_dns_http_response() {
         Duration::ZERO,
     )
     .await;
-    let factory = RustCryptoDohResolverFactory::new(
+    let factory = RustlsDohResolverFactory::new(
         &[certificate_der(CA_CERTIFICATE_PEM)],
         Duration::from_secs(2),
         8,
@@ -537,7 +537,7 @@ async fn rustcrypto_doh_rejects_non_dns_http_response() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rustcrypto_doh_cancels_a_slow_response_at_the_resolver_timeout() {
+async fn rustls_doh_cancels_a_slow_response_at_the_resolver_timeout() {
     let (address, _) = spawn_doh_server(
         true,
         http::StatusCode::OK,
@@ -545,7 +545,7 @@ async fn rustcrypto_doh_cancels_a_slow_response_at_the_resolver_timeout() {
         Duration::from_millis(100),
     )
     .await;
-    let factory = RustCryptoDohResolverFactory::new(
+    let factory = RustlsDohResolverFactory::new(
         &[certificate_der(CA_CERTIFICATE_PEM)],
         Duration::from_millis(20),
         8,
@@ -565,7 +565,7 @@ async fn rustcrypto_doh_cancels_a_slow_response_at_the_resolver_timeout() {
 
 #[test]
 fn doh_factory_keeps_system_resolver_for_non_doh_configs() {
-    let factory = RustCryptoDohResolverFactory::new(&[], Duration::from_secs(1), 4).unwrap();
+    let factory = RustlsDohResolverFactory::new(&[], Duration::from_secs(1), 4).unwrap();
     let config = GoResolverRuntimeConfig {
         id: "system".to_owned(),
         transport: GoResolverTransport::System,

@@ -18,7 +18,7 @@ use yuhaiin_store::{GoResolverRuntimeConfig, GoResolverTransport};
 
 use crate::{
     BuiltinResolverFactory, ResolverProxyBridge, ResolverTransportFactory,
-    RustCryptoDohResolverFactory, RustCryptoDotResolverFactory,
+    RustlsDohResolverFactory, RustlsDotResolverFactory,
 };
 
 struct ResolverBridgeDatagramConnector {
@@ -100,21 +100,21 @@ impl AsyncDnsDatagram for RuntimeDnsDatagram {
 }
 
 #[derive(Clone)]
-pub struct RustCryptoResolverFactory {
+pub struct RuntimeResolverRegistry {
     pub builtin: BuiltinResolverFactory,
-    doh: RustCryptoDohResolverFactory,
-    dot: RustCryptoDotResolverFactory,
+    doh: RustlsDohResolverFactory,
+    dot: RustlsDotResolverFactory,
     doq: DoqResolverFactory,
 }
 
-impl RustCryptoResolverFactory {
+impl RuntimeResolverRegistry {
     pub fn new(
         root_certificates: &[Vec<u8>],
         timeout: Duration,
         cache_capacity: usize,
     ) -> Result<Self> {
-        let doh = RustCryptoDohResolverFactory::new(root_certificates, timeout, cache_capacity)?;
-        let dot = RustCryptoDotResolverFactory::new(root_certificates, timeout, cache_capacity)?;
+        let doh = RustlsDohResolverFactory::new(root_certificates, timeout, cache_capacity)?;
+        let dot = RustlsDotResolverFactory::new(root_certificates, timeout, cache_capacity)?;
         let doq = DoqResolverFactory::new(root_certificates, timeout, cache_capacity)?;
         Ok(Self {
             builtin: BuiltinResolverFactory::new(timeout, cache_capacity),
@@ -145,12 +145,12 @@ impl RustCryptoResolverFactory {
     ) -> Self {
         Self {
             builtin: BuiltinResolverFactory::new(timeout, cache_capacity),
-            doh: RustCryptoDohResolverFactory::from_client_config(
+            doh: RustlsDohResolverFactory::from_client_config(
                 client_config.clone(),
                 timeout,
                 cache_capacity,
             ),
-            dot: RustCryptoDotResolverFactory::from_client_config(
+            dot: RustlsDotResolverFactory::from_client_config(
                 client_config.clone(),
                 timeout,
                 cache_capacity,
@@ -167,12 +167,12 @@ impl RustCryptoResolverFactory {
         let doq = DoqResolverFactory::from_webpki_roots(timeout, cache_capacity)?;
         Ok(Self {
             builtin: BuiltinResolverFactory::new(timeout, cache_capacity),
-            doh: RustCryptoDohResolverFactory::from_client_config(
+            doh: RustlsDohResolverFactory::from_client_config(
                 client_config.clone(),
                 timeout,
                 cache_capacity,
             ),
-            dot: RustCryptoDotResolverFactory::from_client_config(
+            dot: RustlsDotResolverFactory::from_client_config(
                 client_config,
                 timeout,
                 cache_capacity,
@@ -192,7 +192,7 @@ impl RustCryptoResolverFactory {
     }
 }
 
-impl ResolverTransportFactory for RustCryptoResolverFactory {
+impl ResolverTransportFactory for RuntimeResolverRegistry {
     fn build(&self, config: &GoResolverRuntimeConfig) -> Result<Arc<dyn AsyncIpResolver>> {
         self.build_with_policy(config, &[])
     }
@@ -238,7 +238,7 @@ impl ResolverTransportFactory for RustCryptoResolverFactory {
             GoResolverTransport::Doh3 => Err(Error::new(
                 ErrorKind::Unsupported,
                 format!(
-                    "resolver {} transport {:?} is not implemented by the RustCrypto registry",
+                    "resolver {} transport {:?} is not implemented by the runtime resolver registry",
                     config.id, config.transport
                 ),
             )),

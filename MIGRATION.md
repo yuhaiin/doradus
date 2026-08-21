@@ -367,7 +367,7 @@
 
 > 2026-08-09 Rust pprof 与 MaxMind fixture：runtime 使用纯 Rust `pprof-rs` 提供 `/debug/pprof/` index 和 `/debug/pprof/profile?seconds=N` protobuf profile endpoint；沿用 Go settings 的 `pprof` 开关，关闭时返回 404，并有 API 回归覆盖 index、profile 和 reload。profile 格式遵循 Rust crate，不承诺 Go wire compatibility。MaxMind 使用用户指定的 `Country-without-asn.mmdb` 下载地址；真实库文件只保存在 `~/.cache/yuhaiin-rust-maxmind`，未进入仓库，8.2 MiB fixture 的 SHA-256 为 `1d900f73aa4644d255793548319410ff559ef9294a662ec1a0354f106c794155`，真实 IPv4、IPv4-mapped IPv6 查询和已有 atomic refresh/concurrency 测试均通过。
 
-> 已实现的代码包括：SQLite 配置事务与 schema v3 typed repository、Go v6 fixture/import/字段差异报告、FakeIP IPv4/IPv6 分配/持久化/旧 snapshot 幂等导入与 A/AAAA/PTR/HTTPS/SVCB hint answer transform、域名/CIDR/Geo country Router snapshot publish/rollback、独立 `yuhaiin-geo` 的 MaxMindDB reader/校验下载/atomic refresh、带 TTL/容量淘汰的 DNS cache、同步/异步 UDP DNS client/server/policy/cancellation boundary、DoH transport boundary、基于 Hyper 的 HTTP/1.1 + HTTP/2 DoH framing、可直接接入异步 DNS/TUN packet pipeline 的 `DnsOverHttpHandler`、可复用的 RustCrypto TCP→TLS→ALPN h2/http1.1 DoH connector 和 DoT TCP framing resolver、同时组装 System/UDP/TCP/DoH/DoT 的 `RustCryptoResolverFactory`、hosts→upstream→FakeIP 的可注入异步 resolver stack、`yuhaiin-runtime` 的 Go compatibility snapshot 组装与 direct/HTTP/SOCKS5/Shadowsocks/Trojan/VLESS/chain proxy 构造、direct/fixed/drop/HTTP CONNECT/SOCKS5、独立 `yuhaiin-protocol` 的 Shadowsocks/Trojan/VLESS TCP/UDP codec、inbound/outbound wrapper、TLS 和 WebSocket transport 组合、feature-gated `rustls-rustcrypto` TLS client、共享 WebSocket byte-stream transport（standalone、VLESS 和 WebSocket+HTTP/2 inbound/outbound）、Yuubinsya native UDP client/server socket、UOT/TCP/coalesce/Ping client/server session、full-cone NAT UDP relay、唯一的 `tun-rs AsyncDevice + smoltcp` TUN adapter，以及独立的 `yuhaiin-chain`（fixedv2 → 可选 TLS/WebSocket → HTTP/2 pool/CONNECT → Yuubinsya TCP/UOT/Ping）。TLS provider 仍是 alpha，DoQ/DoH3、WebSocket early-data/子协议和特权 Linux namespace/Android/macOS 验收仍是独立门槛，未用 C TLS 代替。
+> 已实现的代码包括：SQLite 配置事务与 schema v3 typed repository、Go v6 fixture/import/字段差异报告、FakeIP IPv4/IPv6 分配/持久化/旧 snapshot 幂等导入与 A/AAAA/PTR/HTTPS/SVCB hint answer transform、域名/CIDR/Geo country Router snapshot publish/rollback、独立 `yuhaiin-geo` 的 MaxMindDB reader/校验下载/atomic refresh、带 TTL/容量淘汰的 DNS cache、同步/异步 UDP DNS client/server/policy/cancellation boundary、DoH transport boundary、基于 Hyper 的 HTTP/1.1 + HTTP/2 DoH framing、可直接接入异步 DNS/TUN packet pipeline 的 `DnsOverHttpHandler`、可复用的 Rustls TCP→TLS→ALPN h2/http1.1 DoH connector 和 DoT TCP framing resolver、同时组装 System/UDP/TCP/DoH/DoT 的 `RuntimeResolverRegistry`、hosts→upstream→FakeIP 的可注入异步 resolver stack、`yuhaiin-runtime` 的 Go compatibility snapshot 组装与 direct/HTTP/SOCKS5/Shadowsocks/Trojan/VLESS/chain proxy 构造、direct/fixed/drop/HTTP CONNECT/SOCKS5、独立 `yuhaiin-protocol` 的 Shadowsocks/Trojan/VLESS TCP/UDP codec、inbound/outbound wrapper、TLS 和 WebSocket transport 组合、feature-gated `rustls-rustcrypto` TLS client、共享 WebSocket byte-stream transport（standalone、VLESS 和 WebSocket+HTTP/2 inbound/outbound）、Yuubinsya native UDP client/server socket、UOT/TCP/coalesce/Ping client/server session、full-cone NAT UDP relay、唯一的 `tun-rs AsyncDevice + smoltcp` TUN adapter，以及独立的 `yuhaiin-chain`（fixedv2 → 可选 TLS/WebSocket → HTTP/2 pool/CONNECT → Yuubinsya TCP/UOT/Ping）。TLS provider 仍是 alpha，DoQ/DoH3、WebSocket early-data/子协议和特权 Linux namespace/Android/macOS 验收仍是独立门槛，未用 C TLS 代替。
 >
 > 本轮新增 Go 自定义 AEAD transport：它与 Shadowsocks AEAD 不同，使用 P-256/Ed25519 handshake、ChaCha20/XChaCha20 方向 stream，以及 Go 兼容的 `nonce || ciphertext` UDP packet。协议 codec、TCP/UDP outbound wrapper、SOCKS5 AEAD inbound 和 AEAD 外层 Yuubinsya UDP 已接入；Rust 本地回归与 Go↔Rust TCP/UDP 双向实例互操作通过，更完整组合仍列为 P1 验收项。
 
@@ -547,10 +547,10 @@ System/UDP/TCP 的按 ID 构造，route rule 的常见 domain/CIDR matcher、act
 和 resolver policy 会编译为 `RouterRuntime`；route settings 可按 direct/proxy mode 选择
 resolver，已构造 resolver 在查询失败或空结果时可回退到 shared resolver，构建失败可选择
 fail-build 或 keep-unavailable，并已有同一 store 重建新 snapshot 的 reload 回归；无法表达的旧
-matcher fail-closed。DoH 已提供 `RustCryptoDohResolverFactory` 的直连 TCP/TLS/ALPN h2
+matcher fail-closed。DoH 已提供 `RustlsDohResolverFactory` 的直连 TCP/TLS/ALPN h2
 实现，并以 resolver timeout 取消完整响应 future；需要代理链或自定义 bootstrap 时仍使用
-注入式 connector。启用 runtime `doh-tls` feature 后，`RustCryptoDohResolverFactory` 和
-`RustCryptoDotResolverFactory` 提供直连 TCP/TLS 数据面；DoQ/DoH3 不允许无提示地回退 system
+注入式 connector。启用 runtime `doh-tls` feature 后，`RustlsDohResolverFactory` 和
+`RustlsDotResolverFactory` 提供直连 TCP/TLS 数据面；DoQ/DoH3 不允许无提示地回退 system
 DNS，避免 DoH bootstrap 反向进入自身 proxy chain。启用 runtime HTTP/DoH feature 后，
 `DnsOverHttpResolverFactory` 复用 core `DnsOverHttp`，由上层注入 TLS/proxy connector，
 并通过 Hyper 协商 HTTP/1.1 或 HTTP/2；
@@ -2186,8 +2186,8 @@ DoH/DoT fixture 见下节，本次没有把 UDP/TCP 的已有覆盖重复实现�
 
 在 UDP/TCP resolver smoke 之后，继续把加密 DNS transport 的 source-address policy 做成
 真实网络验收。`crates/yuhaiin-runtime/tests/doh_tls.rs` 的 server fixture 现在把接入方
-peer 传回测试，并新增 `rustcrypto_encrypted_resolvers_honor_local_bind_address`：同一个
-`RustCryptoResolverFactory` 分别构造 DoH/HTTP2 和 DoT/TLS resolver，调用统一的
+peer 传回测试，并新增 `rustls_encrypted_resolvers_honor_local_bind_address`：同一个
+`RuntimeResolverRegistry` 分别构造 DoH/HTTP2 和 DoT/TLS resolver，调用统一的
 `build_with_policy`，要求两端都从 `127.0.0.2` 连接并检查返回地址。
 
 `scripts/integration/doh-source-bind.sh` 与 `make doh-source-smoke` 在 host-network Debian
@@ -2197,7 +2197,7 @@ testing Podman 中执行该测试；构建和运行日志位于
 实际执行结果：
 
 ```text
-test rustcrypto_encrypted_resolvers_honor_local_bind_address ... ok
+test rustls_encrypted_resolvers_honor_local_bind_address ... ok
 [doh-source-bind] passed
 ```
 

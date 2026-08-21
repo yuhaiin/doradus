@@ -779,13 +779,13 @@ fn dns_tls_config(
 
 #[cfg(feature = "doh-tls")]
 #[derive(Clone)]
-pub struct RustCryptoDohResolverFactory {
+pub struct RustlsDohResolverFactory {
     pub builtin: BuiltinResolverFactory,
     inner: DohResolverFactory,
 }
 
 #[cfg(feature = "doh-tls")]
-impl RustCryptoDohResolverFactory {
+impl RustlsDohResolverFactory {
     pub fn new(
         root_certificates: &[Vec<u8>],
         timeout: Duration,
@@ -818,7 +818,7 @@ impl RustCryptoDohResolverFactory {
 }
 
 #[cfg(feature = "doh-tls")]
-impl ResolverTransportFactory for RustCryptoDohResolverFactory {
+impl ResolverTransportFactory for RustlsDohResolverFactory {
     fn build(&self, config: &GoResolverRuntimeConfig) -> Result<Arc<dyn AsyncIpResolver>> {
         self.build_with_policy(config, &[])
     }
@@ -856,13 +856,13 @@ impl ResolverTransportFactory for RustCryptoDohResolverFactory {
 
 #[cfg(feature = "doh-tls")]
 #[derive(Clone)]
-pub struct RustCryptoDotResolverFactory {
+pub struct RustlsDotResolverFactory {
     pub builtin: BuiltinResolverFactory,
     inner: DotResolverFactory,
 }
 
 #[cfg(feature = "doh-tls")]
-impl RustCryptoDotResolverFactory {
+impl RustlsDotResolverFactory {
     pub fn new(
         root_certificates: &[Vec<u8>],
         timeout: Duration,
@@ -895,7 +895,7 @@ impl RustCryptoDotResolverFactory {
 }
 
 #[cfg(feature = "doh-tls")]
-impl ResolverTransportFactory for RustCryptoDotResolverFactory {
+impl ResolverTransportFactory for RustlsDotResolverFactory {
     fn build(&self, config: &GoResolverRuntimeConfig) -> Result<Arc<dyn AsyncIpResolver>> {
         self.build_with_policy(config, &[])
     }

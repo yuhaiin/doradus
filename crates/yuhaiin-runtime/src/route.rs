@@ -443,7 +443,7 @@ pub async fn download_route_url_with_transport(
             {
                 let mut roots = rustls::RootCertStore::empty();
                 roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                let dialer = crate::RustCryptoTlsDialer::from_root_store(roots, timeout)?;
+                let dialer = crate::RustlsTlsDialer::from_root_store(roots, timeout)?;
                 Box::new(dialer.connect_boxed_stream(&host, stream).await?)
             }
             #[cfg(not(feature = "doh-tls"))]
@@ -462,7 +462,7 @@ pub async fn download_route_url_with_transport(
         {
             let mut roots = rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let dialer = crate::RustCryptoTlsDialer::from_root_store(roots, timeout)?;
+            let dialer = crate::RustlsTlsDialer::from_root_store(roots, timeout)?;
             Box::new(dialer.connect(&host, port, &host).await?)
         }
         #[cfg(not(feature = "doh-tls"))]

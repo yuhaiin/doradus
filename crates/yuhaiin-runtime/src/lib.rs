@@ -17,9 +17,9 @@ mod loopback;
 pub mod monitor;
 mod proxy;
 mod resolver;
-mod route;
 #[cfg(feature = "doh-tls")]
-mod rustcrypto_resolver;
+mod resolver_registry;
+mod route;
 mod settings;
 #[cfg(feature = "doh-tls")]
 mod tls;
@@ -65,13 +65,15 @@ pub use proxy::{ProxyBuild, RuntimeProxySelector};
 #[cfg(feature = "http2")]
 pub use resolver::DnsOverHttpResolverFactory;
 #[cfg(feature = "doh-tls")]
-pub use resolver::RustCryptoDohResolverFactory;
+pub use resolver::RustlsDohResolverFactory;
 #[cfg(feature = "doh-tls")]
-pub use resolver::RustCryptoDotResolverFactory;
+pub use resolver::RustlsDotResolverFactory;
 pub use resolver::{
     BuiltinResolverFactory, ResolverFailurePolicy, ResolverProxyBridge, ResolverTransportFactory,
     TimeoutResolver, parse_dns_server,
 };
+#[cfg(feature = "doh-tls")]
+pub use resolver_registry::RuntimeResolverRegistry;
 pub use route::{
     ProxyRouteListTransport, RouteListRefreshReport, RouteListSnapshot, RouteListTransport,
     compile_go_route_rules, compile_go_route_rules_with_geo, compile_go_route_rules_with_lists,
@@ -79,11 +81,9 @@ pub use route::{
     refresh_route_list_caches, refresh_route_list_caches_with_transport, route_list_cache_dir,
     route_list_cache_path, route_rule_from_go_record,
 };
-#[cfg(feature = "doh-tls")]
-pub use rustcrypto_resolver::RustCryptoResolverFactory;
 pub use settings::{Ipv6PolicyResolver, RuntimeSettings};
 #[cfg(feature = "doh-tls")]
-pub use tls::RustCryptoTlsDialer;
+pub use tls::RustlsTlsDialer;
 
 /// Runtime-only knobs that are not part of the persisted Go schema.
 #[derive(Debug, Clone)]

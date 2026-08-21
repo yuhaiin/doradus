@@ -600,10 +600,10 @@ pub async fn run_tun_device_until_ref(
     controller.monitor().info("TUN inbound ready");
     let mut dispatcher = yuhaiin_tun::TunDispatcher::new(64 * 1024, 64 * 1024, 2048)?
         .with_skip_multicast(config.tun.skip_multicast);
-    tun.run_dispatcher_until_with_input_interceptor(
+    tun.run_dispatcher_until(
         &mut dispatcher,
         &mut proxy_runtime,
-        &mut inbound_interceptor,
+        Some(&mut inbound_interceptor),
         async {
             let _ = wait_for_shutdown_or_matching_inbound_reload(
                 &controller,
