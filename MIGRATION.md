@@ -1116,7 +1116,7 @@ YUHAIIN_CHAIN_PROBE=1 \
 
 `crates/yuhaiin-chain/tests/interop/websocket_go_client.go` 使用 Go 仓库里的真实 `fixed -> websocket -> http2/v2 -> yuubinsya` client，由 ignored Rust 集成测试启动 Rust WebSocket+HTTP/2 server；测试已在 `GOEXPERIMENT=jsonv2,greenteagc` 下通过。2026-08-09 起，Rust WebSocket inbound 兼容 Go 的 `early_data: base64`：握手阶段按 RawStd base64 解码 `Sec-WebSocket-Key`，最多接收 2048 字节并注入后续协议读取流，同时返回 `early_data: true`；该行为已有 tungstenite 握手和分片读取单测。outbound lazy early-data 需要把握手延迟到首个 protocol write，暂留后续；subprotocol 也仍未纳入默认配置路径。
 
-这里的 `CONFIG.json` 只作为用户外部配置读取，密码和 CA 不复制进仓库。当前 `concurrency` 同时限制 bounded CONNECT pipe 容量；Rust 版已经有按 fixed endpoint 的 HTTP/2 pool、多 stream 复用、有 owner flush task 的有界 UOT coalesced writer、application-level drain、peer GOAWAY 观察和连接重建，且已有优雅 drain/session rollover 验收。由于 `h2 0.4` 的公开 client API 不提供主动发送 GOAWAY frame，Rust 版接受将 client-side GOAWAY 作为非阻塞延期，不调用私有 API 或引入 raw frame hack；当前关闭策略已满足使用需求，未来只有升级到公开支持该能力的 h2 API 才重新评估主动 GOAWAY。
+这里的 `CONFIG.json` 只作为用户外部配置读取，密码和 CA 不复制进仓库。当前 `concurrency` 同时限制 bounded CONNECT pipe 容量；Rust 版已经有按 fixed endpoint 的 Hyper HTTP/2 pool、多 stream 复用、有 owner flush task 的有界 UOT coalesced writer、application-level drain、peer GOAWAY 观察和连接重建，且已有优雅 drain/session rollover 验收。HTTP/2 CONNECT 的双向数据面使用 Hyper 的 `upgrade::on`，由 Hyper 负责 frame、flow-control、RST/GOAWAY 和升级流生命周期，应用层只负责本地 relay 和连接池策略。
 
 ## 7.7 第一版管理 HTTP 与服务进程
 
@@ -2902,23 +2902,18 @@ TCP flow，连续读取并断言 `connections_added` 和 `connections_removed` �
 到达客户端；traffic/telemetry 仍通过独立 API 和进程级统计 smoke 验证，生产长时锁竞争继续保留
 在 checklist 的 `[~]`。
 
-## 84. 2026-08-10 H2 producer-side bounded backpressure regression
+## 84. 2026-08-10 Hyper HTTP/2 CONNECT upgrade and bounded backpressure regression
 
-上一轮 H2 relay 使用 `h2::SendStream::send_data` 直接提交 frame。该 API 在 peer flow-control
-window 耗尽时会把未发送的 payload 保留在 h2 自身队列中；调用方 buffer 固定为 16 KiB，仍不能
-证明 producer-side 内存有界。更直接的问题是，若 relay 在 `tokio::select!` 的读本地方向分支中
-等待发送窗口，就会停止消费远端方向，TLS + HTTP/2 + Yuubinsya 的全双工长流可能互相等待。
-
-现在 `send_h2_data` 先调用 `reserve_capacity`/`poll_capacity`，只把已分配窗口内的最多 16 KiB
-提交给 h2；窗口等待被放进独立的 relay send task，主 relay 继续消费另一方向并释放接收窗口。
-服务端 `bridge_h2_stream` 使用同一模型，避免 inbound H2 bridge 复现同类死锁。发送 task 在
-relay 关闭、shutdown 或远端流结束时会被回收；待发送数据只存在本地固定 buffer、一个当前 frame
-和 h2 已明确分配的窗口中。
+上一轮 H2 relay 直接维护 `h2::SendStream`/`RecvStream`，同时承担 frame、flow-control、CONNECT
+升级和 relay task 生命周期，复杂度集中在协议层。现在客户端 `H2Connection` 和服务端
+`YuubinsyaH2Server` 都使用 Hyper 的 HTTP/2 connection API 与 `hyper::upgrade::on`：CONNECT
+成功后由 Hyper 把 HTTP/2 双向 DATA 映射成 `Upgraded`，应用层只在本地 duplex stream 和升级流
+之间做双向复制。这样 peer window 耗尽时，Hyper 自己暂停发送，relay 不再直接操作 H2 frame。
 
 新增/保留的证据包括：
 
-- `bounded_h2_sender_waits_for_peer_window_before_accepting_more_data`：对 128 KiB payload
-  验证 peer window 耗尽时发送 future 保持 pending，而不是继续接收无界数据；
+- `hyper_connect_upgrade_respects_peer_flow_control`：对 128 KiB payload 验证 Hyper CONNECT
+  upgrade 在 peer window 耗尽时保持发送 future pending，而不是继续接收无界数据；
 - `cargo test -p yuhaiin-chain --all-features --offline`：51 个 library tests、HTTP/2
   protocol tests 和 12 个 P0 TUN/chain tests 通过；chain clippy `-D warnings` 通过；
 - `make service-chain-smoke`：12 个真实进程 inbound/router/outbound 场景通过；

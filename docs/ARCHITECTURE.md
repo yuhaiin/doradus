@@ -1139,7 +1139,7 @@ negative constraints 的完整判断。`Router::apply_to_context` 写入 `route_
 | Trojan | [`trojan.rs`](../crates/yuhaiin-protocol/src/trojan.rs) | `password_hash`、`write_request`、`read_request`、`encode_udp_frame`、`TrojanProxy::new` | password hash + command + endpoint；UDP frame 独立于 TCP |
 | Shadowsocks | `shadowsocks.rs` | `Method::parse`、`encrypt_udp_packet`、`decrypt_udp_packet`、`ShadowsocksProxy::new` | cipher state、stream payload、UDP AEAD packet |
 | ShadowsocksR | `shadowsocksr.rs` | `CipherMethod::parse`、`ShadowsocksrConfig::new`、`ShadowsocksrProxy::new` | protocol/obfs/cipher 三段配置和 session state |
-| H2 | [`h2_tunnel.rs`](../crates/yuhaiin-protocol/src/h2_tunnel.rs) | `H2Pool::open`、`H2Connection::handshake_with_limits`、`open_connect_stream` | endpoint identity → reusable H2 connection → bounded concurrent streams |
+| H2 | [`h2_tunnel.rs`](../crates/yuhaiin-protocol/src/h2_tunnel.rs) | `H2Pool::open`、`H2Connection::handshake_with_limits`、`open_connect_stream` | Hyper HTTP/2 CONNECT upgrade；endpoint identity → reusable connection → bounded concurrent streams |
 | WebSocket/HTTP obfs | `websocket.rs`、`websocket_io.rs`、`http_obfs.rs` | `WebSocketProxy::new`、`WebSocketIo::new`、`HttpObfsProxy::new` | stream wrapping，不改变上层 `FlowContext` |
 | Yuubinsya | [`yuubinsya.rs`](../crates/yuhaiin-protocol/src/yuubinsya.rs)、`session.rs` | `encode_header`、`decode_header`、`YuubinsyaTcpSession::connect/accept`、`YuubinsyaServerProxy::serve_observed_with_dns` | custom auth/header、TCP stream、UOT、server UDP session、DNS observation |
 | direct UOT | `direct_uot.rs`、`direct_uot_session.rs` | `parse_go_direct_uot`、`DirectUotProxy` | direct UDP over a stream-like UOT session |

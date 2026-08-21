@@ -36,7 +36,7 @@ pub mod yuubinsya;
 pub mod yuubinsya_udp;
 
 pub use h2_server::YuubinsyaH2Server;
-pub use h2_tunnel::{H2Connection, H2Pool, H2PoolEndpoint, H2PoolStats, send_h2_data};
+pub use h2_tunnel::{H2Connection, H2Pool, H2PoolEndpoint, H2PoolStats};
 pub use session::{
     AsyncYuubinsyaPingServerSession, AsyncYuubinsyaPingSession, AsyncYuubinsyaTcpSession,
     AsyncYuubinsyaUotServerSession, AsyncYuubinsyaUotSession, YuubinsyaDnsHandler,

@@ -5,22 +5,27 @@
 //! responsible for authenticating and dispatching the protocol carried inside
 //! each CONNECT stream.
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
+use http_body_util::Empty;
+use hyper::body::Incoming;
+use hyper::server::conn::http2::Builder;
+use hyper::service::service_fn;
+use hyper::upgrade::on;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::ServerConfig;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream, split};
+use tokio::io::AsyncRead;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use yuhaiin_core::{Error, ErrorKind, Result};
 
-use crate::h2_tunnel::send_h2_data;
 use crate::session::YuubinsyaServerProxy;
-
-const H2_RELAY_CAPACITY: usize = 16 * 1024;
 
 /// A TLS-enabled HTTP/2 server that dispatches each CONNECT body to a shared
 /// Yuubinsya server proxy.
@@ -115,32 +120,21 @@ impl YuubinsyaH2Server {
     where
         S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let mut connection = h2::server::handshake(stream)
+        let streams = Arc::new(Mutex::new(JoinSet::new()));
+        let proxy = Arc::clone(&self.proxy);
+        let active_streams = Arc::clone(&streams);
+        let service = service_fn(move |request: Request<Incoming>| {
+            serve_connect(request, Arc::clone(&proxy), Arc::clone(&active_streams))
+        });
+        let result = Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(stream), service)
             .await
-            .map_err(|error| protocol_error(format!("HTTP/2 server handshake: {error}")))?;
-        let mut streams = JoinSet::new();
+            .map_err(|error| protocol_error(format!("HTTP/2 connection: {error}")));
 
-        loop {
-            tokio::select! {
-                result = connection.accept() => {
-                    let Some(result) = result else { break };
-                    let (request, respond) = result
-                        .map_err(|error| protocol_error(format!("HTTP/2 request: {error}")))?;
-                    let proxy = Arc::clone(&self.proxy);
-                    streams.spawn(async move { serve_connect(request, respond, proxy).await });
-                }
-                Some(result) = streams.join_next(), if !streams.is_empty() => {
-                    // A single CONNECT failing must not tear down unrelated
-                    // streams on the same H2 connection. The H2 connection
-                    // itself remains driven by the accept future above.
-                    let _ = result;
-                }
-            }
-        }
-
+        let mut streams = streams.lock().await;
         streams.abort_all();
         while streams.join_next().await.is_some() {}
-        Ok(())
+        result
     }
 
     /// Close retained server-side migrated UDP sessions without needing to
@@ -151,84 +145,34 @@ impl YuubinsyaH2Server {
 }
 
 async fn serve_connect(
-    request: Request<h2::RecvStream>,
-    mut respond: h2::server::SendResponse<Bytes>,
+    request: Request<Incoming>,
     proxy: Arc<YuubinsyaServerProxy>,
-) -> Result<()> {
+    streams: Arc<Mutex<JoinSet<()>>>,
+) -> std::result::Result<Response<H2Body>, Infallible> {
     if request.method() != http::Method::CONNECT {
-        let response = Response::builder()
+        return Ok(Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(())
-            .map_err(|error| protocol_error(format!("HTTP/2 error response: {error}")))?;
-        respond
-            .send_response(response, true)
-            .map_err(|error| protocol_error(format!("HTTP/2 error response send: {error}")))?;
-        return Ok(());
+            .body(empty_body())
+            .expect("static HTTP/2 method response cannot fail"));
     }
 
+    let upgrade = on(request);
     let response = Response::builder()
         .status(StatusCode::OK)
-        .body(())
-        .map_err(|error| protocol_error(format!("HTTP/2 CONNECT response: {error}")))?;
-    let send = respond
-        .send_response(response, false)
-        .map_err(|error| protocol_error(format!("HTTP/2 CONNECT response send: {error}")))?;
-    let (proxy_io, bridge_io) = tokio::io::duplex(H2_RELAY_CAPACITY);
-    let bridge = tokio::spawn(bridge_h2_stream(request.into_body(), send, bridge_io));
-
-    let result = proxy.serve(proxy_io).await;
-    let _ = bridge.await;
-    result
-}
-
-async fn bridge_h2_stream(
-    mut body: h2::RecvStream,
-    mut send: h2::SendStream<Bytes>,
-    relay_side: DuplexStream,
-) -> Result<()> {
-    let (mut reader, mut writer) = split(relay_side);
-    let mut request_done = false;
-
-    // The response sender may wait for the client's H2 flow-control window.
-    // It must not block this task from consuming request data, otherwise a
-    // full-duplex Yuubinsya stream can deadlock while both directions wait
-    // for capacity updates.
-    let mut send_task = tokio::spawn(async move {
-        let mut buffer = vec![0u8; H2_RELAY_CAPACITY];
-        loop {
-            let length = reader.read(&mut buffer).await.map_err(io_error)?;
-            if length == 0 {
-                send.send_data(Bytes::new(), true)
-                    .map_err(|error| protocol_error(format!("HTTP/2 response end: {error}")))?;
-                return Ok::<(), Error>(());
-            }
-            send_h2_data(&mut send, &buffer[..length]).await?;
+        .body(Empty::new())
+        .expect("static HTTP/2 CONNECT response cannot fail");
+    streams.lock().await.spawn(async move {
+        if let Ok(upgraded) = upgrade.await {
+            let _ = proxy.serve(TokioIo::new(upgraded)).await;
         }
     });
+    Ok(response)
+}
 
-    loop {
-        tokio::select! {
-            result = &mut send_task => {
-                return match result {
-                    Ok(result) => result,
-                    Err(error) => Err(protocol_error(format!("HTTP/2 response task: {error}"))),
-                };
-            }
-            result = body.data(), if !request_done => {
-                let Some(result) = result else {
-                    writer.shutdown().await.map_err(io_error)?;
-                    request_done = true;
-                    continue;
-                };
-                let data = result
-                    .map_err(|error| protocol_error(format!("HTTP/2 request body: {error}")))?;
-                body.flow_control()
-                    .release_capacity(data.len())
-                    .map_err(|error| protocol_error(format!("HTTP/2 request capacity: {error}")))?;
-                writer.write_all(&data).await.map_err(io_error)?;
-            }
-        }
-    }
+type H2Body = Empty<Bytes>;
+
+fn empty_body() -> H2Body {
+    Empty::new()
 }
 
 fn io_error(error: std::io::Error) -> Error {

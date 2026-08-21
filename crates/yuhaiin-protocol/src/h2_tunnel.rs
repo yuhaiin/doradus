@@ -1,15 +1,17 @@
-use bytes::Bytes;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use http::Request;
+use http_body_util::Empty;
+use hyper::client::conn::http2::SendRequest;
+use hyper::upgrade::Upgraded;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::collections::HashMap;
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
-use tokio::io::split;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
@@ -20,12 +22,13 @@ const DEFAULT_MAX_CONNECTIONS_PER_ENDPOINT: usize = 4;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(650);
+type H2Body = Empty<bytes::Bytes>;
 
 /// One HTTP/2 connection that can own multiple independent CONNECT streams.
 /// The sender mutex is held only while opening a stream; data transfer is
 /// handled by each stream's bounded relay and never serializes other flows.
 pub struct H2Connection {
-    sender: Mutex<h2::client::SendRequest<Bytes>>,
+    sender: Mutex<SendRequest<H2Body>>,
     connection_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     relay_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     drain_lock: Mutex<()>,
@@ -99,9 +102,12 @@ impl H2Connection {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let (sender, connection) = h2::client::handshake(tls_stream)
-            .await
-            .map_err(|error| protocol_error(format!("HTTP/2 handshake: {error}")))?;
+        let (sender, connection) = hyper::client::conn::http2::handshake::<_, _, H2Body>(
+            TokioExecutor::new(),
+            TokioIo::new(tls_stream),
+        )
+        .await
+        .map_err(|error| protocol_error(format!("HTTP/2 handshake: {error}")))?;
         let result = Arc::new(Self {
             sender: Mutex::new(sender),
             connection_task: Mutex::new(None),
@@ -184,37 +190,28 @@ impl H2Connection {
         let request = Request::builder()
             .method(http::Method::CONNECT)
             .uri("http://localhost")
-            .body(())
+            .body(Empty::new())
             .map_err(|error| {
                 self.release_stream();
                 Error::new(ErrorKind::InvalidInput, error.to_string())
             })?;
-        let (response, send_stream) = {
-            let sender = self.sender.lock().await;
-            let mut sender = match timeout(Duration::from_secs(15), sender.clone().ready()).await {
-                Ok(Ok(sender)) => sender,
-                Ok(Err(error)) => {
-                    self.release_stream();
-                    return Err(protocol_error(format!("HTTP/2 stream readiness: {error}")));
-                }
-                Err(_) => {
-                    self.release_stream();
-                    return Err(protocol_error("HTTP/2 stream readiness timed out"));
-                }
-            };
-            match sender.send_request(request, false) {
-                Ok(stream) => stream,
-                Err(error) => {
-                    self.release_stream();
-                    return Err(protocol_error(format!("HTTP/2 CONNECT request: {error}")));
-                }
+        let mut sender = self.sender.lock().await.clone();
+        match timeout(Duration::from_secs(15), sender.ready()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.release_stream();
+                return Err(protocol_error(format!("HTTP/2 stream readiness: {error}")));
             }
-        };
-        let response = match timeout(Duration::from_secs(15), response).await {
+            Err(_) => {
+                self.release_stream();
+                return Err(protocol_error("HTTP/2 stream readiness timed out"));
+            }
+        }
+        let response = match timeout(Duration::from_secs(15), sender.send_request(request)).await {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 self.release_stream();
-                return Err(protocol_error(format!("HTTP/2 CONNECT response: {error}")));
+                return Err(protocol_error(format!("HTTP/2 CONNECT request: {error}")));
             }
             Err(_) => {
                 self.release_stream();
@@ -229,19 +226,28 @@ impl H2Connection {
             )));
         }
 
-        let pipe_capacity = 16 * 1024 * concurrency.clamp(1, 64);
-        let (application, relay_side) = tokio::io::duplex(pipe_capacity);
-        {
-            let mut relay_tasks = self.relay_tasks.lock().await;
-            relay_tasks.retain(|task| !task.is_finished());
-        }
+        let upgraded = match timeout(Duration::from_secs(15), hyper::upgrade::on(response)).await {
+            Ok(Ok(upgraded)) => upgraded,
+            Ok(Err(error)) => {
+                self.release_stream();
+                return Err(protocol_error(format!("HTTP/2 CONNECT upgrade: {error}")));
+            }
+            Err(_) => {
+                self.release_stream();
+                return Err(protocol_error("HTTP/2 CONNECT upgrade timed out"));
+            }
+        };
+        let (application, relay_side) = tokio::io::duplex(16 * 1024 * concurrency.clamp(1, 64));
         let relay_task = tokio::spawn(relay(
-            send_stream,
-            response.into_body(),
+            TokioIo::new(upgraded),
             relay_side,
             self.active_streams.clone(),
             self.shutdown.subscribe(),
         ));
+        {
+            let mut relay_tasks = self.relay_tasks.lock().await;
+            relay_tasks.retain(|task| !task.is_finished());
+        }
         self.relay_tasks.lock().await.push(relay_task);
         Ok((application, self.local_addr))
     }
@@ -257,9 +263,9 @@ impl H2Connection {
     }
 
     /// Stop accepting new streams and wait for existing relays up to the
-    /// deadline. h2 0.4 does not expose client-side GOAWAY on its public
-    /// client API, so this is an application-level drain; peer GOAWAY is
-    /// still observed by the connection task and causes pool replacement.
+    /// deadline. Hyper drives peer GOAWAY and connection errors through the
+    /// connection task; this method adds the application-level drain deadline
+    /// for active CONNECT upgrades before closing the shared connection.
     pub async fn drain(&self, deadline: Duration) {
         let _drain_guard = self.drain_lock.lock().await;
         self.draining.store(true, Ordering::Release);
@@ -660,8 +666,7 @@ impl H2Pool {
 }
 
 async fn relay(
-    mut send_stream: h2::SendStream<Bytes>,
-    mut recv_stream: h2::RecvStream,
+    mut upgraded: TokioIo<Upgraded>,
     relay_side: DuplexStream,
     active_streams: Arc<AtomicUsize>,
     mut shutdown: watch::Receiver<bool>,
@@ -673,107 +678,16 @@ async fn relay(
         }
     }
     let _active = ActiveGuard(&active_streams);
-    let (mut reader, mut writer) = split(relay_side);
     if *shutdown.borrow() {
-        let _ = writer.shutdown().await;
         return;
     }
-
-    // Sending a request body can wait for the peer's H2 window. Keep that
-    // wait in a separate task so the relay continues consuming response data
-    // and can therefore release the peer's response capacity. Waiting inside
-    // the select branch would deadlock full-duplex protocols such as
-    // TLS+H2+Yuubinsya once either direction fills its flow-control window.
-    let mut send_shutdown = shutdown.clone();
-    let mut send_task = tokio::spawn(async move {
-        let mut buffer = vec![0u8; 16 * 1024];
-        loop {
-            tokio::select! {
-                result = reader.read(&mut buffer) => {
-                    let Ok(length) = result else { return Err(()); };
-                    if length == 0 {
-                        return send_stream.send_data(Bytes::new(), true).map_err(|_| ());
-                    }
-                    if send_h2_data(&mut send_stream, &buffer[..length])
-                        .await
-                        .is_err()
-                    {
-                        return Err(());
-                    }
-                }
-                result = send_shutdown.changed() => {
-                    return if result.is_ok() { Ok(()) } else { Err(()) };
-                }
-            }
-        }
-    });
-
-    let mut send_done = false;
-    loop {
-        tokio::select! {
-            result = &mut send_task, if !send_done => {
-                send_done = true;
-                if !matches!(result, Ok(Ok(()))) {
-                    return;
-                }
-            }
-            result = recv_stream.data() => {
-                let Some(result) = result else {
-                    let _ = writer.shutdown().await;
-                    send_task.abort();
-                    return;
-                };
-                let Ok(data) = result else {
-                    send_task.abort();
-                    return;
-                };
-                if recv_stream.flow_control().release_capacity(data.len()).is_err() {
-                    send_task.abort();
-                    return;
-                }
-                if writer.write_all(&data).await.is_err() {
-                    send_task.abort();
-                    return;
-                }
-            }
-            _ = shutdown.changed() => {
-                let _ = writer.shutdown().await;
-                send_task.abort();
-                return;
-            }
+    let mut relay_side = relay_side;
+    tokio::select! {
+        _ = tokio::io::copy_bidirectional(&mut upgraded, &mut relay_side) => {}
+        _ = shutdown.changed() => {
+            let _ = relay_side.shutdown().await;
         }
     }
-}
-
-pub async fn send_h2_data(stream: &mut h2::SendStream<Bytes>, data: &[u8]) -> Result<()> {
-    // `h2::SendStream::send_data` buffers without a producer-side bound when
-    // the peer's flow-control window is exhausted. Never hand it bytes until
-    // capacity has been assigned; this keeps the relay's pending memory
-    // bounded by its caller-owned buffer and one h2 frame.
-    let mut offset = 0;
-    while offset < data.len() {
-        let available = stream.capacity();
-        if available == 0 {
-            let requested = (data.len() - offset).min(16 * 1024);
-            stream.reserve_capacity(requested);
-            poll_fn(|context| stream.poll_capacity(context))
-                .await
-                .ok_or_else(|| {
-                    protocol_error("HTTP/2 send stream closed while waiting for capacity")
-                })?
-                .map_err(|error| protocol_error(format!("HTTP/2 capacity update: {error}")))?;
-            continue;
-        }
-        let length = available.min(data.len() - offset);
-        stream
-            .send_data(
-                Bytes::copy_from_slice(&data[offset..offset + length]),
-                false,
-            )
-            .map_err(|error| protocol_error(format!("HTTP/2 send data: {error}")))?;
-        offset += length;
-    }
-    Ok(())
 }
 
 fn protocol_error(message: impl Into<String>) -> Error {
@@ -783,8 +697,10 @@ fn protocol_error(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use http::Response;
     use std::collections::VecDeque;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     #[tokio::test(flavor = "current_thread")]
@@ -859,7 +775,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn bounded_h2_sender_waits_for_peer_window_before_accepting_more_data() {
+    async fn hyper_connect_upgrade_respects_peer_flow_control() {
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
         let server = tokio::spawn(async move {
             let mut connection = h2::server::handshake(server_io).await.unwrap();
@@ -867,48 +783,27 @@ mod tests {
             let (request, mut respond) = request;
             let _ = respond.send_response(Response::new(()), false).unwrap();
             let mut body = request.into_body();
-            let (_release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-            let reader = tokio::spawn(async move {
-                let _ = release_rx.await;
-                let mut received = 0usize;
-                while let Some(result) = body.data().await {
-                    let Ok(data) = result else { break };
-                    received += data.len();
-                    if body.flow_control().release_capacity(data.len()).is_err() {
-                        break;
-                    }
-                }
-                received
-            });
             // Keep the connection driver active while the application body
-            // is deliberately not released. The client must stop at the
-            // initial flow-control window instead of growing h2's queue.
+            // is deliberately not released. Hyper's CONNECT upgrade must
+            // stop at the peer's flow-control window instead of buffering
+            // the entire application payload.
             let _ = connection.accept().await;
-            let _ = reader.await;
+            let _ = body.data().await;
         });
 
-        let (mut sender, connection) = h2::client::handshake(client_io).await.unwrap();
-        let driver = tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let request = Request::builder()
-            .method(http::Method::CONNECT)
-            .uri("http://localhost")
-            .body(())
+        let connection = H2Connection::handshake_with_limits(client_io, 1)
+            .await
             .unwrap();
-        let (response, mut stream) = sender.send_request(request, false).unwrap();
-        let response = response.await.unwrap();
-        assert_eq!(response.status(), http::StatusCode::OK);
-
+        let mut stream = connection.open_connect_stream(1).await.unwrap();
         let payload = vec![0x5a; 128 * 1024];
-        let send = tokio::spawn(async move { send_h2_data(&mut stream, &payload).await });
+        let send = tokio::spawn(async move { stream.write_all(&payload).await });
         tokio::time::sleep(Duration::from_millis(25)).await;
-        assert!(!send.is_finished(), "sender buffered past the peer window");
+        assert!(
+            !send.is_finished(),
+            "CONNECT upgrade buffered past peer window"
+        );
 
-        // Closing the test driver is enough to release the pending sender;
-        // the test's assertion above is the important boundedness check.
-        driver.abort();
-        let _ = driver.await;
+        connection.close().await;
         let _ = send.await;
         server.abort();
         let _ = server.await;

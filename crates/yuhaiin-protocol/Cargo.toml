@@ -19,7 +19,9 @@ md-5 = { version = "0.10.6", default-features = false }
 p256 = { version = "0.13.2", default-features = false, features = ["ecdh", "std"] }
 rand = { version = "0.10.2", default-features = false, features = ["std", "thread_rng"] }
 futures-util = { version = "0.3.33", default-features = false, features = ["std", "sink"] }
-h2 = "0.4.15"
+http-body-util = "0.1.4"
+hyper = { version = "1.11.0", default-features = false, features = ["client", "http2", "server"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
 http = "1.5.0"
 sha2 = { version = "0.11.0", default-features = false }
 sha2_10 = { package = "sha2", version = "0.10.9", default-features = false }
@@ -39,6 +41,9 @@ tls-rustcrypto = ["tls-ring"]
 websocket = ["dep:tokio-tungstenite"]
 
 [dev-dependencies]
+# Raw peer used only to exercise Hyper's HTTP/2 CONNECT interoperability;
+# production client/server code uses Hyper directly.
+h2 = "0.4.15"
 rustls-pemfile = "2.2.0"
 
 [lints]
