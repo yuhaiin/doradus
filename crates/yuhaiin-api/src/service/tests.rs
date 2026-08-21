@@ -1,6 +1,8 @@
 use super::{RuntimeService, ServiceOptions};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 fn test_database() -> PathBuf {
     let root = std::env::var_os("YUHAIIN_CACHE_DIR")
@@ -35,13 +37,24 @@ async fn service_start_exposes_api_and_shutdowns() {
             options.username = "".to_owned();
             options.password = "".to_owned();
             let service = RuntimeService::start(options).await.unwrap();
-            let response = reqwest::Client::new()
-                .get(format!("http://{}/api/v2/info", service.address()))
-                .send()
+            let address = service.address();
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "GET /api/v2/info HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
                 .await
                 .unwrap();
-            assert!(response.status().is_success());
-            let _ = response.text().await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            let response = String::from_utf8_lossy(&response);
+            assert!(
+                response.starts_with("HTTP/1.1 2"),
+                "unexpected response: {response}"
+            );
             service.shutdown().unwrap();
             service.wait().await.unwrap();
             remove_database(&database);

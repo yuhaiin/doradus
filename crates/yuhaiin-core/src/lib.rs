@@ -25,9 +25,13 @@ pub mod dns_tcp {
 pub mod flow;
 pub mod geo;
 pub use geo::GeoLookup;
-#[cfg(feature = "http2")]
+#[cfg(feature = "http")]
+pub mod dns_http {
+    pub use yuhaiin_dns::dns_http::*;
+}
+#[cfg(feature = "http")]
 pub mod http2 {
-    pub use yuhaiin_dns::http2::*;
+    pub use yuhaiin_dns::dns_http::*;
 }
 pub mod nat;
 pub mod process;

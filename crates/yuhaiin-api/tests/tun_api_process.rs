@@ -78,7 +78,7 @@ fn device_is_present(name: &str) -> bool {
 }
 
 async fn wait_for_health(
-    client: &reqwest::Client,
+    client: &support::HttpClient,
     base_url: &str,
     diagnostics: &Arc<Mutex<String>>,
 ) {
@@ -116,11 +116,16 @@ async fn wait_for_device(name: &str, expected: bool, diagnostics: &Arc<Mutex<Str
     );
 }
 
-async fn put_inbound(client: &reqwest::Client, base_url: &str, id: &str, config: &Value) -> Value {
+async fn put_inbound(
+    client: &support::HttpClient,
+    base_url: &str,
+    id: &str,
+    config: &Value,
+) -> Value {
     api_json(
         client,
         base_url,
-        reqwest::Method::PUT,
+        http::Method::PUT,
         &format!("/api/v2/inbounds/{id}"),
         Some(config),
     )
@@ -139,7 +144,7 @@ async fn foreground_binary_api_toggle_changes_real_tun_device() {
     let address = reserve_loopback().await;
     let base_url = format!("http://{address}");
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = reqwest::Client::new();
+    let client = support::HttpClient::new();
     let diagnostics = Arc::new(Mutex::new(String::new()));
     let runtime = RuntimeChild::spawn(&database, &address.to_string(), &diagnostics);
     let tun_id = "tun-api-process";

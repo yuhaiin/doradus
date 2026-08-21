@@ -19,8 +19,8 @@ use crate::dns::{
     DnsRecordType, DnsResponse, decode_response, encode_query, validate_query_packet,
     validate_response_packet,
 };
+use crate::dns_http::{DnsOverHttp, DnsOverHttpConnector, HttpConnection, HttpVersion};
 use crate::dns_resolver::{AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, SendAsyncDnsQuery};
-use crate::http2::{H2DohClient, H2DohConnector};
 use crate::transport::connect_tcp;
 use crate::{BoxFuture, DomainName, Error, ErrorKind, LocalBoxFuture, Result};
 
@@ -161,7 +161,7 @@ impl DnsTlsConnector for RustCryptoTlsConnector {
 }
 
 #[derive(Clone)]
-pub struct RustCryptoH2Connector {
+pub struct RustCryptoHttpConnector {
     tls: RustCryptoTlsConnector,
     resolver_id: String,
     server_name: Option<String>,
@@ -169,7 +169,7 @@ pub struct RustCryptoH2Connector {
     bind_interface: Option<String>,
 }
 
-impl RustCryptoH2Connector {
+impl RustCryptoHttpConnector {
     pub fn new(
         tls: RustCryptoTlsConnector,
         resolver_id: String,
@@ -187,10 +187,10 @@ impl RustCryptoH2Connector {
     }
 }
 
-impl H2DohConnector for RustCryptoH2Connector {
+impl DnsOverHttpConnector for RustCryptoHttpConnector {
     type Stream = DnsTlsStream;
 
-    fn connect<'a>(&'a self, uri: &'a Uri) -> BoxFuture<'a, Result<Self::Stream>> {
+    fn connect<'a>(&'a self, uri: &'a Uri) -> BoxFuture<'a, Result<HttpConnection<Self::Stream>>> {
         Box::pin(async move {
             let host = uri
                 .host()
@@ -208,16 +208,17 @@ impl H2DohConnector for RustCryptoH2Connector {
                     self.bind_interface.as_deref(),
                 )
                 .await?;
-            if stream.get_ref().1.alpn_protocol() != Some(b"h2") {
-                return Err(Error::new(
-                    ErrorKind::Protocol,
-                    format!(
-                        "DoH TLS negotiated {:?}, expected h2",
-                        stream.get_ref().1.alpn_protocol()
-                    ),
-                ));
-            }
-            Ok(stream)
+            let version = match stream.get_ref().1.alpn_protocol() {
+                Some(b"h2") => HttpVersion::Http2,
+                Some(b"http/1.1") | None => HttpVersion::Http1,
+                Some(protocol) => {
+                    return Err(Error::new(
+                        ErrorKind::Protocol,
+                        format!("DoH TLS negotiated unsupported ALPN {protocol:?}"),
+                    ));
+                }
+            };
+            Ok(HttpConnection { stream, version })
         })
     }
 }
@@ -264,21 +265,23 @@ impl DohResolverFactory {
     pub fn build(&self, config: DnsTlsResolverConfig) -> Result<Arc<dyn AsyncIpResolver>> {
         let endpoint = doh_endpoint(&config.host, &config.id)?;
         let mut client_config = (*self.client_config).clone();
-        if !client_config
-            .alpn_protocols
-            .iter()
-            .any(|protocol| protocol == b"h2")
-        {
-            client_config.alpn_protocols.push(b"h2".to_vec());
+        for protocol in [b"h2".to_vec(), b"http/1.1".to_vec()] {
+            if !client_config
+                .alpn_protocols
+                .iter()
+                .any(|value| value == &protocol)
+            {
+                client_config.alpn_protocols.push(protocol);
+            }
         }
         let tls = RustCryptoTlsConnector::from_config(Arc::new(client_config), self.timeout);
         let tls = match &self.stream_connector {
             Some(connector) => tls.with_stream_connector(connector.clone()),
             None => tls,
         };
-        let client = H2DohClient::new(
+        let client = DnsOverHttp::new(
             endpoint,
-            RustCryptoH2Connector::new(
+            RustCryptoHttpConnector::new(
                 tls,
                 config.id,
                 config.server_name,

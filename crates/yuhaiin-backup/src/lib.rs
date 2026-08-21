@@ -12,9 +12,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use hmac::{Hmac, Mac};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use reqwest::{Client, Method, StatusCode};
+use http::header::{HeaderMap, HeaderName, HeaderValue};
+use http::{Method, Request, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sha2_10::Sha256 as Sha256V10;
@@ -44,7 +50,7 @@ pub struct S3Config {
 pub enum Error {
     Invalid(String),
     Url(url::ParseError),
-    Request(reqwest::Error),
+    Request(String),
     Transport(String),
     Response { status: StatusCode, body: String },
     Header(String),
@@ -72,12 +78,6 @@ impl std::error::Error for Error {}
 impl From<url::ParseError> for Error {
     fn from(error: url::ParseError) -> Self {
         Self::Url(error)
-    }
-}
-
-impl From<reqwest::Error> for Error {
-    fn from(error: reqwest::Error) -> Self {
-        Self::Request(error)
     }
 }
 
@@ -124,9 +124,11 @@ struct SignedRequest {
     body: Vec<u8>,
 }
 
+type S3HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
+
 #[derive(Clone)]
 pub struct S3Client {
-    client: Client,
+    client: S3HttpClient,
     config: S3Config,
     endpoint: Url,
     transport: Option<Arc<dyn S3Transport>>,
@@ -167,10 +169,13 @@ impl S3Client {
             Url::parse(config.endpoint_url.trim())?
         };
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = Client::builder()
-            .user_agent("yuhaiin-rust-backup")
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let https = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build();
+        let client = Client::builder(TokioExecutor::new()).build(https);
         Ok(Self {
             client,
             config,
@@ -179,24 +184,36 @@ impl S3Client {
         })
     }
 
+    fn http_request(&self, signed: SignedRequest) -> Result<Request<Full<Bytes>>, Error> {
+        let mut builder = Request::builder()
+            .method(signed.method)
+            .uri(signed.url.as_str());
+        for (name, value) in &signed.headers {
+            builder = builder.header(name, value);
+        }
+        builder
+            .header("user-agent", "yuhaiin-rust-backup")
+            .body(Full::new(Bytes::from(signed.body)))
+            .map_err(|error| Error::Request(format!("build S3 request: {error}")))
+    }
+
+    async fn send(
+        &self,
+        request: Request<Full<Bytes>>,
+    ) -> Result<hyper::Response<Incoming>, Error> {
+        tokio::time::timeout(Duration::from_secs(30), self.client.request(request))
+            .await
+            .map_err(|_| Error::Request("S3 request timed out".to_owned()))?
+            .map_err(|error| Error::Request(error.to_string()))
+    }
+
     pub async fn put(&self, object: &str, body: &[u8]) -> Result<(), Error> {
         let signed = self.signed_request(Method::PUT, object, body)?;
         if let Some(transport) = &self.transport {
             let response = transport.execute(signed.transport).await?;
             return ensure_transport_success(response).map(|_| ());
         }
-        let mut request = self
-            .client
-            .request(signed.method, signed.url)
-            .headers(signed.headers);
-        if !signed.body.is_empty() {
-            request = request.body(signed.body);
-        }
-        let response = self
-            .client
-            .execute(request.build().map_err(Error::Request)?)
-            .await
-            .map_err(Error::Request)?;
+        let response = self.send(self.http_request(signed)?).await?;
         ensure_success(response).await
     }
 
@@ -206,15 +223,15 @@ impl S3Client {
             let response = transport.execute(signed.transport).await?;
             return ensure_transport_success(response).map(|response| response.body);
         }
-        let request = self
-            .client
-            .request(signed.method, signed.url)
-            .headers(signed.headers)
-            .build()
-            .map_err(Error::Request)?;
-        let response = self.client.execute(request).await.map_err(Error::Request)?;
+        let response = self.send(self.http_request(signed)?).await?;
         let response = ensure_success_response(response).await?;
-        Ok(response.bytes().await.map_err(Error::Request)?.to_vec())
+        Ok(response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|error| Error::Request(format!("read S3 response: {error}")))?
+            .to_bytes()
+            .to_vec())
     }
 
     fn signed_request(
@@ -357,7 +374,7 @@ impl S3Client {
     }
 }
 
-async fn ensure_success(response: reqwest::Response) -> Result<(), Error> {
+async fn ensure_success(response: hyper::Response<Incoming>) -> Result<(), Error> {
     ensure_success_response(response).await.map(|_| ())
 }
 
@@ -374,14 +391,18 @@ fn ensure_transport_success(response: S3Response) -> Result<S3Response, Error> {
     })
 }
 
-async fn ensure_success_response(response: reqwest::Response) -> Result<reqwest::Response, Error> {
+async fn ensure_success_response(
+    response: hyper::Response<Incoming>,
+) -> Result<hyper::Response<Incoming>, Error> {
     if response.status().is_success() {
         return Ok(response);
     }
     let status = response.status();
     let body = response
-        .text()
+        .into_body()
+        .collect()
         .await
+        .map(|body| String::from_utf8_lossy(&body.to_bytes()).into_owned())
         .unwrap_or_else(|_| "<unreadable response>".to_owned());
     Err(Error::Response {
         status,

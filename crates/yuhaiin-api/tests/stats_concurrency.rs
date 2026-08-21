@@ -50,7 +50,7 @@ async fn connect_http_tunnel(
     );
 }
 
-async fn assert_json_success(client: &reqwest::Client, url: &str) -> Result<(), String> {
+async fn assert_json_success(client: &support::HttpClient, url: &str) -> Result<(), String> {
     let response = client
         .get(url)
         .send()
@@ -111,7 +111,7 @@ async fn concurrent_stats_readers_survive_flow_updates_and_restart() {
     for reader_id in 0..reader_count {
         let urls = urls.clone();
         readers.push(tokio::spawn(async move {
-            let http = reqwest::Client::new();
+            let http = support::HttpClient::new();
             for round in 0..reader_rounds {
                 let url = &urls[(reader_id + round) % urls.len()];
                 assert_json_success(&http, url).await?;
@@ -138,7 +138,7 @@ async fn concurrent_stats_readers_survive_flow_updates_and_restart() {
     let total = api_json(
         &restarted.client,
         &restarted.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections/total",
         None,
     )
@@ -147,7 +147,7 @@ async fn concurrent_stats_readers_survive_flow_updates_and_restart() {
     let history = api_json(
         &restarted.client,
         &restarted.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections/history",
         None,
     )
@@ -184,7 +184,7 @@ async fn force_stop_during_stats_reads_reopens_same_database() {
 
     let base_url = service.base_url.clone();
     let reader = tokio::spawn(async move {
-        let http = reqwest::Client::new();
+        let http = support::HttpClient::new();
         for _ in 0..120 {
             let _ =
                 assert_json_success(&http, &format!("{base_url}/api/v2/connections/total")).await;
@@ -211,7 +211,7 @@ async fn force_stop_during_stats_reads_reopens_same_database() {
     let total = api_json(
         &restarted.client,
         &restarted.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections/total",
         None,
     )
@@ -222,7 +222,7 @@ async fn force_stop_during_stats_reads_reopens_same_database() {
     let connections = api_json(
         &restarted.client,
         &restarted.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections",
         None,
     )
@@ -236,7 +236,7 @@ async fn force_stop_during_stats_reads_reopens_same_database() {
     let history = api_json(
         &restarted.client,
         &restarted.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections/history",
         None,
     )

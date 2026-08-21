@@ -2,12 +2,18 @@
 //!
 //! The update endpoint is deliberately kept outside the proxy/data-plane
 //! builder.  It only deals with release metadata, bounded downloads and an
-//! atomic hand-off to the platform helper.  The HTTP client uses reqwest with
+//! atomic hand-off to the platform helper. The HTTP client uses Hyper with
 //! rustls and its ring provider; no system TLS library such as OpenSSL is
 //! required.
 
+use bytes::Bytes;
 use futures_util::StreamExt;
-use reqwest::Client;
+use http::{Method, Request, Uri, header};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
@@ -120,9 +126,12 @@ struct SelectedRelease {
     asset_size: u64,
 }
 
+type UpdateHttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
+
 #[derive(Debug, Clone)]
 pub struct UpdateService {
-    client: Client,
+    client: UpdateHttpClient,
+    timeout: Duration,
     releases_url: String,
     current_version: String,
     target_os: String,
@@ -149,17 +158,20 @@ impl UpdateService {
     }
 
     fn with_releases_url(releases_url: String, timeout: Duration) -> Self {
-        // reqwest is built with rustls' no-provider feature.  Install the
-        // ring provider once for this process; an already installed
-        // provider is harmless when another runtime component initialized it.
+        // Install the ring provider once for this process; an already
+        // installed provider is harmless when another runtime component
+        // initialized it.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = Client::builder()
-            .timeout(timeout)
-            .user_agent(format!("yuhaiin-rust/{}", env!("CARGO_PKG_VERSION")))
-            .build()
-            .unwrap_or_else(|_| Client::new());
+        let https = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build();
+        let client = Client::builder(TokioExecutor::new()).build(https);
         Self {
             client,
+            timeout,
             releases_url,
             current_version: env::var("YUHAIIN_VERSION")
                 .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_owned()),
@@ -179,6 +191,50 @@ impl UpdateService {
             .lock()
             .expect("update status mutex poisoned")
             .clone()
+    }
+
+    fn request(
+        &self,
+        method: Method,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Bytes,
+    ) -> Result<Request<Full<Bytes>>, String> {
+        let uri = url
+            .parse::<Uri>()
+            .map_err(|error| format!("invalid update URL: {error}"))?;
+        let mut builder = Request::builder().method(method).uri(uri).header(
+            header::USER_AGENT,
+            format!("yuhaiin-rust/{}", env!("CARGO_PKG_VERSION")),
+        );
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder
+            .body(Full::new(body))
+            .map_err(|error| format!("build update request: {error}"))
+    }
+
+    async fn send(
+        &self,
+        request: Request<Full<Bytes>>,
+        label: &str,
+    ) -> Result<hyper::Response<Incoming>, String> {
+        tokio::time::timeout(self.timeout, self.client.request(request))
+            .await
+            .map_err(|_| format!("{label}: request timed out"))?
+            .map_err(|error| format!("{label}: {error}"))
+    }
+
+    fn ensure_success(
+        response: hyper::Response<Incoming>,
+        label: &str,
+    ) -> Result<hyper::Response<Incoming>, String> {
+        if response.status().is_success() {
+            Ok(response)
+        } else {
+            Err(format!("{label}: HTTP {}", response.status()))
+        }
     }
 
     pub async fn check(&self, channel: &str) -> Result<CheckResult, String> {
@@ -278,16 +334,18 @@ impl UpdateService {
         let staged = staging_dir.join(format!("{}-{}", env!("CARGO_PKG_NAME"), selected.tag));
         let _ = tokio::fs::remove_file(&staged).await;
         self.set_progress("downloading", 0, selected.asset_size);
-        let response = self
-            .client
-            .get(&selected.asset_url)
-            .send()
-            .await
-            .map_err(|error| format!("download update asset: {error}"))?
-            .error_for_status()
-            .map_err(|error| format!("download update asset: {error}"))?;
-        let total = response.content_length().unwrap_or(selected.asset_size);
-        let mut stream = response.bytes_stream();
+        let request = self.request(Method::GET, &selected.asset_url, &[], Bytes::new())?;
+        let response = Self::ensure_success(
+            self.send(request, "download update asset").await?,
+            "download update asset",
+        )?;
+        let total = response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(selected.asset_size);
+        let mut stream = response.into_body().into_data_stream();
         let mut file = tokio::fs::File::create(&staged)
             .await
             .map_err(|error| format!("create staged update: {error}"))?;
@@ -335,21 +393,30 @@ impl UpdateService {
     async fn releases(&self) -> Result<Vec<Release>, String> {
         let mut all = Vec::new();
         for page in 1.. {
-            let response = self
-                .client
-                .get(&self.releases_url)
-                .query(&[("per_page", MAX_RELEASES_PAGE), ("page", page)])
-                .header("accept", "application/vnd.github+json")
-                .header("cache-control", "no-cache")
-                .send()
-                .await
-                .map_err(|error| format!("request releases: {error}"))?
-                .error_for_status()
-                .map_err(|error| format!("request releases: {error}"))?;
+            let mut url = url::Url::parse(&self.releases_url)
+                .map_err(|error| format!("invalid releases URL: {error}"))?;
+            url.query_pairs_mut()
+                .append_pair("per_page", &MAX_RELEASES_PAGE.to_string())
+                .append_pair("page", &page.to_string());
+            let request = self.request(
+                Method::GET,
+                url.as_str(),
+                &[
+                    ("accept", "application/vnd.github+json"),
+                    ("cache-control", "no-cache"),
+                ],
+                Bytes::new(),
+            )?;
+            let response = Self::ensure_success(
+                self.send(request, "request releases").await?,
+                "request releases",
+            )?;
             let body = response
-                .bytes()
+                .into_body()
+                .collect()
                 .await
-                .map_err(|error| format!("read releases: {error}"))?;
+                .map_err(|error| format!("read releases: {error}"))?
+                .to_bytes();
             if body.len() > MAX_RELEASE_BODY {
                 return Err("release metadata is too large".to_owned());
             }
@@ -365,18 +432,20 @@ impl UpdateService {
     }
 
     async fn download_checksum(&self, url: &str, asset_name: &str) -> Result<String, String> {
-        let body = self
-            .client
-            .get(url)
-            .send()
+        let request = self.request(Method::GET, url, &[], Bytes::new())?;
+        let response = Self::ensure_success(
+            self.send(request, "download checksums").await?,
+            "download checksums",
+        )?;
+        let body = response
+            .into_body()
+            .collect()
             .await
-            .map_err(|error| format!("download checksums: {error}"))?
-            .error_for_status()
-            .map_err(|error| format!("download checksums: {error}"))?
-            .text()
-            .await
-            .map_err(|error| format!("read checksums: {error}"))?;
-        parse_checksum(&body, asset_name)
+            .map_err(|error| format!("read checksums: {error}"))?
+            .to_bytes();
+        let body =
+            std::str::from_utf8(&body).map_err(|error| format!("decode checksums: {error}"))?;
+        parse_checksum(body, asset_name)
     }
 }
 

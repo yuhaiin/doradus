@@ -63,7 +63,7 @@ pub use log::RuntimeLog;
 pub use monitor::ConnectionMonitor;
 pub use proxy::{ProxyBuild, RuntimeProxySelector};
 #[cfg(feature = "http2")]
-pub use resolver::H2DohResolverFactory;
+pub use resolver::DnsOverHttpResolverFactory;
 #[cfg(feature = "doh-tls")]
 pub use resolver::RustCryptoDohResolverFactory;
 #[cfg(feature = "doh-tls")]

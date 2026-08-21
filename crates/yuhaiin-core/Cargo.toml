@@ -6,7 +6,9 @@ license.workspace = true
 
 [features]
 default = []
-http2 = ["yuhaiin-dns/http2"]
+http = ["yuhaiin-dns/http"]
+# Compatibility alias for callers that used the previous HTTP/2-only name.
+http2 = ["http"]
 tls-ring = []
 # Compatibility alias for callers using the former provider feature name.
 tls-rustcrypto = ["tls-ring"]

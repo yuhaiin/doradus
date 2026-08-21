@@ -363,11 +363,11 @@
 
 > 2026-08-09 cross-target boundary：`yuhaiin-core` 的 `async-proxy,tun` 已通过 `aarch64-linux-android` 和 `aarch64-apple-darwin` 的 `cargo check`。在 Android 上使用 `/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang`、对应 `clang++`、`llvm-ar` 和 Cargo linker 后，`yuhaiin-runtime --all-features` 的 `aarch64-linux-android` target check 也通过；bundled SQLite 的 C 编译边界已验证。macOS runtime check 仍需要 macOS SDK/clang，Android VpnService fd、权限和实机生命周期仍未由此命令行检查替代。
 
-> 2026-08-09 update service：补齐 `/api/v2/update/check`、`update.apply`、`update.status` 的真实 Rust 实现。服务按 Go 的 stable/beta/main channel 过滤和排序 GitHub releases，要求目标平台 asset 与 `checksums.txt`，下载时持续更新状态并在 SHA-256 不匹配时删除 staged 文件；临时文件放在 `~/.cache/yuhaiin-rust/updates`，helper 会复制到安装目录后再做替换和 service restart，失败恢复 `.update-backup`。reqwest 使用 rustls no-provider + RustCrypto，`cargo tree` 未发现 ring/OpenSSL/native-tls；网络端点和不同发行版 service manager 仍需现场验收。
+> 2026-08-09 update service：补齐 `/api/v2/update/check`、`update.apply`、`update.status` 的真实 Rust 实现。服务按 Go 的 stable/beta/main channel 过滤和排序 GitHub releases，要求目标平台 asset 与 `checksums.txt`，下载时持续更新状态并在 SHA-256 不匹配时删除 staged 文件；临时文件放在 `~/.cache/yuhaiin-rust/updates`，helper 会复制到安装目录后再做替换和 service restart，失败恢复 `.update-backup`。HTTP 客户端统一使用 Hyper + hyper-rustls，TLS 根证书和 provider 由 RustCrypto 配置提供；网络端点和不同发行版 service manager 仍需现场验收。
 
 > 2026-08-09 Rust pprof 与 MaxMind fixture：runtime 使用纯 Rust `pprof-rs` 提供 `/debug/pprof/` index 和 `/debug/pprof/profile?seconds=N` protobuf profile endpoint；沿用 Go settings 的 `pprof` 开关，关闭时返回 404，并有 API 回归覆盖 index、profile 和 reload。profile 格式遵循 Rust crate，不承诺 Go wire compatibility。MaxMind 使用用户指定的 `Country-without-asn.mmdb` 下载地址；真实库文件只保存在 `~/.cache/yuhaiin-rust-maxmind`，未进入仓库，8.2 MiB fixture 的 SHA-256 为 `1d900f73aa4644d255793548319410ff559ef9294a662ec1a0354f106c794155`，真实 IPv4、IPv4-mapped IPv6 查询和已有 atomic refresh/concurrency 测试均通过。
 
-> 已实现的代码包括：SQLite 配置事务与 schema v3 typed repository、Go v6 fixture/import/字段差异报告、FakeIP IPv4/IPv6 分配/持久化/旧 snapshot 幂等导入与 A/AAAA/PTR/HTTPS/SVCB hint answer transform、域名/CIDR/Geo country Router snapshot publish/rollback、独立 `yuhaiin-geo` 的 MaxMindDB reader/校验下载/atomic refresh、带 TTL/容量淘汰的 DNS cache、同步/异步 UDP DNS client/server/policy/cancellation boundary、DoH transport boundary、注入 connector 的 HTTP/2 DoH framing、可直接接入异步 DNS/TUN packet pipeline 的 `H2DohDnsHandler`、可复用的 RustCrypto TCP→TLS→ALPN h2 DoH connector 和 DoT TCP framing resolver、同时组装 System/UDP/TCP/DoH/DoT 的 `RustCryptoResolverFactory`、hosts→upstream→FakeIP 的可注入异步 resolver stack、`yuhaiin-runtime` 的 Go compatibility snapshot 组装与 direct/HTTP/SOCKS5/Shadowsocks/Trojan/VLESS/chain proxy 构造、direct/fixed/drop/HTTP CONNECT/SOCKS5、独立 `yuhaiin-protocol` 的 Shadowsocks/Trojan/VLESS TCP/UDP codec、inbound/outbound wrapper、TLS 和 WebSocket transport 组合、feature-gated `rustls-rustcrypto` TLS client、共享 WebSocket byte-stream transport（standalone、VLESS 和 WebSocket+HTTP/2 inbound/outbound）、Yuubinsya native UDP client/server socket、UOT/TCP/coalesce/Ping client/server session、full-cone NAT UDP relay、唯一的 `tun-rs AsyncDevice + smoltcp` TUN adapter，以及独立的 `yuhaiin-chain`（fixedv2 → 可选 TLS/WebSocket → HTTP/2 pool/CONNECT → Yuubinsya TCP/UOT/Ping）。TLS provider 仍是 alpha，DoQ/DoH3、WebSocket early-data/子协议和特权 Linux namespace/Android/macOS 验收仍是独立门槛，未用 C TLS 代替。
+> 已实现的代码包括：SQLite 配置事务与 schema v3 typed repository、Go v6 fixture/import/字段差异报告、FakeIP IPv4/IPv6 分配/持久化/旧 snapshot 幂等导入与 A/AAAA/PTR/HTTPS/SVCB hint answer transform、域名/CIDR/Geo country Router snapshot publish/rollback、独立 `yuhaiin-geo` 的 MaxMindDB reader/校验下载/atomic refresh、带 TTL/容量淘汰的 DNS cache、同步/异步 UDP DNS client/server/policy/cancellation boundary、DoH transport boundary、基于 Hyper 的 HTTP/1.1 + HTTP/2 DoH framing、可直接接入异步 DNS/TUN packet pipeline 的 `DnsOverHttpHandler`、可复用的 RustCrypto TCP→TLS→ALPN h2/http1.1 DoH connector 和 DoT TCP framing resolver、同时组装 System/UDP/TCP/DoH/DoT 的 `RustCryptoResolverFactory`、hosts→upstream→FakeIP 的可注入异步 resolver stack、`yuhaiin-runtime` 的 Go compatibility snapshot 组装与 direct/HTTP/SOCKS5/Shadowsocks/Trojan/VLESS/chain proxy 构造、direct/fixed/drop/HTTP CONNECT/SOCKS5、独立 `yuhaiin-protocol` 的 Shadowsocks/Trojan/VLESS TCP/UDP codec、inbound/outbound wrapper、TLS 和 WebSocket transport 组合、feature-gated `rustls-rustcrypto` TLS client、共享 WebSocket byte-stream transport（standalone、VLESS 和 WebSocket+HTTP/2 inbound/outbound）、Yuubinsya native UDP client/server socket、UOT/TCP/coalesce/Ping client/server session、full-cone NAT UDP relay、唯一的 `tun-rs AsyncDevice + smoltcp` TUN adapter，以及独立的 `yuhaiin-chain`（fixedv2 → 可选 TLS/WebSocket → HTTP/2 pool/CONNECT → Yuubinsya TCP/UOT/Ping）。TLS provider 仍是 alpha，DoQ/DoH3、WebSocket early-data/子协议和特权 Linux namespace/Android/macOS 验收仍是独立门槛，未用 C TLS 代替。
 >
 > 本轮新增 Go 自定义 AEAD transport：它与 Shadowsocks AEAD 不同，使用 P-256/Ed25519 handshake、ChaCha20/XChaCha20 方向 stream，以及 Go 兼容的 `nonce || ciphertext` UDP packet。协议 codec、TCP/UDP outbound wrapper、SOCKS5 AEAD inbound 和 AEAD 外层 Yuubinsya UDP 已接入；Rust 本地回归与 Go↔Rust TCP/UDP 双向实例互操作通过，更完整组合仍列为 P1 验收项。
 
@@ -551,8 +551,9 @@ matcher fail-closed。DoH 已提供 `RustCryptoDohResolverFactory` 的直连 TCP
 实现，并以 resolver timeout 取消完整响应 future；需要代理链或自定义 bootstrap 时仍使用
 注入式 connector。启用 runtime `doh-tls` feature 后，`RustCryptoDohResolverFactory` 和
 `RustCryptoDotResolverFactory` 提供直连 TCP/TLS 数据面；DoQ/DoH3 不允许无提示地回退 system
-DNS，避免 DoH bootstrap 反向进入自身 proxy chain。启用 runtime `http2` feature 后，`H2DohResolverFactory` 复用 core
-`H2DohClient`，由上层注入 TLS/proxy connector；
+DNS，避免 DoH bootstrap 反向进入自身 proxy chain。启用 runtime HTTP/DoH feature 后，
+`DnsOverHttpResolverFactory` 复用 core `DnsOverHttp`，由上层注入 TLS/proxy connector，
+并通过 Hyper 协商 HTTP/1.1 或 HTTP/2；
 `RuntimeBuilder` 同时读取
 `maxmind_metadata` 的第一条记录，用独立 `yuhaiin-geo::GeoDatabaseManager` 加载纯 Rust MaxMindDB 并注入 route snapshot；
 reload 时旧 snapshot 继续持有旧 reader，不会被新 reader 提前关闭。
@@ -3680,7 +3681,7 @@ target/linker 构建门禁，不替代 Podman 内的 runtime 运行测试；所�
 Rust API 的真实功能缺口：`backup.run` 过去无论配置如何都只创建本地 SQLite 文件，
 `backup.restore` 也只接受本地路径；这会让前端配置了 S3 后得到错误的“成功”语义。
 
-新增 `crates/yuhaiin-backup`，使用纯 Rust 的 `reqwest + rustls-rustcrypto + HMAC/SHA-256`
+新增 `crates/yuhaiin-backup`，使用纯 Rust 的 `Hyper + hyper-rustls + HMAC/SHA-256`
 实现 S3 Signature V4，并保留 Go 的 camelCase 配置字段、path-style endpoint、storage class、
 `{instanceName}-state.db` object name 和 BLAKE2b-256(`state.db || json(S3)`) 的
 `lastBackupHash` 语义。运行流程现在是：

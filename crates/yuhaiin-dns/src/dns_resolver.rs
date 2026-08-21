@@ -851,14 +851,16 @@ impl<T: AsyncDnsQuery + ?Sized> AsyncDnsQuery for Box<T> {
     }
 }
 
-#[cfg(feature = "http2")]
-impl<C: crate::http2::H2DohConnector> AsyncDnsQuery for crate::http2::H2DohClient<C> {
+#[cfg(feature = "http")]
+impl<C: crate::dns_http::DnsOverHttpConnector> AsyncDnsQuery for crate::dns_http::DnsOverHttp<C> {
     fn query<'a>(
         &'a self,
         domain: &'a DomainName,
         record_type: DnsRecordType,
     ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
-        Box::pin(async move { crate::http2::H2DohClient::query(self, domain, record_type).await })
+        Box::pin(
+            async move { crate::dns_http::DnsOverHttp::query(self, domain, record_type).await },
+        )
     }
 
     fn query_packet<'a>(&'a self, packet: &'a [u8]) -> LocalBoxFuture<'a, Result<Vec<u8>>> {
@@ -866,14 +868,18 @@ impl<C: crate::http2::H2DohConnector> AsyncDnsQuery for crate::http2::H2DohClien
     }
 }
 
-#[cfg(feature = "http2")]
-impl<C: crate::http2::H2DohConnector> SendAsyncDnsQuery for crate::http2::H2DohClient<C> {
+#[cfg(feature = "http")]
+impl<C: crate::dns_http::DnsOverHttpConnector> SendAsyncDnsQuery
+    for crate::dns_http::DnsOverHttp<C>
+{
     fn query_send<'a>(
         &'a self,
         domain: &'a DomainName,
         record_type: DnsRecordType,
     ) -> BoxFuture<'a, Result<DnsResponse>> {
-        Box::pin(async move { crate::http2::H2DohClient::query(self, domain, record_type).await })
+        Box::pin(
+            async move { crate::dns_http::DnsOverHttp::query(self, domain, record_type).await },
+        )
     }
 
     fn query_packet_send<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {

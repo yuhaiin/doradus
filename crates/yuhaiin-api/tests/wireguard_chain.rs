@@ -383,7 +383,7 @@ async fn configure_wireguard_network_split_chain(
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/inbounds",
         Some(&inbound_config),
     )
@@ -448,7 +448,7 @@ async fn configure_wireguard_node_and_route_with_network_split(
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/nodes",
         Some(&node),
     )
@@ -456,7 +456,7 @@ async fn configure_wireguard_node_and_route_with_network_split(
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/nodes/wireguard-runtime-out/use",
         None,
     )
@@ -471,7 +471,7 @@ async fn configure_wireguard_node_and_route_with_network_split(
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/route/rules",
         Some(&route),
     )
@@ -529,7 +529,7 @@ async fn http_inbound_routes_through_wireguard_userspace_outbound() {
                 let logs = api_json(
                     &service.client,
                     &service.base_url,
-                    reqwest::Method::POST,
+                    http::Method::POST,
                     "/api/v2/rpc/tools.logs",
                     Some(&json!({})),
                 )
@@ -544,7 +544,7 @@ async fn http_inbound_routes_through_wireguard_userspace_outbound() {
             let logs = api_json(
                 &service.client,
                 &service.base_url,
-                reqwest::Method::POST,
+                http::Method::POST,
                 "/api/v2/rpc/tools.logs",
                 Some(&json!({})),
             )
@@ -580,7 +580,7 @@ async fn http_inbound_routes_through_wireguard_userspace_outbound() {
         let logs = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::POST,
+            http::Method::POST,
             "/api/v2/rpc/tools.logs",
             Some(&json!({})),
         )
@@ -588,7 +588,7 @@ async fn http_inbound_routes_through_wireguard_userspace_outbound() {
         let connections = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/connections",
             None,
         )
@@ -613,7 +613,7 @@ async fn http_inbound_routes_through_wireguard_userspace_outbound() {
         let connections = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/connections",
             None,
         )
@@ -621,7 +621,7 @@ async fn http_inbound_routes_through_wireguard_userspace_outbound() {
         let logs = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::POST,
+            http::Method::POST,
             "/api/v2/rpc/tools.logs",
             Some(&json!({})),
         )
@@ -663,7 +663,7 @@ async fn http_inbound_routes_through_wireguard_userspace_outbound() {
     let latency = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/nodes/wireguard-runtime-out/latency",
         Some(&json!({
             "type":"http",
@@ -727,7 +727,7 @@ async fn socks5_udp_inbound_routes_through_wireguard_userspace_outbound() {
             let connections = api_json(
                 &service.client,
                 &service.base_url,
-                reqwest::Method::GET,
+                http::Method::GET,
                 "/api/v2/connections",
                 None,
             )
@@ -735,7 +735,7 @@ async fn socks5_udp_inbound_routes_through_wireguard_userspace_outbound() {
             let logs = api_json(
                 &service.client,
                 &service.base_url,
-                reqwest::Method::POST,
+                http::Method::POST,
                 "/api/v2/rpc/tools.logs",
                 Some(&json!({})),
             )
@@ -785,7 +785,7 @@ async fn socks5_udp_inbound_routes_through_wireguard_userspace_outbound() {
     let total = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections/total",
         None,
     )

@@ -108,7 +108,7 @@ async fn wait_for_history(service: &ServiceProcess) -> serde_json::Value {
         let history = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/connections/history",
             None,
         )
@@ -158,7 +158,7 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::PUT,
+        http::Method::PUT,
         "/api/v2/nodes/http-out",
         Some(&updated_node),
     )
@@ -167,7 +167,7 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     let latency = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/nodes/http-out/latency",
         Some(&json!({
             "type":"tcp",
@@ -208,7 +208,7 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::PUT,
+        http::Method::PUT,
         "/api/v2/inbounds/http-chain-in",
         Some(&updated_inbound),
     )
@@ -221,7 +221,7 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::PUT,
+        http::Method::PUT,
         "/api/v2/inbounds/http-chain-in",
         Some(&disabled_inbound),
     )
@@ -231,7 +231,7 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::PUT,
+        http::Method::PUT,
         "/api/v2/inbounds/http-chain-in",
         Some(&updated_inbound),
     )
@@ -249,7 +249,7 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::PUT,
+        http::Method::PUT,
         "/api/v2/route/rules/proxy-example-test/0",
         Some(&json!({
             "mode":"direct",
@@ -263,7 +263,7 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     let route_test = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/route/rules/test",
         Some(&json!({"host":format!("localhost:{}", second.target.port())})),
     )
@@ -289,7 +289,7 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     let total = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections/total",
         None,
     )
@@ -312,7 +312,7 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     let traffic = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         &format!("/api/v2/connections/traffic?interval=hour&from={range_start}&to={range_end}"),
         None,
     )
@@ -335,7 +335,7 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     let nodes = api_json(
         &restarted.client,
         &restarted.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/nodes?page=1&pageSize=100",
         None,
     )
@@ -349,7 +349,7 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     let inbounds = api_json(
         &restarted.client,
         &restarted.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/inbounds?page=1&pageSize=100",
         None,
     )
@@ -363,7 +363,7 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     let persisted_total = api_json(
         &restarted.client,
         &restarted.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections/total",
         None,
     )
@@ -372,7 +372,7 @@ async fn api_mutations_reload_real_flow_and_survive_restart() {
     let persisted_history = api_json(
         &restarted.client,
         &restarted.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections/history",
         None,
     )
@@ -421,7 +421,7 @@ async fn api_tun_inbound_toggle_reloads_and_persists() {
     let saved = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::PUT,
+        http::Method::PUT,
         &path,
         Some(&config),
     )
@@ -434,7 +434,7 @@ async fn api_tun_inbound_toggle_reloads_and_persists() {
     let enabled = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::PUT,
+        http::Method::PUT,
         &path,
         Some(&config),
     )
@@ -447,7 +447,7 @@ async fn api_tun_inbound_toggle_reloads_and_persists() {
     let _ = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/info",
         None,
     )
@@ -457,7 +457,7 @@ async fn api_tun_inbound_toggle_reloads_and_persists() {
     let disabled = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::PUT,
+        http::Method::PUT,
         &path,
         Some(&config),
     )
@@ -469,7 +469,7 @@ async fn api_tun_inbound_toggle_reloads_and_persists() {
     let persisted = api_json(
         &restarted.client,
         &restarted.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         &path,
         None,
     )
@@ -533,7 +533,7 @@ async fn api_adds_and_removes_socks5_and_yuubinsya_inbounds_live() {
         connections = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/connections",
             None,
         )
@@ -572,7 +572,7 @@ async fn api_adds_and_removes_socks5_and_yuubinsya_inbounds_live() {
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::DELETE,
+        http::Method::DELETE,
         "/api/v2/inbounds/api-live-socks5-in",
         None,
     )
@@ -582,7 +582,7 @@ async fn api_adds_and_removes_socks5_and_yuubinsya_inbounds_live() {
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::DELETE,
+        http::Method::DELETE,
         "/api/v2/inbounds/api-live-yuubinsya-in",
         None,
     )
@@ -592,7 +592,7 @@ async fn api_adds_and_removes_socks5_and_yuubinsya_inbounds_live() {
     let inbounds = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/inbounds?page=1&pageSize=100",
         None,
     )

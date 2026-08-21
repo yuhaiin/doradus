@@ -1,7 +1,7 @@
 //! Privileged cross-crate smoke test for the first TUN DNS path.
 //!
 //! This deliberately uses an in-process HTTP/2 DoH peer.  It exercises the
-//! same `H2DohClient`, async resolver adapter, persistent FakeIP pool and
+//! same `DnsOverHttp`, async resolver adapter, persistent FakeIP pool and
 //! `TunProxyRuntime` that production code composes, without depending on an
 //! external network or a C-backed HTTP/TUN library.
 
@@ -22,7 +22,7 @@ use yuhaiin_core::dns::{
     AsyncDnsHandler, DnsRecordType, DnsResponse, decode_query, decode_response, encode_query,
     encode_response,
 };
-use yuhaiin_core::http2::{H2DohClient, H2DohConnector};
+use yuhaiin_core::dns_http::{DnsOverHttp, DnsOverHttpConnector, HttpConnection, HttpVersion};
 use yuhaiin_core::proxy::{
     AsyncDatagram, AsyncProxy, BoxAsyncStream, DropAsyncProxy, StaticProxySelector,
 };
@@ -43,10 +43,13 @@ const FAKEIP_END: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 14);
 #[derive(Clone, Copy)]
 struct InProcessDohConnector;
 
-impl H2DohConnector for InProcessDohConnector {
+impl DnsOverHttpConnector for InProcessDohConnector {
     type Stream = DuplexStream;
 
-    fn connect<'a>(&'a self, _uri: &'a http::Uri) -> BoxFuture<'a, CoreResult<Self::Stream>> {
+    fn connect<'a>(
+        &'a self,
+        _uri: &'a http::Uri,
+    ) -> BoxFuture<'a, CoreResult<HttpConnection<Self::Stream>>> {
         Box::pin(async {
             let (client, server) = tokio::io::duplex(16 * 1024);
             tokio::spawn(async move {
@@ -54,13 +57,16 @@ impl H2DohConnector for InProcessDohConnector {
                     eprintln!("in-process DoH server: {error}");
                 }
             });
-            Ok(client)
+            Ok(HttpConnection {
+                stream: client,
+                version: HttpVersion::Http2,
+            })
         })
     }
 }
 
 struct DohResolver {
-    client: H2DohClient<InProcessDohConnector>,
+    client: DnsOverHttp<InProcessDohConnector>,
 }
 
 impl AsyncDomainResolver for DohResolver {
@@ -290,7 +296,7 @@ async fn async_main() -> io::Result<()> {
         .map_err(|error| io::Error::other(error.to_string()))?,
     );
     let resolver = DohResolver {
-        client: H2DohClient::new(
+        client: DnsOverHttp::new(
             "https://in-process.invalid/dns-query"
                 .parse()
                 .map_err(|error| io::Error::other(format!("DoH URI: {error}")))?,

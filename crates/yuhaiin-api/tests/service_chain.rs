@@ -696,7 +696,7 @@ async fn configure_protocol_outbound_chain(
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/nodes",
         Some(&node),
     )
@@ -704,7 +704,7 @@ async fn configure_protocol_outbound_chain(
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         &format!("/api/v2/nodes/{node_id}/use"),
         None,
     )
@@ -726,7 +726,7 @@ async fn configure_protocol_outbound_chain(
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/inbounds",
         Some(&inbound),
     )
@@ -741,7 +741,7 @@ async fn configure_protocol_outbound_chain(
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/route/rules",
         Some(&rule),
     )
@@ -791,7 +791,7 @@ async fn configure_protocol_h2_outbound_chain(
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/nodes",
         Some(&node),
     )
@@ -799,7 +799,7 @@ async fn configure_protocol_h2_outbound_chain(
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         &format!("/api/v2/nodes/{node_id}/use"),
         None,
     )
@@ -820,7 +820,7 @@ async fn configure_protocol_h2_outbound_chain(
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/inbounds",
         Some(&inbound),
     )
@@ -834,7 +834,7 @@ async fn configure_protocol_h2_outbound_chain(
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/route/rules",
         Some(&rule),
     )
@@ -917,7 +917,7 @@ async fn run_protocol_h2_outbound_chain_on_host(kind: ProtocolOutboundKind, bind
     let latency = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         &format!("/api/v2/nodes/{node_id}/latency"),
         Some(&json!({
             "id": node_id,
@@ -1074,7 +1074,7 @@ async fn run_protocol_outbound_chain(kind: ProtocolOutboundKind) {
         connections = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/connections",
             None,
         )
@@ -1114,7 +1114,7 @@ async fn run_protocol_outbound_chain(kind: ProtocolOutboundKind) {
     let total = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections/total",
         None,
     )
@@ -1125,7 +1125,7 @@ async fn run_protocol_outbound_chain(kind: ProtocolOutboundKind) {
     let latency = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         &format!("/api/v2/nodes/{node_id}/latency"),
         Some(&json!({
             "id": node_id,
@@ -1366,7 +1366,7 @@ async fn http2_inbound_routes_through_http_outbound() {
             let logs = api_json(
                 &service.client,
                 &service.base_url,
-                reqwest::Method::POST,
+                http::Method::POST,
                 "/api/v2/rpc/tools.logs",
                 Some(&json!({})),
             )
@@ -1426,7 +1426,7 @@ async fn http2_inbound_routes_through_http_outbound() {
     let total = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections/total",
         None,
     )
@@ -1579,7 +1579,7 @@ async fn aead_http2_inbound_routes_through_http_outbound() {
     let total = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections/total",
         None,
     )
@@ -1855,7 +1855,7 @@ async fn tls_aead_http2_inbound_routes_through_http_outbound() {
     let total = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections/total",
         None,
     )
@@ -1953,7 +1953,7 @@ async fn run_h2_protocol_chain(protocol: H2FinalProtocol) {
     let latency = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         &format!("/api/v2/nodes/{node_id}/latency"),
         Some(&json!({"type":"tcp","url":"http://example.test:443/health"})),
     )
@@ -1984,7 +1984,7 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
     let configured_inbounds = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/inbounds?page=1&pageSize=100",
         None,
     )
@@ -2012,7 +2012,7 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
         let logs = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::POST,
+            http::Method::POST,
             "/api/v2/rpc/tools.logs",
             Some(&json!({})),
         )
@@ -2069,7 +2069,7 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
     let total = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections/total",
         None,
     )
@@ -2079,7 +2079,7 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
     let route_test = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/route/rules/test",
         Some(&json!({"host":authority})),
     )
@@ -2089,7 +2089,7 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
     let latency = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/nodes/http-out/latency",
         Some(&json!({
             "type":"tcp",
@@ -2111,7 +2111,7 @@ async fn http_inbound_routes_through_http_outbound_and_exposes_runtime_state() {
         let current = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/connections",
             None,
         )
@@ -2265,7 +2265,7 @@ async fn central_basic_user_authenticates_http_inbound_chain() {
     let user = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/users",
         Some(&json!({
             "id":"central-http-user",
@@ -2346,7 +2346,7 @@ async fn central_basic_user_authenticates_http_inbound_chain() {
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::PUT,
+        http::Method::PUT,
         &user_path,
         Some(&json!({
             "name":"Central HTTP user updated",
@@ -2399,7 +2399,7 @@ async fn central_basic_user_authenticates_http_inbound_chain() {
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::DELETE,
+        http::Method::DELETE,
         &user_path,
         None,
     )
@@ -2458,7 +2458,7 @@ async fn central_basic_user_authenticates_socks5_and_yuubinsya_inbounds() {
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/users",
         Some(&json!({
             "id":"central-required-user",
@@ -2552,7 +2552,7 @@ async fn central_basic_user_authenticates_socks5_and_yuubinsya_inbounds() {
         let current = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/connections",
             None,
         )
@@ -2671,7 +2671,7 @@ async fn http_inbound_routes_through_socks5_outbound() {
     let latency = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/nodes/socks5-out/latency",
         Some(&json!({
             "type":"tcp",
@@ -2966,7 +2966,7 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
         let logs = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::POST,
+            http::Method::POST,
             "/api/v2/rpc/tools.logs",
             Some(&json!({})),
         )
@@ -2974,7 +2974,7 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
         let inbounds = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/inbounds?page=1&pageSize=100",
             None,
         )
@@ -2982,7 +2982,7 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
         let connections = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/connections",
             None,
         )
@@ -3007,7 +3007,7 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
     let traffic = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         &format!("/api/v2/connections/traffic?interval=hour&from={range_start}&to={range_end}"),
         None,
     )
@@ -3025,7 +3025,7 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
     let telemetry = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         &format!("/api/v2/connections/telemetry?from={range_start}&to={range_end}&limit=6"),
         None,
     )
@@ -3046,7 +3046,7 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
     let failed_history = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::GET,
+        http::Method::GET,
         "/api/v2/connections/failed-history",
         None,
     )
@@ -3059,7 +3059,7 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
         let current = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/connections",
             None,
         )
@@ -3086,7 +3086,7 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
     let latency = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/nodes/tls-h2-yuubinsya-out/latency",
         Some(&json!({
             "type":"tcp",
@@ -3103,7 +3103,7 @@ async fn http_inbound_routes_through_tls_h2_yuubinsya_outbound() {
         let current = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/connections/history",
             None,
         )
@@ -3230,7 +3230,7 @@ async fn socks5_and_yuubinsya_inbounds_route_through_tls_h2_yuubinsya_outbound()
     let latency = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/nodes/tls-h2-yuubinsya-out/latency",
         Some(&json!({
             "type":"tcp",
@@ -3299,7 +3299,7 @@ async fn mixed_inbound_exposes_socks5_udp_and_keeps_supervisor_alive() {
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::PUT,
+        http::Method::PUT,
         "/api/v2/inbounds/mixed",
         Some(&mixed_config),
     )
@@ -3356,7 +3356,7 @@ async fn mixed_inbound_exposes_socks5_udp_and_keeps_supervisor_alive() {
     let logs = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/rpc/tools.logs",
         Some(&json!({})),
     )
@@ -3543,7 +3543,7 @@ async fn yuubinsya_native_udp_and_uot_inbounds_route_through_the_runtime_process
         snapshot = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/connections",
             None,
         )
@@ -3657,7 +3657,7 @@ async fn vless_and_trojan_inbounds_route_through_the_runtime_process() {
         snapshot = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/connections",
             None,
         )
@@ -3775,7 +3775,7 @@ async fn vless_and_trojan_udp_inbounds_route_through_the_runtime_process() {
         snapshot = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/connections",
             None,
         )
@@ -3915,7 +3915,7 @@ async fn reverse_inbounds_route_through_the_runtime_process() {
         connections = api_json(
             &service.client,
             &service.base_url,
-            reqwest::Method::GET,
+            http::Method::GET,
             "/api/v2/connections",
             None,
         )
@@ -4064,7 +4064,7 @@ async fn reverse_http_termination_service_chain(tls_termination: bool, standalon
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/nodes",
         Some(&node),
     )
@@ -4072,7 +4072,7 @@ async fn reverse_http_termination_service_chain(tls_termination: bool, standalon
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/nodes/reverse-http-termination/use",
         None,
     )
@@ -4089,7 +4089,7 @@ async fn reverse_http_termination_service_chain(tls_termination: bool, standalon
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/inbounds",
         Some(&inbound),
     )
@@ -4097,7 +4097,7 @@ async fn reverse_http_termination_service_chain(tls_termination: bool, standalon
     api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/route/rules",
         Some(&json!({
             "name":"reverse-http-termination-proxy",
@@ -4109,7 +4109,7 @@ async fn reverse_http_termination_service_chain(tls_termination: bool, standalon
     let route_test = api_json(
         &service.client,
         &service.base_url,
-        reqwest::Method::POST,
+        http::Method::POST,
         "/api/v2/route/rules/test",
         Some(&json!({"host":format!("127.0.0.1:{}", http_target.port())})),
     )

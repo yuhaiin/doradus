@@ -35,10 +35,12 @@ pub mod dns_tcp;
 pub use dns_tcp::{
     AsyncTcpDnsClient, AsyncTcpDnsHandler, AsyncTcpDnsServer, TcpDnsClient, TcpDnsServer,
 };
-#[cfg(feature = "http2")]
-pub mod http2;
-#[cfg(feature = "http2")]
-pub use http2::{H2DohClient, H2DohConnector, H2DohDnsHandler};
+#[cfg(feature = "http")]
+pub mod dns_http;
+#[cfg(feature = "http")]
+pub use dns_http::{
+    DnsOverHttp, DnsOverHttpConnector, DnsOverHttpHandler, HttpConnection, HttpVersion,
+};
 #[cfg(feature = "quic")]
 pub mod dns_quic;
 #[cfg(feature = "quic")]
@@ -48,6 +50,6 @@ pub mod dns_tls;
 #[cfg(feature = "tls")]
 pub use dns_tls::{
     DnsIoStream, DnsStreamConnector, DnsTlsConnector, DnsTlsResolverConfig, DohResolverFactory,
-    DotResolverFactory, RustCryptoH2Connector, RustCryptoTlsConnector, webpki_client_config,
+    DotResolverFactory, RustCryptoHttpConnector, RustCryptoTlsConnector, webpki_client_config,
 };
 mod transport;

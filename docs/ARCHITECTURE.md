@@ -996,7 +996,7 @@ workspace check，再跑 DNS/core 的可选 feature 测试；如果工作树正�
 | `dns_datagram.rs` | datagram abstraction | `AsyncDnsDatagram`、`DnsDatagramConnector` | 给 UDP/QUIC/代理 resolver 提供统一 datagram |
 | `dns_tcp.rs` | async TCP | `AsyncTcpDnsClient`、`AsyncTcpDnsServer` | 两字节 length-prefix 的 DNS over TCP 和 listener loop |
 | `dns_tls.rs` | DoT/DoH TLS glue | `DnsTlsConnector`、`DotResolverFactory`、`DohResolverFactory` | TLS stream、SNI/证书、resolver factory |
-| `http2.rs` | H2 DoH | `H2DohClient`、`H2DohDnsHandler` | 通过 H2 stream 发送 DNS POST/响应 |
+| `dns_http.rs` | DoH over HTTP | `DnsOverHttp`、`DnsOverHttpHandler` | 通过 Hyper 协商 HTTP/1.1 或 HTTP/2，发送 DNS POST/响应 |
 | `dns_quic.rs` | DoQ | `DoqClient`、`DoqResolverFactory` | QUIC stream/datagram 的 DNS framing |
 | `transport.rs` | socket bind helper | `bind_udp_socket` 等 | local address/interface policy，不包含 DNS policy |
 

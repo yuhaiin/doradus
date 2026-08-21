@@ -2,7 +2,7 @@
 
 mod support;
 
-use reqwest::{Method, StatusCode};
+use http::{Method, StatusCode};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -90,7 +90,10 @@ async fn expect_sse(service: &ServiceProcess, path: &str) {
     );
 }
 
-async fn next_sse_event(response: &mut reqwest::Response, buffer: &mut Vec<u8>) -> (String, Value) {
+async fn next_sse_event(
+    response: &mut support::HttpResponse,
+    buffer: &mut Vec<u8>,
+) -> (String, Value) {
     loop {
         if let Some(end) = buffer.windows(2).position(|window| window == b"\n\n") {
             let frame = buffer.drain(..end + 2).collect::<Vec<_>>();

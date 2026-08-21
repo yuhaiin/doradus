@@ -34,7 +34,9 @@ use yuhaiin_store::{GoResolverRuntimeConfig, GoResolverTransport};
 use crate::ConnectionMonitor;
 
 #[cfg(feature = "http2")]
-use yuhaiin_core::http2::{H2DohClient, H2DohConnector};
+use yuhaiin_core::dns_http::{DnsOverHttp, DnsOverHttpConnector};
+#[cfg(all(feature = "http2", test))]
+use yuhaiin_core::dns_http::{HttpConnection, HttpVersion};
 #[cfg(feature = "doh-tls")]
 use yuhaiin_dns::{
     DnsIoStream, DnsStreamConnector, DnsTlsResolverConfig, DohResolverFactory, DotResolverFactory,
@@ -631,14 +633,14 @@ fn next_transaction_id() -> u16 {
 /// the application can inject TLS verification, proxy dialing and bootstrap
 /// policy without making the store or runtime depend on a concrete client.
 #[cfg(feature = "http2")]
-pub struct H2DohResolverFactory<F, C> {
+pub struct DnsOverHttpResolverFactory<F, C> {
     pub builtin: BuiltinResolverFactory,
     pub connector: F,
     connector_type: PhantomData<fn() -> C>,
 }
 
 #[cfg(feature = "http2")]
-impl<F, C> H2DohResolverFactory<F, C> {
+impl<F, C> DnsOverHttpResolverFactory<F, C> {
     pub fn new(timeout: Duration, cache_capacity: usize, connector: F) -> Self {
         Self {
             builtin: BuiltinResolverFactory::new(timeout, cache_capacity),
@@ -649,17 +651,17 @@ impl<F, C> H2DohResolverFactory<F, C> {
 }
 
 #[cfg(feature = "http2")]
-impl<F, C> ResolverTransportFactory for H2DohResolverFactory<F, C>
+impl<F, C> ResolverTransportFactory for DnsOverHttpResolverFactory<F, C>
 where
     F: Fn(&GoResolverRuntimeConfig) -> Result<C> + Send + Sync,
-    C: H2DohConnector + 'static,
+    C: DnsOverHttpConnector + 'static,
 {
     fn build(&self, config: &GoResolverRuntimeConfig) -> Result<Arc<dyn AsyncIpResolver>> {
         if config.transport != GoResolverTransport::Doh {
             return self.builtin.build(config);
         }
         let endpoint = doh_endpoint(&config.host, &config.id)?;
-        let client = H2DohClient::new(endpoint, (self.connector)(config)?);
+        let client = DnsOverHttp::new(endpoint, (self.connector)(config)?);
         let resolver = AsyncDnsResolver::new(client)
             .with_cache(DnsCache::new(self.builtin.cache_capacity.max(1))?);
         Ok(Arc::new(TimeoutResolver::new(
@@ -1564,18 +1566,24 @@ mod tests {
     fn h2_doh_factory_constructs_a_cached_resolver_from_injected_connector() {
         struct DuplexConnector;
 
-        impl H2DohConnector for DuplexConnector {
+        impl DnsOverHttpConnector for DuplexConnector {
             type Stream = tokio::io::DuplexStream;
 
-            fn connect<'a>(&'a self, _uri: &'a http::Uri) -> BoxFuture<'a, Result<Self::Stream>> {
+            fn connect<'a>(
+                &'a self,
+                _uri: &'a http::Uri,
+            ) -> BoxFuture<'a, Result<HttpConnection<Self::Stream>>> {
                 Box::pin(async {
                     let (stream, _peer) = tokio::io::duplex(4096);
-                    Ok(stream)
+                    Ok(HttpConnection {
+                        stream,
+                        version: HttpVersion::Http2,
+                    })
                 })
             }
         }
 
-        let factory = H2DohResolverFactory::<_, DuplexConnector>::new(
+        let factory = DnsOverHttpResolverFactory::<_, DuplexConnector>::new(
             Duration::from_secs(1),
             8,
             |_config: &GoResolverRuntimeConfig| -> Result<DuplexConnector> { Ok(DuplexConnector) },

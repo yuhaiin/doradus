@@ -6,9 +6,18 @@ license.workspace = true
 
 [features]
 default = []
-http2 = ["dep:bytes", "dep:h2", "dep:http"]
+http = [
+    "dep:bytes",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+]
+# Compatibility feature name for callers that previously enabled DoH.
+# The client now negotiates HTTP/1.1 or HTTP/2 through Hyper.
+http2 = ["http"]
 tls = [
-    "http2",
+    "http",
     "dep:rustls",
     "dep:tokio-rustls",
     "dep:p256-tls-auto",
@@ -24,8 +33,10 @@ quic = ["dep:quinn", "dep:rustls", "dep:webpki-roots"]
 bytes = { version = "1.12.1", optional = true }
 futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
 hickory-proto = { version = "0.26.1", default-features = false, features = ["std"] }
-h2 = { version = "0.4.15", optional = true }
 http = { version = "1.5.0", optional = true }
+http-body-util = { version = "0.1.4", optional = true }
+hyper = { version = "1.11.0", default-features = false, features = ["client", "http1", "http2"], optional = true }
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"], optional = true }
 ed25519-tls-auto = { package = "ed25519-dalek", version = "2.2.0", optional = true, default-features = false, features = ["std", "pkcs8"] }
 p256-tls-auto = { package = "p256", version = "0.13.2", optional = true, default-features = false, features = ["ecdsa", "pem", "pkcs8", "std"] }
 quinn = { version = "0.11.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -43,6 +54,7 @@ yuhaiin-types = { path = "../yuhaiin-types" }
 workspace = true
 
 [dev-dependencies]
+hyper = { version = "1.11.0", default-features = false, features = ["server"] }
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls-pemfile = "2.2.0"
 
