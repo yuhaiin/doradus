@@ -47,17 +47,24 @@ pub trait ProxyInputInterceptor: Send {
 
 /// Independent deadlines for one TUN proxy flow.
 ///
-/// `connect` bounds proxy stream/datagram establishment, `read` bounds one
-/// inbound read, `write` bounds one outbound write, and `idle` bounds the
-/// period in which a flow may make no progress at all.  Keeping these
-/// meanings separate lets callers tune UDP idle expiry without accidentally
-/// shortening a TLS/HTTP2 connect or a large backpressured write.
+/// `connect` bounds proxy stream/datagram establishment, `write` bounds one
+/// outbound write, and `idle` bounds completion of a queued proxy output.
+/// TCP reads intentionally have no synthetic inactivity deadline: EOF and
+/// actual I/O errors own their lifetime, as in Go's stream relay. The
+/// UDP-specific deadlines below retain Go's 90-second idle semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProxyTimeouts {
     pub connect: Duration,
+    /// Retained for the shared timeout configuration; TCP reads do not use a
+    /// synthetic inactivity deadline. UDP reads use `udp_read` instead.
     pub read: Duration,
     pub write: Duration,
     pub idle: Duration,
+    /// Go's `UDPIdleTimeout` covers both the remote datagram read deadline
+    /// and the idle lifetime of the UDP source. Keep those separate from the
+    /// TCP flow deadlines so the two runtimes share the same UDP behavior.
+    pub udp_read: Duration,
+    pub udp_idle: Duration,
 }
 
 impl ProxyTimeouts {
@@ -67,6 +74,8 @@ impl ProxyTimeouts {
             read: timeout,
             write: timeout,
             idle: timeout,
+            udp_read: timeout,
+            udp_idle: timeout,
         };
         timeouts.validate()?;
         Ok(timeouts)
@@ -77,6 +86,8 @@ impl ProxyTimeouts {
             || self.read.is_zero()
             || self.write.is_zero()
             || self.idle.is_zero()
+            || self.udp_read.is_zero()
+            || self.udp_idle.is_zero()
         {
             return Err(Error::invalid("TUN proxy timeouts must be non-zero"));
         }
@@ -87,11 +98,31 @@ impl ProxyTimeouts {
 impl Default for ProxyTimeouts {
     fn default() -> Self {
         Self {
-            connect: Duration::from_secs(30),
+            // Go wraps inbound stream/datagram setup in configuration.Timeout
+            // (16 seconds), rather than the 30-second post-connect read
+            // watchdog that this runtime used previously.
+            connect: Duration::from_secs(16),
             read: Duration::from_secs(30),
             write: Duration::from_secs(30),
             idle: Duration::from_secs(30),
+            udp_read: Duration::from_secs(90),
+            udp_idle: Duration::from_secs(90),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProxyTimeouts;
+    use std::time::Duration;
+
+    #[test]
+    fn defaults_match_go_flow_timeouts() {
+        let timeouts = ProxyTimeouts::default();
+
+        assert_eq!(timeouts.connect, Duration::from_secs(16));
+        assert_eq!(timeouts.udp_read, Duration::from_secs(90));
+        assert_eq!(timeouts.udp_idle, Duration::from_secs(90));
     }
 }
 

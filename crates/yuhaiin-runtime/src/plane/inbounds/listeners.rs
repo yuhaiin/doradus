@@ -688,13 +688,16 @@ async fn run_tun_owner(
         let owner_id = tun_owner_id(&config);
         let mut reload_already_received = false;
         if config.enabled {
-            monitor.info(format!(
-                "TUN inbound started name={}",
-                config.tun.name.as_deref().unwrap_or("<unnamed>")
-            ));
             let result = match &mut source {
                 TunSource::Desktop => match crate::data_plane::open_tun(&config) {
                     Ok(tun) => {
+                        monitor.info(format!(
+                            "TUN inbound started name={}",
+                            tun.name()
+                                .ok()
+                                .or_else(|| config.tun.name.clone())
+                                .unwrap_or_else(|| "<unnamed>".to_owned())
+                        ));
                         crate::run_tun_device_until(
                             controller.clone(),
                             tun,
@@ -706,6 +709,13 @@ async fn run_tun_owner(
                     Err(error) => Err(error),
                 },
                 TunSource::Injected(tun) => {
+                    monitor.info(format!(
+                        "TUN inbound started name={}",
+                        tun.name()
+                            .ok()
+                            .or_else(|| config.tun.name.clone())
+                            .unwrap_or_else(|| "<unnamed>".to_owned())
+                    ));
                     crate::run_tun_device_until_ref(
                         controller.clone(),
                         tun,

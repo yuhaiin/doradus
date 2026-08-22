@@ -295,7 +295,7 @@ async fn tcp_input_backpressure_releases_only_the_affected_flow() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn idle_timeout_closes_quiet_tcp_flow_and_releases_nat() {
+async fn quiet_tcp_flow_stays_until_local_close_and_releases_nat() {
     use crate::proxy::{AsyncProxy, DirectAsyncProxy, StaticProxySelector};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -323,6 +323,8 @@ async fn idle_timeout_closes_quiet_tcp_flow_and_releases_nat() {
             read: Duration::from_secs(1),
             write: Duration::from_secs(1),
             idle: Duration::from_millis(10),
+            udp_read: Duration::from_secs(1),
+            udp_idle: Duration::from_millis(10),
         })
         .unwrap();
     let flow = TunFlowKey {
@@ -343,6 +345,13 @@ async fn idle_timeout_closes_quiet_tcp_flow_and_releases_nat() {
             break;
         }
     }
+    assert_eq!(runtime.task_len(), 1);
+    assert_eq!(runtime.nat_len().unwrap(), 1);
+    runtime
+        .handle_proxy_input(ProxyInput::TcpClosed {
+            flow: TunFlow { key: flow },
+        })
+        .unwrap();
     assert_eq!(runtime.task_len(), 0);
     assert_eq!(runtime.nat_len().unwrap(), 0);
     server.abort();
@@ -422,6 +431,8 @@ async fn idle_timeout_closes_quiet_udp_source_and_releases_full_cone_nat() {
             read: Duration::from_secs(1),
             write: Duration::from_secs(1),
             idle: Duration::from_millis(10),
+            udp_read: Duration::from_secs(1),
+            udp_idle: Duration::from_millis(10),
         })
         .unwrap();
     let flow = TunFlow {
@@ -626,6 +637,8 @@ async fn full_cone_udp_output_backpressure_closes_datagram_and_releases_nat() {
             read: Duration::from_secs(1),
             write: Duration::from_secs(1),
             idle: Duration::from_millis(10),
+            udp_read: Duration::from_secs(1),
+            udp_idle: Duration::from_millis(10),
         })
         .unwrap();
     let flow = TunFlow {

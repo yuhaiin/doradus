@@ -63,7 +63,8 @@ const SCHEMA_VERSION: i64 = 3;
 // Later versions still fail closed until their table/enum contracts are
 // audited.
 const MAX_SUPPORTED_GO_SCHEMA_VERSION: i64 = 7;
-pub const DEFAULT_NAT_IDLE_TIMEOUT_MS: i64 = 30_000;
+/// Matches Go's default `configuration.UDPIdleTimeout` (90 seconds).
+pub const DEFAULT_NAT_IDLE_TIMEOUT_MS: i64 = 90_000;
 const BUSY_RETRY_ATTEMPTS: usize = 64;
 const BUSY_RETRY_MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
 const STARTUP_COMPACT_MIN_FREE_BYTES: i64 = 4 << 20;

@@ -3,12 +3,15 @@ SHELL := /bin/bash
 CARGO ?= cargo
 RUSTC ?= rustc
 CACHE_ROOT ?= $(HOME)/.cache/yuhaiin-rust
-CARGO_TARGET_DIR ?= $(CACHE_ROOT)/cargo-target
+# Empty means Cargo's native repository-local `target/` directory. Set this
+# explicitly when a separate target directory is desired.
+CARGO_TARGET_DIR ?=
 PODMAN_CARGO ?= ./scripts/integration/podman-cargo.sh
 PODMAN_CARGO_STATE_DIR ?= $(CACHE_ROOT)/integration/make-cargo
-# Cargo/rustc commands are containerized by default. Set HOST_CARGO=1 only for
-# local toolchain debugging; integration tests remain Podman-owned either way.
-HOST_CARGO ?= 0
+# Use the system Cargo/rustc by default. Set HOST_CARGO=0 to opt into the
+# disposable Podman build adapter; integration tests remain Podman-owned where
+# they need isolated networking, services, or kernel capabilities.
+HOST_CARGO ?= 1
 ANDROID_NDK ?= /opt/android-ndk
 ANDROID_API ?= 35
 ANDROID_TARGET ?= aarch64-linux-android
@@ -19,11 +22,14 @@ MUSL_HOST_ARCH ?= $(shell uname -m)
 # Build a native musl binary by default.  Keep MUSL_TARGET overridable for
 # deliberate cross builds, which must also provide a matching C toolchain.
 MUSL_TARGET ?= $(if $(filter aarch64 arm64,$(MUSL_HOST_ARCH)),aarch64-unknown-linux-musl,x86_64-unknown-linux-musl)
+PODMAN_TARGET_DIR := $(if $(strip $(CARGO_TARGET_DIR)),$(CARGO_TARGET_DIR),$(CACHE_ROOT)/cargo-target)
 ifeq ($(HOST_CARGO),1)
+CARGO_OUTPUT_DIR := $(if $(strip $(CARGO_TARGET_DIR)),$(CARGO_TARGET_DIR),target)
 RUST_SYSROOT ?= $(shell $(RUSTC) --print sysroot)
 RUST_HOST ?= $(shell $(RUSTC) -vV | sed -n 's/^host: //p')
 MUSL_LINKER ?= $(RUST_SYSROOT)/lib/rustlib/$(RUST_HOST)/bin/rust-lld
 else
+CARGO_OUTPUT_DIR := $(PODMAN_TARGET_DIR)
 # The container owns rustc/rust-lld in the default path; avoid invoking a
 # host compiler merely while Make expands variables.
 MUSL_LINKER ?= rust-lld
@@ -34,17 +40,17 @@ endif
 FEATURES ?=
 NO_DEFAULT_FEATURES ?= 0
 
-CARGO_COMMON_ARGS := --target-dir "$(CARGO_TARGET_DIR)"
+CARGO_COMMON_ARGS := $(if $(strip $(CARGO_TARGET_DIR)),--target-dir "$(CARGO_TARGET_DIR)",)
 ifeq ($(MUSL),1)
 CARGO_TARGET_ARGS := --target "$(MUSL_TARGET)"
 CARGO_BUILD_ENV := RUSTFLAGS="$(RUSTFLAGS) -C linker=$(MUSL_LINKER)"
-DEBUG_BINARY_DIR := $(CARGO_TARGET_DIR)/$(MUSL_TARGET)/debug
-RELEASE_BINARY_DIR := $(CARGO_TARGET_DIR)/$(MUSL_TARGET)/release
+DEBUG_BINARY_DIR := $(CARGO_OUTPUT_DIR)/$(MUSL_TARGET)/debug
+RELEASE_BINARY_DIR := $(CARGO_OUTPUT_DIR)/$(MUSL_TARGET)/release
 else
 CARGO_TARGET_ARGS :=
 CARGO_BUILD_ENV :=
-DEBUG_BINARY_DIR := $(CARGO_TARGET_DIR)/debug
-RELEASE_BINARY_DIR := $(CARGO_TARGET_DIR)/release
+DEBUG_BINARY_DIR := $(CARGO_OUTPUT_DIR)/debug
+RELEASE_BINARY_DIR := $(CARGO_OUTPUT_DIR)/release
 endif
 ifeq ($(HOST_CARGO),1)
 CARGO_EXEC := $(CARGO)
@@ -65,9 +71,9 @@ CARGO_EXEC_PODMAN_ENV :=
 CARGO_EXEC_PODMAN_TARGET :=
 CARGO_EXEC_PODMAN_MUSL :=
 endif
-CARGO_EXEC := $(PODMAN_CARGO) --target-dir "$(CARGO_TARGET_DIR)" --state-dir "$(PODMAN_CARGO_STATE_DIR)" $(CARGO_EXEC_PODMAN_ENV) $(CARGO_EXEC_PODMAN_TARGET) $(CARGO_EXEC_PODMAN_MUSL) -- cargo
-CARGO_CLIPPY_EXEC := $(PODMAN_CARGO) --target-dir "$(CARGO_TARGET_DIR)" --state-dir "$(PODMAN_CARGO_STATE_DIR)" $(CARGO_EXEC_PODMAN_ENV) $(CARGO_EXEC_PODMAN_TARGET) $(CARGO_EXEC_PODMAN_MUSL) --install-component clippy -- cargo
-CARGO_FMT_CHECK_EXEC := $(PODMAN_CARGO) --target-dir "$(CARGO_TARGET_DIR)" --state-dir "$(PODMAN_CARGO_STATE_DIR)" --install-component rustfmt -- cargo
+CARGO_EXEC := $(PODMAN_CARGO) --target-dir "$(PODMAN_TARGET_DIR)" --state-dir "$(PODMAN_CARGO_STATE_DIR)" $(CARGO_EXEC_PODMAN_ENV) $(CARGO_EXEC_PODMAN_TARGET) $(CARGO_EXEC_PODMAN_MUSL) -- cargo
+CARGO_CLIPPY_EXEC := $(PODMAN_CARGO) --target-dir "$(PODMAN_TARGET_DIR)" --state-dir "$(PODMAN_CARGO_STATE_DIR)" $(CARGO_EXEC_PODMAN_ENV) $(CARGO_EXEC_PODMAN_TARGET) $(CARGO_EXEC_PODMAN_MUSL) --install-component clippy -- cargo
+CARGO_FMT_CHECK_EXEC := $(PODMAN_CARGO) --target-dir "$(PODMAN_TARGET_DIR)" --state-dir "$(PODMAN_CARGO_STATE_DIR)" --install-component rustfmt -- cargo
 endif
 ifeq ($(HOST_CARGO),1)
 CARGO_CLIPPY_EXEC := $(CARGO)
@@ -94,9 +100,9 @@ help:
 		'make cache-usage        show generated Rust cache usage' \
 		'make cache-prune        remove stale integration outputs; preserve cargo-target/fixtures' \
 		'make checklist-check    verify module coverage counts in IMPLEMENTATION_CHECKLIST.md' \
-		'make build              build the yuhaiin runtime binary in Podman (debug)' \
-		'make build-release      build the yuhaiin runtime binary in Podman (release)' \
-		'make build MUSL=1       build a static musl debug binary in Podman' \
+		'make build              build the yuhaiin runtime binary with system Rust (debug)' \
+		'make build-release      build the yuhaiin runtime binary with system Rust (release)' \
+		'make build MUSL=1       build a static musl debug binary with the local toolchain' \
 		'make build-musl         alias for make build MUSL=1' \
 		'make build-release-musl build a static musl release binary (native arch by default)' \
 		'make build-all-bins     build every workspace binary' \
@@ -158,11 +164,11 @@ help:
 		'make test               run the full workspace test suite' \
 		'make fmt-check          verify Rust formatting' \
 		'make clippy             run workspace Clippy checks' \
-		'HOST_CARGO=1           opt into host Cargo only for local toolchain debugging' \
+		'HOST_CARGO=0           opt into the Podman Cargo build adapter' \
 		'YUHAIIN_TEST_IMAGE=... override the Podman integration image (default Debian)' \
 		'make android-aarch64   cross-build for Android arm64' \
 		'' \
-		'CARGO_TARGET_DIR=$(CARGO_TARGET_DIR)' \
+		'CARGO_TARGET_DIR=$(CARGO_OUTPUT_DIR)' \
 		'FEATURES=$(FEATURES)' \
 		'NO_DEFAULT_FEATURES=$(NO_DEFAULT_FEATURES)' \
 		'MUSL=$(MUSL) MUSL_TARGET=$(MUSL_TARGET) MUSL_LINKER=$(MUSL_LINKER)'
@@ -197,11 +203,11 @@ build-all-bins:
 
 build-tun-smoke:
 	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p yuhaiin-core --bin tun-smoke --features tun
-	@printf 'binary: %s/debug/tun-smoke\n' "$(CARGO_TARGET_DIR)"
+	@printf 'binary: %s/debug/tun-smoke\n' "$(CARGO_OUTPUT_DIR)"
 
 build-tun-service-smoke:
 	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p $(RUNTIME_PACKAGE) --bin tun-service-smoke --all-features
-	@printf 'binary: %s/debug/tun-service-smoke\n' "$(CARGO_TARGET_DIR)"
+	@printf 'binary: %s/debug/tun-service-smoke\n' "$(CARGO_OUTPUT_DIR)"
 
 tun-service-smoke:
 	./scripts/integration/tun-service.sh
@@ -265,7 +271,7 @@ s3-minio-smoke:
 
 build-transparent-service-smoke:
 	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p $(RUNTIME_PACKAGE) --bin transparent-service-smoke --all-features
-	@printf 'binary: %s/debug/transparent-service-smoke\n' "$(CARGO_TARGET_DIR)"
+	@printf 'binary: %s/debug/transparent-service-smoke\n' "$(CARGO_OUTPUT_DIR)"
 
 transparent-service-smoke:
 	./scripts/integration/transparent-service.sh
@@ -364,7 +370,7 @@ startup-logs-smoke:
 
 build-chain-smoke:
 	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p yuhaiin-chain --bin chain-smoke
-	@printf 'binary: %s/debug/chain-smoke\n' "$(CARGO_TARGET_DIR)"
+	@printf 'binary: %s/debug/chain-smoke\n' "$(CARGO_OUTPUT_DIR)"
 
 run:
 	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) run $(CARGO_EXEC_COMMON_ARGS) -p $(API_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS) -- $(ARGS)
@@ -408,4 +414,4 @@ android-aarch64:
 	AR_aarch64_linux_android="$(ANDROID_LLVM_AR)" \
 	CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$(ANDROID_CLANG)" \
 		$(CARGO) build $(CARGO_COMMON_ARGS) --target $(ANDROID_TARGET) --release -p $(API_PACKAGE) --bin $(RUNTIME_BIN) $(FEATURE_ARGS)
-	@printf 'binary: %s/%s/release/%s\n' "$(CARGO_TARGET_DIR)" "$(ANDROID_TARGET)" "$(RUNTIME_BIN)"
+	@printf 'binary: %s/%s/release/%s\n' "$(CARGO_OUTPUT_DIR)" "$(ANDROID_TARGET)" "$(RUNTIME_BIN)"

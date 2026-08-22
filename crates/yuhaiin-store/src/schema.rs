@@ -149,7 +149,7 @@ pub(super) fn typed_schema_sql() -> &'static str {
     CREATE TABLE IF NOT EXISTS nat_config (
         key TEXT PRIMARY KEY NOT NULL,
         full_cone INTEGER NOT NULL DEFAULT 1,
-        idle_timeout_ms INTEGER NOT NULL DEFAULT 30000,
+        idle_timeout_ms INTEGER NOT NULL DEFAULT 90000,
         CHECK (full_cone = 1)
     );
     CREATE TABLE IF NOT EXISTS maxmind_metadata (

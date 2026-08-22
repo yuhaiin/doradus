@@ -133,7 +133,7 @@ impl TunRoute {
 ///
 /// Keeping this trait independent of netlink makes all ordering and rollback
 /// behavior testable without CAP_NET_ADMIN. The production Linux backend is
-/// implemented below with the pure-Rust `route_manager` netlink client.
+/// implemented below with the pure-Rust `route_manager` client.
 #[cfg(feature = "tun-routes")]
 pub trait TunRouteBackend {
     fn add_route(&mut self, route: &TunRoute) -> io::Result<()>;
@@ -279,6 +279,106 @@ impl TunRouteBackend for LinuxTunRouteBackend {
     }
 
     fn remove_route(&mut self, route: &TunRoute) -> io::Result<()> {
+        self.manager.delete(&self.system_route(route))
+    }
+}
+
+/// macOS route backend for utun devices.
+///
+/// Darwin routes need an actual next-hop address for an utun interface.  The
+/// Go implementation uses the configured portal address as that gateway, so
+/// this backend applies the same fallback when a route did not specify one.
+#[cfg(all(feature = "tun-routes", target_os = "macos"))]
+pub struct MacosTunRouteBackend {
+    interface: String,
+    ipv4_gateway: Option<Ipv4Addr>,
+    ipv6_gateway: Option<Ipv6Addr>,
+    manager: route_manager::RouteManager,
+    preexisting: Vec<TunRoute>,
+}
+
+#[cfg(all(feature = "tun-routes", target_os = "macos"))]
+impl MacosTunRouteBackend {
+    pub fn new(
+        interface: impl Into<String>,
+        ipv4_gateway: Option<Ipv4Addr>,
+        ipv6_gateway: Option<Ipv6Addr>,
+    ) -> io::Result<Self> {
+        let interface = interface.into();
+        if interface.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TUN route interface name must not be empty",
+            ));
+        }
+        Ok(Self {
+            interface,
+            ipv4_gateway,
+            ipv6_gateway,
+            manager: route_manager::RouteManager::new()?,
+            preexisting: Vec::new(),
+        })
+    }
+
+    fn gateway_for(&self, route: &TunRoute) -> Option<IpAddr> {
+        route.gateway.or_else(|| match route.destination {
+            IpAddr::V4(_) => self.ipv4_gateway.map(IpAddr::V4),
+            IpAddr::V6(_) => self.ipv6_gateway.map(IpAddr::V6),
+        })
+    }
+
+    fn system_route(&self, route: &TunRoute) -> route_manager::Route {
+        let gateway = self.gateway_for(route);
+        let mut system_route = route_manager::Route::new(route.network(), route.prefix)
+            .with_if_name(self.interface.clone());
+        if let Some(gateway) = gateway {
+            system_route = system_route.with_gateway(gateway);
+        }
+        system_route
+    }
+
+    fn already_present(&mut self, route: &TunRoute) -> io::Result<bool> {
+        let destination = route.network();
+        let gateway = self.gateway_for(route);
+        let present = self.manager.list()?.into_iter().any(|existing| {
+            existing.destination() == destination
+                && existing.prefix() == route.prefix
+                && existing.gateway() == gateway
+                && existing
+                    .if_name()
+                    .is_none_or(|interface| interface == &self.interface)
+        });
+        if present && !self.preexisting.contains(route) {
+            self.preexisting.push(route.clone());
+        }
+        Ok(present)
+    }
+}
+
+#[cfg(all(feature = "tun-routes", target_os = "macos"))]
+impl TunRouteBackend for MacosTunRouteBackend {
+    fn add_route(&mut self, route: &TunRoute) -> io::Result<()> {
+        if self.already_present(route)? {
+            return Ok(());
+        }
+        match self.manager.add(&self.system_route(route)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if self.already_present(route)? {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn remove_route(&mut self, route: &TunRoute) -> io::Result<()> {
+        if let Some(index) = self.preexisting.iter().position(|owned| owned == route) {
+            self.preexisting.swap_remove(index);
+            return Ok(());
+        }
         self.manager.delete(&self.system_route(route))
     }
 }

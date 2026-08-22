@@ -71,14 +71,19 @@ done
 (($# > 0)) || usage
 mkdir -p "${target_dir}" "${state_dir}" "${cargo_home}"
 
-podman run --rm --network=host \
-  "${podman_env_args[@]}" \
-  -v "${repo_root}:/workspace:ro" \
-  -v "${target_dir}:/target:Z" \
-  -v "${state_dir}:/state:Z" \
-  -v "${cargo_home}:/cargo-home:Z" \
-  --entrypoint /bin/sh "${image}" \
-  -ec '
+podman_cmd=(podman run --rm --network=host)
+if ((${#podman_env_args[@]} > 0)); then
+  podman_cmd+=("${podman_env_args[@]}")
+fi
+podman_cmd+=(
+  -v "${repo_root}:/workspace:ro"
+  -v "${target_dir}:/target:Z"
+  -v "${state_dir}:/state:Z"
+  -v "${cargo_home}:/cargo-home:Z"
+  --entrypoint /bin/sh "${image}"
+)
+
+"${podman_cmd[@]}" -ec '
     set -eu
     install_musl_toolchain="$1"
     install_target="$2"

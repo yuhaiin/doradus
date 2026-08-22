@@ -10,6 +10,60 @@ pub use tun_rs::AsyncDevice;
 #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
 pub use tun_rs::DeviceBuilder;
 
+/// Pick the same macOS utun name that the Go implementation uses before it
+/// asks the kernel to create the device. `tun-rs` treats an explicit
+/// `utunN` name as a fixed control-unit request, so passing a configured
+/// `utun0` through unchanged fails when macOS already owns that unit.
+pub(crate) fn choose_macos_tun_name<'a>(
+    configured_name: Option<&str>,
+    existing_names: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut name = configured_name
+        .filter(|name| name.starts_with("utun"))
+        .unwrap_or("utun0")
+        .to_owned();
+    let mut requested_name_exists = false;
+    let mut max_index = None;
+
+    for existing_name in existing_names {
+        if existing_name == name {
+            requested_name_exists = true;
+        }
+        let Some(index) = existing_name
+            .strip_prefix("utun")
+            .and_then(|suffix| suffix.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        max_index = Some(max_index.map_or(index, |current: u32| current.max(index)));
+    }
+
+    if requested_name_exists {
+        name = format!("utun{}", max_index.unwrap_or(0).saturating_add(1));
+    }
+    name
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn resolve_macos_tun_name(configured_name: Option<&str>) -> String {
+    let existing_names = getifaddrs::getifaddrs()
+        .map(|interfaces| {
+            interfaces
+                .map(|interface| interface.name)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    choose_macos_tun_name(configured_name, existing_names.iter().map(String::as_str))
+}
+
+pub(crate) fn next_macos_tun_name(name: &str) -> String {
+    let index = name
+        .strip_prefix("utun")
+        .and_then(|suffix| suffix.parse::<u32>().ok())
+        .unwrap_or(0);
+    format!("utun{}", index.saturating_add(1))
+}
+
 #[cfg(unix)]
 use std::os::fd::{IntoRawFd, OwnedFd};
 
@@ -98,4 +152,43 @@ pub fn enable_loopback() -> std::io::Result<()> {
 #[cfg(not(target_os = "linux"))]
 pub fn enable_loopback() -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{choose_macos_tun_name, next_macos_tun_name};
+
+    #[test]
+    fn macos_tun_name_defaults_to_utun0_when_free() {
+        assert_eq!(choose_macos_tun_name(None, ["en0", "lo"]), "utun0");
+    }
+
+    #[test]
+    fn macos_tun_name_uses_the_highest_existing_index_when_requested_name_exists() {
+        assert_eq!(
+            choose_macos_tun_name(Some("utun0"), ["utun0", "utun1", "utun3"]),
+            "utun4"
+        );
+    }
+
+    #[test]
+    fn macos_tun_name_keeps_a_free_explicit_name() {
+        assert_eq!(
+            choose_macos_tun_name(Some("utun10"), ["utun0", "utun3"]),
+            "utun10"
+        );
+    }
+
+    #[test]
+    fn macos_tun_name_normalizes_non_utun_names() {
+        assert_eq!(
+            choose_macos_tun_name(Some("tun0"), ["utun0", "utun2"]),
+            "utun3"
+        );
+    }
+
+    #[test]
+    fn macos_tun_name_retry_advances_the_control_unit() {
+        assert_eq!(next_macos_tun_name("utun4"), "utun5");
+    }
 }

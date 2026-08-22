@@ -14,6 +14,8 @@ impl ProxyInputInterceptor for PassthroughInputInterceptor {
 }
 
 const DEFAULT_TUN_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(target_os = "macos")]
+const MACOS_TUN_OPEN_ATTEMPTS: usize = 64;
 
 struct TunWrite {
     packet: Vec<u8>,
@@ -23,6 +25,21 @@ struct TunWrite {
 struct TunWriter {
     tx: mpsc::Sender<TunWrite>,
     join: tokio::task::JoinHandle<io::Result<()>>,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
+fn build_async_device(config: &TunConfig) -> io::Result<AsyncDevice> {
+    let mut builder = DeviceBuilder::new().mtu(config.mtu as u16);
+    if let Some(name) = config.name.as_deref() {
+        builder = builder.name(name);
+    }
+    if let Some((address, prefix)) = config.ipv4 {
+        builder = builder.ipv4(address, prefix, None);
+    }
+    for (address, prefix) in &config.ipv6 {
+        builder = builder.ipv6(*address, *prefix);
+    }
+    builder.build_async()
 }
 
 impl Drop for TunWriter {
@@ -160,22 +177,37 @@ impl TunRuntime {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
-    pub fn open(config: TunConfig) -> io::Result<Self> {
+    pub fn open(mut config: TunConfig) -> io::Result<Self> {
         config
             .validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let mut builder = DeviceBuilder::new().mtu(config.mtu as u16);
-        if let Some(name) = config.name.as_deref() {
-            builder = builder.name(name);
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut name = platform::resolve_macos_tun_name(config.name.as_deref());
+            for _ in 0..MACOS_TUN_OPEN_ATTEMPTS {
+                config.name = Some(name.clone());
+                match build_async_device(&config) {
+                    Ok(device) => return Self::from_async_device(config, device),
+                    Err(error) if error.kind() == io::ErrorKind::ResourceBusy => {
+                        name = platform::next_macos_tun_name(&name);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!(
+                    "no available macOS utun interface after {MACOS_TUN_OPEN_ATTEMPTS} attempts"
+                ),
+            ));
         }
-        if let Some((address, prefix)) = config.ipv4 {
-            builder = builder.ipv4(address, prefix, None);
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let device = build_async_device(&config)?;
+            Self::from_async_device(config, device)
         }
-        for (address, prefix) in &config.ipv6 {
-            builder = builder.ipv6(*address, *prefix);
-        }
-        let device = builder.build_async()?;
-        Self::from_async_device(config, device)
     }
 
     /// Mobile platforms receive their TUN from the host VPN API rather than
@@ -275,6 +307,24 @@ impl TunRuntime {
     pub fn install_linux_routes(&mut self, routes: &[TunRoute]) -> io::Result<()> {
         let interface = self.device.name()?;
         self.install_routes(LinuxTunRouteBackend::new(interface)?, routes)
+    }
+
+    /// Install routes through Darwin's route socket for the utun device.
+    ///
+    /// The portal addresses are used as implicit gateways, matching the Go
+    /// implementation. Explicit per-route gateways still take precedence.
+    #[cfg(all(feature = "tun-routes", target_os = "macos"))]
+    pub fn install_macos_routes(
+        &mut self,
+        routes: &[TunRoute],
+        ipv4_gateway: Option<Ipv4Addr>,
+        ipv6_gateway: Option<Ipv6Addr>,
+    ) -> io::Result<()> {
+        let interface = self.device.name()?;
+        self.install_routes(
+            MacosTunRouteBackend::new(interface, ipv4_gateway, ipv6_gateway)?,
+            routes,
+        )
     }
 
     /// Remove all routes owned by this runtime. Failed removals remain tracked

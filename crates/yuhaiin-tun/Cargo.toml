@@ -28,6 +28,9 @@ path = "src/bin/tun_smoke.rs"
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
 route_manager = { version = "0.2.13", optional = true, default-features = false }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+getifaddrs = "0.6.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.30.1", default-features = false, features = ["net"] }
 netlink-packet-core = "0.8.2"

@@ -14,10 +14,11 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  HOST_CARGO: 1
 
 jobs:
   checks:
-    name: Checks and container tests
+    name: Checks and isolated integration tests
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -31,7 +32,7 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Install Podman
+      - name: Install Podman for isolated integration tests
         run: |
           sudo apt-get update
           sudo apt-get install --yes podman

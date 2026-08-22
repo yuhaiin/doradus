@@ -4,7 +4,11 @@
 //! `PacketTunnelProvider`, and future embedders can create their platform TUN
 //! device themselves and hand the owned [`TunRuntime`] to the same runner.
 
-#[cfg(all(feature = "tun", feature = "tun-routes", target_os = "linux"))]
+#[cfg(all(
+    feature = "tun",
+    feature = "tun-routes",
+    any(target_os = "linux", target_os = "macos")
+))]
 use std::net::IpAddr;
 #[cfg(feature = "tun")]
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -532,7 +536,11 @@ fn parse_ipv6_string(value: &Value) -> Option<(Ipv6Addr, u8)> {
     Some((address.parse().ok()?, prefix.parse().ok()?))
 }
 
-#[cfg(all(feature = "tun", feature = "tun-routes", target_os = "linux"))]
+#[cfg(all(
+    feature = "tun",
+    feature = "tun-routes",
+    any(target_os = "linux", target_os = "macos")
+))]
 fn parse_tun_routes(routes: &[String]) -> Result<Vec<yuhaiin_tun::TunRoute>> {
     routes
         .iter()
@@ -562,6 +570,7 @@ pub(crate) fn open_tun(config: &TunRuntimeConfig) -> Result<yuhaiin_tun::TunRunt
             &tun_dns_servers(&config.tun),
         );
     }
+    #[cfg(not(all(feature = "tun-routes", target_os = "macos")))]
     if config.routes.is_empty() {
         return Ok(tun);
     }
@@ -589,12 +598,42 @@ pub(crate) fn open_tun(config: &TunRuntimeConfig) -> Result<yuhaiin_tun::TunRunt
         tun.install_linux_routes(&routes).map_err(io_error)?;
         Ok(tun)
     }
-    #[cfg(not(all(feature = "tun-routes", target_os = "linux")))]
+    #[cfg(all(feature = "tun-routes", target_os = "macos"))]
+    {
+        let mut routes = parse_tun_routes(&config.routes)?;
+        // Go's Darwin route setup always adds the portal subnet as a route
+        // for the DNS/virtual gateway, even when the user supplied no other
+        // route. The address itself is the next hop on the utun interface.
+        if let Some((address, prefix)) = config.tun.ipv4
+            && let Some(destination) = u32::from(address).checked_add(1).map(Ipv4Addr::from)
+        {
+            let portal_route = yuhaiin_tun::TunRoute::new(IpAddr::V4(destination), prefix)?;
+            if !routes.iter().any(|route| {
+                route.network() == portal_route.network() && route.prefix == portal_route.prefix
+            }) {
+                routes.push(portal_route);
+            }
+        }
+        if routes.is_empty() {
+            return Ok(tun);
+        }
+        tun.install_macos_routes(
+            &routes,
+            config.tun.ipv4.map(|(address, _)| address),
+            config.tun.ipv6.first().map(|(address, _)| *address),
+        )
+        .map_err(io_error)?;
+        Ok(tun)
+    }
+    #[cfg(not(any(
+        all(feature = "tun-routes", target_os = "linux"),
+        all(feature = "tun-routes", target_os = "macos")
+    )))]
     {
         let _ = tun.shutdown();
         Err(Error::new(
             ErrorKind::Unsupported,
-            "TUN inbound routes require the Linux tun-routes feature",
+            "TUN inbound routes require the Linux or macOS tun-routes feature",
         ))
     }
 }
@@ -666,7 +705,9 @@ pub async fn run_tun_device_until_ref(
             &udp_proxy_id,
             &config.bypass_id,
             &config.drop_id,
-            Duration::from_secs(30),
+            // Go's inbound handler bounds proxy setup with configuration.Timeout
+            // (16 seconds); the established TCP stream has no read idle deadline.
+            Duration::from_secs(16),
             config.channel_capacity,
             None,
         )

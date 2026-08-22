@@ -26,8 +26,8 @@ make build-release-musl \
   MUSL_LINKER=/opt/musl/bin/aarch64-linux-musl-gcc
 ```
 
-输出位于 `$(CARGO_TARGET_DIR)/$(MUSL_TARGET)/{debug,release}/yuhaiin`，默认
-`CARGO_TARGET_DIR` 是 `~/.cache/yuhaiin-rust/cargo-target`；可用 `file` 和直接执行
+输出位于 `target/$(MUSL_TARGET)/{debug,release}/yuhaiin`；也可以通过
+`CARGO_TARGET_DIR=/path/to/target` 指定独立目录。可用 `file` 和直接执行
 `yuhaiin version` 检查产物。
 
 如果从源码构建 Android `aarch64` 产物，使用本机 NDK 的 API 35 clang；不要把中间文件放进 `/tmp`：

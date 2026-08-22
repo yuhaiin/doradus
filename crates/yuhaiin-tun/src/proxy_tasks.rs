@@ -59,21 +59,16 @@ pub(super) async fn run_tcp_proxy(
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut buffer = vec![0u8; 16 * 1024];
     let mut write_closed = false;
-    let mut idle = Box::pin(tokio::time::sleep(timeouts.idle));
-    // A continuously writable local/TUN side must not keep a dead remote
-    // connection alive forever. The per-read timeout below is cancelled when
-    // a command wins the select; this watchdog is reset only by remote data.
-    let mut remote_progress = Box::pin(tokio::time::sleep(timeouts.read));
     loop {
         tokio::select! {
-            result = tokio::time::timeout(timeouts.read, tokio::io::AsyncReadExt::read(&mut reader, &mut buffer)) => {
+            result = tokio::io::AsyncReadExt::read(&mut reader, &mut buffer) => {
                 match result {
-                    Ok(Ok(0)) => {
+                    Ok(0) => {
                         tun_debug(format!("TCP proxy remote EOF flow={flow:?}"));
                         let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
                         return;
                     }
-                    Ok(Err(error)) => {
+                    Err(error) => {
                         report_failure(
                             failure_observer.as_ref(),
                             flow,
@@ -84,20 +79,7 @@ pub(super) async fn run_tcp_proxy(
                         let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
                         return;
                     }
-                    Err(_) => {
-                        report_failure(
-                            failure_observer.as_ref(),
-                            flow,
-                            "tcp-read",
-                            format!("timeout after {:?}", timeouts.read),
-                        );
-                        tun_debug(format!("TCP proxy remote read timed out flow={flow:?}"));
-                        let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
-                        return;
-                    }
-                    Ok(Ok(length)) => {
-                        idle.as_mut().reset(tokio::time::Instant::now() + timeouts.idle);
-                        remote_progress.as_mut().reset(tokio::time::Instant::now() + timeouts.read);
+                    Ok(length) => {
                         if !emit_output(
                             &output,
                             ProxyOutput::TcpData { flow, payload: buffer[..length].to_vec() },
@@ -137,7 +119,6 @@ pub(super) async fn run_tcp_proxy(
                             let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
                             return;
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + timeouts.idle);
                     }
                     Some(ProxyCommand::Shutdown) | None if !write_closed => {
                         let _ = tokio::time::timeout(
@@ -145,25 +126,13 @@ pub(super) async fn run_tcp_proxy(
                             tokio::io::AsyncWriteExt::shutdown(&mut writer),
                         ).await;
                         write_closed = true;
-                        idle.as_mut().reset(tokio::time::Instant::now() + timeouts.idle);
                     }
-                    Some(ProxyCommand::Data(_)) | Some(ProxyCommand::Shutdown) | None => {}
+                    None => {
+                        let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
+                        return;
+                    }
+                    Some(ProxyCommand::Data(_)) | Some(ProxyCommand::Shutdown) => {}
                 }
-            }
-            _ = &mut idle => {
-                tun_debug(format!("TCP proxy idle timeout flow={flow:?}"));
-                let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
-                return;
-            }
-            _ = &mut remote_progress => {
-                report_failure(
-                    failure_observer.as_ref(),
-                    flow,
-                    "tcp-read",
-                    format!("no remote data after {:?}", timeouts.read),
-                );
-                let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
-                return;
             }
         }
     }
@@ -192,7 +161,7 @@ pub(super) async fn run_udp_proxy(
             let _ = emit_output(
                 &output,
                 ProxyOutput::UdpClosed { flow: initial_flow },
-                timeouts.idle,
+                timeouts.udp_idle,
             )
             .await;
             return;
@@ -208,7 +177,7 @@ pub(super) async fn run_udp_proxy(
             let _ = emit_output(
                 &output,
                 ProxyOutput::UdpClosed { flow: initial_flow },
-                timeouts.idle,
+                timeouts.udp_idle,
             )
             .await;
             return;
@@ -232,7 +201,7 @@ pub(super) async fn run_udp_proxy(
                 source: udp_source_key(initial_flow),
                 translated,
             },
-            timeouts.idle,
+            timeouts.udp_idle,
         )
         .await
     {
@@ -242,11 +211,11 @@ pub(super) async fn run_udp_proxy(
     let mut buffer = vec![0u8; udp_buffer_size];
     let mut routes = HashMap::<Endpoint, TunFlowKey>::new();
     let mut last_flow = None;
-    let mut idle = Box::pin(tokio::time::sleep(timeouts.idle));
+    let mut idle = Box::pin(tokio::time::sleep(timeouts.udp_idle));
     // UDP send_to can succeed after the route has disappeared because it only
     // queues bytes locally. Reset this watchdog only after a remote datagram;
     // continuous uploads therefore cannot pin a stale SOCKS5 association.
-    let mut remote_progress = Box::pin(tokio::time::sleep(timeouts.read));
+    let mut remote_progress = Box::pin(tokio::time::sleep(timeouts.udp_read));
     loop {
         tokio::select! {
             command = commands.recv() => {
@@ -271,11 +240,11 @@ pub(super) async fn run_udp_proxy(
                             ));
                             let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
                             for flow in routes.values().copied().collect::<HashSet<_>>() {
-                                let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
+                                let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.udp_idle).await;
                             }
                             return;
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + timeouts.idle);
+                        idle.as_mut().reset(tokio::time::Instant::now() + timeouts.udp_idle);
                     }
                     Some(UdpProxyCommand::CloseFlow(flow)) => {
                         routes.retain(|_, current| *current != flow);
@@ -284,20 +253,20 @@ pub(super) async fn run_udp_proxy(
                         }
                         if routes.is_empty() {
                             let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
-                            let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
+                            let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.udp_idle).await;
                             return;
                         }
                     }
                     Some(UdpProxyCommand::Shutdown) | None => {
                         let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
                         for flow in routes.values().copied().collect::<HashSet<_>>() {
-                            let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
+                            let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.udp_idle).await;
                         }
                         return;
                     }
                 }
             }
-            result = tokio::time::timeout(timeouts.read, datagram.recv_from(&mut buffer)) => {
+            result = tokio::time::timeout(timeouts.udp_read, datagram.recv_from(&mut buffer)) => {
                 let Ok(Ok((length, source))) = result else {
                     report_failure(
                         failure_observer.as_ref(),
@@ -308,19 +277,19 @@ pub(super) async fn run_udp_proxy(
                     tun_debug(format!("UDP proxy receive ended flow={initial_flow:?} result={result:?}"));
                     let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
                     for flow in routes.values().copied().collect::<HashSet<_>>() {
-                        let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
+                        let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.udp_idle).await;
                     }
                     return;
                 };
-                idle.as_mut().reset(tokio::time::Instant::now() + timeouts.idle);
-                remote_progress.as_mut().reset(tokio::time::Instant::now() + timeouts.read);
+                idle.as_mut().reset(tokio::time::Instant::now() + timeouts.udp_idle);
+                remote_progress.as_mut().reset(tokio::time::Instant::now() + timeouts.udp_read);
                 let flow = routes.get(&source).copied().or(last_flow);
                 let Some(flow) = flow else { continue; };
                 routes.entry(source).or_insert(flow);
                 if !emit_output(
                     &output,
                     ProxyOutput::UdpData { flow, payload: buffer[..length].to_vec() },
-                    timeouts.idle,
+                    timeouts.udp_idle,
 
                 ).await {
                     report_failure(
@@ -336,7 +305,7 @@ pub(super) async fn run_udp_proxy(
             _ = &mut idle => {
                 let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
                 for flow in routes.values().copied().collect::<HashSet<_>>() {
-                    let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
+                    let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.udp_idle).await;
                 }
                 return;
             }
@@ -345,11 +314,11 @@ pub(super) async fn run_udp_proxy(
                     failure_observer.as_ref(),
                     initial_flow,
                     "udp-receive",
-                    format!("no remote datagram after {:?}", timeouts.read),
+                    format!("no remote datagram after {:?}", timeouts.udp_read),
                 );
                 let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
                 for flow in routes.values().copied().collect::<HashSet<_>>() {
-                    let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
+                    let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.udp_idle).await;
                 }
                 return;
             }
@@ -494,22 +463,16 @@ mod tests {
             read: Duration::from_millis(25),
             write: Duration::from_millis(50),
             idle: Duration::from_secs(1),
+            udp_read: Duration::from_millis(25),
+            udp_idle: Duration::from_secs(1),
         }
     }
 
     #[tokio::test]
-    async fn tcp_flow_closes_when_upload_continues_without_remote_progress() {
+    async fn tcp_flow_stays_open_without_remote_progress_until_shutdown() {
         let flow = tcp_flow();
         let (commands_tx, commands_rx) = mpsc::channel(32);
         let (output_tx, mut output_rx) = mpsc::channel(8);
-        let sender = tokio::spawn(async move {
-            loop {
-                if commands_tx.send(ProxyCommand::Data(vec![1])).await.is_err() {
-                    break;
-                }
-                sleep(Duration::from_millis(2)).await;
-            }
-        });
         let worker = tokio::spawn(run_tcp_proxy(
             Arc::new(BlackholeProxy),
             yuhaiin_core::flow::Flow { key: flow }.context(),
@@ -529,12 +492,13 @@ mod tests {
             }
         })
         .await;
-        sender.abort();
-        worker.await.unwrap();
         assert!(
-            closed.is_ok(),
-            "continuous upload masked the TCP read timeout"
+            closed.is_err(),
+            "TCP read inactivity must not close the flow"
         );
+        commands_tx.send(ProxyCommand::Shutdown).await.unwrap();
+        drop(commands_tx);
+        worker.await.unwrap();
     }
 
     #[tokio::test]

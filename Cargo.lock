@@ -4388,6 +4388,7 @@ version = "0.1.0"
 dependencies = [
  "futures-lite",
  "futures-util",
+ "getifaddrs",
  "netlink-packet-core",
  "netlink-packet-route 0.31.0",
  "netlink-sys",
