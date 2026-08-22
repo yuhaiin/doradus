@@ -471,6 +471,12 @@ pub fn encode_empty_response(packet: &[u8]) -> Result<Vec<u8>> {
         ));
     }
     let mut response = Message::response(message.metadata.id, message.metadata.op_code);
+    // Match Go's netapi.NewDNSMsg for locally synthesized responses.  The
+    // hickory response constructor defaults both recursion bits to false,
+    // which makes recursive answers look like a non-recursive server to
+    // clients such as nslookup.
+    response.metadata.recursion_desired = true;
+    response.metadata.recursion_available = true;
     for query in &message.queries {
         response.add_query(query.clone());
     }
@@ -500,6 +506,11 @@ pub fn encode_response(packet: &[u8], answer: &DnsResponse) -> Result<Vec<u8>> {
         }
     };
     let mut response = Message::response(message.metadata.id, message.metadata.op_code);
+    // Keep the typed/synthetic response header aligned with Go's
+    // netapi.NewDNSMsg: RD=1 and RA=1.  Raw upstream responses take a
+    // different path and retain the flags supplied by the upstream server.
+    response.metadata.recursion_desired = true;
+    response.metadata.recursion_available = true;
     response.add_query(query.clone());
     for address in answer.addresses.iter() {
         let rdata = match address {
@@ -741,6 +752,29 @@ mod tests {
         let decoded = decode_response(&response.to_vec().unwrap(), 42, DnsRecordType::A).unwrap();
         assert_eq!(decoded.addresses.v4, vec![Ipv4Addr::new(192, 0, 2, 1)]);
         assert_eq!(decoded.minimum_ttl, Some(30));
+    }
+
+    #[test]
+    fn synthesized_responses_advertise_recursion_like_go() {
+        let domain = DomainName::new("example.com").unwrap();
+        let query = encode_query(42, &domain, DnsRecordType::A).unwrap();
+        let answer = DnsResponse {
+            addresses: IpSet {
+                v4: vec![Ipv4Addr::new(192, 0, 2, 1)],
+                v6: Vec::new(),
+            },
+            ptr_names: Vec::new(),
+            service_bindings: Vec::new(),
+            minimum_ttl: Some(30),
+        };
+
+        let response = Message::from_vec(&encode_response(&query, &answer).unwrap()).unwrap();
+        assert!(response.metadata.recursion_desired);
+        assert!(response.metadata.recursion_available);
+
+        let empty = Message::from_vec(&encode_empty_response(&query).unwrap()).unwrap();
+        assert!(empty.metadata.recursion_desired);
+        assert!(empty.metadata.recursion_available);
     }
 
     #[test]
