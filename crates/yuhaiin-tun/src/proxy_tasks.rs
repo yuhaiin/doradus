@@ -2,6 +2,18 @@
 
 use super::*;
 
+fn report_failure(
+    observer: Option<&Arc<dyn TunFlowObserver>>,
+    flow: TunFlowKey,
+    stage: &str,
+    error: impl std::fmt::Display,
+) {
+    if let Some(observer) = observer {
+        let error = error.to_string();
+        observer.failed(flow, stage, &error);
+    }
+}
+
 pub(super) async fn run_tcp_proxy(
     proxy: Arc<dyn AsyncProxy>,
     mut context: crate::FlowContext,
@@ -11,14 +23,22 @@ pub(super) async fn run_tcp_proxy(
     timeouts: ProxyTimeouts,
     observer: Option<Arc<dyn TunFlowObserver>>,
 ) {
+    let failure_observer = observer.clone();
     let stream = match tokio::time::timeout(timeouts.connect, proxy.connect(&context)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
+            report_failure(failure_observer.as_ref(), flow, "tcp-connect", &error);
             tun_debug(format!("TCP proxy connect failed flow={flow:?}: {error}"));
             let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
             return;
         }
         Err(_) => {
+            report_failure(
+                failure_observer.as_ref(),
+                flow,
+                "tcp-connect",
+                format!("timeout after {:?}", timeouts.connect),
+            );
             tun_debug(format!("TCP proxy connect timed out flow={flow:?}"));
             let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
             return;
@@ -40,6 +60,10 @@ pub(super) async fn run_tcp_proxy(
     let mut buffer = vec![0u8; 16 * 1024];
     let mut write_closed = false;
     let mut idle = Box::pin(tokio::time::sleep(timeouts.idle));
+    // A continuously writable local/TUN side must not keep a dead remote
+    // connection alive forever. The per-read timeout below is cancelled when
+    // a command wins the select; this watchdog is reset only by remote data.
+    let mut remote_progress = Box::pin(tokio::time::sleep(timeouts.read));
     loop {
         tokio::select! {
             result = tokio::time::timeout(timeouts.read, tokio::io::AsyncReadExt::read(&mut reader, &mut buffer)) => {
@@ -49,23 +73,42 @@ pub(super) async fn run_tcp_proxy(
                         let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
                         return;
                     }
-                    Ok(Err(_)) => {
-                        tun_debug(format!("TCP proxy remote read failed flow={flow:?}"));
+                    Ok(Err(error)) => {
+                        report_failure(
+                            failure_observer.as_ref(),
+                            flow,
+                            "tcp-read",
+                            &error,
+                        );
+                        tun_debug(format!("TCP proxy remote read failed flow={flow:?}: {error}"));
                         let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
                         return;
                     }
                     Err(_) => {
+                        report_failure(
+                            failure_observer.as_ref(),
+                            flow,
+                            "tcp-read",
+                            format!("timeout after {:?}", timeouts.read),
+                        );
                         tun_debug(format!("TCP proxy remote read timed out flow={flow:?}"));
                         let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
                         return;
                     }
                     Ok(Ok(length)) => {
                         idle.as_mut().reset(tokio::time::Instant::now() + timeouts.idle);
+                        remote_progress.as_mut().reset(tokio::time::Instant::now() + timeouts.read);
                         if !emit_output(
                             &output,
                             ProxyOutput::TcpData { flow, payload: buffer[..length].to_vec() },
                             timeouts.idle,
                         ).await {
+                            report_failure(
+                                failure_observer.as_ref(),
+                                flow,
+                                "tcp-output",
+                                "proxy output queue timed out",
+                            );
                             tun_debug(format!("TCP proxy output channel timed out flow={flow:?}"));
                             let _ = tokio::time::timeout(
                                 timeouts.write,
@@ -84,6 +127,12 @@ pub(super) async fn run_tcp_proxy(
                             tokio::io::AsyncWriteExt::write_all(&mut writer, &payload),
                         ).await;
                         if !matches!(write, Ok(Ok(()))) {
+                            report_failure(
+                                failure_observer.as_ref(),
+                                flow,
+                                "tcp-write",
+                                format!("{write:?}"),
+                            );
                             tun_debug(format!("TCP proxy remote write failed flow={flow:?}"));
                             let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
                             return;
@@ -106,6 +155,16 @@ pub(super) async fn run_tcp_proxy(
                 let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
                 return;
             }
+            _ = &mut remote_progress => {
+                report_failure(
+                    failure_observer.as_ref(),
+                    flow,
+                    "tcp-read",
+                    format!("no remote data after {:?}", timeouts.read),
+                );
+                let _ = emit_output(&output, ProxyOutput::TcpClosed { flow }, timeouts.idle).await;
+                return;
+            }
         }
     }
 }
@@ -121,10 +180,12 @@ pub(super) async fn run_udp_proxy(
     observer: Option<Arc<dyn TunFlowObserver>>,
     udp_buffer_size: usize,
 ) {
+    let failure_observer = observer.clone();
     let datagram = match tokio::time::timeout(timeouts.connect, proxy.open_datagram(&context)).await
     {
         Ok(Ok(datagram)) => datagram,
         Ok(Err(error)) => {
+            report_failure(failure_observer.as_ref(), initial_flow, "udp-open", &error);
             tun_debug(format!(
                 "UDP proxy open failed flow={initial_flow:?}: {error}"
             ));
@@ -137,6 +198,12 @@ pub(super) async fn run_udp_proxy(
             return;
         }
         Err(_) => {
+            report_failure(
+                failure_observer.as_ref(),
+                initial_flow,
+                "udp-open",
+                format!("timeout after {:?}", timeouts.connect),
+            );
             tun_debug(format!("UDP proxy open timed out flow={initial_flow:?}"));
             let _ = emit_output(
                 &output,
@@ -176,6 +243,10 @@ pub(super) async fn run_udp_proxy(
     let mut routes = HashMap::<Endpoint, TunFlowKey>::new();
     let mut last_flow = None;
     let mut idle = Box::pin(tokio::time::sleep(timeouts.idle));
+    // UDP send_to can succeed after the route has disappeared because it only
+    // queues bytes locally. Reset this watchdog only after a remote datagram;
+    // continuous uploads therefore cannot pin a stale SOCKS5 association.
+    let mut remote_progress = Box::pin(tokio::time::sleep(timeouts.read));
     loop {
         tokio::select! {
             command = commands.recv() => {
@@ -189,6 +260,12 @@ pub(super) async fn run_udp_proxy(
                             datagram.send_to(&payload, destination.clone()),
                         ).await;
                         if !matches!(send, Ok(Ok(_))) {
+                            report_failure(
+                                failure_observer.as_ref(),
+                                flow,
+                                "udp-send",
+                                format!("{send:?}"),
+                            );
                             tun_debug(format!(
                                 "UDP proxy send failed flow={flow:?} target={destination:?} result={send:?}"
                             ));
@@ -222,6 +299,12 @@ pub(super) async fn run_udp_proxy(
             }
             result = tokio::time::timeout(timeouts.read, datagram.recv_from(&mut buffer)) => {
                 let Ok(Ok((length, source))) = result else {
+                    report_failure(
+                        failure_observer.as_ref(),
+                        initial_flow,
+                        "udp-receive",
+                        format!("{result:?}"),
+                    );
                     tun_debug(format!("UDP proxy receive ended flow={initial_flow:?} result={result:?}"));
                     let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
                     for flow in routes.values().copied().collect::<HashSet<_>>() {
@@ -230,6 +313,7 @@ pub(super) async fn run_udp_proxy(
                     return;
                 };
                 idle.as_mut().reset(tokio::time::Instant::now() + timeouts.idle);
+                remote_progress.as_mut().reset(tokio::time::Instant::now() + timeouts.read);
                 let flow = routes.get(&source).copied().or(last_flow);
                 let Some(flow) = flow else { continue; };
                 routes.entry(source).or_insert(flow);
@@ -239,11 +323,30 @@ pub(super) async fn run_udp_proxy(
                     timeouts.idle,
 
                 ).await {
+                    report_failure(
+                        failure_observer.as_ref(),
+                        flow,
+                        "udp-output",
+                        "proxy output queue timed out",
+                    );
                     let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
                     return;
                 }
             }
             _ = &mut idle => {
+                let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
+                for flow in routes.values().copied().collect::<HashSet<_>>() {
+                    let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
+                }
+                return;
+            }
+            _ = &mut remote_progress => {
+                report_failure(
+                    failure_observer.as_ref(),
+                    initial_flow,
+                    "udp-receive",
+                    format!("no remote datagram after {:?}", timeouts.read),
+                );
                 let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
                 for flow in routes.values().copied().collect::<HashSet<_>>() {
                     let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.idle).await;
@@ -302,4 +405,184 @@ pub(super) async fn run_icmp_proxy(
         timeouts.idle,
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::pending;
+    use std::sync::Arc;
+    use tokio::io::duplex;
+    use tokio::time::{sleep, timeout};
+    use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
+
+    struct BlackholeProxy;
+
+    struct BlackholeDatagram;
+
+    impl AsyncProxy for BlackholeProxy {
+        fn connect<'a>(
+            &'a self,
+            _context: &'a crate::FlowContext,
+        ) -> yuhaiin_core::BoxFuture<'a, Result<BoxAsyncStream>> {
+            Box::pin(async {
+                let (client, peer) = duplex(64 * 1024);
+                tokio::spawn(async move {
+                    let _peer = peer;
+                    pending::<()>().await;
+                });
+                Ok(Box::new(client) as BoxAsyncStream)
+            })
+        }
+
+        fn open_datagram<'a>(
+            &'a self,
+            _context: &'a crate::FlowContext,
+        ) -> yuhaiin_core::BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+            Box::pin(async { Ok(Box::new(BlackholeDatagram) as Box<dyn AsyncDatagram>) })
+        }
+
+        fn close(&self) -> yuhaiin_core::BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl AsyncDatagram for BlackholeDatagram {
+        fn send_to<'a>(
+            &'a self,
+            payload: &'a [u8],
+            _target: Endpoint,
+        ) -> yuhaiin_core::BoxFuture<'a, Result<usize>> {
+            Box::pin(async move { Ok(payload.len()) })
+        }
+
+        fn recv_from<'a>(
+            &'a self,
+            _buffer: &'a mut [u8],
+        ) -> yuhaiin_core::BoxFuture<'a, Result<(usize, Endpoint)>> {
+            Box::pin(pending())
+        }
+
+        fn local_addr(&self) -> Result<Endpoint> {
+            Ok(Endpoint::ip(Network::Udp, "0.0.0.0:0".parse().unwrap()))
+        }
+
+        fn close(&self) -> yuhaiin_core::BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn tcp_flow() -> TunFlowKey {
+        TunFlowKey {
+            network: Network::Tcp,
+            source: "10.0.0.2:1234".parse().unwrap(),
+            destination: "203.0.113.10:443".parse().unwrap(),
+        }
+    }
+
+    fn udp_flow() -> TunFlowKey {
+        TunFlowKey {
+            network: Network::Udp,
+            source: "10.0.0.2:1234".parse().unwrap(),
+            destination: "203.0.113.10:53".parse().unwrap(),
+        }
+    }
+
+    fn short_timeouts() -> ProxyTimeouts {
+        ProxyTimeouts {
+            connect: Duration::from_millis(50),
+            read: Duration::from_millis(25),
+            write: Duration::from_millis(50),
+            idle: Duration::from_secs(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_flow_closes_when_upload_continues_without_remote_progress() {
+        let flow = tcp_flow();
+        let (commands_tx, commands_rx) = mpsc::channel(32);
+        let (output_tx, mut output_rx) = mpsc::channel(8);
+        let sender = tokio::spawn(async move {
+            loop {
+                if commands_tx.send(ProxyCommand::Data(vec![1])).await.is_err() {
+                    break;
+                }
+                sleep(Duration::from_millis(2)).await;
+            }
+        });
+        let worker = tokio::spawn(run_tcp_proxy(
+            Arc::new(BlackholeProxy),
+            yuhaiin_core::flow::Flow { key: flow }.context(),
+            flow,
+            commands_rx,
+            output_tx,
+            short_timeouts(),
+            None,
+        ));
+
+        let closed = timeout(Duration::from_millis(150), async {
+            loop {
+                if matches!(output_rx.recv().await, Some(ProxyOutput::TcpClosed { flow: key }) if key == flow)
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        sender.abort();
+        worker.await.unwrap();
+        assert!(
+            closed.is_ok(),
+            "continuous upload masked the TCP read timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_association_closes_when_upload_continues_without_remote_progress() {
+        let flow = udp_flow();
+        let (commands_tx, commands_rx) = mpsc::channel(32);
+        let (output_tx, mut output_rx) = mpsc::channel(8);
+        let sender = tokio::spawn(async move {
+            loop {
+                if commands_tx
+                    .send(UdpProxyCommand::Data {
+                        flow,
+                        target: Endpoint::ip(Network::Udp, flow.destination),
+                        payload: vec![1],
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(2)).await;
+            }
+        });
+        let worker = tokio::spawn(run_udp_proxy(
+            Arc::new(BlackholeProxy),
+            yuhaiin_core::flow::Flow { key: flow }.context(),
+            flow,
+            commands_rx,
+            output_tx,
+            short_timeouts(),
+            None,
+            2048,
+        ));
+
+        let closed = timeout(Duration::from_millis(150), async {
+            loop {
+                if matches!(output_rx.recv().await, Some(ProxyOutput::UdpClosed { flow: key }) if key == flow)
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        sender.abort();
+        worker.await.unwrap();
+        assert!(
+            closed.is_ok(),
+            "continuous upload masked the UDP receive timeout"
+        );
+    }
 }

@@ -148,6 +148,7 @@ struct NetworkSplitYuubinsyaProxy {
 struct NetworkSplitHttp2Proxy {
     upstream: Arc<dyn AsyncProxy>,
     connections: tokio::sync::Mutex<Vec<Arc<yuhaiin_chain::H2Connection>>>,
+    connect_lock: tokio::sync::Mutex<()>,
     concurrency: usize,
     max_streams: usize,
 }
@@ -157,10 +158,14 @@ impl NetworkSplitHttp2Proxy {
         &self,
         context: &FlowContext,
     ) -> Result<(tokio::io::DuplexStream, Option<SocketAddr>)> {
-        let mut connections = self.connections.lock().await;
-        connections.retain(|connection| !connection.is_closed());
+        let _connect_guard = self.connect_lock.lock().await;
+        let connections = {
+            let mut connections = self.connections.lock().await;
+            connections.retain(|connection| !connection.is_closed());
+            connections.clone()
+        };
 
-        for connection in connections.iter() {
+        for connection in connections {
             if connection.at_capacity() {
                 continue;
             }
@@ -169,8 +174,20 @@ impl NetworkSplitHttp2Proxy {
                 .await
             {
                 Ok(stream) => return Ok(stream),
-                Err(_) if connection.is_closed() => continue,
-                Err(error) => return Err(error),
+                Err(_) if connection.is_closed() => {
+                    let mut connections = self.connections.lock().await;
+                    connections.retain(|current| !Arc::ptr_eq(current, &connection));
+                }
+                Err(error) => {
+                    let mut connections = self.connections.lock().await;
+                    connections.retain(|current| !Arc::ptr_eq(current, &connection));
+                    drop(connections);
+                    connection.close().await;
+                    // A live HTTP/2 connection can reject a CONNECT stream
+                    // without closing the session. Do not let that stale
+                    // session block every later flow.
+                    let _ = error;
+                }
             }
         }
 
@@ -182,10 +199,17 @@ impl NetworkSplitHttp2Proxy {
             local_addr,
         )
         .await?;
-        let stream = connection
+        let stream = match connection
             .open_connect_stream_with_local_addr(self.concurrency)
-            .await?;
-        connections.push(connection);
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                connection.close().await;
+                return Err(error);
+            }
+        };
+        self.connections.lock().await.push(connection);
         Ok(stream)
     }
 }
@@ -211,8 +235,10 @@ impl AsyncProxy for NetworkSplitHttp2Proxy {
 
     fn close(&self) -> BoxFuture<'_, Result<()>> {
         let upstream = Arc::clone(&self.upstream);
+        let connect_lock = &self.connect_lock;
         let connections = &self.connections;
         Box::pin(async move {
+            let _connect_guard = connect_lock.lock().await;
             let connections = connections.lock().await.drain(..).collect::<Vec<_>>();
             for connection in connections {
                 connection.close().await;
@@ -1038,6 +1064,7 @@ impl RuntimeSnapshot {
                 Ok(Arc::new(NetworkSplitHttp2Proxy {
                     upstream: parent,
                     connections: tokio::sync::Mutex::new(Vec::new()),
+                    connect_lock: tokio::sync::Mutex::new(()),
                     concurrency,
                     max_streams,
                 }))

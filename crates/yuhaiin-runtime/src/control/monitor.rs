@@ -276,7 +276,14 @@ impl ConnectionMonitor {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()?;
-        Some(handler.answer(packet).await)
+        let target = yuhaiin_core::dns::decode_query(packet)
+            .map(|query| format!("{} {:?}", query.domain, query.record_type))
+            .unwrap_or_else(|_| format!("packet_len={}", packet.len()));
+        let result = handler.answer(packet).await;
+        if let Err(error) = &result {
+            self.error(format!("DNS query failed target={target}: {error}"));
+        }
+        Some(result)
     }
 
     /// Load durable totals/history from the same SQLite store as the
@@ -788,6 +795,10 @@ impl ConnectionMonitor {
         error: &str,
         process: Option<&str>,
     ) {
+        self.error(format!(
+            "outbound connection failed protocol={protocol} target={host} process={} error={error}",
+            process.unwrap_or("-")
+        ));
         let mut state = self.lock();
         let process = process.unwrap_or_default().to_owned();
         let last_seen = unix_seconds();
@@ -1404,6 +1415,22 @@ impl TunFlowObserver for ConnectionMonitor {
 
     fn closed(&self, flow: TunFlowKey) {
         self.close(flow);
+    }
+
+    fn failed(&self, flow: TunFlowKey, stage: &str, error: &str) {
+        let metadata = self.lock().connections.get(&flow).map(|entry| {
+            (
+                entry.value["nodeId"].as_str().unwrap_or("-").to_owned(),
+                entry.value["protocol"].as_str().unwrap_or("-").to_owned(),
+                entry.value["inbound"].as_str().unwrap_or("-").to_owned(),
+            )
+        });
+        let (node, protocol, inbound) =
+            metadata.unwrap_or_else(|| ("-".to_owned(), "-".to_owned(), "-".to_owned()));
+        self.error(format!(
+            "TUN flow failed stage={stage} src={} dst={} node={node} protocol={protocol} inbound={inbound} error={error}",
+            flow.source, flow.destination,
+        ));
     }
 
     fn close_requested(&self, flow: TunFlowKey) -> bool {
@@ -2381,6 +2408,26 @@ mod tests {
         let history = monitor.failed_history_value();
         assert_eq!(history["items"][0]["failedCount"], "2");
         assert_eq!(history["items"][0]["error"], "timeout");
+    }
+
+    #[test]
+    fn monitor_surfaces_transport_failures_without_packet_logs() {
+        let monitor = ConnectionMonitor::new();
+        monitor.record_failure("http2", "proxy.example:443", "connection lost");
+        let (flow, _) = flow();
+        monitor.failed(flow.key, "tcp-connect", "timeout after 30s");
+
+        let logs = monitor.logs().snapshot();
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("outbound connection failed")
+                    && line.contains("proxy.example:443"))
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("TUN flow failed") && line.contains("tcp-connect"))
+        );
+        assert!(logs.iter().all(|line| !line.contains("packet")));
     }
 
     #[test]

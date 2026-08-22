@@ -49,6 +49,34 @@ pub(crate) struct ReloadableAsyncDnsHandler {
     current: Arc<RwLock<Option<RuntimeDnsHandler>>>,
 }
 
+#[derive(Clone)]
+struct LoggedDnsHandler<H> {
+    inner: H,
+    monitor: Arc<crate::ConnectionMonitor>,
+}
+
+impl<H> AsyncDnsHandler for LoggedDnsHandler<H>
+where
+    H: AsyncDnsHandler + Clone + Send + Sync + 'static,
+{
+    fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        let inner = self.inner.clone();
+        let monitor = Arc::clone(&self.monitor);
+        Box::pin(async move {
+            let result = inner.answer(packet).await;
+            if let Err(error) = &result {
+                let target = decode_query(packet)
+                    .map(|query| format!("{} {:?}", query.domain, query.record_type))
+                    .unwrap_or_else(|_| format!("packet_len={}", packet.len()));
+                monitor.error(format!(
+                    "DNS listener query failed target={target}: {error}"
+                ));
+            }
+            result
+        })
+    }
+}
+
 impl ReloadableAsyncDnsHandler {
     pub(crate) fn new(handler: Option<RuntimeDnsHandler>) -> Self {
         Self {
@@ -600,21 +628,28 @@ pub async fn run_tun_device_until_ref(
     controller.monitor().info("TUN inbound ready");
     let mut dispatcher = yuhaiin_tun::TunDispatcher::new(64 * 1024, 64 * 1024, 2048)?
         .with_skip_multicast(config.tun.skip_multicast);
-    tun.run_dispatcher_until(
-        &mut dispatcher,
-        &mut proxy_runtime,
-        Some(&mut inbound_interceptor),
-        async {
-            let _ = wait_for_shutdown_or_matching_inbound_reload(
-                &controller,
-                shutdown.clone(),
-                config.inbound_id.as_deref(),
-            )
-            .await;
-        },
-    )
-    .await
-    .map_err(io_error)?;
+    let result = tun
+        .run_dispatcher_until(
+            &mut dispatcher,
+            &mut proxy_runtime,
+            Some(&mut inbound_interceptor),
+            async {
+                let _ = wait_for_shutdown_or_matching_inbound_reload(
+                    &controller,
+                    shutdown.clone(),
+                    config.inbound_id.as_deref(),
+                )
+                .await;
+            },
+        )
+        .await
+        .map_err(io_error);
+    if let Err(error) = &result {
+        controller
+            .monitor()
+            .error(format!("TUN dispatcher stopped: {error}"));
+    }
+    result?;
     if *shutdown.borrow() {
         return Ok(());
     }
@@ -647,7 +682,10 @@ pub async fn run_dns_supervisor(
         }
         let address = parse_dns_server(&server, 53, "api-dns")?;
         let snapshot = controller.handle().load();
-        let handler = (*controller.dns_handler()).clone();
+        let handler = LoggedDnsHandler {
+            inner: (*controller.dns_handler()).clone(),
+            monitor: controller.monitor(),
+        };
         // UDP and TCP are independent listeners in the Go server. A stale
         // process, another service, or a partial reload may occupy either
         // one, so keep the available transport alive instead of terminating

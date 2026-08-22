@@ -1217,14 +1217,18 @@ impl AsyncProxy for Socks5AsyncProxy {
                     bind_interface.as_deref(),
                     proxy.timeout,
                 )
-                .await?;
+                .await
+                .map_err(|error| socks5_stage("proxy TCP connect", error))?;
                 socks5_authenticate(
                     &mut stream,
                     proxy.username.as_deref(),
                     proxy.password.as_deref(),
                 )
-                .await?;
-                socks5_request(&mut stream, 1, &destination).await?;
+                .await
+                .map_err(|error| socks5_stage("authentication", error))?;
+                socks5_request(&mut stream, 1, &destination)
+                    .await
+                    .map_err(|error| socks5_stage("CONNECT", error))?;
                 Ok::<_, Error>(stream)
             })
             .await
@@ -1258,13 +1262,15 @@ impl AsyncProxy for Socks5AsyncProxy {
                     bind_interface.as_deref(),
                     proxy.timeout,
                 )
-                .await?;
+                .await
+                .map_err(|error| socks5_stage("UDP associate TCP connect", error))?;
                 socks5_authenticate(
                     &mut control,
                     proxy.username.as_deref(),
                     proxy.password.as_deref(),
                 )
-                .await?;
+                .await
+                .map_err(|error| socks5_stage("UDP associate authentication", error))?;
                 let unspecified = if proxy.proxy.is_ipv4() {
                     SocketAddr::from(([0, 0, 0, 0], 0))
                 } else {
@@ -1272,7 +1278,8 @@ impl AsyncProxy for Socks5AsyncProxy {
                 };
                 let reply =
                     socks5_request(&mut control, 3, &Endpoint::ip(Network::Udp, unspecified))
-                        .await?;
+                        .await
+                        .map_err(|error| socks5_stage("UDP associate request", error))?;
                 let relay = if reply.ip().is_unspecified() {
                     SocketAddr::new(proxy.proxy.ip(), reply.port())
                 } else {
@@ -1353,6 +1360,10 @@ async fn socks5_authenticate(
         }
     }
     Ok(())
+}
+
+fn socks5_stage(stage: &str, error: Error) -> Error {
+    Error::new(error.kind, format!("SOCKS5 {stage}: {}", error.message))
 }
 
 async fn socks5_request(

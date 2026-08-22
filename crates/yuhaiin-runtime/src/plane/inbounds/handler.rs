@@ -271,8 +271,15 @@ impl InboundHandler {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        let target = destination.clone();
         let connection = self.open_stream(protocol, peer, destination).await?;
-        self.relay(stream, connection, peer).await.map_err(|error| {
+        let result = self.relay(stream, connection, peer).await;
+        if let Err(error) = &result {
+            self.monitor.error(format!(
+                "relay failed protocol={protocol} peer={peer} target={target}: {error}"
+            ));
+        }
+        result.map_err(|error| {
             yuhaiin_core::Error::new(yuhaiin_core::ErrorKind::Io, error.to_string())
         })
     }
@@ -288,12 +295,19 @@ impl InboundHandler {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        let target = destination.clone();
         let connection = self.open_stream(protocol, peer, destination).await?;
-        self.relay_with_prefix(stream, connection, peer, prefix)
-            .await
-            .map_err(|error| {
-                yuhaiin_core::Error::new(yuhaiin_core::ErrorKind::Io, error.to_string())
-            })
+        let result = self
+            .relay_with_prefix(stream, connection, peer, prefix)
+            .await;
+        if let Err(error) = &result {
+            self.monitor.error(format!(
+                "relay failed protocol={protocol} peer={peer} target={target}: {error}"
+            ));
+        }
+        result.map_err(|error| {
+            yuhaiin_core::Error::new(yuhaiin_core::ErrorKind::Io, error.to_string())
+        })
     }
 
     pub(crate) async fn open_datagram(
@@ -302,11 +316,20 @@ impl InboundHandler {
         peer: SocketAddr,
     ) -> Result<InboundDatagram> {
         self.selector.route_context(&mut context);
-        let datagram = self
-            .selector
-            .select(&context)
-            .open_datagram(&context)
-            .await?;
+        let target = context.effective_destination().to_string();
+        let process = context.process.clone();
+        let datagram = match self.selector.select(&context).open_datagram(&context).await {
+            Ok(datagram) => datagram,
+            Err(error) => {
+                self.monitor.record_failure_with_process(
+                    "udp",
+                    &target,
+                    &error.to_string(),
+                    process.as_deref(),
+                );
+                return Err(error);
+            }
+        };
         record_outbound_datagram(&mut context, &*datagram);
         let flow = self.flow_key(&context, peer);
         Ok(InboundDatagram {
@@ -854,11 +877,14 @@ impl UdpFlowWorker {
         let Some(datagram) = self.datagram.as_ref() else {
             return false;
         };
-        if datagram
-            .send_to(&packet.payload, packet.target)
+        if let Err(error) = datagram
+            .send_to(&packet.payload, packet.target.clone())
             .await
-            .is_err()
         {
+            inbound.monitor.error(format!(
+                "UDP forwarding send failed source={} target={}: {error}",
+                packet.peer, packet.target
+            ));
             return false;
         }
         if let Some(flow) = self.flow {

@@ -520,6 +520,10 @@ impl RuntimeController {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *error = (!message.is_empty()).then(|| message.to_owned());
+        if !message.is_empty() {
+            self.monitor
+                .error(format!("runtime reload failed: {message}"));
+        }
     }
 }
 

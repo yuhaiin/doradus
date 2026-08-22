@@ -47,6 +47,12 @@ pub trait FlowObserver: Send + Sync {
     fn bytes(&self, flow: FlowKey, direction: FlowDirection, bytes: usize);
     fn closed(&self, flow: FlowKey);
 
+    /// Report a flow-scoped transport failure without making packet-level
+    /// logging part of the observer contract. Runtime implementations can
+    /// surface these failures in their bounded diagnostic log; existing
+    /// observers remain source-compatible through the default no-op.
+    fn failed(&self, _flow: FlowKey, _stage: &str, _error: &str) {}
+
     fn close_requested(&self, _flow: FlowKey) -> bool {
         false
     }

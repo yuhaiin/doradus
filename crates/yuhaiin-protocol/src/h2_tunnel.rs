@@ -475,6 +475,8 @@ impl H2Pool {
                             .stream_open_failures
                             .fetch_add(1, Ordering::Relaxed);
                         last_error = Some(error);
+                        self.remove_connection(&key, &connection).await;
+                        connection.close().await;
                     }
                 }
             }
@@ -513,6 +515,8 @@ impl H2Pool {
                             .stream_open_failures
                             .fetch_add(1, Ordering::Relaxed);
                         last_error = Some(error);
+                        self.remove_connection(&key, &connection).await;
+                        connection.close().await;
                     }
                 }
             }
@@ -1180,6 +1184,80 @@ mod tests {
         drop(second);
         assert_eq!(pool.len().await, 1);
         pool.close().await;
+        server_two.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pool_rebuilds_after_a_stream_error_on_a_live_connection() {
+        let (client_one, server_one) = tokio::io::duplex(64 * 1024);
+        let (client_two, server_two) = tokio::io::duplex(64 * 1024);
+        let server_one = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_one).await.unwrap();
+            for status in [http::StatusCode::OK, http::StatusCode::BAD_GATEWAY] {
+                let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+                assert_eq!(request.method(), http::Method::CONNECT);
+                respond
+                    .send_response(Response::builder().status(status).body(()).unwrap(), true)
+                    .unwrap();
+            }
+            while connection.accept().await.is_some() {}
+        });
+        let server_two = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_two).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(request.method(), http::Method::CONNECT);
+            respond.send_response(Response::new(()), true).unwrap();
+            connection.graceful_shutdown();
+            while connection.accept().await.is_some() {}
+        });
+
+        let transports = Arc::new(Mutex::new(VecDeque::from([client_one, client_two])));
+        let connection_attempts = Arc::new(AtomicUsize::new(0));
+        let address = "127.0.0.1:443".parse().unwrap();
+        let pool = H2Pool::with_limits(1, Duration::from_secs(300));
+        let first = pool
+            .open(&[address], 1, {
+                let transports = Arc::clone(&transports);
+                let connection_attempts = Arc::clone(&connection_attempts);
+                move |_| {
+                    let transports = Arc::clone(&transports);
+                    let connection_attempts = Arc::clone(&connection_attempts);
+                    async move {
+                        connection_attempts.fetch_add(1, Ordering::Relaxed);
+                        let io = transports.lock().await.pop_front().ok_or_else(|| {
+                            Error::new(ErrorKind::Closed, "test h2 transports exhausted")
+                        })?;
+                        H2Connection::handshake_with_limits(io, 128).await
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        drop(first);
+        let second = pool
+            .open(&[address], 1, {
+                let transports = Arc::clone(&transports);
+                let connection_attempts = Arc::clone(&connection_attempts);
+                move |_| {
+                    let transports = Arc::clone(&transports);
+                    let connection_attempts = Arc::clone(&connection_attempts);
+                    async move {
+                        connection_attempts.fetch_add(1, Ordering::Relaxed);
+                        let io = transports.lock().await.pop_front().ok_or_else(|| {
+                            Error::new(ErrorKind::Closed, "pool did not rebuild h2 connection")
+                        })?;
+                        H2Connection::handshake_with_limits(io, 128).await
+                    }
+                }
+            })
+            .await
+            .expect("pool should rebuild after a live connection rejects a stream");
+
+        assert_eq!(connection_attempts.load(Ordering::Relaxed), 2);
+        drop(second);
+        pool.close().await;
+        server_one.abort();
+        let _ = server_one.await;
         server_two.await.unwrap();
     }
 
