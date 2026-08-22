@@ -249,6 +249,59 @@ struct AsyncDnsResolverState {
     refreshing: Mutex<HashSet<DnsFlightKey>>,
 }
 
+impl AsyncDnsResolverState {
+    fn remove_flight(&self, key: &DnsFlightKey, flight: &Arc<AsyncDnsFlight>) -> bool {
+        self.in_flight
+            .lock()
+            .ok()
+            .and_then(|mut in_flight| {
+                if in_flight
+                    .get(key)
+                    .is_some_and(|current| Arc::ptr_eq(current, flight))
+                {
+                    in_flight.remove(key)
+                } else {
+                    None
+                }
+            })
+            .is_some()
+    }
+}
+
+struct AsyncDnsFlightCleanup {
+    state: Arc<AsyncDnsResolverState>,
+    key: DnsFlightKey,
+    flight: Arc<AsyncDnsFlight>,
+    armed: bool,
+}
+
+impl AsyncDnsFlightCleanup {
+    fn new(
+        state: Arc<AsyncDnsResolverState>,
+        key: DnsFlightKey,
+        flight: Arc<AsyncDnsFlight>,
+    ) -> Self {
+        Self {
+            state,
+            key,
+            flight,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AsyncDnsFlightCleanup {
+    fn drop(&mut self) {
+        if self.armed && self.state.remove_flight(&self.key, &self.flight) {
+            self.flight.notify.notify_waiters();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemAsyncIpResolver;
 
@@ -939,17 +992,7 @@ impl<Q> AsyncDnsResolver<Q> {
         if let Ok(mut stored) = flight.result.lock() {
             *stored = Some(result);
         }
-        let current = self.state.in_flight.lock().ok().and_then(|mut in_flight| {
-            if in_flight
-                .get(key)
-                .is_some_and(|current| Arc::ptr_eq(current, flight))
-            {
-                in_flight.remove(key)
-            } else {
-                None
-            }
-        });
-        if current.is_some() {
+        if self.state.remove_flight(key, flight) {
             flight.notify.notify_waiters();
         }
     }
@@ -1019,6 +1062,8 @@ impl<Q: AsyncDnsQuery> AsyncDnsResolver<Q> {
 
                 let (flight, owner) = self.begin_flight(key.clone())?;
                 if owner {
+                    let cleanup =
+                        AsyncDnsFlightCleanup::new(self.state.clone(), key.clone(), flight.clone());
                     let result = self.upstream.query_packet(packet).await;
                     let result = result.and_then(|response| {
                         crate::dns::validate_response_packet(packet, &response)?;
@@ -1028,6 +1073,7 @@ impl<Q: AsyncDnsQuery> AsyncDnsResolver<Q> {
                         crate::dns::rewrite_dns_response_for_query(response, packet)
                     });
                     self.finish_flight(&key, &flight, result.clone());
+                    cleanup.disarm();
                     return result;
                 }
 
@@ -1115,6 +1161,8 @@ impl<Q: SendAsyncDnsQuery + 'static> AsyncDnsResolver<Q> {
 
                 let (flight, owner) = self.begin_flight(key.clone())?;
                 if owner {
+                    let cleanup =
+                        AsyncDnsFlightCleanup::new(self.state.clone(), key.clone(), flight.clone());
                     let result = self.upstream.query_packet_send(packet).await;
                     let result = result.and_then(|response| {
                         crate::dns::validate_response_packet(packet, &response)?;
@@ -1124,6 +1172,7 @@ impl<Q: SendAsyncDnsQuery + 'static> AsyncDnsResolver<Q> {
                         crate::dns::rewrite_dns_response_for_query(response, packet)
                     });
                     self.finish_flight(&key, &flight, result.clone());
+                    cleanup.disarm();
                     return result;
                 }
 
@@ -1341,6 +1390,36 @@ mod async_tests {
         }
     }
 
+    struct CancellableSendQuery {
+        calls: Arc<AtomicUsize>,
+        started: Arc<Notify>,
+    }
+
+    impl SendAsyncDnsQuery for CancellableSendQuery {
+        fn query_send<'a>(
+            &'a self,
+            _domain: &'a DomainName,
+            _record_type: DnsRecordType,
+        ) -> BoxFuture<'a, Result<DnsResponse>> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::Relaxed);
+                self.started.notify_one();
+                if call == 0 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(DnsResponse {
+                    addresses: IpSet {
+                        v4: vec![Ipv4Addr::new(192, 0, 2, 79)],
+                        v6: Vec::new(),
+                    },
+                    ptr_names: Vec::new(),
+                    service_bindings: Vec::new(),
+                    minimum_ttl: Some(30),
+                })
+            })
+        }
+    }
+
     struct PartialQuery {
         calls: Arc<Mutex<Vec<DnsRecordType>>>,
     }
@@ -1448,6 +1527,100 @@ mod async_tests {
                 assert!(first.await.unwrap().is_ok());
                 assert!(second.await.unwrap().is_ok());
                 assert_eq!(calls.load(Ordering::Relaxed), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_resolver_cancellation_clears_send_singleflight() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let resolver = Arc::new(AsyncDnsResolver::new(CancellableSendQuery {
+            calls: calls.clone(),
+            started: started.clone(),
+        }));
+        let domain = DomainName::new("cancelled.example").unwrap();
+
+        let first_resolver = resolver.clone();
+        let first_domain = domain.clone();
+        let first = tokio::spawn(async move {
+            <AsyncDnsResolver<CancellableSendQuery> as AsyncIpResolver>::query(
+                &first_resolver,
+                &first_domain,
+                DnsRecordType::A,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("singleflight owner did not reach the upstream");
+
+        let second_resolver = resolver.clone();
+        let second_domain = domain.clone();
+        let second = tokio::spawn(async move {
+            <AsyncDnsResolver<CancellableSendQuery> as AsyncIpResolver>::query(
+                &second_resolver,
+                &second_domain,
+                DnsRecordType::A,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("query remained stuck behind a cancelled singleflight owner")
+            .unwrap();
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_resolver_cancellation_clears_local_singleflight() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let resolver = Arc::new(AsyncDnsResolver::new(SlowQuery {
+            calls: calls.clone(),
+            started: started.clone(),
+            release: release.clone(),
+        }));
+        let domain = DomainName::new("cancelled-local.example").unwrap();
+        let local = tokio::task::LocalSet::new();
+
+        local
+            .run_until(async move {
+                let first_resolver = resolver.clone();
+                let first_domain = domain.clone();
+                let first = tokio::task::spawn_local(async move {
+                    first_resolver.query(&first_domain, DnsRecordType::A).await
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+                    .await
+                    .expect("local singleflight owner did not reach the upstream");
+
+                let second_resolver = resolver.clone();
+                let second_domain = domain.clone();
+                let second = tokio::task::spawn_local(async move {
+                    second_resolver
+                        .query(&second_domain, DnsRecordType::A)
+                        .await
+                });
+                tokio::task::yield_now().await;
+
+                first.abort();
+                assert!(first.await.unwrap_err().is_cancelled());
+                tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+                    .await
+                    .expect("local query remained behind a cancelled singleflight owner");
+                release.notify_waiters();
+
+                assert!(second.await.unwrap().is_ok());
+                assert_eq!(calls.load(Ordering::Relaxed), 2);
             })
             .await;
     }
