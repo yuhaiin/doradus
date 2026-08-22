@@ -180,6 +180,9 @@ pub struct TunRuntimeConfig {
     pub inbound_id: Option<String>,
     pub enabled: bool,
     pub tun: yuhaiin_tun::TunConfig,
+    /// Optional Go-compatible macOS network service override. An empty value
+    /// follows the current default route service.
+    pub network_service: Option<String>,
     /// Go's `TunProtocol.routes` and `excludes`, kept together because Go
     /// installs both lists through the same device route boundary.
     pub routes: Vec<String>,
@@ -239,6 +242,7 @@ pub async fn load_tun_config(store: &yuhaiin_store::ConfigStore) -> Result<TunRu
         inbound_id: None,
         enabled,
         tun,
+        network_service: parse_network_service(&value),
         routes: Vec::new(),
         direct_id: value
             .get("directId")
@@ -466,6 +470,7 @@ fn parse_go_tun_config(record: &GoInboundRecord) -> Result<TunRuntimeConfig> {
             queue_capacity: 256,
             skip_multicast,
         },
+        network_service: parse_network_service(protocol),
         routes,
         direct_id: String::new(),
         proxy_id: None,
@@ -473,6 +478,22 @@ fn parse_go_tun_config(record: &GoInboundRecord) -> Result<TunRuntimeConfig> {
         drop_id: String::new(),
         channel_capacity: 256,
     })
+}
+
+#[cfg(feature = "tun")]
+fn parse_network_service(value: &Value) -> Option<String> {
+    [
+        value.get("networkService"),
+        value.get("network_service"),
+        value.pointer("/platform/darwin/networkService"),
+        value.pointer("/platform/darwin/network_service"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .map(str::trim)
+    .find(|service| !service.is_empty())
+    .map(str::to_owned)
 }
 
 #[cfg(feature = "tun")]
@@ -533,13 +554,19 @@ fn parse_tun_routes(routes: &[String]) -> Result<Vec<yuhaiin_tun::TunRoute>> {
 
 #[cfg(feature = "tun")]
 pub(crate) fn open_tun(config: &TunRuntimeConfig) -> Result<yuhaiin_tun::TunRuntime> {
-    let tun = yuhaiin_tun::TunRuntime::open(config.tun.clone()).map_err(io_error)?;
+    let mut tun = yuhaiin_tun::TunRuntime::open(config.tun.clone()).map_err(io_error)?;
+    #[cfg(target_os = "macos")]
+    {
+        tun.install_macos_dns(
+            config.network_service.as_deref(),
+            &tun_dns_servers(&config.tun),
+        );
+    }
     if config.routes.is_empty() {
         return Ok(tun);
     }
     #[cfg(all(feature = "tun-routes", target_os = "linux"))]
     {
-        let mut tun = tun;
         let routes = parse_tun_routes(&config.routes)?;
         for route in &routes {
             match route.destination {
@@ -570,6 +597,27 @@ pub(crate) fn open_tun(config: &TunRuntimeConfig) -> Result<yuhaiin_tun::TunRunt
             "TUN inbound routes require the Linux tun-routes feature",
         ))
     }
+}
+
+#[cfg(all(feature = "tun", any(target_os = "macos", test)))]
+fn tun_dns_servers(config: &yuhaiin_tun::TunConfig) -> Vec<std::net::IpAddr> {
+    let mut servers = Vec::with_capacity(1 + config.ipv6.len());
+    if let Some((address, _)) = config.ipv4
+        && let Some(next) = u32::from(address)
+            .checked_add(1)
+            .map(std::net::Ipv4Addr::from)
+    {
+        servers.push(std::net::IpAddr::V4(next));
+    }
+    for (address, _) in &config.ipv6 {
+        if let Some(next) = u128::from(*address)
+            .checked_add(1)
+            .map(std::net::Ipv6Addr::from)
+        {
+            servers.push(std::net::IpAddr::V6(next));
+        }
+    }
+    servers
 }
 
 /// Run one already-created TUN device through the shared runtime snapshot.
@@ -895,6 +943,7 @@ mod tests {
                 ipv4: Some((Ipv4Addr::new(10, 42, 0, 1), 24)),
                 ..Default::default()
             },
+            network_service: None,
             routes: Vec::new(),
             direct_id: "direct".to_owned(),
             proxy_id: Some("proxy".to_owned()),
@@ -1251,6 +1300,7 @@ mod tests {
                     "mtu": 1400,
                     "portal": "10.24.0.1/24",
                     "portalV6": "fd24::1/64",
+                    "platform": {"darwin": {"network_service": "Wi-Fi"}},
                     "skipMulticast": true,
                     "routes": ["198.18.0.0/15"],
                     "excludes": ["10.0.0.0/8"]
@@ -1281,9 +1331,26 @@ mod tests {
         assert_eq!(config.tun.name.as_deref(), Some("yuhaiin0"));
         assert_eq!(config.tun.ipv4, Some((Ipv4Addr::new(10, 24, 0, 1), 24)));
         assert_eq!(config.tun.ipv6, vec![("fd24::1".parse().unwrap(), 64)]);
+        assert_eq!(config.network_service.as_deref(), Some("Wi-Fi"));
         assert!(config.tun.skip_multicast);
         assert_eq!(config.tun.mtu, 1400);
         assert_eq!(config.routes, ["198.18.0.0/15", "10.0.0.0/8"]);
+    }
+
+    #[test]
+    fn macos_tun_dns_servers_follow_go_gateway_next_addresses() {
+        let config = yuhaiin_tun::TunConfig {
+            ipv4: Some((Ipv4Addr::new(10, 24, 0, 1), 24)),
+            ipv6: vec![("fd24::1".parse().unwrap(), 64)],
+            ..Default::default()
+        };
+        assert_eq!(
+            tun_dns_servers(&config),
+            vec![
+                "10.24.0.2".parse::<std::net::IpAddr>().unwrap(),
+                "fd24::2".parse::<std::net::IpAddr>().unwrap(),
+            ]
+        );
     }
 
     #[tokio::test]

@@ -57,6 +57,8 @@ use yuhaiin_core::proxy::{AsyncProxy, AsyncProxySelector, stream_local_addr, str
 
 mod config;
 mod dispatcher;
+#[cfg(target_os = "macos")]
+mod macos_dns;
 mod packet;
 #[path = "proxy.rs"]
 mod proxy_runtime;

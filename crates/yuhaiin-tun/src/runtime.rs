@@ -2,6 +2,9 @@
 
 use super::*;
 
+#[cfg(target_os = "macos")]
+use super::macos_dns::MacosDnsLease;
+
 struct PassthroughInputInterceptor;
 
 impl ProxyInputInterceptor for PassthroughInputInterceptor {
@@ -62,6 +65,8 @@ async fn write_tun_fragment(device: &AsyncDevice, packet: &[u8]) -> io::Result<(
 pub struct TunRuntime {
     #[cfg(feature = "tun-routes")]
     route_lease: Option<TunRouteLease>,
+    #[cfg(target_os = "macos")]
+    dns_lease: Option<MacosDnsLease>,
     device: Arc<AsyncDevice>,
     pub(crate) smoltcp_device: SmoltcpTunDevice,
     pub(crate) interface: Interface,
@@ -117,6 +122,8 @@ impl TunRuntime {
         Ok(Self {
             #[cfg(feature = "tun-routes")]
             route_lease: None,
+            #[cfg(target_os = "macos")]
+            dns_lease: None,
             device: Arc::new(device),
             smoltcp_device,
             interface,
@@ -180,6 +187,20 @@ impl TunRuntime {
             io::ErrorKind::Unsupported,
             "this platform requires an injected TUN device",
         ))
+    }
+
+    /// Install the Go-compatible macOS DNS lease for this TUN runtime.
+    ///
+    /// The lease snapshots the selected network service's DNS servers, applies
+    /// the TUN gateway addresses as DNS servers, follows default-interface
+    /// changes when no service is pinned, and restores the snapshot on drop.
+    #[cfg(target_os = "macos")]
+    pub fn install_macos_dns(&mut self, network_service: Option<&str>, dns_servers: &[IpAddr]) {
+        let _ = self.dns_lease.take();
+        match MacosDnsLease::apply(network_service, dns_servers) {
+            Ok(lease) => self.dns_lease = Some(lease),
+            Err(error) => tun_debug(format!("macOS DNS setup failed: {error}")),
+        }
     }
 
     /// Open a TUN device and install its owned routes as one startup
