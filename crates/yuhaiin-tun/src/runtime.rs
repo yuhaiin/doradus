@@ -144,7 +144,10 @@ impl TunRuntime {
             device: Arc::new(device),
             smoltcp_device,
             interface,
-            buffer: vec![0; config.mtu.max(65535)],
+            // A raw TUN read is bounded by the configured device MTU. Large
+            // IPv6 datagrams are reassembled after the read, so this buffer
+            // does not need to reserve the full 65 KiB smoltcp datagram size.
+            buffer: vec![0; config.mtu],
             ipv6_fragments: Ipv6FragmentReassembler::default(),
             fragment_identification: AtomicU32::new(0),
             pcap_capture,
@@ -440,7 +443,7 @@ impl TunRuntime {
         ));
         let packet = self
             .ipv6_fragments
-            .push(&self.buffer[..length], StdInstant::now())
+            .push_borrowed(&self.buffer[..length], StdInstant::now())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         let Some(packet) = packet else {
             // A fragment assembly is either waiting for more wire packets or
@@ -449,7 +452,7 @@ impl TunRuntime {
             // inbound just because one hostile datagram was dropped.
             return Ok(length);
         };
-        let packet = normalize_ipv6_extension_headers(&packet)
+        let packet = normalize_ipv6_extension_headers(packet.as_ref())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
             .into_owned();
         let accepted = self

@@ -336,6 +336,67 @@ pub fn decode_query(packet: &[u8]) -> Result<DnsQuestion> {
     })
 }
 
+/// Cheap, allocation-free gate for the DNS interception path.
+///
+/// This intentionally only recognizes the wire shape and the QTYPEs handled
+/// by [`decode_query`]. Full validation still belongs to `decode_query`; the
+/// gate exists so ordinary UDP payloads do not make Hickory build a complete
+/// `Message` just to answer a boolean question.
+pub fn looks_like_supported_query(packet: &[u8]) -> bool {
+    let Some(header) = packet.get(..12) else {
+        return false;
+    };
+    let flags = u16::from_be_bytes([header[2], header[3]]);
+    let question_count = u16::from_be_bytes([header[4], header[5]]);
+
+    // Responses and non-standard opcodes are not inbound queries.  The
+    // decoder only consumes the first question, so additional questions do
+    // not need to be walked by this fast path.
+    if flags & 0x8000 != 0 || (flags >> 11) & 0x0f != 0 || question_count == 0 {
+        return false;
+    }
+
+    let mut offset = 12usize;
+    let mut labels = 0usize;
+    loop {
+        let Some(&length) = packet.get(offset) else {
+            return false;
+        };
+        if length == 0 {
+            offset += 1;
+            break;
+        }
+        if length & 0xc0 == 0xc0 {
+            // The first question starts immediately after the header, so it
+            // has no earlier domain name that a compression pointer could
+            // legally reference. Reject this in the allocation-free gate;
+            // packets sent to port 53 still go through the full decoder.
+            return false;
+        }
+        if length & 0xc0 != 0 || length > 63 {
+            return false;
+        }
+        let length = usize::from(length);
+        let Some(next) = offset.checked_add(1 + length) else {
+            return false;
+        };
+        if next > packet.len() {
+            return false;
+        }
+        offset = next;
+        labels += 1;
+        if labels > 127 {
+            return false;
+        }
+    }
+
+    let Some(question_tail) = packet.get(offset..offset.saturating_add(4)) else {
+        return false;
+    };
+    let qtype = u16::from_be_bytes([question_tail[0], question_tail[1]]);
+    matches!(qtype, 1 | 28 | 12 | 65 | 64)
+}
+
 /// Decode the cache key used by the raw resolver path. Unlike [`decode_query`]
 /// this accepts every DNS QTYPE, because Go caches and forwards records that
 /// the address-oriented API does not model.
@@ -802,6 +863,37 @@ mod tests {
             vec![DomainName::new("host.example.com").unwrap()]
         );
         assert_eq!(decoded.minimum_ttl, Some(17));
+    }
+
+    #[test]
+    fn supported_query_fast_gate_matches_wire_queries_without_allocating() {
+        let domain = DomainName::new("example.com").unwrap();
+        for record_type in [
+            DnsRecordType::A,
+            DnsRecordType::Aaaa,
+            DnsRecordType::Ptr,
+            DnsRecordType::Https,
+            DnsRecordType::Svcb,
+        ] {
+            let packet = encode_query(7, &domain, record_type).unwrap();
+            assert!(looks_like_supported_query(&packet));
+        }
+
+        let mut response = encode_query(7, &domain, DnsRecordType::A).unwrap();
+        response[2] |= 0x80;
+        assert!(!looks_like_supported_query(&response));
+
+        let mut unsupported = encode_raw_query(7, &domain, 16).unwrap();
+        assert!(!looks_like_supported_query(&unsupported));
+        unsupported[0] = 0;
+        assert!(!looks_like_supported_query(&unsupported[..8]));
+
+        let mut invalid_pointer = vec![0; 18];
+        invalid_pointer[5] = 1;
+        invalid_pointer[12..14].copy_from_slice(&[0xc0, 0xff]);
+        invalid_pointer[14..16].copy_from_slice(&1u16.to_be_bytes());
+        invalid_pointer[16..18].copy_from_slice(&1u16.to_be_bytes());
+        assert!(!looks_like_supported_query(&invalid_pointer));
     }
 
     #[test]

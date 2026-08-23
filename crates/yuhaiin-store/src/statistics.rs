@@ -1,10 +1,9 @@
 //! Go-compatible statistics tables.
 //!
 //! Runtime state is kept in memory for fast packet-path updates, while this
-//! boundary makes the durable totals/history/traffic tables readable when a
-//! Rust process takes over a Go state database. The runtime writes a full
-//! compatibility snapshot during its final flush; the compact runtime JSON
-//! remains the frequent checkpoint used for crash recovery.
+//! boundary owns the durable totals/history/traffic tables used by both the
+//! Rust and Go runtimes. Runtime writers submit small additive batches rather
+//! than loading the whole historical projection into a long-lived object.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,6 +66,19 @@ pub struct GoStatisticsSnapshot {
     pub telemetry: Vec<GoTelemetryBucketRecord>,
 }
 
+/// Runtime deltas that can be applied without loading the historical
+/// statistics into the process. Counts in history, failures, traffic and
+/// telemetry are additive; totals are absolute values from the live monitor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GoStatisticsDelta {
+    pub total_download: u64,
+    pub total_upload: u64,
+    pub traffic: Vec<GoTrafficBucketRecord>,
+    pub history: Vec<GoConnectionHistoryRecord>,
+    pub failed_history: Vec<GoFailedHistoryRecord>,
+    pub telemetry: Vec<GoTelemetryBucketRecord>,
+}
+
 impl ConfigStore {
     /// Read the durable statistics written by the Go runtime, if those tables
     /// exist. Missing optional tables are treated as an empty snapshot so a
@@ -74,6 +86,29 @@ impl ConfigStore {
     pub fn load_go_statistics(&self) -> Result<GoStatisticsSnapshot> {
         let connection = self.lock_connection()?;
         load(&connection)
+    }
+
+    /// Read only the two durable totals needed to initialise the live
+    /// monitor. Historical rows stay in SQLite until an API asks for them.
+    pub fn load_go_totals(&self) -> Result<(u64, u64)> {
+        let connection = self.lock_connection()?;
+        let mut total_download = 0;
+        let mut total_upload = 0;
+        if table_exists(&connection, "statistics_kv") {
+            for row in connection
+                .query("SELECT key, value_int FROM statistics_kv")
+                .map_err(storage_error)?
+            {
+                match row_text(&row, 0, "statistics_kv.key")?.as_str() {
+                    "total_download" => {
+                        total_download = row_u64(&row, 1, "statistics_kv.value_int")?
+                    }
+                    "total_upload" => total_upload = row_u64(&row, 1, "statistics_kv.value_int")?,
+                    _ => {}
+                }
+            }
+        }
+        Ok((total_download, total_upload))
     }
 
     /// Replace the Go-compatible statistics projection atomically. This is
@@ -124,6 +159,303 @@ impl ConfigStore {
             record_failed_history_row(connection, protocol, host, process, error, last_seen)
         })
     }
+
+    /// Apply a batch of runtime observations directly to the Go-compatible
+    /// SQLite tables. This is the steady-state path; unlike
+    /// [`replace_go_statistics`](Self::replace_go_statistics), it never reads
+    /// the historical tables into a Rust-owned snapshot first.
+    pub fn try_apply_go_statistics_delta(&self, delta: &GoStatisticsDelta) -> Result<()> {
+        self.with_try_write(|connection| apply_delta(connection, delta))
+    }
+
+    /// Apply a batch, waiting for the normal SQLite write retry policy. This
+    /// is used by the explicit shutdown flush after the background worker has
+    /// stopped.
+    pub fn apply_go_statistics_delta(&self, delta: &GoStatisticsDelta) -> Result<()> {
+        self.with_write_retry(|connection| apply_delta(connection, delta))
+    }
+}
+
+fn apply_delta(connection: &Connection, delta: &GoStatisticsDelta) -> Result<()> {
+    // Older Go databases used the pre-v6 dimension/value schema. Migrate it
+    // once before the first incremental write so the steady-state path can
+    // use the compact tables without retaining a compatibility snapshot.
+    if !table_exists(connection, "telemetry_dimension_values")
+        && table_exists(connection, "traffic_dimension_hourly")
+        && table_has_column(connection, "traffic_dimension_hourly", "dimension")
+            .map_err(storage_error)?
+    {
+        let existing = load(connection)?;
+        replace(connection, &existing)?;
+    }
+    connection
+        .execute("BEGIN IMMEDIATE")
+        .map_err(storage_error)?;
+    let result = apply_delta_in_transaction(connection, delta);
+    match result {
+        Ok(()) => connection
+            .execute("COMMIT")
+            .map_err(storage_error)
+            .map(|_| ()),
+        Err(error) => {
+            let _ = connection.execute("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn apply_delta_in_transaction(connection: &Connection, delta: &GoStatisticsDelta) -> Result<()> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS statistics_kv (
+                key TEXT PRIMARY KEY, value_int INTEGER NOT NULL, updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS traffic_hourly (
+                bucket_start_utc INTEGER PRIMARY KEY, upload_bytes INTEGER NOT NULL,
+                download_bytes INTEGER NOT NULL, updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS connection_history (
+                protocol INTEGER NOT NULL, addr TEXT NOT NULL, process_name TEXT NOT NULL,
+                hit_count INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+                last_connection_json TEXT NOT NULL,
+                PRIMARY KEY (protocol, addr, process_name)
+            );
+            CREATE TABLE IF NOT EXISTS failed_connection_history (
+                protocol INTEGER NOT NULL, host TEXT NOT NULL, process_name TEXT NOT NULL,
+                failed_count INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+                last_error TEXT NOT NULL,
+                PRIMARY KEY (protocol, host, process_name)
+            );
+            CREATE TABLE IF NOT EXISTS telemetry_dimension_values (
+                id INTEGER PRIMARY KEY, dimension TEXT NOT NULL, value TEXT NOT NULL,
+                UNIQUE (dimension, value)
+            );
+            CREATE TABLE IF NOT EXISTS traffic_dimension_hourly (
+                bucket_start_utc INTEGER NOT NULL, value_id INTEGER NOT NULL,
+                upload_bytes INTEGER NOT NULL, download_bytes INTEGER NOT NULL,
+                PRIMARY KEY (bucket_start_utc, value_id)
+            );
+            CREATE TABLE IF NOT EXISTS failure_dimension_hourly (
+                bucket_start_utc INTEGER NOT NULL, value_id INTEGER NOT NULL,
+                failed_count INTEGER NOT NULL,
+                PRIMARY KEY (bucket_start_utc, value_id)
+            );
+            CREATE TABLE IF NOT EXISTS traffic_dimension_daily (
+                bucket_start_utc INTEGER NOT NULL, value_id INTEGER NOT NULL,
+                upload_bytes INTEGER NOT NULL, download_bytes INTEGER NOT NULL,
+                PRIMARY KEY (bucket_start_utc, value_id)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS failure_dimension_daily (
+                bucket_start_utc INTEGER NOT NULL, value_id INTEGER NOT NULL,
+                failed_count INTEGER NOT NULL,
+                PRIMARY KEY (bucket_start_utc, value_id)
+            ) WITHOUT ROWID;",
+        )
+        .map_err(storage_error)?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Error::new(ErrorKind::Storage, error.to_string()))?
+        .as_secs() as i64;
+    for (key, value) in [
+        ("total_download", delta.total_download),
+        ("total_upload", delta.total_upload),
+    ] {
+        connection
+            .execute_with_params(
+                "INSERT INTO statistics_kv(key, value_int, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET
+                   value_int = excluded.value_int, updated_at = excluded.updated_at",
+                &[
+                    SqliteValue::from(key),
+                    SqliteValue::from(u64_to_i64(value, key)?),
+                    SqliteValue::from(now),
+                ],
+            )
+            .map_err(storage_error)?;
+    }
+
+    for bucket in &delta.traffic {
+        connection
+            .execute_with_params(
+                "INSERT INTO traffic_hourly(
+                    bucket_start_utc, upload_bytes, download_bytes, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(bucket_start_utc) DO UPDATE SET
+                   upload_bytes = traffic_hourly.upload_bytes + excluded.upload_bytes,
+                   download_bytes = traffic_hourly.download_bytes + excluded.download_bytes,
+                   updated_at = excluded.updated_at",
+                &[
+                    SqliteValue::from(bucket.bucket),
+                    SqliteValue::from(u64_to_i64(bucket.upload, "traffic upload")?),
+                    SqliteValue::from(u64_to_i64(bucket.download, "traffic download")?),
+                    SqliteValue::from(now),
+                ],
+            )
+            .map_err(storage_error)?;
+    }
+
+    for history in &delta.history {
+        let connection_json =
+            String::from_utf8(history.connection_json.clone()).map_err(|error| {
+                Error::new(
+                    ErrorKind::Storage,
+                    format!("history connection JSON is not UTF-8: {error}"),
+                )
+            })?;
+        connection
+            .execute_with_params(
+                "INSERT INTO connection_history(
+                    protocol, addr, process_name, hit_count, last_seen_at,
+                    last_connection_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(protocol, addr, process_name) DO UPDATE SET
+                   hit_count = connection_history.hit_count + excluded.hit_count,
+                   last_seen_at = excluded.last_seen_at,
+                   last_connection_json = excluded.last_connection_json",
+                &[
+                    SqliteValue::from(history.protocol.as_str()),
+                    SqliteValue::from(history.addr.as_str()),
+                    SqliteValue::from(history.process.as_str()),
+                    SqliteValue::from(u64_to_i64(history.count, "history count")?),
+                    SqliteValue::from(history.last_seen),
+                    SqliteValue::from(connection_json),
+                ],
+            )
+            .map_err(storage_error)?;
+    }
+
+    for failure in &delta.failed_history {
+        connection
+            .execute_with_params(
+                "INSERT INTO failed_connection_history(
+                    protocol, host, process_name, failed_count, last_seen_at, last_error
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(protocol, host, process_name) DO UPDATE SET
+                   failed_count = failed_connection_history.failed_count + excluded.failed_count,
+                   last_seen_at = excluded.last_seen_at,
+                   last_error = excluded.last_error",
+                &[
+                    SqliteValue::from(failure.protocol.as_str()),
+                    SqliteValue::from(failure.host.as_str()),
+                    SqliteValue::from(failure.process.as_str()),
+                    SqliteValue::from(u64_to_i64(failure.count, "failure count")?),
+                    SqliteValue::from(failure.last_seen),
+                    SqliteValue::from(failure.error.as_str()),
+                ],
+            )
+            .map_err(storage_error)?;
+    }
+
+    for item in &delta.telemetry {
+        connection
+            .execute_with_params(
+                "INSERT OR IGNORE INTO telemetry_dimension_values(dimension, value)
+                 VALUES (?1, ?2)",
+                &[
+                    SqliteValue::from(item.dimension.as_str()),
+                    SqliteValue::from(item.value.as_str()),
+                ],
+            )
+            .map_err(storage_error)?;
+        let rows = connection
+            .query_with_params(
+                "SELECT id FROM telemetry_dimension_values
+                 WHERE dimension = ?1 AND value = ?2",
+                &[
+                    SqliteValue::from(item.dimension.as_str()),
+                    SqliteValue::from(item.value.as_str()),
+                ],
+            )
+            .map_err(storage_error)?;
+        let Some(row) = rows.first() else {
+            return Err(Error::new(
+                ErrorKind::Storage,
+                "telemetry dimension value was not created",
+            ));
+        };
+        let value_id = row_i64(row, 0, "telemetry_dimension_values.id")?;
+        let bucket = item.bucket.div_euclid(TELEMETRY_HOURLY_BUCKET_SECONDS)
+            * TELEMETRY_HOURLY_BUCKET_SECONDS;
+        connection
+            .execute_with_params(
+                "INSERT INTO traffic_dimension_hourly(
+                    bucket_start_utc, value_id, upload_bytes, download_bytes
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(bucket_start_utc, value_id) DO UPDATE SET
+                   upload_bytes = traffic_dimension_hourly.upload_bytes + excluded.upload_bytes,
+                   download_bytes = traffic_dimension_hourly.download_bytes + excluded.download_bytes",
+                &[
+                    SqliteValue::from(bucket),
+                    SqliteValue::from(value_id),
+                    SqliteValue::from(u64_to_i64(item.upload, "telemetry upload")?),
+                    SqliteValue::from(u64_to_i64(item.download, "telemetry download")?),
+                ],
+            )
+            .map_err(storage_error)?;
+        if item.failures != 0 {
+            connection
+                .execute_with_params(
+                    "INSERT INTO failure_dimension_hourly(
+                        bucket_start_utc, value_id, failed_count
+                     ) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(bucket_start_utc, value_id) DO UPDATE SET
+                       failed_count = failure_dimension_hourly.failed_count + excluded.failed_count",
+                    &[
+                        SqliteValue::from(bucket),
+                        SqliteValue::from(value_id),
+                        SqliteValue::from(u64_to_i64(item.failures, "telemetry failures")?),
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+    }
+
+    let telemetry_cutoff = now.div_euclid(3_600) * 3_600 - TELEMETRY_HOURLY_RETENTION_SECONDS;
+    connection
+        .execute_with_params(
+            "INSERT INTO traffic_dimension_daily(
+                 bucket_start_utc, value_id, upload_bytes, download_bytes
+             )
+             SELECT (bucket_start_utc / ?1) * ?1, value_id,
+                    SUM(upload_bytes), SUM(download_bytes)
+             FROM traffic_dimension_hourly
+             WHERE bucket_start_utc < ?2
+             GROUP BY (bucket_start_utc / ?1) * ?1, value_id
+             ON CONFLICT(bucket_start_utc, value_id) DO UPDATE SET
+               upload_bytes = traffic_dimension_daily.upload_bytes + excluded.upload_bytes,
+               download_bytes = traffic_dimension_daily.download_bytes + excluded.download_bytes",
+            &[
+                SqliteValue::from(TELEMETRY_SECONDS_PER_DAY),
+                SqliteValue::from(telemetry_cutoff),
+            ],
+        )
+        .map_err(storage_error)?;
+    connection
+        .execute_with_params(
+            "INSERT INTO failure_dimension_daily(bucket_start_utc, value_id, failed_count)
+             SELECT (bucket_start_utc / ?1) * ?1, value_id, SUM(failed_count)
+             FROM failure_dimension_hourly
+             WHERE bucket_start_utc < ?2
+             GROUP BY (bucket_start_utc / ?1) * ?1, value_id
+             ON CONFLICT(bucket_start_utc, value_id) DO UPDATE SET
+               failed_count = failure_dimension_daily.failed_count + excluded.failed_count",
+            &[
+                SqliteValue::from(TELEMETRY_SECONDS_PER_DAY),
+                SqliteValue::from(telemetry_cutoff),
+            ],
+        )
+        .map_err(storage_error)?;
+    for table in ["traffic_dimension_hourly", "failure_dimension_hourly"] {
+        connection
+            .execute_with_params(
+                &format!("DELETE FROM {table} WHERE bucket_start_utc < ?1"),
+                &[SqliteValue::from(telemetry_cutoff)],
+            )
+            .map_err(storage_error)?;
+    }
+    Ok(())
 }
 
 fn record_failed_history_row(
@@ -864,6 +1196,58 @@ mod tests {
 
         store.replace_go_statistics(&snapshot).unwrap();
         assert_eq!(store.load_go_statistics().unwrap(), snapshot);
+    }
+
+    #[tokio::test]
+    async fn go_statistics_delta_updates_projection_without_reloading_history() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let bucket = 1_700_000_000;
+        let history = GoConnectionHistoryRecord {
+            protocol: "tcp".to_owned(),
+            addr: "example.com:443".to_owned(),
+            process: "browser".to_owned(),
+            count: 1,
+            last_seen: bucket,
+            connection_json: br#"{"addr":"example.com:443"}"#.to_vec(),
+        };
+        store
+            .apply_go_statistics_delta(&GoStatisticsDelta {
+                total_upload: 10,
+                total_download: 20,
+                traffic: vec![GoTrafficBucketRecord {
+                    bucket,
+                    upload: 10,
+                    download: 20,
+                }],
+                history: vec![history.clone()],
+                ..GoStatisticsDelta::default()
+            })
+            .unwrap();
+        store
+            .apply_go_statistics_delta(&GoStatisticsDelta {
+                total_upload: 15,
+                total_download: 25,
+                traffic: vec![GoTrafficBucketRecord {
+                    bucket,
+                    upload: 5,
+                    download: 5,
+                }],
+                history: vec![GoConnectionHistoryRecord {
+                    count: 2,
+                    last_seen: bucket + 1,
+                    ..history
+                }],
+                ..GoStatisticsDelta::default()
+            })
+            .unwrap();
+
+        let snapshot = store.load_go_statistics().unwrap();
+        assert_eq!(snapshot.total_upload, 15);
+        assert_eq!(snapshot.total_download, 25);
+        assert_eq!(snapshot.traffic[0].upload, 15);
+        assert_eq!(snapshot.traffic[0].download, 25);
+        assert_eq!(snapshot.history[0].count, 3);
+        assert_eq!(snapshot.history[0].last_seen, bucket + 1);
     }
 
     #[tokio::test]

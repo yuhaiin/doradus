@@ -195,6 +195,54 @@ pub struct TunRuntimeConfig {
     pub bypass_id: String,
     pub drop_id: String,
     pub channel_capacity: usize,
+    /// Per-socket smoltcp receive buffer. These are deliberately separate
+    /// from the proxy task channel because every active endpoint owns them.
+    pub socket_rx_buffer_size: usize,
+    /// Per-socket smoltcp transmit buffer.
+    pub socket_tx_buffer_size: usize,
+    /// Number of datagrams each smoltcp UDP socket can queue in either
+    /// direction.
+    pub udp_packet_capacity: usize,
+}
+
+const DEFAULT_TUN_SOCKET_RX_BUFFER_SIZE: usize = 8 * 1024;
+const DEFAULT_TUN_SOCKET_TX_BUFFER_SIZE: usize = 8 * 1024;
+const DEFAULT_TUN_UDP_PACKET_CAPACITY: usize = 64;
+
+fn tun_socket_settings(value: &Value) -> (usize, usize, usize) {
+    fn bounded(value: Option<&Value>, default: usize, min: usize, max: usize) -> usize {
+        value
+            .and_then(Value::as_u64)
+            .map(|value| (value as usize).clamp(min, max))
+            .unwrap_or(default)
+    }
+
+    (
+        bounded(
+            value
+                .get("socketRxBufferSize")
+                .or_else(|| value.get("socket_rx_buffer_size")),
+            DEFAULT_TUN_SOCKET_RX_BUFFER_SIZE,
+            4 * 1024,
+            1024 * 1024,
+        ),
+        bounded(
+            value
+                .get("socketTxBufferSize")
+                .or_else(|| value.get("socket_tx_buffer_size")),
+            DEFAULT_TUN_SOCKET_TX_BUFFER_SIZE,
+            4 * 1024,
+            1024 * 1024,
+        ),
+        bounded(
+            value
+                .get("udpPacketCapacity")
+                .or_else(|| value.get("udp_packet_capacity")),
+            DEFAULT_TUN_UDP_PACKET_CAPACITY,
+            4,
+            4096,
+        ),
+    )
 }
 
 /// Load the persisted TUN settings without opening a platform device.  A
@@ -220,6 +268,8 @@ pub async fn load_tun_config(store: &yuhaiin_store::ConfigStore) -> Result<TunRu
         .and_then(Value::as_bool)
         .unwrap_or(false)
         || std::env::var("YUHAIIN_TUN").ok().as_deref() == Some("1");
+    let (socket_rx_buffer_size, socket_tx_buffer_size, udp_packet_capacity) =
+        tun_socket_settings(&value);
     let tun = yuhaiin_tun::TunConfig {
         name: value.get("name").and_then(Value::as_str).map(str::to_owned),
         ipv4: value
@@ -271,6 +321,9 @@ pub async fn load_tun_config(store: &yuhaiin_store::ConfigStore) -> Result<TunRu
             .get("channelCapacity")
             .and_then(Value::as_u64)
             .unwrap_or(256) as usize,
+        socket_rx_buffer_size,
+        socket_tx_buffer_size,
+        udp_packet_capacity,
     };
     if !crate::RuntimeSettings::load(store).await?.ipv6 {
         config.tun.ipv6.clear();
@@ -463,6 +516,8 @@ fn parse_go_tun_config(record: &GoInboundRecord) -> Result<TunRuntimeConfig> {
         .or_else(|| protocol.get("skip_multicast"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let (socket_rx_buffer_size, socket_tx_buffer_size, udp_packet_capacity) =
+        tun_socket_settings(protocol);
     Ok(TunRuntimeConfig {
         inbound_id: Some(record.id.clone()),
         enabled: record.enabled,
@@ -481,6 +536,9 @@ fn parse_go_tun_config(record: &GoInboundRecord) -> Result<TunRuntimeConfig> {
         bypass_id: String::new(),
         drop_id: String::new(),
         channel_capacity: 256,
+        socket_rx_buffer_size,
+        socket_tx_buffer_size,
+        udp_packet_capacity,
     })
 }
 
@@ -715,8 +773,12 @@ pub async fn run_tun_device_until_ref(
     let mut inbound_interceptor =
         crate::inbound::InboundInputInterceptor::new(controller.monitor(), config.channel_capacity);
     controller.monitor().info("TUN inbound ready");
-    let mut dispatcher = yuhaiin_tun::TunDispatcher::new(64 * 1024, 64 * 1024, 2048)?
-        .with_skip_multicast(config.tun.skip_multicast);
+    let mut dispatcher = yuhaiin_tun::TunDispatcher::new(
+        config.socket_rx_buffer_size,
+        config.socket_tx_buffer_size,
+        config.udp_packet_capacity,
+    )?
+    .with_skip_multicast(config.tun.skip_multicast);
     let result = tun
         .run_dispatcher_until(
             &mut dispatcher,
@@ -991,7 +1053,17 @@ mod tests {
             bypass_id: String::new(),
             drop_id: String::new(),
             channel_capacity: 256,
+            socket_rx_buffer_size: DEFAULT_TUN_SOCKET_RX_BUFFER_SIZE,
+            socket_tx_buffer_size: DEFAULT_TUN_SOCKET_TX_BUFFER_SIZE,
+            udp_packet_capacity: DEFAULT_TUN_UDP_PACKET_CAPACITY,
         }
+    }
+
+    #[test]
+    fn tun_socket_defaults_use_bounded_per_flow_buffers() {
+        let config = platform_tun_config(true);
+        assert_eq!(config.socket_rx_buffer_size, 8 * 1024);
+        assert_eq!(config.socket_tx_buffer_size, 8 * 1024);
     }
 
     fn go_tun_record(id: &str, enabled: bool, updated_at: i64) -> GoInboundRecord {
@@ -1303,7 +1375,10 @@ mod tests {
             "proxyId": "proxy",
             "bypassId": "bypass",
             "dropId": "drop",
-            "channelCapacity": 32
+            "channelCapacity": 32,
+            "socketRxBufferSize": 8192,
+            "socketTxBufferSize": 12288,
+            "udpPacketCapacity": 32
         });
         store
             .put_config("tun.runtime", &serde_json::to_vec(&value).unwrap())
@@ -1323,6 +1398,9 @@ mod tests {
         assert_eq!(config.tun.queue_capacity, 64);
         assert_eq!(config.channel_capacity, 32);
         assert_eq!(config.proxy_id.as_deref(), Some("proxy"));
+        assert_eq!(config.socket_rx_buffer_size, 8192);
+        assert_eq!(config.socket_tx_buffer_size, 12288);
+        assert_eq!(config.udp_packet_capacity, 32);
     }
 
     #[tokio::test]

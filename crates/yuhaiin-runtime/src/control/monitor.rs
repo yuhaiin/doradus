@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -22,9 +22,9 @@ use yuhaiin_core::flow::{
 };
 use yuhaiin_core::{BoxFuture, Endpoint, FlowContext, RouteMode};
 use yuhaiin_store::{
-    ConfigStore, GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsSnapshot,
-    GoTelemetryBucketRecord, GoTrafficBucketRecord, TELEMETRY_DAILY_BUCKET_SECONDS,
-    TELEMETRY_HOURLY_BUCKET_SECONDS,
+    ConfigStore, GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsDelta,
+    GoStatisticsSnapshot, GoTelemetryBucketRecord, GoTrafficBucketRecord,
+    TELEMETRY_DAILY_BUCKET_SECONDS, TELEMETRY_HOURLY_BUCKET_SECONDS,
 };
 
 use crate::RuntimeLog;
@@ -33,9 +33,6 @@ const HISTORY_LIMIT: usize = 2048;
 const GO_HISTORY_SIZE: usize = 1000;
 const BUCKET_LIMIT: usize = 90 * 24 * 60;
 const PERSISTENCE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
-const GO_STATISTICS_PROJECTION_INTERVAL: Duration = Duration::from_secs(30);
-const GO_STATISTICS_PROJECTION_RETRY_INITIAL: Duration = Duration::from_secs(2);
-const GO_STATISTICS_PROJECTION_RETRY_MAX: Duration = Duration::from_secs(60);
 const PERSISTENCE_KEY: &str = "statistics.runtime";
 const PERSISTENCE_VERSION: u32 = 1;
 // Go stores the history key's protocol in a separate SQLite column, while
@@ -115,6 +112,13 @@ struct MonitorState {
     history: Vec<Value>,
     failed_history: BTreeMap<(String, String, String), FailedEntry>,
     block_history: BTreeMap<(String, String, String), BlockEntry>,
+    // These are short-lived observations waiting for the SQLite writer. The
+    // durable history/traffic/telemetry tables are queried on demand when a
+    // persistent monitor serves an API request, matching Go's memory boundary.
+    pending_traffic: BTreeMap<i64, (u64, u64)>,
+    pending_telemetry: BTreeMap<TelemetryBucketKey, TelemetryBucketValue>,
+    pending_history: Vec<GoConnectionHistoryRecord>,
+    pending_failed_history: BTreeMap<(String, String, String), GoFailedHistoryRecord>,
     close_requests: Vec<TunFlowKey>,
 }
 
@@ -173,41 +177,6 @@ struct PersistedMonitor {
     failed_history: Vec<FailedEntry>,
     #[serde(default)]
     block_history: Vec<BlockEntry>,
-}
-
-#[derive(Serialize)]
-struct PersistedTelemetryRef<'a> {
-    dimension: &'a str,
-    value: &'a str,
-    download: u64,
-    upload: u64,
-    failures: u64,
-}
-
-#[derive(Serialize)]
-struct PersistedTelemetryBucketRef<'a> {
-    bucket: i64,
-    span_seconds: i64,
-    dimension: &'a str,
-    value: &'a str,
-    download: u64,
-    upload: u64,
-    failures: u64,
-}
-
-#[derive(Serialize)]
-struct PersistedMonitorRef<'a> {
-    version: u32,
-    next_id: u64,
-    total_upload: u64,
-    total_download: u64,
-    counters: &'a BTreeMap<String, (u64, u64)>,
-    buckets: &'a BTreeMap<i64, (u64, u64)>,
-    telemetry: Vec<PersistedTelemetryRef<'a>>,
-    telemetry_buckets: Vec<PersistedTelemetryBucketRef<'a>>,
-    history: &'a [Value],
-    failed_history: Vec<&'a FailedEntry>,
-    block_history: Vec<&'a BlockEntry>,
 }
 
 #[derive(Clone)]
@@ -286,13 +255,12 @@ impl ConnectionMonitor {
         Some(result)
     }
 
-    /// Load durable totals/history from the same SQLite store as the
-    /// configuration and periodically flush the in-memory counters back to
-    /// it. Active connections are deliberately not restored: a process
-    /// restart cannot prove that those sockets still exist.
+    /// Load only the live totals from SQLite. Historical rows remain in the
+    /// store and are read on demand, like Go's statistics package. The old
+    /// `statistics.runtime` blob is imported once for upgrade compatibility
+    /// and then removed.
     pub async fn load_with_store(store: ConfigStore) -> yuhaiin_core::Result<Self> {
         let monitor = Self::new();
-        let go_statistics = store.load_go_statistics()?;
         if let Some(bytes) = store.get_config(PERSISTENCE_KEY).await? {
             let persisted: PersistedMonitor = serde_json::from_slice(&bytes).map_err(|error| {
                 yuhaiin_core::Error::new(
@@ -306,13 +274,16 @@ impl ConnectionMonitor {
                     format!("unsupported statistics state version {}", persisted.version),
                 ));
             }
-            monitor.restore_persisted(persisted);
-            // The compact checkpoint is asynchronous, while the durable Go
-            // table is a derived projection. Merge it after restoring the
-            // checkpoint so a newer table cannot roll counts back.
-            monitor.restore_failed_history(go_statistics.failed_history);
+            let existing = store.load_go_statistics()?;
+            let migrated = merge_statistics_snapshots(existing, persisted_snapshot(&persisted)?);
+            store.replace_go_statistics(&migrated)?;
+            monitor.restore_persisted_runtime(persisted);
+            store.delete_config(PERSISTENCE_KEY).await?;
         } else {
-            monitor.restore_go_statistics(go_statistics)?;
+            let (total_download, total_upload) = store.load_go_totals()?;
+            let mut state = monitor.lock();
+            state.total_download = total_download;
+            state.total_upload = total_upload;
         }
 
         let (shutdown, mut shutdown_rx) = watch::channel(false);
@@ -329,10 +300,6 @@ impl ConnectionMonitor {
         let worker = tokio::spawn(async move {
             let mut interval = tokio::time::interval(PERSISTENCE_CHECKPOINT_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let mut last_go_projection = Instant::now();
-            let mut project_go_statistics = true;
-            let mut next_go_projection = Instant::now();
-            let mut projection_backoff = GO_STATISTICS_PROJECTION_RETRY_INITIAL;
             loop {
                 tokio::select! {
                     biased;
@@ -343,48 +310,25 @@ impl ConnectionMonitor {
                     }
                     _ = interval.tick() => {},
                 }
-                let dirty = worker_persistence.dirty.swap(false, Ordering::AcqRel);
-                let projection_due = project_go_statistics && Instant::now() >= next_go_projection;
-                let periodic_projection_due =
-                    last_go_projection.elapsed() >= GO_STATISTICS_PROJECTION_INTERVAL;
-                if !dirty && !projection_due && !periodic_projection_due {
+                if !worker_persistence.dirty.swap(false, Ordering::AcqRel) {
                     continue;
                 }
-                if let Ok(bytes) = writer_monitor.persisted_json() {
-                    let store = worker_persistence.store.clone();
-                    let checkpoint_written = tokio::task::spawn_blocking(move || {
-                        store.try_put_config(PERSISTENCE_KEY, &bytes).is_ok()
-                    })
-                    .await
-                    .unwrap_or(false);
-                    if !checkpoint_written {
-                        worker_persistence.dirty.store(true, Ordering::Release);
-                    }
-                    if checkpoint_written && (projection_due || periodic_projection_due) {
-                        // Keep the compact checkpoint as the crash-recovery
-                        // path, but refresh Go's public tables infrequently so
-                        // another Go/Rust management process can observe
-                        // recent totals without rewriting the tables per flow.
-                        let store = worker_persistence.store.clone();
-                        let snapshot = writer_monitor.go_statistics_snapshot();
-                        let projected = tokio::task::spawn_blocking(move || {
-                            store.try_replace_go_statistics(&snapshot).is_ok()
-                        })
-                        .await
-                        .unwrap_or(false);
-                        if projected {
-                            last_go_projection = Instant::now();
-                            project_go_statistics = false;
-                            next_go_projection =
-                                last_go_projection + GO_STATISTICS_PROJECTION_INTERVAL;
-                            projection_backoff = GO_STATISTICS_PROJECTION_RETRY_INITIAL;
-                        } else {
-                            project_go_statistics = true;
-                            next_go_projection = Instant::now() + projection_backoff;
-                            projection_backoff = next_projection_backoff(projection_backoff);
-                        }
-                    }
-                } else {
+                let delta = writer_monitor.take_statistics_delta();
+                let store = worker_persistence.store.clone();
+                let write_delta = delta.clone();
+                let result = match tokio::task::spawn_blocking(move || {
+                    store.try_apply_go_statistics_delta(&write_delta)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(yuhaiin_core::Error::new(
+                        yuhaiin_core::ErrorKind::Storage,
+                        format!("statistics persistence task: {error}"),
+                    )),
+                };
+                if result.is_err() {
+                    writer_monitor.merge_statistics_delta(delta);
                     worker_persistence.dirty.store(true, Ordering::Release);
                 }
             }
@@ -425,25 +369,28 @@ impl ConnectionMonitor {
         let Some(persistence) = self.persistence.clone() else {
             return Ok(());
         };
-        let bytes = self.persisted_json().map_err(|error| {
-            yuhaiin_core::Error::new(
-                yuhaiin_core::ErrorKind::Storage,
-                format!("statistics state serialization: {error}"),
-            )
-        })?;
+        let delta = self.take_statistics_delta();
         let store = persistence.store.clone();
-        let snapshot = self.go_statistics_snapshot();
-        tokio::task::spawn_blocking(move || {
-            store.try_put_config(PERSISTENCE_KEY, &bytes)?;
-            store.try_replace_go_statistics(&snapshot)
+        let write_delta = delta.clone();
+        let result = match tokio::task::spawn_blocking(move || {
+            store.try_apply_go_statistics_delta(&write_delta)
         })
         .await
-        .map_err(|error| {
-            yuhaiin_core::Error::new(
-                yuhaiin_core::ErrorKind::Storage,
-                format!("statistics persistence task: {error}"),
-            )
-        })?
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.merge_statistics_delta(delta);
+                return Err(yuhaiin_core::Error::new(
+                    yuhaiin_core::ErrorKind::Storage,
+                    format!("statistics persistence task: {error}"),
+                ));
+            }
+        };
+        if let Err(error) = result {
+            self.merge_statistics_delta(delta);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<MonitorEvent> {
@@ -520,16 +467,28 @@ impl ConnectionMonitor {
         };
         let start = start.min(end);
         let end = end.max(start);
-        let state = self.lock();
         let mut buckets = BTreeMap::<i64, (u64, u64)>::new();
-        for (bucket, (download, upload)) in &state.buckets {
-            if *bucket < start || *bucket >= end {
-                continue;
+        if let Some(snapshot) = self.durable_snapshot() {
+            for item in snapshot.traffic {
+                if item.bucket < start || item.bucket >= end {
+                    continue;
+                }
+                let group = traffic_bucket_start(interval, item.bucket);
+                let entry = buckets.entry(group).or_default();
+                entry.0 = entry.0.saturating_add(item.download);
+                entry.1 = entry.1.saturating_add(item.upload);
             }
-            let group = traffic_bucket_start(interval, *bucket);
-            let entry = buckets.entry(group).or_default();
-            entry.0 = entry.0.saturating_add(*download);
-            entry.1 = entry.1.saturating_add(*upload);
+        } else {
+            let state = self.lock();
+            for (bucket, (download, upload)) in &state.buckets {
+                if *bucket < start || *bucket >= end {
+                    continue;
+                }
+                let group = traffic_bucket_start(interval, *bucket);
+                let entry = buckets.entry(group).or_default();
+                entry.0 = entry.0.saturating_add(*download);
+                entry.1 = entry.1.saturating_add(*upload);
+            }
         }
         let items = buckets
             .into_iter()
@@ -550,38 +509,48 @@ impl ConnectionMonitor {
     }
 
     pub fn telemetry_value_range(&self, from: i64, to: i64, limit: usize) -> Value {
-        let state = self.lock();
         let mut dimensions: BTreeMap<String, BTreeMap<String, (u64, u64, u64)>> = BTreeMap::new();
-        if state.telemetry_buckets.is_empty() {
-            for ((dimension, value), (download, upload, failures)) in &state.telemetry {
-                dimensions
-                    .entry(dimension.clone())
-                    .or_default()
-                    .insert(value.clone(), (*download, *upload, *failures));
-            }
+        let telemetry = if let Some(snapshot) = self.durable_snapshot() {
+            snapshot.telemetry
         } else {
-            for ((bucket, span_seconds, dimension, value), (download, upload, failures)) in
-                &state.telemetry_buckets
-            {
-                let span_seconds = normalize_telemetry_bucket_span_seconds(*span_seconds);
-                let in_range = if span_seconds == TELEMETRY_DAILY_BUCKET_SECONDS {
-                    let bucket_end = bucket.saturating_add(span_seconds);
-                    *bucket < to && bucket_end > from
-                } else {
-                    *bucket >= from && *bucket < to
-                };
-                if !in_range {
-                    continue;
-                }
-                let item = dimensions
-                    .entry(dimension.clone())
-                    .or_default()
-                    .entry(value.clone())
-                    .or_default();
-                item.0 = item.0.saturating_add(*download);
-                item.1 = item.1.saturating_add(*upload);
-                item.2 = item.2.saturating_add(*failures);
+            let state = self.lock();
+            state
+                .telemetry_buckets
+                .iter()
+                .map(
+                    |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
+                        GoTelemetryBucketRecord {
+                            bucket: *bucket,
+                            span_seconds: *span_seconds,
+                            dimension: dimension.clone(),
+                            value: value.clone(),
+                            download: *download,
+                            upload: *upload,
+                            failures: *failures,
+                        }
+                    },
+                )
+                .collect()
+        };
+        for item in telemetry {
+            let span_seconds = normalize_telemetry_bucket_span_seconds(item.span_seconds);
+            let in_range = if span_seconds == TELEMETRY_DAILY_BUCKET_SECONDS {
+                let bucket_end = item.bucket.saturating_add(span_seconds);
+                item.bucket < to && bucket_end > from
+            } else {
+                item.bucket >= from && item.bucket < to
+            };
+            if !in_range {
+                continue;
             }
+            let entry = dimensions
+                .entry(item.dimension)
+                .or_default()
+                .entry(item.value)
+                .or_default();
+            entry.0 = entry.0.saturating_add(item.download);
+            entry.1 = entry.1.saturating_add(item.upload);
+            entry.2 = entry.2.saturating_add(item.failures);
         }
         let telemetry_group = |dimension: String, items: BTreeMap<String, (u64, u64, u64)>| {
             let mut items = items.into_iter().collect::<Vec<_>>();
@@ -625,21 +594,49 @@ impl ConnectionMonitor {
     }
 
     pub fn failed_history_value(&self) -> Value {
-        let state = self.lock();
-        let mut items = state
-            .failed_history
-            .values()
-            .map(|entry| {
-                json!({
-                    "protocol": entry.protocol,
-                    "host": entry.host,
-                    "error": entry.error,
-                    "process": entry.process,
-                    "time": format_time(entry.time),
-                    "failedCount": entry.count.to_string(),
+        let (mut items, dump_process_enabled) = if let Some(snapshot) = self.durable_snapshot() {
+            let items = snapshot
+                .failed_history
+                .into_iter()
+                .map(|entry| {
+                    json!({
+                        "protocol": entry.protocol,
+                        "host": entry.host,
+                        "error": entry.error,
+                        "process": entry.process,
+                        "time": format_time(entry.last_seen),
+                        "failedCount": entry.count.to_string(),
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>();
+            let dump = items.iter().any(|item| {
+                item.get("process")
+                    .and_then(Value::as_str)
+                    .is_some_and(|process| !process.is_empty())
+            });
+            (items, dump)
+        } else {
+            let state = self.lock();
+            let items = state
+                .failed_history
+                .values()
+                .map(|entry| {
+                    json!({
+                        "protocol": entry.protocol,
+                        "host": entry.host,
+                        "error": entry.error,
+                        "process": entry.process,
+                        "time": format_time(entry.time),
+                        "failedCount": entry.count.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let dump = state
+                .failed_history
+                .values()
+                .any(|entry| !entry.process.is_empty());
+            (items, dump)
+        };
         items.sort_by(|left, right| {
             right
                 .get("time")
@@ -649,25 +646,41 @@ impl ConnectionMonitor {
         items.truncate(GO_HISTORY_SIZE);
         json!({
             "items": items,
-            "dumpProcessEnabled": state.failed_history.values().any(|entry| !entry.process.is_empty()),
+            "dumpProcessEnabled": dump_process_enabled,
         })
     }
 
     pub fn all_history_value(&self) -> Value {
-        let state = self.lock();
-        let mut items = coalesce_history(state.history.clone());
+        let (mut items, dump_process_enabled) = if let Some(snapshot) = self.durable_snapshot() {
+            let items = snapshot
+                .history
+                .into_iter()
+                .filter_map(history_record_value)
+                .collect::<Vec<_>>();
+            let dump = items.iter().any(|item| {
+                item.get("connection")
+                    .and_then(|connection| connection.get("process"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|process| !process.is_empty())
+            });
+            (coalesce_history(items), dump)
+        } else {
+            let state = self.lock();
+            let items = coalesce_history(state.history.clone());
+            let dump = items.iter().any(|item| {
+                item.get("connection")
+                    .and_then(|connection| connection.get("process"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|process| !process.is_empty())
+            });
+            (items, dump)
+        };
         items.sort_by(|left, right| {
             history_time(right)
                 .cmp(&history_time(left))
                 .then_with(|| history_key(left).cmp(&history_key(right)))
         });
         items.truncate(GO_HISTORY_SIZE);
-        let dump_process_enabled = items.iter().any(|item| {
-            item.get("connection")
-                .and_then(|connection| connection.get("process"))
-                .and_then(Value::as_str)
-                .is_some_and(|process| !process.is_empty())
-        });
         let public_items = items.iter().map(public_history_item).collect::<Vec<_>>();
         json!({
             "items": public_items,
@@ -799,11 +812,29 @@ impl ConnectionMonitor {
             "outbound connection failed protocol={protocol} target={host} process={} error={error}",
             process.unwrap_or("-")
         ));
+        let persistent = self.persistence.is_some();
         let mut state = self.lock();
         let process = process.unwrap_or_default().to_owned();
         let last_seen = unix_seconds();
         let key = (protocol.to_owned(), host.to_owned(), process.clone());
-        let bucket = {
+        let bucket = last_seen.div_euclid(3_600) * 3_600;
+        if persistent {
+            let entry =
+                state
+                    .pending_failed_history
+                    .entry(key)
+                    .or_insert_with(|| GoFailedHistoryRecord {
+                        protocol: protocol.to_owned(),
+                        host: host.to_owned(),
+                        process: process.clone(),
+                        error: error.to_owned(),
+                        last_seen,
+                        count: 0,
+                    });
+            entry.count = entry.count.saturating_add(1);
+            entry.error = error.to_owned();
+            entry.last_seen = last_seen;
+        } else {
             let entry = state
                 .failed_history
                 .entry(key)
@@ -818,8 +849,7 @@ impl ConnectionMonitor {
             entry.count = entry.count.saturating_add(1);
             entry.error = error.to_owned();
             entry.time = last_seen;
-            entry.time.div_euclid(3600) * 3600
-        };
+        }
         let connection = json!({
             "network": {"connType": protocol},
             "addr": host,
@@ -827,24 +857,25 @@ impl ConnectionMonitor {
             "process": process,
         });
         for (dimension, value) in telemetry_dimensions(&connection) {
-            let item = state
-                .telemetry
-                .entry((dimension.clone(), value.clone()))
-                .or_default();
-            item.2 = item.2.saturating_add(1);
-            let item = state
-                .telemetry_buckets
-                .entry((bucket, TELEMETRY_HOURLY_BUCKET_SECONDS, dimension, value))
-                .or_default();
-            item.2 = item.2.saturating_add(1);
+            if persistent {
+                let item = state
+                    .pending_telemetry
+                    .entry((bucket, TELEMETRY_HOURLY_BUCKET_SECONDS, dimension, value))
+                    .or_default();
+                item.2 = item.2.saturating_add(1);
+            } else {
+                let item = state
+                    .telemetry
+                    .entry((dimension.clone(), value.clone()))
+                    .or_default();
+                item.2 = item.2.saturating_add(1);
+                let key = (bucket, TELEMETRY_HOURLY_BUCKET_SECONDS, dimension, value);
+                let item = state.telemetry_buckets.entry(key).or_default();
+                item.2 = item.2.saturating_add(1);
+            }
         }
         drop(state);
         self.mark_dirty();
-        // Failed history is part of the in-memory statistics checkpoint. The
-        // persistence worker projects the complete snapshot periodically and
-        // on shutdown; do not open a second SQLite/write-lock path for every
-        // failed dial, since that adds file-descriptor pressure precisely
-        // when many inbound connections are failing.
     }
 
     pub fn take_close_requests(&self) -> Vec<TunFlowKey> {
@@ -859,6 +890,17 @@ impl ConnectionMonitor {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn durable_snapshot(&self) -> Option<GoStatisticsSnapshot> {
+        let store = self.persistence.as_ref()?.store.clone();
+        let mut snapshot = store.load_go_statistics().ok()?;
+        let delta = {
+            let state = self.lock();
+            pending_delta_from_state(&state)
+        };
+        apply_delta_to_snapshot(&mut snapshot, delta);
+        Some(snapshot)
     }
 
     fn emit(&self, kind: &str, payload: Value) {
@@ -910,6 +952,7 @@ impl ConnectionMonitor {
     }
 
     fn add_bytes(&self, flow: TunFlowKey, direction: TunFlowDirection, bytes: usize) {
+        let persistent = self.persistence.is_some();
         let mut state = self.lock();
         let bytes = bytes as u64;
         match direction {
@@ -920,17 +963,27 @@ impl ConnectionMonitor {
                 state.total_download = state.total_download.saturating_add(bytes)
             }
         }
-        let now = unix_seconds().div_euclid(60) * 60;
-        let bucket = state.buckets.entry(now).or_default();
-        match direction {
-            TunFlowDirection::Upload => bucket.1 = bucket.1.saturating_add(bytes),
-            TunFlowDirection::Download => bucket.0 = bucket.0.saturating_add(bytes),
-        }
-        while state.buckets.len() > BUCKET_LIMIT {
-            let Some(first) = state.buckets.first_key_value().map(|(key, _)| *key) else {
-                break;
-            };
-            state.buckets.remove(&first);
+        let now = unix_seconds();
+        let bucket =
+            now.div_euclid(TELEMETRY_HOURLY_BUCKET_SECONDS) * TELEMETRY_HOURLY_BUCKET_SECONDS;
+        if persistent {
+            let item = state.pending_traffic.entry(bucket).or_default();
+            match direction {
+                TunFlowDirection::Upload => item.1 = item.1.saturating_add(bytes),
+                TunFlowDirection::Download => item.0 = item.0.saturating_add(bytes),
+            }
+        } else {
+            let item = state.buckets.entry(now.div_euclid(60) * 60).or_default();
+            match direction {
+                TunFlowDirection::Upload => item.1 = item.1.saturating_add(bytes),
+                TunFlowDirection::Download => item.0 = item.0.saturating_add(bytes),
+            }
+            while state.buckets.len() > BUCKET_LIMIT {
+                let Some(first) = state.buckets.first_key_value().map(|(key, _)| *key) else {
+                    break;
+                };
+                state.buckets.remove(&first);
+            }
         }
         let Some(id) = state.connections.get(&flow).map(|entry| entry.id.clone()) else {
             drop(state);
@@ -959,49 +1012,63 @@ impl ConnectionMonitor {
             TunFlowDirection::Download => counter.0 = counter.0.saturating_add(bytes),
         }
         for (dimension, value) in telemetry.iter() {
-            let item = state
-                .telemetry
-                .entry((dimension.clone(), value.clone()))
-                .or_default();
-            match direction {
-                TunFlowDirection::Upload => item.1 = item.1.saturating_add(bytes),
-                TunFlowDirection::Download => item.0 = item.0.saturating_add(bytes),
-            }
-            let item = state
-                .telemetry_buckets
-                .entry((
-                    now.div_euclid(TELEMETRY_HOURLY_BUCKET_SECONDS)
-                        * TELEMETRY_HOURLY_BUCKET_SECONDS,
-                    TELEMETRY_HOURLY_BUCKET_SECONDS,
-                    dimension.clone(),
-                    value.clone(),
-                ))
-                .or_default();
+            let item = if persistent {
+                state
+                    .pending_telemetry
+                    .entry((
+                        bucket,
+                        TELEMETRY_HOURLY_BUCKET_SECONDS,
+                        dimension.clone(),
+                        value.clone(),
+                    ))
+                    .or_default()
+            } else {
+                let item = state
+                    .telemetry
+                    .entry((dimension.clone(), value.clone()))
+                    .or_default();
+                match direction {
+                    TunFlowDirection::Upload => item.1 = item.1.saturating_add(bytes),
+                    TunFlowDirection::Download => item.0 = item.0.saturating_add(bytes),
+                }
+                state
+                    .telemetry_buckets
+                    .entry((
+                        bucket,
+                        TELEMETRY_HOURLY_BUCKET_SECONDS,
+                        dimension.clone(),
+                        value.clone(),
+                    ))
+                    .or_default()
+            };
             match direction {
                 TunFlowDirection::Upload => item.1 = item.1.saturating_add(bytes),
                 TunFlowDirection::Download => item.0 = item.0.saturating_add(bytes),
             }
         }
-        let telemetry_cutoff = now.saturating_sub(90 * 86_400);
-        while state
-            .telemetry_buckets
-            .first_key_value()
-            .is_some_and(|((bucket, _, _, _), _)| *bucket < telemetry_cutoff)
-        {
-            let Some(key) = state
+        if !persistent {
+            let telemetry_cutoff = now.saturating_sub(90 * 86_400);
+            while state
                 .telemetry_buckets
                 .first_key_value()
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            state.telemetry_buckets.remove(&key);
+                .is_some_and(|((bucket, _, _, _), _)| *bucket < telemetry_cutoff)
+            {
+                let Some(key) = state
+                    .telemetry_buckets
+                    .first_key_value()
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                state.telemetry_buckets.remove(&key);
+            }
         }
         drop(state);
         self.mark_dirty();
     }
 
     fn close(&self, flow: TunFlowKey) {
+        let persistent = self.persistence.is_some();
         let mut state = self.lock();
         let Some(entry) = state.connections.remove(&flow) else {
             return;
@@ -1058,32 +1125,33 @@ impl ConnectionMonitor {
         state.ids.remove(&entry.id);
         state.close_requests.retain(|pending| *pending != flow);
         let now = unix_seconds();
-        let key = history_key(&json!({"connection": entry.value.clone()}));
-        if let Some(existing) = state
-            .history
-            .iter_mut()
-            .find(|item| history_key(item) == key)
-        {
-            let count = existing
-                .get("count")
-                .and_then(Value::as_str)
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(0)
-                .saturating_add(1);
-            existing["connection"] = entry.value;
-            existing["count"] = Value::String(count.to_string());
-            existing["time"] = Value::String(format_time(now));
+        if persistent {
+            if let Some(record) = connection_history_record(&entry.value, now) {
+                merge_pending_history(&mut state.pending_history, record);
+            }
         } else {
-            state.history.push(json!({
-                "connection": entry.value,
-                "count": "1",
-                "time": format_time(now),
-            }));
-        }
-        if state.history.len() > HISTORY_LIMIT {
-            state.history.sort_by_key(history_time);
-            let excess = state.history.len() - HISTORY_LIMIT;
-            state.history.drain(..excess);
+            let key = connection_history_key(&entry.value);
+            if let Some(existing) = state
+                .history
+                .iter_mut()
+                .find(|item| history_key(item) == key)
+            {
+                let count = history_count(existing).saturating_add(1);
+                existing["connection"] = entry.value;
+                existing["count"] = Value::String(count.to_string());
+                existing["time"] = Value::String(format_time(now));
+            } else {
+                state.history.push(json!({
+                    "connection": entry.value,
+                    "count": "1",
+                    "time": format_time(now),
+                }));
+            }
+            if state.history.len() > HISTORY_LIMIT {
+                state.history.sort_by_key(history_time);
+                let excess = state.history.len() - HISTORY_LIMIT;
+                state.history.drain(..excess);
+            }
         }
         let id = entry.id;
         drop(state);
@@ -1097,32 +1165,98 @@ impl ConnectionMonitor {
         }
     }
 
-    fn restore_persisted(&self, persisted: PersistedMonitor) {
+    fn take_statistics_delta(&self) -> GoStatisticsDelta {
+        let mut state = self.lock();
+        GoStatisticsDelta {
+            total_download: state.total_download,
+            total_upload: state.total_upload,
+            traffic: std::mem::take(&mut state.pending_traffic)
+                .into_iter()
+                .map(|(bucket, (download, upload))| GoTrafficBucketRecord {
+                    bucket,
+                    upload,
+                    download,
+                })
+                .collect(),
+            history: std::mem::take(&mut state.pending_history),
+            failed_history: std::mem::take(&mut state.pending_failed_history)
+                .into_values()
+                .collect(),
+            telemetry: std::mem::take(&mut state.pending_telemetry)
+                .into_iter()
+                .map(
+                    |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
+                        GoTelemetryBucketRecord {
+                            bucket,
+                            span_seconds,
+                            dimension,
+                            value,
+                            download,
+                            upload,
+                            failures,
+                        }
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    fn merge_statistics_delta(&self, delta: GoStatisticsDelta) {
+        let mut state = self.lock();
+        for traffic in delta.traffic {
+            let item = state.pending_traffic.entry(traffic.bucket).or_default();
+            item.0 = item.0.saturating_add(traffic.download);
+            item.1 = item.1.saturating_add(traffic.upload);
+        }
+        for history in delta.history {
+            merge_pending_history(&mut state.pending_history, history);
+        }
+        for failure in delta.failed_history {
+            let key = (
+                failure.protocol.clone(),
+                failure.host.clone(),
+                failure.process.clone(),
+            );
+            let item =
+                state
+                    .pending_failed_history
+                    .entry(key)
+                    .or_insert_with(|| GoFailedHistoryRecord {
+                        protocol: failure.protocol.clone(),
+                        host: failure.host.clone(),
+                        process: failure.process.clone(),
+                        ..GoFailedHistoryRecord::default()
+                    });
+            item.count = item.count.saturating_add(failure.count);
+            if failure.last_seen >= item.last_seen {
+                item.last_seen = failure.last_seen;
+                item.error = failure.error;
+            }
+        }
+        for telemetry in delta.telemetry {
+            let item = state
+                .pending_telemetry
+                .entry((
+                    telemetry.bucket,
+                    telemetry.span_seconds,
+                    telemetry.dimension,
+                    telemetry.value,
+                ))
+                .or_default();
+            item.0 = item.0.saturating_add(telemetry.download);
+            item.1 = item.1.saturating_add(telemetry.upload);
+            item.2 = item.2.saturating_add(telemetry.failures);
+        }
+    }
+
+    fn restore_persisted_runtime(&self, persisted: PersistedMonitor) {
         let mut state = self.lock();
         state.next_id = persisted.next_id;
         state.total_upload = persisted.total_upload;
         state.total_download = persisted.total_download;
-        // Active sockets are intentionally not restored after a process
-        // restart, so counters from an older checkpoint cannot describe a
-        // live connection. Keep deserializing the legacy field for v1 file
-        // compatibility, but start the live counter map empty like Go.
+        // Active sockets and historical tables are intentionally not restored
+        // into the monitor. The latter now live in SQLite, as in Go.
         state.counters.clear();
-        state.buckets = persisted.buckets;
-        state.history = coalesce_history(persisted.history);
-        state.failed_history = persisted
-            .failed_history
-            .into_iter()
-            .map(|entry| {
-                (
-                    (
-                        entry.protocol.clone(),
-                        entry.host.clone(),
-                        entry.process.clone(),
-                    ),
-                    entry,
-                )
-            })
-            .collect();
         state.block_history = persisted
             .block_history
             .into_iter()
@@ -1148,259 +1282,6 @@ impl ConnectionMonitor {
             };
             state.block_history.remove(&key);
         }
-        state.telemetry = persisted
-            .telemetry
-            .into_iter()
-            .map(|entry| {
-                let value = normalize_persisted_telemetry_value(&entry.dimension, entry.value);
-                (
-                    (entry.dimension, value),
-                    (entry.download, entry.upload, entry.failures),
-                )
-            })
-            .collect();
-        state.telemetry_buckets = persisted
-            .telemetry_buckets
-            .into_iter()
-            .map(|entry| {
-                let value = normalize_persisted_telemetry_value(&entry.dimension, entry.value);
-                (
-                    (
-                        entry.bucket,
-                        normalize_telemetry_bucket_span_seconds(entry.span_seconds),
-                        entry.dimension,
-                        value,
-                    ),
-                    (entry.download, entry.upload, entry.failures),
-                )
-            })
-            .collect();
-    }
-
-    fn restore_failed_history(&self, persisted: Vec<GoFailedHistoryRecord>) {
-        let mut state = self.lock();
-        for failure in persisted {
-            let key = (
-                failure.protocol.clone(),
-                failure.host.clone(),
-                failure.process.clone(),
-            );
-            let entry = state.failed_history.entry(key).or_insert(FailedEntry {
-                protocol: failure.protocol.clone(),
-                host: failure.host.clone(),
-                process: failure.process.clone(),
-                error: failure.error.clone(),
-                time: failure.last_seen,
-                count: failure.count,
-            });
-            if failure.count > entry.count || failure.last_seen >= entry.time {
-                entry.count = entry.count.max(failure.count);
-                if failure.last_seen >= entry.time {
-                    entry.error = failure.error;
-                    entry.time = failure.last_seen;
-                }
-            }
-        }
-    }
-
-    fn restore_go_statistics(&self, persisted: GoStatisticsSnapshot) -> yuhaiin_core::Result<()> {
-        let mut state = self.lock();
-        state.total_upload = persisted.total_upload;
-        state.total_download = persisted.total_download;
-        for bucket in persisted.traffic {
-            let entry = state.buckets.entry(bucket.bucket).or_default();
-            entry.0 = entry.0.saturating_add(bucket.download);
-            entry.1 = entry.1.saturating_add(bucket.upload);
-        }
-        let history = persisted
-            .history
-            .into_iter()
-            .filter_map(|history| {
-                let mut connection =
-                    serde_json::from_slice::<Value>(&history.connection_json).ok()?;
-                connection.as_object_mut()?.insert(
-                    INTERNAL_GO_PROTOCOL_KEY.to_owned(),
-                    Value::String(history.protocol),
-                );
-                Some(json!({
-                    "connection": connection,
-                    "count": history.count.to_string(),
-                    "time": format_time(history.last_seen),
-                }))
-            })
-            .collect();
-        state.history = coalesce_history(history);
-        state.history.sort_by_key(history_time);
-        if state.history.len() > HISTORY_LIMIT {
-            let excess = state.history.len() - HISTORY_LIMIT;
-            state.history.drain(..excess);
-        }
-        for failure in persisted.failed_history {
-            state.failed_history.insert(
-                (
-                    failure.protocol.clone(),
-                    failure.host.clone(),
-                    failure.process.clone(),
-                ),
-                FailedEntry {
-                    protocol: failure.protocol,
-                    host: failure.host,
-                    process: failure.process,
-                    error: failure.error,
-                    time: failure.last_seen,
-                    count: failure.count,
-                },
-            );
-        }
-        for item in persisted.telemetry {
-            let value = normalize_persisted_telemetry_value(&item.dimension, item.value);
-            let aggregate = state
-                .telemetry
-                .entry((item.dimension.clone(), value.clone()))
-                .or_default();
-            aggregate.0 = aggregate.0.saturating_add(item.download);
-            aggregate.1 = aggregate.1.saturating_add(item.upload);
-            aggregate.2 = aggregate.2.saturating_add(item.failures);
-            let bucket = state
-                .telemetry_buckets
-                .entry((
-                    item.bucket,
-                    normalize_telemetry_bucket_span_seconds(item.span_seconds),
-                    item.dimension,
-                    value,
-                ))
-                .or_default();
-            bucket.0 = bucket.0.saturating_add(item.download);
-            bucket.1 = bucket.1.saturating_add(item.upload);
-            bucket.2 = bucket.2.saturating_add(item.failures);
-        }
-        Ok(())
-    }
-
-    fn go_statistics_snapshot(&self) -> GoStatisticsSnapshot {
-        let state = self.lock();
-        let mut traffic = BTreeMap::<i64, (u64, u64)>::new();
-        for (bucket, (download, upload)) in &state.buckets {
-            let hour = bucket.div_euclid(3_600) * 3_600;
-            let entry = traffic.entry(hour).or_default();
-            entry.0 = entry.0.saturating_add(*upload);
-            entry.1 = entry.1.saturating_add(*download);
-        }
-        GoStatisticsSnapshot {
-            total_download: state.total_download,
-            total_upload: state.total_upload,
-            traffic: traffic
-                .into_iter()
-                .map(|(bucket, (upload, download))| GoTrafficBucketRecord {
-                    bucket,
-                    upload,
-                    download,
-                })
-                .collect(),
-            history: coalesce_history(state.history.clone())
-                .iter()
-                .filter_map(|item| {
-                    let connection = item.get("connection")?;
-                    let mut public_connection = connection.clone();
-                    public_connection
-                        .as_object_mut()?
-                        .remove(INTERNAL_GO_PROTOCOL_KEY);
-                    Some(GoConnectionHistoryRecord {
-                        protocol: history_protocol(connection),
-                        addr: connection
-                            .get("addr")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        process: connection
-                            .get("process")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        count: history_count(item),
-                        last_seen: history_time(item),
-                        connection_json: serde_json::to_vec(&public_connection).ok()?,
-                    })
-                })
-                .collect(),
-            failed_history: state
-                .failed_history
-                .values()
-                .map(|entry| GoFailedHistoryRecord {
-                    protocol: entry.protocol.clone(),
-                    host: entry.host.clone(),
-                    process: entry.process.clone(),
-                    count: entry.count,
-                    last_seen: entry.time,
-                    error: entry.error.clone(),
-                })
-                .collect(),
-            telemetry: state
-                .telemetry_buckets
-                .iter()
-                .map(
-                    |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
-                        GoTelemetryBucketRecord {
-                            bucket: *bucket,
-                            span_seconds: *span_seconds,
-                            dimension: dimension.clone(),
-                            value: value.clone(),
-                            download: *download,
-                            upload: *upload,
-                            failures: *failures,
-                        }
-                    },
-                )
-                .collect(),
-        }
-    }
-
-    fn persisted_json(&self) -> Result<Vec<u8>, serde_json::Error> {
-        let mut state = self.lock();
-        coalesce_history_in_place(&mut state.history);
-        let telemetry = state
-            .telemetry
-            .iter()
-            .map(
-                |((dimension, value), (download, upload, failures))| PersistedTelemetryRef {
-                    dimension,
-                    value,
-                    download: *download,
-                    upload: *upload,
-                    failures: *failures,
-                },
-            )
-            .collect();
-        let telemetry_buckets = state
-            .telemetry_buckets
-            .iter()
-            .map(
-                |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
-                    PersistedTelemetryBucketRef {
-                        bucket: *bucket,
-                        span_seconds: *span_seconds,
-                        dimension,
-                        value,
-                        download: *download,
-                        upload: *upload,
-                        failures: *failures,
-                    }
-                },
-            )
-            .collect();
-        serde_json::to_vec(&PersistedMonitorRef {
-            version: PERSISTENCE_VERSION,
-            next_id: state.next_id,
-            total_upload: state.total_upload,
-            total_download: state.total_download,
-            counters: &state.counters,
-            buckets: &state.buckets,
-            telemetry,
-            telemetry_buckets,
-            history: &state.history,
-            failed_history: state.failed_history.values().collect(),
-            block_history: state.block_history.values().collect(),
-        })
     }
 }
 
@@ -1624,19 +1505,21 @@ fn telemetry_dimensions(connection: &Value) -> Vec<(String, String)> {
     let tag = string_field(connection, "tag");
     let destination = telemetry_destination(connection);
 
-    let mut values = BTreeMap::new();
+    let mut values = Vec::with_capacity(9);
+    // Keep the same lexicographic order previously supplied by BTreeMap while
+    // using a flat Vec, since these dimensions are already unique by name.
     for (dimension, value) in [
-        ("protocol", protocol.to_owned()),
-        ("inbound", inbound),
-        ("source", source),
         ("addr", addr),
+        ("destination", destination),
+        ("inbound", inbound),
         ("outbound", outbound),
         ("process", process),
+        ("protocol", protocol.to_owned()),
+        ("source", source),
         ("tag", tag),
-        ("destination", destination),
     ] {
         if !value.is_empty() {
-            values.insert(dimension.to_owned(), value);
+            values.push((dimension.to_owned(), value));
         }
     }
     if let Some(rule) = connection
@@ -1647,9 +1530,13 @@ fn telemetry_dimensions(connection: &Value) -> Vec<(String, String)> {
         .filter_map(|match_value| match_value.get("ruleName").and_then(Value::as_str))
         .rfind(|rule| !rule.is_empty())
     {
-        values.insert("rule".to_owned(), rule.to_owned());
+        let insert_at = values
+            .iter()
+            .position(|(dimension, _)| dimension.as_str() > "rule")
+            .unwrap_or(values.len());
+        values.insert(insert_at, ("rule".to_owned(), rule.to_owned()));
     }
-    values.into_iter().collect()
+    values
 }
 
 fn string_field(value: &Value, key: &str) -> String {
@@ -1774,10 +1661,369 @@ fn route_mode(mode: RouteMode) -> &'static str {
     }
 }
 
-fn next_projection_backoff(current: Duration) -> Duration {
-    current
-        .saturating_mul(2)
-        .min(GO_STATISTICS_PROJECTION_RETRY_MAX)
+fn persisted_snapshot(persisted: &PersistedMonitor) -> yuhaiin_core::Result<GoStatisticsSnapshot> {
+    let mut traffic = BTreeMap::<i64, (u64, u64)>::new();
+    for (bucket, (download, upload)) in &persisted.buckets {
+        let hour = bucket.div_euclid(3_600) * 3_600;
+        let item = traffic.entry(hour).or_default();
+        item.0 = item.0.saturating_add(*download);
+        item.1 = item.1.saturating_add(*upload);
+    }
+    let history = persisted
+        .history
+        .iter()
+        .filter_map(|item| {
+            let connection = item.get("connection")?;
+            let mut public_connection = connection.clone();
+            public_connection
+                .as_object_mut()?
+                .remove(INTERNAL_GO_PROTOCOL_KEY);
+            Some(GoConnectionHistoryRecord {
+                protocol: history_protocol(connection),
+                addr: connection
+                    .get("addr")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                process: connection
+                    .get("process")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                count: history_count(item),
+                last_seen: history_time(item),
+                connection_json: serde_json::to_vec(&public_connection).ok()?,
+            })
+        })
+        .collect();
+    let telemetry = if persisted.telemetry_buckets.is_empty() {
+        let bucket = unix_seconds().div_euclid(TELEMETRY_HOURLY_BUCKET_SECONDS)
+            * TELEMETRY_HOURLY_BUCKET_SECONDS;
+        persisted
+            .telemetry
+            .iter()
+            .map(|entry| GoTelemetryBucketRecord {
+                bucket,
+                span_seconds: TELEMETRY_HOURLY_BUCKET_SECONDS,
+                dimension: entry.dimension.clone(),
+                value: normalize_persisted_telemetry_value(&entry.dimension, entry.value.clone()),
+                download: entry.download,
+                upload: entry.upload,
+                failures: entry.failures,
+            })
+            .collect()
+    } else {
+        persisted
+            .telemetry_buckets
+            .iter()
+            .map(|entry| GoTelemetryBucketRecord {
+                bucket: entry.bucket,
+                span_seconds: normalize_telemetry_bucket_span_seconds(entry.span_seconds),
+                dimension: entry.dimension.clone(),
+                value: normalize_persisted_telemetry_value(&entry.dimension, entry.value.clone()),
+                download: entry.download,
+                upload: entry.upload,
+                failures: entry.failures,
+            })
+            .collect()
+    };
+    Ok(GoStatisticsSnapshot {
+        total_download: persisted.total_download,
+        total_upload: persisted.total_upload,
+        traffic: traffic
+            .into_iter()
+            .map(|(bucket, (download, upload))| GoTrafficBucketRecord {
+                bucket,
+                upload,
+                download,
+            })
+            .collect(),
+        history,
+        failed_history: persisted
+            .failed_history
+            .iter()
+            .map(|entry| GoFailedHistoryRecord {
+                protocol: entry.protocol.clone(),
+                host: entry.host.clone(),
+                process: entry.process.clone(),
+                count: entry.count,
+                last_seen: entry.time,
+                error: entry.error.clone(),
+            })
+            .collect(),
+        telemetry,
+    })
+}
+
+fn pending_delta_from_state(state: &MonitorState) -> GoStatisticsDelta {
+    GoStatisticsDelta {
+        total_download: state.total_download,
+        total_upload: state.total_upload,
+        traffic: state
+            .pending_traffic
+            .iter()
+            .map(|(bucket, (download, upload))| GoTrafficBucketRecord {
+                bucket: *bucket,
+                upload: *upload,
+                download: *download,
+            })
+            .collect(),
+        history: state.pending_history.clone(),
+        failed_history: state.pending_failed_history.values().cloned().collect(),
+        telemetry: state
+            .pending_telemetry
+            .iter()
+            .map(
+                |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
+                    GoTelemetryBucketRecord {
+                        bucket: *bucket,
+                        span_seconds: *span_seconds,
+                        dimension: dimension.clone(),
+                        value: value.clone(),
+                        download: *download,
+                        upload: *upload,
+                        failures: *failures,
+                    }
+                },
+            )
+            .collect(),
+    }
+}
+
+fn apply_delta_to_snapshot(snapshot: &mut GoStatisticsSnapshot, delta: GoStatisticsDelta) {
+    snapshot.total_download = delta.total_download;
+    snapshot.total_upload = delta.total_upload;
+    for item in delta.traffic {
+        if let Some(existing) = snapshot
+            .traffic
+            .iter_mut()
+            .find(|existing| existing.bucket == item.bucket)
+        {
+            existing.download = existing.download.saturating_add(item.download);
+            existing.upload = existing.upload.saturating_add(item.upload);
+        } else {
+            snapshot.traffic.push(item);
+        }
+    }
+    for item in delta.history {
+        if let Some(existing) = snapshot.history.iter_mut().find(|existing| {
+            existing.protocol == item.protocol
+                && existing.addr == item.addr
+                && existing.process == item.process
+        }) {
+            existing.count = existing.count.saturating_add(item.count);
+            if item.last_seen >= existing.last_seen {
+                existing.last_seen = item.last_seen;
+                existing.connection_json = item.connection_json;
+            }
+        } else {
+            snapshot.history.push(item);
+        }
+    }
+    for item in delta.failed_history {
+        if let Some(existing) = snapshot.failed_history.iter_mut().find(|existing| {
+            existing.protocol == item.protocol
+                && existing.host == item.host
+                && existing.process == item.process
+        }) {
+            existing.count = existing.count.saturating_add(item.count);
+            if item.last_seen >= existing.last_seen {
+                existing.last_seen = item.last_seen;
+                existing.error = item.error;
+            }
+        } else {
+            snapshot.failed_history.push(item);
+        }
+    }
+    for item in delta.telemetry {
+        if let Some(existing) = snapshot.telemetry.iter_mut().find(|existing| {
+            existing.bucket == item.bucket
+                && existing.span_seconds == item.span_seconds
+                && existing.dimension == item.dimension
+                && existing.value == item.value
+        }) {
+            existing.download = existing.download.saturating_add(item.download);
+            existing.upload = existing.upload.saturating_add(item.upload);
+            existing.failures = existing.failures.saturating_add(item.failures);
+        } else {
+            snapshot.telemetry.push(item);
+        }
+    }
+}
+
+fn merge_statistics_snapshots(
+    mut base: GoStatisticsSnapshot,
+    overlay: GoStatisticsSnapshot,
+) -> GoStatisticsSnapshot {
+    base.total_download = base.total_download.max(overlay.total_download);
+    base.total_upload = base.total_upload.max(overlay.total_upload);
+
+    let mut traffic = base
+        .traffic
+        .into_iter()
+        .map(|item| (item.bucket, item))
+        .collect::<BTreeMap<_, _>>();
+    for item in overlay.traffic {
+        traffic
+            .entry(item.bucket)
+            .and_modify(|current| {
+                current.upload = current.upload.max(item.upload);
+                current.download = current.download.max(item.download);
+            })
+            .or_insert(item);
+    }
+    base.traffic = traffic.into_values().collect();
+
+    let mut history = base
+        .history
+        .into_iter()
+        .map(|item| history_record_key(&item).map(|key| (key, item)))
+        .flatten()
+        .collect::<BTreeMap<_, _>>();
+    for item in overlay.history {
+        let key = (
+            item.protocol.clone(),
+            item.addr.clone(),
+            item.process.clone(),
+        );
+        if let Some(current) = history.get_mut(&key) {
+            if item.count > current.count || item.last_seen >= current.last_seen {
+                *current = item;
+            }
+        } else {
+            history.insert(key, item);
+        }
+    }
+    base.history = history.into_values().collect();
+
+    let mut failed = base
+        .failed_history
+        .into_iter()
+        .map(|item| {
+            (
+                (
+                    item.protocol.clone(),
+                    item.host.clone(),
+                    item.process.clone(),
+                ),
+                item,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for item in overlay.failed_history {
+        let key = (
+            item.protocol.clone(),
+            item.host.clone(),
+            item.process.clone(),
+        );
+        if let Some(current) = failed.get_mut(&key) {
+            if item.count > current.count || item.last_seen >= current.last_seen {
+                *current = item;
+            }
+        } else {
+            failed.insert(key, item);
+        }
+    }
+    base.failed_history = failed.into_values().collect();
+
+    let mut telemetry = base
+        .telemetry
+        .into_iter()
+        .map(|item| {
+            (
+                (
+                    item.bucket,
+                    item.span_seconds,
+                    item.dimension.clone(),
+                    item.value.clone(),
+                ),
+                item,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for item in overlay.telemetry {
+        let key = (
+            item.bucket,
+            item.span_seconds,
+            item.dimension.clone(),
+            item.value.clone(),
+        );
+        if let Some(current) = telemetry.get_mut(&key) {
+            current.download = current.download.max(item.download);
+            current.upload = current.upload.max(item.upload);
+            current.failures = current.failures.max(item.failures);
+        } else {
+            telemetry.insert(key, item);
+        }
+    }
+    base.telemetry = telemetry.into_values().collect();
+    base
+}
+
+fn history_record_key(item: &GoConnectionHistoryRecord) -> Option<(String, String, String)> {
+    Some((
+        item.protocol.clone(),
+        item.addr.clone(),
+        item.process.clone(),
+    ))
+}
+
+fn history_record_value(item: GoConnectionHistoryRecord) -> Option<Value> {
+    let mut connection = serde_json::from_slice::<Value>(&item.connection_json).ok()?;
+    connection.as_object_mut()?.insert(
+        INTERNAL_GO_PROTOCOL_KEY.to_owned(),
+        Value::String(item.protocol),
+    );
+    Some(json!({
+        "connection": connection,
+        "count": item.count.to_string(),
+        "time": format_time(item.last_seen),
+    }))
+}
+
+fn connection_history_record(
+    connection: &Value,
+    last_seen: i64,
+) -> Option<GoConnectionHistoryRecord> {
+    let mut public_connection = connection.clone();
+    public_connection
+        .as_object_mut()?
+        .remove(INTERNAL_GO_PROTOCOL_KEY);
+    Some(GoConnectionHistoryRecord {
+        protocol: history_protocol(connection),
+        addr: connection
+            .get("addr")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        process: connection
+            .get("process")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        count: 1,
+        last_seen,
+        connection_json: serde_json::to_vec(&public_connection).ok()?,
+    })
+}
+
+fn merge_pending_history(
+    pending: &mut Vec<GoConnectionHistoryRecord>,
+    record: GoConnectionHistoryRecord,
+) {
+    if let Some(existing) = pending.iter_mut().find(|existing| {
+        existing.protocol == record.protocol
+            && existing.addr == record.addr
+            && existing.process == record.process
+    }) {
+        existing.count = existing.count.saturating_add(record.count);
+        if record.last_seen >= existing.last_seen {
+            existing.last_seen = record.last_seen;
+            existing.connection_json = record.connection_json;
+        }
+    } else {
+        pending.push(record);
+    }
 }
 
 fn unix_seconds() -> i64 {
@@ -1808,6 +2054,10 @@ fn parse_time(value: Option<&str>) -> Option<i64> {
 
 fn history_key(item: &Value) -> (String, String, String) {
     let connection = item.get("connection").unwrap_or(item);
+    connection_history_key(connection)
+}
+
+fn connection_history_key(connection: &Value) -> (String, String, String) {
     (
         history_protocol(connection),
         connection
@@ -1876,11 +2126,6 @@ fn coalesce_history(items: Vec<Value>) -> Vec<Value> {
             .then_with(|| history_key(left).cmp(&history_key(right)))
     });
     items
-}
-
-fn coalesce_history_in_place(items: &mut Vec<Value>) {
-    let current = std::mem::take(items);
-    *items = coalesce_history(current);
 }
 
 fn normalize_history_time(mut item: Value) -> Value {
@@ -2263,22 +2508,6 @@ mod tests {
     }
 
     #[test]
-    fn go_statistics_projection_backoff_is_bounded_and_doubles() {
-        assert_eq!(
-            next_projection_backoff(GO_STATISTICS_PROJECTION_RETRY_INITIAL),
-            Duration::from_secs(4)
-        );
-        assert_eq!(
-            next_projection_backoff(Duration::from_secs(32)),
-            GO_STATISTICS_PROJECTION_RETRY_MAX
-        );
-        assert_eq!(
-            next_projection_backoff(GO_STATISTICS_PROJECTION_RETRY_MAX),
-            GO_STATISTICS_PROJECTION_RETRY_MAX
-        );
-    }
-
-    #[test]
     fn monitor_emits_snapshot_add_and_remove_events() {
         let monitor = ConnectionMonitor::new();
         let mut receiver = monitor.subscribe();
@@ -2304,45 +2533,6 @@ mod tests {
         let history = monitor.all_history_value();
         assert_eq!(history["items"].as_array().unwrap().len(), 1);
         assert_eq!(history["items"][0]["count"], "2");
-    }
-
-    #[test]
-    fn monitor_coalesces_duplicate_checkpoint_history_before_go_projection() {
-        let monitor = ConnectionMonitor::new();
-        {
-            let mut state = monitor.lock();
-            state.history = vec![
-                json!({
-                    "connection": {
-                        "protocol": "",
-                        "addr": "example.com:443",
-                        "process": "browser"
-                    },
-                    "count": "2",
-                    "time": "2024-01-01T00:00:00Z"
-                }),
-                json!({
-                    "connection": {
-                        "protocol": "",
-                        "addr": "example.com:443",
-                        "process": "browser"
-                    },
-                    "count": "3",
-                    "time": "2024-01-02T00:00:00Z"
-                }),
-            ];
-        }
-
-        let snapshot = monitor.go_statistics_snapshot();
-        assert_eq!(snapshot.history.len(), 1);
-        assert_eq!(snapshot.history[0].count, 5);
-        assert_eq!(
-            monitor.all_history_value()["items"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
     }
 
     #[tokio::test]
@@ -2799,7 +2989,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn monitor_coalesces_dirty_updates_until_the_next_checkpoint_interval() {
+    async fn monitor_flushes_incremental_statistics_on_the_next_interval() {
         let store = ConfigStore::open_memory().await.unwrap();
         let monitor = ConnectionMonitor::load_with_store(store.clone())
             .await
@@ -2810,9 +3000,8 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if let Some(bytes) = store.get_config(PERSISTENCE_KEY).await.unwrap() {
-                    let checkpoint: PersistedMonitor = serde_json::from_slice(&bytes).unwrap();
-                    if checkpoint.total_upload == 13 {
+                if store.load_go_statistics().unwrap().total_upload == 13 {
+                    if store.get_config(PERSISTENCE_KEY).await.unwrap().is_none() {
                         break;
                     }
                 }
@@ -2823,21 +3012,12 @@ mod tests {
         .expect("initial checkpoint should be written");
 
         monitor.bytes(flow.key, TunFlowDirection::Upload, 17);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let checkpoint: PersistedMonitor =
-            serde_json::from_slice(&store.get_config(PERSISTENCE_KEY).await.unwrap().unwrap())
-                .unwrap();
-        assert_eq!(checkpoint.total_upload, 13);
-
         tokio::time::timeout(
             PERSISTENCE_CHECKPOINT_INTERVAL + Duration::from_secs(1),
             async {
                 loop {
-                    if let Some(bytes) = store.get_config(PERSISTENCE_KEY).await.unwrap() {
-                        let checkpoint: PersistedMonitor = serde_json::from_slice(&bytes).unwrap();
-                        if checkpoint.total_upload == 30 {
-                            break;
-                        }
+                    if store.load_go_statistics().unwrap().total_upload == 30 {
+                        break;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -2972,5 +3152,51 @@ mod tests {
                 "tcp"
             );
         });
+    }
+
+    #[tokio::test]
+    async fn monitor_migrates_legacy_runtime_blob_into_go_tables_once() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let bucket = 1_700_000_000;
+        let persisted = PersistedMonitor {
+            version: PERSISTENCE_VERSION,
+            next_id: 9,
+            total_upload: 7,
+            total_download: 11,
+            counters: BTreeMap::new(),
+            buckets: BTreeMap::from([(bucket, (11, 7))]),
+            telemetry: vec![],
+            telemetry_buckets: vec![PersistedTelemetryBucket {
+                bucket,
+                span_seconds: TELEMETRY_HOURLY_BUCKET_SECONDS,
+                dimension: "protocol".to_owned(),
+                value: "tcp".to_owned(),
+                download: 11,
+                upload: 7,
+                failures: 0,
+            }],
+            history: vec![json!({
+                "connection": {"protocol": "tcp", "addr": "example.com:443"},
+                "count": "2",
+                "time": "2024-01-01T00:00:00Z"
+            })],
+            failed_history: vec![],
+            block_history: vec![],
+        };
+        store
+            .put_config(PERSISTENCE_KEY, &serde_json::to_vec(&persisted).unwrap())
+            .await
+            .unwrap();
+
+        let monitor = ConnectionMonitor::load_with_store(store.clone())
+            .await
+            .unwrap();
+        assert_eq!(monitor.total_flow_value()["upload"], "7");
+        assert_eq!(monitor.all_history_value()["items"][0]["count"], "2");
+        assert!(store.get_config(PERSISTENCE_KEY).await.unwrap().is_none());
+        let statistics = store.load_go_statistics().unwrap();
+        assert_eq!(statistics.total_upload, 7);
+        assert_eq!(statistics.history[0].count, 2);
+        monitor.shutdown().await.unwrap();
     }
 }

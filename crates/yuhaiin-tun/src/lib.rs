@@ -166,6 +166,10 @@ const MAX_TCP_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
 const IPV6_FRAGMENT_MAX_ENTRIES: usize = 32;
 const IPV6_FRAGMENT_MAX_FRAGMENTS: usize = 128;
 const IPV6_FRAGMENT_MAX_PACKET: usize = MAX_SMOLTCP_PACKET_SIZE;
+// Bound aggregate memory across concurrent hostile fragment streams. The
+// per-datagram limit alone would otherwise allow 32 assemblies to retain
+// roughly 2 MiB of payload plus metadata until timeout.
+const IPV6_FRAGMENT_MAX_TOTAL_BYTES: usize = 1024 * 1024;
 const IPV6_FRAGMENT_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 // The smoltcp device is allowed to produce one complete IP datagram. The
 // real wire MTU is applied by `fragment_ip_packet` immediately before the

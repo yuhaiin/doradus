@@ -60,7 +60,8 @@ impl InboundDnsPolicy {
 impl InboundDnsHandler for InboundDnsPolicy {
     fn should_hijack(&self, destination_port: Option<u16>, packet: &[u8]) -> bool {
         self.monitor.dns_hijack_enabled()
-            && (destination_port == Some(53) || yuhaiin_core::dns::decode_query(packet).is_ok())
+            && (destination_port == Some(53)
+                || yuhaiin_core::dns::looks_like_supported_query(packet))
     }
 
     fn answer<'a>(

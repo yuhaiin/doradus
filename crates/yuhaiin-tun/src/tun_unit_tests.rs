@@ -335,6 +335,31 @@ fn ipv6_fragment_reassembler_drops_fragment_count_overflow_without_poisoning() {
     assert_eq!(reassembler.push(&second, now).unwrap(), Some(recovered));
 }
 
+#[test]
+fn ipv6_fragment_reassembler_enforces_a_global_memory_budget() {
+    let payload = vec![0xa5; 65_000];
+    let whole = ipv6_udp_packet(
+        Ipv6Addr::LOCALHOST,
+        Ipv6Addr::LOCALHOST,
+        41000,
+        5353,
+        &payload,
+    );
+    let now = StdInstant::now();
+    let mut reassembler = Ipv6FragmentReassembler::default();
+
+    for identification in 0..17u32 {
+        let fragment = ipv6_fragment(&whole, 0, true, payload.len(), identification);
+        assert!(reassembler.push(&fragment, now).unwrap().is_none());
+    }
+
+    assert_eq!(reassembler.assemblies.len(), 16);
+    assert!(reassembler.buffered_bytes <= IPV6_FRAGMENT_MAX_TOTAL_BYTES);
+    reassembler.expire(now + IPV6_FRAGMENT_TIMEOUT + StdDuration::from_secs(1));
+    assert!(reassembler.assemblies.is_empty());
+    assert_eq!(reassembler.buffered_bytes, 0);
+}
+
 fn ipv6_udp_packet(
     source: Ipv6Addr,
     destination: Ipv6Addr,
@@ -418,6 +443,23 @@ fn config_rejects_invalid_mtu_and_queue() {
     config.mtu = DEFAULT_MTU;
     config.queue_capacity = 0;
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn reassembler_borrows_non_fragmented_packets() {
+    let packet = ipv6_udp_packet(
+        Ipv6Addr::LOCALHOST,
+        Ipv6Addr::LOCALHOST,
+        41000,
+        5353,
+        b"borrowed",
+    );
+    let mut reassembler = Ipv6FragmentReassembler::default();
+    let result = reassembler
+        .push_borrowed(&packet, StdInstant::now())
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Cow::Borrowed(_)));
 }
 
 #[test]

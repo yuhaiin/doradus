@@ -667,6 +667,12 @@ pub(crate) struct Ipv6FragmentAssembly {
 }
 
 impl Ipv6FragmentAssembly {
+    fn memory_bytes(&self) -> usize {
+        self.unfragmentable_prefix
+            .len()
+            .saturating_add(self.received_bytes)
+    }
+
     fn complete(&self) -> Option<usize> {
         let total = self.total_payload?;
         let mut pieces = self
@@ -714,13 +720,28 @@ pub(crate) fn ipv6_unfragmentable_prefixes_match(left: &[u8], right: &[u8]) -> b
 #[derive(Debug, Default)]
 pub struct Ipv6FragmentReassembler {
     pub(crate) assemblies: HashMap<Ipv6FragmentKey, Ipv6FragmentAssembly>,
+    pub(crate) buffered_bytes: usize,
 }
 
 impl Ipv6FragmentReassembler {
+    fn remove_assembly(&mut self, key: &Ipv6FragmentKey) -> Option<Ipv6FragmentAssembly> {
+        let assembly = self.assemblies.remove(key)?;
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(assembly.memory_bytes());
+        Some(assembly)
+    }
+
     /// Remove assemblies that have exceeded the bounded reassembly timeout.
     pub fn expire(&mut self, now: StdInstant) {
-        self.assemblies
-            .retain(|_, assembly| assembly.expires_at > now);
+        let mut released = 0usize;
+        self.assemblies.retain(|_, assembly| {
+            if assembly.expires_at > now {
+                true
+            } else {
+                released = released.saturating_add(assembly.memory_bytes());
+                false
+            }
+        });
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(released);
     }
 
     /// Return the packet to enqueue, or `None` for an incomplete/invalid
@@ -732,9 +753,20 @@ impl Ipv6FragmentReassembler {
     /// returns `None` until all pieces arrive; malformed, overlapping, or
     /// resource-exhausted assemblies are dropped and also return `None`.
     pub fn push(&mut self, packet: &[u8], now: StdInstant) -> Result<Option<Vec<u8>>> {
+        self.push_borrowed(packet, now)
+            .map(|packet| packet.map(Cow::into_owned))
+    }
+
+    /// Borrow non-fragmented packets instead of copying them into a second
+    /// temporary `Vec`. Fragmented packets still produce an owned reassembly.
+    pub fn push_borrowed<'a>(
+        &mut self,
+        packet: &'a [u8],
+        now: StdInstant,
+    ) -> Result<Option<Cow<'a, [u8]>>> {
         self.expire(now);
         let Some(metadata) = parse_ipv6_fragment_metadata(packet)? else {
-            return Ok(Some(packet.to_vec()));
+            return Ok(Some(Cow::Borrowed(packet)));
         };
         let fragment_end = metadata
             .fragment_offset
@@ -760,6 +792,13 @@ impl Ipv6FragmentReassembler {
             if self.assemblies.len() >= IPV6_FRAGMENT_MAX_ENTRIES {
                 return Ok(None);
             }
+            let required = metadata
+                .unfragmentable_prefix
+                .len()
+                .saturating_add(metadata.payload.len());
+            if self.buffered_bytes.saturating_add(required) > IPV6_FRAGMENT_MAX_TOTAL_BYTES {
+                return Ok(None);
+            }
             self.assemblies.insert(
                 key,
                 Ipv6FragmentAssembly {
@@ -772,6 +811,16 @@ impl Ipv6FragmentReassembler {
                     expires_at: now + IPV6_FRAGMENT_TIMEOUT,
                 },
             );
+            self.buffered_bytes = self
+                .buffered_bytes
+                .saturating_add(metadata.unfragmentable_prefix.len());
+        }
+
+        if self.buffered_bytes.saturating_add(metadata.payload.len())
+            > IPV6_FRAGMENT_MAX_TOTAL_BYTES
+        {
+            self.remove_assembly(&key);
+            return Ok(None);
         }
 
         let Some(assembly) = self.assemblies.get_mut(&key) else {
@@ -788,7 +837,7 @@ impl Ipv6FragmentReassembler {
                 .saturating_add(metadata.payload.len())
                 > IPV6_FRAGMENT_MAX_PACKET
         {
-            self.assemblies.remove(&key);
+            self.remove_assembly(&key);
             return Ok(None);
         }
         if assembly
@@ -798,20 +847,20 @@ impl Ipv6FragmentReassembler {
         {
             // Overlap handling is deliberately fail-closed. Accepting either
             // first- or last-fragment bytes creates ambiguous security policy.
-            self.assemblies.remove(&key);
+            self.remove_assembly(&key);
             return Ok(None);
         }
         if let Some(total) = assembly.total_payload
             && fragment_end > total
         {
-            self.assemblies.remove(&key);
+            self.remove_assembly(&key);
             return Ok(None);
         }
         if !metadata.more_fragments {
             if let Some(total) = assembly.total_payload
                 && total != fragment_end
             {
-                self.assemblies.remove(&key);
+                self.remove_assembly(&key);
                 return Ok(None);
             }
             assembly.total_payload = Some(fragment_end);
@@ -822,11 +871,12 @@ impl Ipv6FragmentReassembler {
             end: fragment_end,
             payload: metadata.payload.to_vec(),
         });
+        self.buffered_bytes = self.buffered_bytes.saturating_add(metadata.payload.len());
         let Some(total) = assembly.complete() else {
             return Ok(None);
         };
-        let assembly = self.assemblies.remove(&key).expect("assembly exists");
-        Ok(assembly.finish(total))
+        let assembly = self.remove_assembly(&key).expect("assembly exists");
+        Ok(assembly.finish(total).map(Cow::Owned))
     }
 }
 

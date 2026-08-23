@@ -41,6 +41,8 @@ pub mod interfaces;
 pub mod latency;
 #[path = "support/loopback.rs"]
 mod loopback;
+#[path = "support/monitoring.rs"]
+mod monitoring;
 #[cfg(feature = "doh-tls")]
 #[path = "support/tls.rs"]
 mod tls;

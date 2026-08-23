@@ -189,10 +189,20 @@ impl ResolverProxyBridge {
         port: u16,
         use_proxy: bool,
     ) -> Result<Option<BoxAsyncStream>> {
+        self.connect_for_resolver("", host, port, use_proxy).await
+    }
+
+    pub(crate) async fn connect_for_resolver(
+        &self,
+        resolver_id: &str,
+        host: &str,
+        port: u16,
+        use_proxy: bool,
+    ) -> Result<Option<BoxAsyncStream>> {
         if !use_proxy {
             return Ok(None);
         }
-        self.connect_via_selector(host, port, RouteMode::Proxy)
+        self.connect_via_selector(resolver_id, host, port, RouteMode::Proxy)
             .await
             .map(Some)
     }
@@ -200,13 +210,19 @@ impl ResolverProxyBridge {
     /// Connect through the runtime selector with a forced route mode. This is
     /// used by Go-compatible bootstrap DNS: it still enters the common
     /// dialer/monitor path, but the selected outbound slot is always direct.
-    pub(crate) async fn connect_direct(&self, host: &str, port: u16) -> Result<BoxAsyncStream> {
-        self.connect_via_selector(host, port, RouteMode::Direct)
+    pub(crate) async fn connect_direct_for_resolver(
+        &self,
+        resolver_id: &str,
+        host: &str,
+        port: u16,
+    ) -> Result<BoxAsyncStream> {
+        self.connect_via_selector(resolver_id, host, port, RouteMode::Direct)
             .await
     }
 
     async fn connect_via_selector(
         &self,
+        resolver_id: &str,
         host: &str,
         port: u16,
         route_mode: RouteMode,
@@ -227,9 +243,13 @@ impl ResolverProxyBridge {
         context.skip_route = route_mode == RouteMode::Direct;
         context.skip_resolve = true;
         selector.route_context(&mut context);
+        annotate_resolver_context(&mut context, resolver_id, host)?;
         let proxy = selector.select(&context);
         match proxy.connect(&context).await {
-            Ok(stream) => Ok(stream),
+            Ok(stream) => {
+                let stream = self.observe_stream(stream, context);
+                Ok(stream)
+            }
             Err(error) => {
                 self.record_failure_with_protocol("tcp", host, port, &error);
                 Err(error)
@@ -247,10 +267,21 @@ impl ResolverProxyBridge {
         port: u16,
         use_proxy: bool,
     ) -> Result<Option<Box<dyn AsyncDatagram>>> {
+        self.open_datagram_for_resolver("", host, port, use_proxy)
+            .await
+    }
+
+    pub(crate) async fn open_datagram_for_resolver(
+        &self,
+        resolver_id: &str,
+        host: &str,
+        port: u16,
+        use_proxy: bool,
+    ) -> Result<Option<Box<dyn AsyncDatagram>>> {
         if !use_proxy {
             return Ok(None);
         }
-        self.open_datagram_via_selector(host, port, RouteMode::Proxy)
+        self.open_datagram_via_selector(resolver_id, host, port, RouteMode::Proxy)
             .await
             .map(Some)
     }
@@ -262,12 +293,22 @@ impl ResolverProxyBridge {
         host: &str,
         port: u16,
     ) -> Result<Box<dyn AsyncDatagram>> {
-        self.open_datagram_via_selector(host, port, RouteMode::Direct)
+        self.open_datagram_direct_for_resolver("", host, port).await
+    }
+
+    pub(crate) async fn open_datagram_direct_for_resolver(
+        &self,
+        resolver_id: &str,
+        host: &str,
+        port: u16,
+    ) -> Result<Box<dyn AsyncDatagram>> {
+        self.open_datagram_via_selector(resolver_id, host, port, RouteMode::Direct)
             .await
     }
 
     async fn open_datagram_via_selector(
         &self,
+        resolver_id: &str,
         host: &str,
         port: u16,
         route_mode: RouteMode,
@@ -287,9 +328,10 @@ impl ResolverProxyBridge {
         context.route_mode = route_mode;
         context.skip_route = route_mode == RouteMode::Direct;
         selector.route_context(&mut context);
+        annotate_resolver_context(&mut context, resolver_id, host)?;
         let proxy = selector.select(&context);
         match proxy.open_datagram(&context).await {
-            Ok(datagram) => Ok(datagram),
+            Ok(datagram) => Ok(self.observe_datagram(datagram, context)),
             Err(error) => {
                 self.record_failure_with_protocol("udp", host, port, &error);
                 Err(error)
@@ -308,6 +350,57 @@ impl ResolverProxyBridge {
             monitor.record_failure(protocol, &resolver_authority(host, port), &error.message);
         }
     }
+
+    fn observe_stream(&self, stream: BoxAsyncStream, context: FlowContext) -> BoxAsyncStream {
+        let observer = self
+            .monitor
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(|monitor| monitor as Arc<dyn yuhaiin_core::flow::FlowObserver>);
+        match observer {
+            Some(observer) => crate::monitoring::observe_stream(observer, stream, context),
+            None => stream,
+        }
+    }
+
+    fn observe_datagram(
+        &self,
+        datagram: Box<dyn AsyncDatagram>,
+        context: FlowContext,
+    ) -> Box<dyn AsyncDatagram> {
+        let observer = self
+            .monitor
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(|monitor| monitor as Arc<dyn yuhaiin_core::flow::FlowObserver>);
+        match observer {
+            Some(observer) => crate::monitoring::observe_datagram(observer, datagram, context),
+            None => datagram,
+        }
+    }
+}
+
+fn annotate_resolver_context(
+    context: &mut FlowContext,
+    resolver_id: &str,
+    host: &str,
+) -> Result<()> {
+    context.component = Some(if resolver_id.trim().is_empty() {
+        "dns".to_owned()
+    } else {
+        format!("dns:{resolver_id}")
+    });
+    if !resolver_id.trim().is_empty() {
+        context.resolver = Some(resolver_id.trim().to_owned());
+    }
+    if host.parse::<IpAddr>().is_err() {
+        context.original_domain = Some(DomainName::new(host.trim_matches(['[', ']']))?);
+    }
+    Ok(())
 }
 
 fn resolver_endpoint(host: &str, port: u16, network: Network) -> Result<Endpoint> {
@@ -420,6 +513,7 @@ const MAX_DNS_TCP_FRAME: usize = u16::MAX as usize;
 #[derive(Clone)]
 enum RoutedDnsClient {
     Udp {
+        resolver_id: String,
         server: SocketAddr,
         timeout: Duration,
         max_packet_size: usize,
@@ -427,6 +521,7 @@ enum RoutedDnsClient {
         route_mode: RouteMode,
     },
     Tcp {
+        resolver_id: String,
         server: SocketAddr,
         timeout: Duration,
         max_packet_size: usize,
@@ -447,6 +542,7 @@ impl RoutedDnsClient {
         validate_query_packet(packet)?;
         match self {
             Self::Udp {
+                resolver_id,
                 server,
                 timeout,
                 max_packet_size,
@@ -457,10 +553,16 @@ impl RoutedDnsClient {
                 let datagram = tokio::time::timeout(*timeout, async {
                     match route_mode {
                         RouteMode::Direct => {
-                            bridge.open_datagram_direct(&host, server.port()).await
+                            bridge
+                                .open_datagram_direct_for_resolver(
+                                    resolver_id,
+                                    &host,
+                                    server.port(),
+                                )
+                                .await
                         }
                         RouteMode::Proxy => bridge
-                            .open_datagram(&host, server.port(), true)
+                            .open_datagram_for_resolver(resolver_id, &host, server.port(), true)
                             .await?
                             .ok_or_else(|| {
                                 Error::invalid("proxy DNS UDP transport was not opened")
@@ -492,6 +594,7 @@ impl RoutedDnsClient {
                 }?;
                 if response_is_truncated(&response)? {
                     return Self::Tcp {
+                        resolver_id: resolver_id.clone(),
                         server: *server,
                         timeout: *timeout,
                         max_packet_size: *max_packet_size,
@@ -509,6 +612,7 @@ impl RoutedDnsClient {
 
     async fn query_packet_tcp(&self, packet: &[u8]) -> Result<Vec<u8>> {
         let Self::Tcp {
+            resolver_id,
             server,
             timeout,
             max_packet_size,
@@ -529,9 +633,13 @@ impl RoutedDnsClient {
         let host = server.ip().to_string();
         let stream = tokio::time::timeout(*timeout, async {
             match route_mode {
-                RouteMode::Direct => bridge.connect_direct(&host, server.port()).await,
+                RouteMode::Direct => {
+                    bridge
+                        .connect_direct_for_resolver(resolver_id, &host, server.port())
+                        .await
+                }
                 RouteMode::Proxy => bridge
-                    .connect(&host, server.port(), true)
+                    .connect_for_resolver(resolver_id, &host, server.port(), true)
                     .await?
                     .ok_or_else(|| Error::invalid("proxy DNS TCP transport was not opened")),
                 RouteMode::Bypass | RouteMode::Block => {
@@ -730,10 +838,14 @@ impl DnsStreamConnector for ResolverBridgeStreamConnector {
                 return Ok(None);
             };
             let stream = match route_mode {
-                RouteMode::Direct => self.bridge.connect_direct(host, port).await?,
+                RouteMode::Direct => {
+                    self.bridge
+                        .connect_direct_for_resolver(resolver_id, host, port)
+                        .await?
+                }
                 RouteMode::Proxy => self
                     .bridge
-                    .connect(host, port, true)
+                    .connect_for_resolver(resolver_id, host, port, true)
                     .await?
                     .ok_or_else(|| Error::invalid("DNS proxy TCP transport was not opened"))?,
                 RouteMode::Bypass | RouteMode::Block => {
@@ -962,6 +1074,7 @@ impl ResolverTransportFactory for BuiltinResolverFactory {
                         .map(|route_mode| (bridge.clone(), route_mode))
                 }) {
                     let client = RoutedDnsClient::Udp {
+                        resolver_id: config.id.clone(),
                         server,
                         timeout: self.timeout,
                         max_packet_size: self.max_packet_size,
@@ -992,6 +1105,7 @@ impl ResolverTransportFactory for BuiltinResolverFactory {
                         .map(|route_mode| (bridge.clone(), route_mode))
                 }) {
                     let client = RoutedDnsClient::Tcp {
+                        resolver_id: config.id.clone(),
                         server,
                         timeout: self.timeout,
                         max_packet_size: self.max_packet_size,
@@ -1061,7 +1175,9 @@ mod tests {
         AsyncDnsHandler, DnsRecordType, DnsResponse, decode_query, encode_response,
     };
     use yuhaiin_core::dns_tcp::AsyncTcpDnsServer;
-    use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncProxySelector};
+    use yuhaiin_core::proxy::{
+        AsyncDatagram, AsyncProxy, AsyncProxySelector, with_stream_socket_addrs,
+    };
     use yuhaiin_core::{BoxFuture, DomainName, IpSet, ResolveStrategy};
 
     struct BridgeProxy {
@@ -1085,8 +1201,16 @@ mod tests {
                 if fail {
                     Err(Error::new(ErrorKind::Io, "proxy resolver failed"))
                 } else {
-                    let (stream, _peer) = tokio::io::duplex(64);
-                    Ok(Box::new(stream) as BoxAsyncStream)
+                    let (stream, mut peer) = tokio::io::duplex(64);
+                    tokio::spawn(async move {
+                        let mut buffer = [0u8; 64];
+                        let _ = peer.read(&mut buffer).await;
+                    });
+                    Ok(with_stream_socket_addrs(
+                        Box::new(stream) as BoxAsyncStream,
+                        Some("127.0.0.1:41001".parse().unwrap()),
+                        Some("192.0.2.10:443".parse().unwrap()),
+                    ))
                 }
             })
         }
@@ -1368,6 +1492,8 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let bridge = Arc::new(ResolverProxyBridge::new());
+            let monitor = Arc::new(ConnectionMonitor::new());
+            bridge.set_monitor(&monitor);
             bridge.set_proxy_resolver_id(Some("resolver-1"));
             let udp_calls = Arc::new(AtomicUsize::new(0));
             let tcp_calls = Arc::new(AtomicUsize::new(0));
@@ -1392,6 +1518,14 @@ mod tests {
                 vec!["192.0.2.123".parse::<std::net::Ipv4Addr>().unwrap()]
             );
             assert_eq!(udp_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                monitor.all_history_value()["items"][0]["connection"]["component"],
+                "dns:resolver-1"
+            );
+            assert_eq!(
+                monitor.all_history_value()["items"][0]["connection"]["resolver"],
+                "resolver-1"
+            );
         });
     }
 
@@ -1528,7 +1662,12 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
-            assert!(bridge.connect_direct("resolver.example", 443).await.is_ok());
+            assert!(
+                bridge
+                    .connect_direct_for_resolver("", "resolver.example", 443)
+                    .await
+                    .is_ok()
+            );
         });
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert!(saw_skip_resolve.load(Ordering::Relaxed));
@@ -1559,6 +1698,53 @@ mod tests {
         let history = monitor.failed_history_value();
         assert_eq!(history["items"][0]["protocol"], "tcp");
         assert_eq!(history["items"][0]["host"], "resolver.example:443");
+    }
+
+    #[test]
+    fn resolver_proxy_bridge_records_successful_chain_entries() {
+        let bridge = ResolverProxyBridge::new();
+        let monitor = Arc::new(ConnectionMonitor::new());
+        bridge.set_monitor(&monitor);
+        bridge.set_selector(Arc::new(FixedBridgeSelector {
+            proxy: Arc::new(BridgeProxy {
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+                saw_skip_resolve: None,
+            }),
+        }));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut stream = bridge
+                .connect_for_resolver("resolver-1", "resolver.example", 443, true)
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = &monitor.connections_value()["connections"][0];
+            assert_eq!(connection["component"], "dns:resolver-1");
+            assert_eq!(connection["resolver"], "resolver-1");
+            assert_eq!(connection["mode"], "proxy");
+            assert_eq!(connection["localAddr"], "127.0.0.1:41001");
+            assert_eq!(connection["domain"], "resolver.example");
+
+            stream.write_all(b"query").await.unwrap();
+            assert_eq!(monitor.total_flow_value()["upload"], "5");
+            drop(stream);
+        });
+
+        assert!(
+            monitor.connections_value()["connections"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            monitor.all_history_value()["items"][0]["connection"]["component"],
+            "dns:resolver-1"
+        );
     }
 
     #[cfg(feature = "http2")]

@@ -46,7 +46,7 @@ pub use compat_runtime::{
 };
 pub use resolver::{FakeIpPolicy, FakeIpPools, FakeIpResolver};
 pub use statistics::{
-    GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsSnapshot,
+    GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsDelta, GoStatisticsSnapshot,
     GoTelemetryBucketRecord, GoTrafficBucketRecord, TELEMETRY_DAILY_BUCKET_SECONDS,
     TELEMETRY_HOURLY_BUCKET_SECONDS,
 };
