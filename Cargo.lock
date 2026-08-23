@@ -4117,6 +4117,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "yuhaiin-android"
+version = "0.1.0"
+dependencies = [
+ "jni",
+ "tokio",
+ "yuhaiin-api",
+ "yuhaiin-runtime",
+ "yuhaiin-tun",
+]
+
+[[package]]
 name = "yuhaiin-api"
 version = "0.1.0"
 dependencies = [

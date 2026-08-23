@@ -1973,6 +1973,7 @@ fn sha256_file(path: &Path) -> Result<String> {
         .collect())
 }
 
+#[cfg(not(target_os = "android"))]
 fn lock_write_file(path: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .create(true)
@@ -1985,6 +1986,7 @@ fn lock_write_file(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+#[cfg(not(target_os = "android"))]
 fn try_lock_write_file(path: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .create(true)
@@ -2001,6 +2003,25 @@ fn try_lock_write_file(path: &Path) -> Result<File> {
         )),
         Err(std::fs::TryLockError::Error(error)) => Err(storage_error(error)),
     }
+}
+
+#[cfg(target_os = "android")]
+fn lock_write_file(path: &Path) -> Result<File> {
+    // Android's std::fs::File exposes the lock API but its bionic-backed
+    // implementation returns Unsupported. SQLite still provides the actual
+    // cross-process database locking and the caller retries SQLITE_BUSY.
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(storage_error)
+}
+
+#[cfg(target_os = "android")]
+fn try_lock_write_file(path: &Path) -> Result<File> {
+    lock_write_file(path)
 }
 
 fn storage_error(error: impl std::fmt::Display) -> Error {

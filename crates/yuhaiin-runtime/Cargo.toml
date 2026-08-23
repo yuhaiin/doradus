@@ -130,7 +130,7 @@ netlink-packet-core = "0.8.2"
 netlink-packet-route = "0.31.0"
 netlink-sys = "0.8.8"
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
 pprof = { version = "0.15.0", default-features = false, features = ["prost-codec"] }
 
 [target.'cfg(windows)'.dependencies]

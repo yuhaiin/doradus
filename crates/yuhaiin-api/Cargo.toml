@@ -46,10 +46,10 @@ yuhaiin-runtime = { path = "../yuhaiin-runtime", default-features = false }
 yuhaiin-store = { path = "../yuhaiin-store" }
 yuhaiin-tun = { path = "../yuhaiin-tun" }
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
 pprof = { version = "0.15.0", default-features = false, features = ["prost-codec"] }
 
-[target.'cfg(not(windows))'.dependencies]
+[target.'cfg(all(not(windows), not(target_os = "android")))'.dependencies]
 # PprofAlloc supplies sampled heap profiles while using mimalloc as its
 # underlying allocator. It is enabled in both Debug and Release builds.
 pprof-alloc = { version = "0.5.0", features = ["allocator-mimalloc"] }

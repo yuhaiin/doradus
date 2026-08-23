@@ -404,7 +404,7 @@ pub fn router(state: ApiState) -> Router {
             let auth = auth.clone();
             async move { authenticate(auth, request, next).await }
         }));
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "android")))]
     let router = router
         .route("/debug/pprof/heap", get(pprof_heap))
         .route("/debug/pprof/allocs", get(pprof_heap));
@@ -457,7 +457,7 @@ async fn health() -> StatusCode {
 
 #[derive(Debug, Default, Deserialize)]
 struct PprofQuery {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     seconds: Option<u64>,
 }
 
@@ -468,7 +468,7 @@ async fn pprof_index(State(state): State<ApiState>) -> Response {
     if !state.controller.handle().load().settings.pprof {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let heap_link = if cfg!(not(windows)) {
+    let heap_link = if cfg!(all(not(windows), not(target_os = "android"))) {
         "<li><a href=\"/debug/pprof/heap\">Heap profile (pprof)</a></li><li><a href=\"/debug/pprof/allocs\">Allocation profile (pprof)</a></li>"
     } else {
         ""
@@ -487,7 +487,7 @@ async fn pprof_index(State(state): State<ApiState>) -> Response {
 /// Return the current sampled mimalloc allocation snapshot in gzipped
 /// protobuf pprof format. The route is available in Debug and Release builds
 /// on non-Windows targets.
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "android")))]
 async fn pprof_heap(State(state): State<ApiState>) -> Response {
     if !state.controller.handle().load().settings.pprof {
         return StatusCode::NOT_FOUND.into_response();
@@ -519,7 +519,7 @@ async fn pprof_heap(State(state): State<ApiState>) -> Response {
         })
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 async fn pprof_profile(State(state): State<ApiState>, Query(query): Query<PprofQuery>) -> Response {
     if !state.controller.handle().load().settings.pprof {
         return StatusCode::NOT_FOUND.into_response();
@@ -582,7 +582,7 @@ async fn pprof_profile(State(state): State<ApiState>, Query(query): Query<PprofQ
         })
 }
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), target_os = "android"))]
 async fn pprof_profile(
     State(state): State<ApiState>,
     Query(_query): Query<PprofQuery>,
