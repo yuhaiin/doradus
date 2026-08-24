@@ -20,8 +20,9 @@ use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_async;
 use yuhaiin_chain::{
-    ChainClient, ChainProxy, ValidatedChain, ValidatedHttp2, ValidatedTls, ValidatedWebSocket,
-    ValidatedYuubinsya, YuubinsyaH2Server, YuubinsyaServerProxy, parse_config,
+    ChainClient, ChainProxy, ValidatedChain, ValidatedFixedConfig, ValidatedHttp2, ValidatedNode,
+    ValidatedTls, ValidatedWebSocket, ValidatedYuubinsya, YuubinsyaH2Server, YuubinsyaServerProxy,
+    parse_config,
 };
 use yuhaiin_core::proxy::{AsyncProxy, DirectAsyncProxy, DropAsyncProxy, StaticProxySelector};
 use yuhaiin_core::{DomainName, Endpoint, FlowContext, Network};
@@ -770,30 +771,31 @@ fn insecure_chain_client(address: SocketAddr) -> ChainClient {
     ChainClient::new(ValidatedChain {
         id: None,
         name: Some("P0 insecure TLS fixture".to_owned()),
-        fixed_addresses: vec![yuhaiin_chain::ValidatedFixedAddress {
-            host: address.ip().to_string(),
-            port: address.port(),
-            network_interface: None,
-        }],
-        tls: ValidatedTls {
-            insecure_skip_verify: true,
-            servernames: vec!["localhost".to_owned()],
-            ca_certificates: Vec::new(),
-            next_protos: vec!["h2".to_owned()],
-        },
-        websocket: None,
-        http2: ValidatedHttp2 {
-            concurrency: 4,
-            max_streams: 128,
-            idle_timeout: std::time::Duration::from_secs(300),
-        },
-        yuubinsya: Some(ValidatedYuubinsya {
-            password: PASSWORD.to_owned(),
-            udp_over_stream: true,
-            udp_coalesce: false,
-        }),
-        http: None,
-        socks5: None,
+        nodes: vec![
+            ValidatedNode::Fixed(ValidatedFixedConfig {
+                addresses: vec![yuhaiin_chain::ValidatedFixedAddress {
+                    host: address.ip().to_string(),
+                    port: address.port(),
+                    network_interface: None,
+                }],
+            }),
+            ValidatedNode::Tls(ValidatedTls {
+                insecure_skip_verify: true,
+                servernames: vec!["localhost".to_owned()],
+                ca_certificates: Vec::new(),
+                next_protos: vec!["h2".to_owned()],
+            }),
+            ValidatedNode::Http2(ValidatedHttp2 {
+                concurrency: 4,
+                max_streams: 128,
+                idle_timeout: std::time::Duration::from_secs(300),
+            }),
+            ValidatedNode::Yuubinsya(ValidatedYuubinsya {
+                password: PASSWORD.to_owned(),
+                udp_over_stream: true,
+                udp_coalesce: false,
+            }),
+        ],
     })
     .unwrap()
 }
@@ -806,30 +808,31 @@ fn chain_client_with_max_streams(
     ChainClient::new(ValidatedChain {
         id: None,
         name: Some("P0 fixture".to_owned()),
-        fixed_addresses: vec![yuhaiin_chain::ValidatedFixedAddress {
-            host: address.ip().to_string(),
-            port: address.port(),
-            network_interface: None,
-        }],
-        tls: ValidatedTls {
-            insecure_skip_verify: false,
-            servernames: vec!["localhost".to_owned()],
-            ca_certificates: vec![certificate],
-            next_protos: vec!["h2".to_owned()],
-        },
-        websocket: None,
-        http2: ValidatedHttp2 {
-            concurrency: 4,
-            max_streams,
-            idle_timeout: std::time::Duration::from_secs(300),
-        },
-        yuubinsya: Some(ValidatedYuubinsya {
-            password: PASSWORD.to_owned(),
-            udp_over_stream: true,
-            udp_coalesce: false,
-        }),
-        http: None,
-        socks5: None,
+        nodes: vec![
+            ValidatedNode::Fixed(ValidatedFixedConfig {
+                addresses: vec![yuhaiin_chain::ValidatedFixedAddress {
+                    host: address.ip().to_string(),
+                    port: address.port(),
+                    network_interface: None,
+                }],
+            }),
+            ValidatedNode::Tls(ValidatedTls {
+                insecure_skip_verify: false,
+                servernames: vec!["localhost".to_owned()],
+                ca_certificates: vec![certificate],
+                next_protos: vec!["h2".to_owned()],
+            }),
+            ValidatedNode::Http2(ValidatedHttp2 {
+                concurrency: 4,
+                max_streams,
+                idle_timeout: std::time::Duration::from_secs(300),
+            }),
+            ValidatedNode::Yuubinsya(ValidatedYuubinsya {
+                password: PASSWORD.to_owned(),
+                udp_over_stream: true,
+                udp_coalesce: false,
+            }),
+        ],
     })
     .unwrap()
 }
@@ -941,33 +944,35 @@ async fn tls_websocket_http2_chain_uses_http11_upgrade_before_h2() {
     let client = ChainClient::new(ValidatedChain {
         id: None,
         name: Some("TLS WebSocket fixture".to_owned()),
-        fixed_addresses: vec![yuhaiin_chain::ValidatedFixedAddress {
-            host: address.ip().to_string(),
-            port: address.port(),
-            network_interface: None,
-        }],
-        tls: ValidatedTls {
-            insecure_skip_verify: false,
-            servernames: vec!["localhost".to_owned()],
-            ca_certificates: vec![certificate.as_ref().to_vec()],
-            next_protos: Vec::new(),
-        },
-        websocket: Some(ValidatedWebSocket {
-            host: "localhost".to_owned(),
-            path: "/proxy/ws".to_owned(),
-        }),
-        http2: ValidatedHttp2 {
-            concurrency: 2,
-            max_streams: 8,
-            idle_timeout: Duration::from_secs(30),
-        },
-        yuubinsya: Some(ValidatedYuubinsya {
-            password: PASSWORD.to_owned(),
-            udp_over_stream: false,
-            udp_coalesce: false,
-        }),
-        http: None,
-        socks5: None,
+        nodes: vec![
+            ValidatedNode::Fixed(ValidatedFixedConfig {
+                addresses: vec![yuhaiin_chain::ValidatedFixedAddress {
+                    host: address.ip().to_string(),
+                    port: address.port(),
+                    network_interface: None,
+                }],
+            }),
+            ValidatedNode::Tls(ValidatedTls {
+                insecure_skip_verify: false,
+                servernames: vec!["localhost".to_owned()],
+                ca_certificates: vec![certificate.as_ref().to_vec()],
+                next_protos: Vec::new(),
+            }),
+            ValidatedNode::WebSocket(ValidatedWebSocket {
+                host: "localhost".to_owned(),
+                path: "/proxy/ws".to_owned(),
+            }),
+            ValidatedNode::Http2(ValidatedHttp2 {
+                concurrency: 2,
+                max_streams: 8,
+                idle_timeout: Duration::from_secs(30),
+            }),
+            ValidatedNode::Yuubinsya(ValidatedYuubinsya {
+                password: PASSWORD.to_owned(),
+                udp_over_stream: false,
+                udp_coalesce: false,
+            }),
+        ],
     })
     .unwrap();
     let mut stream = client

@@ -1,4 +1,4 @@
-//! Adapter from the Go node contract to the first runnable Rust chain.
+//! Adapter from the Go node contract to the ordered Rust chain.
 
 use std::net::SocketAddr;
 
@@ -10,7 +10,7 @@ use crate::config::{ChainConfig, ValidatedChain};
 /// Parse a Go `contract/node.Node` JSON payload into the currently runnable
 /// Rust chain. Go stores fixed endpoints as `{host, port}` objects while the
 /// first Rust chain uses `SocketAddr` strings, so this adapter normalizes only
-/// that representation and leaves TLS/HTTP2/Yuubinsya fields intact.
+/// that representation and leaves the ordered protocol layers intact.
 pub fn parse_go_node(json_text: &str) -> Result<ValidatedChain> {
     let mut node: Value = serde_json::from_str(json_text)
         .map_err(|error| Error::new(ErrorKind::InvalidInput, format!("Go node JSON: {error}")))?;
@@ -143,6 +143,35 @@ fn network_interface(value: &Value) -> Option<&str> {
 mod tests {
     use super::*;
 
+    fn fixed(chain: &ValidatedChain) -> &crate::config::ValidatedFixedConfig {
+        chain
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                crate::config::ValidatedNode::Fixed(config) => Some(config),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn http2(chain: &ValidatedChain) -> &crate::config::ValidatedHttp2 {
+        chain
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                crate::config::ValidatedNode::Http2(config) => Some(config),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn yuubinsya(chain: &ValidatedChain) -> Option<&crate::config::ValidatedYuubinsya> {
+        chain.nodes.iter().find_map(|node| match node {
+            crate::config::ValidatedNode::Yuubinsya(config) => Some(config),
+            _ => None,
+        })
+    }
+
     fn chain(fixed: Value) -> String {
         json!({
             "id": "go-node",
@@ -177,15 +206,15 @@ mod tests {
         })))
         .unwrap();
         assert_eq!(
-            parsed.fixed_addresses,
+            fixed(&parsed).addresses,
             vec![crate::config::ValidatedFixedAddress {
                 host: "127.0.0.1".to_owned(),
                 port: 12103,
                 network_interface: None,
             }]
         );
-        assert_eq!(parsed.http2.max_streams, 8);
-        assert!(parsed.yuubinsya.as_ref().unwrap().udp_over_stream);
+        assert_eq!(http2(&parsed).max_streams, 8);
+        assert!(yuubinsya(&parsed).unwrap().udp_over_stream);
     }
 
     #[test]
@@ -199,11 +228,11 @@ mod tests {
             }
         })))
         .unwrap();
-        assert_eq!(parsed.fixed_addresses.len(), 2);
-        assert_eq!(parsed.fixed_addresses[0].host, "2001:db8::1");
-        assert_eq!(parsed.fixed_addresses[0].port, 443);
-        assert_eq!(parsed.fixed_addresses[1].host, "127.0.0.1");
-        assert_eq!(parsed.fixed_addresses[1].port, 8443);
+        assert_eq!(fixed(&parsed).addresses.len(), 2);
+        assert_eq!(fixed(&parsed).addresses[0].host, "2001:db8::1");
+        assert_eq!(fixed(&parsed).addresses[0].port, 443);
+        assert_eq!(fixed(&parsed).addresses[1].host, "127.0.0.1");
+        assert_eq!(fixed(&parsed).addresses[1].port, 8443);
     }
 
     #[test]
@@ -222,15 +251,15 @@ mod tests {
         })))
         .unwrap();
         assert_eq!(
-            parsed.fixed_addresses[0].network_interface.as_deref(),
+            fixed(&parsed).addresses[0].network_interface.as_deref(),
             Some("eth0")
         );
         assert_eq!(
-            parsed.fixed_addresses[1].network_interface.as_deref(),
+            fixed(&parsed).addresses[1].network_interface.as_deref(),
             Some("eth0")
         );
         assert_eq!(
-            parsed.fixed_addresses[2].network_interface.as_deref(),
+            fixed(&parsed).addresses[2].network_interface.as_deref(),
             Some("lo")
         );
     }
@@ -266,10 +295,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(parsed.fixed_addresses[0].host, "proxy.example");
-        assert_eq!(parsed.fixed_addresses[0].port, 443);
-        assert_eq!(parsed.http2.concurrency, 10);
-        assert!(parsed.yuubinsya.as_ref().unwrap().udp_coalesce);
+        assert_eq!(fixed(&parsed).addresses[0].host, "proxy.example");
+        assert_eq!(fixed(&parsed).addresses[0].port, 443);
+        assert_eq!(http2(&parsed).concurrency, 10);
+        assert!(yuubinsya(&parsed).unwrap().udp_coalesce);
     }
 
     #[test]
@@ -298,7 +327,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(parsed.yuubinsya.is_none());
-        assert_eq!(parsed.http2.concurrency, 1);
+        assert!(yuubinsya(&parsed).is_none());
+        assert_eq!(http2(&parsed).concurrency, 1);
     }
 }

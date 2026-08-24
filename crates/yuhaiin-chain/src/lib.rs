@@ -3,7 +3,7 @@
 //! The crate keeps each protocol boundary explicit:
 //!
 //! ```text
-//! fixed TCP -> Rustls TLS -> HTTP/2 CONNECT stream -> Yuubinsya TCP/UOT
+//! Go chain[0] -> chain[1] -> ... -> chain[n]
 //! ```
 //!
 //! TCP and UDP-over-TCP use the same HTTP/2 stream transport, but different
@@ -14,8 +14,9 @@ mod config;
 mod go_node;
 
 pub use config::{
-    ChainConfig, ChainNode, ValidatedChain, ValidatedFixedAddress, ValidatedHttp, ValidatedHttp2,
-    ValidatedSocks5, ValidatedTls, ValidatedWebSocket, ValidatedYuubinsya, parse_config,
+    ChainConfig, ChainNode, ValidatedChain, ValidatedDirect, ValidatedFixedAddress,
+    ValidatedFixedConfig, ValidatedHttp, ValidatedHttp2, ValidatedNode, ValidatedSocks5,
+    ValidatedTls, ValidatedWebSocket, ValidatedYuubinsya, parse_config,
 };
 pub use go_node::parse_go_node;
 pub use yuhaiin_protocol::YuubinsyaH2Server;
@@ -37,11 +38,10 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{Mutex, Notify, watch};
 use tokio_rustls::TlsConnector;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use yuhaiin_core::dns_resolver::{AsyncIpResolver, SystemAsyncIpResolver};
 use yuhaiin_core::proxy::{
-    AsyncDatagram, AsyncProxy, BoxAsyncStream, connect_tokio_tcp_with_interface, stream_local_addr,
-    with_stream_local_addr,
+    AsyncDatagram, AsyncProxy, BindInterfaceProxy, BoxAsyncStream, DirectAsyncProxy,
+    FixedAsyncProxy, stream_local_addr, with_stream_local_addr,
 };
 use yuhaiin_core::{
     BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, ResolveStrategy, Result,
@@ -108,14 +108,330 @@ struct CachedPing {
     last_used: StdMutex<Instant>,
 }
 
-/// A validated, reusable client for one fixed -> optional TLS/WebSocket ->
-/// HTTP/2 -> Yuubinsya chain.
+const TRANSPORT_ENDPOINT: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+
+#[derive(Clone)]
+struct FixedChainProxy {
+    config: ValidatedFixedConfig,
+    resolver: Arc<dyn AsyncIpResolver>,
+    upstream: Option<Arc<dyn AsyncProxy>>,
+}
+
+impl FixedChainProxy {
+    fn new(
+        config: ValidatedFixedConfig,
+        resolver: Arc<dyn AsyncIpResolver>,
+        upstream: Option<Arc<dyn AsyncProxy>>,
+    ) -> Self {
+        Self {
+            config,
+            resolver,
+            upstream,
+        }
+    }
+
+    async fn resolve_addresses(&self) -> Result<Vec<(SocketAddr, Option<String>)>> {
+        let mut addresses = Vec::new();
+        for endpoint in &self.config.addresses {
+            if let Some(address) = endpoint.socket_addr() {
+                addresses.push((address, endpoint.network_interface.clone()));
+                continue;
+            }
+            let domain = endpoint
+                .domain()
+                .ok_or_else(|| Error::invalid("fixedv2 endpoint has an invalid domain"))?;
+            let resolved = self
+                .resolver
+                .resolve(&domain, ResolveStrategy::Default)
+                .await?;
+            addresses.extend(resolved.iter().map(|address| {
+                (
+                    SocketAddr::new(address, endpoint.port),
+                    endpoint.network_interface.clone(),
+                )
+            }));
+        }
+        if addresses.is_empty() {
+            return Err(Error::invalid("fixedv2 has no resolved upstream address"));
+        }
+        Ok(addresses)
+    }
+}
+
+impl AsyncProxy for FixedChainProxy {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        Box::pin(async move {
+            let addresses = self.resolve_addresses().await?;
+            let mut last_error = None;
+            for (address, endpoint_interface) in addresses {
+                let mut candidate_context = context.clone();
+                candidate_context.network = Network::Tcp;
+                candidate_context.destination = Endpoint::ip(Network::Tcp, address);
+                candidate_context.resolved_destination = None;
+                candidate_context.original_domain = None;
+                candidate_context.bind_interface =
+                    endpoint_interface.or_else(|| context.bind_interface.clone());
+                let result = if let Some(upstream) = &self.upstream {
+                    upstream.connect(&candidate_context).await
+                } else {
+                    FixedAsyncProxy {
+                        address,
+                        timeout: Duration::from_secs(15),
+                    }
+                    .connect(&candidate_context)
+                    .await
+                };
+                match result {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| Error::invalid("fixedv2 connection failed")))
+        })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+        Box::pin(async move {
+            let addresses = self.resolve_addresses().await?;
+            let (address, endpoint_interface) = addresses
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::invalid("fixedv2 has no resolved upstream address"))?;
+            let mut candidate_context = context.clone();
+            candidate_context.destination = Endpoint::ip(Network::Udp, address);
+            candidate_context.resolved_destination = None;
+            candidate_context.original_domain = None;
+            candidate_context.bind_interface =
+                endpoint_interface.or_else(|| context.bind_interface.clone());
+            if let Some(upstream) = &self.upstream {
+                upstream.open_datagram(&candidate_context).await
+            } else {
+                FixedAsyncProxy {
+                    address,
+                    timeout: Duration::from_secs(15),
+                }
+                .open_datagram(&candidate_context)
+                .await
+            }
+        })
+    }
+
+    fn ping<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<Duration>> {
+        Box::pin(async move {
+            let started = Instant::now();
+            let mut stream = self.connect(context).await?;
+            stream.shutdown().await.map_err(io_error)?;
+            Ok(started.elapsed())
+        })
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        if let Some(upstream) = &self.upstream {
+            upstream.close()
+        } else {
+            Box::pin(async { Ok(()) })
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TlsChainProxy {
+    upstream: Arc<dyn AsyncProxy>,
+    connector: TlsConnector,
+    config: ValidatedTls,
+}
+
+impl TlsChainProxy {
+    fn new(upstream: Arc<dyn AsyncProxy>, config: ValidatedTls) -> Result<Self> {
+        let roots = if config.insecure_skip_verify {
+            RootCertStore::empty()
+        } else {
+            root_store(&config.ca_certificates)?
+        };
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client = if config.insecure_skip_verify {
+            ClientConfig::builder_with_provider(Arc::clone(&provider))
+                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+                .map_err(tls_error)?
+                .dangerous()
+                .with_custom_certificate_verifier(SkipServerVerification::new(provider))
+                .with_no_client_auth()
+        } else {
+            ClientConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+                .map_err(tls_error)?
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        };
+        client.alpn_protocols = config
+            .next_protos
+            .iter()
+            .map(|protocol| protocol.as_bytes().to_vec())
+            .collect();
+        Ok(Self {
+            upstream,
+            connector: TlsConnector::from(Arc::new(client)),
+            config,
+        })
+    }
+}
+
+impl AsyncProxy for TlsChainProxy {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        Box::pin(async move {
+            let stream = self.upstream.connect(context).await?;
+            let local_addr = stream_local_addr(&*stream);
+            let server_name = rustls::pki_types::ServerName::try_from(self.config.server_name())
+                .map_err(|_| Error::invalid("TLS server name is invalid"))?;
+            let stream = self
+                .connector
+                .connect(server_name, stream)
+                .await
+                .map_err(tls_error)?;
+            Ok(with_stream_local_addr(
+                Box::new(stream) as BoxAsyncStream,
+                local_addr,
+            ))
+        })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        _context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+        Box::pin(async {
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "TLS transport does not expose a datagram socket",
+            ))
+        })
+    }
+
+    fn ping<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<Duration>> {
+        Box::pin(async move {
+            let started = Instant::now();
+            let mut stream = self.connect(context).await?;
+            stream.shutdown().await.map_err(io_error)?;
+            Ok(started.elapsed())
+        })
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        self.upstream.close()
+    }
+}
+
+#[derive(Clone)]
+struct H2ChainProxy {
+    upstream: Arc<dyn AsyncProxy>,
+    pool: Arc<H2Pool>,
+    concurrency: usize,
+    max_streams: usize,
+    identity: String,
+}
+
+impl H2ChainProxy {
+    fn new(upstream: Arc<dyn AsyncProxy>, config: ValidatedHttp2, index: usize) -> Arc<Self> {
+        Arc::new(Self {
+            upstream,
+            pool: Arc::new(H2Pool::with_limits(4, config.idle_timeout)),
+            concurrency: config.concurrency,
+            max_streams: config.max_streams,
+            identity: format!("chain-http2-layer-{index}"),
+        })
+    }
+
+    fn stats(&self) -> H2PoolStats {
+        self.pool.stats()
+    }
+
+    async fn open_stream(&self, context: &FlowContext) -> Result<BoxAsyncStream> {
+        let mut parent_context = context.clone();
+        parent_context.network = Network::Tcp;
+        parent_context.destination = Endpoint::ip(Network::Tcp, TRANSPORT_ENDPOINT);
+        parent_context.resolved_destination = None;
+        parent_context.original_domain = None;
+        let upstream = Arc::clone(&self.upstream);
+        let max_streams = self.max_streams;
+        let endpoints = [H2PoolEndpoint {
+            address: TRANSPORT_ENDPOINT,
+            bind_interface: None,
+        }];
+        let (stream, local_addr) = self
+            .pool
+            .open_with_endpoints_and_local_addr(
+                &endpoints,
+                &self.identity,
+                self.concurrency,
+                move |_| {
+                    let upstream = Arc::clone(&upstream);
+                    let context = parent_context.clone();
+                    async move {
+                        let stream = upstream.connect(&context).await?;
+                        let local_addr = stream_local_addr(&*stream);
+                        H2Connection::handshake_with_limits_and_local_addr(
+                            stream,
+                            max_streams,
+                            local_addr,
+                        )
+                        .await
+                    }
+                },
+            )
+            .await?;
+        Ok(with_stream_local_addr(
+            Box::new(stream) as BoxAsyncStream,
+            local_addr,
+        ))
+    }
+}
+
+impl AsyncProxy for H2ChainProxy {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        Box::pin(async move { self.open_stream(context).await })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        _context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+        Box::pin(async {
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "HTTP/2 transport does not expose a datagram socket",
+            ))
+        })
+    }
+
+    fn ping<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<Duration>> {
+        Box::pin(async move {
+            let started = Instant::now();
+            let mut stream = self.connect(context).await?;
+            stream.shutdown().await.map_err(io_error)?;
+            Ok(started.elapsed())
+        })
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        let pool = Arc::clone(&self.pool);
+        let upstream = Arc::clone(&self.upstream);
+        Box::pin(async move {
+            pool.close().await;
+            upstream.close().await
+        })
+    }
+}
+
+/// A validated, reusable client for an ordered Go-compatible protocol chain.
 #[derive(Clone)]
 pub struct ChainClient {
     chain: Arc<ValidatedChain>,
-    resolver: Arc<dyn AsyncIpResolver>,
-    tls: TlsConnector,
-    pool: Arc<H2Pool>,
+    proxy: Arc<dyn AsyncProxy>,
+    h2_layers: Vec<Arc<H2ChainProxy>>,
     ping_cache: Arc<Mutex<HashMap<String, Arc<CachedPing>>>>,
     ping_connect_lock: Arc<Mutex<()>>,
     closed: Arc<AtomicBool>,
@@ -130,41 +446,94 @@ impl ChainClient {
         chain: ValidatedChain,
         resolver: Arc<dyn AsyncIpResolver>,
     ) -> Result<Self> {
-        let roots = if chain.tls.insecure_skip_verify {
-            // The verifier below does not consult roots; matching Go also
-            // means malformed optional CA material must not block an
-            // explicitly insecure test node.
-            RootCertStore::empty()
-        } else {
-            root_store(&chain.tls.ca_certificates)?
-        };
-        let h2_idle_timeout = chain.http2.idle_timeout;
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut config = if chain.tls.insecure_skip_verify {
-            ClientConfig::builder_with_provider(Arc::clone(&provider))
-                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-                .map_err(tls_error)?
-                .dangerous()
-                .with_custom_certificate_verifier(SkipServerVerification::new(provider))
-                .with_no_client_auth()
-        } else {
-            ClientConfig::builder_with_provider(provider)
-                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-                .map_err(tls_error)?
-                .with_root_certificates(roots)
-                .with_no_client_auth()
-        };
-        config.alpn_protocols = chain
-            .tls
-            .next_protos
-            .iter()
-            .map(|protocol| protocol.as_bytes().to_vec())
-            .collect();
+        // Go's ContractDialer starts with zeroproxy.  For transport purposes
+        // that sentinel behaves like direct dialing until a node replaces it.
+        let direct: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy {
+            timeout: Duration::from_secs(15),
+        });
+        let mut proxy = Some(direct);
+        let mut h2_layers = Vec::new();
+        for (index, node) in chain.nodes.iter().enumerate() {
+            match node {
+                ValidatedNode::Direct(config) => {
+                    let direct: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy {
+                        timeout: Duration::from_secs(15),
+                    });
+                    proxy = Some(match &config.network_interface {
+                        Some(interface) => {
+                            Arc::new(BindInterfaceProxy::new(direct, Some(interface.clone())))
+                        }
+                        None => direct,
+                    });
+                    // An explicit direct node resets the Go fold.  Any
+                    // transport layers before it are no longer reachable.
+                    h2_layers.clear();
+                }
+                ValidatedNode::Fixed(config) => {
+                    let upstream = proxy.take();
+                    proxy = Some(Arc::new(FixedChainProxy::new(
+                        config.clone(),
+                        Arc::clone(&resolver),
+                        upstream,
+                    )));
+                }
+                ValidatedNode::Tls(config) => {
+                    let upstream = proxy
+                        .take()
+                        .ok_or_else(|| Error::invalid("TLS node has no parent transport"))?;
+                    proxy = Some(Arc::new(TlsChainProxy::new(upstream, config.clone())?));
+                }
+                ValidatedNode::WebSocket(config) => {
+                    let upstream = proxy
+                        .take()
+                        .ok_or_else(|| Error::invalid("WebSocket node has no parent transport"))?;
+                    proxy = Some(Arc::new(yuhaiin_protocol::websocket::WebSocketProxy::new(
+                        upstream,
+                        config.host.clone(),
+                        config.path.clone(),
+                    )?));
+                }
+                ValidatedNode::Http2(config) => {
+                    let upstream = proxy
+                        .take()
+                        .ok_or_else(|| Error::invalid("HTTP/2 node has no parent transport"))?;
+                    let layer = H2ChainProxy::new(upstream, config.clone(), index);
+                    proxy = Some(layer.clone());
+                    h2_layers.push(layer);
+                }
+                ValidatedNode::Http(config) | ValidatedNode::HttpProxy(config) => {
+                    let upstream = proxy
+                        .take()
+                        .ok_or_else(|| Error::invalid("HTTP node has no parent transport"))?;
+                    proxy = Some(Arc::new(yuhaiin_protocol::http::HttpProxy::new(
+                        upstream,
+                        config.user.clone(),
+                        config.password.clone(),
+                    )));
+                }
+                ValidatedNode::Socks5(config) => {
+                    let upstream = proxy
+                        .take()
+                        .ok_or_else(|| Error::invalid("SOCKS5 node has no parent transport"))?;
+                    proxy = Some(Arc::new(yuhaiin_protocol::socks5::Socks5Proxy::new(
+                        upstream,
+                        config.user.clone(),
+                        config.password.clone(),
+                        config.hostname.clone(),
+                        config.override_port,
+                    )?));
+                }
+                ValidatedNode::Yuubinsya(_)
+                | ValidatedNode::None
+                | ValidatedNode::Proxy
+                | ValidatedNode::BootstrapDnsWarp => {}
+            }
+        }
+        let proxy = proxy.ok_or_else(|| Error::invalid("chain has no runnable transport"))?;
         Ok(Self {
             chain: Arc::new(chain),
-            resolver,
-            tls: TlsConnector::from(Arc::new(config)),
-            pool: Arc::new(H2Pool::with_limits(4, h2_idle_timeout)),
+            proxy,
+            h2_layers,
             ping_cache: Arc::new(Mutex::new(HashMap::new())),
             ping_connect_lock: Arc::new(Mutex::new(())),
             closed: Arc::new(AtomicBool::new(false)),
@@ -197,10 +566,9 @@ impl ChainClient {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        // Close the H2 pool first.  A cached Yuubinsya ping may be holding its
-        // session mutex while waiting for a peer response; draining the H2
-        // relay wakes that read before we try to acquire the same mutex.
-        self.pool.close().await;
+        // Close every ordered transport layer first. A cached Yuubinsya ping
+        // may be waiting on one of the H2 layers; closing the chain wakes it.
+        let _ = self.proxy.close().await;
         let sessions = self
             .ping_cache
             .lock()
@@ -218,19 +586,39 @@ impl ChainClient {
     }
 
     pub async fn h2_connection_count(&self) -> usize {
-        self.pool.len().await
+        let mut count = 0;
+        for layer in &self.h2_layers {
+            count += layer.pool.len().await;
+        }
+        count
     }
 
     pub async fn h2_active_streams(&self) -> usize {
-        self.pool.active_streams().await
+        let mut count = 0;
+        for layer in &self.h2_layers {
+            count += layer.pool.active_streams().await;
+        }
+        count
     }
 
     /// Sample H2 capacity and pool counters together for runtime observation.
     pub async fn runtime_stats(&self) -> ChainRuntimeStats {
+        let mut stats = H2PoolStats::default();
+        let mut connections = 0;
+        let mut active_streams = 0;
+        for layer in &self.h2_layers {
+            connections += layer.pool.len().await;
+            active_streams += layer.pool.active_streams().await;
+            let current = layer.stats();
+            stats.connection_attempts += current.connection_attempts;
+            stats.connection_failures += current.connection_failures;
+            stats.stream_capacity_rejections += current.stream_capacity_rejections;
+            stats.stream_open_failures += current.stream_open_failures;
+        }
         ChainRuntimeStats {
-            h2_connections: self.pool.len().await,
-            h2_active_streams: self.pool.active_streams().await,
-            h2_pool: self.pool.stats(),
+            h2_connections: connections,
+            h2_active_streams: active_streams,
+            h2_pool: stats,
         }
     }
 
@@ -242,7 +630,16 @@ impl ChainClient {
     /// Return monotonic HTTP/2 pool counters for operational backpressure and
     /// connection-rebuild diagnostics.
     pub fn h2_pool_stats(&self) -> H2PoolStats {
-        self.pool.stats()
+        self.h2_layers
+            .iter()
+            .fold(H2PoolStats::default(), |mut total, layer| {
+                let current = layer.stats();
+                total.connection_attempts += current.connection_attempts;
+                total.connection_failures += current.connection_failures;
+                total.stream_capacity_rejections += current.stream_capacity_rejections;
+                total.stream_open_failures += current.stream_open_failures;
+                total
+            })
     }
 
     /// Ping through a hostname-keyed persistent session. The session lock
@@ -320,7 +717,7 @@ impl ChainClient {
             return Ok(elapsed);
         }
 
-        let Some(yuubinsya) = self.chain.yuubinsya.as_ref() else {
+        let Some(yuubinsya) = self.yuubinsya() else {
             let started = Instant::now();
             let mut stream = self
                 .open_h2_stream(local_bind_addresses, bind_interface)
@@ -383,7 +780,7 @@ impl ChainClient {
                 "Yuubinsya TCP destination must use tcp network",
             ));
         }
-        let yuubinsya = self.chain.yuubinsya.as_ref().ok_or_else(|| {
+        let yuubinsya = self.yuubinsya().ok_or_else(|| {
             Error::new(
                 ErrorKind::Unsupported,
                 "standalone HTTP/2 transport has no destination protocol",
@@ -417,7 +814,7 @@ impl ChainClient {
         local_bind_addresses: &[std::net::IpAddr],
         bind_interface: Option<&str>,
     ) -> Result<BoxAsyncStream> {
-        if self.chain.yuubinsya.is_some() {
+        if self.has_destination_protocol() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "raw HTTP/2 transport requested from a Yuubinsya chain",
@@ -453,7 +850,7 @@ impl ChainClient {
         bind_interface: Option<&str>,
     ) -> Result<AsyncYuubinsyaUotSession<BoxAsyncStream>> {
         self.ensure_open()?;
-        let yuubinsya = self.chain.yuubinsya.as_ref().ok_or_else(|| {
+        let yuubinsya = self.yuubinsya().ok_or_else(|| {
             Error::new(
                 ErrorKind::Unsupported,
                 "standalone HTTP/2 transport has no UDP protocol",
@@ -479,87 +876,51 @@ impl ChainClient {
         .await
     }
 
+    fn yuubinsya(&self) -> Option<&ValidatedYuubinsya> {
+        match self.chain.nodes.iter().rev().find(|node| {
+            !matches!(
+                node,
+                ValidatedNode::None | ValidatedNode::Proxy | ValidatedNode::BootstrapDnsWarp
+            )
+        }) {
+            Some(ValidatedNode::Yuubinsya(config)) => Some(config),
+            _ => None,
+        }
+    }
+
+    fn has_destination_protocol(&self) -> bool {
+        matches!(
+            self.chain.nodes.iter().rev().find(|node| {
+                !matches!(
+                    node,
+                    ValidatedNode::None | ValidatedNode::Proxy | ValidatedNode::BootstrapDnsWarp
+                )
+            }),
+            Some(
+                ValidatedNode::Yuubinsya(_)
+                    | ValidatedNode::Http(_)
+                    | ValidatedNode::HttpProxy(_)
+                    | ValidatedNode::Socks5(_)
+            )
+        )
+    }
+
     async fn open_h2_stream(
         &self,
         local_bind_addresses: &[std::net::IpAddr],
         bind_interface: Option<&str>,
     ) -> Result<BoxAsyncStream> {
         self.ensure_open()?;
-        let tls_identity = self.transport_identity();
-        let endpoints = self
-            .resolve_fixed_addresses()
-            .await?
-            .iter()
-            .map(|(address, bind_interface)| H2PoolEndpoint {
-                address: *address,
-                bind_interface: bind_interface.clone(),
-            })
-            .collect::<Vec<_>>();
-        let stream = self
-            .pool
-            .open_with_endpoints_and_local_addr(
-                &endpoints,
-                &tls_identity,
-                self.chain.http2.concurrency,
-                |endpoint| {
-                    let endpoint_interface = endpoint
-                        .bind_interface
-                        .or_else(|| bind_interface.map(str::to_owned));
-                    self.open_h2_connection(
-                        endpoint.address,
-                        local_bind_addresses,
-                        endpoint_interface,
-                    )
-                },
-            )
-            .await?;
-        let (stream, local_addr) = stream;
+        let mut context = FlowContext::new(Endpoint::ip(Network::Tcp, TRANSPORT_ENDPOINT));
+        context.local_bind_addresses = local_bind_addresses.to_vec();
+        context.bind_interface = bind_interface.map(str::to_owned);
+        let stream = self.proxy.connect(&context).await?;
         if self.closed.load(Ordering::Acquire) {
             let mut stream = stream;
             let _ = stream.shutdown().await;
             return Err(closed_error());
         }
-        Ok(with_stream_local_addr(
-            Box::new(stream) as BoxAsyncStream,
-            local_addr,
-        ))
-    }
-
-    fn transport_identity(&self) -> String {
-        let websocket = self
-            .chain
-            .websocket
-            .as_ref()
-            .map(|websocket| format!("{}{}", websocket.host, websocket.path))
-            .unwrap_or_default();
-        format!("{}\0websocket:{websocket}", self.chain.tls.pool_identity())
-    }
-
-    async fn resolve_fixed_addresses(&self) -> Result<Vec<(SocketAddr, Option<String>)>> {
-        let mut addresses = Vec::new();
-        for endpoint in &self.chain.fixed_addresses {
-            if let Some(address) = endpoint.socket_addr() {
-                addresses.push((address, endpoint.network_interface.clone()));
-                continue;
-            }
-            let domain = endpoint
-                .domain()
-                .ok_or_else(|| Error::invalid("fixedv2 endpoint has an invalid domain"))?;
-            let resolved = self
-                .resolver
-                .resolve(&domain, ResolveStrategy::Default)
-                .await?;
-            addresses.extend(resolved.iter().map(|address| {
-                (
-                    SocketAddr::new(address, endpoint.port),
-                    endpoint.network_interface.clone(),
-                )
-            }));
-        }
-        if addresses.is_empty() {
-            return Err(Error::invalid("fixedv2 has no resolved upstream address"));
-        }
-        Ok(addresses)
+        Ok(stream)
     }
 
     fn ensure_open(&self) -> Result<()> {
@@ -568,67 +929,10 @@ impl ChainClient {
         }
         Ok(())
     }
-
-    async fn open_h2_connection(
-        &self,
-        address: SocketAddr,
-        local_bind_addresses: &[std::net::IpAddr],
-        bind_interface: Option<String>,
-    ) -> Result<Arc<H2Connection>> {
-        let local_bind = local_bind_addresses
-            .iter()
-            .copied()
-            .find(|ip| ip.is_ipv4() == address.ip().is_ipv4())
-            .map(|ip| SocketAddr::new(ip, 0));
-        let stream = connect_tokio_tcp_with_interface(
-            address,
-            local_bind,
-            bind_interface.as_deref(),
-            Duration::from_secs(15),
-        )
-        .await?;
-        let local_addr = stream.local_addr().ok();
-        let mut stream: BoxAsyncStream = if self.chain.tls.servernames.is_empty() {
-            Box::new(stream)
-        } else {
-            let server_name = self.chain.tls.server_name();
-            let server_name = rustls::pki_types::ServerName::try_from(server_name)
-                .map_err(|_| Error::invalid("TLS server name is invalid"))?;
-            Box::new(
-                self.tls
-                    .connect(server_name, stream)
-                    .await
-                    .map_err(tls_error)?,
-            )
-        };
-        if let Some(websocket) = &self.chain.websocket {
-            let request = websocket
-                .request_uri()
-                .into_client_request()
-                .map_err(|error| {
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        format!("WebSocket request: {error}"),
-                    )
-                })?;
-            let (websocket, _) = tokio_tungstenite::client_async(request, stream)
-                .await
-                .map_err(|error| {
-                    Error::new(ErrorKind::Protocol, format!("WebSocket handshake: {error}"))
-                })?;
-            stream = Box::new(yuhaiin_protocol::websocket::WebSocketIo::new(websocket));
-        }
-        H2Connection::handshake_with_limits_and_local_addr(
-            stream,
-            self.chain.http2.max_streams,
-            local_addr,
-        )
-        .await
-    }
 }
 
-/// Adapter from the runnable fixed -> TLS -> HTTP/2 -> destination protocol
-/// chain to the common async proxy contract used by the TUN flow runtime.
+/// Adapter from the ordered protocol chain to the common async proxy contract
+/// used by the TUN flow runtime.
 #[derive(Clone)]
 pub struct ChainProxy {
     backend: ChainProxyBackend,
@@ -649,32 +953,12 @@ impl ChainProxy {
     }
 
     fn final_proxy(client: ChainClient) -> Result<Self> {
-        if client.chain.yuubinsya.is_some() {
+        if client.yuubinsya().is_some() {
             return Ok(Self::new(client));
         }
-        let parent: Arc<dyn AsyncProxy> = Arc::new(Self::new(client.clone()));
-        if let Some(http) = client.chain.http.as_ref() {
+        if client.has_destination_protocol() {
             return Ok(Self {
-                backend: ChainProxyBackend::Protocol(Arc::new(
-                    yuhaiin_protocol::http::HttpProxy::new(
-                        parent,
-                        http.user.clone(),
-                        http.password.clone(),
-                    ),
-                )),
-            });
-        }
-        if let Some(socks5) = client.chain.socks5.as_ref() {
-            return Ok(Self {
-                backend: ChainProxyBackend::Protocol(Arc::new(
-                    yuhaiin_protocol::socks5::Socks5Proxy::new(
-                        parent,
-                        socks5.user.clone(),
-                        socks5.password.clone(),
-                        socks5.hostname.clone(),
-                        socks5.override_port,
-                    )?,
-                )),
+                backend: ChainProxyBackend::Protocol(client.proxy.clone()),
             });
         }
         Err(Error::new(
@@ -712,10 +996,7 @@ impl ChainProxy {
         resolver: Arc<dyn AsyncIpResolver>,
     ) -> Result<Self> {
         let client = ChainClient::from_go_json_with_resolver(json, resolver)?;
-        if client.chain.yuubinsya.is_some()
-            || client.chain.http.is_some()
-            || client.chain.socks5.is_some()
-        {
+        if client.has_destination_protocol() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "raw HTTP/2 transport cannot contain a destination protocol",
@@ -739,7 +1020,7 @@ impl AsyncProxy for ChainProxy {
             ChainProxyBackend::H2(client) => {
                 let client = client.clone();
                 Box::pin(async move {
-                    if client.chain.yuubinsya.is_some() {
+                    if client.yuubinsya().is_some() {
                         let session = client
                             .connect_tcp_with_bind_and_interface(
                                 context.effective_destination(),

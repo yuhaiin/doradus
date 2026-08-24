@@ -1,7 +1,7 @@
 use std::env;
 use std::time::Duration;
 
-use yuhaiin_chain::{ChainClient, parse_config};
+use yuhaiin_chain::{ChainClient, ValidatedNode, parse_config};
 use yuhaiin_core::{DomainName, Endpoint, Network};
 
 #[tokio::main(flavor = "current_thread")]
@@ -12,18 +12,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = env::args().nth(2).unwrap_or_else(|| "tcp".to_owned());
     let json = std::fs::read_to_string(path)?;
     let chain = parse_config(&json)?;
-    let sni = chain
-        .tls
-        .servernames
-        .first()
+    let tls = chain.nodes.iter().find_map(|node| match node {
+        ValidatedNode::Tls(config) => Some(config),
+        _ => None,
+    });
+    let fixed = chain.nodes.iter().find_map(|node| match node {
+        ValidatedNode::Fixed(config) => Some(config),
+        _ => None,
+    });
+    let http2 = chain.nodes.iter().find_map(|node| match node {
+        ValidatedNode::Http2(config) => Some(config),
+        _ => None,
+    });
+    let sni = tls
+        .and_then(|tls| tls.servernames.first())
         .cloned()
         .unwrap_or_else(|| "none".to_owned());
     println!(
         "chain-config-valid fixed={} concurrency={} sni={} websocket={}",
-        chain.fixed_addresses.len(),
-        chain.http2.concurrency,
+        fixed.map_or(0, |fixed| fixed.addresses.len()),
+        http2.map_or(0, |http2| http2.concurrency),
         sni,
-        chain.websocket.is_some()
+        chain
+            .nodes
+            .iter()
+            .any(|node| matches!(node, ValidatedNode::WebSocket(_)))
     );
     let client = ChainClient::new(chain.clone())?;
 

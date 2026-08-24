@@ -1188,9 +1188,10 @@ JSON / Go node JSON
   -> ChainClient::new / new_with_resolver
 ```
 
-[`config.rs`](../crates/yuhaiin-chain/src/config.rs#L8) 将 chain 拆成 `ChainNode`、固定地址、
-TLS、WebSocket、HTTP2、Yuubinsya、HTTP、Socks5 等可组合段；`ValidatedChain` 保存后续
-建连必需的规范化值。`go_node.rs::parse_go_node` 负责 Go 的字段/默认值兼容，不应该把
+[`config.rs`](../crates/yuhaiin-chain/src/config.rs#L8) 将 chain 解码为强类型 `ChainNode`，
+并在 `ValidatedChain.nodes` 中按原顺序保存规范化后的 `ValidatedNode`。`ChainClient` 按
+Go 的 `ContractDialer` 语义逐节点包装前一个 transport；因此重复的 TLS、HTTP2 或其他
+可组合层不会被压平。`go_node.rs::parse_go_node` 负责 Go 的字段/默认值兼容，不应该把
 这些兼容判断散落到 runtime selector。
 
 #### 20.6.2 `ChainClient` 内部调用
