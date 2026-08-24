@@ -539,7 +539,63 @@ async fn full_cone_udp_input_backpressure_releases_the_shared_source() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn full_cone_udp_output_backpressure_closes_datagram_and_releases_nat() {
+async fn udp_output_buffer_full_drops_packet_without_closing_flow() {
+    use crate::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
+
+    let drop_proxy: Arc<dyn AsyncProxy> = Arc::new(DropAsyncProxy);
+    let selector = Arc::new(StaticProxySelector {
+        direct: Arc::clone(&drop_proxy),
+        proxy: Arc::clone(&drop_proxy),
+        bypass: Arc::clone(&drop_proxy),
+        drop: Arc::clone(&drop_proxy),
+    });
+    let table = NatTable::new();
+    let mut runtime = TunProxyRuntime::new(selector, 1)
+        .unwrap()
+        .with_nat(table.clone(), Duration::from_secs(30))
+        .unwrap();
+    let flow = TunFlowKey {
+        network: Network::Udp,
+        source: "192.0.2.10:40000".parse().unwrap(),
+        destination: "198.51.100.1:5353".parse().unwrap(),
+    };
+    runtime.track_flow(flow).unwrap();
+    let source = udp_source_key(flow);
+    let (command, _commands) = mpsc::channel(1);
+    let join = tokio::spawn(async { std::future::pending::<()>().await });
+    runtime.udp_tasks.insert(
+        source,
+        UdpProxyTask {
+            command,
+            join,
+            flows: HashSet::from([flow]),
+        },
+    );
+    runtime.udp_flow_sources.insert(flow, source);
+
+    let mut dispatcher = TunDispatcher::new(32, 32, 1).unwrap();
+    dispatcher.ensure_udp_socket(flow.destination).unwrap();
+    dispatcher.write_udp(flow, b"already queued").unwrap();
+
+    runtime
+        .proxy_output_tx
+        .try_send(ProxyOutput::UdpData {
+            flow,
+            payload: b"drop under backpressure".to_vec(),
+        })
+        .unwrap();
+    runtime.process_proxy_outputs(&mut dispatcher).unwrap();
+
+    assert!(runtime.udp_tasks.contains_key(&source));
+    assert_eq!(runtime.udp_flow_sources.get(&flow), Some(&source));
+    assert_eq!(runtime.nat_len().unwrap(), 1);
+
+    runtime.close();
+    assert_eq!(table.len().unwrap(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_cone_udp_output_to_missing_socket_releases_nat() {
     use crate::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, StaticProxySelector};
     use std::sync::atomic::{AtomicUsize, Ordering};
 

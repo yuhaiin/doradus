@@ -392,6 +392,7 @@ impl TunProxyRuntime {
         let Some(nat) = &self.nat else {
             return Ok(0);
         };
+        let idle_timeout = nat.idle_timeout;
         let expired = nat.table.sweep_keys()?;
         for key in &expired {
             let flow = TunFlowKey {
@@ -402,6 +403,14 @@ impl TunProxyRuntime {
             if key.network == Network::Tcp {
                 let _ = dispatcher.abort_tcp(flow);
             } else if key.network == Network::Udp {
+                let error = format!("NAT entry expired after {:?}", idle_timeout);
+                tun_debug(format!(
+                    "TUN UDP NAT entry expired flow={flow:?} timeout={:?}",
+                    idle_timeout
+                ));
+                if let Some(observer) = &self.observer {
+                    observer.failed(flow, "udp-nat-sweep", &error);
+                }
                 let _ = dispatcher.close_udp(flow);
             }
             self.remove_flow_task(&flow);
@@ -526,6 +535,10 @@ impl TunProxyRuntime {
                 payload,
             },
         ) {
+            let error_message = error.to_string();
+            if let Some(observer) = &self.observer {
+                observer.failed(flow.key, "udp-command", &error_message);
+            }
             let flows = self.remove_udp_source_task(source);
             for flow in flows {
                 self.untrack_flow(&flow)?;

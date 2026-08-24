@@ -142,11 +142,26 @@ impl TunProxyRuntime {
                         "TUN UDP output queued flow={flow:?} bytes={}",
                         payload.len()
                     )),
+                    Err(error) if error.kind == ErrorKind::Timeout => {
+                        // UDP is lossy by contract. A full smoltcp TX buffer
+                        // means the TUN side is temporarily backpressured;
+                        // drop this datagram but keep the flow and NAT entry
+                        // alive so the peer can apply its own congestion
+                        // control instead of reopening the same flow.
+                        tun_debug(format!(
+                            "TUN UDP output backpressure flow={flow:?} bytes={} error={error}",
+                            payload.len()
+                        ));
+                    }
                     Err(error) => {
+                        let error_message = error.to_string();
                         tun_debug(format!(
                             "TUN UDP output dropped flow={flow:?} bytes={} error={error}",
                             payload.len()
                         ));
+                        if let Some(observer) = &self.observer {
+                            observer.failed(flow, "udp-output-to-tun", &error_message);
+                        }
                         if tracked {
                             self.remove_flow_task(&flow);
                             self.untrack_flow(&flow)?;
@@ -194,11 +209,15 @@ impl TunProxyRuntime {
                     nat.table
                         .bind_translated(source.network, source.source, translated)
                 {
+                    let error_message = error.to_string();
                     tun_debug(format!(
                         "TUN UDP translated endpoint rejected source={source:?} translated={translated}: {error}"
                     ));
                     let flows = self.remove_udp_source_task(source);
                     for flow in flows {
+                        if let Some(observer) = &self.observer {
+                            observer.failed(flow, "udp-bind-translated", &error_message);
+                        }
                         let _ = dispatcher.close_udp(flow);
                         self.untrack_flow(&flow)?;
                     }
@@ -258,7 +277,17 @@ impl TunProxyRuntime {
             .collect();
         for source in finished_udp {
             let flows = self.remove_udp_source_task(source);
+            tun_debug(format!(
+                "TUN UDP proxy task reaped before close output source={source:?} flows={flows:?}"
+            ));
             for flow in flows {
+                if let Some(observer) = &self.observer {
+                    observer.failed(
+                        flow,
+                        "udp-task-reaped",
+                        "UDP proxy task ended before emitting a close result",
+                    );
+                }
                 let _ = dispatcher.close_udp(flow);
                 self.untrack_flow(&flow)?;
             }

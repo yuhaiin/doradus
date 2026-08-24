@@ -60,7 +60,13 @@ impl TunDispatcher {
         self.sockets
             .get_mut::<udp::Socket>(handle)
             .send_slice(payload, IpEndpoint::from(flow.source))
-            .map_err(|error| Error::new(ErrorKind::Closed, format!("TUN UDP write: {error:?}")))
+            .map_err(|error| {
+                let kind = match error {
+                    udp::SendError::BufferFull => ErrorKind::Timeout,
+                    udp::SendError::Unaddressable => ErrorKind::Closed,
+                };
+                Error::new(kind, format!("TUN UDP write: {error:?}"))
+            })
     }
 
     /// Queue a raw ICMP packet for the next TUN poll.

@@ -195,7 +195,8 @@ pub(super) async fn run_udp_proxy(
         network: Network::Udp,
         addr: translated,
     }) = datagram.local_addr()
-        && !emit_output(
+    {
+        if !emit_output(
             &output,
             ProxyOutput::UdpBound {
                 source: udp_source_key(initial_flow),
@@ -204,9 +205,19 @@ pub(super) async fn run_udp_proxy(
             timeouts.udp_idle,
         )
         .await
-    {
-        let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
-        return;
+        {
+            report_failure(
+                failure_observer.as_ref(),
+                initial_flow,
+                "udp-bind-output",
+                "proxy output queue timed out",
+            );
+            tun_debug(format!(
+                "UDP proxy bound result could not be delivered flow={initial_flow:?} translated={translated}"
+            ));
+            let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
+            return;
+        }
     }
     let mut buffer = vec![0u8; udp_buffer_size];
     let mut routes = HashMap::<Endpoint, TunFlowKey>::new();
@@ -252,15 +263,48 @@ pub(super) async fn run_udp_proxy(
                             last_flow = routes.values().next().copied();
                         }
                         if routes.is_empty() {
+                            tun_debug(format!(
+                                "UDP proxy closing after last flow was removed flow={flow:?}"
+                            ));
                             let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
-                            let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.udp_idle).await;
+                            if !emit_output(
+                                &output,
+                                ProxyOutput::UdpClosed { flow },
+                                timeouts.udp_idle,
+                            )
+                            .await
+                            {
+                                report_failure(
+                                    failure_observer.as_ref(),
+                                    flow,
+                                    "udp-close-output",
+                                    "proxy output queue timed out",
+                                );
+                            }
                             return;
                         }
                     }
                     Some(UdpProxyCommand::Shutdown) | None => {
+                        tun_debug(format!(
+                            "UDP proxy closing after shutdown command flow={initial_flow:?} routes={}",
+                            routes.len()
+                        ));
                         let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
                         for flow in routes.values().copied().collect::<HashSet<_>>() {
-                            let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.udp_idle).await;
+                            if !emit_output(
+                                &output,
+                                ProxyOutput::UdpClosed { flow },
+                                timeouts.udp_idle,
+                            )
+                            .await
+                            {
+                                report_failure(
+                                    failure_observer.as_ref(),
+                                    flow,
+                                    "udp-close-output",
+                                    "proxy output queue timed out",
+                                );
+                            }
                         }
                         return;
                     }
@@ -303,9 +347,27 @@ pub(super) async fn run_udp_proxy(
                 }
             }
             _ = &mut idle => {
+                tun_debug(format!(
+                    "UDP proxy idle timeout flow={initial_flow:?} routes={} timeout={:?}",
+                    routes.len(),
+                    timeouts.udp_idle
+                ));
                 let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
                 for flow in routes.values().copied().collect::<HashSet<_>>() {
-                    let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.udp_idle).await;
+                    if !emit_output(
+                        &output,
+                        ProxyOutput::UdpClosed { flow },
+                        timeouts.udp_idle,
+                    )
+                    .await
+                    {
+                        report_failure(
+                            failure_observer.as_ref(),
+                            flow,
+                            "udp-close-output",
+                            "proxy output queue timed out",
+                        );
+                    }
                 }
                 return;
             }
@@ -318,7 +380,20 @@ pub(super) async fn run_udp_proxy(
                 );
                 let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
                 for flow in routes.values().copied().collect::<HashSet<_>>() {
-                    let _ = emit_output(&output, ProxyOutput::UdpClosed { flow }, timeouts.udp_idle).await;
+                    if !emit_output(
+                        &output,
+                        ProxyOutput::UdpClosed { flow },
+                        timeouts.udp_idle,
+                    )
+                    .await
+                    {
+                        report_failure(
+                            failure_observer.as_ref(),
+                            flow,
+                            "udp-close-output",
+                            "proxy output queue timed out",
+                        );
+                    }
                 }
                 return;
             }
