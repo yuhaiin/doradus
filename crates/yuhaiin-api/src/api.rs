@@ -2956,6 +2956,23 @@ async fn update_status_value(state: &ApiState) -> ApiResult {
     json_value(serde_json::to_value(state.update.status()).unwrap_or_else(|_| json!({})))
 }
 
+fn latency_probe_outer_timeout(request: &LatencyRequest, timeout: Duration) -> Duration {
+    let probe_type = request.probe_type.trim();
+    if probe_type != "stun" && probe_type != "stun_tcp" {
+        return timeout;
+    }
+
+    // Go gives each NAT-behavior request a five-second deadline. Mapping can
+    // use three requests and Filtering can use another three, so the API
+    // wrapper must not cancel a valid STUN classification after one ten-second
+    // request budget has elapsed.
+    if probe_type == "stun_tcp" || request.tcp {
+        timeout.saturating_mul(3)
+    } else {
+        timeout.saturating_add(timeout.min(Duration::from_secs(5)).saturating_mul(6))
+    }
+}
+
 async fn node_latency_value(state: &ApiState, value: &Value) -> ApiResult {
     let id = required_string(value, "id")?;
     let timeout = Duration::from_millis(
@@ -2979,8 +2996,9 @@ async fn node_latency_value(state: &ApiState, value: &Value) -> ApiResult {
         .map_err(ApiError::from)?
         .proxy;
     let request: LatencyRequest = serde_json::from_value(value.clone())?;
+    let outer_timeout = latency_probe_outer_timeout(&request, timeout);
     match tokio::time::timeout(
-        timeout,
+        outer_timeout,
         yuhaiin_runtime::latency::probe_with_resolver(proxy, resolver, request, timeout),
     )
     .await
@@ -4664,6 +4682,37 @@ mod tests {
     use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
     use yuhaiin_runtime::{RuntimeBuilder, RuntimeController};
     use yuhaiin_store::ConfigStore;
+
+    #[test]
+    fn stun_latency_outer_timeout_covers_nat_behavior_requests() {
+        let udp = LatencyRequest {
+            probe_type: "stun".to_owned(),
+            ..LatencyRequest::default()
+        };
+        assert_eq!(
+            latency_probe_outer_timeout(&udp, Duration::from_secs(10)),
+            Duration::from_secs(40)
+        );
+
+        let tcp = LatencyRequest {
+            probe_type: "stun".to_owned(),
+            tcp: true,
+            ..LatencyRequest::default()
+        };
+        assert_eq!(
+            latency_probe_outer_timeout(&tcp, Duration::from_secs(10)),
+            Duration::from_secs(30)
+        );
+
+        let http = LatencyRequest {
+            probe_type: "http".to_owned(),
+            ..LatencyRequest::default()
+        };
+        assert_eq!(
+            latency_probe_outer_timeout(&http, Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+    }
 
     #[test]
     fn node_public_json_hides_go_internal_user_ids_without_mutating_unknown_json() {

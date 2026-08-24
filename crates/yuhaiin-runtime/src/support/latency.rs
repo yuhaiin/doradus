@@ -175,11 +175,15 @@ impl LatencyRequest {
         }
     }
 
-    fn host_or_default(&self, _tcp: bool) -> String {
+    fn host_or_default(&self, tcp: bool) -> String {
         if !self.host.trim().is_empty() {
             return self.host.trim().to_owned();
         }
-        "stun.l.google.com:19302".to_owned()
+        if tcp {
+            "stun.nextcloud.com:443".to_owned()
+        } else {
+            "stun.nextcloud.com:3478".to_owned()
+        }
     }
 
     fn dns_host_or_default(&self) -> String {
@@ -627,48 +631,168 @@ async fn probe_stun(
 ) -> Result<LatencyResponse> {
     let tcp = request.probe_type == "stun_tcp" || request.tcp;
     let target = parse_host_port(&request.host_or_default(tcp), 3478)?;
-    let transaction = transaction_id();
-    let packet = stun_binding_request(transaction);
-    let started = std::time::Instant::now();
+    let request_timeout = timeout.min(Duration::from_secs(5));
     let values = if tcp {
+        let transaction = transaction_id();
+        let packet = stun_binding_request(transaction);
         let endpoint = endpoint(Network::Tcp, &target.0, target.1)?;
         let context = FlowContext::new(endpoint);
         let mut stream = tokio::time::timeout(timeout, proxy.connect(&context))
             .await
             .map_err(|_| Error::new(ErrorKind::Timeout, "STUN TCP connect timed out"))??;
         use tokio::io::AsyncWriteExt;
-        let mut framed = Vec::with_capacity(packet.len() + 2);
-        framed.extend_from_slice(&(packet.len() as u16).to_be_bytes());
-        framed.extend_from_slice(&packet);
-        tokio::time::timeout(timeout, stream.write_all(&framed))
+        tokio::time::timeout(timeout, stream.write_all(&packet))
             .await
             .map_err(|_| Error::new(ErrorKind::Timeout, "STUN TCP write timed out"))?
             .map_err(io_error)?;
         let response = read_stun_tcp(&mut stream, timeout).await?;
-        parse_stun_response(&response, transaction)?
+        let response = parse_stun_response(&response, transaction)?;
+        let mapped_address = response.xor_mapped.ok_or_else(|| {
+            Error::new(
+                ErrorKind::Protocol,
+                "STUN response has no XOR mapped address",
+            )
+        })?;
+        StunLatency {
+            mapped_address: mapped_address.to_string(),
+            ..StunLatency::default()
+        }
     } else {
         let endpoint = endpoint(Network::Udp, &target.0, target.1)?;
         let context = FlowContext::new(endpoint.clone());
         let datagram = tokio::time::timeout(timeout, proxy.open_datagram(&context))
             .await
             .map_err(|_| Error::new(ErrorKind::Timeout, "STUN UDP open timed out"))??;
-        tokio::time::timeout(timeout, datagram.send_to(&packet, endpoint))
-            .await
-            .map_err(|_| Error::new(ErrorKind::Timeout, "STUN UDP write timed out"))??;
-        let mut buffer = vec![0u8; 2048];
-        let (length, _) = tokio::time::timeout(timeout, datagram.recv_from(&mut buffer))
-            .await
-            .map_err(|_| Error::new(ErrorKind::Timeout, "STUN UDP response timed out"))??;
+        let result = probe_stun_udp(datagram.as_ref(), endpoint, target.1, request_timeout).await;
         datagram.close().await?;
-        parse_stun_response(&buffer[..length], transaction)?
+        result?
     };
     Ok(LatencyResponse {
         ok: true,
-        latency_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+        latency_ms: 0,
         ip: None,
         stun: Some(values),
         error: String::new(),
     })
+}
+
+async fn probe_stun_udp(
+    datagram: &dyn AsyncDatagram,
+    primary: Endpoint,
+    primary_port: u16,
+    timeout: Duration,
+) -> Result<StunLatency> {
+    // Keep one datagram association for every probe, matching Go's Mapping
+    // and Filtering tests and preserving the NAT source mapping.
+    let first = stun_udp_request(datagram, primary.clone(), None, timeout).await?;
+    let mapped_address = first.xor_mapped.ok_or_else(|| {
+        Error::new(
+            ErrorKind::Protocol,
+            "STUN response has no XOR mapped address",
+        )
+    })?;
+
+    let mapping = if datagram
+        .local_addr()
+        .ok()
+        .and_then(|address| address.addr())
+        == Some(mapped_address)
+    {
+        "EndpointIndependentNoNAT"
+    } else {
+        let Some(other_address) = first.other_address.or(first.changed_address) else {
+            return Ok(StunLatency {
+                mapped_address: mapped_address.to_string(),
+                mapping: "ServerNotSupportChangePort".to_owned(),
+                filtering: "ServerNotSupportChangePort".to_owned(),
+                ..StunLatency::default()
+            });
+        };
+
+        let other_primary = Endpoint::ip(
+            Network::Udp,
+            SocketAddr::new(other_address.ip(), primary_port),
+        );
+        let second = stun_udp_request(datagram, other_primary, None, timeout).await;
+        match second {
+            Ok(second) if second.xor_mapped == Some(mapped_address) => "EndpointIndependent",
+            Ok(second) => {
+                let third = stun_udp_request(
+                    datagram,
+                    Endpoint::ip(Network::Udp, other_address),
+                    None,
+                    timeout,
+                )
+                .await;
+                match third {
+                    Ok(third) if third.xor_mapped == second.xor_mapped => "AddressDependent",
+                    Ok(_) => "AddressAndPortDependent",
+                    Err(error) if is_stun_timeout(&error) => "AddressAndPortDependent",
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) if is_stun_timeout(&error) => {
+                let third = stun_udp_request(
+                    datagram,
+                    Endpoint::ip(Network::Udp, other_address),
+                    None,
+                    timeout,
+                )
+                .await;
+                match third {
+                    Ok(_) => "AddressAndPortDependent",
+                    Err(error) if is_stun_timeout(&error) => "AddressAndPortDependent",
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    };
+
+    let filtering = if mapping == "ServerNotSupportChangePort" {
+        mapping
+    } else {
+        stun_udp_request(datagram, primary.clone(), None, timeout).await?;
+        match stun_udp_request(datagram, primary.clone(), Some(0x06), timeout).await {
+            Ok(_) => "EndpointIndependent",
+            Err(error) if is_stun_timeout(&error) => {
+                match stun_udp_request(datagram, primary, Some(0x02), timeout).await {
+                    Ok(_) => "AddressDependent",
+                    Err(error) if is_stun_timeout(&error) => "AddressAndPortDependent",
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    };
+
+    Ok(StunLatency {
+        mapped_address: mapped_address.to_string(),
+        mapping: mapping.to_owned(),
+        filtering: filtering.to_owned(),
+        ..StunLatency::default()
+    })
+}
+
+async fn stun_udp_request(
+    datagram: &dyn AsyncDatagram,
+    target: Endpoint,
+    change_request: Option<u8>,
+    timeout: Duration,
+) -> Result<ParsedStunResponse> {
+    let transaction = transaction_id();
+    let packet = match change_request {
+        Some(change_request) => stun_binding_request_with_change(transaction, change_request),
+        None => stun_binding_request(transaction),
+    };
+    tokio::time::timeout(timeout, datagram.send_to(&packet, target))
+        .await
+        .map_err(|_| Error::new(ErrorKind::Timeout, "STUN UDP write timed out"))??;
+    let mut buffer = vec![0u8; 2048];
+    let (length, _) = tokio::time::timeout(timeout, datagram.recv_from(&mut buffer))
+        .await
+        .map_err(|_| Error::new(ErrorKind::Timeout, "STUN UDP response timed out"))??;
+    parse_stun_response(&buffer[..length], transaction)
 }
 
 async fn probe_dns(
@@ -783,20 +907,20 @@ impl AsyncDnsDatagram for LatencyDatagram {
 
 async fn read_stun_tcp(stream: &mut BoxAsyncStream, timeout: Duration) -> Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
-    let mut length = [0u8; 2];
-    tokio::time::timeout(timeout, stream.read_exact(&mut length))
+    let mut response = vec![0u8; 20];
+    tokio::time::timeout(timeout, stream.read_exact(&mut response))
         .await
-        .map_err(|_| Error::new(ErrorKind::Timeout, "STUN TCP length timed out"))?
+        .map_err(|_| Error::new(ErrorKind::Timeout, "STUN TCP header timed out"))?
         .map_err(io_error)?;
-    let length = usize::from(u16::from_be_bytes(length));
-    if length > 2048 {
+    let length = usize::from(u16::from_be_bytes([response[2], response[3]]));
+    if length > 2048 - 20 {
         return Err(Error::new(
             ErrorKind::Protocol,
             "STUN TCP response is too large",
         ));
     }
-    let mut response = vec![0u8; length];
-    tokio::time::timeout(timeout, stream.read_exact(&mut response))
+    response.resize(20 + length, 0);
+    tokio::time::timeout(timeout, stream.read_exact(&mut response[20..]))
         .await
         .map_err(|_| Error::new(ErrorKind::Timeout, "STUN TCP response timed out"))?
         .map_err(io_error)?;
@@ -912,16 +1036,36 @@ fn transaction_id() -> [u8; 12] {
     id
 }
 
+#[derive(Debug, Default)]
+struct ParsedStunResponse {
+    values: StunLatency,
+    xor_mapped: Option<SocketAddr>,
+    other_address: Option<SocketAddr>,
+    changed_address: Option<SocketAddr>,
+}
+
 fn stun_binding_request(transaction: [u8; 12]) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(20);
+    stun_binding_request_with_attributes(transaction, &[])
+}
+
+fn stun_binding_request_with_change(transaction: [u8; 12], change_request: u8) -> Vec<u8> {
+    stun_binding_request_with_attributes(
+        transaction,
+        &[0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00, change_request],
+    )
+}
+
+fn stun_binding_request_with_attributes(transaction: [u8; 12], attributes: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(20 + attributes.len());
     packet.extend_from_slice(&0x0001u16.to_be_bytes());
-    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(&(attributes.len() as u16).to_be_bytes());
     packet.extend_from_slice(&0x2112_A442u32.to_be_bytes());
     packet.extend_from_slice(&transaction);
+    packet.extend_from_slice(attributes);
     packet
 }
 
-fn parse_stun_response(packet: &[u8], transaction: [u8; 12]) -> Result<StunLatency> {
+fn parse_stun_response(packet: &[u8], transaction: [u8; 12]) -> Result<ParsedStunResponse> {
     if packet.len() < 20 || packet[0] & 0xc0 != 0 {
         return Err(Error::new(ErrorKind::Protocol, "invalid STUN response"));
     }
@@ -939,7 +1083,7 @@ fn parse_stun_response(packet: &[u8], transaction: [u8; 12]) -> Result<StunLaten
     if packet[8..20] != transaction {
         return Err(Error::new(ErrorKind::Protocol, "STUN transaction mismatch"));
     }
-    let mut result = StunLatency::default();
+    let mut result = ParsedStunResponse::default();
     let end = 20 + length;
     let mut offset = 20;
     while offset + 4 <= end {
@@ -951,25 +1095,45 @@ fn parse_stun_response(packet: &[u8], transaction: [u8; 12]) -> Result<StunLaten
         }
         let value = &packet[offset..offset + size];
         match kind {
-            0x0001 => result.mapped_address = decode_address(value, false, transaction)?,
-            0x0020 => result.xor_mapped_address = decode_address(value, true, transaction)?,
-            0x8022 => result.software = String::from_utf8_lossy(value).to_string(),
-            0x802b => result.response_origin_address = decode_address(value, true, transaction)?,
-            0x802c => result.other_address = decode_address(value, true, transaction)?,
+            0x0001 => {
+                result.values.mapped_address =
+                    decode_address(value, false, transaction)?.to_string();
+            }
+            0x0005 => {
+                result.changed_address = Some(decode_address(value, false, transaction)?);
+            }
+            0x0020 => {
+                let address = decode_address(value, true, transaction)?;
+                result.values.xor_mapped_address = address.to_string();
+                result.xor_mapped = Some(address);
+            }
+            0x8022 => result.values.software = String::from_utf8_lossy(value).to_string(),
+            0x802b => {
+                result.values.response_origin_address =
+                    decode_address(value, true, transaction)?.to_string();
+            }
+            0x802c => {
+                // OTHER-ADDRESS is a plain address attribute.  Unlike
+                // XOR-MAPPED-ADDRESS and RESPONSE-ORIGIN, its address and
+                // port are not XOR encoded.
+                let address = decode_address(value, false, transaction)?;
+                result.values.other_address = address.to_string();
+                result.other_address = Some(address);
+            }
             _ => {}
         }
         offset += (size + 3) & !3;
     }
-    if result.mapped_address.is_empty() && result.xor_mapped_address.is_empty() {
+    if result.xor_mapped.is_none() {
         return Err(Error::new(
             ErrorKind::Protocol,
-            "STUN response has no mapped address",
+            "STUN response has no XOR mapped address",
         ));
     }
     Ok(result)
 }
 
-fn decode_address(value: &[u8], xor: bool, transaction: [u8; 12]) -> Result<String> {
+fn decode_address(value: &[u8], xor: bool, transaction: [u8; 12]) -> Result<SocketAddr> {
     if value.len() < 4 {
         return Err(Error::new(
             ErrorKind::Protocol,
@@ -1012,11 +1176,15 @@ fn decode_address(value: &[u8], xor: bool, transaction: [u8; 12]) -> Result<Stri
             ));
         }
     };
-    Ok(SocketAddr::new(address, port).to_string())
+    Ok(SocketAddr::new(address, port))
 }
 
 fn io_error(error: std::io::Error) -> Error {
     Error::new(ErrorKind::Io, error.to_string())
+}
+
+fn is_stun_timeout(error: &Error) -> bool {
+    error.kind == ErrorKind::Timeout
 }
 
 fn is_zero(value: &i64) -> bool {
@@ -1027,6 +1195,7 @@ fn is_zero(value: &i64) -> bool {
 mod tests {
     use std::io;
     use std::pin::Pin;
+    use std::sync::Mutex;
     use std::task::{Context, Poll};
 
     use super::*;
@@ -1227,19 +1396,17 @@ mod tests {
             Box::pin(async {
                 let (client, mut server) = tokio::io::duplex(4096);
                 tokio::spawn(async move {
-                    let mut length = [0u8; 2];
-                    if server.read_exact(&mut length).await.is_err() {
-                        return;
-                    }
-                    let mut request = vec![0u8; usize::from(u16::from_be_bytes(length))];
+                    let mut request = vec![0u8; 20];
                     if server.read_exact(&mut request).await.is_err() {
                         return;
                     }
+                    let length = usize::from(u16::from_be_bytes([request[2], request[3]]));
+                    request.resize(20 + length, 0);
+                    if server.read_exact(&mut request[20..]).await.is_err() {
+                        return;
+                    }
                     let response = stun_response(&request);
-                    let mut framed = Vec::with_capacity(response.len() + 2);
-                    framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
-                    framed.extend_from_slice(&response);
-                    let _ = server.write_all(&framed).await;
+                    let _ = server.write_all(&response).await;
                 });
                 Ok(Box::new(client) as BoxAsyncStream)
             })
@@ -1311,23 +1478,140 @@ mod tests {
         }
     }
 
+    struct NatBehaviorDatagram {
+        tx: mpsc::Sender<Vec<u8>>,
+        rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+        requests: Arc<Mutex<Vec<(SocketAddr, Option<u8>)>>>,
+    }
+
+    impl AsyncDatagram for NatBehaviorDatagram {
+        fn send_to<'a>(
+            &'a self,
+            payload: &'a [u8],
+            target: Endpoint,
+        ) -> BoxFuture<'a, Result<usize>> {
+            let tx = self.tx.clone();
+            let requests = self.requests.clone();
+            Box::pin(async move {
+                let target = target
+                    .addr()
+                    .ok_or_else(|| Error::invalid("NAT behavior target is not an IP"))?;
+                let change_request = stun_change_request(payload);
+                requests.lock().unwrap().push((target, change_request));
+                let response = stun_response_with_addresses(
+                    payload,
+                    "198.51.100.10:50000".parse().unwrap(),
+                    Some("192.0.2.2:3478".parse().unwrap()),
+                    Some("192.0.2.1:3478".parse().unwrap()),
+                );
+                tx.send(response)
+                    .await
+                    .map_err(|_| Error::new(ErrorKind::Closed, "NAT behavior datagram closed"))?;
+                Ok(payload.len())
+            })
+        }
+
+        fn recv_from<'a>(
+            &'a self,
+            buffer: &'a mut [u8],
+        ) -> BoxFuture<'a, Result<(usize, Endpoint)>> {
+            let rx = &self.rx;
+            Box::pin(async move {
+                let packet =
+                    rx.lock().await.recv().await.ok_or_else(|| {
+                        Error::new(ErrorKind::Closed, "NAT behavior datagram closed")
+                    })?;
+                buffer[..packet.len()].copy_from_slice(&packet);
+                Ok((
+                    packet.len(),
+                    Endpoint::ip(Network::Udp, "192.0.2.1:3478".parse().unwrap()),
+                ))
+            })
+        }
+
+        fn local_addr(&self) -> Result<Endpoint> {
+            Ok(Endpoint::ip(
+                Network::Udp,
+                "192.0.2.10:40000".parse().unwrap(),
+            ))
+        }
+
+        fn close(&self) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     fn stun_response(request: &[u8]) -> Vec<u8> {
-        let mut response = Vec::from([0x01, 0x01, 0, 12, 0x21, 0x12, 0xa4, 0x42]);
+        stun_response_with_addresses(request, "127.0.0.1:3478".parse().unwrap(), None, None)
+    }
+
+    fn stun_response_with_addresses(
+        request: &[u8],
+        mapped: SocketAddr,
+        other: Option<SocketAddr>,
+        origin: Option<SocketAddr>,
+    ) -> Vec<u8> {
+        let mut attributes = Vec::new();
+        append_xor_address_attribute(&mut attributes, 0x0020, mapped);
+        if let Some(other) = other {
+            append_xor_address_attribute(&mut attributes, 0x802c, other);
+        }
+        if let Some(origin) = origin {
+            append_xor_address_attribute(&mut attributes, 0x802b, origin);
+        }
+        let mut response = Vec::with_capacity(20 + attributes.len());
+        response.extend_from_slice(&[0x01, 0x01]);
+        response.extend_from_slice(&(attributes.len() as u16).to_be_bytes());
+        response.extend_from_slice(&0x2112_A442u32.to_be_bytes());
         response.extend_from_slice(&request[8..20]);
-        let port = 3478u16 ^ 0x2112;
-        let address = [127u8, 0, 0, 1];
-        let cookie = 0x2112_A442u32.to_be_bytes();
-        response.extend_from_slice(&[0, 0x20, 0, 8, 0, 1]);
-        response.extend_from_slice(&port.to_be_bytes());
-        response.extend(
-            address
-                .into_iter()
-                .zip(cookie)
-                .map(|(a, b)| a ^ b)
-                .collect::<Vec<_>>()
-                .as_slice(),
-        );
+        response.extend_from_slice(&attributes);
         response
+    }
+
+    fn append_xor_address_attribute(attributes: &mut Vec<u8>, kind: u16, address: SocketAddr) {
+        let SocketAddr::V4(address) = address else {
+            panic!("STUN fixture only supports IPv4 addresses");
+        };
+        attributes.extend_from_slice(&kind.to_be_bytes());
+        attributes.extend_from_slice(&8u16.to_be_bytes());
+        attributes.extend_from_slice(&[0, 1]);
+        let encoded_port = if kind == 0x802c {
+            address.port()
+        } else {
+            address.port() ^ 0x2112
+        };
+        attributes.extend_from_slice(&encoded_port.to_be_bytes());
+        let encoded_ip = if kind == 0x802c {
+            u32::from_be_bytes(address.ip().octets())
+        } else {
+            u32::from_be_bytes(address.ip().octets()) ^ 0x2112_A442
+        };
+        attributes.extend_from_slice(&encoded_ip.to_be_bytes());
+    }
+
+    fn stun_change_request(packet: &[u8]) -> Option<u8> {
+        if packet.len() < 20 {
+            return None;
+        }
+        let length = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+        let end = 20 + length;
+        if end > packet.len() {
+            return None;
+        }
+        let mut offset = 20;
+        while offset + 4 <= end {
+            let kind = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+            let size = usize::from(u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]));
+            offset += 4;
+            if offset + size > end {
+                return None;
+            }
+            if kind == 0x0003 && size == 4 {
+                return Some(packet[offset + 3]);
+            }
+            offset += (size + 3) & !3;
+        }
+        None
     }
 
     #[test]
@@ -1338,6 +1622,14 @@ mod tests {
         assert_eq!(http.port, 8443);
         assert_eq!(http.path, "/path?q=1");
         assert_eq!(parse_host_port("stun.example:3479", 3478).unwrap().1, 3479);
+        assert_eq!(
+            LatencyRequest::default().host_or_default(false),
+            "stun.nextcloud.com:3478"
+        );
+        assert_eq!(
+            LatencyRequest::default().host_or_default(true),
+            "stun.nextcloud.com:443"
+        );
     }
 
     #[test]
@@ -1360,7 +1652,40 @@ mod tests {
                 .as_slice(),
         );
         let reply = parse_stun_response(&packet, transaction).unwrap();
-        assert_eq!(reply.xor_mapped_address, "127.0.0.1:3478");
+        assert_eq!(reply.values.xor_mapped_address, "127.0.0.1:3478");
+    }
+
+    #[test]
+    fn stun_other_address_is_not_xor_decoded() {
+        let transaction = [2u8; 12];
+        let mut packet = stun_binding_request(transaction);
+        packet[0..2].copy_from_slice(&0x0101u16.to_be_bytes());
+        packet[2..4].copy_from_slice(&36u16.to_be_bytes());
+
+        let mapped_port = 3478u16 ^ 0x2112;
+        let mapped_address = [127u8, 0, 0, 1];
+        let cookie = 0x2112_A442u32.to_be_bytes();
+        packet.extend_from_slice(&[0, 0x20, 0, 8, 0, 1]);
+        packet.extend_from_slice(&mapped_port.to_be_bytes());
+        packet.extend(
+            mapped_address
+                .into_iter()
+                .zip(cookie)
+                .map(|(a, b)| a ^ b)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
+        let other = Ipv6Addr::new(0x2a01, 0x04f8, 0x1c1e, 0xd769, 0, 0, 0, 1);
+        packet.extend_from_slice(&[0x80, 0x2c, 0, 20, 0, 2]);
+        packet.extend_from_slice(&443u16.to_be_bytes());
+        packet.extend_from_slice(&other.octets());
+
+        let reply = parse_stun_response(&packet, transaction).unwrap();
+        assert_eq!(
+            reply.other_address,
+            Some(SocketAddr::new(IpAddr::V6(other), 443))
+        );
+        assert_eq!(reply.values.other_address, "[2a01:4f8:1c1e:d769::1]:443");
     }
 
     #[tokio::test]
@@ -1430,7 +1755,49 @@ mod tests {
         .await
         .unwrap();
         assert!(response.ok);
-        assert_eq!(response.stun.unwrap().xor_mapped_address, "127.0.0.1:3478");
+        let stun = response.stun.unwrap();
+        assert_eq!(stun.mapped_address, "127.0.0.1:3478");
+        assert_eq!(stun.mapping, "ServerNotSupportChangePort");
+        assert_eq!(stun.filtering, "ServerNotSupportChangePort");
+    }
+
+    #[tokio::test]
+    async fn udp_stun_probe_matches_go_mapping_and_filtering_sequence() {
+        let (tx, rx) = mpsc::channel(8);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let datagram = NatBehaviorDatagram {
+            tx,
+            rx: tokio::sync::Mutex::new(rx),
+            requests: Arc::clone(&requests),
+        };
+        let primary: SocketAddr = "192.0.2.1:3478".parse().unwrap();
+        let other_primary: SocketAddr = "192.0.2.2:3478".parse().unwrap();
+
+        let response = probe_stun_udp(
+            &datagram,
+            Endpoint::ip(Network::Udp, primary),
+            primary.port(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.mapped_address, "198.51.100.10:50000");
+        assert_eq!(response.mapping, "EndpointIndependent");
+        assert_eq!(response.filtering, "EndpointIndependent");
+        assert!(response.xor_mapped_address.is_empty());
+        assert!(response.other_address.is_empty());
+        assert!(response.response_origin_address.is_empty());
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                (primary, None),
+                (other_primary, None),
+                (primary, None),
+                (primary, Some(0x06)),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1568,7 +1935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_stun_probe_uses_length_prefixed_framing() {
+    async fn tcp_stun_probe_uses_standard_stun_framing() {
         let response = probe_stun(
             Arc::new(TcpStunProxy),
             LatencyRequest {
@@ -1581,6 +1948,6 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(response.stun.unwrap().xor_mapped_address, "127.0.0.1:3478");
+        assert_eq!(response.stun.unwrap().mapped_address, "127.0.0.1:3478");
     }
 }
