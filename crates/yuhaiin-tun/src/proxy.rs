@@ -411,7 +411,8 @@ impl TunProxyRuntime {
                 if let Some(observer) = &self.observer {
                     observer.failed(flow, "udp-nat-sweep", &error);
                 }
-                let _ = dispatcher.close_udp(flow);
+                self.close_udp_flow(dispatcher, flow)?;
+                continue;
             }
             self.remove_flow_task(&flow);
         }
@@ -747,6 +748,28 @@ impl TunProxyRuntime {
         if remove_source {
             let _ = self.remove_udp_source_task(source);
         }
+    }
+
+    pub(crate) fn close_udp_flow(
+        &mut self,
+        dispatcher: &mut TunDispatcher,
+        flow: TunFlowKey,
+    ) -> Result<()> {
+        self.remove_flow_task(&flow);
+
+        let another_flow_uses_destination = self.tracked_flows.iter().any(|candidate| {
+            candidate.network == Network::Udp
+                && candidate.destination == flow.destination
+                && *candidate != flow
+        });
+        if !another_flow_uses_destination {
+            // UDP sockets are shared by all source tuples bound to the same
+            // destination endpoint. Only the last active flow may close the
+            // socket; closing one source tuple must not invalidate replies
+            // for unrelated tuples.
+            let _ = dispatcher.close_udp(flow);
+        }
+        self.untrack_flow(&flow)
     }
 
     fn send_udp_command(&self, source: &UdpSourceKey, command: UdpProxyCommand) -> Result<()> {

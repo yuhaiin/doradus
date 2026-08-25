@@ -130,11 +130,15 @@ impl TunProxyRuntime {
                 }
             }
             ProxyOutput::UdpData { flow, payload } => {
-                let tracked = self.tracked_flows.contains(&flow);
-                if tracked {
-                    self.touch_flow(flow)?;
+                if !self.tracked_flows.contains(&flow) {
+                    tun_debug(format!(
+                        "TUN UDP output dropped for stale flow={flow:?} bytes={}",
+                        payload.len()
+                    ));
+                    return Ok(true);
                 }
-                if tracked && let Some(observer) = &self.observer {
+                self.touch_flow(flow)?;
+                if let Some(observer) = &self.observer {
                     observer.bytes(flow, TunFlowDirection::Download, payload.len());
                 }
                 match dispatcher.write_udp(flow, &payload) {
@@ -162,10 +166,7 @@ impl TunProxyRuntime {
                         if let Some(observer) = &self.observer {
                             observer.failed(flow, "udp-output-to-tun", &error_message);
                         }
-                        if tracked {
-                            self.remove_flow_task(&flow);
-                            self.untrack_flow(&flow)?;
-                        }
+                        self.close_udp_flow(dispatcher, flow)?;
                     }
                 }
                 Ok(true)
@@ -183,8 +184,7 @@ impl TunProxyRuntime {
                         vec![flow]
                     });
                 for flow in flows {
-                    let _ = dispatcher.close_udp(flow);
-                    self.untrack_flow(&flow)?;
+                    self.close_udp_flow(dispatcher, flow)?;
                 }
                 Ok(true)
             }
@@ -218,8 +218,7 @@ impl TunProxyRuntime {
                         if let Some(observer) = &self.observer {
                             observer.failed(flow, "udp-bind-translated", &error_message);
                         }
-                        let _ = dispatcher.close_udp(flow);
-                        self.untrack_flow(&flow)?;
+                        self.close_udp_flow(dispatcher, flow)?;
                     }
                 }
                 Ok(true)
@@ -288,8 +287,7 @@ impl TunProxyRuntime {
                         "UDP proxy task ended before emitting a close result",
                     );
                 }
-                let _ = dispatcher.close_udp(flow);
-                self.untrack_flow(&flow)?;
+                self.close_udp_flow(dispatcher, flow)?;
             }
         }
         Ok(())
@@ -333,13 +331,14 @@ impl TunProxyRuntime {
             .filter(|flow| observer.close_requested(*flow))
             .collect::<Vec<_>>();
         for flow in requested {
-            self.remove_flow_task(&flow);
             match flow.network {
                 Network::Tcp => {
+                    self.remove_flow_task(&flow);
                     let _ = dispatcher.abort_tcp(flow);
                 }
                 Network::Udp => {
-                    let _ = dispatcher.close_udp(flow);
+                    self.close_udp_flow(dispatcher, flow)?;
+                    continue;
                 }
                 Network::Icmp | Network::Any => {}
             }

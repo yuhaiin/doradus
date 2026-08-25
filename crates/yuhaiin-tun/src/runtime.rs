@@ -726,7 +726,7 @@ impl TunRuntime {
                                 let _ = dispatcher.abort_tcp(flow);
                             }
                             Network::Udp => {
-                                let _ = dispatcher.close_udp(flow);
+                                let _ = proxy_runtime.close_udp_flow(dispatcher, flow);
                             }
                             Network::Icmp | Network::Any => {}
                         }

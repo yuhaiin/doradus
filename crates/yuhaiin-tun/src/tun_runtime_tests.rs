@@ -594,6 +594,147 @@ async fn udp_output_buffer_full_drops_packet_without_closing_flow() {
     assert_eq!(table.len().unwrap(), 0);
 }
 
+#[test]
+fn udp_shared_destination_keeps_socket_for_other_source_flow() {
+    use crate::proxy::{DropAsyncProxy, StaticProxySelector};
+
+    let drop_proxy: Arc<dyn AsyncProxy> = Arc::new(DropAsyncProxy);
+    let selector = Arc::new(StaticProxySelector {
+        direct: Arc::clone(&drop_proxy),
+        proxy: Arc::clone(&drop_proxy),
+        bypass: Arc::clone(&drop_proxy),
+        drop: Arc::clone(&drop_proxy),
+    });
+    let mut runtime = TunProxyRuntime::new(selector, 4).unwrap();
+
+    let local = Ipv4Address::new(10, 0, 0, 1);
+    let source_a = Ipv4Address::new(10, 0, 0, 2);
+    let source_b = Ipv4Address::new(10, 0, 0, 3);
+    let destination = Ipv4Address::new(10, 0, 0, 1);
+    let mut device = SmoltcpTunDevice::new(1500, 8).unwrap();
+    let mut interface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(IpAddress::Ipv4(local), 24))
+            .unwrap();
+    });
+    let mut dispatcher = TunDispatcher::new(2048, 2048, 4).unwrap();
+    device
+        .enqueue_rx(udp_packet(source_a, destination, 41000, 5353, b"first"))
+        .unwrap();
+    device
+        .enqueue_rx(udp_packet(source_b, destination, 41001, 5353, b"second"))
+        .unwrap();
+
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(1))
+        .unwrap();
+    let flows: Vec<_> = dispatcher
+        .proxy_inputs()
+        .map(|event| match event {
+            ProxyInput::UdpDatagram { flow, .. } => flow.key,
+            other => panic!("expected UDP datagram, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(flows.len(), 2);
+
+    let first = flows
+        .iter()
+        .copied()
+        .find(|flow| flow.source.port() == 41000)
+        .unwrap();
+    let second = flows
+        .iter()
+        .copied()
+        .find(|flow| flow.source.port() == 41001)
+        .unwrap();
+    runtime.track_flow(first).unwrap();
+    runtime.track_flow(second).unwrap();
+
+    runtime.close_udp_flow(&mut dispatcher, first).unwrap();
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(2))
+        .unwrap();
+    dispatcher.write_udp(second, b"reply").unwrap();
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(3))
+        .unwrap();
+
+    let response = device
+        .take_tx()
+        .unwrap()
+        .expect("shared UDP socket was closed with the first flow");
+    let ip = Ipv4Packet::new_checked(&response).unwrap();
+    let udp = UdpPacket::new_checked(ip.payload()).unwrap();
+    assert_eq!(udp.src_port(), 5353);
+    assert_eq!(udp.dst_port(), 41001);
+    assert_eq!(udp.payload(), b"reply");
+
+    runtime.close_udp_flow(&mut dispatcher, second).unwrap();
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(4))
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .write_udp(second, b"late-reply")
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn stale_udp_output_is_dropped_without_writing_to_tun() {
+    use crate::proxy::{DropAsyncProxy, StaticProxySelector};
+
+    let drop_proxy: Arc<dyn AsyncProxy> = Arc::new(DropAsyncProxy);
+    let selector = Arc::new(StaticProxySelector {
+        direct: Arc::clone(&drop_proxy),
+        proxy: Arc::clone(&drop_proxy),
+        bypass: Arc::clone(&drop_proxy),
+        drop: Arc::clone(&drop_proxy),
+    });
+    let mut runtime = TunProxyRuntime::new(selector, 4).unwrap();
+    let flow = TunFlowKey {
+        network: Network::Udp,
+        source: "10.0.0.2:41000".parse().unwrap(),
+        destination: "10.0.0.1:5353".parse().unwrap(),
+    };
+    let mut dispatcher = TunDispatcher::new(2048, 2048, 4).unwrap();
+    dispatcher.ensure_udp_socket(flow.destination).unwrap();
+    runtime
+        .proxy_output_tx
+        .try_send(ProxyOutput::UdpData {
+            flow,
+            payload: b"stale-reply".to_vec(),
+        })
+        .unwrap();
+    runtime.process_proxy_outputs(&mut dispatcher).unwrap();
+
+    let mut device = SmoltcpTunDevice::new(1500, 8).unwrap();
+    let mut interface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(
+                IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)),
+                24,
+            ))
+            .unwrap();
+    });
+    dispatcher
+        .poll_with(&mut interface, &mut device, Instant::from_millis(1))
+        .unwrap();
+    assert!(device.take_tx().unwrap().is_none());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn full_cone_udp_output_to_missing_socket_releases_nat() {
     use crate::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, StaticProxySelector};
