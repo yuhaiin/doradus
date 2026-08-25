@@ -476,6 +476,22 @@ async fn configure_wireguard_node_and_route_with_network_split(
         Some(&route),
     )
     .await;
+    // The generated test peer uses TEST-NET (192.0.2.0/24), which is also in
+    // the built-in LAN rule. Make the scenario's WireGuard route explicitly
+    // win so the test exercises the encrypted outbound rather than the LAN
+    // direct fallback.
+    api_json(
+        &service.client,
+        &service.base_url,
+        http::Method::POST,
+        "/api/v2/route/rules/priority",
+        Some(&json!({
+            "source":{"name":"wireguard-cidr-route","index":2},
+            "target":{"name":"LAN","index":1},
+            "operate":"insert_before"
+        })),
+    )
+    .await;
 }
 
 async fn configure_wireguard_udp_chain(

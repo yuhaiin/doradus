@@ -34,6 +34,16 @@ where
     ) -> BoxFuture<'a, Result<()>>;
 }
 
+/// Configuration carried by one reverse HTTP connection. Keeping the
+/// protocol inputs together prevents the stream loop from growing a long
+/// positional argument list as reverse HTTP gains another option.
+pub struct ReverseHttpOptions<'a> {
+    pub target: Endpoint,
+    pub path: &'a str,
+    pub authority: &'a str,
+    pub https: bool,
+}
+
 /// Run the complete reverse HTTP protocol loop.
 ///
 /// Sniffing, prefix restoration, HTTP parsing and request rewriting stay in
@@ -42,10 +52,7 @@ where
 pub async fn handle<S, R, F>(
     mut stream: S,
     peer: SocketAddr,
-    target: Endpoint,
-    path: &str,
-    authority: &str,
-    https: bool,
+    options: ReverseHttpOptions<'_>,
     raw_handler: &R,
     forward_handler: &F,
 ) -> Result<()>
@@ -60,7 +67,7 @@ where
             .handle_stream(
                 PrefixedIo::new(prefix, stream),
                 peer,
-                target,
+                options.target,
                 "reverse_http",
             )
             .await;
@@ -73,9 +80,16 @@ where
         )
     })?;
     let http_host = request_host(headers);
-    let rewritten_request = rewrite_request(headers, path, authority)?.into_bytes();
+    let rewritten_request = rewrite_request(headers, options.path, options.authority)?.into_bytes();
     forward_handler
-        .handle_forward(stream, peer, target, http_host, https, rewritten_request)
+        .handle_forward(
+            stream,
+            peer,
+            options.target,
+            http_host,
+            options.https,
+            rewritten_request,
+        )
         .await
 }
 
@@ -257,10 +271,12 @@ mod tests {
             handle(
                 server,
                 "127.0.0.1:23456".parse().unwrap(),
-                target(),
-                "/base",
-                "upstream.example",
-                false,
+                ReverseHttpOptions {
+                    target: target(),
+                    path: "/base",
+                    authority: "upstream.example",
+                    https: false,
+                },
                 raw.as_ref(),
                 forward.as_ref(),
             )
@@ -289,10 +305,12 @@ mod tests {
             handle(
                 server,
                 "127.0.0.1:23456".parse().unwrap(),
-                target(),
-                "/base",
-                "upstream.example",
-                true,
+                ReverseHttpOptions {
+                    target: target(),
+                    path: "/base",
+                    authority: "upstream.example",
+                    https: true,
+                },
                 raw.as_ref(),
                 task_forward.as_ref(),
             )

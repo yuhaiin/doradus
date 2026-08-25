@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
@@ -27,7 +27,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, ServerConfig};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 use tokio_rustls::{TlsAcceptor, TlsConnector, client::TlsStream};
 use x509_cert::builder::{Builder, CertificateBuilder, Profile};
 use x509_cert::der::Encode;
@@ -1236,25 +1236,20 @@ pub struct ServiceProcess {
     diagnostics: Arc<Mutex<String>>,
 }
 
-// `reserve_loopback` closes its temporary listener before the child binds.
-// Serialize that small hand-off so parallel integration tests cannot choose
-// the same port between the probe and the runtime's real bind.
-static API_START_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-
 impl ServiceProcess {
     pub async fn start(db: &Path) -> Self {
-        let _api_start_guard = API_START_LOCK
-            .get_or_init(|| AsyncMutex::new(()))
-            .lock()
-            .await;
-        let api_address = reserve_loopback().await;
         let diagnostics = Arc::new(Mutex::new(String::new()));
         let runtime_binary = std::env::var_os("YUHAIIN_RUNTIME_BIN")
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_yuhaiin").into());
         let mut child = Command::new(runtime_binary)
             .env("YUHAIIN_DB", db)
-            .env("YUHAIIN_HTTP", api_address.to_string())
-            .env("YUHAIIN_QUIET", "1")
+            // Let the child own an ephemeral API port.  Reserving a port in
+            // the test process and then dropping the listener before spawn
+            // races with every other integration process that also allocates
+            // loopback ports.  The startup notice below is the authoritative
+            // hand-off for the port actually bound by the child.
+            .env("YUHAIIN_HTTP", "127.0.0.1:0")
+            .env("YUHAIIN_QUIET", "0")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -1289,11 +1284,10 @@ impl ServiceProcess {
         }
         let _ = rustls::crypto::ring::default_provider().install_default();
         let client = HttpClient::new();
-        let base_url = format!("http://{api_address}");
         let mut service = Self {
             child,
             client,
-            base_url,
+            base_url: String::new(),
             diagnostics,
         };
         for _ in 0..120 {
@@ -1302,6 +1296,15 @@ impl ServiceProcess {
                     "yuhaiin exited before ready ({status}): {}",
                     service.diagnostics()
                 );
+            }
+            if service.base_url.is_empty()
+                && let Some(address) = api_address_from_diagnostics(&service.diagnostics())
+            {
+                service.base_url = format!("http://{address}");
+            }
+            if service.base_url.is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
             }
             if let Ok(response) = service
                 .client
@@ -1371,6 +1374,13 @@ impl ServiceProcess {
     }
 }
 
+fn api_address_from_diagnostics(diagnostics: &str) -> Option<SocketAddr> {
+    diagnostics.lines().find_map(|line| {
+        line.strip_prefix("yuhaiin-rust: HTTP API listening on http://")
+            .and_then(|address| address.trim().parse().ok())
+    })
+}
+
 impl Drop for ServiceProcess {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
@@ -1384,8 +1394,10 @@ pub async fn wait_for_connection(client: &HttpClient, base_url: &str) -> Value {
     // under load the flow can be established before the monitor checkpoint
     // is visible, so keep the observation window independent of the normal
     // listener startup retry budget.
+    let mut last = Value::Null;
     for _ in 0..500 {
         let value = api_json(client, base_url, Method::GET, "/api/v2/connections", None).await;
+        last = value.clone();
         if value["connections"]
             .as_array()
             .is_some_and(|items| !items.is_empty())
@@ -1394,7 +1406,7 @@ pub async fn wait_for_connection(client: &HttpClient, base_url: &str) -> Value {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("connection did not become visible");
+    panic!("connection did not become visible; last response={last}");
 }
 
 /// Open a real HTTP CONNECT tunnel against an HTTP inbound. Keeping this

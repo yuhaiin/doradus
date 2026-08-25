@@ -195,8 +195,7 @@ pub(super) async fn run_udp_proxy(
         network: Network::Udp,
         addr: translated,
     }) = datagram.local_addr()
-    {
-        if !emit_output(
+        && !emit_output(
             &output,
             ProxyOutput::UdpBound {
                 source: udp_source_key(initial_flow),
@@ -205,19 +204,18 @@ pub(super) async fn run_udp_proxy(
             timeouts.udp_idle,
         )
         .await
-        {
-            report_failure(
-                failure_observer.as_ref(),
-                initial_flow,
-                "udp-bind-output",
-                "proxy output queue timed out",
-            );
-            tun_debug(format!(
-                "UDP proxy bound result could not be delivered flow={initial_flow:?} translated={translated}"
-            ));
-            let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
-            return;
-        }
+    {
+        report_failure(
+            failure_observer.as_ref(),
+            initial_flow,
+            "udp-bind-output",
+            "proxy output queue timed out",
+        );
+        tun_debug(format!(
+            "UDP proxy bound result could not be delivered flow={initial_flow:?} translated={translated}"
+        ));
+        let _ = tokio::time::timeout(timeouts.write, datagram.close()).await;
+        return;
     }
     let mut buffer = vec![0u8; udp_buffer_size];
     let mut routes = HashMap::<Endpoint, TunFlowKey>::new();

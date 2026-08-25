@@ -873,7 +873,11 @@ async fn run_protocol_h2_outbound_chain_on_host(kind: ProtocolOutboundKind, bind
 
     let _default_mixed_blocker = TcpListener::bind("127.0.0.1:1080").await.ok();
     let inbound = support::reserve_loopback().await;
-    let root = integration_dir(&format!("service-{}-runtime-h2-outbound", kind.name()));
+    let host_suffix = bind_host.replace([':', '[', ']'], "_");
+    let root = integration_dir(&format!(
+        "service-{}-runtime-h2-outbound-{host_suffix}",
+        kind.name()
+    ));
     std::fs::create_dir_all(&root).unwrap();
     let database = root.join("state.sqlite");
     seed_empty_database(&database).await;
@@ -1004,7 +1008,7 @@ async fn run_protocol_h2_udp_outbound_chain(kind: ProtocolOutboundKind) {
         &response[..length]
     );
 
-    let connections = wait_for_connection(&service.client, &service.base_url).await;
+    let connections = wait_for_named_connection(&service, &kind.inbound_name()).await;
     let item = connections["connections"]
         .as_array()
         .unwrap()
@@ -1219,7 +1223,7 @@ async fn run_protocol_udp_outbound_chain(kind: ProtocolOutboundKind) {
         &response[..length]
     );
 
-    let connections = wait_for_connection(&service.client, &service.base_url).await;
+    let connections = wait_for_named_connection(&service, &kind.inbound_name()).await;
     let item = connections["connections"]
         .as_array()
         .unwrap()
@@ -1238,6 +1242,68 @@ async fn run_protocol_udp_outbound_chain(kind: ProtocolOutboundKind) {
 
     service.shutdown().await;
     server_task.await.unwrap();
+}
+
+async fn wait_for_named_connection(service: &support::ServiceProcess, inbound_name: &str) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..500 {
+        let current = api_json(
+            &service.client,
+            &service.base_url,
+            http::Method::GET,
+            "/api/v2/connections",
+            None,
+        )
+        .await;
+        last = current.clone();
+        if current["connections"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["inboundName"] == inbound_name))
+        {
+            return current;
+        }
+        // The protocol UDP fixtures deliberately close their one-shot
+        // UDP-over-stream session after echoing the packet. The runtime moves
+        // that flow to history, so an active-only wait would race the normal
+        // close path and report a false failure.
+        let history = api_json(
+            &service.client,
+            &service.base_url,
+            http::Method::GET,
+            "/api/v2/connections/history",
+            None,
+        )
+        .await;
+        if let Some(connection) = history["items"].as_array().and_then(|items| {
+            items.iter().find_map(|item| {
+                (item["connection"]["inboundName"] == inbound_name)
+                    .then(|| item["connection"].clone())
+            })
+        }) {
+            return json!({"connections": [connection]});
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let history = api_json(
+        &service.client,
+        &service.base_url,
+        http::Method::GET,
+        "/api/v2/connections/history",
+        None,
+    )
+    .await;
+    let total = api_json(
+        &service.client,
+        &service.base_url,
+        http::Method::GET,
+        "/api/v2/connections/total",
+        None,
+    )
+    .await;
+    panic!(
+        "connection {inbound_name:?} did not become visible; last={last}; history={history}; total={total}; diagnostics={}",
+        service.diagnostics()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4103,6 +4169,21 @@ async fn reverse_http_termination_service_chain(tls_termination: bool, standalon
             "name":"reverse-http-termination-proxy",
             "mode":"proxy",
             "match":{"cidr":"127.0.0.1/32"}
+        })),
+    )
+    .await;
+    // Fresh stores contain the built-in LAN rule (127.0.0.1/8) at the first
+    // priority. This scenario intentionally proxies a loopback target, so
+    // make that precedence explicit instead of relying on insertion order.
+    api_json(
+        &service.client,
+        &service.base_url,
+        http::Method::POST,
+        "/api/v2/route/rules/priority",
+        Some(&json!({
+            "source":{"name":"reverse-http-termination-proxy","index":2},
+            "target":{"name":"LAN","index":1},
+            "operate":"insert_before"
         })),
     )
     .await;

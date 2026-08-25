@@ -13,6 +13,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, Network, Result};
 use yuhaiin_types::{InboundUdpCodec, InboundUdpFlowId, InboundUdpRequest, InboundUdpResponse};
 
+type UdpRecvFuture<'a> = Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>>;
+type UdpSendFuture<'a> = Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Socks5Command {
     Connect,
@@ -30,31 +33,17 @@ pub struct Socks5Request {
 /// Listener setup remains a runtime concern; defining this port here lets
 /// SOCKS5 packet framing and client-peer pinning live with the protocol.
 pub trait UdpTransport: Send + Unpin + 'static {
-    fn recv_from<'a>(
-        &'a mut self,
-        buffer: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>>;
+    fn recv_from<'a>(&'a mut self, buffer: &'a mut [u8]) -> UdpRecvFuture<'a>;
 
-    fn send_to<'a>(
-        &'a mut self,
-        buffer: &'a [u8],
-        peer: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>>;
+    fn send_to<'a>(&'a mut self, buffer: &'a [u8], peer: SocketAddr) -> UdpSendFuture<'a>;
 }
 
 impl UdpTransport for Box<dyn UdpTransport> {
-    fn recv_from<'a>(
-        &'a mut self,
-        buffer: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>> {
+    fn recv_from<'a>(&'a mut self, buffer: &'a mut [u8]) -> UdpRecvFuture<'a> {
         (**self).recv_from(buffer)
     }
 
-    fn send_to<'a>(
-        &'a mut self,
-        buffer: &'a [u8],
-        peer: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+    fn send_to<'a>(&'a mut self, buffer: &'a [u8], peer: SocketAddr) -> UdpSendFuture<'a> {
         (**self).send_to(buffer, peer)
     }
 }
@@ -87,10 +76,7 @@ impl<S> UdpTransport for AeadUdpTransport<S>
 where
     S: UdpTransport,
 {
-    fn recv_from<'a>(
-        &'a mut self,
-        buffer: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a>> {
+    fn recv_from<'a>(&'a mut self, buffer: &'a mut [u8]) -> UdpRecvFuture<'a> {
         Box::pin(async move {
             const AEAD_UDP_MAX_OVERHEAD: usize = 24 + 16;
             let required = buffer
@@ -117,11 +103,7 @@ where
         })
     }
 
-    fn send_to<'a>(
-        &'a mut self,
-        buffer: &'a [u8],
-        peer: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+    fn send_to<'a>(&'a mut self, buffer: &'a [u8], peer: SocketAddr) -> UdpSendFuture<'a> {
         Box::pin(async move {
             let packet = crate::aead::encrypt_packet(buffer, &self.password, self.method)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;

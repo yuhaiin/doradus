@@ -194,7 +194,7 @@ pub extern "system" fn Java_io_github_asutorufa_yuhaiin_rust_RustRuntime_nativeS
             let ipv4 = jni_string(env, ipv4, "TUN IPv4")?;
             let ipv6 = jni_string(env, ipv6, "TUN IPv6")?;
             let web_root = jni_string(env, web_root, "web root")?;
-            native_start(
+            native_start(NativeStartConfig {
                 database,
                 web_root,
                 tun_fd,
@@ -203,13 +203,13 @@ pub extern "system" fn Java_io_github_asutorufa_yuhaiin_rust_RustRuntime_nativeS
                 ipv4_prefix,
                 ipv6,
                 ipv6_prefix,
-            )
+            })
             .map_err(JniError::ParseFailed)
         })
         .resolve::<ThrowRuntimeExAndDefault>()
 }
 
-fn native_start(
+struct NativeStartConfig {
     database: String,
     web_root: String,
     tun_fd: jint,
@@ -218,12 +218,23 @@ fn native_start(
     ipv4_prefix: jint,
     ipv6: String,
     ipv6_prefix: jint,
-) -> std::result::Result<jlong, String> {
-    let tun = injected_tun(tun_fd, mtu, &ipv4, ipv4_prefix, &ipv6, ipv6_prefix)?;
+}
+
+fn native_start(config: NativeStartConfig) -> std::result::Result<jlong, String> {
+    let tun = injected_tun(
+        config.tun_fd,
+        config.mtu,
+        &config.ipv4,
+        config.ipv4_prefix,
+        &config.ipv6,
+        config.ipv6_prefix,
+    )?;
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (stop_tx, stop_rx) = oneshot::channel();
     let api_port = Arc::new(AtomicU16::new(0));
     let thread_api_port = Arc::clone(&api_port);
+    let database = config.database;
+    let web_root = config.web_root;
     let thread = thread::Builder::new()
         .name("yuhaiin-rust-android".to_owned())
         .spawn(move || run_service(database, web_root, tun, thread_api_port, ready_tx, stop_rx))

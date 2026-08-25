@@ -14,6 +14,7 @@ pub use tun_rs::DeviceBuilder;
 /// asks the kernel to create the device. `tun-rs` treats an explicit
 /// `utunN` name as a fixed control-unit request, so passing a configured
 /// `utun0` through unchanged fails when macOS already owns that unit.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn choose_macos_tun_name<'a>(
     configured_name: Option<&str>,
     existing_names: impl IntoIterator<Item = &'a str>,
@@ -56,6 +57,7 @@ pub(crate) fn resolve_macos_tun_name(configured_name: Option<&str>) -> String {
     choose_macos_tun_name(configured_name, existing_names.iter().map(String::as_str))
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn next_macos_tun_name(name: &str) -> String {
     let index = name
         .strip_prefix("utun")

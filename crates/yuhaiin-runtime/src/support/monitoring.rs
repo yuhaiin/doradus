@@ -171,10 +171,10 @@ impl AsyncDatagram for ObservedDatagram {
                 ));
             }
             let result = self.inner.send_to(payload, target).await;
-            if let Ok(bytes) = result {
-                if bytes != 0 {
-                    observer.bytes(flow, FlowDirection::Upload, bytes);
-                }
+            if let Ok(bytes) = result
+                && bytes != 0
+            {
+                observer.bytes(flow, FlowDirection::Upload, bytes);
             }
             result
         })
@@ -191,10 +191,10 @@ impl AsyncDatagram for ObservedDatagram {
                 ));
             }
             let result = self.inner.recv_from(buffer).await;
-            if let Ok((bytes, _)) = result {
-                if bytes != 0 {
-                    observer.bytes(flow, FlowDirection::Download, bytes);
-                }
+            if let Ok((bytes, _)) = result
+                && bytes != 0
+            {
+                observer.bytes(flow, FlowDirection::Download, bytes);
             }
             result
         })

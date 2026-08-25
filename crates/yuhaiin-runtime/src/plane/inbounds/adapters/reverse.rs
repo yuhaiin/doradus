@@ -47,10 +47,12 @@ pub(crate) async fn handle_http(
     reverse_http::handle(
         stream,
         peer,
-        forward_handler.config.target.clone(),
-        &forward_handler.config.path,
-        &forward_handler.config.authority,
-        forward_handler.config.https,
+        reverse_http::ReverseHttpOptions {
+            target: forward_handler.config.target.clone(),
+            path: &forward_handler.config.path,
+            authority: &forward_handler.config.authority,
+            https: forward_handler.config.https,
+        },
         forward_handler.inbound.as_ref(),
         &forward_handler,
     )

@@ -180,7 +180,10 @@ impl TunRuntime {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
-    pub fn open(mut config: TunConfig) -> io::Result<Self> {
+    pub fn open(config: TunConfig) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        let mut config = config;
+
         config
             .validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
