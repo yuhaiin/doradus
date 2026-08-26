@@ -21,9 +21,8 @@ fn flow() -> (TunFlow, FlowContext) {
 }
 
 fn monitor_test_database_path() -> PathBuf {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
+    let cache = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .expect("a cache directory is required for the monitor test");
     let directory = cache.join("yuhaiin-rust-monitor-tests");
     fs::create_dir_all(&directory).unwrap();

@@ -5,7 +5,7 @@ set -euo pipefail
 # test creates two local userspace peers, so it needs no external network and
 # does not touch a host WireGuard device.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 integration_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/wireguard}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"

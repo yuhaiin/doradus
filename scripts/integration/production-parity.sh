@@ -3,11 +3,11 @@ set -euo pipefail
 
 # Run the existing Go/Rust management parity smoke against several stopped
 # production-shaped databases. The source files are never modified; each
-# invocation gets an isolated cache-backed copy under ~/.cache.
+# invocation gets an isolated cache-backed copy under the repository-local cache.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 go_root="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 scenario_root="${YUHAIIN_PRODUCTION_PARITY_DIR:-${cache_root}/production-parity}"
 port_base="${YUHAIIN_PRODUCTION_PORT_BASE:-55250}"
 

@@ -203,7 +203,7 @@ jobs:
           set -euo pipefail
           artifact_dir="${GITHUB_WORKSPACE}/native-service-artifacts"
           mkdir -p "${artifact_dir}"
-          source_dir="${HOME}/.cache/yuhaiin-rust/integration/native-service-macos"
+          source_dir="${GITHUB_WORKSPACE}/.cache/yuhaiin-rust/integration/native-service-macos"
           if [[ -d "${source_dir}" ]]; then
             cp -R "${source_dir}/." "${artifact_dir}/"
           fi
@@ -214,7 +214,7 @@ jobs:
         run: |
           $artifactDir = Join-Path $env:GITHUB_WORKSPACE "native-service-artifacts"
           New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
-          $sourceDir = Join-Path $env:USERPROFILE ".cache\yuhaiin-rust\integration\native-service-windows"
+          $sourceDir = Join-Path $env:GITHUB_WORKSPACE ".cache\yuhaiin-rust\integration\native-service-windows"
           if (Test-Path -LiteralPath $sourceDir) {
               Copy-Item -LiteralPath $sourceDir -Destination $artifactDir -Recurse -Force
           }

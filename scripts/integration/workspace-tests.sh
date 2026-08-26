@@ -7,7 +7,7 @@ set -euo pipefail
 # complete workspace-test command.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/workspace-tests}"
 cargo_home="${YUHAIIN_CARGO_HOME:-${cache_root}/cargo-home}"
@@ -15,7 +15,7 @@ image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 build_image="${YUHAIIN_BUILD_IMAGE:-docker.io/library/rust:latest}"
 
 command -v podman >/dev/null
-mkdir -p "${scenario_dir}" "${cargo_home}"
+mkdir -p "${target_dir}" "${scenario_dir}" "${cargo_home}"
 
 echo "[workspace-tests] compiling test harnesses in Podman"
 podman run --rm --network=host \
@@ -88,7 +88,7 @@ run_in_podman() {
     -e YUHAIIN_RUNTIME_BIN=/usr/local/bin/yuhaiin \
     -e HOME=/state/home \
     -e TMPDIR=/state/cache/tmp \
-    -e XDG_CACHE_HOME=/state/cache \
+    -e YUHAIIN_CACHE_DIR=/state/cache \
     -e YUHAIIN_CACHE_DIR=/state/cache/yuhaiin-rust \
     -e YUHAIIN_INTEGRATION_DIR=/state/integration \
     -e YUHAIIN_RESET_INTEGRATION_STATE=1 \
@@ -96,7 +96,7 @@ run_in_podman() {
     "${image}" \
     -ec '
       set -eu
-      mkdir -p "$HOME" "$TMPDIR" "$XDG_CACHE_HOME" "$YUHAIIN_CACHE_DIR"
+      mkdir -p "$HOME" "$TMPDIR" "$YUHAIIN_CACHE_DIR" "$YUHAIIN_CACHE_DIR"
       for test_binary do
         echo "[workspace-tests] ${test_binary}"
         case "${test_binary##*/}" in

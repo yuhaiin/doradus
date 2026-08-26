@@ -135,9 +135,8 @@ pub(super) fn update_staging_dir() -> PathBuf {
     if let Some(path) = env::var_os("YUHAIIN_UPDATE_DIR") {
         return PathBuf::from(path);
     }
-    let cache = env::var_os("XDG_CACHE_HOME")
+    let cache = env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from("."));
     cache.join("yuhaiin-rust/updates")
 }

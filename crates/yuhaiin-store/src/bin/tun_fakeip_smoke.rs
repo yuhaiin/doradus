@@ -256,10 +256,7 @@ fn database_path() -> io::Result<PathBuf> {
     if let Some(path) = env::var_os("YUHAIIN_TUN_FAKEIP_DB") {
         return Ok(PathBuf::from(path));
     }
-    let home = env::var_os("HOME")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-    Ok(PathBuf::from(home)
-        .join(".cache/yuhaiin-rust-check")
+    Ok(PathBuf::from(".cache/yuhaiin-rust-check")
         .join(format!("tun-fakeip-smoke-{}.sqlite", std::process::id())))
 }
 

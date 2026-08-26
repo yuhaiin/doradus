@@ -92,9 +92,8 @@ pub fn backup_download_destination() -> Result<PathBuf, ApiError> {
 }
 
 pub fn backup_directory() -> Result<PathBuf, ApiError> {
-    let root = std::env::var_os("XDG_CACHE_HOME")
+    let root = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from(".cache"));
     let directory = root.join("yuhaiin-rust").join("backups");
     std::fs::create_dir_all(&directory)

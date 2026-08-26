@@ -78,9 +78,8 @@ async fn run_go_websocket_http2_client(tls: bool) {
         .unwrap_or_else(|| PathBuf::from("/home/asutorufa/Documents/Programming/yuhaiin"));
     let server = server_address.to_string();
     let target = target_address.to_string();
-    let go_tmp = std::env::var_os("XDG_CACHE_HOME")
+    let go_tmp = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from(".cache"))
         .join("yuhaiin-rust/go-tmp");
     std::fs::create_dir_all(&go_tmp).unwrap();

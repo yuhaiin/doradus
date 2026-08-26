@@ -5,7 +5,7 @@ set -euo pipefail
 # still discover the resulting binary from the shared cache, but no host cargo
 # or rustc process is involved.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 state_dir="${YUHAIIN_PODMAN_BUILD_STATE:-${cache_root}/integration/podman-build}"
 cargo_home="${YUHAIIN_CARGO_HOME:-${cache_root}/cargo-home}"

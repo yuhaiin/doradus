@@ -9,7 +9,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 go_root="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
 source_db="${YUHAIIN_SOURCE_DB:?set YUHAIIN_SOURCE_DB to a stopped, consistent Go state.db snapshot}"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/go-api-parity}"
 go_cache_root="${YUHAIIN_GO_CACHE_DIR:-${cache_root}/go-cache}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
@@ -218,7 +218,7 @@ normalize() {
       ;;
     route.lists.get)
       # Go refreshes remote lists into its Pebble cache during startup. Rust
-      # intentionally consumes only its persistent ~/.cache route-list cache,
+      # intentionally consumes only its persistent repository-local route-list cache,
       # so remote item counts/errors/previews are environment-dependent here;
       # compare the stable control-plane projection and keep local metrics
       # fully strict.

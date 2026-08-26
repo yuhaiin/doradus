@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 scenario_dir="${YUHAIIN_TUN_DISTRO_DIR:-${cache_root}/integration/tun-distro}"
 target_dir="${YUHAIIN_TUN_DISTRO_TARGET_DIR:-${cache_root}/tun-distro-target}"
 # Keep the distro-specific knob for callers that need separate scenarios, but

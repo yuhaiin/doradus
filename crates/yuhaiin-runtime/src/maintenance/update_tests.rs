@@ -6,9 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 fn update_test_dir(name: &str) -> PathBuf {
-    let cache = env::var_os("XDG_CACHE_HOME")
+    let cache = env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from("."));
     cache
         .join("yuhaiin-rust/update-tests")

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
-# Helpers for generated test artifacts under ~/.cache/yuhaiin-rust. Callers
+# Helpers for generated test artifacts under the repository-local
+# .cache/yuhaiin-rust directory. Callers
 # must pass the exact scenario directory they own; this helper never searches
 # or removes anything outside that directory.
 

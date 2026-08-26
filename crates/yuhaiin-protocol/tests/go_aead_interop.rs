@@ -18,9 +18,9 @@ use yuhaiin_protocol::aead::{self, AeadProxy, CryptoMethod};
 use yuhaiin_protocol::proxy::FixedAsyncProxy;
 
 fn go_cache() -> std::path::PathBuf {
-    std::env::var_os("XDG_CACHE_HOME")
+    std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/home/asutorufa/.cache"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".cache"))
         .join("yuhaiin-rust/go-tmp")
 }
 

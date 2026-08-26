@@ -11,7 +11,7 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $cacheRoot = if ($env:YUHAIIN_CACHE_DIR) {
     $env:YUHAIIN_CACHE_DIR
 } else {
-    Join-Path $env:USERPROFILE ".cache\yuhaiin-rust"
+    Join-Path $repoRoot ".cache\yuhaiin-rust"
 }
 $scenarioRoot = if ($env:YUHAIIN_NATIVE_SERVICE_WINDOWS_DIR) {
     $env:YUHAIIN_NATIVE_SERVICE_WINDOWS_DIR

@@ -2,8 +2,8 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_dir="${YUHAIIN_TUN_MTU_DIR:-${HOME}/.cache/yuhaiin-rust/integration/tun-mtu}"
-target_dir="${CARGO_TARGET_DIR:-${HOME}/.cache/yuhaiin-rust/cargo-target}"
+cache_dir="${YUHAIIN_TUN_MTU_DIR:-${repo_dir}/.cache/yuhaiin-rust/integration/tun-mtu}"
+target_dir="${CARGO_TARGET_DIR:-${repo_dir}/.cache/yuhaiin-rust/cargo-target}"
 binary="${YUHAIIN_TUN_BINARY:-${target_dir}/debug/tun-service-smoke}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 tun_device_args=()

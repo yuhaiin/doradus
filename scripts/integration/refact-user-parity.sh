@@ -5,7 +5,7 @@ set -euo pipefail
 # because Go main does not currently carry these handlers.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 source_db="${YUHAIIN_SOURCE_DB:?set YUHAIIN_SOURCE_DB to a stopped Go state.db snapshot}"
 go_root="${YUHAIIN_GO_REFAC_USER_DIR:-${cache_root}/go-refact-user}"

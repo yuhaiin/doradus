@@ -58,9 +58,9 @@ async fn run_go_trojan_udp_client(address: std::net::SocketAddr) {
         .unwrap_or_else(|| PathBuf::from("/home/asutorufa/Documents/Programming/yuhaiin"));
     let helper =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/interop/trojan_udp_go_client.go");
-    let cache_root = std::env::var_os("XDG_CACHE_HOME")
+    let cache_root = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/home/asutorufa/.cache"))
+        .unwrap_or_else(|| PathBuf::from(".cache"))
         .join("yuhaiin-rust/go-tmp");
     std::fs::create_dir_all(&cache_root).unwrap();
     let output = tokio::task::spawn_blocking(move || {

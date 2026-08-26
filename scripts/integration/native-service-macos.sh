@@ -10,7 +10,7 @@ if [[ "${CI:-}" != "true" && "${YUHAIIN_NATIVE_SERVICE_ALLOW_GLOBAL:-}" != "1" ]
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 scenario_root="${YUHAIIN_NATIVE_SERVICE_MACOS_DIR:-${cache_root}/integration/native-service-macos}"
 run_id="$(date +%Y%m%d%H%M%S)-$$"
 run_dir="${scenario_root}/${run_id}"

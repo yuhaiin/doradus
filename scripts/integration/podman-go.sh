@@ -5,7 +5,7 @@ set -euo pipefail
 # and build caches are reusable, while scratch files remain under the project
 # cache rather than the host /tmp.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 go_root="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
 cache_dir="${YUHAIIN_GO_CACHE_DIR:-${cache_root}/go-cache}"
 state_dir="${YUHAIIN_PODMAN_GO_STATE:-${cache_root}/integration/podman-go-build}"

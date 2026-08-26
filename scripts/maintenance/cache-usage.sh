@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Keep all build and integration state under the user's cache directory. This
+# Keep all build and integration state under the repository-local cache directory. This
 # command is intentionally read-only: removal remains an explicit
 # cache-prune operation with its own allowlists.
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 warn_gib="${YUHAIIN_CACHE_WARN_GIB:-20}"
 
 if [[ ! "${warn_gib}" =~ ^[0-9]+$ ]] || [[ "${warn_gib}" -eq 0 ]]; then

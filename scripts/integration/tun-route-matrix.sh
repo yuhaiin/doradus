@@ -8,8 +8,8 @@ set -euo pipefail
 # TUN owner exits or is force-stopped.
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_dir="${YUHAIIN_TUN_ROUTE_DIR:-${HOME}/.cache/yuhaiin-rust/integration/tun-route-matrix}"
-target_dir="${CARGO_TARGET_DIR:-${HOME}/.cache/yuhaiin-rust/cargo-target}"
+cache_dir="${YUHAIIN_TUN_ROUTE_DIR:-${repo_dir}/.cache/yuhaiin-rust/integration/tun-route-matrix}"
+target_dir="${CARGO_TARGET_DIR:-${repo_dir}/.cache/yuhaiin-rust/cargo-target}"
 binary="${YUHAIIN_TUN_BINARY:-${target_dir}/debug/tun-smoke}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
 name="yuhaiin-tun-route-matrix-$$"

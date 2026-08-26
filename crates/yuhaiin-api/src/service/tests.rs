@@ -7,7 +7,6 @@ use tokio::net::TcpStream;
 fn test_database() -> PathBuf {
     let root = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("yuhaiin-rust/service-tests");
     let nonce = SystemTime::now()

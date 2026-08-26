@@ -8,9 +8,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn cache_directory() -> PathBuf {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
+    let cache = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .expect("a cache directory is required for the process test");
     let directory = cache.join("yuhaiin-rust-check");
     fs::create_dir_all(&directory).unwrap();

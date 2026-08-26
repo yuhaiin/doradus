@@ -26,9 +26,9 @@ async fn rust_vless_client_round_trips_against_go_server() {
         });
     let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/interop/vless_go_server.go");
-    let cache_root = std::env::var_os("XDG_CACHE_HOME")
+    let cache_root = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/home/asutorufa/.cache"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".cache"))
         .join("yuhaiin-rust/go-tmp");
     std::fs::create_dir_all(&cache_root).unwrap();
     let ready = cache_root.join(format!("vless-ready-{}", std::process::id()));
@@ -142,9 +142,9 @@ async fn run_go_vless_client(address: std::net::SocketAddr, transport: Option<&s
         });
     let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/interop/vless_go_client.go");
-    let cache_root = std::env::var_os("XDG_CACHE_HOME")
+    let cache_root = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/home/asutorufa/.cache"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".cache"))
         .join("yuhaiin-rust/go-tmp");
     std::fs::create_dir_all(&cache_root).unwrap();
     let listen = address.to_string();

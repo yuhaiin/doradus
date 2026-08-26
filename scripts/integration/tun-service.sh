@@ -2,8 +2,8 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_dir="${YUHAIIN_INTEGRATION_DIR:-${HOME}/.cache/yuhaiin-rust/integration/tun-service}"
-target_dir="${CARGO_TARGET_DIR:-${HOME}/.cache/yuhaiin-rust/cargo-target}"
+cache_dir="${YUHAIIN_INTEGRATION_DIR:-${repo_dir}/.cache/yuhaiin-rust/integration/tun-service}"
+target_dir="${CARGO_TARGET_DIR:-${repo_dir}/.cache/yuhaiin-rust/cargo-target}"
 binary="${YUHAIIN_TUN_BINARY:-${target_dir}/debug/tun-service-smoke}"
 database_dir="${cache_dir}/state"
 log_path="${cache_dir}/podman.log"

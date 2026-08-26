@@ -6,7 +6,7 @@ set -euo pipefail
 # The Rust test itself owns the service process and persists its fixture under
 # the normal cache root; this wrapper only supplies a stable Podman entrypoint.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 state_dir="${YUHAIIN_HTTP_INBOUND_HTTPS_DIR:-${cache_root}/integration/http-inbound-https}"
 

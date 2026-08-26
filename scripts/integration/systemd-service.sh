@@ -6,7 +6,7 @@ set -euo pipefail
 # unit, binary install path, database, and backups stay inside the container.
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_dir}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 scenario_dir="${YUHAIIN_SYSTEMD_DIR:-${cache_root}/integration/systemd-service}"
 image="${YUHAIIN_SYSTEMD_IMAGE:-quay.io/fedora/fedora:latest}"

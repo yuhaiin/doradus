@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 go_checkout="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 scenario_dir="${YUHAIIN_GO_INTEROP_DIR:-${cache_root}/integration/go-protocol-interop}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
@@ -77,7 +77,7 @@ for test_name in "${tests[@]}"; do
     -e GOMODCACHE=/go-mod \
     -e GOCACHE=/state/go-build \
     -e GOTMPDIR=/state/go-tmp \
-    -e XDG_CACHE_HOME=/state/cache \
+    -e YUHAIIN_CACHE_DIR=/state/cache \
     -e HOME=/state/home \
     -e YUHAIIN_GO_ROOT="${go_checkout}" \
     --entrypoint "/target/debug/deps/${harness}" \
@@ -122,7 +122,7 @@ for test_name in "${protocol_tests[@]}"; do
     -e GOMODCACHE=/go-mod \
     -e GOCACHE=/state/go-build \
     -e GOTMPDIR=/state/go-tmp \
-    -e XDG_CACHE_HOME=/state/cache \
+    -e YUHAIIN_CACHE_DIR=/state/cache \
     -e HOME=/state/home \
     -e YUHAIIN_GO_ROOT="${go_checkout}" \
     --entrypoint "/target/debug/deps/${harness}" \

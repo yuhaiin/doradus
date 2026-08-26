@@ -3,9 +3,9 @@ set -euo pipefail
 
 # Exercise the real S3-compatible request path against MinIO.  The runtime,
 # MinIO, the bucket helper and the binary build all run in disposable Podman
-# containers. State and logs stay below ~/.cache.
+# containers. State and logs stay below the repository-local cache directory.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/s3-minio}"
 image="${YUHAIIN_MINIO_IMAGE:-quay.io/minio/minio:latest}"
@@ -88,7 +88,7 @@ podman run -d \
   -v "${runtime_binary}:/usr/local/bin/yuhaiin:ro" \
   -v "${state_dir}:/state:Z" \
   -e HOME=/state/home \
-  -e XDG_CACHE_HOME=/state/cache \
+  -e YUHAIIN_CACHE_DIR=/state/cache \
   -e YUHAIIN_DB=/state/state.sqlite \
   -e YUHAIIN_HTTP=0.0.0.0:50051 \
   --entrypoint /usr/local/bin/yuhaiin \

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 scenario_dir="${YUHAIIN_RELEASE_LINUX_DIR:-${cache_root}/integration/release-linux-cross}"
 target_dir="${YUHAIIN_RELEASE_LINUX_TARGET_DIR:-${cache_root}/release-linux-target}"
 cargo_home="${YUHAIIN_RELEASE_LINUX_CARGO_HOME:-${cache_root}/release-linux-cargo-home}"

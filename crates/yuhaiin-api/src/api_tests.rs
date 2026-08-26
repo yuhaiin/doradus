@@ -378,9 +378,8 @@ async fn state() -> ApiState {
 
 #[tokio::test]
 async fn external_web_root_serves_assets_and_react_fallback_without_hiding_api() {
-    let root = std::env::var_os("XDG_CACHE_HOME")
+    let root = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from(".cache"))
         .join("yuhaiin-rust")
         .join(format!("api-web-{}", std::process::id()));
@@ -1375,9 +1374,8 @@ async fn route_list_refresh_downloads_geoip_through_runtime_and_persists_metadat
             .unwrap();
     });
 
-    let unique_path = std::env::var_os("XDG_CACHE_HOME")
+    let unique_path = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from(".cache"))
         .join("yuhaiin-rust")
         .join("geo-tests")

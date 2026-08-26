@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_dir}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 cargo_home="${YUHAIIN_CARGO_HOME:-${cache_root}/cargo-home}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/tun-api-process}"
@@ -69,7 +69,7 @@ common_args=(
   -e YUHAIIN_INTEGRATION_DIR=/state
   -e YUHAIIN_RESET_INTEGRATION_STATE=1
   -e HOME=/state/home
-  -e XDG_CACHE_HOME=/state/cache
+  -e YUHAIIN_CACHE_DIR=/state/cache
   --entrypoint "${TUN_CONTAINER_ENTRYPOINT}"
   "${image}"
 )

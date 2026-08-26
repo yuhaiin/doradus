@@ -49,9 +49,8 @@ impl GeoDownloadTransport for RouteGeoDownloadTransport {
 }
 
 pub fn geo_cache_path() -> PathBuf {
-    let root = std::env::var_os("XDG_CACHE_HOME")
+    let root = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from(".cache"));
     root.join("yuhaiin-rust").join("geo").join("Country.mmdb")
 }

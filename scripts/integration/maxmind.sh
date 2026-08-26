@@ -6,7 +6,7 @@ set -euo pipefail
 # Podman. The source URL is public and the checksum prevents a partial
 # or replaced download from becoming a test fixture.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_dir}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/maxmind}"
 fixture_dir="${YUHAIIN_MAXMIND_FIXTURE_DIR:-${cache_root}/fixtures}"

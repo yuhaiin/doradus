@@ -9,12 +9,7 @@ use yuhaiin_store::ConfigStore;
 fn cache_root() -> PathBuf {
     std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".cache/yuhaiin-rust"))
-        })
-        .expect("a cache directory is required for the legacy runtime test")
+        .unwrap_or_else(|| PathBuf::from(".cache/yuhaiin-rust"))
 }
 
 fn remove_database_artifacts(path: &std::path::Path) {

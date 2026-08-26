@@ -294,9 +294,8 @@ mod tests {
 
     #[test]
     fn service_backup_restores_previous_files_and_missing_entries() {
-        let root = std::env::var_os("XDG_CACHE_HOME")
+        let root = std::env::var_os("YUHAIIN_CACHE_DIR")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
             .unwrap_or_else(|| PathBuf::from(".cache"))
             .join("yuhaiin-rust/service-unit-tests")
             .join(format!(

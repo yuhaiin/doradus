@@ -25,13 +25,13 @@ The current scenarios cover:
   traffic/history, and reads the same node, moved inbound, totals, and history
   after a process restart. Run the reusable Podman entry point with
   `make api-reload-flow-smoke`; logs are kept under
-  `~/.cache/yuhaiin-rust/integration/api-reload-flow`.
+  `.cache/yuhaiin-rust/integration/api-reload-flow`.
 - `tun_api_process.rs` starts the real foreground binary, writes a user TUN
   inbound through `/api/v2/inbounds/{id}`, and observes the actual interface
   in `/proc/net/dev` while toggling disabled/enabled across reloads. It is
   ignored in the normal workspace run because it needs `/dev/net/tun` and
   `CAP_NET_ADMIN`; run `make tun-api-process-smoke` so the process and test
-  execute in the disposable Podman namespace under `~/.cache`.
+  execute in the disposable Podman namespace under `.cache`.
 - HTTP inbound → domain route rule → fixed + HTTP CONNECT outbound, including
   live connection metadata, traffic counters, route testing, and node latency.
 - HTTP inbound + mixed UDP inbound → TLS + HTTP/2 + Yuubinsya UDP-over-TCP
@@ -80,7 +80,7 @@ The current scenarios cover:
   inbound with a SQLite-selected `fixed -> TLS -> HTTP/2 -> Yuubinsya` TCP
   outbound and a loopback echo target. It deliberately half-closes the client
   immediately after writing, covering bidirectional HTTP/2 half-close behavior.
-  State and logs remain under `~/.cache/yuhaiin-rust/integration/tun-chain-service`;
+  State and logs remain under `.cache/yuhaiin-rust/integration/tun-chain-service`;
   run it with `make tun-chain-service-smoke`.
 - `scripts/integration/transparent-service.sh` runs an isolated privileged
   Linux namespace with a host `iptables` helper, redirects a non-root TCP
@@ -95,25 +95,25 @@ The current scenarios cover:
   source-address tests inside a host-network Podman container. It confirms
   that the configured local IPv4 address reaches the DNS server for both
   transports; build and Podman logs are kept under
-  `~/.cache/yuhaiin-rust/integration/dns-source-bind`.
+  `.cache/yuhaiin-rust/integration/dns-source-bind`.
 - `scripts/integration/doh-source-bind.sh` runs a real ring-backed DoH/HTTP2 and
   DoT/TLS resolver pair in a host-network Podman container. It asserts that
   both TLS transports reach their server from the configured local IPv4
-  address; logs are kept under `~/.cache/yuhaiin-rust/integration/doh-source-bind`.
+  address; logs are kept under `.cache/yuhaiin-rust/integration/doh-source-bind`.
 - `scripts/integration/socks5-udp-associate.sh` runs the real SOCKS5 control
   handshake, UDP ASSOCIATE, UDP echo, shared direct outbound and monitor
   assertion in a host-network Podman container. It keeps logs under
-  `~/.cache/yuhaiin-rust/integration/socks5-udp-associate`.
+  `.cache/yuhaiin-rust/integration/socks5-udp-associate`.
 - `scripts/integration/node-latency-dns.sh` saves a direct node through the
   API-layer fixture, invokes `node_latency` with a real UDP DNS server, and
   checks the selected proxy datagram path and DNS transaction in Podman. Logs
-  are kept under `~/.cache/yuhaiin-rust/integration/node-latency-dns`.
+  are kept under `.cache/yuhaiin-rust/integration/node-latency-dns`.
 - `stats_concurrency.rs` starts the real runtime process, keeps an HTTP inbound
   flow active while concurrent readers query connections, totals, traffic,
   telemetry, history, and failed-history, then restarts the same SQLite state
   and verifies persisted traffic/history remain readable. The reusable Podman
   entry point is `scripts/integration/stats-concurrency.sh`; logs are kept
-  under `~/.cache/yuhaiin-rust/integration/stats-concurrency`.
+  under `.cache/yuhaiin-rust/integration/stats-concurrency`.
 - `startup_logs.rs` starts the real runtime executable without
   `YUHAIIN_QUIET`, verifies that database/API/supervisor startup progress is
   visible on stderr, and then checks a clean SIGTERM shutdown. This protects
@@ -122,7 +122,7 @@ The current scenarios cover:
 - `make go-protocol-interop-smoke` compiles the ignored cross-language
   harnesses on the host and runs them in Podman: Go Yuubinsya, WebSocket→H2,
   H2 v1, VLESS, VMess, and Trojan. The Go checkout and all scratch state are
-  mounted from `~/.cache/yuhaiin-rust`; the normal workspace test run does not
+  mounted from `.cache/yuhaiin-rust`; the normal workspace test run does not
   start external Go processes.
 - `make go-termination-parity-smoke` starts the Go and Rust services with the
   same semantic API configuration and sends raw TLS `reverse_http` traffic
@@ -132,7 +132,7 @@ The current scenarios cover:
   `502` behavior in both services for 6/6 cases. The Go test moves its proxy rule before the built-in
   LAN rule; the Rust test uses the equivalent route priority. Build/runtime logs
   remain under
-  `~/.cache/yuhaiin-rust/integration/go-termination-parity`.
+  `.cache/yuhaiin-rust/integration/go-termination-parity`.
 - `make service-chain-smoke` includes a process-level 3-case protocol matrix:
   the API writes a Go-shaped fixed+VLESS/VMess/Trojan node, an HTTP inbound
   routes `example.test` through it, and the Podman test checks payload echo,
@@ -149,18 +149,18 @@ The current scenarios cover:
   process contract in Podman, including CRUD, reload, selection, connections,
   statistics, SSE, and representative error responses. It uses host networking
   so the subprocess and loopback fixtures share one namespace; build/runtime
-  logs are kept under `~/.cache/yuhaiin-rust/integration/api-contract`.
+  logs are kept under `.cache/yuhaiin-rust/integration/api-contract`.
 - `scripts/integration/go-rust-stats.sh` starts Go and Rust in separate Podman
   network namespaces against one shared SQLite file. Both mixed inbounds write
   traffic while both management APIs read connections/statistics concurrently;
   build and process logs are kept under
-  `~/.cache/yuhaiin-rust/integration/go-rust-stats`.
+  `.cache/yuhaiin-rust/integration/go-rust-stats`.
 - `scripts/integration/production-parity.sh` discovers stopped SQLite snapshots
   in the sibling Go checkout (or uses `YUHAIIN_SOURCE_DB`), then runs the full
   Go/Rust management parity smoke for each one. Copies and logs live under
-  `~/.cache/yuhaiin-rust/production-parity`.
+  `.cache/yuhaiin-rust/production-parity`.
 - `make maxmind-smoke` downloads the selected `Country-without-asn.mmdb` into
-  `~/.cache/yuhaiin-rust/fixtures` with a pinned SHA-256, then runs the ignored
+  `.cache/yuhaiin-rust/fixtures` with a pinned SHA-256, then runs the ignored
   real-database IPv4/IPv4-mapped-IPv6 query test in Podman.
 - standalone Go HTTP/2 transport wire compatibility is covered separately in
   `crates/yuhaiin-chain/tests/standalone_http2.rs`: fixed endpoint resolution,
@@ -176,7 +176,7 @@ the release runtime, configures the data plane through the API, sends a known
 loopback payload, and samples the runtime's Linux `/proc` RSS and CPU ticks.
 `scripts/benchmark/throughput.sh` runs both the short HTTP CONNECT path and the
 full TLS → HTTP/2 → Yuubinsya path, printing one `BENCHMARK {...}` JSON line per
-scenario. All build/runtime output is stored below `~/.cache`.
+scenario. All build/runtime output is stored below `.cache`.
 
 The current H2 relay deliberately uses h2's own flow-control queue after a
 reservation-based adapter exposed a deadlock at partial window updates. The
@@ -211,7 +211,7 @@ loopback payload. It recorded the following same-host regression baseline:
 | BoringTun userspace packet | 542.52 MiB/s | 3,732 KiB | 11 | 190 |
 
 The raw `BENCHMARK {...}` lines are kept in
-`~/.cache/yuhaiin-rust/benchmarks/{http-throughput,tun-throughput,wireguard}/podman.log`.
+`.cache/yuhaiin-rust/benchmarks/{http-throughput,tun-throughput,wireguard}/podman.log`.
 These figures are intended for regression tracking on the same host with the
 same profile, payload, namespace, and fixture. They are not a cross-machine,
 public-network, or WARP performance guarantee.
@@ -226,11 +226,11 @@ make service-chain-smoke
 ```
 
 By default each test stores its SQLite state below
-`~/.cache/yuhaiin-rust/integration/<scenario>/<pid>`. To retain a reusable
+`.cache/yuhaiin-rust/integration/<scenario>/<pid>`. To retain a reusable
 scenario directory for inspection or a Podman job, set an explicit cache path:
 
 ```bash
-YUHAIIN_INTEGRATION_DIR="$HOME/.cache/yuhaiin-rust/integration-reusable" \
+YUHAIIN_INTEGRATION_DIR=".cache/yuhaiin-rust/integration-reusable" \
   cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
 ```
 
@@ -255,4 +255,4 @@ YUHAIIN_TUN_BENCH_BYTES=$((16 * 1024 * 1024)) make benchmark-tun-throughput
 
 The fixtures only use loopback sockets. A container runner should use
 `--network=host` when it needs the same loopback behavior and mount the chosen
-cache directory under `~/.cache`; no test state is written to `/tmp`.
+cache directory under `.cache`; no test state is written to `/tmp`.

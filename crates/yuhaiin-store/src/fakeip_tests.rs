@@ -24,9 +24,8 @@ fn v6_config() -> FakeIpV6Config {
 }
 
 fn test_database_path() -> PathBuf {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
+    let cache = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .expect("a cache directory is required for the persistence test");
     let directory = cache.join("yuhaiin-rust-check");
     std::fs::create_dir_all(&directory).unwrap();
@@ -141,9 +140,8 @@ fn reopen_ignores_duplicate_address_without_a_reverse_ghost() {
 #[test]
 fn release_is_persisted_before_reopen_and_does_not_leave_reverse_mapping() {
     let path = {
-        let cache = std::env::var_os("XDG_CACHE_HOME")
+        let cache = std::env::var_os("YUHAIIN_CACHE_DIR")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
             .unwrap()
             .join("yuhaiin-rust-check");
         std::fs::create_dir_all(&cache).unwrap();
@@ -1155,9 +1153,8 @@ fn overlapping_prefixes_quarantine_an_existing_conflicting_row() {
 
 #[test]
 fn ipv6_pool_reopens_with_mapping_and_cursor() {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
+    let cache = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .expect("a cache directory is required for the persistence test")
         .join("yuhaiin-rust-check");
     std::fs::create_dir_all(&cache).unwrap();

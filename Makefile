@@ -2,7 +2,7 @@ SHELL := /bin/bash
 
 CARGO ?= cargo
 RUSTC ?= rustc
-CACHE_ROOT ?= $(HOME)/.cache/yuhaiin-rust
+CACHE_ROOT ?= $(CURDIR)/.cache/yuhaiin-rust
 # Empty means Cargo's native repository-local `target/` directory. Set this
 # explicitly when a separate target directory is desired.
 CARGO_TARGET_DIR ?=

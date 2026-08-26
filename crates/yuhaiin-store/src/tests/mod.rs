@@ -16,12 +16,9 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 fn test_database_path() -> std::path::PathBuf {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
+    let cache = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
-        })
-        .expect("a cache directory is required for the persistence test");
+        .unwrap_or_else(|| std::path::PathBuf::from(".cache"));
     let directory = cache.join("yuhaiin-rust-check");
     fs::create_dir_all(&directory).unwrap();
     let nonce = SystemTime::now()

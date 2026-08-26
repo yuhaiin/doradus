@@ -7,9 +7,9 @@ This document describes the minimum safe procedure for replacing the existing Go
 First verify the Rust binary, frontend directory, and state directory:
 
 ```bash
-install -m 0755 target/release/yuhaiin "$HOME/.cache/yuhaiin-rust/release/yuhaiin.new"
-test -x "$HOME/.cache/yuhaiin-rust/release/yuhaiin.new"
-test -f "$HOME/.cache/yuhaiin-rust/release/yuhaiin.new"
+install -m 0755 target/release/yuhaiin ".cache/yuhaiin-rust/release/yuhaiin.new"
+test -x ".cache/yuhaiin-rust/release/yuhaiin.new"
+test -f ".cache/yuhaiin-rust/release/yuhaiin.new"
 ```
 
 The default Linux build continues to use the host toolchain. Use the Makefile when a static musl artifact is required. `MUSL=1` uses the Rust toolchain's `rust-lld` by default, avoiding PIE binaries produced by the local `musl-gcc` that may fail to start with some musl loader versions:
@@ -54,7 +54,7 @@ Stop the service before taking a backup. Do not copy a changing `state.db` while
 
 ```bash
 service_state="$HOME/.local/share/yuhaiin"
-backup_dir="$HOME/.cache/yuhaiin-rust/backups"
+backup_dir=".cache/yuhaiin-rust/backups"
 mkdir -p "$backup_dir"
 backup="$backup_dir/state-$(date -u +%Y%m%dT%H%M%SZ).db"
 
@@ -73,7 +73,7 @@ The Rust binary can also manage the Linux service lifecycle directly. `install` 
 `daemon-reload`, `enable`, and `start`; an existing instance is restarted automatically:
 
 ```bash
-sudo "$HOME/.cache/yuhaiin-rust/release/yuhaiin.new" install \
+sudo ".cache/yuhaiin-rust/release/yuhaiin.new" install \
   -host 0.0.0.0:50051 -path /var/lib/yuhaiin
 sudo systemctl is-active yuhaiin.service
 ```
@@ -89,7 +89,7 @@ if systemctl is-active --quiet yuhaiin.service; then
   exit 1
 fi
 
-install -m 0755 "$HOME/.cache/yuhaiin-rust/release/yuhaiin.new" \
+install -m 0755 ".cache/yuhaiin-rust/release/yuhaiin.new" \
   /usr/local/bin/yuhaiin
 sudo systemctl start yuhaiin.service
 
@@ -108,7 +108,7 @@ label=com.asutorufa.yuhaiin
 domain="system/$label"
 sudo launchctl bootout "$domain" || true
 
-sudo install -m 0755 "$HOME/.cache/yuhaiin-rust/release/yuhaiin.new" \
+sudo install -m 0755 ".cache/yuhaiin-rust/release/yuhaiin.new" \
   /usr/local/bin/yuhaiin
 sudo launchctl bootstrap system /Library/LaunchDaemons/$label.plist
 sudo launchctl kickstart -kp "$domain"
@@ -119,7 +119,7 @@ Verify that `-path`, `-host`, `-eweb`, and the log paths in the plist are unchan
 The Rust binary can also install or reinstall the LaunchDaemon directly:
 
 ```bash
-sudo "$HOME/.cache/yuhaiin-rust/release/yuhaiin.new" install \
+sudo ".cache/yuhaiin-rust/release/yuhaiin.new" install \
   -host 0.0.0.0:50051 -path "/Library/Application Support/yuhaiin"
 sudo /usr/local/bin/yuhaiin restart
 sudo /usr/local/bin/yuhaiin uninstall
@@ -136,7 +136,7 @@ sudo systemctl stop yuhaiin.service
 sudo install -m 0755 /usr/local/bin/yuhaiin.update-backup /usr/local/bin/yuhaiin
 
 state="$HOME/.local/share/yuhaiin/state.db"
-restore="$HOME/.cache/yuhaiin-rust/backups/state-before-rust.db"
+restore=".cache/yuhaiin-rust/backups/state-before-rust.db"
 sqlite3 "$state" ".restore '$restore'"
 
 sudo systemctl start yuhaiin.service
@@ -149,7 +149,7 @@ Rust's `update-helper` attempts to restore `.update-backup` when installation fa
 ## 6. Parallel-run limitations
 
 - Go and Rust may read independent database copies in parallel for API and protocol comparison; they must not write the same `state.db` concurrently.
-- For compatibility comparison, copy a stopped service database after completing the SQLite backup to `~/.cache/yuhaiin-rust/compare/`, then start the two runtimes separately.
+- For compatibility comparison, copy a stopped service database after completing the SQLite backup to `.cache/yuhaiin-rust/compare/`, then start the two runtimes separately.
 - The Rust `statistics.runtime` checkpoint is an abnormal-exit recovery path; the final Go-compatible statistics projection is written during normal shutdown. During cutover, wait for Rust `/api/v2/info` to pass its health check before disabling the old service's automatic restart policy. Retain the pre-release backup until Go reverse-open and production-shaped data checks are complete.
 - Stop the cutover if `SQLITE_BUSY`, a sidecar lock, or a migration lock appears. Do not delete lock or WAL files; first verify that no stale process remains, then follow the backup recovery procedure.
 

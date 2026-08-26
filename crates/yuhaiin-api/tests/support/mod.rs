@@ -191,9 +191,8 @@ pub fn integration_dir(name: &str) -> PathBuf {
     if let Some(path) = std::env::var_os("YUHAIIN_INTEGRATION_DIR") {
         return PathBuf::from(path).join(name);
     }
-    let cache = std::env::var_os("XDG_CACHE_HOME")
+    let cache = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from(".cache"));
     cache
         .join("yuhaiin-rust")

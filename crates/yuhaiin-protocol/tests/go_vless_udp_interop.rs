@@ -50,9 +50,9 @@ async fn go_vless_udp_client_round_trips_against_rust_wire_server() {
         .unwrap_or_else(|| PathBuf::from("/home/asutorufa/Documents/Programming/yuhaiin"));
     let helper =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/interop/vless_udp_go_client.go");
-    let go_tmp = std::env::var_os("XDG_CACHE_HOME")
+    let go_tmp = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/home/asutorufa/.cache"))
+        .unwrap_or_else(|| PathBuf::from(".cache"))
         .join("yuhaiin-rust/go-tmp");
     std::fs::create_dir_all(&go_tmp).unwrap();
     let output = tokio::task::spawn_blocking(move || {

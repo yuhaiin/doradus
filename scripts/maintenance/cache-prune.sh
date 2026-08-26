@@ -4,7 +4,8 @@ set -euo pipefail
 # Remove only stale, reproducible integration outputs. Cargo artifacts and
 # reusable fixtures are intentionally left alone because deleting them makes
 # the next Podman run needlessly expensive.
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 retention_days="${YUHAIIN_CACHE_RETENTION_DAYS:-1}"
 dry_run="${YUHAIIN_CACHE_DRY_RUN:-0}"
 prune_debug="${YUHAIIN_CACHE_PRUNE_DEBUG:-0}"

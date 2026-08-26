@@ -186,9 +186,8 @@ async fn go_client_round_trips_against_rust_yuubinsya_server() {
     let go_root = std::env::var_os("YUHAIIN_GO_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/home/asutorufa/Documents/Programming/yuhaiin"));
-    let go_tmp = std::env::var_os("XDG_CACHE_HOME")
+    let go_tmp = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from(".cache"))
         .join("yuhaiin-rust/go-tmp");
     std::fs::create_dir_all(&go_tmp).expect("create Go temp directory");
@@ -243,9 +242,8 @@ async fn rust_client_round_trips_and_measures_uot_against_go_server() {
     let go_root = std::env::var_os("YUHAIIN_GO_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/home/asutorufa/Documents/Programming/yuhaiin"));
-    let go_tmp = std::env::var_os("XDG_CACHE_HOME")
+    let go_tmp = std::env::var_os("YUHAIIN_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from(".cache"))
         .join("yuhaiin-rust/go-tmp");
     std::fs::create_dir_all(&go_tmp).expect("create Go temp directory");

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_dir}/.cache/yuhaiin-rust}"
 scenario_dir="${YUHAIIN_TRANSPARENT_DIR:-${cache_root}/integration/transparent-service}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 binary="${YUHAIIN_TRANSPARENT_BINARY:-${target_dir}/debug/transparent-service-smoke}"

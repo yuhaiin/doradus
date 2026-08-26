@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/stats-concurrency}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
@@ -44,7 +44,7 @@ podman run --rm \
   -v "${runtime_binary}:/usr/local/bin/yuhaiin:ro" \
   -v "${scenario_dir}:/state:Z" \
   -e HOME=/state/home \
-  -e XDG_CACHE_HOME=/state/cache \
+  -e YUHAIIN_CACHE_DIR=/state/cache \
   -e TMPDIR=/state/tmp \
   -e YUHAIIN_INTEGRATION_DIR=/state \
   -e YUHAIIN_RUNTIME_BIN=/usr/local/bin/yuhaiin \

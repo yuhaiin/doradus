@@ -7,7 +7,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source_db="${YUHAIIN_GO_LEGACY_PRODUCTION_DB:?set YUHAIIN_GO_LEGACY_PRODUCTION_DB to a copied Go v1 state.db}"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/legacy-v1-runtime}"
 image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"

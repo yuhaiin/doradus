@@ -130,10 +130,7 @@ async fn run() -> Result<()> {
     let database = std::env::var_os("YUHAIIN_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".cache/yuhaiin-rust/integration/tun-service/state.sqlite")
+            PathBuf::from(".cache/yuhaiin-rust/integration/tun-service/state.sqlite")
         });
     let name = std::env::var("YUHAIIN_TUN_NAME").unwrap_or_else(|_| "yuhaiin-smoke0".to_owned());
     let hold_ms = std::env::var("YUHAIIN_TUN_HOLD_MS")

@@ -10,7 +10,7 @@ set -euo pipefail
 # crate archive for every workspace feature, so this job deliberately uses a
 # writable Cargo cache and lets `--locked` enforce dependency reproducibility.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${HOME}/.cache/yuhaiin-rust}"
+cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
 scenario_dir="${YUHAIIN_RELEASE_WINDOWS_DIR:-${cache_root}/integration/release-windows-cross}"
 target_dir="${YUHAIIN_RELEASE_WINDOWS_TARGET_DIR:-${cache_root}/release-windows-target}"
 cargo_home="${YUHAIIN_RELEASE_WINDOWS_CARGO_HOME:-${cache_root}/release-windows-cargo-home}"
