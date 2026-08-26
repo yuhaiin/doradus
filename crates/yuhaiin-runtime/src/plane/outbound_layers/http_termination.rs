@@ -490,8 +490,8 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use yuhaiin_core::proxy::{DirectAsyncProxy, FixedAsyncProxy};
     use yuhaiin_core::{DomainName, Network};
+    use yuhaiin_protocol::proxy::{DirectAsyncProxy, FixedAsyncProxy};
 
     fn rules(value: serde_json::Value) -> HeaderRules {
         parse_header_rules(&GoProxyLayer {

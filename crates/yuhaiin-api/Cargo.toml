@@ -45,6 +45,7 @@ yuhaiin-geo = { path = "../yuhaiin-geo" }
 yuhaiin-runtime = { path = "../yuhaiin-runtime", default-features = false }
 yuhaiin-store = { path = "../yuhaiin-store" }
 yuhaiin-tun = { path = "../yuhaiin-tun" }
+yuhaiin-protocol = { path = "../yuhaiin-protocol", features = ["websocket"] }
 
 [target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
 pprof = { version = "0.15.0", default-features = false, features = ["prost-codec"] }
@@ -73,7 +74,6 @@ tokio-tungstenite = { version = "0.28.0", default-features = false, features = [
 tower = { version = "0.5.2", features = ["util"] }
 x509-cert = { version = "0.2.5", default-features = false, features = ["builder", "std"] }
 yuhaiin-chain = { path = "../yuhaiin-chain" }
-yuhaiin-protocol = { path = "../yuhaiin-protocol", features = ["websocket"] }
 
 [lints]
 workspace = true

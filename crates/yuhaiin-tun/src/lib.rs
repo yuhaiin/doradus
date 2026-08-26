@@ -48,7 +48,14 @@ pub use yuhaiin_core::{BoxFuture, DomainName, IpSet};
 use yuhaiin_core::{Error, ErrorKind, Network, Result};
 pub use yuhaiin_core::{FlowContext, LocalBoxFuture};
 #[cfg(test)]
-pub use yuhaiin_core::{dns, process, proxy};
+pub use yuhaiin_core::{dns, process};
+#[cfg(test)]
+pub mod proxy {
+    pub use yuhaiin_core::proxy::*;
+    pub use yuhaiin_protocol::proxy::{
+        DelayedDropAsyncProxy, DirectAsyncProxy, DropAsyncProxy, FixedAsyncProxy,
+    };
+}
 
 pub use yuhaiin_core::flow::{Flow as TunFlow, FlowKey as TunFlowKey};
 pub use yuhaiin_core::flow::{FlowDirection as TunFlowDirection, FlowObserver as TunFlowObserver};

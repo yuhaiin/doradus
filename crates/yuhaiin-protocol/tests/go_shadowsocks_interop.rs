@@ -10,8 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use yuhaiin_core::proxy::{AsyncProxy, FixedAsyncProxy};
+use yuhaiin_core::proxy::AsyncProxy;
 use yuhaiin_core::{DomainName, Endpoint, FlowContext, Network};
+use yuhaiin_protocol::proxy::FixedAsyncProxy;
 use yuhaiin_protocol::shadowsocks::{Method, ShadowsocksProxy};
 
 #[tokio::test]

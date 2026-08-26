@@ -349,7 +349,8 @@ fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
     use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
-    use yuhaiin_core::proxy::{AsyncProxy, DropAsyncProxy, FixedAsyncProxy, StaticProxySelector};
+    use yuhaiin_core::proxy::{AsyncProxy, StaticProxySelector};
+    use yuhaiin_protocol::proxy::{DropAsyncProxy, FixedAsyncProxy};
     use yuhaiin_tun::{TunDispatcher, TunProxyRuntime};
 
     let total_bytes = env::var("YUHAIIN_TUN_BENCH_BYTES")
@@ -519,7 +520,8 @@ fn run_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
     use std::io::{Read, Write};
     use std::sync::Arc;
     use std::time::Duration;
-    use yuhaiin_core::proxy::{AsyncProxy, DropAsyncProxy, FixedAsyncProxy, StaticProxySelector};
+    use yuhaiin_core::proxy::{AsyncProxy, StaticProxySelector};
+    use yuhaiin_protocol::proxy::{DropAsyncProxy, FixedAsyncProxy};
     use yuhaiin_tun::{TunDispatcher, TunProxyRuntime};
 
     let async_runtime = tokio::runtime::Builder::new_current_thread()
@@ -608,7 +610,8 @@ fn run_udp_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use yuhaiin_core::proxy::{AsyncProxy, DropAsyncProxy, FixedAsyncProxy, StaticProxySelector};
+    use yuhaiin_core::proxy::{AsyncProxy, StaticProxySelector};
+    use yuhaiin_protocol::proxy::{DropAsyncProxy, FixedAsyncProxy};
     use yuhaiin_tun::{TunDispatcher, TunProxyRuntime};
 
     let async_runtime = tokio::runtime::Builder::new_current_thread()
@@ -699,8 +702,9 @@ fn run_dns_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
         AsyncDnsHandler, DnsHandler, DnsRecordType, DnsResponse, answer_query, decode_response,
         encode_query,
     };
-    use yuhaiin_core::proxy::{AsyncProxy, DropAsyncProxy, StaticProxySelector};
+    use yuhaiin_core::proxy::{AsyncProxy, StaticProxySelector};
     use yuhaiin_core::{BoxFuture, DomainName, IpSet, Result as CoreResult};
+    use yuhaiin_protocol::proxy::DropAsyncProxy;
     use yuhaiin_tun::{TunDispatcher, TunProxyRuntime};
 
     struct FixedDns;

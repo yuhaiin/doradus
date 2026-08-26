@@ -844,5 +844,5 @@ fn generate_ca() -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 #[cfg(test)]
-#[path = "tls_auto_tests.rs"]
+#[path = "auto_tests.rs"]
 mod tests;

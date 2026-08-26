@@ -54,11 +54,11 @@ impl AsyncProxy for HttpMockProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::FixedAsyncProxy;
     use std::net::SocketAddr;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use yuhaiin_core::proxy::FixedAsyncProxy;
     use yuhaiin_core::{Endpoint, Network};
 
     #[test]

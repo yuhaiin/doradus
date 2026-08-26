@@ -3,7 +3,7 @@
 use super::*;
 
 use super::datagrams::{TokioDatagram, resolve_direct_addresses};
-use super::socket::interface_for_address;
+use yuhaiin_core::network::interface_for_address;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DirectAsyncProxy {

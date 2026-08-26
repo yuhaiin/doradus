@@ -7,6 +7,17 @@ use sha2::{Digest, Sha256};
 
 use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, Network, Result};
 
+pub mod direct_uot;
+pub mod direct_uot_session;
+pub mod session;
+pub mod udp;
+
+pub use session::{
+    AsyncYuubinsyaPingServerSession, AsyncYuubinsyaPingSession, AsyncYuubinsyaTcpSession,
+    AsyncYuubinsyaUotServerSession, AsyncYuubinsyaUotSession,
+};
+pub use udp::{YuubinsyaUdpDatagram, YuubinsyaUdpProxy, YuubinsyaUdpServer};
+
 pub const MAX_SEGMENT_SIZE: usize = 64 * 1024 - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

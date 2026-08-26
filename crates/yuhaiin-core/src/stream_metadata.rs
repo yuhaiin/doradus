@@ -1,6 +1,12 @@
 //! Stream endpoint metadata.
 
-use super::*;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use crate::proxy::{AsyncStream, BoxAsyncStream};
 
 /// Preserve the socket's local endpoint while protocol layers replace the
 /// concrete stream type (TLS, HTTP/2, Yuubinsya, and WebSocket all do this).

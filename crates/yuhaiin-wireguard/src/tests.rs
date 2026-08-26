@@ -17,7 +17,8 @@ use smoltcp::wire::{IpAddress, IpCidr};
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::mpsc;
 use yuhaiin_core::dns_resolver::AsyncIpResolver;
-use yuhaiin_core::proxy::{AsyncProxy, DEFAULT_INTERFACE};
+use yuhaiin_core::network::DEFAULT_INTERFACE;
+use yuhaiin_core::proxy::AsyncProxy;
 use yuhaiin_core::{
     BoxFuture, DomainName, Endpoint, ErrorKind, FlowContext, IpSet, Network, ResolveStrategy,
     Result,

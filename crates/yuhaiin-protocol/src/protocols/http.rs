@@ -145,10 +145,10 @@ fn io_error(error: std::io::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::FixedAsyncProxy;
     use std::net::SocketAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use yuhaiin_core::proxy::FixedAsyncProxy;
     use yuhaiin_core::{DomainName, Network};
 
     #[tokio::test]

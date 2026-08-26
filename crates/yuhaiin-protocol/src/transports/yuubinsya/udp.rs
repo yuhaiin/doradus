@@ -3,9 +3,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use yuhaiin_core::proxy::{
-    AsyncDatagram, AsyncProxy, BoxAsyncStream, bind_tokio_udp_socket_for_target,
-};
+use yuhaiin_core::network::bind_tokio_udp_socket_for_target;
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 use yuhaiin_types::{InboundUdpCodec, InboundUdpFlowId, InboundUdpRequest, InboundUdpResponse};
 

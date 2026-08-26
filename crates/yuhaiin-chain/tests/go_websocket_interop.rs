@@ -12,7 +12,8 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_async;
 use yuhaiin_chain::{YuubinsyaH2Server, YuubinsyaServerProxy};
-use yuhaiin_core::proxy::{AsyncProxy, DirectAsyncProxy};
+use yuhaiin_core::proxy::AsyncProxy;
+use yuhaiin_protocol::proxy::DirectAsyncProxy;
 use yuhaiin_protocol::websocket::WebSocketIo;
 use yuhaiin_protocol::yuubinsya::derive_salt;
 

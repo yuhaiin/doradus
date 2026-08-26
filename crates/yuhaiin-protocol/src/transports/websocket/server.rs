@@ -7,7 +7,7 @@
 use base64::Engine as _;
 use yuhaiin_core::{Error, ErrorKind, Result};
 
-use crate::websocket::WebSocketIo;
+use super::WebSocketIo;
 
 #[allow(clippy::result_large_err)]
 pub async fn accept_stream<S>(stream: S) -> Result<(WebSocketIo<S>, Vec<u8>)>

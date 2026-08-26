@@ -1,7 +1,7 @@
 //! Yuubinsya server proxy dispatch and observed-flow integration.
 
-use super::yuubinsya_tcp::{AsyncYuubinsyaPingServerSession, AsyncYuubinsyaTcpSession};
-use super::yuubinsya_uot::AsyncYuubinsyaUotServerSession;
+use super::tcp_impl::{AsyncYuubinsyaPingServerSession, AsyncYuubinsyaTcpSession};
+use super::uot_impl::AsyncYuubinsyaUotServerSession;
 use super::*;
 
 enum ServerUdpMessage {

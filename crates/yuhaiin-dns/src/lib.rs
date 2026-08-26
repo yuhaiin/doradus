@@ -24,8 +24,7 @@ pub use dns_hosts::{
 };
 pub mod dns_resolver;
 pub use dns_resolver::{
-    AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, DnsResolver, ResolverTransport,
-    SendAsyncDnsQuery, SystemAsyncIpResolver,
+    AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, SendAsyncDnsQuery, SystemAsyncIpResolver,
 };
 pub mod dns_resolver_stack;
 pub use dns_resolver_stack::AsyncHostsResolver;

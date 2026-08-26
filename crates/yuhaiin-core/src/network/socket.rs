@@ -1,6 +1,13 @@
 //! Socket and interface binding helpers.
 
-use super::*;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use socket2::Socket;
+
+use crate::{Error, ErrorKind, Result};
+
+use super::DEFAULT_INTERFACE;
 
 pub async fn connect_tokio_tcp(
     address: SocketAddr,
@@ -58,10 +65,7 @@ fn resolve_bind_interface(bind_interface: &str) -> Option<String> {
     Some(bind_interface.to_owned())
 }
 
-pub(super) fn interface_for_address(
-    address: SocketAddr,
-    bind_interface: Option<&str>,
-) -> Option<&str> {
+pub fn interface_for_address(address: SocketAddr, bind_interface: Option<&str>) -> Option<&str> {
     if address.ip().is_loopback()
         && bind_interface.is_some_and(|interface| interface.trim() == DEFAULT_INTERFACE)
     {
@@ -92,7 +96,7 @@ fn default_route_interface() -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn default_route_interface_v4(content: &str) -> Option<String> {
+pub fn default_route_interface_v4(content: &str) -> Option<String> {
     content.lines().skip(1).find_map(|line| {
         let fields = line.split_whitespace().collect::<Vec<_>>();
         if fields.len() < 8 || fields[1] != "00000000" || fields[7] != "00000000" {
@@ -104,7 +108,7 @@ pub(super) fn default_route_interface_v4(content: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn default_route_interface_v6(content: &str) -> Option<String> {
+pub fn default_route_interface_v6(content: &str) -> Option<String> {
     content.lines().find_map(|line| {
         let fields = line.split_whitespace().collect::<Vec<_>>();
         if fields.len() < 10

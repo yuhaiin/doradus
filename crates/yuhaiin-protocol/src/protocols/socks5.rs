@@ -230,9 +230,9 @@ fn io_error(error: std::io::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::FixedAsyncProxy;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use yuhaiin_core::proxy::FixedAsyncProxy;
     use yuhaiin_core::{DomainName, Network};
 
     #[tokio::test]
@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn validates_override_port_like_go_int32_contract() {
-        let parent: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_core::proxy::DropAsyncProxy);
+        let parent: Arc<dyn AsyncProxy> = Arc::new(crate::proxy::DropAsyncProxy);
         assert!(Socks5Proxy::new(parent.clone(), "", "", "", -1).is_err());
         assert!(Socks5Proxy::new(parent.clone(), "", "", "", 65_536).is_err());
         assert!(Socks5Proxy::new(parent, "", "", "", 443).is_ok());

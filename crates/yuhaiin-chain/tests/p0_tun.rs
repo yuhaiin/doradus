@@ -24,8 +24,9 @@ use yuhaiin_chain::{
     ValidatedTls, ValidatedWebSocket, ValidatedYuubinsya, YuubinsyaH2Server, YuubinsyaServerProxy,
     parse_config,
 };
-use yuhaiin_core::proxy::{AsyncProxy, DirectAsyncProxy, DropAsyncProxy, StaticProxySelector};
+use yuhaiin_core::proxy::{AsyncProxy, StaticProxySelector};
 use yuhaiin_core::{DomainName, Endpoint, FlowContext, Network};
+use yuhaiin_protocol::proxy::{DirectAsyncProxy, DropAsyncProxy};
 use yuhaiin_protocol::websocket::WebSocketIo;
 use yuhaiin_protocol::yuubinsya::{
     YuubinsyaProtocol, decode_header, decode_uot_frame, derive_salt, encode_uot_frame,

@@ -1,32 +1,13 @@
 //! Asynchronous stream and datagram proxy primitives.
 
 use std::any::Any;
-use std::collections::HashMap;
-use std::net::Ipv6Addr;
-use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
-use socket2::{Domain, Protocol, Socket, Type};
-
-use crate::DomainName;
-use crate::{BoxFuture, FlowContext, Network};
+use crate::{BoxFuture, FlowContext};
 use crate::{Endpoint, Error, ErrorKind, Result};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::Notify;
-use tokio::time::Sleep;
-
-/// Internal marker used by the runtime for Go's `useDefaultInterface` mode.
-/// It is resolved to the current physical default-route interface immediately
-/// before each outbound socket is bound, rather than when a runtime snapshot
-/// is built.
-pub const DEFAULT_INTERFACE: &str = "__yuhaiin_default_interface__";
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send + Any {
     fn as_any(&self) -> &dyn Any;
@@ -94,34 +75,7 @@ impl AsyncProxySelector for StaticProxySelector {
     }
 }
 
-#[path = "proxy_datagrams.rs"]
-mod datagrams;
-#[path = "proxy_direct.rs"]
-mod direct;
-#[path = "proxy_drop.rs"]
-mod drop;
-#[path = "proxy_socket.rs"]
-mod socket;
-#[path = "proxy_socks5.rs"]
-mod socks5;
-#[path = "proxy_stream.rs"]
-mod stream_metadata;
-#[path = "proxy_wrappers.rs"]
-mod wrappers;
-
-pub use direct::DirectAsyncProxy;
-pub use drop::{DelayedDropAsyncProxy, DropAsyncProxy};
-pub use socket::{
-    bind_socket_to_interface, bind_tokio_udp_socket_for_target, connect_tokio_tcp,
-    connect_tokio_tcp_with_interface,
-};
-pub use socks5::Socks5AsyncProxy;
-pub use stream_metadata::{
+pub use crate::stream_metadata::{
     LocalAddrStream, stream_local_addr, stream_remote_addr, with_stream_local_addr,
     with_stream_socket_addrs,
 };
-pub use wrappers::{BindInterfaceProxy, FallbackAsyncProxy, FixedAsyncProxy};
-
-#[cfg(test)]
-#[path = "proxy_tests.rs"]
-mod tests;

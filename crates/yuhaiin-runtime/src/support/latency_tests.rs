@@ -623,7 +623,7 @@ async fn dns_udp_probe_uses_proxy_datagram_and_validates_response() {
     });
 
     let response = probe(
-        Arc::new(yuhaiin_core::proxy::DirectAsyncProxy {
+        Arc::new(yuhaiin_protocol::proxy::DirectAsyncProxy {
             timeout: Duration::from_secs(1),
         }),
         LatencyRequest {

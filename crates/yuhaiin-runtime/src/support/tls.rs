@@ -10,9 +10,8 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use yuhaiin_core::proxy::{
-    BoxAsyncStream, connect_tokio_tcp_with_interface, stream_local_addr, with_stream_local_addr,
-};
+use yuhaiin_core::network::connect_tokio_tcp_with_interface;
+use yuhaiin_core::proxy::{BoxAsyncStream, stream_local_addr, with_stream_local_addr};
 use yuhaiin_core::{Error, ErrorKind, Result};
 
 pub type RustlsTlsStream = tokio_rustls::client::TlsStream<TcpStream>;

@@ -15,9 +15,8 @@ use crate::yuubinsya::derive_salt;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use yuhaiin_core::dns_resolver::AsyncIpResolver;
-use yuhaiin_core::proxy::{
-    AsyncDatagram, AsyncProxy, BoxAsyncStream, connect_tokio_tcp_with_interface,
-};
+use yuhaiin_core::network::connect_tokio_tcp_with_interface;
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, Result};
 
 use crate::direct_uot_session::{DirectUotSession, closed_error};

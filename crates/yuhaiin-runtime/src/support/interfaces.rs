@@ -96,11 +96,11 @@ pub(crate) fn bind_addresses_for_settings(settings: &RuntimeSettings) -> Vec<IpA
 /// a network change does not require rebuilding every proxy.
 pub(crate) fn bind_interface_for_settings(settings: &RuntimeSettings) -> Option<String> {
     if settings.use_default_interface {
-        return Some(yuhaiin_core::proxy::DEFAULT_INTERFACE.to_owned());
+        return Some(yuhaiin_core::network::DEFAULT_INTERFACE.to_owned());
     }
     let requested = settings.net_interface.trim();
     if requested.eq_ignore_ascii_case("default") {
-        return Some(yuhaiin_core::proxy::DEFAULT_INTERFACE.to_owned());
+        return Some(yuhaiin_core::network::DEFAULT_INTERFACE.to_owned());
     }
     (!requested.is_empty()).then(|| requested.to_owned())
 }
@@ -489,7 +489,7 @@ mod tests {
         let settings = RuntimeSettings::default();
         assert_eq!(
             bind_interface_for_settings(&settings).as_deref(),
-            Some(yuhaiin_core::proxy::DEFAULT_INTERFACE)
+            Some(yuhaiin_core::network::DEFAULT_INTERFACE)
         );
     }
 

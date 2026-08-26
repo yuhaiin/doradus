@@ -10,6 +10,9 @@ use yuhaiin_core::proxy::{
 };
 use yuhaiin_core::{BoxFuture, Error, ErrorKind, FlowContext, Result};
 
+pub mod auto;
+pub mod server;
+
 /// Wrap an already-connected stream proxy with client-side TLS.
 ///
 /// It intentionally leaves endpoint selection to `upstream`: a fixed parent

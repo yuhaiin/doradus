@@ -31,9 +31,11 @@ pub mod http2 {
     pub use yuhaiin_dns::dns_http::*;
 }
 pub mod nat;
+pub mod network;
 pub mod process;
 pub mod proxy;
 pub mod sniff;
+pub mod stream_metadata;
 
 pub use yuhaiin_types::{
     BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, IpSet, LocalBoxFuture,

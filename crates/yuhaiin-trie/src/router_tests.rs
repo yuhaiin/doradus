@@ -507,7 +507,8 @@ fn runtime_hot_publish_keeps_readers_on_whole_snapshots() {
 fn routed_proxy_selector_uses_snapshot_and_honors_skip_route() {
     use std::sync::Arc;
     use yuhaiin_core::FlowContext;
-    use yuhaiin_core::proxy::{AsyncProxySelector, DropAsyncProxy};
+    use yuhaiin_core::proxy::AsyncProxySelector;
+    use yuhaiin_protocol::proxy::DropAsyncProxy;
 
     let router = Arc::new(
         Router::compile(
@@ -547,7 +548,8 @@ fn routed_proxy_selector_uses_snapshot_and_honors_skip_route() {
 #[test]
 fn runtime_routed_proxy_selector_observes_new_snapshots_without_retargeting_old_flows() {
     use yuhaiin_core::FlowContext;
-    use yuhaiin_core::proxy::{AsyncProxySelector, DropAsyncProxy};
+    use yuhaiin_core::proxy::AsyncProxySelector;
+    use yuhaiin_protocol::proxy::DropAsyncProxy;
 
     let fallback = RouteDecision {
         mode: RouteMode::Direct,
@@ -589,7 +591,8 @@ fn runtime_routed_proxy_selector_observes_new_snapshots_without_retargeting_old_
 #[test]
 fn runtime_selector_keeps_old_flow_and_selects_whole_snapshots_under_pressure() {
     use yuhaiin_core::FlowContext;
-    use yuhaiin_core::proxy::{AsyncProxySelector, DropAsyncProxy};
+    use yuhaiin_core::proxy::AsyncProxySelector;
+    use yuhaiin_protocol::proxy::DropAsyncProxy;
 
     let fallback = RouteDecision {
         mode: RouteMode::Direct,

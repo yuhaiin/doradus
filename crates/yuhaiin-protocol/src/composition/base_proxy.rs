@@ -10,10 +10,11 @@ use std::time::Duration;
 
 use crate::YuubinsyaUdpProxy;
 use crate::http::HttpProxy;
-use yuhaiin_core::proxy::{
-    AsyncProxy, BindInterfaceProxy, DelayedDropAsyncProxy, DirectAsyncProxy, DropAsyncProxy,
+use crate::proxy::{
+    BindInterfaceProxy, DelayedDropAsyncProxy, DirectAsyncProxy, DropAsyncProxy,
     FallbackAsyncProxy, FixedAsyncProxy, Socks5AsyncProxy,
 };
+use yuhaiin_core::proxy::AsyncProxy;
 use yuhaiin_core::{Error, ErrorKind, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

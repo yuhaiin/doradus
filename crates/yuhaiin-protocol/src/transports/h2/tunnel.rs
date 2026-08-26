@@ -699,5 +699,5 @@ fn protocol_error(message: impl Into<String>) -> Error {
 }
 
 #[cfg(test)]
-#[path = "h2_tunnel_tests.rs"]
+#[path = "tunnel_tests.rs"]
 mod tests;

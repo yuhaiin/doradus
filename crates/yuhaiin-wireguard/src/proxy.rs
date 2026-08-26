@@ -15,9 +15,8 @@ use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
 use yuhaiin_core::dns_resolver::AsyncIpResolver;
-use yuhaiin_core::proxy::{
-    AsyncDatagram, AsyncProxy, BoxAsyncStream, DEFAULT_INTERFACE, bind_socket_to_interface,
-};
+use yuhaiin_core::network::{DEFAULT_INTERFACE, bind_socket_to_interface};
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 use crate::config::{

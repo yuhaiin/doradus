@@ -1,8 +1,8 @@
 use super::*;
 use std::sync::Arc;
 use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
-use yuhaiin_core::proxy::FixedAsyncProxy;
 use yuhaiin_core::{Endpoint, Network};
+use yuhaiin_protocol::proxy::FixedAsyncProxy;
 use yuhaiin_store::GoRouteListRecord;
 
 fn record(json: &str, mode: &str, match_type: &str) -> GoRouteRuleRecord {

@@ -1,10 +1,7 @@
 //! VMess v2 TCP client and wire codec.
 
-#[path = "vmess_body.rs"]
 mod body;
-#[path = "vmess_codec.rs"]
 mod codec;
-#[path = "vmess_stream.rs"]
 mod stream;
 
 pub use body::{read_body_frame, write_body_frame};
@@ -26,5 +23,5 @@ pub(crate) use codec::{
 pub(crate) use stream::{VmessDatagram, VmessDatagramReader, VmessDatagramWriter};
 
 #[cfg(test)]
-#[path = "vmess_tests.rs"]
+#[cfg(test)]
 mod tests;

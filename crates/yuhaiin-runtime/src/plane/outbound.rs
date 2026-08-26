@@ -17,15 +17,15 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use yuhaiin_chain::ChainProxy;
 use yuhaiin_core::dns_resolver::AsyncIpResolver;
 use yuhaiin_core::proxy::{
-    AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream, DelayedDropAsyncProxy,
-    DirectAsyncProxy, DropAsyncProxy, stream_local_addr, stream_remote_addr,
-    with_stream_local_addr, with_stream_socket_addrs,
+    AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream, stream_local_addr,
+    stream_remote_addr, with_stream_local_addr, with_stream_socket_addrs,
 };
 use yuhaiin_core::{
     BoxFuture, Endpoint, Error, ErrorKind, FlowContext, GeoLookup, IpSet, ResolveStrategy, Result,
     RouteMode,
 };
 use yuhaiin_protocol::YuubinsyaUdpDatagram;
+use yuhaiin_protocol::proxy::{DelayedDropAsyncProxy, DirectAsyncProxy, DropAsyncProxy};
 use yuhaiin_protocol::proxy_factory::{BaseProxyConfig, BaseProxyKind};
 use yuhaiin_store::fakeip::FakeIpViewStore;
 use yuhaiin_store::{FakeIpPools, GoProxyLayer, GoProxyRuntimeConfig, GoProxyTransport};

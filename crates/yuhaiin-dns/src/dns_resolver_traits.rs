@@ -1,6 +1,7 @@
 //! Async DNS query traits.
 
 use super::*;
+use crate::dns::{decode_query, encode_response};
 
 /// Query-level variant whose future can safely cross a Tokio task boundary.
 pub trait SendAsyncDnsQuery: Send + Sync {

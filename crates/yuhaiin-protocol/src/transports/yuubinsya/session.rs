@@ -27,18 +27,18 @@ const SERVER_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SERVER_UDP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DNS_TCP_PACKET: usize = 4096;
 
-#[path = "yuubinsya_proxy.rs"]
-mod yuubinsya_proxy;
-#[path = "yuubinsya_tcp.rs"]
-mod yuubinsya_tcp;
-#[path = "yuubinsya_uot.rs"]
-mod yuubinsya_uot;
+#[path = "proxy.rs"]
+mod proxy_impl;
+#[path = "tcp.rs"]
+mod tcp_impl;
+#[path = "uot.rs"]
+mod uot_impl;
 
-pub use yuubinsya_proxy::YuubinsyaServerProxy;
-pub use yuubinsya_tcp::{
+pub use proxy_impl::YuubinsyaServerProxy;
+pub use tcp_impl::{
     AsyncYuubinsyaPingServerSession, AsyncYuubinsyaPingSession, AsyncYuubinsyaTcpSession,
 };
-pub use yuubinsya_uot::{AsyncYuubinsyaUotServerSession, AsyncYuubinsyaUotSession};
+pub use uot_impl::{AsyncYuubinsyaUotServerSession, AsyncYuubinsyaUotSession};
 
 pub async fn read_uot_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
     let mut endpoint = read_endpoint_bytes(stream).await?;

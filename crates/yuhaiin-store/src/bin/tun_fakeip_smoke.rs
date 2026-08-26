@@ -23,13 +23,12 @@ use yuhaiin_core::dns::{
     encode_response,
 };
 use yuhaiin_core::dns_http::{DnsOverHttp, DnsOverHttpConnector, HttpConnection, HttpVersion};
-use yuhaiin_core::proxy::{
-    AsyncDatagram, AsyncProxy, BoxAsyncStream, DropAsyncProxy, StaticProxySelector,
-};
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, StaticProxySelector};
 use yuhaiin_core::{
     BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, IpSet, Network,
     Result as CoreResult,
 };
+use yuhaiin_protocol::proxy::DropAsyncProxy;
 use yuhaiin_store::ConfigStore;
 use yuhaiin_store::fakeip::{
     AsyncDomainResolver, FakeIpAnswerTransform, FakeIpAsyncDnsHandler, FakeIpConfig, FakeIpPool,

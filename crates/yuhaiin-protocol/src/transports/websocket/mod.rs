@@ -10,7 +10,9 @@ use tokio_tungstenite::{client_async, tungstenite::client::IntoClientRequest};
 use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{BoxFuture, Error, ErrorKind, FlowContext, Result};
 
-pub use super::websocket_io::WebSocketIo;
+mod io;
+pub use io::WebSocketIo;
+pub mod server;
 
 pub struct WebSocketProxy {
     upstream: Arc<dyn AsyncProxy>,
@@ -88,10 +90,10 @@ impl AsyncProxy for WebSocketProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::FixedAsyncProxy;
     use std::net::SocketAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use yuhaiin_core::proxy::FixedAsyncProxy;
     use yuhaiin_core::{Endpoint, Network};
 
     #[tokio::test]

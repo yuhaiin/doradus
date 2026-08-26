@@ -222,11 +222,11 @@ fn validate_header_value(name: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::FixedAsyncProxy;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use yuhaiin_core::proxy::FixedAsyncProxy;
     use yuhaiin_core::{Endpoint, Network};
 
     #[test]

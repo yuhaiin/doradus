@@ -24,11 +24,12 @@ use yuhaiin_core::dns::{
     DnsRecordType, DnsResponse, decode_response, encode_query, encode_response,
 };
 use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, DirectAsyncProxy};
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use yuhaiin_core::{
     BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, IpSet, Network, Result,
     RouteMode,
 };
+use yuhaiin_protocol::proxy::DirectAsyncProxy;
 use yuhaiin_runtime::{
     BuiltinResolverFactory, RuntimeBuildOptions, RuntimeBuilder, RuntimeController, inbound,
     load_tun_config,

@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use rustls::RootCertStore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use yuhaiin_core::proxy::{AsyncProxy, FixedAsyncProxy};
+use yuhaiin_core::proxy::AsyncProxy;
 use yuhaiin_core::{DomainName, Endpoint, FlowContext, Network};
+use yuhaiin_protocol::proxy::FixedAsyncProxy;
 use yuhaiin_protocol::tls::RustCryptoTlsProxy;
 use yuhaiin_protocol::vless::VlessProxy;
 

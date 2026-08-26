@@ -12,9 +12,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::UdpSocket;
-use yuhaiin_core::proxy::{AsyncProxy, FixedAsyncProxy};
+use yuhaiin_core::proxy::AsyncProxy;
 use yuhaiin_core::{Endpoint, FlowContext, Network};
 use yuhaiin_protocol::aead::{self, AeadProxy, CryptoMethod};
+use yuhaiin_protocol::proxy::FixedAsyncProxy;
 
 fn go_cache() -> std::path::PathBuf {
     std::env::var_os("XDG_CACHE_HOME")

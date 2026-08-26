@@ -28,9 +28,10 @@ use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use yuhaiin_backup::{S3Client, S3Config};
-use yuhaiin_core::proxy::{AsyncProxy, DirectAsyncProxy};
+use yuhaiin_core::proxy::AsyncProxy;
 use yuhaiin_core::{BoxFuture, DomainName, Endpoint, FlowContext, Network, ResolveStrategy};
 use yuhaiin_geo::{GeoDatabaseManager, GeoDownloadTransport, GeoRefreshRequest};
+use yuhaiin_protocol::proxy::DirectAsyncProxy;
 
 use yuhaiin_store::{
     GoBackupSettingsRecord, GoInboundRecord, GoNodeRecord, GoPublishRecord, GoResolverRecord,

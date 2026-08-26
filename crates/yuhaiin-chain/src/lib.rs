@@ -40,12 +40,12 @@ use tokio::sync::{Mutex, Notify, watch};
 use tokio_rustls::TlsConnector;
 use yuhaiin_core::dns_resolver::{AsyncIpResolver, SystemAsyncIpResolver};
 use yuhaiin_core::proxy::{
-    AsyncDatagram, AsyncProxy, BindInterfaceProxy, BoxAsyncStream, DirectAsyncProxy,
-    FixedAsyncProxy, stream_local_addr, with_stream_local_addr,
+    AsyncDatagram, AsyncProxy, BoxAsyncStream, stream_local_addr, with_stream_local_addr,
 };
 use yuhaiin_core::{
     BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, ResolveStrategy, Result,
 };
+use yuhaiin_protocol::proxy::{BindInterfaceProxy, DirectAsyncProxy, FixedAsyncProxy};
 
 use yuhaiin_protocol::direct_uot::{DirectUotProxy, parse_go_direct_uot};
 use yuhaiin_protocol::session::{MAX_UOT_COALESCE_BYTES, MAX_UOT_COALESCE_FRAMES, read_uot_frame};

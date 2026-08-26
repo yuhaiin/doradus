@@ -2,10 +2,11 @@
 
 use super::datagrams::socks_address;
 use super::drop::DelayedDropState;
-#[cfg(target_os = "linux")]
-use super::socket::{default_route_interface_v4, default_route_interface_v6};
 use super::*;
-use crate::{DomainName, Network};
+#[cfg(target_os = "linux")]
+use yuhaiin_core::network::{default_route_interface_v4, default_route_interface_v6};
+use yuhaiin_core::stream_metadata::stream_local_addr;
+use yuhaiin_core::{DomainName, Network};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

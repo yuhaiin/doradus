@@ -18,15 +18,13 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use yuhaiin_core::dns::{
     AsyncDnsHandler, DnsRecordType, DnsResponse, decode_response, encode_query,
 };
-use yuhaiin_core::proxy::{
-    AsyncDatagram, AsyncProxy, BoxAsyncStream, FixedAsyncProxy, Socks5AsyncProxy,
-    StaticProxySelector,
-};
+use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream, StaticProxySelector};
 use yuhaiin_core::{
     BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, IpSet, Network, ResolverPolicy,
     Result, RouteMode,
 };
 use yuhaiin_protocol::http::HttpProxy;
+use yuhaiin_protocol::proxy::{FixedAsyncProxy, Socks5AsyncProxy};
 use yuhaiin_store::ConfigStore;
 use yuhaiin_store::fakeip::{
     AsyncDomainResolver, FakeIpAnswerTransform, FakeIpAsyncDnsHandler, FakeIpConfig, FakeIpPool,
@@ -492,7 +490,7 @@ async fn run_stream_proxy_tun(kind: StreamProxyKind) {
             password: None,
         }),
     };
-    let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_core::proxy::DropAsyncProxy);
+    let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_protocol::proxy::DropAsyncProxy);
     let selector = Arc::new(yuhaiin_core::proxy::StaticProxySelector {
         direct: Arc::clone(&drop),
         proxy,
@@ -642,7 +640,7 @@ async fn fixed_async_proxy_runs_through_tun_tcp_runtime() {
         address: target_address,
         timeout: Duration::from_secs(2),
     });
-    let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_core::proxy::DropAsyncProxy);
+    let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_protocol::proxy::DropAsyncProxy);
     let selector = Arc::new(StaticProxySelector {
         direct: Arc::clone(&drop),
         proxy: fixed,
@@ -744,7 +742,7 @@ async fn fixed_async_proxy_runs_through_tun_tcp_runtime() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn drop_proxy_closes_established_tun_tcp_flow() {
-    let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_core::proxy::DropAsyncProxy);
+    let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_protocol::proxy::DropAsyncProxy);
     let selector = Arc::new(StaticProxySelector {
         direct: Arc::clone(&drop),
         proxy: Arc::clone(&drop),
@@ -813,7 +811,7 @@ async fn tcp_half_close_forwards_eof_and_close_releases_task() {
     let proxy: Arc<dyn AsyncProxy> = Arc::new(DuplexProxy {
         saw_eof: Arc::clone(&saw_eof),
     });
-    let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_core::proxy::DropAsyncProxy);
+    let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_protocol::proxy::DropAsyncProxy);
     let selector = Arc::new(StaticProxySelector {
         direct: Arc::clone(&drop),
         proxy,
@@ -865,7 +863,7 @@ async fn tcp_connect_timeout_drops_pending_future_and_task() {
     let proxy: Arc<dyn AsyncProxy> = Arc::new(PendingProxy {
         dropped: Arc::clone(&dropped),
     });
-    let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_core::proxy::DropAsyncProxy);
+    let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_protocol::proxy::DropAsyncProxy);
     let selector = Arc::new(StaticProxySelector {
         direct: Arc::clone(&drop),
         proxy,
@@ -907,7 +905,7 @@ async fn dropping_proxy_runtime_aborts_owned_flow_tasks() {
     let proxy: Arc<dyn AsyncProxy> = Arc::new(PendingProxy {
         dropped: Arc::clone(&dropped),
     });
-    let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_core::proxy::DropAsyncProxy);
+    let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_protocol::proxy::DropAsyncProxy);
     let selector = Arc::new(StaticProxySelector {
         direct: Arc::clone(&drop),
         proxy,
@@ -957,7 +955,7 @@ async fn dns_fakeip_reverse_lookup_router_and_proxy_form_one_udp_flow() {
         contexts: Arc::clone(&recorded),
         sent_targets: Arc::clone(&sent_targets),
     });
-    let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_core::proxy::DropAsyncProxy);
+    let drop: Arc<dyn AsyncProxy> = Arc::new(yuhaiin_protocol::proxy::DropAsyncProxy);
     let domain_rule = route_rule("example.com");
     let fallback = RouteDecision {
         mode: RouteMode::Proxy,

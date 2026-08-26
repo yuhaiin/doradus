@@ -817,5 +817,5 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-#[path = "http_server_tests.rs"]
+#[path = "http_tests.rs"]
 mod tests;
