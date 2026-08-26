@@ -209,7 +209,7 @@ fn ipv6_proc_addresses(devices: &BTreeMap<u32, (String, bool)>) -> Vec<(u32, Str
             let index = names.get(fields[5])?;
             let prefix = u8::from_str_radix(fields[2], 16).ok()?;
             let mut bytes = [0u8; 16];
-            for (offset, chunk) in fields[0].as_bytes().chunks_exact(2).enumerate() {
+            for (offset, chunk) in fields[0].as_bytes().as_chunks::<2>().0.iter().enumerate() {
                 bytes[offset] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
             }
             Some((
@@ -288,7 +288,7 @@ mod linux {
                     return None;
                 }
                 let mut network = [0u8; 16];
-                for (offset, chunk) in fields[0].as_bytes().chunks_exact(2).enumerate() {
+                for (offset, chunk) in fields[0].as_bytes().as_chunks::<2>().0.iter().enumerate() {
                     network[offset] =
                         u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
                 }

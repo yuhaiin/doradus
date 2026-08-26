@@ -187,7 +187,7 @@ pub fn parse_uuid(value: &str) -> Result<[u8; 16]> {
         return Err(Error::invalid("VLESS UUID has the wrong length"));
     }
     let mut output = [0u8; 16];
-    for (index, pair) in compact.chunks_exact(2).enumerate() {
+    for (index, pair) in compact.as_chunks::<2>().0.iter().enumerate() {
         output[index] = (hex(pair[0])? << 4) | hex(pair[1])?;
     }
     Ok(output)

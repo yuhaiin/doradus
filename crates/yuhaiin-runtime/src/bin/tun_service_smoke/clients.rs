@@ -388,10 +388,11 @@ pub(super) fn ipv6_udp_checksum(source: Ipv6Addr, destination: Ipv6Addr, udp_pac
 
 fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0u32;
-    for word in bytes.chunks_exact(2) {
+    let (words, remainder) = bytes.as_chunks::<2>();
+    for word in words {
         sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
     }
-    if let Some(&byte) = bytes.chunks_exact(2).remainder().first() {
+    if let Some(&byte) = remainder.first() {
         sum += u32::from(byte) << 8;
     }
     while (sum >> 16) != 0 {
