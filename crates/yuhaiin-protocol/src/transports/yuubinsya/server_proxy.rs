@@ -1,155 +1,27 @@
 //! Yuubinsya server proxy dispatch and observed-flow integration.
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use super::super::{YuubinsyaHeader, YuubinsyaProtocol, decode_header_any};
+use super::common::{io_error, read_header_bytes};
+use super::observed_flow::{
+    DnsTcpDecision, ObservedFlow, ObservedInbound, answer_dns_packet, copy_bidirectional_observed,
+    endpoint_socket_addr, intercept_dns_tcp,
+};
+use super::server_udp_session::{ServerUdpMessage, ServerUdpSession};
 use super::tcp_impl::{AsyncYuubinsyaPingServerSession, AsyncYuubinsyaTcpSession};
 use super::uot_impl::AsyncYuubinsyaUotServerSession;
-use super::*;
 
-enum ServerUdpMessage {
-    Data { source: Endpoint, payload: Vec<u8> },
-    Closed,
-}
-
-struct ServerUdpSession {
-    datagram: Arc<dyn AsyncDatagram>,
-    routes: Mutex<HashMap<Endpoint, mpsc::Sender<ServerUdpMessage>>>,
-    last_sender: Mutex<Option<mpsc::Sender<ServerUdpMessage>>>,
-    last_used: StdMutex<Instant>,
-    worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
-}
-
-impl ServerUdpSession {
-    async fn spawn(datagram: Box<dyn AsyncDatagram>, udp_buffer_size: usize) -> Arc<Self> {
-        let session = Arc::new(Self {
-            datagram: Arc::from(datagram),
-            routes: Mutex::new(HashMap::new()),
-            last_sender: Mutex::new(None),
-            last_used: StdMutex::new(Instant::now()),
-            worker: Mutex::new(None),
-        });
-        let worker_session = Arc::clone(&session);
-        let worker = tokio::spawn(async move {
-            worker_session.run_reader(udp_buffer_size).await;
-        });
-        *session.worker.lock().await = Some(worker);
-        session
-    }
-
-    async fn run_reader(self: Arc<Self>, udp_buffer_size: usize) {
-        let mut buffer = vec![0u8; udp_buffer_size];
-        loop {
-            let result = tokio::time::timeout(
-                SERVER_UDP_RESPONSE_TIMEOUT,
-                self.datagram.recv_from(&mut buffer),
-            )
-            .await;
-            let Ok(Ok((length, source))) = result else {
-                self.notify_closed().await;
-                return;
-            };
-            self.touch();
-            let sender = {
-                let routes = self.routes.lock().await;
-                routes.get(&source).cloned()
-            };
-            let sender = match sender {
-                Some(sender) => Some(sender),
-                None => self.last_sender.lock().await.clone(),
-            };
-            let Some(sender) = sender else {
-                continue;
-            };
-            if sender
-                .send(ServerUdpMessage::Data {
-                    source,
-                    payload: buffer[..length].to_vec(),
-                })
-                .await
-                .is_err()
-            {
-                self.unregister_sender(&sender).await;
-            }
-        }
-    }
-
-    fn touch(&self) {
-        if let Ok(mut last_used) = self.last_used.lock() {
-            *last_used = Instant::now();
-        }
-    }
-
-    fn is_idle(&self, now: Instant) -> bool {
-        self.last_used
-            .lock()
-            .map(|last_used| now.duration_since(*last_used) >= SERVER_UDP_IDLE_TIMEOUT)
-            .unwrap_or(false)
-    }
-
-    async fn register(
-        &self,
-        destination: Endpoint,
-    ) -> (
-        mpsc::Sender<ServerUdpMessage>,
-        mpsc::Receiver<ServerUdpMessage>,
-    ) {
-        let (sender, receiver) = mpsc::channel(64);
-        self.routes.lock().await.insert(destination, sender.clone());
-        *self.last_sender.lock().await = Some(sender.clone());
-        self.touch();
-        (sender, receiver)
-    }
-
-    async fn route(&self, destination: Endpoint, sender: &mpsc::Sender<ServerUdpMessage>) {
-        self.routes.lock().await.insert(destination, sender.clone());
-        *self.last_sender.lock().await = Some(sender.clone());
-        self.touch();
-    }
-
-    async fn unregister_sender(&self, sender: &mpsc::Sender<ServerUdpMessage>) {
-        let remaining = {
-            let mut routes = self.routes.lock().await;
-            routes.retain(|_, current| !current.same_channel(sender));
-            routes.values().next().cloned()
-        };
-        let mut last_sender = self.last_sender.lock().await;
-        if last_sender
-            .as_ref()
-            .is_some_and(|current| current.same_channel(sender))
-        {
-            *last_sender = remaining;
-        }
-    }
-
-    async fn notify_closed(&self) {
-        let senders = self
-            .routes
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for sender in senders {
-            let _ = sender.send(ServerUdpMessage::Closed).await;
-        }
-    }
-
-    async fn send_to(&self, payload: &[u8], target: Endpoint) -> Result<usize> {
-        self.touch();
-        self.datagram.send_to(payload, target).await
-    }
-
-    fn local_addr(&self) -> Result<Endpoint> {
-        self.datagram.local_addr()
-    }
-
-    async fn close(&self) {
-        let _ = self.datagram.close().await;
-        self.notify_closed().await;
-        if let Some(worker) = self.worker.lock().await.take() {
-            worker.abort();
-            let _ = worker.await;
-        }
-    }
-}
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Mutex;
+use yuhaiin_core::flow::{Flow, FlowDirection, FlowKey, FlowObserver, FlowObserverGuard};
+use yuhaiin_core::proxy::AsyncProxy;
+use yuhaiin_core::{Endpoint, Error, ErrorKind, FlowContext, Result};
+use yuhaiin_types::{InboundDnsHandler, InboundStreamHandler};
 
 /// Server-side Yuubinsya protocol dispatcher.
 ///
@@ -165,17 +37,6 @@ pub struct YuubinsyaServerProxy {
     next_migrate_id: AtomicU64,
     udp_sessions: Mutex<HashMap<u64, Arc<ServerUdpSession>>>,
     udp_open_lock: Mutex<()>,
-}
-
-struct ObservedInbound {
-    source: SocketAddr,
-    observer: Arc<dyn FlowObserver>,
-    annotate: Arc<dyn Fn(&mut FlowContext) + Send + Sync>,
-}
-
-struct ObservedFlow {
-    flow: FlowKey,
-    _observation: FlowObserverGuard,
 }
 
 impl YuubinsyaServerProxy {
@@ -654,141 +515,5 @@ impl YuubinsyaServerProxy {
         for session in sessions {
             let _ = session.close().await;
         }
-    }
-}
-
-enum DnsTcpDecision {
-    Forward(Vec<u8>),
-    Answered { upload: usize, download: usize },
-}
-
-async fn intercept_dns_tcp<S>(
-    stream: &mut S,
-    handler: &dyn InboundDnsHandler,
-    destination_port: Option<u16>,
-) -> Result<DnsTcpDecision>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut length = [0u8; 2];
-    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut length))
-        .await
-        .map_err(|_| Error::new(ErrorKind::Timeout, "Yuubinsya DNS over TCP query timed out"))?
-        .map_err(io_error)?;
-    let length = usize::from(u16::from_be_bytes(length));
-    // A Yuubinsya TCP payload is not necessarily DNS over TCP.  If its first
-    // two bytes describe an implausibly large DNS frame, forward the prefix
-    // immediately instead of waiting for a full frame that belongs to the
-    // normal application stream.
-    if length > MAX_DNS_TCP_PACKET {
-        return Ok(DnsTcpDecision::Forward(
-            (length as u16).to_be_bytes().to_vec(),
-        ));
-    }
-    let mut packet = vec![0u8; length];
-    stream.read_exact(&mut packet).await.map_err(io_error)?;
-    let mut framed = Vec::with_capacity(length + 2);
-    framed.extend_from_slice(&(length as u16).to_be_bytes());
-    framed.extend_from_slice(&packet);
-    if !handler.should_hijack(destination_port, &packet) {
-        return Ok(DnsTcpDecision::Forward(framed));
-    }
-    let Some(response) = handler.answer(&packet).await else {
-        return Ok(DnsTcpDecision::Forward(framed));
-    };
-    let response = response?;
-    if response.len() > usize::from(u16::MAX) {
-        return Err(Error::new(
-            ErrorKind::Protocol,
-            "Yuubinsya DNS over TCP response is too large",
-        ));
-    }
-    stream
-        .write_all(&(response.len() as u16).to_be_bytes())
-        .await
-        .map_err(io_error)?;
-    stream.write_all(&response).await.map_err(io_error)?;
-    stream.flush().await.map_err(io_error)?;
-    Ok(DnsTcpDecision::Answered {
-        upload: framed.len(),
-        download: response.len() + 2,
-    })
-}
-
-async fn answer_dns_packet(
-    handler: &dyn InboundDnsHandler,
-    destination_port: Option<u16>,
-    packet: &[u8],
-) -> Result<Option<Vec<u8>>> {
-    if !handler.should_hijack(destination_port, packet) {
-        return Ok(None);
-    }
-    match handler.answer(packet).await {
-        Some(response) => response.map(Some),
-        None => Ok(None),
-    }
-}
-
-fn endpoint_socket_addr(endpoint: &Endpoint, source: SocketAddr) -> SocketAddr {
-    endpoint.addr().unwrap_or_else(|| {
-        SocketAddr::new(
-            match source.ip() {
-                IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-            },
-            endpoint.port().unwrap_or(0),
-        )
-    })
-}
-
-async fn copy_bidirectional_observed<A, B>(
-    left: &mut A,
-    right: &mut B,
-    observer: Arc<dyn FlowObserver>,
-    flow: FlowKey,
-) -> std::io::Result<()>
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-    B: AsyncRead + AsyncWrite + Unpin,
-{
-    let (mut left_read, mut left_write) = tokio::io::split(left);
-    let (mut right_read, mut right_write) = tokio::io::split(right);
-    let upload = copy_observed(
-        &mut left_read,
-        &mut right_write,
-        Arc::clone(&observer),
-        flow,
-        FlowDirection::Upload,
-    );
-    let download = copy_observed(
-        &mut right_read,
-        &mut left_write,
-        observer,
-        flow,
-        FlowDirection::Download,
-    );
-    tokio::try_join!(upload, download).map(|_| ())
-}
-
-async fn copy_observed<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    observer: Arc<dyn FlowObserver>,
-    flow: FlowKey,
-    direction: FlowDirection,
-) -> std::io::Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buffer = vec![0u8; 16 * 1024];
-    loop {
-        let length = reader.read(&mut buffer).await?;
-        if length == 0 {
-            writer.shutdown().await?;
-            return Ok(());
-        }
-        writer.write_all(&buffer[..length]).await?;
-        observer.bytes(flow, direction, length);
     }
 }

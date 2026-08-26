@@ -1,6 +1,21 @@
 //! Yuubinsya UDP-over-TCP client and server frame sessions.
 
-use super::*;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::super::{
+    YuubinsyaHeader, YuubinsyaProtocol, decode_header, decode_uot_frame, encode_header,
+    encode_uot_frame,
+};
+use super::common::{
+    MAX_UOT_COALESCE_BYTES, MAX_UOT_COALESCE_FRAMES, UOT_COALESCE_FLUSH_DELAY, io_error,
+    read_header_bytes, read_uot_frame,
+};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split};
+use tokio::sync::{Mutex, Notify};
+use yuhaiin_core::{Endpoint, Error, ErrorKind, Result};
 
 /// Yuubinsya UDP-over-TCP session. A session starts with the migrate-ID
 /// handshake and then carries `[address][u16 length][payload]` frames.
@@ -13,7 +28,7 @@ pub struct AsyncYuubinsyaUotSession<S> {
     pub migrate_id: u64,
     pub udp_coalesce: bool,
     local_addr: Option<SocketAddr>,
-    closed: std::sync::atomic::AtomicBool,
+    closed: AtomicBool,
 }
 
 pub(super) struct AsyncYuubinsyaUotWriter<S> {
@@ -114,7 +129,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncYuubinsyaUotSession<S> {
             migrate_id: assigned_migrate_id,
             udp_coalesce,
             local_addr,
-            closed: std::sync::atomic::AtomicBool::new(false),
+            closed: AtomicBool::new(false),
         })
     }
 

@@ -1,6 +1,13 @@
 //! Yuubinsya TCP and persistent ping sessions.
 
-use super::*;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use super::super::{YuubinsyaHeader, YuubinsyaProtocol, decode_header, encode_header};
+use super::common::{io_error, read_header_bytes, write_ping_reply};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use yuhaiin_core::{Endpoint, Error, ErrorKind, Result};
 
 /// A Yuubinsya TCP stream after the authenticated destination header has been
 /// sent. The remaining bytes are transparent TCP payload.
@@ -127,7 +134,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for AsyncYuubinsyaTcpSession<S
     fn poll_read(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
-        buffer: &mut tokio::io::ReadBuf<'_>,
+        buffer: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.stream).poll_read(context, buffer)
     }
