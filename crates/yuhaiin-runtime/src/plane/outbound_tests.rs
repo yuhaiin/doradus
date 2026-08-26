@@ -699,6 +699,16 @@ impl AsyncIpResolver for MappingResolver {
     }
 }
 
+fn snapshot_with_localhost_resolver(config: GoProxyRuntimeConfig) -> RuntimeSnapshot {
+    snapshot_with_resolver(
+        config,
+        Arc::new(MappingResolver {
+            address: std::net::Ipv4Addr::LOCALHOST,
+            queries: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn runtime_wireguard_resolves_peer_and_domain_targets_with_configured_resolver() {
     let key = |value| base64::engine::general_purpose::STANDARD.encode([value; 32]);
@@ -763,7 +773,7 @@ async fn standalone_build_proxy_resolves_domain_destinations() {
         transport: GoProxyTransport::Direct,
         data_json: br#"{"protocol":"direct"}"#.to_vec(),
     };
-    let built = snapshot(config)
+    let built = snapshot_with_localhost_resolver(config)
         .build_proxy("direct", Duration::from_secs(1))
         .await
         .unwrap();
@@ -959,7 +969,7 @@ async fn selector_resolves_domain_for_direct_socket_without_losing_protocol_doma
         transport: GoProxyTransport::Direct,
         data_json: br#"{"protocol":"direct"}"#.to_vec(),
     };
-    let selector = snapshot(config)
+    let selector = snapshot_with_localhost_resolver(config)
         .build_proxy_selector("", "proxy", "", "", Duration::from_secs(1))
         .await
         .unwrap();
@@ -1173,7 +1183,7 @@ async fn selector_resolves_domain_for_direct_udp_even_when_proxy_dns_is_skipped(
         transport: GoProxyTransport::Direct,
         data_json: br#"{"protocol":"direct"}"#.to_vec(),
     };
-    let selector = snapshot(config)
+    let selector = snapshot_with_localhost_resolver(config)
         .build_proxy_selector("", "proxy", "", "", Duration::from_secs(1))
         .await
         .unwrap();
