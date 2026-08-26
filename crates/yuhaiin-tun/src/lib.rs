@@ -32,7 +32,9 @@ use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX
 mod platform;
 #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
 pub use platform::DeviceBuilder;
-pub use platform::{AsyncDevice, async_device_from_owned_fd, enable_loopback};
+#[cfg(unix)]
+pub use platform::async_device_from_owned_fd;
+pub use platform::{AsyncDevice, enable_loopback};
 
 use tokio::sync::mpsc;
 

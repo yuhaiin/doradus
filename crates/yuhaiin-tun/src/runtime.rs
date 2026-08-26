@@ -51,32 +51,16 @@ impl Drop for TunWriter {
 async fn write_tun_fragment(device: &AsyncDevice, packet: &[u8]) -> io::Result<()> {
     let deadline = tokio::time::Instant::now() + DEFAULT_TUN_WRITE_STALL_TIMEOUT;
 
-    loop {
-        match device.try_send(packet) {
-            Ok(written) => {
-                if written != packet.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        format!("partial TUN write: {written}/{}", packet.len()),
-                    ));
-                }
-
-                return Ok(());
-            }
-
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                tokio::time::timeout_at(deadline, device.writable())
-                    .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TUN writer stalled"))??;
-            }
-
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
-                continue;
-            }
-
-            Err(error) => return Err(error),
-        }
+    let written = tokio::time::timeout_at(deadline, device.send(packet))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TUN writer stalled"))??;
+    if written != packet.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!("partial TUN write: {written}/{}", packet.len()),
+        ));
     }
+    Ok(())
 }
 
 pub struct TunRuntime {

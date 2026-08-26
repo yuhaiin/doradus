@@ -2,6 +2,9 @@
 
 use super::*;
 
+#[cfg(target_os = "windows")]
+use crate::dns::decode_response;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemAsyncIpResolver;
 
