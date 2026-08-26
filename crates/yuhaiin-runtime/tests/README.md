@@ -234,10 +234,11 @@ YUHAIIN_INTEGRATION_DIR="$HOME/.cache/yuhaiin-rust/integration-reusable" \
   cargo test -p yuhaiin-runtime --all-features --offline --test service_chain -- --nocapture
 ```
 
-固定目录会保留日志和 fixture 文件，便于复盘；如果要从干净的 SQLite
-配置开始，设置 `YUHAIIN_RESET_INTEGRATION_STATE=1`，或直接运行
-`make service-chain-smoke`。reset gate 只删除该 service-chain fixture 的
-`state.sqlite`、`-wal` 和 `-shm`，不会清理整个缓存目录。
+The fixed directory retains logs and fixture files for later inspection. To start
+with a clean SQLite configuration, set `YUHAIIN_RESET_INTEGRATION_STATE=1`, or
+run `make service-chain-smoke`. The reset gate removes only the `state.sqlite`,
+`-wal`, and `-shm` files for that service-chain fixture; it does not clear the
+entire cache directory.
 
 The runtime-owned TUN process smoke uses the same cache convention:
 
