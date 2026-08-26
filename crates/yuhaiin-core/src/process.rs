@@ -273,8 +273,10 @@ fn parse_proc_endpoint(value: &str, ipv6: bool) -> io::Result<SocketAddr> {
         let mut bytes = [0u8; 16];
         for (chunk, output) in address
             .as_bytes()
-            .chunks_exact(8)
-            .zip(bytes.chunks_exact_mut(4))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(bytes.as_chunks_mut::<4>().0.iter_mut())
         {
             let word = u32::from_str_radix(std::str::from_utf8(chunk).unwrap_or_default(), 16)
                 .map_err(|error| {
