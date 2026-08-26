@@ -1,5 +1,7 @@
 use super::tun_test_support::*;
 use super::*;
+use smoltcp::iface::{Config, Interface};
+use smoltcp::wire::HardwareAddress;
 
 #[test]
 fn proxy_runtime_enriches_context_with_injected_process_metadata() {

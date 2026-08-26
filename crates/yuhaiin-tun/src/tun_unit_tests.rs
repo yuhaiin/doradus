@@ -1,5 +1,8 @@
 use super::tun_test_support::*;
 use super::*;
+use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::phy::Medium;
+use smoltcp::wire::HardwareAddress;
 
 #[test]
 fn stale_proxy_flow_and_backpressure_errors_are_recoverable() {

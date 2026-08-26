@@ -1,10 +1,9 @@
-pub(super) use smoltcp::iface::{Config, Interface, SocketSet};
-pub(super) use smoltcp::phy::{ChecksumCapabilities, Device, Medium, TxToken};
+pub(super) use smoltcp::phy::{ChecksumCapabilities, Device, TxToken};
 pub(super) use smoltcp::socket::{icmp, tcp, udp};
 pub(super) use smoltcp::wire::{
-    HardwareAddress, Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpProtocol,
-    Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket,
-    TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+    Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpProtocol, Ipv4Address,
+    Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr,
+    TcpSeqNumber, UdpPacket, UdpRepr,
 };
 
 pub(super) fn udp_packet(

@@ -1,5 +1,7 @@
 use super::tun_test_support::*;
 use super::*;
+use smoltcp::iface::{Config, Interface};
+use smoltcp::wire::HardwareAddress;
 
 #[tokio::test(flavor = "current_thread")]
 async fn external_icmp_flow_uses_proxy_ping_and_writes_back_echo_reply() {
