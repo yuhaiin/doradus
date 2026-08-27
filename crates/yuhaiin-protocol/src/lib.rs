@@ -21,6 +21,8 @@ pub use transports::h2::{
     H2Connection, H2Pool, H2PoolEndpoint, H2PoolStats, YuubinsyaH2Server, server as h2_server,
     tunnel as h2_tunnel,
 };
+#[cfg(feature = "quic")]
+pub use transports::quic;
 pub use transports::stream;
 #[cfg(feature = "tls-ring")]
 pub use transports::tls::{self, auto as tls_auto, server as tls_server};
@@ -29,6 +31,7 @@ pub use transports::websocket;
 #[cfg(feature = "websocket")]
 pub use transports::websocket::server as websocket_server;
 pub use transports::yuubinsya;
+pub use transports::yuubinsya::YuubinsyaOverTransportProxy;
 pub use transports::yuubinsya::direct_uot;
 pub use transports::yuubinsya::direct_uot_session;
 pub use transports::yuubinsya::session;

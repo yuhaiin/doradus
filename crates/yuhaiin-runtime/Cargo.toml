@@ -95,7 +95,7 @@ yuhaiin-chain = { path = "../yuhaiin-chain" }
 yuhaiin-dns = { path = "../yuhaiin-dns" }
 yuhaiin-core = { path = "../yuhaiin-core" }
 yuhaiin-geo = { path = "../yuhaiin-geo" }
-yuhaiin-protocol = { path = "../yuhaiin-protocol" }
+yuhaiin-protocol = { path = "../yuhaiin-protocol", features = ["quic"] }
 yuhaiin-store = { path = "../yuhaiin-store" }
 yuhaiin-tun = { path = "../yuhaiin-tun" }
 yuhaiin-trie = { path = "../yuhaiin-trie" }

@@ -194,3 +194,55 @@ fn native_yuubinsya_udp_reuses_fixed_endpoint_and_derives_password_hash() {
         }
     );
 }
+
+#[test]
+fn quic_layer_uses_its_own_endpoint_and_tls_settings() {
+    let config = GoProxyRuntimeConfig {
+        id: "quic".to_owned(),
+        name: "quic".to_owned(),
+        group_name: "default".to_owned(),
+        origin: "local".to_owned(),
+        enabled: true,
+        chain_types: vec!["fixedv2".to_owned(), "quic".to_owned()],
+        layers: vec![
+            GoProxyLayer {
+                kind: "fixedv2".to_owned(),
+                config: serde_json::json!({
+                    "addresses": [{ "host": "wrong.example", "port": 443 }]
+                }),
+            },
+            GoProxyLayer {
+                kind: "quic".to_owned(),
+                config: serde_json::json!({
+                    "host": "quic.example:784",
+                    "tls": {
+                        "serverName": "edge.example",
+                        "caCert": [base64::engine::general_purpose::STANDARD.encode(b"ca")]
+                    }
+                }),
+            },
+        ],
+        transport: GoProxyTransport::Quic,
+        data_json: Vec::new(),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let built =
+        runtime
+            .block_on(config.to_base_proxy_config_with_resolver(
+                Duration::from_secs(3),
+                Arc::new(StaticResolver),
+            ))
+            .unwrap();
+    assert_eq!(
+        built.kind,
+        BaseProxyKind::Quic {
+            server: "192.0.2.44:784".parse().unwrap(),
+            server_name: "edge.example".to_owned(),
+            ca_certificates: vec![b"ca".to_vec()],
+            insecure_skip_verify: false,
+        }
+    );
+}

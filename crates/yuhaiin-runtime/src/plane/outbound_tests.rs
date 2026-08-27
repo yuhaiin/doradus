@@ -1,12 +1,15 @@
 use super::*;
 use crate::RuntimeSnapshot;
 use base64::Engine;
+#[cfg(feature = "doh-tls")]
+use std::io::Cursor;
 use std::sync::Arc;
 use yuhaiin_core::dns_resolver::SystemAsyncIpResolver;
 use yuhaiin_core::{FlowContext, GeoLookup, RouteMode};
 use yuhaiin_protocol::YuubinsyaUdpServer;
 use yuhaiin_protocol::proxy::FixedAsyncProxy;
 use yuhaiin_protocol::proxy_factory::{BaseProxyConfig, BaseProxyKind};
+use yuhaiin_protocol::quic::{QuicServer, QuicServerConfig};
 use yuhaiin_protocol::trojan::{self, Command};
 use yuhaiin_store::GoProxyLayer;
 use yuhaiin_store::GoProxyTransport;
@@ -1941,6 +1944,137 @@ fn runtime_builds_native_yuubinsya_udp_from_go_layers() {
         assert_eq!(&buffer[..length], b"answer");
         assert_eq!(response_target, decoded_target);
     });
+}
+
+#[cfg(feature = "doh-tls")]
+fn quic_test_server_tls() -> Arc<rustls::ServerConfig> {
+    const CERTIFICATE_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
+MIIBmzCCAUGgAwIBAgIUA6T+/U88N9aMPipK+MdNsAFRUAUwCgYIKoZIzj0EAwIw
+GDEWMBQGA1UEAwwNeXVoYWlpbi1wMC1jYTAeFw0yNjA4MDYxODIwNDlaFw0zNjA4
+MDMxODIwNDlaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEGCCqG
+SM49AwEHA0IABLPnwlYFERi1MgbJNuBHZV/eSpTGdJCQIOyxBt8LlR1ZTEG06pWy
+FnJVIzUS4oPuuHc0RcDEltGb/WolyQlM75SjbTBrMBQGA1UdEQQNMAuCCWxvY2Fs
+aG9zdDATBgNVHSUEDDAKBggrBgEFBQcDATAdBgNVHQ4EFgQUZoMmXETR998IsWt1
+UTBOVMIs7jMwHwYDVR0jBBgwFoAUhaYkOXheQ1JzLpIKK4I2FEcRMyMwCgYIKoZI
+zj0EAwIDSAAwRQIgGEU+sldusbLVAE/kxzZYXaMpIt6l+CZ0cC2jm7lQBqoCIQCw
+M5PhuwMhCCb+dUnK6ueJUMHwyK3l2pIAJTMp9+cwqw==
+-----END CERTIFICATE-----
+"#;
+    const PRIVATE_KEY_PEM: &[u8] = br#"-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIFqkH6SeIb9vVEJ6WecsMk5Pn/a8sQ+vdNS/ZSkl3KwfoAoGCCqGSM49
+AwEHoUQDQgAEs+fCVgURGLUyBsk24EdlX95KlMZ0kJAg7LEG3wuVHVlMQbTqlbIW
+clUjNRLig+64dzRFwMSW0Zv9aiXJCUzvlA==
+-----END EC PRIVATE KEY-----
+"#;
+    let certificate = rustls_pemfile::certs(&mut Cursor::new(CERTIFICATE_PEM))
+        .next()
+        .unwrap()
+        .unwrap();
+    let private_key = rustls_pemfile::private_key(&mut Cursor::new(PRIVATE_KEY_PEM))
+        .unwrap()
+        .unwrap();
+    Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate], private_key)
+        .unwrap(),
+    )
+}
+
+#[cfg(feature = "doh-tls")]
+#[tokio::test]
+async fn runtime_wraps_yuubinsya_above_raw_quic() {
+    let server = Arc::new(
+        QuicServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            quic_test_server_tls(),
+            QuicServerConfig::default(),
+        )
+        .unwrap(),
+    );
+    let server_address = server.local_addr().unwrap();
+    let accepting = {
+        let server = server.clone();
+        tokio::spawn(async move { server.accept().await.unwrap() })
+    };
+    let config = GoProxyRuntimeConfig {
+        id: "yuubinsya-quic".to_owned(),
+        name: "yuubinsya-quic".to_owned(),
+        group_name: "default".to_owned(),
+        origin: "go".to_owned(),
+        enabled: true,
+        chain_types: vec![
+            "fixedv2".to_owned(),
+            "quic".to_owned(),
+            "yuubinsya".to_owned(),
+        ],
+        layers: vec![
+            GoProxyLayer {
+                kind: "fixedv2".to_owned(),
+                config: serde_json::json!({
+                    "addresses": [{
+                        "host": server_address.ip().to_string(),
+                        "port": server_address.port()
+                    }]
+                }),
+            },
+            GoProxyLayer {
+                kind: "quic".to_owned(),
+                config: serde_json::json!({
+                    "host": server_address.to_string(),
+                    "tls": {
+                        "serverName": "localhost",
+                        "insecureSkipVerify": true
+                    }
+                }),
+            },
+            GoProxyLayer {
+                kind: "yuubinsya".to_owned(),
+                config: serde_json::json!({ "password": "password" }),
+            },
+        ],
+        transport: GoProxyTransport::Yuubinsya,
+        data_json: Vec::new(),
+    };
+    let proxy = snapshot(config)
+        .build_proxy("yuubinsya-quic", Duration::from_secs(3))
+        .await
+        .unwrap()
+        .proxy;
+    let target = yuhaiin_core::Endpoint::domain(
+        yuhaiin_core::Network::Udp,
+        yuhaiin_core::DomainName::new("example.com").unwrap(),
+        53,
+    );
+    let datagram = proxy
+        .open_datagram(&FlowContext::new(target.clone()))
+        .await
+        .unwrap();
+    let connection = accepting.await.unwrap();
+    datagram.send_to(b"query", target.clone()).await.unwrap();
+    let raw_server = connection.accept_datagram().await.unwrap();
+    let server_protocol = YuubinsyaUdpServer::new(
+        Box::new(raw_server),
+        yuhaiin_protocol::yuubinsya::derive_salt(b"password"),
+        false,
+    );
+    let mut buffer = [0; 128];
+    let (length, decoded_target, peer) = server_protocol.recv_from(&mut buffer).await.unwrap();
+    assert_eq!(&buffer[..length], b"query");
+    assert_eq!(decoded_target, target);
+    server_protocol
+        .send_to(b"answer", decoded_target.clone(), peer)
+        .await
+        .unwrap();
+    let (length, response_target) = datagram.recv_from(&mut buffer).await.unwrap();
+    assert_eq!(&buffer[..length], b"answer");
+    assert_eq!(response_target, decoded_target);
+    proxy.close().await.unwrap();
+    server.close();
 }
 
 #[test]

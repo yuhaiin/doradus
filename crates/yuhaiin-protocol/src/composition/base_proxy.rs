@@ -14,6 +14,8 @@ use crate::proxy::{
     BindInterfaceProxy, DelayedDropAsyncProxy, DirectAsyncProxy, DropAsyncProxy,
     FallbackAsyncProxy, FixedAsyncProxy, Socks5AsyncProxy,
 };
+#[cfg(feature = "quic")]
+use crate::quic::{QuicConfig, QuicProxy};
 use yuhaiin_core::proxy::AsyncProxy;
 use yuhaiin_core::{Error, ErrorKind, Result};
 
@@ -65,6 +67,20 @@ pub enum BaseProxyKind {
         endpoints: Vec<BaseProxyEndpoint>,
         password_hash: [u8; 32],
         socks5_prefix: bool,
+    },
+    #[cfg(feature = "quic")]
+    Quic {
+        server: SocketAddr,
+        server_name: String,
+        ca_certificates: Vec<Vec<u8>>,
+        insecure_skip_verify: bool,
+    },
+    #[cfg(feature = "quic")]
+    QuicMany {
+        endpoints: Vec<BaseProxyEndpoint>,
+        server_name: String,
+        ca_certificates: Vec<Vec<u8>>,
+        insecure_skip_verify: bool,
     },
 }
 
@@ -132,6 +148,37 @@ impl BaseProxyConfig {
                 password_hash,
                 socks5_prefix,
             } => fallback_yuubinsya(endpoints, *password_hash, *socks5_prefix)?,
+            #[cfg(feature = "quic")]
+            BaseProxyKind::Quic {
+                server,
+                server_name,
+                ca_certificates,
+                insecure_skip_verify,
+            } => Arc::new(QuicProxy::new(QuicConfig {
+                server: *server,
+                server_name: server_name.clone(),
+                ca_certificates: ca_certificates.clone(),
+                insecure_skip_verify: *insecure_skip_verify,
+                timeout: self.timeout,
+                idle_timeout: crate::quic::DEFAULT_IDLE_TIMEOUT,
+                association_idle_timeout: crate::quic::DEFAULT_ASSOCIATION_IDLE_TIMEOUT,
+                max_associations: crate::quic::DEFAULT_MAX_ASSOCIATIONS,
+                rx_queue_capacity: crate::quic::DEFAULT_RX_QUEUE_CAPACITY,
+                rx_memory_budget: crate::quic::DEFAULT_RX_MEMORY_BUDGET,
+            })?),
+            #[cfg(feature = "quic")]
+            BaseProxyKind::QuicMany {
+                endpoints,
+                server_name,
+                ca_certificates,
+                insecure_skip_verify,
+            } => fallback_quic(
+                endpoints,
+                self.timeout,
+                server_name.clone(),
+                ca_certificates.clone(),
+                *insecure_skip_verify,
+            )?,
         };
         Ok(proxy)
     }
@@ -230,6 +277,35 @@ fn fallback_yuubinsya(
     Ok(Arc::new(FallbackAsyncProxy::new(proxies)?))
 }
 
+#[cfg(feature = "quic")]
+fn fallback_quic(
+    endpoints: &[BaseProxyEndpoint],
+    timeout: Duration,
+    server_name: String,
+    ca_certificates: Vec<Vec<u8>>,
+    insecure_skip_verify: bool,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let proxies = endpoints
+        .iter()
+        .map(|endpoint| {
+            let proxy = QuicProxy::new(QuicConfig {
+                server: endpoint.address,
+                server_name: server_name.clone(),
+                ca_certificates: ca_certificates.clone(),
+                insecure_skip_verify,
+                timeout,
+                idle_timeout: crate::quic::DEFAULT_IDLE_TIMEOUT,
+                association_idle_timeout: crate::quic::DEFAULT_ASSOCIATION_IDLE_TIMEOUT,
+                max_associations: crate::quic::DEFAULT_MAX_ASSOCIATIONS,
+                rx_queue_capacity: crate::quic::DEFAULT_RX_QUEUE_CAPACITY,
+                rx_memory_budget: crate::quic::DEFAULT_RX_MEMORY_BUDGET,
+            })?;
+            Ok(bind_endpoint(Arc::new(proxy), endpoint))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(FallbackAsyncProxy::new(proxies)?))
+}
+
 fn http_proxy(
     proxy: SocketAddr,
     timeout: Duration,
@@ -301,6 +377,16 @@ mod tests {
                     server: address,
                     password_hash: [7; 32],
                     socks5_prefix: false,
+                },
+                timeout: timeout(),
+            },
+            #[cfg(feature = "quic")]
+            BaseProxyConfig {
+                kind: BaseProxyKind::Quic {
+                    server: address,
+                    server_name: "localhost".to_owned(),
+                    ca_certificates: Vec::new(),
+                    insecure_skip_verify: true,
                 },
                 timeout: timeout(),
             },

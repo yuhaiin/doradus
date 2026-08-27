@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 #[cfg(test)]
@@ -62,6 +63,7 @@ pub enum GoProxyTransport {
     Vless,
     Vmess,
     Yuubinsya,
+    Quic,
     Wireguard,
     Aead,
     NetworkSplit,
@@ -332,6 +334,7 @@ fn parse_proxy_transport(value: &str) -> GoProxyTransport {
         "vless" => GoProxyTransport::Vless,
         "vmess" => GoProxyTransport::Vmess,
         "yuubinsya" => GoProxyTransport::Yuubinsya,
+        "quic" => GoProxyTransport::Quic,
         "wireguard" | "wire_guard" | "wg" => GoProxyTransport::Wireguard,
         "aead" => GoProxyTransport::Aead,
         // Go registers bootstrap_dns_warp as a no-op wrapper around the
@@ -384,6 +387,7 @@ fn select_proxy_transport(chain_types: &[String], layers: &[GoProxyLayer]) -> Go
         "tls_termination",
         "http_termination",
         "yuubinsya",
+        "quic",
         "wireguard",
         "aead",
         "socks5",
@@ -537,6 +541,37 @@ impl GoProxyRuntimeConfig {
     }
 
     fn fixed_endpoints(&self) -> Result<Vec<ProxyEndpoint>> {
+        let quic_host = (matches!(
+            self.transport,
+            GoProxyTransport::Quic | GoProxyTransport::Yuubinsya
+        ) && self
+            .layers
+            .iter()
+            .any(|layer| layer.kind.eq_ignore_ascii_case("quic")))
+        .then(|| {
+            self.layers
+                .iter()
+                .find(|layer| layer.kind.eq_ignore_ascii_case("quic"))
+                .and_then(|layer| layer.config.get("host"))
+        })
+        .flatten()
+        .filter(|host| !host.as_str().is_some_and(|host| host.trim().is_empty()));
+        if let Some(host) = quic_host {
+            let mut endpoint = endpoint::proxy_endpoint_value(host)?;
+            if endpoint.bind_interface.is_none() {
+                endpoint.bind_interface = self
+                    .layers
+                    .iter()
+                    .find(|layer| {
+                        matches!(
+                            layer.kind.to_ascii_lowercase().as_str(),
+                            "fixed" | "simple" | "fixedv2"
+                        )
+                    })
+                    .and_then(|layer| network_interface_field(&layer.config));
+            }
+            return Ok(vec![endpoint]);
+        }
         match &self.transport {
             GoProxyTransport::Fixed
             | GoProxyTransport::HttpMock
@@ -548,6 +583,7 @@ impl GoProxyRuntimeConfig {
             | GoProxyTransport::Vless
             | GoProxyTransport::Vmess
             | GoProxyTransport::Yuubinsya
+            | GoProxyTransport::Quic
             | GoProxyTransport::Aead => fixed_endpoints(&self.layers),
             GoProxyTransport::NetworkSplit => {
                 // `network_split` wraps the proxy assembled from the chain
@@ -637,6 +673,31 @@ impl GoProxyRuntimeConfig {
                 None => BaseProxyKind::FixedMany { endpoints },
             },
             GoProxyTransport::Yuubinsya => {
+                if self
+                    .layers
+                    .iter()
+                    .any(|layer| layer.kind.eq_ignore_ascii_case("quic"))
+                {
+                    let endpoint = endpoints.first().ok_or_else(|| {
+                        Error::invalid("QUIC transport requires a server endpoint")
+                    })?;
+                    let (server_name, ca_certificates, insecure_skip_verify) =
+                        self.quic_settings(endpoint.address)?;
+                    return Ok(match single_address() {
+                        Some(server) => BaseProxyKind::Quic {
+                            server,
+                            server_name,
+                            ca_certificates,
+                            insecure_skip_verify,
+                        },
+                        None => BaseProxyKind::QuicMany {
+                            endpoints,
+                            server_name,
+                            ca_certificates,
+                            insecure_skip_verify,
+                        },
+                    });
+                }
                 let config = layer_config(&self.layers, "yuubinsya")?;
                 let password = required_string(config, "password")?;
                 let password_hash = yuhaiin_protocol::yuubinsya::derive_salt(password.as_bytes());
@@ -654,6 +715,27 @@ impl GoProxyRuntimeConfig {
                         endpoints,
                         password_hash,
                         socks5_prefix,
+                    },
+                }
+            }
+            GoProxyTransport::Quic => {
+                let endpoint = endpoints
+                    .first()
+                    .ok_or_else(|| Error::invalid("QUIC transport requires a server endpoint"))?;
+                let (server_name, ca_certificates, insecure_skip_verify) =
+                    self.quic_settings(endpoint.address)?;
+                match single_address() {
+                    Some(server) => BaseProxyKind::Quic {
+                        server,
+                        server_name,
+                        ca_certificates,
+                        insecure_skip_verify,
+                    },
+                    None => BaseProxyKind::QuicMany {
+                        endpoints,
+                        server_name,
+                        ca_certificates,
+                        insecure_skip_verify,
                     },
                 }
             }
@@ -679,6 +761,51 @@ impl GoProxyRuntimeConfig {
             }
         })
     }
+
+    fn quic_settings(&self, server: SocketAddr) -> Result<(String, Vec<Vec<u8>>, bool)> {
+        let layer = layer_config(&self.layers, "quic")?;
+        let tls = layer.get("tls").unwrap_or(layer);
+        let server_name = tls
+            .get("servernames")
+            .or_else(|| tls.get("serverNames"))
+            .and_then(Value::as_array)
+            .and_then(|values| values.iter().find_map(Value::as_str))
+            .or_else(|| tls.get("server_name").and_then(Value::as_str))
+            .or_else(|| tls.get("serverName").and_then(Value::as_str))
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| server.ip().to_string());
+        let mut ca_certificates = Vec::new();
+        if let Some(certificates) = tls
+            .get("ca_cert")
+            .or_else(|| tls.get("caCert"))
+            .and_then(Value::as_array)
+        {
+            for (index, certificate) in certificates.iter().enumerate() {
+                let encoded = certificate.as_str().ok_or_else(|| {
+                    Error::invalid(format!("QUIC ca_cert[{index}] must be a string"))
+                })?;
+                let certificate = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|error| {
+                        Error::new(
+                            ErrorKind::InvalidInput,
+                            format!("QUIC ca_cert[{index}] is not base64: {error}"),
+                        )
+                    })?;
+                if certificate.is_empty() {
+                    return Err(Error::invalid("QUIC CA certificate cannot be empty"));
+                }
+                ca_certificates.push(certificate);
+            }
+        }
+        let insecure_skip_verify = tls
+            .get("insecure_skip_verify")
+            .or_else(|| tls.get("insecureSkipVerify"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Ok((server_name, ca_certificates, insecure_skip_verify))
+    }
 }
 
 fn transport_name(transport: &GoProxyTransport) -> &str {
@@ -696,6 +823,7 @@ fn transport_name(transport: &GoProxyTransport) -> &str {
         GoProxyTransport::Vless => "vless",
         GoProxyTransport::Vmess => "vmess",
         GoProxyTransport::Yuubinsya => "yuubinsya",
+        GoProxyTransport::Quic => "quic",
         GoProxyTransport::Wireguard => "wireguard",
         GoProxyTransport::Aead => "aead",
         GoProxyTransport::NetworkSplit => "network_split",

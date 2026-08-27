@@ -583,9 +583,44 @@ impl RuntimeSnapshot {
             }
         } else {
             let base = config
-                .to_base_proxy_config_with_resolver(timeout, resolver)
+                .to_base_proxy_config_with_resolver(timeout, resolver.clone())
                 .await?;
-            base.build()?
+            let mut proxy = base.build()?;
+            if config.transport == GoProxyTransport::Yuubinsya
+                && config
+                    .layers
+                    .iter()
+                    .any(|layer| layer.kind.eq_ignore_ascii_case("quic"))
+            {
+                let yuubinsya = config
+                    .layers
+                    .iter()
+                    .find(|layer| layer.kind.eq_ignore_ascii_case("yuubinsya"))
+                    .ok_or_else(|| Error::invalid("Yuubinsya layer is missing"))?;
+                let password = yuubinsya
+                    .config
+                    .get("password")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|password| !password.is_empty())
+                    .ok_or_else(|| Error::invalid("Yuubinsya password is empty"))?;
+                let server = config
+                    .resolved_fixed_endpoint(resolver.as_ref())
+                    .await?
+                    .ok_or_else(|| Error::invalid("QUIC transport requires a server endpoint"))?;
+                let socks5_prefix = yuubinsya
+                    .config
+                    .get("socks5_prefix")
+                    .or_else(|| yuubinsya.config.get("socks5Prefix"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                proxy = Arc::new(yuhaiin_protocol::YuubinsyaOverTransportProxy::new(
+                    proxy,
+                    yuhaiin_protocol::yuubinsya::derive_salt(password.as_bytes()),
+                    Endpoint::ip(yuhaiin_core::Network::Udp, server),
+                    socks5_prefix,
+                )?);
+            }
+            proxy
         };
 
         let proxy = Arc::new(ConnectBudgetProxy {

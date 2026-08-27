@@ -431,6 +431,7 @@ fn go_node_runtime_preserves_proxy_layers_and_selects_supported_base() {
         ("vless", GoProxyTransport::Vless),
         ("vmess", GoProxyTransport::Vmess),
         ("yuubinsya", GoProxyTransport::Yuubinsya),
+        ("quic", GoProxyTransport::Quic),
         ("aead", GoProxyTransport::Aead),
         // Go's bootstrap_dns_warp point is a no-op wrapper; without a
         // network_split parent its zero/direct proxy is the effective base.

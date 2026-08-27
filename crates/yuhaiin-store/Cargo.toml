@@ -18,6 +18,7 @@ tun-fakeip-smoke = [
 sqlite-rusqlite-probe = []
 
 [dependencies]
+base64 = "0.22.1"
 blake3 = { version = "1.8.6", default-features = false, features = ["std", "pure"] }
 bytes = { version = "1.12.1", optional = true }
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
@@ -30,7 +31,7 @@ smoltcp = { version = "0.13.1", optional = true, default-features = false, featu
 tokio = { version = "1.50.0", optional = true, default-features = false, features = ["io-util", "rt", "sync", "time"] }
 yuhaiin-core = { path = "../yuhaiin-core" }
 yuhaiin-dns = { path = "../yuhaiin-dns" }
-yuhaiin-protocol = { path = "../yuhaiin-protocol" }
+yuhaiin-protocol = { path = "../yuhaiin-protocol", features = ["quic"] }
 yuhaiin-tun = { path = "../yuhaiin-tun", optional = true }
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 
