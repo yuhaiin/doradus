@@ -101,6 +101,7 @@ yuhaiin-tun = { path = "../yuhaiin-tun" }
 yuhaiin-trie = { path = "../yuhaiin-trie" }
 yuhaiin-types = { path = "../yuhaiin-types" }
 yuhaiin-wireguard = { path = "../yuhaiin-wireguard" }
+yuhaiin-masque = { path = "../yuhaiin-masque" }
 socket2 = { version = "0.6.5", features = ["all"] }
 
 [lints]

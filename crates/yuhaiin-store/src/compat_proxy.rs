@@ -65,6 +65,7 @@ pub enum GoProxyTransport {
     Yuubinsya,
     Quic,
     Wireguard,
+    WarpMasque,
     Aead,
     NetworkSplit,
     Tls,
@@ -336,6 +337,7 @@ fn parse_proxy_transport(value: &str) -> GoProxyTransport {
         "yuubinsya" => GoProxyTransport::Yuubinsya,
         "quic" => GoProxyTransport::Quic,
         "wireguard" | "wire_guard" | "wg" => GoProxyTransport::Wireguard,
+        "warp_masque" | "warpmasque" => GoProxyTransport::WarpMasque,
         "aead" => GoProxyTransport::Aead,
         // Go registers bootstrap_dns_warp as a no-op wrapper around the
         // already-built proxy. At node level the zero/direct proxy is the
@@ -389,6 +391,7 @@ fn select_proxy_transport(chain_types: &[String], layers: &[GoProxyLayer]) -> Go
         "yuubinsya",
         "quic",
         "wireguard",
+        "warp_masque",
         "aead",
         "socks5",
         "vmess",
@@ -585,6 +588,7 @@ impl GoProxyRuntimeConfig {
             | GoProxyTransport::Yuubinsya
             | GoProxyTransport::Quic
             | GoProxyTransport::Aead => fixed_endpoints(&self.layers),
+            GoProxyTransport::WarpMasque => Ok(Vec::new()),
             GoProxyTransport::NetworkSplit => {
                 // `network_split` wraps the proxy assembled from the chain
                 // prefix.  The branch payload is a protocol point, not a
@@ -745,6 +749,12 @@ impl GoProxyRuntimeConfig {
                     "WireGuard is a stateful userspace tunnel and must be built by yuhaiin-runtime",
                 ));
             }
+            GoProxyTransport::WarpMasque => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "WARP MASQUE is a stateful userspace tunnel and must be built by yuhaiin-runtime",
+                ));
+            }
             GoProxyTransport::NetworkSplit
             | GoProxyTransport::Tls
             | GoProxyTransport::TlsTermination
@@ -825,6 +835,7 @@ fn transport_name(transport: &GoProxyTransport) -> &str {
         GoProxyTransport::Yuubinsya => "yuubinsya",
         GoProxyTransport::Quic => "quic",
         GoProxyTransport::Wireguard => "wireguard",
+        GoProxyTransport::WarpMasque => "warp_masque",
         GoProxyTransport::Aead => "aead",
         GoProxyTransport::NetworkSplit => "network_split",
         GoProxyTransport::Tls => "tls",

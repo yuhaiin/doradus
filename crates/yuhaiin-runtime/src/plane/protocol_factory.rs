@@ -84,6 +84,7 @@ pub(super) enum ProxyPlanKind {
     VmessTransport,
     TrojanWebSocket,
     Wireguard,
+    WarpMasque,
     HttpMock,
     HttpTermination,
     TlsTermination,
@@ -183,6 +184,11 @@ impl ProxyPlan {
             ProxyPlanKind::TrojanWebSocket
         } else if matches!(config.transport, yuhaiin_store::GoProxyTransport::Wireguard) {
             ProxyPlanKind::Wireguard
+        } else if matches!(
+            config.transport,
+            yuhaiin_store::GoProxyTransport::WarpMasque
+        ) {
+            ProxyPlanKind::WarpMasque
         } else if matches!(config.transport, yuhaiin_store::GoProxyTransport::HttpMock) {
             ProxyPlanKind::HttpMock
         } else if matches!(
@@ -267,6 +273,30 @@ pub(super) async fn build_wireguard_proxy(
     Ok(Arc::new(
         yuhaiin_wireguard::build_proxy_with_interface_and_resolver(
             wireguard,
+            timeout,
+            bind_interface.as_deref(),
+            Some(resolver),
+        )
+        .await?,
+    ))
+}
+
+pub(super) async fn build_warp_masque_proxy(
+    layer: &GoProxyLayer,
+    timeout: Duration,
+    resolver: Arc<dyn AsyncIpResolver>,
+    bind_interface: Option<String>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    let warp: yuhaiin_masque::WarpMasqueConfig = serde_json::from_value(layer.config.clone())
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid WARP MASQUE node configuration: {error}"),
+            )
+        })?;
+    Ok(Arc::new(
+        yuhaiin_masque::build_proxy_with_interface_and_resolver(
+            warp,
             timeout,
             bind_interface.as_deref(),
             Some(resolver),

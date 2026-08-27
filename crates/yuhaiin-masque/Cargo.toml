@@ -1,0 +1,29 @@
+[package]
+name = "yuhaiin-masque"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = "0.22.1"
+bytes = "1.12.1"
+quiche = { version = "0.22.0", features = ["boringssl-vendored"] }
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pem", "pkcs8", "std"] }
+pem = "3.0.6"
+rcgen = "0.13.2"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6"] }
+tempfile = "3.27.0"
+tokio = { version = "1.50.0", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+time = "0.3.44"
+x509-parser = "0.16.0"
+yuhaiin-core = { path = "../yuhaiin-core" }
+yuhaiin-tun = { path = "../yuhaiin-tun" }
+
+[dev-dependencies]
+futures-lite = "2.6.1"
+
+[lints]
+workspace = true

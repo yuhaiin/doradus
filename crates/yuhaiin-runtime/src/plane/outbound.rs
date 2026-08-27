@@ -285,6 +285,19 @@ impl RuntimeSnapshot {
                 )
                 .await
             }
+            "warp_masque" | "warpmasque" => {
+                let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::WarpMasque);
+                let resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
+                build_warp_masque_proxy(
+                    layer,
+                    timeout,
+                    resolver,
+                    child
+                        .network_interface()
+                        .or_else(|| self.socket_bind_interface.clone()),
+                )
+                .await
+            }
             "network_split" | "networksplit" => {
                 Err(Error::invalid("nested network_split is not supported"))
             }
@@ -344,6 +357,21 @@ impl RuntimeSnapshot {
                 .find(|layer| layer.kind.eq_ignore_ascii_case("wireguard"))
                 .ok_or_else(|| Error::invalid("WireGuard protocol layer is missing"))?;
             build_wireguard_proxy(
+                layer,
+                timeout,
+                resolver.clone(),
+                config
+                    .network_interface()
+                    .or_else(|| self.socket_bind_interface.clone()),
+            )
+            .await?
+        } else if plan.kind == ProxyPlanKind::WarpMasque {
+            let layer = config
+                .layers
+                .iter()
+                .find(|layer| layer.kind.eq_ignore_ascii_case("warp_masque"))
+                .ok_or_else(|| Error::invalid("WARP MASQUE protocol layer is missing"))?;
+            build_warp_masque_proxy(
                 layer,
                 timeout,
                 resolver.clone(),
@@ -634,7 +662,9 @@ impl RuntimeSnapshot {
         }) as Arc<dyn AsyncProxy>;
         let proxy = if matches!(
             config.transport,
-            yuhaiin_store::GoProxyTransport::Direct | yuhaiin_store::GoProxyTransport::Wireguard
+            yuhaiin_store::GoProxyTransport::Direct
+                | yuhaiin_store::GoProxyTransport::Wireguard
+                | yuhaiin_store::GoProxyTransport::WarpMasque
         ) {
             // Direct and the userspace WireGuard stack both require an IP
             // endpoint before opening their final socket. Keep their lookup

@@ -11,6 +11,7 @@ members = [
     "crates/yuhaiin-store",
     "crates/yuhaiin-trie",
     "crates/yuhaiin-wireguard",
+    "crates/yuhaiin-masque",
     "crates/yuhaiin-backup",
     "crates/yuhaiin-api",
     "crates/yuhaiin-android",

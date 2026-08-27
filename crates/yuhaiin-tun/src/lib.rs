@@ -72,12 +72,14 @@ mod packet;
 #[path = "proxy.rs"]
 mod proxy_runtime;
 mod runtime;
+mod smoltcp_stack;
 
 pub use config::*;
 pub use dispatcher::*;
 pub use packet::*;
 pub use proxy_runtime::*;
 pub use runtime::*;
+pub use smoltcp_stack::{SmoltcpDatagram, SmoltcpStack, SmoltcpStackConfig, SmoltcpStream};
 #[allow(unused_imports)]
 pub(crate) use {config::*, dispatcher::*, packet::*, proxy_runtime::*, runtime::*};
 

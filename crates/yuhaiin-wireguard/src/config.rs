@@ -7,9 +7,9 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use serde::Deserialize;
-use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
+use smoltcp::wire::{IpAddress, IpCidr};
 use yuhaiin_core::dns_resolver::AsyncIpResolver;
-use yuhaiin_core::{DomainName, Endpoint, Error, ErrorKind, Network, ResolveStrategy, Result};
+use yuhaiin_core::{DomainName, Error, ErrorKind, ResolveStrategy, Result};
 
 /// Go-compatible WireGuard node configuration.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -490,18 +490,6 @@ pub(crate) fn split_host_port(value: &str) -> Result<(String, u16)> {
         port.parse()
             .map_err(|_| Error::invalid("WireGuard endpoint port is invalid"))?,
     ))
-}
-
-pub(crate) fn ip_endpoint(address: SocketAddr) -> IpEndpoint {
-    IpEndpoint::new(IpAddress::from(address.ip()), address.port())
-}
-
-pub(crate) fn listen_endpoint(port: u16) -> IpListenEndpoint {
-    IpListenEndpoint { addr: None, port }
-}
-
-pub(crate) fn core_endpoint(network: Network, address: SocketAddr) -> Endpoint {
-    Endpoint::ip(network, address)
 }
 
 pub(crate) fn error_io(error: impl std::fmt::Display) -> Error {
