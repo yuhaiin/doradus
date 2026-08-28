@@ -251,7 +251,7 @@ mod tests {
             updated_at: 1_700_000_000,
         };
         store
-            .replace_inbound_statistics(&[statistics.clone()])
+            .replace_inbound_statistics(std::slice::from_ref(&statistics))
             .unwrap();
         store
             .append_inbound_runtime_event(&InboundRuntimeEventInput {
