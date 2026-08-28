@@ -179,10 +179,10 @@ impl HappyEyeballsV2Dialer {
             }
 
             if pending.is_empty() {
-                if let Some(result) = attempts.next().await {
-                    if let Some(stream) = self.process_attempt(result, &mut errors, key) {
-                        return Ok(stream);
-                    }
+                if let Some(result) = attempts.next().await
+                    && let Some(stream) = self.process_attempt(result, &mut errors, key)
+                {
+                    return Ok(stream);
                 }
                 continue;
             }
@@ -341,76 +341,74 @@ impl HappyEyeballsV2Dialer {
         ))
     }
 
-    fn attempt<'a>(
+    async fn attempt<'a>(
         &'a self,
         candidate: TcpDialCandidate,
         local_bind_addresses: &'a [IpAddr],
         deadline: Instant,
-    ) -> impl std::future::Future<Output = AttemptResult> + Send + 'a {
-        async move {
-            let address = candidate.address;
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return AttemptResult::failure(
-                    candidate,
-                    Error::new(ErrorKind::Timeout, "Happy Eyeballs deadline elapsed"),
-                    Duration::ZERO,
-                );
-            }
-
-            let permit = if let Some(semaphore) = &self.semaphore {
-                match tokio::time::timeout(remaining, Arc::clone(semaphore).acquire_owned()).await {
-                    Ok(Ok(permit)) => Some(permit),
-                    Ok(Err(_)) => {
-                        return AttemptResult::failure(
-                            candidate,
-                            Error::new(ErrorKind::Closed, "Happy Eyeballs semaphore is closed"),
-                            Duration::ZERO,
-                        );
-                    }
-                    Err(_) => {
-                        return AttemptResult::failure(
-                            candidate,
-                            Error::new(
-                                ErrorKind::Timeout,
-                                "waiting for Happy Eyeballs permit timed out",
-                            ),
-                            remaining,
-                        );
-                    }
-                }
-            } else {
-                None
-            };
-
-            if let Some(observer) = &self.observer {
-                observer.tcp_attempt_started();
-            }
-            let started = Instant::now();
-            let local_bind = local_bind_addresses
-                .iter()
-                .copied()
-                .find(|local| local.is_ipv4() == address.is_ipv4())
-                .map(|local| SocketAddr::new(local, 0));
-            let result = connect_tokio_tcp_with_interface(
-                address,
-                local_bind,
-                candidate.bind_interface.as_deref(),
-                deadline.saturating_duration_since(started),
-            )
-            .await;
-            let elapsed = started.elapsed();
-            drop(permit);
-            if result.is_err() {
-                if let Some(observer) = &self.observer {
-                    observer.tcp_attempt_failed();
-                }
-            }
-            AttemptResult {
+    ) -> AttemptResult {
+        let address = candidate.address;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return AttemptResult::failure(
                 candidate,
-                result,
-                elapsed,
+                Error::new(ErrorKind::Timeout, "Happy Eyeballs deadline elapsed"),
+                Duration::ZERO,
+            );
+        }
+
+        let permit = if let Some(semaphore) = &self.semaphore {
+            match tokio::time::timeout(remaining, Arc::clone(semaphore).acquire_owned()).await {
+                Ok(Ok(permit)) => Some(permit),
+                Ok(Err(_)) => {
+                    return AttemptResult::failure(
+                        candidate,
+                        Error::new(ErrorKind::Closed, "Happy Eyeballs semaphore is closed"),
+                        Duration::ZERO,
+                    );
+                }
+                Err(_) => {
+                    return AttemptResult::failure(
+                        candidate,
+                        Error::new(
+                            ErrorKind::Timeout,
+                            "waiting for Happy Eyeballs permit timed out",
+                        ),
+                        remaining,
+                    );
+                }
             }
+        } else {
+            None
+        };
+
+        if let Some(observer) = &self.observer {
+            observer.tcp_attempt_started();
+        }
+        let started = Instant::now();
+        let local_bind = local_bind_addresses
+            .iter()
+            .copied()
+            .find(|local| local.is_ipv4() == address.is_ipv4())
+            .map(|local| SocketAddr::new(local, 0));
+        let result = connect_tokio_tcp_with_interface(
+            address,
+            local_bind,
+            candidate.bind_interface.as_deref(),
+            deadline.saturating_duration_since(started),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        drop(permit);
+        if result.is_err()
+            && let Some(observer) = &self.observer
+        {
+            observer.tcp_attempt_failed();
+        }
+        AttemptResult {
+            candidate,
+            result,
+            elapsed,
         }
     }
 

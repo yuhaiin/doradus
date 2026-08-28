@@ -4,7 +4,7 @@
 //! the IPv6-first default ordering and the short delay that lets the preferred
 //! DNS family answer before the fallback family is released.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -234,16 +234,8 @@ impl HappyEyeballsDirectProxy {
                 } else {
                     Arc::clone(&self.direct_resolver)
                 };
-                self.connect_resolved_domain(
-                    resolver,
-                    &host,
-                    port,
-                    context.resolver_policy.strategy,
-                    &context.local_bind_addresses,
-                    context.bind_interface.clone(),
-                    self.inner.timeout,
-                )
-                .await?
+                self.connect_resolved_domain(resolver, &host, port, context)
+                    .await?
             }
         };
         let local_addr = stream.local_addr().ok();
@@ -260,11 +252,10 @@ impl HappyEyeballsDirectProxy {
         resolver: Arc<dyn AsyncIpResolver>,
         host: &DomainName,
         port: u16,
-        strategy: ResolveStrategy,
-        local_bind_addresses: &[IpAddr],
-        bind_interface: Option<String>,
-        timeout: Duration,
+        context: &FlowContext,
     ) -> Result<tokio::net::TcpStream> {
+        let strategy = context.resolver_policy.strategy;
+        let bind_interface = context.bind_interface.clone();
         let (sender, receiver) = mpsc::channel(32);
         let dialer = Arc::clone(&self.dialer);
         let host_for_task = host.clone();
@@ -283,7 +274,12 @@ impl HappyEyeballsDirectProxy {
         });
         let result = self
             .dialer
-            .dial_candidate_stream(receiver, local_bind_addresses, timeout, Some(key))
+            .dial_candidate_stream(
+                receiver,
+                &context.local_bind_addresses,
+                self.inner.timeout,
+                Some(key),
+            )
             .await;
         // DNS is only an input to this connection attempt.  Once the TCP
         // deadline is reached or a winner exists, do not retain its task.
@@ -519,7 +515,7 @@ async fn coordinate_default_resolution(
                     }
                 }
                 if v6_released && !v4_released && v4_result.is_some() {
-                    send_candidates(&sender, v4_candidates.drain(..).collect()).await;
+                    send_candidates(&sender, std::mem::take(&mut v4_candidates)).await;
                     v4_released = true;
                     release_at = None;
                 }
@@ -545,14 +541,14 @@ async fn coordinate_default_resolution(
                     v4_released = true;
                     release_at = None;
                 } else if v6_result.is_some() {
-                    send_candidates(&sender, v4_candidates.drain(..).collect()).await;
+                    send_candidates(&sender, std::mem::take(&mut v4_candidates)).await;
                     v4_released = true;
                     release_at = None;
                 } else {
                     release_at = Some(std::time::Instant::now() + DNS_FAMILY_DELAY);
                 }
                 if v4_released && !v6_released && v6_result.is_some() {
-                    send_candidates(&sender, v6_candidates.drain(..).collect()).await;
+                    send_candidates(&sender, std::mem::take(&mut v6_candidates)).await;
                     v6_released = true;
                     release_at = None;
                 }
@@ -560,11 +556,11 @@ async fn coordinate_default_resolution(
             _ = &mut delay, if release_at.is_some() => {
                 release_at = None;
                 if !v6_released && !v6_candidates.is_empty() {
-                    send_candidates(&sender, v6_candidates.drain(..).collect()).await;
+                    send_candidates(&sender, std::mem::take(&mut v6_candidates)).await;
                     v6_released = true;
                 }
                 if !v4_released && !v4_candidates.is_empty() {
-                    send_candidates(&sender, v4_candidates.drain(..).collect()).await;
+                    send_candidates(&sender, std::mem::take(&mut v4_candidates)).await;
                     v4_released = true;
                 }
             }
@@ -578,63 +574,6 @@ async fn coordinate_default_resolution(
         if let Some(Err(error)) = v4_result {
             let _ = sender.send(Err(error)).await;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn semaphore_configuration_matches_go_bounds() {
-        let metrics = Arc::new(RuntimeMetrics::new());
-        assert!(new_dialer(0, Arc::clone(&metrics)).semaphore().is_none());
-        assert_eq!(
-            new_dialer(1, Arc::clone(&metrics))
-                .semaphore()
-                .unwrap()
-                .available_permits(),
-            10
-        );
-        assert_eq!(
-            new_dialer(9, Arc::clone(&metrics))
-                .semaphore()
-                .unwrap()
-                .available_permits(),
-            10
-        );
-        assert_eq!(
-            new_dialer(11, metrics)
-                .semaphore()
-                .unwrap()
-                .available_permits(),
-            11
-        );
-    }
-
-    #[test]
-    fn default_resolution_interleaves_address_families() {
-        let v6 = [
-            TcpDialCandidate::new("[2001:db8::1]:443".parse().unwrap(), None),
-            TcpDialCandidate::new("[2001:db8::2]:443".parse().unwrap(), None),
-        ];
-        let v4 = [
-            TcpDialCandidate::new("192.0.2.1:443".parse().unwrap(), None),
-            TcpDialCandidate::new("192.0.2.2:443".parse().unwrap(), None),
-        ];
-        let candidates = interleave(v6.into_iter(), v4.into_iter());
-        assert_eq!(
-            candidates
-                .iter()
-                .map(|candidate| candidate.address)
-                .collect::<Vec<_>>(),
-            vec![
-                "[2001:db8::1]:443".parse().unwrap(),
-                "192.0.2.1:443".parse().unwrap(),
-                "[2001:db8::2]:443".parse().unwrap(),
-                "192.0.2.2:443".parse().unwrap(),
-            ]
-        );
     }
 }
 
@@ -704,4 +643,61 @@ async fn send_addresses(
 ) {
     let candidates = candidates_for_family(dialer, key, addresses, family, port, bind_interface);
     send_candidates(sender, candidates).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semaphore_configuration_matches_go_bounds() {
+        let metrics = Arc::new(RuntimeMetrics::new());
+        assert!(new_dialer(0, Arc::clone(&metrics)).semaphore().is_none());
+        assert_eq!(
+            new_dialer(1, Arc::clone(&metrics))
+                .semaphore()
+                .unwrap()
+                .available_permits(),
+            10
+        );
+        assert_eq!(
+            new_dialer(9, Arc::clone(&metrics))
+                .semaphore()
+                .unwrap()
+                .available_permits(),
+            10
+        );
+        assert_eq!(
+            new_dialer(11, metrics)
+                .semaphore()
+                .unwrap()
+                .available_permits(),
+            11
+        );
+    }
+
+    #[test]
+    fn default_resolution_interleaves_address_families() {
+        let v6 = [
+            TcpDialCandidate::new("[2001:db8::1]:443".parse().unwrap(), None),
+            TcpDialCandidate::new("[2001:db8::2]:443".parse().unwrap(), None),
+        ];
+        let v4 = [
+            TcpDialCandidate::new("192.0.2.1:443".parse().unwrap(), None),
+            TcpDialCandidate::new("192.0.2.2:443".parse().unwrap(), None),
+        ];
+        let candidates = interleave(v6.into_iter(), v4.into_iter());
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.address)
+                .collect::<Vec<_>>(),
+            vec![
+                "[2001:db8::1]:443".parse().unwrap(),
+                "192.0.2.1:443".parse().unwrap(),
+                "[2001:db8::2]:443".parse().unwrap(),
+                "192.0.2.2:443".parse().unwrap(),
+            ]
+        );
+    }
 }
