@@ -15,6 +15,7 @@ use tokio::task::JoinSet;
 use doradus_core::flow::{Flow as TunFlow, FlowKey as TunFlowKey, FlowObserver as TunFlowObserver};
 use doradus_core::proxy::{AsyncDatagram, AsyncProxySelector, BoxAsyncStream};
 use doradus_core::{BoxFuture, Endpoint, FlowContext, Network, Result};
+use doradus_metrics::{InboundProtocol, MetricNetwork, ResultKind};
 
 use super::InboundSpec;
 use crate::inbound::adapters::common::{
@@ -235,6 +236,8 @@ impl InboundHandler {
         protocol: &str,
         mut context: FlowContext,
     ) -> Result<InboundStream> {
+        let metrics = self.monitor.metrics();
+        metrics.inbound_request(MetricNetwork::Tcp, InboundProtocol::from_name(protocol));
         self.selector.route_context(&mut context);
         let process = context.process.clone();
         let destination = context.destination.clone();
@@ -247,9 +250,11 @@ impl InboundHandler {
                     &error.to_string(),
                     process.as_deref(),
                 );
+                metrics.inbound_outcome(ResultKind::Failure);
                 return Err(error);
             }
         };
+        metrics.inbound_outcome(ResultKind::Success);
         record_outbound_stream(&mut context, &outbound);
         Ok(InboundStream { outbound, context })
     }
@@ -318,6 +323,11 @@ impl InboundHandler {
         mut context: FlowContext,
         peer: SocketAddr,
     ) -> Result<InboundDatagram> {
+        let metrics = self.monitor.metrics();
+        metrics.inbound_request(
+            MetricNetwork::Udp,
+            InboundProtocol::from_name(&self.spec.protocol),
+        );
         self.selector.route_context(&mut context);
         let target = context.effective_destination().to_string();
         let process = context.process.clone();
@@ -330,9 +340,11 @@ impl InboundHandler {
                     &error.to_string(),
                     process.as_deref(),
                 );
+                metrics.inbound_outcome(ResultKind::Failure);
                 return Err(error);
             }
         };
+        metrics.inbound_outcome(ResultKind::Success);
         record_outbound_datagram(&mut context, &*datagram);
         let flow = self.flow_key(&context, peer);
         Ok(InboundDatagram {

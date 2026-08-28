@@ -9,6 +9,7 @@ pub(super) fn build(state: ApiState) -> Router {
     let web_root = state.web_root.clone();
     let router = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/api/v2/info", get(info))
         .route("/api/v2/update/check", post(update_check))
         .route("/api/v2/update/apply", post(update_apply))

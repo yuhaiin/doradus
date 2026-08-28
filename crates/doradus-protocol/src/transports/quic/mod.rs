@@ -21,6 +21,7 @@ use bytes::Bytes;
 use doradus_core::network::bind_tokio_udp_socket_for_target;
 use doradus_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use doradus_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use doradus_metrics::RuntimeMetrics;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, mpsc};
 
@@ -53,9 +54,51 @@ struct StatsInner {
     datagrams_received: AtomicUsize,
     datagrams_dropped: AtomicUsize,
     fragments_expired: AtomicUsize,
+    runtime: Option<Arc<RuntimeMetrics>>,
 }
 
 impl StatsInner {
+    fn new(runtime: Option<Arc<RuntimeMetrics>>) -> Self {
+        Self {
+            runtime,
+            ..Self::default()
+        }
+    }
+
+    fn datagram_sent(&self) {
+        self.datagrams_sent.fetch_add(1, Ordering::Relaxed);
+        if let Some(runtime) = &self.runtime {
+            runtime.quic_datagram_sent();
+        }
+    }
+
+    fn datagram_received(&self) {
+        self.datagrams_received.fetch_add(1, Ordering::Relaxed);
+        if let Some(runtime) = &self.runtime {
+            runtime.quic_datagram_received();
+        }
+    }
+
+    fn datagram_dropped(&self) {
+        self.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+        if let Some(runtime) = &self.runtime {
+            runtime.quic_datagram_dropped();
+        }
+    }
+
+    fn fragments_expired(&self, count: usize) {
+        self.fragments_expired.fetch_add(count, Ordering::Relaxed);
+        if let Some(runtime) = &self.runtime {
+            runtime.quic_fragments_expired(count as u64);
+        }
+    }
+
+    fn queued_bytes_changed(&self, bytes: i64) {
+        if let Some(runtime) = &self.runtime {
+            runtime.change_quic_queued_bytes(bytes);
+        }
+    }
+
     fn snapshot(&self) -> QuicStats {
         QuicStats {
             datagrams_sent: self.datagrams_sent.load(Ordering::Relaxed),
@@ -158,16 +201,22 @@ pub struct QuicProxy {
     config: Arc<QuicConfig>,
     client_config: Arc<rustls::ClientConfig>,
     session: Mutex<Option<Arc<ClientSession>>>,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 impl QuicProxy {
     pub fn new(config: QuicConfig) -> Result<Self> {
+        Self::new_with_metrics(config, Arc::new(RuntimeMetrics::new()))
+    }
+
+    pub fn new_with_metrics(config: QuicConfig, metrics: Arc<RuntimeMetrics>) -> Result<Self> {
         config.validate()?;
         let client_config = build_client_tls_config(&config)?;
         Ok(Self {
             config: Arc::new(config),
             client_config,
             session: Mutex::const_new(None),
+            metrics,
         })
     }
 
@@ -175,11 +224,20 @@ impl QuicProxy {
         config: QuicConfig,
         client_config: Arc<rustls::ClientConfig>,
     ) -> Result<Self> {
+        Self::with_client_config_and_metrics(config, client_config, Arc::new(RuntimeMetrics::new()))
+    }
+
+    pub fn with_client_config_and_metrics(
+        config: QuicConfig,
+        client_config: Arc<rustls::ClientConfig>,
+        metrics: Arc<RuntimeMetrics>,
+    ) -> Result<Self> {
         config.validate()?;
         Ok(Self {
             config: Arc::new(config),
             client_config: force_alpn(client_config),
             session: Mutex::const_new(None),
+            metrics,
         })
     }
 
@@ -243,6 +301,7 @@ impl QuicProxy {
             connection,
             local_addr,
             &self.config,
+            Arc::clone(&self.metrics),
         ));
         tokio::spawn(run_client_dispatcher(session.clone()));
         *stored = Some(session.clone());
@@ -288,6 +347,7 @@ impl AsyncProxy for QuicProxy {
 pub struct QuicServer {
     endpoint: quinn::Endpoint,
     config: QuicServerConfig,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 impl QuicServer {
@@ -296,11 +356,24 @@ impl QuicServer {
         tls_config: Arc<rustls::ServerConfig>,
         config: QuicServerConfig,
     ) -> Result<Self> {
+        Self::new_with_metrics(bind, tls_config, config, Arc::new(RuntimeMetrics::new()))
+    }
+
+    pub fn new_with_metrics(
+        bind: SocketAddr,
+        tls_config: Arc<rustls::ServerConfig>,
+        config: QuicServerConfig,
+        metrics: Arc<RuntimeMetrics>,
+    ) -> Result<Self> {
         config.validate()?;
         let server_config = build_quinn_server_config(tls_config, &config)?;
         let endpoint = quinn::Endpoint::server(server_config, bind)
             .map_err(|error| Error::new(ErrorKind::Io, format!("bind QUIC server: {error}")))?;
-        Ok(Self { endpoint, config })
+        Ok(Self {
+            endpoint,
+            config,
+            metrics,
+        })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -323,6 +396,7 @@ impl QuicServer {
             connection,
             local_addr,
             self.config.clone(),
+            Arc::clone(&self.metrics),
         ))
     }
 
@@ -344,8 +418,9 @@ impl QuicServerConnection {
         connection: quinn::Connection,
         local_addr: SocketAddr,
         config: QuicServerConfig,
+        metrics: Arc<RuntimeMetrics>,
     ) -> Self {
-        let dispatcher = ServerDispatcher::new(connection.clone(), local_addr, config);
+        let dispatcher = ServerDispatcher::new(connection.clone(), local_addr, config, metrics);
         tokio::spawn(run_server_dispatcher(dispatcher.clone()));
         Self {
             remote_addr: connection.remote_address(),
@@ -441,6 +516,7 @@ impl ClientSession {
         connection: quinn::Connection,
         local_addr: SocketAddr,
         config: &QuicConfig,
+        metrics: Arc<RuntimeMetrics>,
     ) -> Self {
         Self {
             endpoint,
@@ -449,7 +525,7 @@ impl ClientSession {
             next_association_id: AtomicU32::new(1),
             associations: Mutex::const_new(HashMap::new()),
             config: server_config_from_client(config),
-            stats: Arc::new(StatsInner::default()),
+            stats: Arc::new(StatsInner::new(Some(metrics))),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -544,6 +620,7 @@ impl ServerDispatcher {
         connection: quinn::Connection,
         local_addr: SocketAddr,
         config: QuicServerConfig,
+        metrics: Arc<RuntimeMetrics>,
     ) -> Arc<Self> {
         let (accept_tx, accept_rx) = mpsc::channel(config.max_associations);
         Arc::new(Self {
@@ -555,7 +632,7 @@ impl ServerDispatcher {
             accept_rx: Mutex::const_new(accept_rx),
             config,
             queued_bytes: Arc::new(AtomicUsize::new(0)),
-            stats: Arc::new(StatsInner::default()),
+            stats: Arc::new(StatsInner::new(Some(metrics))),
         })
     }
 
@@ -565,7 +642,7 @@ impl ServerDispatcher {
             return Some(existing.clone());
         }
         if map.len() >= self.config.max_associations {
-            self.stats.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+            self.stats.datagram_dropped();
             return None;
         }
         let association = Arc::new(Association::new(
@@ -581,7 +658,7 @@ impl ServerDispatcher {
             self.config.rx_memory_budget,
         ));
         if self.accept_tx.try_send(association.clone()).is_err() {
-            self.stats.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+            self.stats.datagram_dropped();
             return None;
         }
         map.insert(id, association.clone());
@@ -682,14 +759,14 @@ impl Association {
         }
         let max_size = self.connection.max_datagram_size();
         let Some(max_size) = max_size else {
-            self.stats.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+            self.stats.datagram_dropped();
             return Ok(payload.len());
         };
         let message_id = self.message_id.fetch_add(1, Ordering::Relaxed);
         let frames = match encode_datagrams(self.id, message_id, payload, max_size) {
             Ok(frames) => frames,
             Err(_) => {
-                self.stats.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                self.stats.datagram_dropped();
                 return Ok(payload.len());
             }
         };
@@ -699,7 +776,7 @@ impl Association {
                 Err(quinn::SendDatagramError::TooLarge)
                 | Err(quinn::SendDatagramError::UnsupportedByPeer)
                 | Err(quinn::SendDatagramError::Disabled) => {
-                    self.stats.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                    self.stats.datagram_dropped();
                     return Ok(payload.len());
                 }
                 Err(quinn::SendDatagramError::ConnectionLost(error)) => {
@@ -710,7 +787,7 @@ impl Association {
                 }
             }
         }
-        self.stats.datagrams_sent.fetch_add(1, Ordering::Relaxed);
+        self.stats.datagram_sent();
         *self.last_activity.lock().await = Instant::now();
         Ok(payload.len())
     }
@@ -729,14 +806,17 @@ impl Association {
         };
         let size = payload.len();
         let queued = self.queued_bytes.fetch_add(size, Ordering::AcqRel);
+        self.stats.queued_bytes_changed(size as i64);
         if queued.saturating_add(size) > self.queue_budget {
             self.queued_bytes.fetch_sub(size, Ordering::AcqRel);
-            self.stats.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+            self.stats.queued_bytes_changed(-(size as i64));
+            self.stats.datagram_dropped();
             return;
         }
         if sender.try_send(payload).is_err() {
             self.queued_bytes.fetch_sub(size, Ordering::AcqRel);
-            self.stats.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+            self.stats.queued_bytes_changed(-(size as i64));
+            self.stats.datagram_dropped();
         }
     }
 
@@ -747,6 +827,7 @@ impl Association {
             .await
             .ok_or_else(|| Error::new(ErrorKind::Closed, "QUIC datagram association closed"))?;
         self.queued_bytes.fetch_sub(payload.len(), Ordering::AcqRel);
+        self.stats.queued_bytes_changed(-(payload.len() as i64));
         if payload.len() > buffer.len() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
@@ -759,9 +840,7 @@ impl Association {
 
     async fn expire_fragments(&self, now: Instant) {
         let expired = self.reassembler.lock().await.expire(now);
-        self.stats
-            .fragments_expired
-            .fetch_add(expired, Ordering::Relaxed);
+        self.stats.fragments_expired(expired);
     }
 
     async fn close(&self) {
@@ -787,6 +866,7 @@ impl Association {
         let mut receiver = self.receiver.lock().await;
         while let Ok(payload) = receiver.try_recv() {
             self.queued_bytes.fetch_sub(payload.len(), Ordering::AcqRel);
+            self.stats.queued_bytes_changed(-(payload.len() as i64));
         }
     }
 
@@ -806,9 +886,9 @@ async fn run_client_dispatcher(session: Arc<ClientSession>) {
         tokio::select! {
             datagram = session.connection.read_datagram() => {
                 let Ok(datagram) = datagram else { break };
-                session.stats.datagrams_received.fetch_add(1, Ordering::Relaxed);
+                session.stats.datagram_received();
                 let Ok(frame) = decode_frame(&datagram) else {
-                    session.stats.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                    session.stats.datagram_dropped();
                     continue;
                 };
                 let id = match frame {
@@ -818,7 +898,7 @@ async fn run_client_dispatcher(session: Arc<ClientSession>) {
                 if let Some(association) = association {
                     association.receive_frame(frame, Instant::now()).await;
                 } else {
-                    session.stats.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                    session.stats.datagram_dropped();
                 }
             }
             _ = ticker.tick() => {
@@ -845,9 +925,9 @@ async fn run_server_dispatcher(dispatcher: Arc<ServerDispatcher>) {
         tokio::select! {
             datagram = dispatcher.connection.read_datagram() => {
                 let Ok(datagram) = datagram else { break };
-                dispatcher.stats.datagrams_received.fetch_add(1, Ordering::Relaxed);
+                dispatcher.stats.datagram_received();
                 let Ok(frame) = decode_frame(&datagram) else {
-                    dispatcher.stats.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                    dispatcher.stats.datagram_dropped();
                     continue;
                 };
                 let id = match frame {

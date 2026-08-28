@@ -74,42 +74,6 @@ pub struct ChainRuntimeStats {
     pub h2_pool: H2PoolStats,
 }
 
-impl ChainRuntimeStats {
-    /// Render a dependency-free Prometheus text snapshot.
-    ///
-    /// This is intentionally a pure pull-format encoder: the embedding app
-    /// owns the HTTP endpoint, logging cadence, labels and authentication.
-    /// No listener, task or global registry is created by the transport crate.
-    pub fn render_prometheus(&self) -> String {
-        format!(
-            "# HELP doradus_chain_h2_connections Current live HTTP/2 connections.\n\
-# TYPE doradus_chain_h2_connections gauge\n\
-doradus_chain_h2_connections {}\n\
-# HELP doradus_chain_h2_active_streams Current active HTTP/2 CONNECT streams.\n\
-# TYPE doradus_chain_h2_active_streams gauge\n\
-doradus_chain_h2_active_streams {}\n\
-# HELP doradus_chain_h2_connection_attempts Total HTTP/2 connection attempts.\n\
-# TYPE doradus_chain_h2_connection_attempts counter\n\
-doradus_chain_h2_connection_attempts {}\n\
-# HELP doradus_chain_h2_connection_failures Total HTTP/2 connection failures.\n\
-# TYPE doradus_chain_h2_connection_failures counter\n\
-doradus_chain_h2_connection_failures {}\n\
-# HELP doradus_chain_h2_stream_capacity_rejections Total stream-capacity rejections.\n\
-# TYPE doradus_chain_h2_stream_capacity_rejections counter\n\
-doradus_chain_h2_stream_capacity_rejections {}\n\
-# HELP doradus_chain_h2_stream_open_failures Total CONNECT stream open failures.\n\
-# TYPE doradus_chain_h2_stream_open_failures counter\n\
-doradus_chain_h2_stream_open_failures {}\n",
-            self.h2_connections,
-            self.h2_active_streams,
-            self.h2_pool.connection_attempts,
-            self.h2_pool.connection_failures,
-            self.h2_pool.stream_capacity_rejections,
-            self.h2_pool.stream_open_failures,
-        )
-    }
-}
-
 const PING_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_UOT_RETRY_BYTES: usize = 256 * 1024;
 const MAX_UOT_RETRY_FRAMES: usize = 128;

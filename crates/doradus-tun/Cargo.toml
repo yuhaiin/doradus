@@ -15,6 +15,7 @@ smoltcp = { version = "0.13.1", default-features = false, features = ["std", "me
 tokio = { version = "1.50.0", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tun-rs = { version = "2.8.8", default-features = false, features = ["async_io"] }
 doradus-core = { path = "../doradus-core" }
+doradus-metrics = { path = "../doradus-metrics" }
 doradus-protocol = { path = "../doradus-protocol" }
 
 # The platform module is the deliberate unsafe boundary around tun-rs's

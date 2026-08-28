@@ -8,7 +8,15 @@ impl ConnectionMonitor {
     /// `statistics.runtime` blob is imported once for upgrade compatibility
     /// and then removed.
     pub async fn load_with_store(store: ConfigStore) -> doradus_core::Result<Self> {
-        let monitor = Self::new();
+        Self::load_with_store_and_metrics(store, Arc::new(doradus_metrics::RuntimeMetrics::new()))
+            .await
+    }
+
+    pub(crate) async fn load_with_store_and_metrics(
+        store: ConfigStore,
+        metrics: Arc<doradus_metrics::RuntimeMetrics>,
+    ) -> doradus_core::Result<Self> {
+        let monitor = Self::new_with_metrics(metrics);
         if let Some(bytes) = store.get_config(PERSISTENCE_KEY).await? {
             let persisted: PersistedMonitor = serde_json::from_slice(&bytes).map_err(|error| {
                 doradus_core::Error::new(

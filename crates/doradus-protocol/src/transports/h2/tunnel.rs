@@ -17,6 +17,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
 
 use doradus_core::{Error, ErrorKind, Result};
+use doradus_metrics::RuntimeMetrics;
 
 const DEFAULT_MAX_CONNECTIONS_PER_ENDPOINT: usize = 4;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -39,6 +40,7 @@ pub struct H2Connection {
     max_streams: usize,
     last_used_millis: AtomicU64,
     local_addr: Option<SocketAddr>,
+    telemetry: OnceLock<Arc<H2PoolMetrics>>,
 }
 
 /// Monotonic operational counters for the HTTP/2 pool.
@@ -62,15 +64,82 @@ struct H2PoolMetrics {
     connection_failures: AtomicU64,
     stream_capacity_rejections: AtomicU64,
     stream_open_failures: AtomicU64,
+    connections: AtomicUsize,
+    active_streams: AtomicUsize,
+    runtime: Option<Arc<RuntimeMetrics>>,
 }
 
 impl H2PoolMetrics {
+    fn with_runtime(runtime: Arc<RuntimeMetrics>) -> Self {
+        Self {
+            runtime: Some(runtime),
+            ..Self::default()
+        }
+    }
+
     fn snapshot(&self) -> H2PoolStats {
         H2PoolStats {
             connection_attempts: self.connection_attempts.load(Ordering::Relaxed),
             connection_failures: self.connection_failures.load(Ordering::Relaxed),
             stream_capacity_rejections: self.stream_capacity_rejections.load(Ordering::Relaxed),
             stream_open_failures: self.stream_open_failures.load(Ordering::Relaxed),
+        }
+    }
+
+    fn connection_attempt(&self) {
+        self.connection_attempts.fetch_add(1, Ordering::Relaxed);
+        if let Some(runtime) = &self.runtime {
+            runtime.chain_h2_connection_attempt();
+        }
+    }
+
+    fn connection_failure(&self) {
+        self.connection_failures.fetch_add(1, Ordering::Relaxed);
+        if let Some(runtime) = &self.runtime {
+            runtime.chain_h2_connection_failure();
+        }
+    }
+
+    fn stream_capacity_rejection(&self) {
+        self.stream_capacity_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(runtime) = &self.runtime {
+            runtime.chain_h2_stream_capacity_rejection();
+        }
+    }
+
+    fn stream_open_failure(&self) {
+        self.stream_open_failures.fetch_add(1, Ordering::Relaxed);
+        if let Some(runtime) = &self.runtime {
+            runtime.chain_h2_stream_open_failure();
+        }
+    }
+
+    fn connection_added(&self) {
+        self.connections.fetch_add(1, Ordering::Relaxed);
+        if let Some(runtime) = &self.runtime {
+            runtime.chain_h2_connection_opened();
+        }
+    }
+
+    fn connection_removed(&self) {
+        self.connections.fetch_sub(1, Ordering::Relaxed);
+        if let Some(runtime) = &self.runtime {
+            runtime.chain_h2_connection_closed();
+        }
+    }
+
+    fn stream_opened(&self) {
+        self.active_streams.fetch_add(1, Ordering::Relaxed);
+        if let Some(runtime) = &self.runtime {
+            runtime.chain_h2_stream_opened();
+        }
+    }
+
+    fn stream_closed(&self) {
+        self.active_streams.fetch_sub(1, Ordering::Relaxed);
+        if let Some(runtime) = &self.runtime {
+            runtime.chain_h2_stream_closed();
         }
     }
 }
@@ -120,6 +189,7 @@ impl H2Connection {
             max_streams: max_streams.max(1),
             last_used_millis: AtomicU64::new(monotonic_millis()),
             local_addr,
+            telemetry: OnceLock::new(),
         });
         let closed = result.closed.clone();
         let shutdown = result.shutdown.clone();
@@ -150,6 +220,10 @@ impl H2Connection {
 
     pub fn active_streams(&self) -> usize {
         self.active_streams.load(Ordering::Acquire)
+    }
+
+    fn attach_telemetry(&self, telemetry: Arc<H2PoolMetrics>) {
+        let _ = self.telemetry.set(telemetry);
     }
 
     #[cfg(test)]
@@ -184,6 +258,9 @@ impl H2Connection {
                 Ok(_) => break,
                 Err(current) => active = current,
             }
+        }
+        if let Some(telemetry) = self.telemetry.get() {
+            telemetry.stream_opened();
         }
         self.last_used_millis
             .store(monotonic_millis(), Ordering::Release);
@@ -254,6 +331,9 @@ impl H2Connection {
 
     fn release_stream(&self) {
         self.active_streams.fetch_sub(1, Ordering::AcqRel);
+        if let Some(telemetry) = self.telemetry.get() {
+            telemetry.stream_closed();
+        }
     }
 
     fn is_idle(&self, idle_timeout: Duration) -> bool {
@@ -361,6 +441,23 @@ impl H2Pool {
         }
     }
 
+    /// Create a pool whose lifecycle and backpressure counters feed the
+    /// owning runtime collector.
+    pub fn with_limits_and_metrics(
+        max_connections_per_endpoint: usize,
+        idle_timeout: Duration,
+        runtime: Arc<RuntimeMetrics>,
+    ) -> Self {
+        Self {
+            connections: Mutex::new(HashMap::new()),
+            connect_lock: Mutex::new(()),
+            next: AtomicUsize::new(0),
+            max_connections_per_endpoint: max_connections_per_endpoint.max(1),
+            idle_timeout,
+            metrics: Arc::new(H2PoolMetrics::with_runtime(runtime)),
+        }
+    }
+
     pub fn stats(&self) -> H2PoolStats {
         self.metrics.snapshot()
     }
@@ -465,15 +562,11 @@ impl H2Pool {
                         self.remove_connection(&key, &connection).await;
                     }
                     Err(error) if connection.at_capacity() => {
-                        self.metrics
-                            .stream_capacity_rejections
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics.stream_capacity_rejection();
                         let _ = error;
                     }
                     Err(error) => {
-                        self.metrics
-                            .stream_open_failures
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics.stream_open_failure();
                         last_error = Some(error);
                         self.remove_connection(&key, &connection).await;
                         connection.close().await;
@@ -511,9 +604,7 @@ impl H2Pool {
                     // connect lock and must not double-count it.
                     Err(_) if connection.at_capacity() => {}
                     Err(error) => {
-                        self.metrics
-                            .stream_open_failures
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics.stream_open_failure();
                         last_error = Some(error);
                         self.remove_connection(&key, &connection).await;
                         connection.close().await;
@@ -545,6 +636,7 @@ impl H2Pool {
             .entry(key)
             .or_default()
             .push(connection);
+        self.metrics.connection_added();
         Ok(stream)
     }
 
@@ -569,21 +661,22 @@ impl H2Pool {
                 if index > 0 {
                     tokio::time::sleep(HAPPY_EYEBALLS_DELAY * index as u32).await;
                 }
-                metrics.connection_attempts.fetch_add(1, Ordering::Relaxed);
+                metrics.connection_attempt();
                 let connection = match connect(endpoint.clone()).await {
                     Ok(connection) => connection,
                     Err(error) => {
-                        metrics.connection_failures.fetch_add(1, Ordering::Relaxed);
+                        metrics.connection_failure();
                         return Err(error);
                     }
                 };
+                connection.attach_telemetry(Arc::clone(&metrics));
                 let stream = match connection
                     .open_connect_stream_with_local_addr(concurrency)
                     .await
                 {
                     Ok(stream) => stream,
                     Err(error) => {
-                        metrics.stream_open_failures.fetch_add(1, Ordering::Relaxed);
+                        metrics.stream_open_failure();
                         return Err(error);
                     }
                 };
@@ -604,7 +697,11 @@ impl H2Pool {
     async fn remove_connection(&self, key: &H2PoolKey, target: &Arc<H2Connection>) {
         let mut connections = self.connections.lock().await;
         if let Some(current) = connections.get_mut(key) {
+            let before = current.len();
             current.retain(|connection| !Arc::ptr_eq(connection, target));
+            if current.len() != before {
+                self.metrics.connection_removed();
+            }
             if current.is_empty() {
                 connections.remove(key);
             }
@@ -630,6 +727,7 @@ impl H2Pool {
             connections.retain(|_, current| !current.is_empty());
         }
         for connection in idle {
+            self.metrics.connection_removed();
             connection.close().await;
         }
     }
@@ -644,6 +742,7 @@ impl H2Pool {
             .collect::<Vec<_>>();
         let mut closers = JoinSet::new();
         for connection in connections {
+            self.metrics.connection_removed();
             closers.spawn(async move {
                 connection.close().await;
             });

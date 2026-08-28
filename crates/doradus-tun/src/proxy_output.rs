@@ -221,6 +221,7 @@ impl TunProxyRuntime {
                         self.close_udp_flow(dispatcher, flow)?;
                     }
                 }
+                self.sync_nat_metrics();
                 Ok(true)
             }
         }

@@ -28,6 +28,18 @@ impl ChainClient {
         chain: ValidatedChain,
         resolver: Arc<dyn AsyncIpResolver>,
     ) -> Result<Self> {
+        Self::new_with_resolver_and_metrics(
+            chain,
+            resolver,
+            Arc::new(doradus_metrics::RuntimeMetrics::new()),
+        )
+    }
+
+    pub fn new_with_resolver_and_metrics(
+        chain: ValidatedChain,
+        resolver: Arc<dyn AsyncIpResolver>,
+        metrics: Arc<doradus_metrics::RuntimeMetrics>,
+    ) -> Result<Self> {
         // Go's ContractDialer starts with zeroproxy.  For transport purposes
         // that sentinel behaves like direct dialing until a node replaces it.
         let direct: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy {
@@ -79,7 +91,8 @@ impl ChainClient {
                     let upstream = proxy
                         .take()
                         .ok_or_else(|| Error::invalid("HTTP/2 node has no parent transport"))?;
-                    let layer = H2ChainProxy::new(upstream, config.clone(), index);
+                    let layer =
+                        H2ChainProxy::new(upstream, config.clone(), index, Arc::clone(&metrics));
                     proxy = Some(layer.clone());
                     h2_layers.push(layer);
                 }
@@ -138,6 +151,14 @@ impl ChainClient {
         resolver: Arc<dyn AsyncIpResolver>,
     ) -> Result<Self> {
         Self::new_with_resolver(parse_go_node(json)?, resolver)
+    }
+
+    pub fn from_go_json_with_resolver_and_metrics(
+        json: &str,
+        resolver: Arc<dyn AsyncIpResolver>,
+        metrics: Arc<doradus_metrics::RuntimeMetrics>,
+    ) -> Result<Self> {
+        Self::new_with_resolver_and_metrics(parse_go_node(json)?, resolver, metrics)
     }
 
     pub fn chain(&self) -> &ValidatedChain {
@@ -202,11 +223,6 @@ impl ChainClient {
             h2_active_streams: active_streams,
             h2_pool: stats,
         }
-    }
-
-    /// Render a point-in-time Prometheus snapshot for an embedding exporter.
-    pub async fn prometheus_metrics(&self) -> String {
-        self.runtime_stats().await.render_prometheus()
     }
 
     /// Return monotonic HTTP/2 pool counters for operational backpressure and

@@ -1,7 +1,6 @@
 //! Minimal, runtime-independent NAT/connection tracking table.
 
 use std::collections::{HashMap, HashSet};
-use std::fmt::{self, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -80,94 +79,6 @@ pub struct NatStats {
     pub translated_rebinds: u64,
     pub expired_bindings: u64,
     pub explicit_closes: u64,
-}
-
-fn append_metric<T: fmt::Display>(output: &mut String, name: &str, kind: &str, value: T) {
-    let _ = writeln!(output, "# TYPE {name} {kind}");
-    let _ = writeln!(output, "{name} {value}");
-}
-
-impl NatStats {
-    /// Render a dependency-free Prometheus text snapshot for the NAT table.
-    ///
-    /// Applications can concatenate this output with other subsystem
-    /// snapshots or expose it through their own authenticated endpoint.
-    pub fn render_prometheus(&self) -> String {
-        let mut output = String::new();
-        let gauges = [
-            (
-                "doradus_nat_active_bindings",
-                "Current endpoint-independent Full Cone bindings.",
-                self.active_bindings,
-            ),
-            (
-                "doradus_nat_active_destinations",
-                "Current logical destinations attached to Full Cone bindings.",
-                self.active_destinations,
-            ),
-            (
-                "doradus_nat_reverse_mappings",
-                "Current translated-endpoint reverse mappings.",
-                self.reverse_mappings,
-            ),
-        ];
-        for (name, help, value) in gauges {
-            let _ = writeln!(output, "# HELP {name} {help}");
-            append_metric(&mut output, name, "gauge", value);
-        }
-        let counters = [
-            (
-                "doradus_nat_allocations",
-                "Total new Full Cone bindings.",
-                self.allocations,
-            ),
-            (
-                "doradus_nat_reuses",
-                "Total endpoint-independent mapping reuses.",
-                self.reuses,
-            ),
-            (
-                "doradus_nat_touch_hits",
-                "Total successful NAT touch operations.",
-                self.touch_hits,
-            ),
-            (
-                "doradus_nat_touch_misses",
-                "Total NAT touch misses or expired bindings.",
-                self.touch_misses,
-            ),
-            (
-                "doradus_nat_reverse_lookups",
-                "Total translated-endpoint reverse lookups.",
-                self.reverse_lookups,
-            ),
-            (
-                "doradus_nat_reverse_hits",
-                "Total successful translated-endpoint reverse lookups.",
-                self.reverse_hits,
-            ),
-            (
-                "doradus_nat_translated_rebinds",
-                "Total translated endpoint rebinds.",
-                self.translated_rebinds,
-            ),
-            (
-                "doradus_nat_expired_bindings",
-                "Total bindings removed by expiry.",
-                self.expired_bindings,
-            ),
-            (
-                "doradus_nat_explicit_closes",
-                "Total bindings removed by explicit close.",
-                self.explicit_closes,
-            ),
-        ];
-        for (name, help, value) in counters {
-            let _ = writeln!(output, "# HELP {name} {help}");
-            append_metric(&mut output, name, "counter", value);
-        }
-        output
-    }
 }
 
 #[derive(Default)]

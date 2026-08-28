@@ -7,6 +7,7 @@ use std::{
 
 use doradus_core::Result;
 use doradus_core::proxy::AsyncProxy;
+use doradus_metrics::RuntimeMetrics;
 use doradus_store::{ConfigMutation, ConfigStore};
 
 use crate::data_plane::{ReloadableAsyncDnsHandler, RuntimeDnsHandler, inbound_dns_handler};
@@ -31,6 +32,7 @@ pub struct RuntimeController {
     reload_error: Arc<RwLock<Option<String>>>,
     selectors: Arc<RwLock<Vec<Weak<RuntimeProxySelector>>>>,
     monitor: Arc<ConnectionMonitor>,
+    metrics: Arc<RuntimeMetrics>,
     inbound_runtime: Arc<InboundRuntimeState>,
     reload_events: tokio::sync::broadcast::Sender<()>,
     dns_reload_events: tokio::sync::broadcast::Sender<()>,
@@ -71,6 +73,7 @@ impl ReloadPlan {
 impl RuntimeController {
     /// Build and publish the initial snapshot before exposing the controller.
     pub async fn from_builder(builder: RuntimeBuilder) -> Result<Self> {
+        let metrics = builder.metrics();
         let builder = Arc::new(builder);
         let resolver_proxy_bridge = builder.resolver_proxy_bridge();
         let initial_snapshot = builder.build().await?;
@@ -78,7 +81,13 @@ impl RuntimeController {
         let (dns_reload_events, _) = tokio::sync::broadcast::channel(32);
         let (inbound_reload_events, _) = tokio::sync::broadcast::channel(32);
         let inbound_runtime = Arc::new(InboundRuntimeState::new(builder.store().clone()));
-        let monitor = Arc::new(ConnectionMonitor::load_with_store(builder.store().clone()).await?);
+        let monitor = Arc::new(
+            ConnectionMonitor::load_with_store_and_metrics(
+                builder.store().clone(),
+                metrics.clone(),
+            )
+            .await?,
+        );
         if let Some(bridge) = &resolver_proxy_bridge {
             bridge.set_monitor(&monitor);
         }
@@ -101,6 +110,7 @@ impl RuntimeController {
             reload_error: Arc::new(RwLock::new(None)),
             selectors: Arc::new(RwLock::new(Vec::new())),
             monitor,
+            metrics,
             inbound_runtime,
             reload_events,
             dns_reload_events,
@@ -121,6 +131,12 @@ impl RuntimeController {
 
     pub fn monitor(&self) -> Arc<ConnectionMonitor> {
         self.monitor.clone()
+    }
+
+    /// Return the process-lifetime metrics collector shared by all runtime
+    /// owners. Configuration reloads intentionally do not replace it.
+    pub fn metrics(&self) -> Arc<RuntimeMetrics> {
+        self.metrics.clone()
     }
 
     pub fn inbound_runtime(&self) -> Arc<InboundRuntimeState> {
@@ -368,6 +384,7 @@ impl RuntimeController {
         let (nat, idle_timeout) = snapshot.new_full_cone_nat()?;
         let mut runtime = doradus_tun::TunProxyRuntime::new(selector.clone(), channel_capacity)?
             .with_nat(nat, idle_timeout)?
+            .with_metrics(self.metrics())
             .with_udp_buffer_size(snapshot.settings.udp_buffer_size)?;
         runtime = runtime.with_observer(self.monitor.clone());
         self.register_selector(&selector);

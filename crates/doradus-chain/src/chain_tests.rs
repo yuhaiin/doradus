@@ -103,24 +103,3 @@ async fn coalesced_uot_flushes_a_low_traffic_datagram_without_recv() {
     assert_eq!(payload, b"low-traffic");
     session.shutdown().await.unwrap();
 }
-
-#[test]
-fn runtime_stats_render_a_stable_prometheus_snapshot() {
-    let stats = ChainRuntimeStats {
-        h2_connections: 2,
-        h2_active_streams: 5,
-        h2_pool: H2PoolStats {
-            connection_attempts: 7,
-            connection_failures: 1,
-            stream_capacity_rejections: 3,
-            stream_open_failures: 2,
-        },
-    };
-    let rendered = stats.render_prometheus();
-    assert!(rendered.contains("# TYPE doradus_chain_h2_connections gauge"));
-    assert!(rendered.contains("doradus_chain_h2_connections 2\n"));
-    assert!(rendered.contains("doradus_chain_h2_active_streams 5\n"));
-    assert!(rendered.contains("doradus_chain_h2_connection_attempts 7\n"));
-    assert!(rendered.contains("doradus_chain_h2_stream_capacity_rejections 3\n"));
-    assert!(rendered.ends_with('\n'));
-}

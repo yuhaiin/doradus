@@ -95,6 +95,7 @@ doradus-chain = { path = "../doradus-chain" }
 doradus-dns = { path = "../doradus-dns" }
 doradus-core = { path = "../doradus-core" }
 doradus-geo = { path = "../doradus-geo" }
+doradus-metrics = { path = "../doradus-metrics" }
 doradus-protocol = { path = "../doradus-protocol", features = ["quic"] }
 doradus-store = { path = "../doradus-store" }
 doradus-tun = { path = "../doradus-tun" }

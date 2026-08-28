@@ -10,6 +10,7 @@ members = [
     "crates/doradus-protocol",
     "crates/doradus-store",
     "crates/doradus-trie",
+    "crates/doradus-metrics",
     "crates/doradus-wireguard",
     "crates/doradus-masque",
     "crates/doradus-backup",

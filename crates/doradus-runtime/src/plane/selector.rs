@@ -1,9 +1,11 @@
 use super::*;
+use doradus_metrics::{RouteAction, RuntimeMetrics};
 
 /// A TUN-facing selector whose proxy slots can be replaced as one unit after
 /// a successful configuration reload. Existing flows keep the `Arc` returned
 /// by the old slot; new flows observe the new snapshot after `replace`.
 pub struct RuntimeProxySelector {
+    metrics: Arc<RuntimeMetrics>,
     current: RwLock<RuntimeRoutedProxySelector>,
     udp_current: RwLock<RuntimeRoutedProxySelector>,
     pub(super) tagged: RwLock<BTreeMap<String, Arc<dyn AsyncProxy>>>,
@@ -83,6 +85,7 @@ impl RuntimeProxySelector {
         // them twice would reopen every tagged node during startup/reload.
         let udp_tagged = tagged.clone();
         Ok(Self {
+            metrics: Arc::clone(&snapshot.metrics),
             current: RwLock::new(track_selector(current, &loopback)),
             udp_current: RwLock::new(track_selector(udp_current, &loopback)),
             tagged: RwLock::new(track_tagged_proxies(tagged, &loopback)),
@@ -329,17 +332,34 @@ impl RuntimeProxySelector {
         if context.original_domain.is_none()
             && let Some(address) = context.destination.addr()
         {
-            if let Some(fakeip_view) = &metadata.fakeip_view
-                && let Some(domain) = fakeip_view.lookup_domain_ip(address.ip())
-            {
-                context.original_domain = Some(domain.clone());
-                context.fake_ip = Some(address.ip().to_string());
-                context.destination = Endpoint::domain(context.network, domain, address.port());
+            if let Some(fakeip_view) = &metadata.fakeip_view {
+                if let Some(domain) = fakeip_view.lookup_domain_ip(address.ip()) {
+                    self.metrics
+                        .fakeip_operation(doradus_metrics::ResultKind::Hit);
+                    context.original_domain = Some(domain.clone());
+                    context.fake_ip = Some(address.ip().to_string());
+                    context.destination = Endpoint::domain(context.network, domain, address.port());
+                } else {
+                    self.metrics
+                        .fakeip_operation(doradus_metrics::ResultKind::Miss);
+                    if metadata
+                        .fakeip_pools
+                        .as_ref()
+                        .is_some_and(|pools| pools.contains_ip(address.ip()))
+                    {
+                        context.route_mode = RouteMode::Block;
+                        context.skip_route = true;
+                        context.tag = Some("fakeip_unmapped".to_owned());
+                        context.match_history.clear();
+                    }
+                }
             } else if metadata
                 .fakeip_pools
                 .as_ref()
                 .is_some_and(|pools| pools.contains_ip(address.ip()))
             {
+                self.metrics
+                    .fakeip_operation(doradus_metrics::ResultKind::Miss);
                 context.route_mode = RouteMode::Block;
                 context.skip_route = true;
                 context.tag = Some("fakeip_unmapped".to_owned());
@@ -449,6 +469,12 @@ impl AsyncProxySelector for RuntimeProxySelector {
         self.restore_fakeip_destination(context, &metadata);
         self.apply_hosts_override(context, &metadata);
         self.evaluate_route(context, &metadata);
+        self.metrics.route_match(match context.route_mode {
+            RouteMode::Direct => RouteAction::Direct,
+            RouteMode::Proxy => RouteAction::Proxy,
+            RouteMode::Bypass => RouteAction::Direct,
+            RouteMode::Block => RouteAction::Block,
+        });
         context.resolver = self.resolver_for_route_mode(context, &metadata);
         annotate_connection_metadata(
             context,

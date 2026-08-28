@@ -24,6 +24,7 @@ fn snapshot_with_resolver(
     resolver: Arc<dyn AsyncIpResolver>,
 ) -> RuntimeSnapshot {
     RuntimeSnapshot {
+        metrics: Arc::new(doradus_metrics::RuntimeMetrics::new()),
         settings: crate::RuntimeSettings::default(),
         connect_semaphore: Arc::new(tokio::sync::Semaphore::new(250)),
         socket_bind_addresses: Arc::from(Vec::<std::net::IpAddr>::new().into_boxed_slice()),

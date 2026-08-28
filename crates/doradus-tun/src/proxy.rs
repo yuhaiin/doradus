@@ -2,6 +2,7 @@
 
 use super::*;
 use doradus_core::process::ProcessInfo;
+use doradus_metrics::RuntimeMetrics;
 
 #[path = "proxy_output.rs"]
 mod proxy_output;
@@ -197,6 +198,7 @@ pub(crate) struct NatBinding {
 /// ensures no blocking connector or async read/write is performed while
 /// `Interface::poll` holds mutable access to the packet engine.
 pub struct TunProxyRuntime {
+    metrics: Arc<RuntimeMetrics>,
     selector: Arc<dyn AsyncProxySelector>,
     context_provider: Arc<dyn Fn(TunFlow) -> crate::FlowContext + Send + Sync>,
     process_resolver: Option<Arc<dyn ProcessResolver>>,
@@ -230,6 +232,7 @@ impl TunProxyRuntime {
         }
         let (proxy_output_tx, proxy_output_rx) = mpsc::channel(channel_capacity);
         Ok(Self {
+            metrics: Arc::new(RuntimeMetrics::new()),
             selector,
             context_provider: Arc::new(|flow| flow.context()),
             process_resolver: default_process_resolver(),
@@ -315,7 +318,15 @@ impl TunProxyRuntime {
             table,
             idle_timeout,
         });
+        self.sync_nat_metrics();
         Ok(self)
+    }
+
+    /// Share the owning runtime's metrics collector with this TUN adapter.
+    pub fn with_metrics(mut self, metrics: Arc<RuntimeMetrics>) -> Self {
+        self.metrics = metrics;
+        self.sync_nat_metrics();
+        self
     }
 
     pub fn with_io_timeout(mut self, timeout: Duration) -> Result<Self> {
@@ -342,6 +353,30 @@ impl TunProxyRuntime {
 
     pub fn nat_len(&self) -> Result<usize> {
         self.nat.as_ref().map_or(Ok(0), |nat| nat.table.len())
+    }
+
+    fn sync_nat_metrics(&self) {
+        let Some(nat) = &self.nat else {
+            self.metrics.set_nat_state(0, 0, 0);
+            return;
+        };
+        let Ok(stats) = nat.table.stats() else {
+            return;
+        };
+        self.metrics.set_nat_counters(
+            stats.active_bindings as i64,
+            stats.active_destinations as i64,
+            stats.reverse_mappings as i64,
+            stats.allocations,
+            stats.reuses,
+            stats.touch_hits,
+            stats.touch_misses,
+            stats.reverse_lookups,
+            stats.reverse_hits,
+            stats.translated_rebinds,
+            stats.expired_bindings,
+            stats.explicit_closes,
+        );
     }
 
     /// Number of currently registered proxy flow tasks.
@@ -416,6 +451,7 @@ impl TunProxyRuntime {
             }
             self.remove_flow_task(&flow);
         }
+        self.sync_nat_metrics();
         Ok(expired.len())
     }
 
@@ -813,6 +849,7 @@ impl TunProxyRuntime {
             let source = udp_source_key(flow);
             *self.process_cache_refs.entry(source).or_default() += 1;
         }
+        self.sync_nat_metrics();
         Ok(())
     }
 
@@ -822,6 +859,7 @@ impl TunProxyRuntime {
         };
         let key = nat_key(flow);
         let _ = nat.table.touch(&key)?;
+        self.sync_nat_metrics();
         Ok(())
     }
 
@@ -840,6 +878,7 @@ impl TunProxyRuntime {
         if let Some(observer) = &self.observer {
             observer.closed(*flow);
         }
+        self.sync_nat_metrics();
         Ok(())
     }
 
@@ -854,6 +893,7 @@ impl TunProxyRuntime {
                 observer.closed(flow);
             }
         }
+        self.sync_nat_metrics();
     }
 
     fn release_process_cache(&mut self, flow: TunFlowKey) {

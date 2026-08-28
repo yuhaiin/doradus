@@ -28,6 +28,7 @@ sha2_10 = { package = "sha2", version = "0.10.9", default-features = false, feat
 sha1 = { version = "0.10.7", default-features = false }
 tokio = { version = "1.50.0", default-features = false, features = ["io-util", "net", "rt", "sync", "time"] }
 doradus-core = { path = "../doradus-core" }
+doradus-metrics = { path = "../doradus-metrics" }
 doradus-types = { path = "../doradus-types" }
 rustls = { version = "0.23.41", default-features = false, features = ["std", "tls12", "ring"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["tls12"] }

@@ -103,6 +103,7 @@ pub async fn build_aead_proxy(
     config: &GoProxyRuntimeConfig,
     timeout: Duration,
     resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
+    metrics: Arc<doradus_metrics::RuntimeMetrics>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     let base = config
         .to_base_proxy_config_with_resolver(timeout, resolver)
@@ -112,7 +113,7 @@ pub async fn build_aead_proxy(
         _ => None,
     };
     #[cfg(feature = "doh-tls")]
-    let mut upstream: Arc<dyn AsyncProxy> = base.build()?;
+    let mut upstream: Arc<dyn AsyncProxy> = base.build_with_metrics(metrics)?;
     #[cfg(not(feature = "doh-tls"))]
     let upstream: Arc<dyn AsyncProxy> = base.build()?;
     if config

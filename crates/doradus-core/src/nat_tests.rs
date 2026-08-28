@@ -119,11 +119,6 @@ fn nat_stats_expose_full_cone_reuse_reverse_and_close_lifecycle() {
     assert_eq!(active.reverse_lookups, 1);
     assert_eq!(active.reverse_hits, 1);
     assert_eq!(active.translated_rebinds, 1);
-    let rendered = active.render_prometheus();
-    assert!(rendered.contains("# TYPE doradus_nat_active_bindings gauge"));
-    assert!(rendered.contains("doradus_nat_active_bindings 1\n"));
-    assert!(rendered.contains("doradus_nat_reverse_hits 1\n"));
-
     table.remove(&second).unwrap();
     let closed = table.stats().unwrap();
     assert_eq!(closed.active_bindings, 0);

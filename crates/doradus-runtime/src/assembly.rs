@@ -18,6 +18,7 @@ use doradus_core::{
     DomainName, Error, ErrorKind, FlowContext, GeoLookup, ResolverPolicy, Result, RouteMode,
 };
 use doradus_geo::{GeoDatabaseManager, GeoMetadata};
+use doradus_metrics::RuntimeMetrics;
 use doradus_store::fakeip::{FakeIpPool, FakeIpPoolOptions, FakeIpV6Pool};
 use doradus_store::{
     ConfigRepository, ConfigStore, FakeIpPolicy, FakeIpPools, FakeIpResolver, GoNodeTagRecord,
@@ -101,6 +102,9 @@ impl Default for RuntimeBuildOptions {
 /// load. Existing flows can keep using an older snapshot during reload.
 #[derive(Clone)]
 pub struct RuntimeSnapshot {
+    /// Process-lifetime metrics shared by every selector and data-plane
+    /// owner created from this snapshot.
+    pub(crate) metrics: Arc<RuntimeMetrics>,
     pub settings: RuntimeSettings,
     /// Inbound-wide policy shared by TUN and socket-based inbound servers.
     pub inbound_settings: InboundSettings,
@@ -341,6 +345,7 @@ impl RuntimeSnapshot {
 pub struct RuntimeBuilder {
     store: ConfigStore,
     upstream: Arc<dyn AsyncIpResolver>,
+    metrics: Arc<RuntimeMetrics>,
     options: RuntimeBuildOptions,
     resolver_factory: Option<Arc<dyn ResolverTransportFactory>>,
     resolver_proxy_bridge: Option<Arc<ResolverProxyBridge>>,
@@ -373,6 +378,7 @@ impl RuntimeBuilder {
         Self {
             store,
             upstream,
+            metrics: Arc::new(RuntimeMetrics::new()),
             options: RuntimeBuildOptions::default(),
             resolver_factory: None,
             resolver_proxy_bridge: None,
@@ -400,6 +406,10 @@ impl RuntimeBuilder {
 
     pub fn store(&self) -> &ConfigStore {
         &self.store
+    }
+
+    pub(crate) fn metrics(&self) -> Arc<RuntimeMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     async fn load_inputs(&self) -> Result<RuntimeInputs> {
@@ -567,6 +577,7 @@ impl RuntimeBuilder {
             dns: dns_resolver_by_id,
         } = resolver_registries.into_parts();
         Ok(RuntimeSnapshot {
+            metrics: Arc::clone(&self.metrics),
             resolver,
             inbound_resolver,
             dns_resolver,

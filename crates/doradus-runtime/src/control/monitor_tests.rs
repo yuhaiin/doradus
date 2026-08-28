@@ -1000,10 +1000,11 @@ fn monitor_recovers_checkpoint_after_force_abort() {
         .spawn()
         .unwrap();
 
-    // The persistence worker's first interval tick is immediate; this
-    // leaves enough time for the checkpoint write while still ensuring
-    // the child is terminated far before its ten-second sleep ends.
-    std::thread::sleep(Duration::from_millis(700));
+    // The persistence worker's first interval tick is immediate, but the
+    // SQLite checkpoint may wait for a blocking worker under load. Keep a
+    // bounded window that is long enough for CI while still terminating the
+    // child far before its ten-second sleep ends.
+    std::thread::sleep(Duration::from_secs(2));
     child.kill().unwrap();
     let status = child.wait().unwrap();
     assert!(!status.success(), "crash child must not exit gracefully");

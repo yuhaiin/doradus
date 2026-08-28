@@ -222,6 +222,7 @@ pub(super) async fn build_stream_transport_upstream(
     timeout: Duration,
     resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
     protocol_name: &str,
+    metrics: Arc<doradus_metrics::RuntimeMetrics>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     #[cfg(feature = "doh-tls")]
     let _ = protocol_name;
@@ -229,7 +230,7 @@ pub(super) async fn build_stream_transport_upstream(
     let base = config
         .to_base_proxy_config_with_resolver(timeout, resolver)
         .await?;
-    let mut upstream: Arc<dyn AsyncProxy> = base.build()?;
+    let mut upstream: Arc<dyn AsyncProxy> = base.build_with_metrics(metrics)?;
     if config
         .chain_types
         .iter()
@@ -309,6 +310,7 @@ pub(super) async fn build_protocol_h2_proxy(
     config: &GoProxyRuntimeConfig,
     _timeout: Duration,
     resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
+    metrics: Arc<doradus_metrics::RuntimeMetrics>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     let protocol = match config.transport {
         doradus_store::GoProxyTransport::Vless => "vless",
@@ -344,10 +346,13 @@ pub(super) async fn build_protocol_h2_proxy(
         )));
     }
 
-    let upstream = Arc::new(ChainProxy::from_go_json_transport_with_resolver(
-        &node.to_string(),
-        resolver,
-    )?) as Arc<dyn AsyncProxy>;
+    let upstream = Arc::new(
+        ChainProxy::from_go_json_transport_with_resolver_and_metrics(
+            &node.to_string(),
+            resolver,
+            metrics,
+        )?,
+    ) as Arc<dyn AsyncProxy>;
     build_protocol_proxy(config, upstream)
 }
 
@@ -417,8 +422,10 @@ pub(super) async fn build_vless_transport_proxy(
     config: &GoProxyRuntimeConfig,
     timeout: Duration,
     resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
+    metrics: Arc<doradus_metrics::RuntimeMetrics>,
 ) -> Result<Arc<dyn AsyncProxy>> {
-    let upstream = build_stream_transport_upstream(config, timeout, resolver, "VLESS").await?;
+    let upstream =
+        build_stream_transport_upstream(config, timeout, resolver, "VLESS", metrics).await?;
     build_protocol_proxy(config, upstream)
 }
 
@@ -426,8 +433,10 @@ pub(super) async fn build_vmess_transport_proxy(
     config: &GoProxyRuntimeConfig,
     timeout: Duration,
     resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
+    metrics: Arc<doradus_metrics::RuntimeMetrics>,
 ) -> Result<Arc<dyn AsyncProxy>> {
-    let upstream = build_stream_transport_upstream(config, timeout, resolver, "VMess").await?;
+    let upstream =
+        build_stream_transport_upstream(config, timeout, resolver, "VMess", metrics).await?;
     build_protocol_proxy(config, upstream)
 }
 
@@ -435,8 +444,10 @@ pub(super) async fn build_trojan_transport_proxy(
     config: &GoProxyRuntimeConfig,
     timeout: Duration,
     resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
+    metrics: Arc<doradus_metrics::RuntimeMetrics>,
 ) -> Result<Arc<dyn AsyncProxy>> {
-    let upstream = build_stream_transport_upstream(config, timeout, resolver, "Trojan").await?;
+    let upstream =
+        build_stream_transport_upstream(config, timeout, resolver, "Trojan", metrics).await?;
     build_protocol_proxy(config, upstream)
 }
 

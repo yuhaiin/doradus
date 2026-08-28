@@ -229,10 +229,15 @@ impl H2ChainProxy {
         upstream: Arc<dyn AsyncProxy>,
         config: ValidatedHttp2,
         index: usize,
+        metrics: Arc<doradus_metrics::RuntimeMetrics>,
     ) -> Arc<Self> {
         Arc::new(Self {
             upstream,
-            pool: Arc::new(H2Pool::with_limits(4, config.idle_timeout)),
+            pool: Arc::new(H2Pool::with_limits_and_metrics(
+                4,
+                config.idle_timeout,
+                metrics,
+            )),
             concurrency: config.concurrency,
             max_streams: config.max_streams,
             identity: format!("chain-http2-layer-{index}"),

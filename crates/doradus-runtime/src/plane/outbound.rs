@@ -147,7 +147,7 @@ impl RuntimeSnapshot {
                 Ok(child
                     .to_base_proxy_config_with_resolver(timeout, resolver)
                     .await?
-                    .build()?)
+                    .build_with_metrics(Arc::clone(&self.metrics))?)
             }
             "http" | "http_proxy" => {
                 let user = layer_string(layer, "user").unwrap_or_default();
@@ -343,13 +343,37 @@ impl RuntimeSnapshot {
         let proxy = if plan.kind == ProxyPlanKind::NetworkSplit {
             self.build_network_split_proxy(&config, timeout).await?
         } else if plan.kind == ProxyPlanKind::ProtocolH2 {
-            build_protocol_h2_proxy(&config, timeout, resolver.clone()).await?
+            build_protocol_h2_proxy(
+                &config,
+                timeout,
+                resolver.clone(),
+                Arc::clone(&self.metrics),
+            )
+            .await?
         } else if plan.kind == ProxyPlanKind::VlessWebSocket {
-            build_vless_transport_proxy(&config, timeout, resolver.clone()).await?
+            build_vless_transport_proxy(
+                &config,
+                timeout,
+                resolver.clone(),
+                Arc::clone(&self.metrics),
+            )
+            .await?
         } else if plan.kind == ProxyPlanKind::VmessTransport {
-            build_vmess_transport_proxy(&config, timeout, resolver.clone()).await?
+            build_vmess_transport_proxy(
+                &config,
+                timeout,
+                resolver.clone(),
+                Arc::clone(&self.metrics),
+            )
+            .await?
         } else if plan.kind == ProxyPlanKind::TrojanWebSocket {
-            build_trojan_transport_proxy(&config, timeout, resolver.clone()).await?
+            build_trojan_transport_proxy(
+                &config,
+                timeout,
+                resolver.clone(),
+                Arc::clone(&self.metrics),
+            )
+            .await?
         } else if plan.kind == ProxyPlanKind::Wireguard {
             let layer = config
                 .layers
@@ -385,7 +409,7 @@ impl RuntimeSnapshot {
                 .to_base_proxy_config_with_resolver(timeout, resolver.clone())
                 .await?;
             Arc::new(doradus_protocol::http_mock::HttpMockProxy::new(
-                base.build()?,
+                base.build_with_metrics(Arc::clone(&self.metrics))?,
             )) as Arc<dyn AsyncProxy>
         } else if plan.kind == ProxyPlanKind::HttpTermination {
             let index = config
@@ -452,17 +476,24 @@ impl RuntimeSnapshot {
                     format!("proxy {:?} data_json is not UTF-8: {error}", config.id),
                 )
             })?;
-            Arc::new(ChainProxy::from_go_json_with_resolver(
+            Arc::new(ChainProxy::from_go_json_with_resolver_and_metrics(
                 json,
                 resolver.clone(),
+                Arc::clone(&self.metrics),
             )?) as Arc<dyn AsyncProxy>
         } else if plan.kind == ProxyPlanKind::Aead {
-            build_aead_proxy(&config, timeout, resolver.clone()).await?
+            build_aead_proxy(
+                &config,
+                timeout,
+                resolver.clone(),
+                Arc::clone(&self.metrics),
+            )
+            .await?
         } else if let ProxyPlanKind::Standard(protocol) = plan.kind {
             let base = config
                 .to_base_proxy_config_with_resolver(timeout, resolver.clone())
                 .await?;
-            let mut upstream = base.build()?;
+            let mut upstream = base.build_with_metrics(Arc::clone(&self.metrics))?;
             if plan.has_protocol_tls {
                 #[cfg(feature = "doh-tls")]
                 {
@@ -613,7 +644,7 @@ impl RuntimeSnapshot {
             let base = config
                 .to_base_proxy_config_with_resolver(timeout, resolver.clone())
                 .await?;
-            let mut proxy = base.build()?;
+            let mut proxy = base.build_with_metrics(Arc::clone(&self.metrics))?;
             if config.transport == GoProxyTransport::Yuubinsya
                 && config
                     .layers
@@ -820,7 +851,7 @@ impl RuntimeSnapshot {
                 kind: fallback,
                 timeout,
             }
-            .build()?;
+            .build_with_metrics(Arc::clone(&self.metrics))?;
             let proxy = Arc::new(ConnectBudgetProxy {
                 inner: Arc::new(SocketPolicyProxy {
                     inner: proxy,

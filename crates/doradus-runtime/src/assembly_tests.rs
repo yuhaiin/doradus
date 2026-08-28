@@ -432,6 +432,7 @@ fn route_settings_select_resolver_from_the_same_snapshot() {
         .unwrap(),
     );
     let snapshot = RuntimeSnapshot {
+        metrics: Arc::new(doradus_metrics::RuntimeMetrics::new()),
         settings: RuntimeSettings::default(),
         connect_semaphore: Arc::new(Semaphore::new(250)),
         socket_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),

@@ -365,6 +365,39 @@ async fn health_endpoint_is_public_even_when_management_api_is_authenticated() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
+#[tokio::test]
+async fn metrics_endpoint_requires_auth_and_exposes_prometheus_text() {
+    let app = router(state().await.with_auth("alice", "secret"));
+    let unauthorized = app
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let token = base64::engine::general_purpose::STANDARD.encode("alice:secret");
+    let response = app
+        .oneshot(
+            Request::get("/metrics")
+                .header("authorization", format!("Basic {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("# HELP doradus_build Doradus build information."));
+    assert!(body.contains("# TYPE doradus_build info"));
+    assert!(body.contains("doradus_build_info{version="));
+}
+
 async fn state() -> ApiState {
     let store = ConfigStore::open_memory().await.unwrap();
     let controller = RuntimeController::from_builder(RuntimeBuilder::new(

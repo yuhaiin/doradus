@@ -1,0 +1,11 @@
+[package]
+name = "doradus-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prometheus-client = "0.25.0"
+
+[lints]
+workspace = true

@@ -4,6 +4,10 @@ use super::*;
 
 impl ConnectionMonitor {
     pub fn new() -> Self {
+        Self::new_with_metrics(Arc::new(doradus_metrics::RuntimeMetrics::new()))
+    }
+
+    pub(crate) fn new_with_metrics(metrics: Arc<doradus_metrics::RuntimeMetrics>) -> Self {
         let (events, _) = broadcast::channel(256);
         let (close_events, _) = broadcast::channel(256);
         Self {
@@ -14,6 +18,7 @@ impl ConnectionMonitor {
             close_events,
             logs: RuntimeLog::new(),
             persistence: None,
+            metrics,
         }
     }
 
@@ -54,7 +59,15 @@ impl ConnectionMonitor {
         let target = doradus_core::dns::decode_query(packet)
             .map(|query| format!("{} {:?}", query.domain, query.record_type))
             .unwrap_or_else(|_| format!("packet_len={}", packet.len()));
+        let started = Instant::now();
         let result = handler.answer(packet).await;
+        self.metrics.dns_query(if result.is_ok() {
+            doradus_metrics::ResultKind::Success
+        } else {
+            doradus_metrics::ResultKind::Failure
+        });
+        self.metrics
+            .dns_query_duration(started.elapsed().as_secs_f64());
         if let Err(error) = &result {
             self.error(format!("DNS query failed target={target}: {error}"));
         }
@@ -67,6 +80,10 @@ impl ConnectionMonitor {
 
     pub fn logs(&self) -> RuntimeLog {
         self.logs.clone()
+    }
+
+    pub(crate) fn metrics(&self) -> Arc<RuntimeMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     pub fn info(&self, message: impl AsRef<str>) {
@@ -476,6 +493,7 @@ impl ConnectionMonitor {
         error: &str,
         process: Option<&str>,
     ) {
+        self.metrics.connection_failed(FailureStage::Dial);
         self.error(format!(
             "outbound connection failed protocol={protocol} target={host} process={} error={error}",
             process.unwrap_or("-")
@@ -629,12 +647,20 @@ impl ConnectionMonitor {
             },
         );
         drop(state);
+        self.metrics.connection_opened();
         self.mark_dirty();
         self.emit("connections_added", json!({"connections": [value]}));
     }
 
     pub(super) fn add_bytes(&self, flow: TunFlowKey, direction: TunFlowDirection, bytes: usize) {
         let persistent = self.persistence.is_some();
+        self.metrics.add_traffic(
+            match direction {
+                TunFlowDirection::Upload => doradus_metrics::Direction::Upload,
+                TunFlowDirection::Download => doradus_metrics::Direction::Download,
+            },
+            bytes as u64,
+        );
         let mut state = self.lock();
         let bytes = bytes as u64;
         match direction {
@@ -776,6 +802,7 @@ impl ConnectionMonitor {
         let Some(entry) = state.connections.remove(&flow) else {
             return;
         };
+        self.metrics.connection_closed();
         if let Some(inbound_id) = entry
             .value
             .get("inboundId")

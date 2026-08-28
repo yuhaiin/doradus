@@ -310,6 +310,30 @@ async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+/// Expose the process-lifetime runtime metrics in Prometheus text format.
+/// Authentication is applied by the same middleware as the management API;
+/// unlike health, this endpoint is intentionally not public when credentials
+/// are configured.
+async fn metrics(State(state): State<ApiState>) -> Response {
+    let metrics = state.controller.metrics();
+    let mut body = String::new();
+    if metrics.encode(&mut body).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to encode runtime metrics",
+        )
+            .into_response();
+    }
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct PprofQuery {
     #[cfg(all(unix, not(target_os = "android")))]

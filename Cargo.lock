@@ -1080,6 +1080,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "doradus-core",
+ "doradus-metrics",
  "doradus-protocol",
  "doradus-tun",
  "futures-util",
@@ -1170,6 +1171,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "doradus-metrics"
+version = "0.1.0"
+dependencies = [
+ "prometheus-client",
+]
+
+[[package]]
 name = "doradus-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1182,6 +1190,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "doradus-core",
+ "doradus-metrics",
  "doradus-types",
  "ed25519-dalek",
  "futures-util",
@@ -1226,6 +1235,7 @@ dependencies = [
  "doradus-dns",
  "doradus-geo",
  "doradus-masque",
+ "doradus-metrics",
  "doradus-protocol",
  "doradus-store",
  "doradus-trie",
@@ -1303,6 +1313,7 @@ name = "doradus-tun"
 version = "0.1.0"
 dependencies = [
  "doradus-core",
+ "doradus-metrics",
  "doradus-protocol",
  "futures-lite",
  "futures-util",

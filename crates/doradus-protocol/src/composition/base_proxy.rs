@@ -18,6 +18,7 @@ use crate::proxy::{
 use crate::quic::{QuicConfig, QuicProxy};
 use doradus_core::proxy::AsyncProxy;
 use doradus_core::{Error, ErrorKind, Result};
+use doradus_metrics::RuntimeMetrics;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseProxyEndpoint {
@@ -92,6 +93,19 @@ pub struct BaseProxyConfig {
 
 impl BaseProxyConfig {
     pub fn build(&self) -> Result<Arc<dyn AsyncProxy>> {
+        self.build_inner(None)
+    }
+
+    /// Build the base proxy and attach the owning runtime metrics collector
+    /// to transports that expose protocol-level telemetry.
+    pub fn build_with_metrics(&self, metrics: Arc<RuntimeMetrics>) -> Result<Arc<dyn AsyncProxy>> {
+        self.build_inner(Some(metrics))
+    }
+
+    fn build_inner(&self, metrics: Option<Arc<RuntimeMetrics>>) -> Result<Arc<dyn AsyncProxy>> {
+        #[cfg(not(feature = "quic"))]
+        let _ = &metrics;
+
         if self.timeout.is_zero() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
@@ -154,18 +168,35 @@ impl BaseProxyConfig {
                 server_name,
                 ca_certificates,
                 insecure_skip_verify,
-            } => Arc::new(QuicProxy::new(QuicConfig {
-                server: *server,
-                server_name: server_name.clone(),
-                ca_certificates: ca_certificates.clone(),
-                insecure_skip_verify: *insecure_skip_verify,
-                timeout: self.timeout,
-                idle_timeout: crate::quic::DEFAULT_IDLE_TIMEOUT,
-                association_idle_timeout: crate::quic::DEFAULT_ASSOCIATION_IDLE_TIMEOUT,
-                max_associations: crate::quic::DEFAULT_MAX_ASSOCIATIONS,
-                rx_queue_capacity: crate::quic::DEFAULT_RX_QUEUE_CAPACITY,
-                rx_memory_budget: crate::quic::DEFAULT_RX_MEMORY_BUDGET,
-            })?),
+            } => Arc::new(match metrics.as_ref() {
+                Some(metrics) => QuicProxy::new_with_metrics(
+                    QuicConfig {
+                        server: *server,
+                        server_name: server_name.clone(),
+                        ca_certificates: ca_certificates.clone(),
+                        insecure_skip_verify: *insecure_skip_verify,
+                        timeout: self.timeout,
+                        idle_timeout: crate::quic::DEFAULT_IDLE_TIMEOUT,
+                        association_idle_timeout: crate::quic::DEFAULT_ASSOCIATION_IDLE_TIMEOUT,
+                        max_associations: crate::quic::DEFAULT_MAX_ASSOCIATIONS,
+                        rx_queue_capacity: crate::quic::DEFAULT_RX_QUEUE_CAPACITY,
+                        rx_memory_budget: crate::quic::DEFAULT_RX_MEMORY_BUDGET,
+                    },
+                    Arc::clone(metrics),
+                )?,
+                None => QuicProxy::new(QuicConfig {
+                    server: *server,
+                    server_name: server_name.clone(),
+                    ca_certificates: ca_certificates.clone(),
+                    insecure_skip_verify: *insecure_skip_verify,
+                    timeout: self.timeout,
+                    idle_timeout: crate::quic::DEFAULT_IDLE_TIMEOUT,
+                    association_idle_timeout: crate::quic::DEFAULT_ASSOCIATION_IDLE_TIMEOUT,
+                    max_associations: crate::quic::DEFAULT_MAX_ASSOCIATIONS,
+                    rx_queue_capacity: crate::quic::DEFAULT_RX_QUEUE_CAPACITY,
+                    rx_memory_budget: crate::quic::DEFAULT_RX_MEMORY_BUDGET,
+                })?,
+            }),
             #[cfg(feature = "quic")]
             BaseProxyKind::QuicMany {
                 endpoints,
@@ -178,6 +209,7 @@ impl BaseProxyConfig {
                 server_name.clone(),
                 ca_certificates.clone(),
                 *insecure_skip_verify,
+                metrics.clone(),
             )?,
         };
         Ok(proxy)
@@ -284,11 +316,12 @@ fn fallback_quic(
     server_name: String,
     ca_certificates: Vec<Vec<u8>>,
     insecure_skip_verify: bool,
+    metrics: Option<Arc<RuntimeMetrics>>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     let proxies = endpoints
         .iter()
         .map(|endpoint| {
-            let proxy = QuicProxy::new(QuicConfig {
+            let config = QuicConfig {
                 server: endpoint.address,
                 server_name: server_name.clone(),
                 ca_certificates: ca_certificates.clone(),
@@ -299,7 +332,11 @@ fn fallback_quic(
                 max_associations: crate::quic::DEFAULT_MAX_ASSOCIATIONS,
                 rx_queue_capacity: crate::quic::DEFAULT_RX_QUEUE_CAPACITY,
                 rx_memory_budget: crate::quic::DEFAULT_RX_MEMORY_BUDGET,
-            })?;
+            };
+            let proxy = match metrics.as_ref() {
+                Some(metrics) => QuicProxy::new_with_metrics(config, Arc::clone(metrics))?,
+                None => QuicProxy::new(config)?,
+            };
             Ok(bind_endpoint(Arc::new(proxy), endpoint))
         })
         .collect::<Result<Vec<_>>>()?;

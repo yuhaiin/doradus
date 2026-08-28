@@ -57,6 +57,21 @@ impl ChainProxy {
         Self::final_proxy(ChainClient::from_go_json_with_resolver(json, resolver)?)
     }
 
+    pub fn from_go_json_with_resolver_and_metrics(
+        json: &str,
+        resolver: Arc<dyn AsyncIpResolver>,
+        metrics: Arc<doradus_metrics::RuntimeMetrics>,
+    ) -> Result<Self> {
+        if let Some(proxy) = parse_go_direct_uot(json, Arc::clone(&resolver))? {
+            return Ok(Self {
+                backend: ChainProxyBackend::DirectUot(proxy),
+            });
+        }
+        Self::final_proxy(ChainClient::from_go_json_with_resolver_and_metrics(
+            json, resolver, metrics,
+        )?)
+    }
+
     /// Construct only the raw Go-compatible HTTP/2 transport from a node
     /// payload whose final protocol layer is supplied by the caller.
     ///
@@ -68,7 +83,19 @@ impl ChainProxy {
         json: &str,
         resolver: Arc<dyn AsyncIpResolver>,
     ) -> Result<Self> {
-        let client = ChainClient::from_go_json_with_resolver(json, resolver)?;
+        Self::from_go_json_transport_with_resolver_and_metrics(
+            json,
+            resolver,
+            Arc::new(doradus_metrics::RuntimeMetrics::new()),
+        )
+    }
+
+    pub fn from_go_json_transport_with_resolver_and_metrics(
+        json: &str,
+        resolver: Arc<dyn AsyncIpResolver>,
+        metrics: Arc<doradus_metrics::RuntimeMetrics>,
+    ) -> Result<Self> {
+        let client = ChainClient::from_go_json_with_resolver_and_metrics(json, resolver, metrics)?;
         if client.has_destination_protocol() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,

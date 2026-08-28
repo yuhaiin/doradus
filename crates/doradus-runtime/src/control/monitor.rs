@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,6 +21,7 @@ use doradus_core::flow::{
     FlowObserver as TunFlowObserver,
 };
 use doradus_core::{BoxFuture, Endpoint, FlowContext, RouteMode};
+use doradus_metrics::{FailureStage, RuntimeMetrics};
 use doradus_store::{
     ConfigStore, GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsDelta,
     GoStatisticsSnapshot, GoTelemetryBucketRecord, GoTrafficBucketRecord, InboundStatisticsRecord,
@@ -230,6 +231,7 @@ pub struct ConnectionMonitor {
     close_events: broadcast::Sender<TunFlowKey>,
     logs: RuntimeLog,
     persistence: Option<Arc<PersistenceState>>,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 impl Default for ConnectionMonitor {
@@ -244,6 +246,31 @@ impl TunFlowObserver for ConnectionMonitor {
     }
 
     fn bytes(&self, flow: TunFlowKey, direction: TunFlowDirection, bytes: usize) {
+        let tun = self
+            .lock()
+            .connections
+            .get(&flow)
+            .and_then(|entry| entry.value.get("component"))
+            .and_then(Value::as_str)
+            == Some("tun");
+        if tun {
+            let direction = match direction {
+                TunFlowDirection::Upload => doradus_metrics::Direction::Upload,
+                TunFlowDirection::Download => doradus_metrics::Direction::Download,
+            };
+            self.metrics.tun_packet(direction);
+            match flow.network {
+                doradus_core::Network::Tcp => {
+                    self.metrics
+                        .add_packet(direction, doradus_metrics::MetricNetwork::Tcp);
+                }
+                doradus_core::Network::Udp => {
+                    self.metrics
+                        .add_packet(direction, doradus_metrics::MetricNetwork::Udp);
+                }
+                doradus_core::Network::Icmp | doradus_core::Network::Any => {}
+            }
+        }
         self.add_bytes(flow, direction, bytes);
     }
 
@@ -252,6 +279,7 @@ impl TunFlowObserver for ConnectionMonitor {
     }
 
     fn failed(&self, flow: TunFlowKey, stage: &str, error: &str) {
+        self.metrics.connection_failed(failure_stage(stage));
         let metadata = self.lock().connections.get(&flow).map(|entry| {
             (
                 entry.value["nodeId"].as_str().unwrap_or("-").to_owned(),
@@ -269,6 +297,18 @@ impl TunFlowObserver for ConnectionMonitor {
 
     fn close_requested(&self, flow: TunFlowKey) -> bool {
         self.close_requested(flow)
+    }
+}
+
+fn failure_stage(value: &str) -> FailureStage {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "listener" => FailureStage::Listener,
+        "dns" | "resolve" | "resolver" => FailureStage::Dns,
+        "route" => FailureStage::Route,
+        "dial" | "connect" => FailureStage::Dial,
+        "handshake" | "auth" => FailureStage::Handshake,
+        "stream" | "relay" => FailureStage::Stream,
+        _ => FailureStage::Other,
     }
 }
 
