@@ -425,6 +425,47 @@ async fn external_web_root_serves_assets_and_react_fallback_without_hiding_api()
 }
 
 #[tokio::test]
+async fn embedded_web_serves_assets_and_react_fallback_by_default() {
+    let app = router(state().await);
+    let index = app
+        .clone()
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    if embedded_web::asset("index.html").is_none() {
+        assert_eq!(index.status(), StatusCode::NOT_FOUND);
+        return;
+    }
+
+    assert_eq!(index.status(), StatusCode::OK);
+    assert_eq!(
+        index.headers()[axum::http::header::CONTENT_TYPE],
+        "text/html; charset=utf-8"
+    );
+    let index_body = to_bytes(index.into_body(), 1024 * 1024).await.unwrap();
+    assert!(
+        index_body
+            .windows(b"<title>".len())
+            .any(|window| window == b"<title>")
+    );
+
+    let fallback = app
+        .oneshot(
+            Request::get("/inbounds/detail")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fallback.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(fallback.into_body(), 1024 * 1024).await.unwrap(),
+        index_body,
+    );
+}
+
+#[tokio::test]
 async fn node_rpc_round_trips_frontend_shape_and_publishes_reload() {
     let state = state().await;
     let value = json!({"id":"direct","name":"Direct","group":"","enabled":true,"chain":[{"type":"direct","direct":{}}]});
@@ -2214,6 +2255,9 @@ async fn every_generated_frontend_rpc_operation_has_a_route() {
         "inbounds.config.put",
         "inbounds.get",
         "inbounds.post",
+        "inbounds.status",
+        "inbound.events",
+        "inbound.retry",
         "info",
         "node.close",
         "node.delete",
@@ -2284,7 +2328,7 @@ async fn every_generated_frontend_rpc_operation_has_a_route() {
         "users.get",
         "users.post",
     ];
-    assert_eq!(OPERATIONS.len(), 88);
+    assert_eq!(OPERATIONS.len(), 91);
 
     let app = router(state().await);
     for operation in OPERATIONS {

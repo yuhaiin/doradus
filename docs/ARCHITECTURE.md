@@ -635,6 +635,32 @@ Route-list activation may first write activation state, then let a refresh loop
 download and compile the list before route snapshot reload. Node selection mainly
 updates selected metadata and the selector slot.
 
+### 13.2 Inbound runtime status, events, and statistics
+
+`enabled` is persisted configuration, not proof that a listener is alive. The
+runtime keeps the actual owner state in memory (`disabled`, `starting`,
+`running`, `degraded`, `failed`, or `stopping`) and publishes it through
+`GET /api/v2/inbounds/status`. A bind or owner failure affects only that inbound;
+the state remains `failed` with `lastError` until the UI calls
+`POST /api/v2/inbounds/{id}/retry`.
+
+Lifecycle observations are append-only rows in `inbound_runtime_events` and are
+read through `GET /api/v2/inbounds/{id}/events`. Rows are retained for 30 days
+and capped at the newest 1000 rows per inbound. Aggregate TCP/UDP flow counts
+and upload/download bytes are kept hot in the monitor, periodically checkpointed
+to `inbound_statistics`, and restored on restart; active flow counts are reset
+to zero because active sockets are not persisted.
+
+The API embeds the Vite output under `crates/doradus-api/web` at compile time.
+The repository keeps that directory as an empty `.gitkeep` placeholder; the
+GitHub Actions release workflow checks out `yuhaiin-react`, builds it once, and
+copies `dist` into the directory before compiling each platform binary. A
+local build without generated frontend assets returns 404 for the embedded
+fallback. When assets are present and no external web root is configured, the
+embedded handler serves them and falls back to `index.html` for React routes.
+`with_external_web` remains an explicit override for development and
+integration tests.
+
 ## 14. Supporting components
 
 ### 14.1 doradus-geo

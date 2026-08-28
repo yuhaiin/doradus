@@ -29,9 +29,12 @@ enum RpcOperation {
     InboundsConfigPut,
     InboundsGet,
     InboundsPost,
+    InboundsStatus,
     InboundGet,
     InboundPut,
     InboundDelete,
+    InboundEvents,
+    InboundRetry,
     ResolversGet,
     ResolversPost,
     ResolverGet,
@@ -123,9 +126,12 @@ impl RpcOperation {
             "inbounds.config.put" => Self::InboundsConfigPut,
             "inbounds.get" => Self::InboundsGet,
             "inbounds.post" => Self::InboundsPost,
+            "inbounds.status" => Self::InboundsStatus,
             "inbound.get" => Self::InboundGet,
             "inbound.put" => Self::InboundPut,
             "inbound.delete" => Self::InboundDelete,
+            "inbound.events" => Self::InboundEvents,
+            "inbound.retry" => Self::InboundRetry,
             "resolvers.get" => Self::ResolversGet,
             "resolvers.post" => Self::ResolversPost,
             "resolver.get" => Self::ResolverGet,
@@ -237,12 +243,19 @@ pub(super) async fn dispatch(
         RpcOperation::InboundsConfigPut => inbounds_config_put_value(&state, body).await,
         RpcOperation::InboundsGet => inbounds_get_value(&state, &body).await,
         RpcOperation::InboundsPost => save_inbound_value(&state, body, None).await,
+        RpcOperation::InboundsStatus => inbounds_status_value(&state).await,
         RpcOperation::InboundGet => {
             get_inbound_value(&state, go_request_string(&body, "id")?).await
         }
         RpcOperation::InboundPut => save_inbound_value(&state, body, None).await,
         RpcOperation::InboundDelete => {
             delete_inbound_value(&state, required_string(&body, "id")?).await
+        }
+        RpcOperation::InboundEvents => {
+            inbound_events_value(&state, go_request_string(&body, "id")?).await
+        }
+        RpcOperation::InboundRetry => {
+            retry_inbound_value(&state, required_string(&body, "id")?).await
         }
         RpcOperation::ResolversGet => resolvers_get_value(&state, &body).await,
         RpcOperation::ResolversPost => save_resolver_value(&state, body, None).await,

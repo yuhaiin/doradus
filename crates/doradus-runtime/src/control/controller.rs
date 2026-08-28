@@ -10,6 +10,7 @@ use doradus_core::proxy::AsyncProxy;
 use doradus_store::{ConfigMutation, ConfigStore};
 
 use crate::data_plane::{ReloadableAsyncDnsHandler, RuntimeDnsHandler, inbound_dns_handler};
+use crate::inbound_runtime::InboundRuntimeState;
 use crate::monitor::SocketDnsHandler;
 use crate::{
     ConnectionMonitor, ResolverProxyBridge, RuntimeBuilder, RuntimeHandle, RuntimeProxySelector,
@@ -30,6 +31,7 @@ pub struct RuntimeController {
     reload_error: Arc<RwLock<Option<String>>>,
     selectors: Arc<RwLock<Vec<Weak<RuntimeProxySelector>>>>,
     monitor: Arc<ConnectionMonitor>,
+    inbound_runtime: Arc<InboundRuntimeState>,
     reload_events: tokio::sync::broadcast::Sender<()>,
     dns_reload_events: tokio::sync::broadcast::Sender<()>,
     inbound_reload_events: tokio::sync::broadcast::Sender<InboundReload>,
@@ -75,6 +77,7 @@ impl RuntimeController {
         let (reload_events, _) = tokio::sync::broadcast::channel(32);
         let (dns_reload_events, _) = tokio::sync::broadcast::channel(32);
         let (inbound_reload_events, _) = tokio::sync::broadcast::channel(32);
+        let inbound_runtime = Arc::new(InboundRuntimeState::new(builder.store().clone()));
         let monitor = Arc::new(ConnectionMonitor::load_with_store(builder.store().clone()).await?);
         if let Some(bridge) = &resolver_proxy_bridge {
             bridge.set_monitor(&monitor);
@@ -98,6 +101,7 @@ impl RuntimeController {
             reload_error: Arc::new(RwLock::new(None)),
             selectors: Arc::new(RwLock::new(Vec::new())),
             monitor,
+            inbound_runtime,
             reload_events,
             dns_reload_events,
             inbound_reload_events,
@@ -117,6 +121,10 @@ impl RuntimeController {
 
     pub fn monitor(&self) -> Arc<ConnectionMonitor> {
         self.monitor.clone()
+    }
+
+    pub fn inbound_runtime(&self) -> Arc<InboundRuntimeState> {
+        self.inbound_runtime.clone()
     }
 
     pub(crate) fn dns_handler(&self) -> Arc<ReloadableAsyncDnsHandler> {
@@ -424,6 +432,33 @@ impl RuntimeController {
         .await
     }
 
+    /// Request a fresh start of one enabled inbound without changing its
+    /// persisted configuration. The supervisor owns the actual bind and will
+    /// publish the eventual ready/failed state independently of its siblings.
+    pub async fn retry_inbound(&self, id: impl Into<String>) -> Result<()> {
+        let id = id.into();
+        let _guard = self.reload_lock.lock().await;
+        let record = self
+            .store()
+            .repository()
+            .list_go_inbounds()
+            .await?
+            .into_iter()
+            .find(|record| record.id == id)
+            .ok_or_else(|| {
+                doradus_core::Error::new(doradus_core::ErrorKind::NotFound, "inbound not found")
+            })?;
+        if !record.enabled {
+            return Err(doradus_core::Error::new(
+                doradus_core::ErrorKind::InvalidInput,
+                "disabled inbound cannot be retried",
+            ));
+        }
+        self.inbound_runtime.mark_starting(&id, true);
+        let _ = self.inbound_reload_events.send(InboundReload::One(id));
+        Ok(())
+    }
+
     pub async fn mutate_and_reload_dns<F, Fut>(&self, operation: F) -> Result<Arc<RuntimeSnapshot>>
     where
         F: FnOnce(ConfigStore) -> Fut,
@@ -508,6 +543,16 @@ impl RuntimeController {
             let _ = self.dns_reload_events.send(());
         }
         if let Some(reload_inbound) = plan.inbound {
+            match &reload_inbound {
+                InboundReload::All => {
+                    if let Ok(records) = self.store().repository().list_go_inbounds().await {
+                        for record in records {
+                            self.inbound_runtime.mark_reload(&record.id);
+                        }
+                    }
+                }
+                InboundReload::One(id) => self.inbound_runtime.mark_reload(id),
+            }
             let _ = self.inbound_reload_events.send(reload_inbound);
         }
         self.set_reload_error("");

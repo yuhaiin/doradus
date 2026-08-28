@@ -20,6 +20,7 @@ use super::{
     build_inbound_tls_acceptor, has_transport, is_supported_inbound_transport,
     is_supported_transparent_transport, selected_proxy_ids, serve_listener, supports_socks5_udp,
 };
+use crate::inbound_runtime::InboundRuntimeState;
 
 pub(super) type InboundOwners = HashMap<String, Vec<tokio::task::JoinHandle<()>>>;
 
@@ -70,8 +71,41 @@ impl InboundStartOptions {
     }
 }
 
-fn push_listener(listeners: &mut InboundOwners, id: &str, listener: tokio::task::JoinHandle<()>) {
-    listeners.entry(id.to_owned()).or_default().push(listener);
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(listener) = self.0.take() {
+            listener.abort();
+        }
+    }
+}
+
+async fn supervise_listener(
+    id: String,
+    runtime: InboundRuntimeState,
+    listener: tokio::task::JoinHandle<()>,
+) {
+    let mut listener = AbortOnDrop(Some(listener));
+    let result = listener.0.as_mut().expect("listener handle exists").await;
+    if runtime.is_stopping(&id) || runtime.has_failed_listener(&id) {
+        return;
+    }
+    let error = match result {
+        Ok(()) => "listener exited unexpectedly".to_owned(),
+        Err(error) => format!("listener task failed: {error}"),
+    };
+    runtime.listener_failed(&id, "listener", None, &error);
+}
+
+fn push_listener(
+    listeners: &mut InboundOwners,
+    id: &str,
+    listener: tokio::task::JoinHandle<()>,
+    runtime: &InboundRuntimeState,
+) {
+    let supervised = tokio::spawn(supervise_listener(id.to_owned(), runtime.clone(), listener));
+    listeners.entry(id.to_owned()).or_default().push(supervised);
 }
 
 pub(super) async fn start_inbounds(
@@ -100,16 +134,65 @@ pub(super) async fn start_inbounds(
         )
         .await?;
     let monitor = controller.monitor();
+    let runtime = controller.inbound_runtime();
+    for record in &records {
+        if only_id.is_some_and(|id| id != record.id) {
+            continue;
+        }
+        if !record.enabled {
+            runtime.mark_disabled(&record.id);
+        } else if !record.protocol_type.eq_ignore_ascii_case("tun") {
+            runtime.mark_starting(&record.id, false);
+        }
+    }
+    let socket_ids = records
+        .iter()
+        .filter(|record| {
+            record.enabled
+                && !record.protocol_type.eq_ignore_ascii_case("tun")
+                && only_id.is_none_or(|id| id == record.id)
+        })
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    let deferred_socket_ids = records
+        .iter()
+        .filter(|record| {
+            record.enabled
+                && !record.protocol_type.eq_ignore_ascii_case("tun")
+                && (record.protocol_type.eq_ignore_ascii_case("tproxy")
+                    || record.protocol_type.eq_ignore_ascii_case("redir"))
+                && only_id.is_none_or(|id| id == record.id)
+        })
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    let tun_ids = records
+        .iter()
+        .filter(|record| {
+            record.enabled
+                && record.protocol_type.eq_ignore_ascii_case("tun")
+                && only_id.is_none_or(|id| id == record.id)
+        })
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
     let mut listeners = HashMap::new();
 
     async fn bind_tcp_listener(
         listen: SocketAddr,
         id: &str,
         monitor: &ConnectionMonitor,
+        runtime: &InboundRuntimeState,
     ) -> Option<TcpListener> {
         match TcpListener::bind(listen).await {
-            Ok(listener) => Some(listener),
+            Ok(listener) => {
+                runtime.listener_ready(
+                    id,
+                    "tcp",
+                    Some(listener.local_addr().unwrap_or(listen).to_string()),
+                );
+                Some(listener)
+            }
             Err(error) => {
+                runtime.listener_failed(id, "tcp", Some(listen.to_string()), &error.to_string());
                 monitor.error(format!("skip inbound {id}: bind TCP {listen}: {error}"));
                 None
             }
@@ -204,6 +287,7 @@ pub(super) async fn start_inbounds(
                 let listener_selector = selector.clone();
                 let listener_monitor = monitor.clone();
                 let listener_tls_acceptor = tls_acceptor.clone();
+                let listener_runtime = runtime.clone();
                 let logs = listener_monitor.logs();
                 push_listener(
                     &mut listeners,
@@ -216,17 +300,20 @@ pub(super) async fn start_inbounds(
                             listener_selector,
                             listener_monitor,
                             listener_tls_acceptor,
+                            listener_runtime,
                         )
                         .await
                         {
                             logs.error(format!("transparent inbound listener stopped: {error}"));
                         }
                     }),
+                    &runtime,
                 );
                 if udp_enabled && is_tproxy {
                     let selector = selector.clone();
                     let monitor = monitor.clone();
                     let spec = udp_spec;
+                    let listener_runtime = runtime.clone();
                     let logs = monitor.logs();
                     push_listener(
                         &mut listeners,
@@ -238,20 +325,23 @@ pub(super) async fn start_inbounds(
                                     spec,
                                     selector,
                                     monitor,
+                                    listener_runtime,
                                 )
                                 .await
                             {
                                 logs.error(format!("transparent UDP listener stopped: {error}"));
                             }
                         }),
+                        &runtime,
                     );
                 }
             }
             #[cfg(not(target_os = "linux"))]
-            monitor.warn(format!(
-                "skip inbound {}: tproxy/redir require Linux socket support",
-                spec.id
-            ));
+            {
+                let error = "tproxy/redir require Linux socket support";
+                monitor.warn(format!("skip inbound {}: {error}", spec.id));
+                runtime.listener_failed(&spec.id, "listener", Some(spec.listen.to_string()), error);
+            }
             continue;
         }
         if has_transport(&spec.transports, "websocket") {
@@ -262,7 +352,8 @@ pub(super) async fn start_inbounds(
                 ));
             }
             if spec.udp_mode.tcp_enabled() {
-                let Some(listener) = bind_tcp_listener(spec.listen, &spec.id, &monitor).await
+                let Some(listener) =
+                    bind_tcp_listener(spec.listen, &spec.id, &monitor, &runtime).await
                 else {
                     continue;
                 };
@@ -293,6 +384,7 @@ pub(super) async fn start_inbounds(
                                     ));
                                 }
                             }),
+                            &runtime,
                         );
                     } else {
                         push_listener(
@@ -313,6 +405,7 @@ pub(super) async fn start_inbounds(
                                     ));
                                 }
                             }),
+                            &runtime,
                         );
                     }
                 }
@@ -342,6 +435,7 @@ pub(super) async fn start_inbounds(
                                     ));
                                 }
                             }),
+                            &runtime,
                         );
                     }
                 }
@@ -361,7 +455,8 @@ pub(super) async fn start_inbounds(
                 ));
             }
             if spec.udp_mode.tcp_enabled() {
-                let Some(listener) = bind_tcp_listener(spec.listen, &spec.id, &monitor).await
+                let Some(listener) =
+                    bind_tcp_listener(spec.listen, &spec.id, &monitor, &runtime).await
                 else {
                     continue;
                 };
@@ -382,6 +477,7 @@ pub(super) async fn start_inbounds(
                             logs.error(format!("HTTP/2 inbound listener stopped: {error}"));
                         }
                     }),
+                    &runtime,
                 );
                 #[cfg(not(feature = "http2"))]
                 {
@@ -394,7 +490,8 @@ pub(super) async fn start_inbounds(
         if spec.udp_mode.tcp_enabled()
             || (spec.protocol.eq_ignore_ascii_case("vless") && spec.udp_mode.udp_enabled())
         {
-            let Some(listener) = bind_tcp_listener(spec.listen, &spec.id, &monitor).await else {
+            let Some(listener) = bind_tcp_listener(spec.listen, &spec.id, &monitor, &runtime).await
+            else {
                 continue;
             };
             spec.listen = listener.local_addr().unwrap_or(spec.listen);
@@ -413,6 +510,7 @@ pub(super) async fn start_inbounds(
                         logs.error(format!("inbound listener stopped: {error}"));
                     }
                 }),
+                &runtime,
             );
         }
         if spec.udp_mode.udp_enabled() {
@@ -447,6 +545,12 @@ pub(super) async fn start_inbounds(
                     let raw = match UdpSocket::bind(spec.listen).await {
                         Ok(socket) => socket,
                         Err(error) => {
+                            runtime.listener_failed(
+                                &spec.id,
+                                "udp",
+                                Some(spec.listen.to_string()),
+                                &error.to_string(),
+                            );
                             monitor.error(format!(
                                 "skip UDP inbound {}: bind AEAD Yuubinsya UDP {}: {error}",
                                 spec.id, spec.listen
@@ -477,6 +581,12 @@ pub(super) async fn start_inbounds(
                     {
                         Ok(socket) => socket,
                         Err(error) => {
+                            runtime.listener_failed(
+                                &spec.id,
+                                "udp",
+                                Some(spec.listen.to_string()),
+                                &error.to_string(),
+                            );
                             monitor.error(format!(
                                 "skip UDP inbound {}: bind Yuubinsya UDP {}: {error}",
                                 spec.id, spec.listen
@@ -499,6 +609,7 @@ pub(super) async fn start_inbounds(
                             logs.error(format!("Yuubinsya UDP listener stopped: {error}"));
                         }
                     }),
+                    &runtime,
                 );
             } else if protocol.eq_ignore_ascii_case("socks5")
                 || protocol.eq_ignore_ascii_case("mixed")
@@ -521,6 +632,12 @@ pub(super) async fn start_inbounds(
                 let socket = match UdpSocket::bind(spec.listen).await {
                     Ok(socket) => socket,
                     Err(error) => {
+                        runtime.listener_failed(
+                            &spec.id,
+                            "udp",
+                            Some(spec.listen.to_string()),
+                            &error.to_string(),
+                        );
                         monitor.error(format!(
                             "skip UDP inbound {}: bind SOCKS5 UDP {}: {error}",
                             spec.id, spec.listen
@@ -550,6 +667,7 @@ pub(super) async fn start_inbounds(
                                 logs.error(format!("AEAD SOCKS5 UDP listener stopped: {error}"));
                             }
                         }),
+                        &runtime,
                     );
                 } else {
                     let socket = crate::inbound::socks5::RuntimeUdpTransport(Box::new(socket));
@@ -566,6 +684,7 @@ pub(super) async fn start_inbounds(
                                 logs.error(format!("SOCKS5 UDP listener stopped: {error}"));
                             }
                         }),
+                        &runtime,
                     );
                 }
             } else {
@@ -617,6 +736,9 @@ pub(super) async fn start_inbounds(
                 Ok(configs) => configs,
                 Err(error) => {
                     monitor.error(format!("load TUN inbound config failed: {error}"));
+                    for id in &tun_ids {
+                        runtime.listener_failed(id, "tun", None, &error.to_string());
+                    }
                     Vec::new()
                 }
             }
@@ -634,8 +756,23 @@ pub(super) async fn start_inbounds(
                 shutdown,
             );
         }
+        for id in tun_ids {
+            if !listeners.contains_key(&id) && !runtime.has_failed_listener(&id) {
+                runtime.mark_no_listener(&id, "no TUN inbound listener was started");
+            }
+        }
     }
 
+    for id in socket_ids {
+        if deferred_socket_ids.iter().any(|deferred| deferred == &id) {
+            continue;
+        }
+        if listeners.contains_key(&id) {
+            runtime.owner_started(&id);
+        } else {
+            runtime.mark_no_listener(&id, "no inbound listener was started");
+        }
+    }
     Ok(listeners)
 }
 
@@ -665,6 +802,8 @@ fn spawn_tun_owner(
 ) {
     let id = tun_owner_id(&config);
     let monitor = controller.monitor();
+    let runtime = controller.inbound_runtime();
+    runtime.mark_starting(&id, false);
     let shutdown = shutdown.clone();
     let task = tokio::task::spawn_local(run_tun_owner(
         controller.clone(),
@@ -673,7 +812,7 @@ fn spawn_tun_owner(
         source,
         monitor,
     ));
-    push_listener(owners, &id, task);
+    push_listener(owners, &id, task, &runtime);
 }
 
 #[cfg(feature = "tun")]
@@ -684,6 +823,7 @@ async fn run_tun_owner(
     mut source: TunSource,
     monitor: Arc<ConnectionMonitor>,
 ) {
+    let runtime = controller.inbound_runtime();
     loop {
         let owner_id = tun_owner_id(&config);
         let mut reload_already_received = false;
@@ -691,6 +831,7 @@ async fn run_tun_owner(
             let result = match &mut source {
                 TunSource::Desktop => match crate::data_plane::open_tun(&config) {
                     Ok(tun) => {
+                        runtime.listener_ready(&owner_id, "tun", config.tun.name.clone());
                         monitor.info(format!(
                             "TUN inbound started name={}",
                             tun.name()
@@ -709,6 +850,7 @@ async fn run_tun_owner(
                     Err(error) => Err(error),
                 },
                 TunSource::Injected(tun) => {
+                    runtime.listener_ready(&owner_id, "tun", config.tun.name.clone());
                     monitor.info(format!(
                         "TUN inbound started name={}",
                         tun.name()
@@ -728,10 +870,17 @@ async fn run_tun_owner(
             match result {
                 Ok(()) => reload_already_received = true,
                 Err(error) => {
+                    runtime.listener_failed(
+                        &owner_id,
+                        "tun",
+                        config.tun.name.clone(),
+                        &error.to_string(),
+                    );
                     monitor.error(format!("TUN inbound stopped: {error}; waiting for reload"));
                 }
             }
         } else {
+            runtime.mark_disabled(&owner_id);
             monitor.info("TUN inbound disabled");
         }
 

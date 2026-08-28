@@ -33,6 +33,7 @@ impl ConnectionMonitor {
             state.total_download = total_download;
             state.total_upload = total_upload;
         }
+        monitor.restore_inbound_statistics(store.load_inbound_statistics()?);
 
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let persistence = Arc::new(PersistenceState {
@@ -62,6 +63,7 @@ impl ConnectionMonitor {
                     continue;
                 }
                 let delta = writer_monitor.take_statistics_delta();
+                let inbound_statistics = writer_monitor.inbound_statistics();
                 let store = worker_persistence.store.clone();
                 let write_delta = delta.clone();
                 let result = match tokio::task::spawn_blocking(move || {
@@ -77,6 +79,22 @@ impl ConnectionMonitor {
                 };
                 if result.is_err() {
                     writer_monitor.merge_statistics_delta(delta);
+                    worker_persistence.dirty.store(true, Ordering::Release);
+                    continue;
+                }
+                let store = worker_persistence.store.clone();
+                let result = match tokio::task::spawn_blocking(move || {
+                    store.replace_inbound_statistics(&inbound_statistics)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(doradus_core::Error::new(
+                        doradus_core::ErrorKind::Storage,
+                        format!("inbound statistics persistence task: {error}"),
+                    )),
+                };
+                if result.is_err() {
                     worker_persistence.dirty.store(true, Ordering::Release);
                 }
             }
@@ -118,6 +136,7 @@ impl ConnectionMonitor {
             return Ok(());
         };
         let delta = self.take_statistics_delta();
+        let inbound_statistics = self.inbound_statistics();
         let store = persistence.store.clone();
         let write_delta = delta.clone();
         let result = match tokio::task::spawn_blocking(move || {
@@ -138,6 +157,17 @@ impl ConnectionMonitor {
             self.merge_statistics_delta(delta);
             return Err(error);
         }
-        Ok(())
+        let store = persistence.store.clone();
+        match tokio::task::spawn_blocking(move || {
+            store.replace_inbound_statistics(&inbound_statistics)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(doradus_core::Error::new(
+                doradus_core::ErrorKind::Storage,
+                format!("inbound statistics persistence task: {error}"),
+            )),
+        }
     }
 }

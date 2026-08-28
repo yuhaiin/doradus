@@ -209,6 +209,10 @@ pub struct FlowContext {
     /// These fields are optional so packet-only callers do not need a second
     /// DTO or synthetic values.
     pub component: Option<String>,
+    /// Stable persisted identity of the inbound that accepted this flow.
+    /// This is separate from the display name so per-inbound statistics stay
+    /// correct when an inbound is renamed.
+    pub inbound_id: Option<String>,
     pub inbound: Option<String>,
     pub inbound_name: Option<String>,
     pub outbound: Option<String>,
@@ -268,6 +272,7 @@ impl FlowContext {
             local_bind_addresses: Vec::new(),
             bind_interface: None,
             component: None,
+            inbound_id: None,
             inbound: None,
             inbound_name: None,
             outbound: None,

@@ -623,6 +623,9 @@ async fn rpc(
 #[path = "operations.rs"]
 mod operations;
 use operations::*;
+mod embedded_web {
+    include!(concat!(env!("OUT_DIR"), "/embedded_web.rs"));
+}
 #[cfg(test)]
 #[path = "api_tests.rs"]
 mod tests;

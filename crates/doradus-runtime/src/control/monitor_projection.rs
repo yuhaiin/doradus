@@ -62,6 +62,7 @@ pub(super) fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -
         "source": source,
         "inbound": inbound,
         "inboundName": inbound_name,
+        "inboundId": context.inbound_id.as_deref().unwrap_or_default(),
         "interface": context.interface.as_deref().unwrap_or_default(),
         "outbound": outbound,
         "localAddr": local_addr,

@@ -486,6 +486,18 @@ pub async fn inbound_get(State(state): State<ApiState>, Path(id): Path<String>) 
     get_inbound_value(&state, id).await
 }
 
+pub async fn inbounds_status(State(state): State<ApiState>) -> ApiResult {
+    inbounds_status_value(&state).await
+}
+
+pub async fn inbound_events(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
+    inbound_events_value(&state, id).await
+}
+
+pub async fn inbound_retry(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult {
+    retry_inbound_value(&state, id).await
+}
+
 pub async fn inbound_put(
     State(state): State<ApiState>,
     Path(id): Path<String>,

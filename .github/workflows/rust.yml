@@ -15,6 +15,8 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   HOST_CARGO: 1
+  FRONTEND_REPOSITORY: Asutorufa/yuhaiin-react
+  FRONTEND_REF: main
 
 jobs:
   checks:
@@ -55,7 +57,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.platform }} ${{ matrix.arch }}
-    needs: checks
+    needs: [checks, frontend]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -89,6 +91,12 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+
+      - name: Download frontend bundle
+        uses: actions/download-artifact@v7
+        with:
+          name: doradus-frontend
+          path: crates/doradus-api/web
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -160,6 +168,40 @@ jobs:
           path: dist/doradus-*
           if-no-files-found: error
           retention-days: 14
+
+  frontend:
+    name: Build frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out frontend
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.FRONTEND_REPOSITORY }}
+          ref: ${{ env.FRONTEND_REF }}
+          path: frontend
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Upload frontend bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: doradus-frontend
+          path: frontend/dist
+          if-no-files-found: error
+          retention-days: 1
 
   native-service:
     name: Native service lifecycle ${{ matrix.platform }}

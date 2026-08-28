@@ -602,6 +602,20 @@ impl ConnectionMonitor {
         let id = state.next_id.to_string();
         let value = connection_value(&id, flow, &context);
         let telemetry = Arc::from(telemetry_dimensions(&value));
+        if let Some(inbound_id) = context.inbound_id.clone() {
+            let statistics = state.inbound_statistics.entry(inbound_id).or_default();
+            match flow.key.network {
+                doradus_core::Network::Tcp => {
+                    statistics.active_tcp = statistics.active_tcp.saturating_add(1);
+                    statistics.total_tcp_flows = statistics.total_tcp_flows.saturating_add(1);
+                }
+                doradus_core::Network::Udp => {
+                    statistics.active_udp = statistics.active_udp.saturating_add(1);
+                    statistics.total_udp_flows = statistics.total_udp_flows.saturating_add(1);
+                }
+                doradus_core::Network::Icmp | doradus_core::Network::Any => {}
+            }
+        }
         state.ids.insert(id.clone(), flow.key);
         state.counters.entry(id.clone()).or_default();
         state.connections.insert(
@@ -653,7 +667,17 @@ impl ConnectionMonitor {
                 state.buckets.remove(&first);
             }
         }
-        let Some(id) = state.connections.get(&flow).map(|entry| entry.id.clone()) else {
+        let Some((id, inbound_id)) = state.connections.get(&flow).map(|entry| {
+            (
+                entry.id.clone(),
+                entry
+                    .value
+                    .get("inboundId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned),
+            )
+        }) else {
             drop(state);
             self.mark_dirty();
             return;
@@ -678,6 +702,17 @@ impl ConnectionMonitor {
         match direction {
             TunFlowDirection::Upload => counter.1 = counter.1.saturating_add(bytes),
             TunFlowDirection::Download => counter.0 = counter.0.saturating_add(bytes),
+        }
+        if let Some(inbound_id) = inbound_id {
+            let statistics = state.inbound_statistics.entry(inbound_id).or_default();
+            match direction {
+                TunFlowDirection::Upload => {
+                    statistics.upload_bytes = statistics.upload_bytes.saturating_add(bytes);
+                }
+                TunFlowDirection::Download => {
+                    statistics.download_bytes = statistics.download_bytes.saturating_add(bytes);
+                }
+            }
         }
         for (dimension, value) in telemetry.iter() {
             let item = if persistent {
@@ -741,6 +776,26 @@ impl ConnectionMonitor {
         let Some(entry) = state.connections.remove(&flow) else {
             return;
         };
+        if let Some(inbound_id) = entry
+            .value
+            .get("inboundId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            let statistics = state
+                .inbound_statistics
+                .entry(inbound_id.to_owned())
+                .or_default();
+            match flow.network {
+                doradus_core::Network::Tcp => {
+                    statistics.active_tcp = statistics.active_tcp.saturating_sub(1);
+                }
+                doradus_core::Network::Udp => {
+                    statistics.active_udp = statistics.active_udp.saturating_sub(1);
+                }
+                doradus_core::Network::Icmp | doradus_core::Network::Any => {}
+            }
+        }
         // Go's `connections.total.counters` is a live-flow view.  The
         // per-connection counter is removed together with the connection;
         // durable totals and history are maintained separately below.
@@ -917,6 +972,14 @@ impl ConnectionMonitor {
         }
     }
 
+    pub fn inbound_statistics(&self) -> Vec<InboundStatisticsRecord> {
+        self.lock()
+            .inbound_statistics
+            .iter()
+            .map(|(id, statistics)| statistics.record(id.clone()))
+            .collect()
+    }
+
     pub(super) fn restore_persisted_runtime(&self, persisted: PersistedMonitor) {
         let mut state = self.lock();
         state.next_id = persisted.next_id;
@@ -949,6 +1012,22 @@ impl ConnectionMonitor {
                 break;
             };
             state.block_history.remove(&key);
+        }
+    }
+
+    pub(super) fn restore_inbound_statistics(&self, records: Vec<InboundStatisticsRecord>) {
+        let mut state = self.lock();
+        for record in records {
+            state.inbound_statistics.insert(
+                record.inbound_id,
+                InboundStatistics {
+                    total_tcp_flows: record.total_tcp_flows,
+                    total_udp_flows: record.total_udp_flows,
+                    upload_bytes: record.upload_bytes,
+                    download_bytes: record.download_bytes,
+                    ..InboundStatistics::default()
+                },
+            );
         }
     }
 }

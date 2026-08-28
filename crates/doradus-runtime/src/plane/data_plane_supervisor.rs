@@ -55,6 +55,16 @@ pub async fn run_tun_device_until_ref(
             None,
         )
         .await?;
+    let inbound_id = config
+        .inbound_id
+        .clone()
+        .or_else(|| config.tun.name.clone())
+        .or_else(|| Some("tun".to_owned()));
+    proxy_runtime.set_context_provider(move |flow| {
+        let mut context = flow.context();
+        context.inbound_id = inbound_id.clone();
+        context
+    });
     let mut inbound_interceptor =
         crate::inbound::InboundInputInterceptor::new(controller.monitor(), config.channel_capacity);
     controller.monitor().info("TUN inbound ready");

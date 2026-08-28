@@ -325,7 +325,7 @@ async fn run_until_inner(
     let mut reload = controller.subscribe_inbound_reload();
     let mut listeners = InboundOwners::new();
     let result = async {
-        abort_inbounds(&mut listeners).await;
+        abort_inbounds(&mut listeners, &controller.inbound_runtime()).await;
         listeners = start_inbounds(&controller, &shutdown, None, &mut options).await?;
         if let Some(selector_ready) = selector_ready.take() {
             let _ = selector_ready.send(());
@@ -349,7 +349,12 @@ async fn run_until_inner(
                             // are latest-wins, so discard intermediates.
                             while reload.try_recv().is_ok() {}
                             let injected_id = options.injected_owner_id();
-                            abort_inbounds_except(&mut listeners, injected_id.as_deref()).await;
+                            abort_inbounds_except(
+                                &mut listeners,
+                                injected_id.as_deref(),
+                                &controller.inbound_runtime(),
+                            )
+                            .await;
                             let owners = start_inbounds(
                                 &controller,
                                 &shutdown,
@@ -361,7 +366,12 @@ async fn run_until_inner(
                         }
                         crate::controller::InboundReload::One(id) => {
                             if !options.is_injected_owner(&id) {
-                                abort_inbound_owner(&mut listeners, &id).await;
+                                abort_inbound_owner(
+                                    &mut listeners,
+                                    &id,
+                                    &controller.inbound_runtime(),
+                                )
+                                .await;
                                 let owner = start_inbounds(
                                     &controller,
                                     &shutdown,
@@ -379,7 +389,7 @@ async fn run_until_inner(
         Ok::<(), Error>(())
     }
     .await;
-    abort_inbounds(&mut listeners).await;
+    abort_inbounds(&mut listeners, &controller.inbound_runtime()).await;
 
     result
 }
@@ -448,8 +458,12 @@ pub async fn selected_proxy_id(controller: &RuntimeController) -> Result<String>
     Ok(selected_proxy_ids(controller).await?.0)
 }
 
-async fn abort_inbounds(listeners: &mut InboundOwners) {
-    for (_, owner) in listeners.drain() {
+async fn abort_inbounds(
+    listeners: &mut InboundOwners,
+    runtime: &crate::inbound_runtime::InboundRuntimeState,
+) {
+    for (id, owner) in listeners.drain() {
+        runtime.mark_stopping(&id);
         for listener in owner {
             listener.abort();
             let _ = listener.await;
@@ -457,8 +471,13 @@ async fn abort_inbounds(listeners: &mut InboundOwners) {
     }
 }
 
-async fn abort_inbound_owner(listeners: &mut InboundOwners, id: &str) {
+async fn abort_inbound_owner(
+    listeners: &mut InboundOwners,
+    id: &str,
+    runtime: &crate::inbound_runtime::InboundRuntimeState,
+) {
     if let Some(owner) = listeners.remove(id) {
+        runtime.mark_stopping(id);
         for listener in owner {
             listener.abort();
             let _ = listener.await;
@@ -466,14 +485,18 @@ async fn abort_inbound_owner(listeners: &mut InboundOwners, id: &str) {
     }
 }
 
-async fn abort_inbounds_except(listeners: &mut InboundOwners, keep_id: Option<&str>) {
+async fn abort_inbounds_except(
+    listeners: &mut InboundOwners,
+    keep_id: Option<&str>,
+    runtime: &crate::inbound_runtime::InboundRuntimeState,
+) {
     let ids = listeners
         .keys()
         .filter(|id| Some(id.as_str()) != keep_id)
         .cloned()
         .collect::<Vec<_>>();
     for id in ids {
-        abort_inbound_owner(listeners, &id).await;
+        abort_inbound_owner(listeners, &id, runtime).await;
     }
 }
 

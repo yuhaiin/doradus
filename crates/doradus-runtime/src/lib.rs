@@ -10,6 +10,8 @@ use doradus_core::Result;
 mod controller;
 #[path = "control/handle.rs"]
 mod handle;
+#[path = "control/inbound_runtime.rs"]
+mod inbound_runtime;
 #[path = "control/monitor.rs"]
 pub mod monitor;
 

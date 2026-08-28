@@ -23,7 +23,7 @@ use doradus_core::flow::{
 use doradus_core::{BoxFuture, Endpoint, FlowContext, RouteMode};
 use doradus_store::{
     ConfigStore, GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsDelta,
-    GoStatisticsSnapshot, GoTelemetryBucketRecord, GoTrafficBucketRecord,
+    GoStatisticsSnapshot, GoTelemetryBucketRecord, GoTrafficBucketRecord, InboundStatisticsRecord,
     TELEMETRY_DAILY_BUCKET_SECONDS, TELEMETRY_HOURLY_BUCKET_SECONDS,
 };
 
@@ -104,6 +104,31 @@ struct ConnectionEntry {
     download: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(super) struct InboundStatistics {
+    pub active_tcp: u64,
+    pub active_udp: u64,
+    pub total_tcp_flows: u64,
+    pub total_udp_flows: u64,
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+}
+
+impl InboundStatistics {
+    fn record(&self, inbound_id: String) -> InboundStatisticsRecord {
+        InboundStatisticsRecord {
+            inbound_id,
+            active_tcp: self.active_tcp,
+            active_udp: self.active_udp,
+            total_tcp_flows: self.total_tcp_flows,
+            total_udp_flows: self.total_udp_flows,
+            upload_bytes: self.upload_bytes,
+            download_bytes: self.download_bytes,
+            updated_at: unix_seconds(),
+        }
+    }
+}
+
 type TelemetryBucketKey = (i64, i64, String, String);
 type TelemetryBucketValue = (u64, u64, u64);
 
@@ -122,6 +147,7 @@ struct MonitorState {
     connections: HashMap<TunFlowKey, ConnectionEntry>,
     ids: HashMap<String, TunFlowKey>,
     counters: BTreeMap<String, (u64, u64)>,
+    inbound_statistics: BTreeMap<String, InboundStatistics>,
     buckets: BTreeMap<i64, (u64, u64)>,
     telemetry: BTreeMap<(String, String), (u64, u64, u64)>,
     telemetry_buckets: BTreeMap<TelemetryBucketKey, TelemetryBucketValue>,

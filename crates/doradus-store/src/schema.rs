@@ -314,6 +314,25 @@ pub(super) fn typed_schema_sql() -> &'static str {
         download_bytes INTEGER NOT NULL DEFAULT 0,
         summary_json   TEXT NOT NULL CHECK (json_valid(summary_json))
     );
+    CREATE TABLE IF NOT EXISTS inbound_runtime_events (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        inbound_id  TEXT NOT NULL,
+        event_type  TEXT NOT NULL,
+        state       TEXT NOT NULL,
+        error       TEXT,
+        detail_json TEXT NOT NULL CHECK (json_valid(detail_json)),
+        created_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS inbound_runtime_events_inbound_idx
+        ON inbound_runtime_events(inbound_id, created_at DESC, id DESC);
+    CREATE TABLE IF NOT EXISTS inbound_statistics (
+        inbound_id      TEXT PRIMARY KEY NOT NULL,
+        total_tcp_flows INTEGER NOT NULL DEFAULT 0,
+        total_udp_flows INTEGER NOT NULL DEFAULT 0,
+        upload_bytes    INTEGER NOT NULL DEFAULT 0,
+        download_bytes  INTEGER NOT NULL DEFAULT 0,
+        updated_at      INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS settings_json (
         id         INTEGER PRIMARY KEY CHECK (id = 1),
         version    INTEGER NOT NULL,
@@ -535,6 +554,29 @@ pub(super) fn validate_typed_schema(connection: &Connection) -> Result<()> {
         (
             "user_token_v2",
             &[("user_id", "TEXT", false, 1), ("token", "TEXT", true, 0)],
+        ),
+        (
+            "inbound_runtime_events",
+            &[
+                ("id", "INTEGER", false, 1),
+                ("inbound_id", "TEXT", true, 0),
+                ("event_type", "TEXT", true, 0),
+                ("state", "TEXT", true, 0),
+                ("error", "TEXT", false, 0),
+                ("detail_json", "TEXT", true, 0),
+                ("created_at", "INTEGER", true, 0),
+            ],
+        ),
+        (
+            "inbound_statistics",
+            &[
+                ("inbound_id", "TEXT", true, 1),
+                ("total_tcp_flows", "INTEGER", true, 0),
+                ("total_udp_flows", "INTEGER", true, 0),
+                ("upload_bytes", "INTEGER", true, 0),
+                ("download_bytes", "INTEGER", true, 0),
+                ("updated_at", "INTEGER", true, 0),
+            ],
         ),
     ];
     for (table, columns) in contracts {

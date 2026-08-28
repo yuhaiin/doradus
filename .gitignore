@@ -5,3 +5,5 @@
 /target-*
 /.codebase-index
 .cache
+/crates/doradus-api/web/*
+!/crates/doradus-api/web/.gitkeep

@@ -19,6 +19,7 @@ mod backup;
 mod compat_runtime;
 #[path = "fakeip_store.rs"]
 mod fakeip_store;
+mod inbound_runtime;
 #[path = "lifecycle.rs"]
 mod lifecycle;
 mod migration;
@@ -52,6 +53,7 @@ pub use compat_runtime::{
     GoFakeIpRuntimeConfig, GoResolverRuntimeConfig, GoResolverTransport, GoRouteRuntimeConfig,
     GoUdpProxyFqdnStrategy,
 };
+pub use inbound_runtime::{InboundRuntimeEvent, InboundRuntimeEventInput, InboundStatisticsRecord};
 pub use records::*;
 pub use resolver::{FakeIpPolicy, FakeIpPools, FakeIpResolver};
 pub use snapshot::{install_go_snapshot, install_go_snapshot_with_manifest, restore_database};
@@ -95,6 +97,8 @@ const BACKUP_RUNTIME_TABLES: &[&str] = &[
     "failure_dimension_hourly",
     "failure_dimension_daily",
     "telemetry_dimension_values",
+    "inbound_runtime_events",
+    "inbound_statistics",
 ];
 
 // SQLite file initialization and WAL bootstrap must not be raced by separate

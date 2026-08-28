@@ -20,6 +20,7 @@ use crate::inbound::{
     InboundHandler, InboundSpec, InboundTlsAcceptor, InboundUdpFlowPolicy, InboundUdpSession,
     prepare_inbound_stream,
 };
+use crate::inbound_runtime::InboundRuntimeState;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
 pub(crate) async fn serve_listener(
@@ -29,11 +30,20 @@ pub(crate) async fn serve_listener(
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
     tls_acceptor: Option<InboundTlsAcceptor>,
+    runtime: Arc<InboundRuntimeState>,
 ) -> Result<()> {
-    let listener = doradus_protocol::transparent::bind_listener(
+    let id = spec.id.clone();
+    let listener = match doradus_protocol::transparent::bind_listener(
         listen,
         protocol.eq_ignore_ascii_case("tproxy"),
-    )?;
+    ) {
+        Ok(listener) => listener,
+        Err(error) => {
+            runtime.listener_failed(&id, "tcp", Some(listen.to_string()), &error.to_string());
+            return Err(error.into());
+        }
+    };
+    runtime.listener_ready(&spec.id, "tcp", Some(listen.to_string()));
     let inbound = InboundHandler::new(spec, Arc::clone(&selector), Arc::clone(&monitor));
     let mut connections = JoinSet::new();
     let result = async {
@@ -76,13 +86,22 @@ pub(crate) async fn serve_udp_listener(
     spec: InboundSpec,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
+    runtime: Arc<InboundRuntimeState>,
 ) -> Result<()> {
-    monitor.info(format!("transparent UDP listener ready at {listen}"));
+    let id = spec.id.clone();
     let inbound = InboundHandler::new(spec, Arc::clone(&selector), Arc::clone(&monitor));
-    let codec = doradus_protocol::transparent::UdpServer::bind(
+    let codec = match doradus_protocol::transparent::UdpServer::bind(
         listen,
         inbound.selector().udp_buffer_size(),
-    )?;
+    ) {
+        Ok(codec) => codec,
+        Err(error) => {
+            runtime.listener_failed(&id, "udp", Some(listen.to_string()), &error.to_string());
+            return Err(error.into());
+        }
+    };
+    runtime.listener_ready(&inbound.spec().id, "udp", Some(listen.to_string()));
+    monitor.info(format!("transparent UDP listener ready at {listen}"));
     InboundUdpSession::new(codec, inbound).run().await
 }
 

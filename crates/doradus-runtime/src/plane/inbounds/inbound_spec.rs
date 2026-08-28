@@ -157,6 +157,7 @@ impl InboundSpec {
         } else {
             self.listen.to_string()
         };
+        context.inbound_id = Some(self.id.clone());
         context.inbound = Some(inbound);
         context.inbound_name = Some(if self.name.trim().is_empty() {
             self.id.clone()

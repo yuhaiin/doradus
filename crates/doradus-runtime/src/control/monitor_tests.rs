@@ -89,6 +89,64 @@ fn monitor_tracks_live_connections_and_precise_string_counters() {
 }
 
 #[test]
+fn monitor_tracks_inbound_tcp_udp_flows_and_bytes() {
+    let monitor = ConnectionMonitor::new();
+    let (tcp, mut tcp_context) = flow();
+    tcp_context.inbound_id = Some("entry".to_owned());
+    monitor.opened(tcp, tcp_context);
+
+    let udp_key = TunFlowKey {
+        network: Network::Udp,
+        source: "10.0.0.2:1235".parse().unwrap(),
+        destination: "203.0.113.11:443".parse().unwrap(),
+    };
+    let udp = TunFlow { key: udp_key };
+    let mut udp_context = FlowContext::new(Endpoint::ip(Network::Udp, udp_key.destination));
+    udp_context.inbound_id = Some("entry".to_owned());
+    monitor.opened(udp, udp_context);
+    monitor.bytes(tcp.key, TunFlowDirection::Upload, 17);
+    monitor.bytes(udp.key, TunFlowDirection::Download, 23);
+
+    let statistics = monitor.inbound_statistics();
+    assert_eq!(statistics.len(), 1);
+    assert_eq!(statistics[0].inbound_id, "entry");
+    assert_eq!(statistics[0].active_tcp, 1);
+    assert_eq!(statistics[0].active_udp, 1);
+    assert_eq!(statistics[0].total_tcp_flows, 1);
+    assert_eq!(statistics[0].total_udp_flows, 1);
+    assert_eq!(statistics[0].upload_bytes, 17);
+    assert_eq!(statistics[0].download_bytes, 23);
+
+    monitor.closed(tcp.key);
+    monitor.closed(udp.key);
+    let statistics = monitor.inbound_statistics();
+    assert_eq!(statistics[0].active_tcp, 0);
+    assert_eq!(statistics[0].active_udp, 0);
+}
+
+#[tokio::test]
+async fn inbound_statistics_persist_aggregate_counters_but_not_active_flows() {
+    let store = ConfigStore::open_memory().await.unwrap();
+    let monitor = ConnectionMonitor::load_with_store(store.clone())
+        .await
+        .unwrap();
+    let (flow, mut context) = flow();
+    context.inbound_id = Some("entry".to_owned());
+    monitor.opened(flow, context);
+    monitor.bytes(flow.key, TunFlowDirection::Upload, 31);
+    monitor.bytes(flow.key, TunFlowDirection::Download, 47);
+    monitor.shutdown().await.unwrap();
+
+    let restored = ConnectionMonitor::load_with_store(store).await.unwrap();
+    let statistics = restored.inbound_statistics();
+    assert_eq!(statistics[0].total_tcp_flows, 1);
+    assert_eq!(statistics[0].upload_bytes, 31);
+    assert_eq!(statistics[0].download_bytes, 47);
+    assert_eq!(statistics[0].active_tcp, 0);
+    restored.shutdown().await.unwrap();
+}
+
+#[test]
 fn history_times_are_serialized_in_utc() {
     assert_eq!(format_time(1_752_883_200), "2025-07-19T00:00:00Z");
 }

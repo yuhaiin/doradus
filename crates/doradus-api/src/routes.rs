@@ -32,6 +32,9 @@ pub(super) fn build(state: ApiState) -> Router {
         .route("/api/v2/nodes/{id}/latency", post(node_latency))
         .route("/api/v2/nodes/{id}/close", post(node_close))
         .route("/api/v2/inbounds", get(inbounds_get).post(inbounds_post))
+        .route("/api/v2/inbounds/status", get(inbounds_status))
+        .route("/api/v2/inbounds/{id}/events", get(inbound_events))
+        .route("/api/v2/inbounds/{id}/retry", post(inbound_retry))
         .route(
             "/api/v2/inbounds/{id}",
             get(inbound_get).put(inbound_put).delete(inbound_delete),
@@ -150,6 +153,22 @@ pub(super) fn build(state: ApiState) -> Router {
         let index = root.join("index.html");
         router.fallback_service(ServeDir::new(root).fallback(ServeFile::new(index)))
     } else {
-        router
+        router.fallback(embedded_web_fallback)
+    }
+}
+
+async fn embedded_web_fallback(uri: axum::http::Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    let asset = embedded_web::asset(path).or_else(|| embedded_web::asset("index.html"));
+    match asset {
+        Some((bytes, content_type)) => (
+            [(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static(content_type),
+            )],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
