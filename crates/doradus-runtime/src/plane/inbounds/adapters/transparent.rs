@@ -40,7 +40,7 @@ pub(crate) async fn serve_listener(
         Ok(listener) => listener,
         Err(error) => {
             runtime.listener_failed(&id, "tcp", Some(listen.to_string()), &error.to_string());
-            return Err(error.into());
+            return Err(error);
         }
     };
     runtime.listener_ready(&spec.id, "tcp", Some(listen.to_string()));
@@ -97,7 +97,7 @@ pub(crate) async fn serve_udp_listener(
         Ok(codec) => codec,
         Err(error) => {
             runtime.listener_failed(&id, "udp", Some(listen.to_string()), &error.to_string());
-            return Err(error.into());
+            return Err(error);
         }
     };
     runtime.listener_ready(&inbound.spec().id, "udp", Some(listen.to_string()));

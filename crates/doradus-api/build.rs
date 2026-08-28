@@ -62,7 +62,7 @@ fn main() {
         "        _ => \"application/octet-stream\",\n",
         "    }\n",
         "}\n\n",
-        "static FILES: &[(&str, &'static [u8])] = &[\n",
+        "static FILES: &[(&str, &[u8])] = &[\n",
     ));
     for (relative, path) in files {
         generated.push_str(&format!(
