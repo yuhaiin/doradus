@@ -65,7 +65,7 @@ pub use chain_proxy::ChainProxy;
 #[cfg(test)]
 use chain_transports::root_store;
 #[cfg(test)]
-use chain_uot::{ChainUotSession, PendingUotDatagram, RetryQueue};
+use chain_uot::{ChainDatagram, ChainUotSession, PendingUotDatagram, RetryQueue};
 
 /// A single best-effort runtime observation for the reusable chain client.
 /// The pool counters are monotonic, while connection/stream counts describe

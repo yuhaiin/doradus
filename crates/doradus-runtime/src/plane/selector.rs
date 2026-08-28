@@ -577,7 +577,16 @@ impl RuntimeSnapshot {
         bypass_id: &str,
         drop_id: &str,
     ) -> Result<ProxyContextMetadata> {
-        let proxy_resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
+        // Endpoint metadata is advisory and is built while the selector is
+        // still being published. Do not route this lookup through the
+        // configured bootstrap resolver: a ResolverProxyBridge may not have
+        // this selector installed yet, which would make startup depend on a
+        // selector that is currently waiting on this metadata.
+        //
+        // Actual proxy construction and flow DNS resolution continue to use
+        // their route-specific resolvers; this only avoids a startup cycle in
+        // the optional observability metadata.
+        let endpoint_resolver = self.dns_resolver.clone();
         let mut endpoints = BTreeMap::new();
         for id in [direct_id, proxy_id, udp_proxy_id, bypass_id, drop_id]
             .into_iter()
@@ -587,7 +596,7 @@ impl RuntimeSnapshot {
                 continue;
             };
             if let Ok(Some(endpoint)) = config
-                .resolved_fixed_endpoint(proxy_resolver.as_ref())
+                .resolved_fixed_endpoint(endpoint_resolver.as_ref())
                 .await
             {
                 endpoints.insert(id.to_owned(), endpoint);
@@ -643,7 +652,10 @@ impl RuntimeSnapshot {
         &self,
     ) -> Result<(BTreeMap<String, SocketAddr>, BTreeMap<String, String>)> {
         let definitions = self.node_tag_definitions()?;
-        let proxy_resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
+        // Keep tag endpoint metadata on the same non-routed resolver as the
+        // node metadata above. Tags are optional observability data and must
+        // not create a bootstrap-selector dependency during publication.
+        let endpoint_resolver = self.dns_resolver.clone();
 
         let mut endpoints = BTreeMap::new();
         let mut node_ids = BTreeMap::new();
@@ -658,7 +670,7 @@ impl RuntimeSnapshot {
                 }
                 node_ids.entry(tag.clone()).or_insert_with(|| id.clone());
                 if let Ok(Some(endpoint)) = config
-                    .resolved_fixed_endpoint(proxy_resolver.as_ref())
+                    .resolved_fixed_endpoint(endpoint_resolver.as_ref())
                     .await
                 {
                     endpoints.insert(tag.clone(), endpoint);
@@ -739,5 +751,130 @@ fn annotate_connection_metadata(
             .geo
             .as_ref()
             .and_then(|geo| geo.country_code(endpoint.ip()).ok().flatten());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use doradus_core::dns_resolver::AsyncIpResolver;
+    use doradus_core::{BoxFuture, DomainName, IpSet, ResolveStrategy};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingResolver {
+        calls: Arc<AtomicUsize>,
+        address: Ipv4Addr,
+    }
+
+    impl AsyncIpResolver for CountingResolver {
+        fn resolve<'a>(
+            &'a self,
+            _domain: &'a DomainName,
+            _strategy: ResolveStrategy,
+        ) -> BoxFuture<'a, doradus_core::Result<IpSet>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let address = self.address;
+            Box::pin(async move {
+                Ok(IpSet {
+                    v4: vec![address],
+                    v6: Vec::new(),
+                })
+            })
+        }
+    }
+
+    fn metadata_snapshot(
+        endpoint_resolver: Arc<dyn AsyncIpResolver>,
+        configured_resolver: Arc<dyn AsyncIpResolver>,
+    ) -> RuntimeSnapshot {
+        let metrics = Arc::new(RuntimeMetrics::new());
+        RuntimeSnapshot {
+            metrics: Arc::clone(&metrics),
+            settings: crate::RuntimeSettings::default(),
+            inbound_settings: doradus_store::InboundSettings::default(),
+            happy_eyeballs: crate::proxy::new_dialer(0, metrics),
+            socket_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
+            socket_bind_interface: None,
+            resolver: Arc::clone(&endpoint_resolver),
+            inbound_resolver: Arc::clone(&endpoint_resolver),
+            dns_resolver: endpoint_resolver,
+            hosts: doradus_core::dns_hosts::HostsTable::new(),
+            fakeip: None,
+            inbound_fakeip: None,
+            resolvers: Vec::new(),
+            route: Some(doradus_store::GoRouteRuntimeConfig {
+                direct_resolver: "bootstrap".to_owned(),
+                proxy_resolver: "bootstrap".to_owned(),
+                resolve_locally: false,
+                udp_proxy_fqdn: doradus_store::GoUdpProxyFqdnStrategy::Default,
+            }),
+            route_rules: Vec::new(),
+            node_tags: Vec::new(),
+            route_lists: Arc::new(crate::RouteListSnapshot::default()),
+            router: doradus_trie::router::RouterRuntime::new(
+                doradus_trie::router::Router::compile(
+                    Vec::new(),
+                    doradus_trie::router::RouteDecision {
+                        mode: RouteMode::Direct,
+                        resolver_policy: doradus_core::ResolverPolicy::default(),
+                        priority: 0,
+                    },
+                )
+                .unwrap(),
+            ),
+            resolver_by_id: BTreeMap::new(),
+            inbound_resolver_by_id: BTreeMap::new(),
+            dns_resolver_by_id: BTreeMap::from([("bootstrap".to_owned(), configured_resolver)]),
+            resolver_errors: BTreeMap::new(),
+            resolver_registry_enabled: true,
+            geo_metadata: Vec::new(),
+            geo: None,
+            proxies: vec![GoProxyRuntimeConfig {
+                id: "node".to_owned(),
+                name: "node".to_owned(),
+                group_name: "default".to_owned(),
+                origin: "test".to_owned(),
+                enabled: true,
+                chain_types: vec!["fixedv2".to_owned()],
+                layers: vec![GoProxyLayer {
+                    kind: "fixedv2".to_owned(),
+                    config: serde_json::json!({
+                        "addresses": [{"host": "proxy.example", "port": 443}]
+                    }),
+                }],
+                transport: GoProxyTransport::Fixed,
+                data_json: Vec::new(),
+            }],
+            nat: doradus_store::NatConfigRecord::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_metadata_does_not_route_through_bootstrap_selector() {
+        let configured_calls = Arc::new(AtomicUsize::new(0));
+        let endpoint_calls = Arc::new(AtomicUsize::new(0));
+        let snapshot = metadata_snapshot(
+            Arc::new(CountingResolver {
+                calls: Arc::clone(&endpoint_calls),
+                address: Ipv4Addr::new(192, 0, 2, 44),
+            }),
+            Arc::new(CountingResolver {
+                calls: Arc::clone(&configured_calls),
+                address: Ipv4Addr::new(192, 0, 2, 45),
+            }),
+        );
+
+        let metadata = snapshot
+            .proxy_context_metadata("", "node", "", "", "")
+            .await
+            .unwrap();
+
+        assert_eq!(configured_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(endpoint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            metadata.endpoints.get("node").copied(),
+            Some("192.0.2.44:443".parse().unwrap())
+        );
     }
 }

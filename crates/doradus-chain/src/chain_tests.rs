@@ -103,3 +103,31 @@ async fn coalesced_uot_flushes_a_low_traffic_datagram_without_recv() {
     assert_eq!(payload, b"low-traffic");
     session.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn successful_uot_datagram_releases_its_retry_slot() {
+    let (client, _peer) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(Box::new(client) as BoxAsyncStream);
+    let session = ChainUotSession::new(reader, writer, false);
+    let chain =
+        ChainClient::new(parse_config(r#"{"chain":[{"type":"direct","direct":{}}]}"#).unwrap())
+            .unwrap();
+    let datagram = ChainDatagram {
+        client: chain,
+        migrate_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        session: Mutex::new(Some(session)),
+        reconnect_lock: Mutex::new(()),
+        generation: std::sync::atomic::AtomicU64::new(1),
+        closed: std::sync::atomic::AtomicBool::new(false),
+        shutdown: watch::channel(false).0,
+        next_retry_id: std::sync::atomic::AtomicU64::new(1),
+        retry: Mutex::new(RetryQueue::new()),
+        local_bind_addresses: Arc::new(Vec::new()),
+        bind_interface: None,
+        local_addr: StdMutex::new(None),
+    };
+
+    datagram.send_to(b"request", endpoint(443)).await.unwrap();
+
+    assert!(datagram.retry.lock().await.snapshot().is_empty());
+}
