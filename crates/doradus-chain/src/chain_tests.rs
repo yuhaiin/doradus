@@ -79,7 +79,11 @@ fn retry_queue_acknowledges_exact_target_before_payload_fallback() {
         })
         .unwrap();
 
-    queue.acknowledge(&second_target, b"same");
+    // Real UDP responses normally have a different payload from their
+    // request. The source/target tuple is the available acknowledgement
+    // boundary, while the exact-payload and payload-only paths retain the
+    // echo/legacy compatibility behavior.
+    queue.acknowledge(&second_target, b"different response");
     assert_eq!(queue.snapshot(), vec![(first_target, b"same".to_vec())]);
     queue.acknowledge(&endpoint(5355), b"same");
     assert!(queue.snapshot().is_empty());
@@ -105,8 +109,10 @@ async fn coalesced_uot_flushes_a_low_traffic_datagram_without_recv() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn successful_uot_datagram_releases_its_retry_slot() {
-    let (client, _peer) = tokio::io::duplex(4096);
+async fn successful_uot_datagram_releases_its_retry_slot_after_response() {
+    use tokio::io::AsyncWriteExt;
+
+    let (client, mut peer) = tokio::io::duplex(4096);
     let (reader, writer) = tokio::io::split(Box::new(client) as BoxAsyncStream);
     let session = ChainUotSession::new(reader, writer, false);
     let chain =
@@ -128,6 +134,15 @@ async fn successful_uot_datagram_releases_its_retry_slot() {
     };
 
     datagram.send_to(b"request", endpoint(443)).await.unwrap();
+
+    assert_eq!(datagram.retry.lock().await.snapshot().len(), 1);
+    peer.write_all(
+        &doradus_protocol::yuubinsya::encode_uot_frame(&endpoint(443), b"response").unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut buffer = [0u8; 64];
+    datagram.recv_from(&mut buffer).await.unwrap();
 
     assert!(datagram.retry.lock().await.snapshot().is_empty());
 }

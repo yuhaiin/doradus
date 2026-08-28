@@ -65,10 +65,13 @@ impl RetryQueue {
             .frames
             .iter()
             .position(|frame| &frame.target == source && frame.payload == payload);
+        let target = self.frames.iter().position(|frame| &frame.target == source);
         let index = exact.or_else(|| {
-            self.frames
-                .iter()
-                .position(|frame| frame.payload == payload)
+            target.or_else(|| {
+                self.frames
+                    .iter()
+                    .position(|frame| frame.payload == payload)
+            })
         });
         if let Some(index) = index
             && let Some(frame) = self.frames.remove(index)
@@ -77,22 +80,10 @@ impl RetryQueue {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn snapshot(&self) -> Vec<(Endpoint, Vec<u8>)> {
         self.frames
             .iter()
             .map(|frame| (frame.target.clone(), frame.payload.clone()))
-            .collect()
-    }
-
-    pub(super) fn snapshot_with_ids(&self) -> Vec<PendingUotDatagram> {
-        self.frames
-            .iter()
-            .map(|frame| PendingUotDatagram {
-                id: frame.id,
-                target: frame.target.clone(),
-                payload: frame.payload.clone(),
-            })
             .collect()
     }
 
@@ -289,11 +280,6 @@ impl AsyncDatagram for ChainDatagram {
                 self.drop_retry(retry_id).await;
                 return Err(closed_error());
             }
-            // The retry entry is only needed while the write is uncertain.
-            // A successful send has no protocol-level acknowledgement for
-            // ordinary UDP payloads, so waiting for a matching response would
-            // retain every DNS/QUIC datagram until the bounded queue filled.
-            self.drop_retry(retry_id).await;
             Ok(payload.len())
         })
     }
@@ -444,9 +430,9 @@ impl ChainDatagram {
         let local_addr = replacement.local_addr();
         let (reader, writer) = replacement.into_split().await;
         let replacement = ChainUotSession::new(reader, writer, udp_coalesce);
-        let retry = self.retry.lock().await.snapshot_with_ids();
-        for frame in &retry {
-            replacement.send_to(&frame.target, &frame.payload).await?;
+        let retry = self.retry.lock().await.snapshot();
+        for (target, payload) in &retry {
+            replacement.send_to(target, payload).await?;
         }
         replacement.flush().await?;
         if self.closed.load(Ordering::Acquire) {
@@ -455,13 +441,6 @@ impl ChainDatagram {
                 ErrorKind::Closed,
                 "Yuubinsya UOT session is closed",
             ));
-        }
-        // Only remove the frames included in this reconnect snapshot. New
-        // sends may have joined the queue while the replacement was being
-        // established and must remain eligible for a later retry.
-        let mut retry_queue = self.retry.lock().await;
-        for frame in &retry {
-            retry_queue.remove_id(frame.id);
         }
         self.migrate_id.store(replacement_id, Ordering::Release);
         if let Ok(mut current) = self.local_addr.lock() {
