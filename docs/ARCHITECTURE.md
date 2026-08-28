@@ -1,4 +1,4 @@
-# yuhaiin-rust Architecture and Change Guide
+# doradus Architecture and Change Guide
 
 This developer-oriented map explains where to start reading, how requests move
 through the system, and where a change belongs. It follows the current
@@ -8,49 +8,51 @@ workspace layout and the ownership boundaries in the source tree.
 
 The workspace has four broad layers:
 
-1. yuhaiin-types contains public types and capability contracts that do not
+1. doradus-types contains public types and capability contracts that do not
    depend on Tokio, an operating system, or a concrete network implementation.
-2. yuhaiin-core, yuhaiin-dns, yuhaiin-trie, yuhaiin-protocol, and yuhaiin-chain
+2. doradus-core, doradus-dns, doradus-trie, doradus-protocol, and doradus-chain
    contain reusable domain implementations.
-3. yuhaiin-store, yuhaiin-tun, yuhaiin-wireguard, and yuhaiin-geo provide
+3. doradus-store, doradus-tun, doradus-wireguard, and doradus-geo provide
    persistence, platform data planes, and external capability adapters.
-4. yuhaiin-runtime and yuhaiin-api assemble configuration, routing, proxy
+4. doradus-runtime and doradus-api assemble configuration, routing, proxy
    selection, inbounds, TUN, DNS, and the management API into a running service.
 
 Classify a problem before editing:
 
 | Concern | Start here | Do not put it here |
 | --- | --- | --- |
-| Public traits, addresses, and DNS values | yuhaiin-types | A second equivalent trait in runtime |
-| DNS wire format, cache, UDP/TCP, DoH, or DoT | yuhaiin-dns | DNS encoding in an API handler or inbound |
-| Flow context, route mode, or resolver strategy | yuhaiin-types; core keeps compatibility re-exports | Tokio socket/proxy traits in types |
-| Async socket/proxy primitives and NAT | yuhaiin-core | Runtime configuration in a protocol crate or a parallel blocking proxy API |
-| Route rules and tries | yuhaiin-trie plus runtime/src/policy/route.rs | Independent rule matching in every inbound |
-| Nodes, chains, and protocol composition | yuhaiin-chain plus yuhaiin-protocol | Handshake assembly in an HTTP API handler |
-| Configuration, migration, and Go compatibility | yuhaiin-store | Direct SQLite writes in a handler |
-| Runtime snapshots, reload, selectors, and owners | yuhaiin-runtime | Live sockets or tasks held by store |
-| REST/RPC, authentication, and service lifecycle | yuhaiin-api | A protocol data plane depending on the API router |
+| Public traits, addresses, and DNS values | doradus-types | A second equivalent trait in runtime |
+| DNS wire format, cache, UDP/TCP, DoH, or DoT | doradus-dns | DNS encoding in an API handler or inbound |
+| Flow context, route mode, or resolver strategy | doradus-types; core keeps compatibility re-exports | Tokio socket/proxy traits in types |
+| Async socket/proxy primitives and NAT | doradus-core | Runtime configuration in a protocol crate or a parallel blocking proxy API |
+| Route rules and tries | doradus-trie plus runtime/src/policy/route.rs | Independent rule matching in every inbound |
+| Nodes, chains, and protocol composition | doradus-chain plus doradus-protocol | Handshake assembly in an HTTP API handler |
+| Configuration, migration, and Go compatibility | doradus-store | Direct SQLite writes in a handler |
+| Runtime snapshots, reload, selectors, and owners | doradus-runtime | Live sockets or tasks held by store |
+| REST/RPC, authentication, and service lifecycle | doradus-api | A protocol data plane depending on the API router |
 
 ## 2. Workspace overview
 
-Workspace members are defined in Cargo.toml. The current workspace contains 13
+Workspace members are defined in Cargo.toml. The current workspace contains 15
 crates:
 
 ~~~mermaid
 graph TD
-    TYPES[yuhaiin-types<br/>Public types and contracts]
-    DNS[yuhaiin-dns<br/>DNS wire, cache, and transports]
-    CORE[yuhaiin-core<br/>Flow, proxy, NAT, and process]
-    TRIE[yuhaiin-trie<br/>Domain, CIDR, and route matching]
-    PROTOCOL[yuhaiin-protocol<br/>Protocol handshakes and sessions]
-    CHAIN[yuhaiin-chain<br/>Node chains and UDP/UOT]
-    STORE[yuhaiin-store<br/>SQLite, Go schema, and FakeIP]
-    TUN[yuhaiin-tun<br/>TUN packet/socket engine]
-    GEO[yuhaiin-geo<br/>GeoIP and Geo metadata]
-    WG[yuhaiin-wireguard<br/>WireGuard adapter]
-    BACKUP[yuhaiin-backup<br/>Backup model and transport]
-    RUNTIME[yuhaiin-runtime<br/>Snapshot, controller, and data plane]
-    API[yuhaiin-api<br/>HTTP API and service host]
+    TYPES[doradus-types<br/>Public types and contracts]
+    DNS[doradus-dns<br/>DNS wire, cache, and transports]
+    CORE[doradus-core<br/>Flow, proxy, NAT, and process]
+    TRIE[doradus-trie<br/>Domain, CIDR, and route matching]
+    PROTOCOL[doradus-protocol<br/>Protocol handshakes and sessions]
+    CHAIN[doradus-chain<br/>Node chains and UDP/UOT]
+    STORE[doradus-store<br/>SQLite, Go schema, and FakeIP]
+    TUN[doradus-tun<br/>TUN packet/socket engine]
+    GEO[doradus-geo<br/>GeoIP and Geo metadata]
+    WG[doradus-wireguard<br/>WireGuard adapter]
+    BACKUP[doradus-backup<br/>Backup model and transport]
+    MASQUE[doradus-masque<br/>MASQUE transport]
+    ANDROID[doradus-android<br/>Android JNI bridge]
+    RUNTIME[doradus-runtime<br/>Snapshot, controller, and data plane]
+    API[doradus-api<br/>HTTP API and service host]
 
     TYPES --> DNS
     TYPES --> CORE
@@ -76,30 +78,37 @@ graph TD
     API --> STORE
     API --> CORE
     API --> BACKUP
+    MASQUE --> CORE
+    MASQUE --> TUN
+    ANDROID --> API
+    ANDROID --> RUNTIME
+    ANDROID --> TUN
 ~~~
 
 ### 2.1 Crate responsibilities and entry points
 
 | Crate | Responsibility | Suggested reading order |
 | --- | --- | --- |
-| yuhaiin-types | DomainName, Endpoint, Network, FlowContext, route policy, errors, future aliases, DNS/inbound contracts | lib.rs → dns.rs → net.rs → inbound.rs |
-| yuhaiin-dns | DNS model, wire codec, cache, hosts, FakeIP view, and UDP/TCP/QUIC/DoH/DoT transports | dns.rs/cache.rs → dns_resolver.rs → transport.rs |
-| yuhaiin-core | Async socket/proxy primitives, NAT, process information, sniffing, and compatibility re-exports | lib.rs → flow.rs → proxy.rs → nat.rs → process.rs |
-| yuhaiin-trie | Domain, CIDR, on-disk trie, and combined route indexes | router.rs → ondisk.rs → lib.rs |
-| yuhaiin-protocol | Async base proxy factory plus SOCKS, HTTP, VLESS, VMess, Trojan, Shadowsocks, H2, WebSocket, and Yuubinsya | proxy_factory.rs → session.rs/tls.rs |
-| yuhaiin-chain | Composition of nodes, transports, and protocols into outbound chains, including TLS/WebSocket/H2/UOT, retries, and UDP | config.rs → go_node.rs → lib.rs |
-| yuhaiin-store | Typed repositories, SQLite, schema, Go v6/legacy compatibility, FakeIP mapping, statistics, and state | lib.rs → sqlite.rs/schema.rs → repository.rs |
-| yuhaiin-tun | OS TUN descriptor, smoltcp packet/socket engine, dispatcher, proxy runtime, and packet write-back | runtime.rs → dispatcher.rs → packet.rs → proxy.rs |
-| yuhaiin-geo | GeoIP/Geo metadata loading and lookup | lib.rs |
-| yuhaiin-wireguard | WireGuard engine, driver, and proxy adapter | config.rs → engine.rs → proxy.rs |
-| yuhaiin-backup | Backup data format and transport helpers | lib.rs |
-| yuhaiin-runtime | Runtime snapshot, controller, selector, resolver bridge, inbounds, and TUN/DNS supervisors | lib.rs → control/ → plane/ → policy/ |
-| yuhaiin-api | Service entry point, HTTP router, authentication, API handlers, and runtime lifecycle | bin/yuhaiin.rs → service/runtime.rs → api.rs |
+| doradus-types | DomainName, Endpoint, Network, FlowContext, route policy, errors, future aliases, DNS/inbound contracts | lib.rs → dns.rs → net.rs → inbound.rs |
+| doradus-dns | DNS model, wire codec, cache, hosts, FakeIP view, and UDP/TCP/QUIC/DoH/DoT transports | dns.rs/cache.rs → dns_resolver.rs → transport.rs |
+| doradus-core | Async socket/proxy primitives, NAT, process information, sniffing, and compatibility re-exports | lib.rs → flow.rs → proxy.rs → nat.rs → process.rs |
+| doradus-trie | Domain, CIDR, on-disk trie, and combined route indexes | router.rs → ondisk.rs → lib.rs |
+| doradus-protocol | Async base proxy factory plus SOCKS, HTTP, VLESS, VMess, Trojan, Shadowsocks, H2, WebSocket, and Yuubinsya | proxy_factory.rs → session.rs/tls.rs |
+| doradus-chain | Composition of nodes, transports, and protocols into outbound chains, including TLS/WebSocket/H2/UOT, retries, and UDP | config.rs → go_node.rs → lib.rs |
+| doradus-store | Typed repositories, SQLite, schema, Go v6/legacy compatibility, FakeIP mapping, statistics, and state | lib.rs → sqlite.rs/schema.rs → repository.rs |
+| doradus-tun | OS TUN descriptor, smoltcp packet/socket engine, dispatcher, proxy runtime, and packet write-back | runtime.rs → dispatcher.rs → packet.rs → proxy.rs |
+| doradus-geo | GeoIP/Geo metadata loading and lookup | lib.rs |
+| doradus-wireguard | WireGuard engine, driver, and proxy adapter | config.rs → engine.rs → proxy.rs |
+| doradus-backup | Backup data format and transport helpers | lib.rs |
+| doradus-masque | MASQUE transport, codec, proxy, and TLS support | config.rs → proxy.rs → codec.rs |
+| doradus-android | Android JNI bridge for API, runtime, and TUN integration | lib.rs |
+| doradus-runtime | Runtime snapshot, controller, selector, resolver bridge, inbounds, and TUN/DNS supervisors | lib.rs → control/ → plane/ → policy/ |
+| doradus-api | Service entry point, HTTP router, authentication, API handlers, and runtime lifecycle | bin/doradus.rs → service/runtime.rs → api.rs |
 
 ## 3. Where public contracts belong
 
 Cross-crate contracts independent of a concrete runtime converge on
-yuhaiin-types. This is the Rust-side public boundary corresponding to the Go
+doradus-types. This is the Rust-side public boundary corresponding to the Go
 netapi boundary. Not every trait should be moved there mechanically.
 
 ### 3.1 Current public contracts
@@ -114,21 +123,21 @@ netapi boundary. Not every trait should be moved there mechanically.
 | InboundDnsHandler, InboundBasicAuth | types/src/inbound.rs | Socket inbounds and TUN can intercept DNS without exposing user storage |
 | InboundStreamHandler, HttpForwardHandler, InboundUdpCodec | types/src/inbound.rs | Protocol servers parse wire data; runtime supplies routing and relay |
 
-yuhaiin-types contains lib.rs, dns.rs, net.rs, and inbound.rs; it does not
+doradus-types contains lib.rs, dns.rs, net.rs, and inbound.rs; it does not
 contain a proxy module. AsyncProxy, AsyncDatagram, and AsyncStream remain in
-yuhaiin-core::proxy because they carry FlowContext, Tokio I/O streams, and async
+doradus-core::proxy because they carry FlowContext, Tokio I/O streams, and async
 resource lifetimes. Moving them into types would expose runtime-specific
 contracts from the lowest-level public crate.
 
 Use the canonical paths in new code:
 
 ~~~rust
-use yuhaiin_types::{AsyncDnsHandler, AsyncIpResolver, Endpoint, InboundDnsHandler};
-use yuhaiin_core::proxy::{AsyncDatagram, AsyncProxy, AsyncStream};
+use doradus_types::{AsyncDnsHandler, AsyncIpResolver, Endpoint, InboundDnsHandler};
+use doradus_core::proxy::{AsyncDatagram, AsyncProxy, AsyncStream};
 ~~~
 
 The old StreamConnector, BlockingStreamProxy, synchronous HTTP/SOCKS
-connectors, and yuhaiin-protocol/src/tls_sync.rs were deliberately removed.
+connectors, and doradus-protocol/src/tls_sync.rs were deliberately removed.
 The project does not maintain a blocking proxy API for theoretical runtime
 neutrality. Inject async proxy implementations at a test or OS boundary when
 replacement is needed.
@@ -136,7 +145,7 @@ replacement is needed.
 ### 3.2 Contracts that should not move downward
 
 - AsyncProxy and AsyncDatagram need Tokio streams, cancellation, and async proxy
-  lifetimes, so they belong to the yuhaiin-core async capability layer.
+  lifetimes, so they belong to the doradus-core async capability layer.
 - RuntimeProxySelector and ProxyBuild depend on RuntimeSnapshot, store
   configuration, node tags, and reload slots, so they belong to runtime.
 - Runtime inbound adapters need InboundSpec, monitoring, DNS policy, and UDP
@@ -145,16 +154,16 @@ replacement is needed.
   selectors, NAT/UDP transport, and failure records, so they are runtime
   resolver adapters.
 - FlowObserver is tied to FlowKey lifecycle and statistics semantics. It remains
-  in yuhaiin-core::flow and is implemented by the runtime monitor.
+  in doradus-core::flow and is implemented by the runtime monitor.
 
 If a trait signature contains only Endpoint, DomainName, IpSet, byte slices, and
-public errors, consider yuhaiin-types. If it contains RuntimeSnapshot, Tokio
+public errors, consider doradus-types. If it contains RuntimeSnapshot, Tokio
 streams, store, monitor, selector, platform descriptors, or route reloads, keep
 it in the corresponding implementation layer.
 
 ## 4. Feature flags: compilation is not feature completeness
 
-The default yuhaiin-runtime features are:
+The default doradus-runtime features are:
 
 ~~~text
 tun, tun-routes, doh-tls, websocket, http-termination
@@ -166,9 +175,9 @@ graph LR
     HTTPAPI --> UPDATE[update]
     API --> TUN[tun]
     TUN --> RUNTIME_TUN[runtime/tun]
-    RUNTIME_TUN --> TUNCRATE[yuhaiin-tun async runtime]
+    RUNTIME_TUN --> TUNCRATE[doradus-tun async runtime]
     ROUTES[tun-routes] --> TUN
-    ROUTES --> TUNROUTES[yuhaiin-tun/tun-routes]
+    ROUTES --> TUNROUTES[doradus-tun/tun-routes]
     TUNROUTES --> LINUX[Linux route installation]
     DOH[doh-tls] --> H2[http2]
     DOH --> DNS_TLS[DNS TLS and QUIC]
@@ -178,10 +187,10 @@ graph LR
     TERM --> HYPER[Hyper HTTP termination]
 ~~~
 
-yuhaiin-api defaults to http-api, tun, tun-routes, doh-tls, websocket, and
-http-termination. yuhaiin-runtime does not include the management API by
+doradus-api defaults to http-api, tun, tun-routes, doh-tls, websocket, and
+http-termination. doradus-runtime does not include the management API by
 default, but includes the same data-plane capabilities apart from http-api.
-tun is a compatibility/assembly feature; the async yuhaiin-tun implementation
+tun is a compatibility/assembly feature; the async doradus-tun implementation
 always compiles, while tun-routes additionally enables the route manager.
 
 The old async-proxy, async-dns, and synchronous TLS features were removed from
@@ -196,7 +205,7 @@ that crosses threads needs Send.
 
 ~~~mermaid
 sequenceDiagram
-    participant P as yuhaiin binary
+    participant P as doradus binary
     participant S as RuntimeService
     participant DB as ConfigStore
     participant C as RuntimeController
@@ -373,7 +382,7 @@ InboundUdpRequest and InboundUdpResponse bridge codec and session.
 InboundUdpCodec defines recv and send without DNS, route, proxy, or network
 I/O. InboundUdpFlowPolicy is a runtime-only close/flow hook. Transparent Linux
 socket setup, SO_ORIGINAL_DST, ancillary destination data, and transparent UDP
-framing remain in yuhaiin-protocol.
+framing remain in doradus-protocol.
 
 UdpSourceKey is inbound_id + session_id + source + authentication; it
 intentionally excludes target so one full-cone source can use many destinations.
@@ -436,8 +445,8 @@ packets.
 
 ~~~mermaid
 flowchart TD
-    CONTRACT[yuhaiin-types DNS model and handlers]
-    CODEC[yuhaiin-dns wire codec]
+    CONTRACT[doradus-types DNS model and handlers]
+    CODEC[doradus-dns wire codec]
     POLICY[Runtime resolver policy]
     TRANSPORT[UDP, TCP, QUIC, DoH, DoT]
     CACHE[Cache, hosts, and FakeIP]
@@ -501,15 +510,15 @@ DNS entry point; resolver transports are the client-side upstream path.
 
 ### 11.1 Three layers
 
-- yuhaiin-core provides async socket connect, stream/datagram primitives, and
+- doradus-core provides async socket connect, stream/datagram primitives, and
   FlowContext; it no longer provides synchronous connectors.
-- yuhaiin-protocol performs protocol handshakes over acquired capabilities:
+- doradus-protocol performs protocol handshakes over acquired capabilities:
   SOCKS5, VLESS, VMess, Trojan, Shadowsocks, H2, WebSocket, and Yuubinsya.
 - BaseProxyConfig::build creates Direct, Reject, Drop, Fixed, HTTP, SOCKS5, and
   Yuubinsya UDP capabilities. HTTP CONNECT is an async HttpProxy around
   FixedAsyncProxy.
 - RustCryptoTlsProxy wraps an existing AsyncProxy for async TLS and ALPN.
-- yuhaiin-chain combines nodes, TLS, WebSocket, H2, UOT, and UDP stages.
+- doradus-chain combines nodes, TLS, WebSocket, H2, UOT, and UDP stages.
   ChainClient owns connection/cache/retry behavior; ChainProxy and ChainDatagram
   expose the capability to runtime.
 - runtime/src/plane/outbound.rs maps Go node/proxy configuration and registers
@@ -525,7 +534,7 @@ Go node/proxy config
 ~~~
 
 AsyncProxy is a core runtime-facing capability. It should not move to
-yuhaiin-types merely because it is a trait; only runtime-independent DNS,
+doradus-types merely because it is a trait; only runtime-independent DNS,
 inbound policy, endpoint, and network models belong there.
 
 ### 11.2 Adding an outbound protocol
@@ -551,18 +560,19 @@ terminal result. Keep these decisions in route policy and selector code.
 
 ### 12.1 Store boundary
 
-yuhaiin-store owns SQLite setup, schema validation, migration, Go-compatible
+doradus-store owns SQLite setup, schema validation, migration, Go-compatible
 records, typed repositories, FakeIP persistence, and runtime statistics
 persistence. It must not own live sockets, supervisors, or handshakes.
 
 ### 12.2 Startup loading and migration
 
-Startup opens the database, validates or upgrades the schema, loads records, and
-constructs a snapshot through RuntimeBuilder. A migration may prepare
-compatibility tables and metadata, but the controller publishes only a complete
-snapshot. Native checkpoints support abnormal-exit recovery; final
+Native startup opens a Doradus database, validates or repairs its schema, loads
+records, and constructs a snapshot through RuntimeBuilder. A database with the
+legacy metadata/migration tables is reserved for an explicit future migration
+workflow; normal startup does not import it. The controller publishes only a
+complete snapshot. Native checkpoints support abnormal-exit recovery; final
 Go-compatible projections are written during normal shutdown. Startup smoke
-alone is not proof of production rollback compatibility.
+alone is not proof of production migration compatibility.
 
 ### 12.3 Safe order for a configuration field change
 
@@ -627,13 +637,13 @@ updates selected metadata and the selector slot.
 
 ## 14. Supporting components
 
-### 14.1 yuhaiin-geo
+### 14.1 doradus-geo
 
 GeoDb opens MaxMind data and implements GeoLookup. The database manager publishes
 metadata and Arc<GeoDb> as one GeoSnapshot; refresh downloads temporary content,
 validates it, and replaces the snapshot. Route matching should not open files.
 
-### 14.2 yuhaiin-wireguard
+### 14.2 doradus-wireguard
 
 ~~~text
 WireGuardConfig::from_json_or_ini / from_wireguard_ini
@@ -644,7 +654,7 @@ WireGuardConfig::from_json_or_ini / from_wireguard_ini
 Parsing belongs in config.rs, the engine in engine.rs, and the runtime adapter in
 proxy.rs. Crypto and driver state should remain in the final adapter.
 
-### 14.3 yuhaiin-backup
+### 14.3 doradus-backup
 
 S3Client depends on S3Transport; put and get implement signed object requests.
 API backup/restore handlers pass encoded database or snapshot data to the client.
@@ -655,14 +665,14 @@ controller rebuild before data becomes live.
 
 ### 15.1 Add a public DNS, inbound, or network trait
 
-Put runtime-independent values and contracts in yuhaiin-types, preserve
+Put runtime-independent values and contracts in doradus-types, preserve
 compatibility re-exports, and test at least two implementations. Keep Tokio
 streams, sockets, store, monitor, selector, and platform descriptors out of the
 low-level public contract.
 
 ### 15.2 Add an inbound protocol
 
-Implement framing and handshake in yuhaiin-protocol, hand parsed data to the
+Implement framing and handshake in doradus-protocol, hand parsed data to the
 existing ports, and add a runtime adapter only for routing, monitoring,
 lifecycle, and protocol preparation. Test startup, authentication, TCP relay,
 UDP if applicable, reload, and shutdown.
@@ -675,7 +685,7 @@ exclusion, list membership, and flow context.
 
 ### 15.4 Change a DNS transport
 
-Keep packet encoding/validation in yuhaiin-dns, transport selection in resolver
+Keep packet encoding/validation in doradus-dns, transport selection in resolver
 policy, and connection setup in the resolver bridge. Test timeouts, truncation
 fallback, source binding, cache behavior, and complete record preservation.
 
@@ -689,7 +699,7 @@ and reload on the target platform.
 ### 15.6 Change persistence or migration
 
 Compare with the Go schema, update repository and migration fixtures, and verify
-fresh, legacy, invalid, round-trip, reload, restart, and rollback-copy behavior.
+fresh, legacy, invalid, round-trip, reload, restart, and restore-copy behavior.
 Keep production credentials and databases out of fixtures.
 
 ## 16. Debugging by symptom
@@ -740,16 +750,16 @@ missing capabilities, and sandbox limitations separately from source failures.
 
 | Need to inspect | Start at |
 | --- | --- |
-| Public contracts | crates/yuhaiin-types/src/{lib,dns,net,inbound}.rs |
-| Runtime assembly | crates/yuhaiin-runtime/src/assembly.rs |
-| Controller/reload | crates/yuhaiin-runtime/src/control/ |
-| Inbound owners | crates/yuhaiin-runtime/src/plane/inbounds/ |
-| TUN and DNS supervisors | crates/yuhaiin-runtime/src/plane/data_plane*.rs |
-| Route policy | runtime/src/policy/route.rs and yuhaiin-trie/src/router.rs |
+| Public contracts | crates/doradus-types/src/{lib,dns,net,inbound}.rs |
+| Runtime assembly | crates/doradus-runtime/src/assembly.rs |
+| Controller/reload | crates/doradus-runtime/src/control/ |
+| Inbound owners | crates/doradus-runtime/src/plane/inbounds/ |
+| TUN and DNS supervisors | crates/doradus-runtime/src/plane/data_plane*.rs |
+| Route policy | runtime/src/policy/route.rs and doradus-trie/src/router.rs |
 | Outbound construction | runtime/src/plane/outbound.rs and protocol/src/composition/base_proxy.rs |
-| Chain validation and connect | yuhaiin-chain/src/{config,go_node,chain_client}.rs |
-| Persistence | yuhaiin-store/src/{sqlite,schema,repository,migration}.rs |
-| HTTP API | yuhaiin-api/src/api.rs and src/service/ |
+| Chain validation and connect | doradus-chain/src/{config,go_node,chain_client}.rs |
+| Persistence | doradus-store/src/{sqlite,schema,repository,migration}.rs |
+| HTTP API | doradus-api/src/api.rs and src/service/ |
 
 ## 19. Change checklist
 
@@ -764,53 +774,54 @@ missing capabilities, and sandbox limitations separately from source failures.
 
 ## 20. Internal component index by crate
 
-### 20.1 yuhaiin-types: shared vocabulary
+### 20.1 doradus-types: shared vocabulary
 
 This crate should remain small and runtime-neutral. It is the canonical home of
 address/network models, flow metadata, DNS models, inbound handler ports, public
 errors, and future aliases. New code should use these canonical definitions.
 
-### 20.2 yuhaiin-dns: model, codec, and transports
+### 20.2 doradus-dns: model, codec, and transports
 
 Separate model, wire codec, cache/hosts/FakeIP policy, resolver orchestration,
 and transport implementations. Keep packet validation and transport I/O
 independently testable. Async UDP owns its socket and timeout state and must not
 make runtime-controller or API decisions.
 
-### 20.3 yuhaiin-core: flow, socket, NAT, and observation
+### 20.3 doradus-core: flow, socket, NAT, and observation
 
 Core owns async stream/datagram capability, flow lifecycle, NAT, process metadata,
-socket policy, and sniffing. Pure flow data is in yuhaiin-types; Tokio I/O and
+socket policy, and sniffing. Pure flow data is in doradus-types; Tokio I/O and
 cancellation remain in core or infrastructure adapters.
 
-### 20.4 yuhaiin-trie: pattern to immutable router
+### 20.4 doradus-trie: pattern to immutable router
 
 The route index combines domain patterns, CIDR/network matching, and on-disk
 host data. Compilation produces an immutable snapshot published as part of
 RuntimeSnapshot. Preserve rule order and explicit exclusions.
 
-### 20.5 yuhaiin-protocol: framing and sessions
+### 20.5 doradus-protocol: framing and sessions
 
 Protocol modules perform handshake, authentication, framing, and session
 management over capabilities supplied by core or chain. They should not read
 runtime configuration or own API/service lifecycle. Wire-specific reverse HTTP,
 transparent sockets, TLS, H2, WebSocket, and Yuubinsya logic stays here.
 
-### 20.6 yuhaiin-chain: validation, connection, and UDP
+### 20.6 doradus-chain: validation, connection, and UDP
 
 Chain configuration converts Go-shaped nodes into an ordered validated chain.
 ChainClient handles connection caching and retries; wrappers retain protocol
 ordering, including repeated transport wrappers. Preserve Vec<ChainNode> order
 and repeated nodes during chain folding or compatibility conversion.
 
-### 20.7 yuhaiin-store: persistence and runtime data
+### 20.7 doradus-store: persistence and runtime data
 
-ConfigStore::open owns database setup, schema/migration checks, and repository
-access. Typed repositories group configuration, users, routes, FakeIP,
-statistics, and backup operations. Store code produces data for runtime; it
-does not hold live resources.
+ConfigStore::open owns native database setup, schema checks, and repository
+access. Explicit future migration helpers use a separate legacy-open boundary.
+Typed repositories group configuration, users, routes, FakeIP, statistics, and
+backup operations. Store code produces data for runtime; it does not hold live
+resources.
 
-### 20.8 yuhaiin-tun: packet engine and proxy tasks
+### 20.8 doradus-tun: packet engine and proxy tasks
 
 The TUN loop polls smoltcp synchronously, turns socket events into owned proxy
 inputs, and writes proxy outputs back to the device. Async workers must not
@@ -828,7 +839,7 @@ flows read the new slot; existing flows keep their already acquired proxy.
 Resolver, local-bind policy, connect budgets, and loopback tracking are separate
 wrappers rather than one untestable connect function.
 
-### 20.10 yuhaiin-api: HTTP adapter, RPC, and service management
+### 20.10 doradus-api: HTTP adapter, RPC, and service management
 
 API routing, authentication, value handlers, repository calls, SSE, backup
 transport, and OS service installation are separate concerns. Keep process-host
@@ -960,9 +971,9 @@ When behavior is unclear, read matching tests before changing implementation:
 
 | Behavior | Test entry points |
 | --- | --- |
-| DNS wire/SVCB/cache/UDP | yuhaiin-dns tests, host tests, and tests/dns_quic.rs |
-| Core NAT/process | yuhaiin-core nat_tests.rs and tests/nat_process.rs |
-| Trie route flow | yuhaiin-trie p0_flow.rs and router tests |
+| DNS wire/SVCB/cache/UDP | doradus-dns tests, host tests, and tests/dns_quic.rs |
+| Core NAT/process | doradus-core nat_tests.rs and tests/nat_process.rs |
+| Trie route flow | doradus-trie p0_flow.rs and router tests |
 | Protocol and Go compatibility | protocol and chain go_*_interop.rs tests |
 | H2/WebSocket/UOT | H2/WebSocket chain tests and protocol tunnel tests |
 | Store schema/migration | store schema/import/snapshot/storage tests and fixtures |
@@ -984,21 +995,21 @@ owner remains intact.
 ~~~mermaid
 flowchart TD
     START[Change a behavior] --> Q1{Shared across crates?}
-    Q1 -->|Yes, no Tokio or platform dependency| TYPES[yuhaiin-types]
+    Q1 -->|Yes, no Tokio or platform dependency| TYPES[doradus-types]
     Q1 -->|No| Q2{DNS packet input or output?}
-    Q2 -->|Yes| DNS[yuhaiin-dns]
+    Q2 -->|Yes| DNS[doradus-dns]
     Q2 -->|No| Q3{Protocol framing or crypto?}
-    Q3 -->|Yes| PROTO[yuhaiin-protocol]
+    Q3 -->|Yes| PROTO[doradus-protocol]
     Q3 -->|No| Q4{Node chain or transport layering?}
-    Q4 -->|Yes| CHAIN[yuhaiin-chain]
+    Q4 -->|Yes| CHAIN[doradus-chain]
     Q4 -->|No| Q5{Packet, TUN, or platform?}
-    Q5 -->|Yes| TUN[yuhaiin-tun]
+    Q5 -->|Yes| TUN[doradus-tun]
     Q5 -->|No| Q6{Persistence, schema, or Go compatibility?}
-    Q6 -->|Yes| STORE[yuhaiin-store]
+    Q6 -->|Yes| STORE[doradus-store]
     Q6 -->|No| Q7{Route, selector, reload, or owner?}
-    Q7 -->|Yes| RUNTIME[yuhaiin-runtime]
+    Q7 -->|Yes| RUNTIME[doradus-runtime]
     Q7 -->|No| Q8{API JSON or service lifecycle?}
-    Q8 -->|Yes| API[yuhaiin-api]
+    Q8 -->|Yes| API[doradus-api]
     Q8 -->|No| REVIEW[Confirm boundary before copying logic]
 ~~~
 
@@ -1040,16 +1051,16 @@ protocol wrappers, and TUN smoke entry points:
 
 | Old location or entry point | Current entry point | Meaning |
 | --- | --- | --- |
-| Endpoint and Network defined independently by core/crates | yuhaiin-types::{Endpoint, Network} | One canonical address/network definition; core re-exports it |
-| DNS model/handlers split between DNS and runtime | yuhaiin-types::{DnsResponse, DnsHandler, AsyncDnsHandler, AsyncIpResolver} | Wire codec, transport, and cache remain in yuhaiin-dns |
-| Separate runtime/TUN inbound DNS contracts | yuhaiin-types::InboundDnsHandler | Shared interception decision and answer interface |
-| StreamConnector, BlockingStreamProxy, sync HTTP/SOCKS | yuhaiin-core::proxy::{AsyncProxy, AsyncDatagram, AsyncStream} | Outbound capability is async; no parallel blocking API |
-| yuhaiin-protocol/src/tls_sync.rs | yuhaiin-protocol/src/tls.rs::RustCryptoTlsProxy | TLS is an async wrapper over an existing AsyncProxy |
-| Runtime-built basic HTTP/SOCKS/direct proxy | yuhaiin-protocol::proxy_factory::BaseProxyConfig::build | Protocol builds reusable capabilities; runtime maps persisted configuration |
-| TUN benchmark in core with old async features | yuhaiin-tun smoke binary with tun-routes | TUN async implementation belongs to yuhaiin-tun; route installation is separate |
+| Endpoint and Network defined independently by core/crates | doradus-types::{Endpoint, Network} | One canonical address/network definition; core re-exports it |
+| DNS model/handlers split between DNS and runtime | doradus-types::{DnsResponse, DnsHandler, AsyncDnsHandler, AsyncIpResolver} | Wire codec, transport, and cache remain in doradus-dns |
+| Separate runtime/TUN inbound DNS contracts | doradus-types::InboundDnsHandler | Shared interception decision and answer interface |
+| StreamConnector, BlockingStreamProxy, sync HTTP/SOCKS | doradus-core::proxy::{AsyncProxy, AsyncDatagram, AsyncStream} | Outbound capability is async; no parallel blocking API |
+| doradus-protocol/src/tls_sync.rs | doradus-protocol/src/tls.rs::RustCryptoTlsProxy | TLS is an async wrapper over an existing AsyncProxy |
+| Runtime-built basic HTTP/SOCKS/direct proxy | doradus-protocol::proxy_factory::BaseProxyConfig::build | Protocol builds reusable capabilities; runtime maps persisted configuration |
+| TUN benchmark in core with old async features | doradus-tun smoke binary with tun-routes | TUN async implementation belongs to doradus-tun; route installation is separate |
 | TUN smoke directly injected a DNS handler | FakeIpDnsProxy plus FakeIpDnsDatagram | DNS interception uses the common datagram capability |
 
-Adding a public trait does not mean putting every proxy trait in yuhaiin-types.
+Adding a public trait does not mean putting every proxy trait in doradus-types.
 First decide whether it expresses a platform-independent value or contract. If
 it needs FlowContext, Tokio I/O, socket metadata, or async resource lifetime,
 keep it in the corresponding core/protocol/runtime layer.

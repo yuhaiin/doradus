@@ -5,10 +5,10 @@ set -euo pipefail
 # test creates two local userspace peers, so it needs no external network and
 # does not touch a host WireGuard device.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-integration_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/wireguard}"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+integration_dir="${DORADUS_INTEGRATION_DIR:-${cache_root}/integration/wireguard}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
 
 command -v podman >/dev/null
 mkdir -p "${integration_dir}"
@@ -17,7 +17,7 @@ echo "[wireguard] compiling the harness in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${integration_dir}" -- \
   cargo test --locked \
-  -p yuhaiin-wireguard \
+  -p doradus-wireguard \
   --all-targets \
   --no-run \
   >"${integration_dir}/build.log" 2>&1

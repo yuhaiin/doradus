@@ -6,13 +6,13 @@ set -euo pipefail
 # invocation gets an isolated cache-backed copy under the repository-local cache.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-go_root="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
-scenario_root="${YUHAIIN_PRODUCTION_PARITY_DIR:-${cache_root}/production-parity}"
-port_base="${YUHAIIN_PRODUCTION_PORT_BASE:-55250}"
+go_root="${DORADUS_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
+scenario_root="${DORADUS_PRODUCTION_PARITY_DIR:-${cache_root}/production-parity}"
+port_base="${DORADUS_PRODUCTION_PORT_BASE:-55250}"
 
 [[ "${port_base}" =~ ^[0-9]+$ ]] || {
-  echo "YUHAIIN_PRODUCTION_PORT_BASE must be a numeric host port" >&2
+  echo "DORADUS_PRODUCTION_PORT_BASE must be a numeric host port" >&2
   exit 1
 }
 
@@ -20,8 +20,8 @@ test -d "${go_root}"
 mkdir -p "${scenario_root}"
 
 declare -a candidates=()
-if [[ -n "${YUHAIIN_SOURCE_DB:-}" ]]; then
-  IFS=: read -r -a candidates <<<"${YUHAIIN_SOURCE_DB}"
+if [[ -n "${DORADUS_SOURCE_DB:-}" ]]; then
+  IFS=: read -r -a candidates <<<"${DORADUS_SOURCE_DB}"
 else
   # Newer stopped production snapshots are prepared with Rust first, because
   # they can carry a migration ledger from a newer Go checkout while still
@@ -30,8 +30,8 @@ else
   candidates=(
     "${go_root}/tmp/state.db"
     "${go_root}/tmp/v2/state.db"
-    "${go_root}/tmp/yuhaiin/state.db"
-    "${go_root}/tmp/aws/yuhaiin/state.db"
+    "${go_root}/tmp/doradus/state.db"
+    "${go_root}/tmp/aws/doradus/state.db"
   )
 fi
 
@@ -50,16 +50,16 @@ for source_db in "${candidates[@]}"; do
   # pasta may retain a just-released forwarding namespace briefly. Give each
   # snapshot its own three-port window so one slow cleanup cannot make the
   # next independent Go/Rust comparison fail before it starts.
-  prepare_http="${YUHAIIN_PREPARE_HTTP:-127.0.0.1:$((port_base + ran * 3))}"
-  rust_http="${YUHAIIN_RUST_HTTP:-127.0.0.1:$((port_base + ran * 3 + 1))}"
-  go_http="${YUHAIIN_GO_HTTP:-127.0.0.1:$((port_base + ran * 3 + 2))}"
-  prepare_mode="${YUHAIIN_PREPARE:-1}"
-  if [[ -z "${YUHAIIN_PREPARE+x}" ]] && command -v sqlite3 >/dev/null 2>&1; then
+  prepare_http="${DORADUS_PREPARE_HTTP:-127.0.0.1:$((port_base + ran * 3))}"
+  rust_http="${DORADUS_RUST_HTTP:-127.0.0.1:$((port_base + ran * 3 + 1))}"
+  go_http="${DORADUS_GO_HTTP:-127.0.0.1:$((port_base + ran * 3 + 2))}"
+  prepare_mode="${DORADUS_PREPARE:-1}"
+  if [[ -z "${DORADUS_PREPARE+x}" ]] && command -v sqlite3 >/dev/null 2>&1; then
     # Go v1 snapshots have only legacy `nodes`/`inbounds` tables. Preparing
     # them with Rust first creates v2 projections that the current Go v1
     # migration path tries to create again. Run both services from independent
     # read-only copies for this old schema; newer snapshots retain the Rust-
-    # first takeover path above.
+    # first compatibility path above.
     has_v2_tables="$(sqlite3 "${source_db}" \
       "SELECT CASE WHEN EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_v2') THEN 1 ELSE 0 END;")"
     if [[ "${has_v2_tables}" != "1" ]]; then
@@ -68,19 +68,19 @@ for source_db in "${candidates[@]}"; do
     fi
   fi
   echo "[production-parity] checking ${source_db}"
-  YUHAIIN_GO_DIR="${go_root}" \
-  YUHAIIN_SOURCE_DB="${source_db}" \
-  YUHAIIN_INTEGRATION_DIR="${scenario_dir}" \
-  YUHAIIN_PREPARE_HTTP="${prepare_http}" \
-  YUHAIIN_RUST_HTTP="${rust_http}" \
-  YUHAIIN_GO_HTTP="${go_http}" \
-  YUHAIIN_PREPARE="${prepare_mode}" \
+  DORADUS_GO_DIR="${go_root}" \
+  DORADUS_SOURCE_DB="${source_db}" \
+  DORADUS_INTEGRATION_DIR="${scenario_dir}" \
+  DORADUS_PREPARE_HTTP="${prepare_http}" \
+  DORADUS_RUST_HTTP="${rust_http}" \
+  DORADUS_GO_HTTP="${go_http}" \
+  DORADUS_PREPARE="${prepare_mode}" \
     "${repo_root}/scripts/integration/go-api-parity.sh"
   ran=$((ran + 1))
 done
 
 if (( ran == 0 )); then
-  echo "[production-parity] no fixture found; set YUHAIIN_SOURCE_DB to a stopped SQLite snapshot" >&2
+  echo "[production-parity] no fixture found; set DORADUS_SOURCE_DB to a stopped SQLite snapshot" >&2
   exit 0
 fi
 echo "[production-parity] passed ${ran} fixture(s); logs=${scenario_root}"

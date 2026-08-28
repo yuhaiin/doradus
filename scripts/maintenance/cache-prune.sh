@@ -5,26 +5,26 @@ set -euo pipefail
 # reusable fixtures are intentionally left alone because deleting them makes
 # the next Podman run needlessly expensive.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
-retention_days="${YUHAIIN_CACHE_RETENTION_DAYS:-1}"
-dry_run="${YUHAIIN_CACHE_DRY_RUN:-0}"
-prune_debug="${YUHAIIN_CACHE_PRUNE_DEBUG:-0}"
-prune_transient="${YUHAIIN_CACHE_PRUNE_TRANSIENT:-0}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
+retention_days="${DORADUS_CACHE_RETENTION_DAYS:-1}"
+dry_run="${DORADUS_CACHE_DRY_RUN:-0}"
+prune_debug="${DORADUS_CACHE_PRUNE_DEBUG:-0}"
+prune_transient="${DORADUS_CACHE_PRUNE_TRANSIENT:-0}"
 
 if [[ ! "${retention_days}" =~ ^[0-9]+$ ]]; then
-  echo "YUHAIIN_CACHE_RETENTION_DAYS must be a non-negative integer" >&2
+  echo "DORADUS_CACHE_RETENTION_DAYS must be a non-negative integer" >&2
   exit 2
 fi
 if [[ "${dry_run}" != 0 && "${dry_run}" != 1 ]]; then
-  echo "YUHAIIN_CACHE_DRY_RUN must be 0 or 1" >&2
+  echo "DORADUS_CACHE_DRY_RUN must be 0 or 1" >&2
   exit 2
 fi
 if [[ "${prune_debug}" != 0 && "${prune_debug}" != 1 ]]; then
-  echo "YUHAIIN_CACHE_PRUNE_DEBUG must be 0 or 1" >&2
+  echo "DORADUS_CACHE_PRUNE_DEBUG must be 0 or 1" >&2
   exit 2
 fi
 if [[ "${prune_transient}" != 0 && "${prune_transient}" != 1 ]]; then
-  echo "YUHAIIN_CACHE_PRUNE_TRANSIENT must be 0 or 1" >&2
+  echo "DORADUS_CACHE_PRUNE_TRANSIENT must be 0 or 1" >&2
   exit 2
 fi
 
@@ -134,17 +134,17 @@ fi
 after="$(size_kib)"
 echo "[cache-prune] stale-directories=${stale_count} size-after=${after} KiB"
 if [[ "${dry_run}" == 1 ]]; then
-  echo "[cache-prune] dry-run only; set YUHAIIN_CACHE_DRY_RUN=0 to remove them"
+  echo "[cache-prune] dry-run only; set DORADUS_CACHE_DRY_RUN=0 to remove them"
 fi
 if [[ "${prune_debug}" == 1 ]]; then
   echo "[cache-prune] selected cargo-target/debug dependency artifacts were pruned; debug binaries remain"
 else
   echo "[cache-prune] cargo-target and fixtures were not modified"
-  echo "[cache-prune] set YUHAIIN_CACHE_PRUNE_DEBUG=1 for opt-in debug dependency cleanup"
+  echo "[cache-prune] set DORADUS_CACHE_PRUNE_DEBUG=1 for opt-in debug dependency cleanup"
 fi
 if [[ "${prune_transient}" == 1 ]]; then
   echo "[cache-prune] transient-roots=${transient_count} (allowlisted, retention=${retention_days}d)"
 else
   echo "[cache-prune] one-off cross/CI target roots were not modified"
-  echo "[cache-prune] set YUHAIIN_CACHE_PRUNE_TRANSIENT=1 for opt-in cleanup"
+  echo "[cache-prune] set DORADUS_CACHE_PRUNE_TRANSIENT=1 for opt-in cleanup"
 fi

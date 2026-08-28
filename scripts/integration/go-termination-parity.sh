@@ -8,13 +8,13 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${repo_root}/scripts/lib/cache.sh"
-go_root="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
+go_root="${DORADUS_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-scenario_root="${YUHAIIN_TERMINATION_PARITY_DIR:-${cache_root}/integration/go-termination-parity}"
-keep_runs="${YUHAIIN_KEEP_RUNS:-3}"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
-proxy_image="${YUHAIIN_PROXY_IMAGE:-localhost/yuhaiin-nettools-python:testing}"
+scenario_root="${DORADUS_TERMINATION_PARITY_DIR:-${cache_root}/integration/go-termination-parity}"
+keep_runs="${DORADUS_KEEP_RUNS:-3}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
+proxy_image="${DORADUS_PROXY_IMAGE:-localhost/doradus-nettools-python:testing}"
 
 command -v curl >/dev/null
 command -v jq >/dev/null
@@ -40,7 +40,8 @@ go_inbound="$(reserve_port)"
 rust_inbound="$(reserve_port)"
 go_address="127.0.0.1:${go_api}"
 rust_address="127.0.0.1:${rust_api}"
-container_api="0.0.0.0:50051"
+go_container_api="0.0.0.0:50051"
+rust_container_api="0.0.0.0:58080"
 container_inbound="0.0.0.0:18081"
 target_port=18090
 rust_target_port=18091
@@ -48,19 +49,19 @@ target_host="$(ip -4 route get 192.168.2.1 | awk '{for (i = 1; i <= NF; i++) if 
 rust_target_host=127.0.0.1
 host_ip="${target_host}"
 test -n "${host_ip}"
-https_target_host="${YUHAIIN_TERMINATION_HTTPS_HOST:-example.com}"
-https_live="${YUHAIIN_TERMINATION_HTTPS_LIVE:-0}"
+https_target_host="${DORADUS_TERMINATION_HTTPS_HOST:-example.com}"
+https_live="${DORADUS_TERMINATION_HTTPS_LIVE:-0}"
 case "${https_live}" in
   0|1) ;;
-  *) echo "YUHAIIN_TERMINATION_HTTPS_LIVE must be 0 or 1" >&2; exit 2 ;;
+  *) echo "DORADUS_TERMINATION_HTTPS_LIVE must be 0 or 1" >&2; exit 2 ;;
 esac
 
-go_binary="${run_dir}/yuhaiin-go"
-rust_binary="${target_dir}/debug/yuhaiin"
-go_container="yuhaiin-go-termination-${run_id}"
-rust_container="yuhaiin-rust-termination-${run_id}"
-go_target_container="yuhaiin-go-termination-target-${run_id}"
-rust_target_container="yuhaiin-rust-termination-target-${run_id}"
+go_binary="${run_dir}/doradus-go"
+rust_binary="${target_dir}/debug/doradus"
+go_container="doradus-go-termination-${run_id}"
+rust_container="doradus-termination-${run_id}"
+go_target_container="doradus-go-termination-target-${run_id}"
+rust_target_container="doradus-termination-target-${run_id}"
 go_client_pid=""
 rust_client_pid=""
 
@@ -85,10 +86,10 @@ trap cleanup EXIT INT TERM
 echo "[go-termination-parity] building Go and Rust services in Podman"
 "${repo_root}/scripts/integration/podman-go.sh" \
   --state-dir "${run_dir}" -- \
-  env GOEXPERIMENT=jsonv2,greenteagc go build -o /state/yuhaiin-go ./cmd/yuhaiin
+  env GOEXPERIMENT=jsonv2,greenteagc go build -o /state/doradus-go ./cmd/doradus
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${run_dir}" -- \
-  cargo build --locked -p yuhaiin-api --all-features --bin yuhaiin \
+  cargo build --locked -p doradus-api --all-features --bin doradus \
   >"${run_dir}/rust-build.log" 2>&1
 test -x "${rust_binary}"
 
@@ -112,25 +113,24 @@ podman run -d \
   -p "127.0.0.1:${go_inbound}:18081" \
   --userns=keep-id \
   -v "${run_dir}:/data" \
-  -v "${go_binary}:/usr/local/bin/yuhaiin:ro" \
+  -v "${go_binary}:/usr/local/bin/doradus:ro" \
   -v "/etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro" \
-  --entrypoint /usr/local/bin/yuhaiin \
+  --entrypoint /usr/local/bin/doradus \
   "${image}" \
-  -host "${container_api}" -path /data/go \
+  -host "${go_container_api}" -path /data/go \
   >"${run_dir}/go-container-id"
 podman run -d \
   --name "${rust_container}" \
   --network=pasta \
-  -p "127.0.0.1:${rust_api}:50051" \
+  -p "127.0.0.1:${rust_api}:58080" \
   -p "127.0.0.1:${rust_inbound}:18081" \
   --userns=keep-id \
   -v "${run_dir}:/data" \
-  -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
+  -v "${rust_binary}:/usr/local/bin/doradus:ro" \
   -v "/etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro" \
-  -e YUHAIIN_DB=/data/rust/state.sqlite \
-  -e YUHAIIN_HTTP="${container_api}" \
-  --entrypoint /usr/local/bin/yuhaiin \
+  --entrypoint /usr/local/bin/doradus \
   "${image}" \
+  -host "${rust_container_api}" -path /data/rust \
   >"${run_dir}/rust-container-id"
 wait_ready "${go_address}"
 wait_ready "${rust_address}"
@@ -192,7 +192,7 @@ rpc() {
 # compatible certificate transport and complete the same TLS flow.
 # Normalize the shared Rust test fixture to one-line base64 at runtime so the
 # Go-shaped API receives exactly the same certificate/key bytes.
-certificate_base64="$(python3 - "${repo_root}/crates/yuhaiin-runtime/tests/support/mod.rs" <<'PY'
+certificate_base64="$(python3 - "${repo_root}/crates/doradus-runtime/tests/support/mod.rs" <<'PY'
 import base64
 import pathlib
 import sys
@@ -204,7 +204,7 @@ end = source.index('"#;', start)
 print(base64.b64encode(source[start:end].encode()).decode())
 PY
 )"
-private_key_base64="$(python3 - "${repo_root}/crates/yuhaiin-runtime/tests/support/mod.rs" <<'PY'
+private_key_base64="$(python3 - "${repo_root}/crates/doradus-runtime/tests/support/mod.rs" <<'PY'
 import base64
 import pathlib
 import sys

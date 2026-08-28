@@ -1,0 +1,84 @@
+[package]
+name = "doradus-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["http-api", "tun", "tun-routes", "doh-tls", "websocket", "http-termination"]
+http-api = ["update"]
+update = ["doradus-runtime/update"]
+http2 = ["doradus-runtime/http2"]
+http-termination = ["doradus-runtime/http-termination"]
+tun = ["doradus-runtime/tun"]
+tun-routes = ["doradus-runtime/tun-routes"]
+doh-tls = [
+    "doradus-runtime/doh-tls",
+    "dep:rustls",
+    "dep:webpki-roots",
+    "doradus-dns/tls",
+]
+websocket = ["doradus-runtime/websocket"]
+
+[dependencies]
+axum = { version = "0.8.4", default-features = false, features = ["http1", "json", "query", "tokio"] }
+base64 = "0.22.1"
+blake2 = { version = "0.10.6", default-features = false }
+futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
+http = "1.5.0"
+http-body-util = "0.1.4"
+rustls = { version = "0.23.41", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = { version = "0.11.0", default-features = false }
+time = { version = "0.3.44", features = ["formatting", "local-offset", "parsing"] }
+tokio = { version = "1.50.0", default-features = false, features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
+tower-http = { version = "0.6.6", default-features = false, features = ["cors", "fs"] }
+uuid = { version = "1.24.0", default-features = false, features = ["std", "v4"] }
+mimalloc = "0.1.52"
+webpki-roots = { version = "1.0.3", optional = true }
+doradus-backup = { path = "../doradus-backup" }
+doradus-dns = { path = "../doradus-dns" }
+doradus-core = { path = "../doradus-core" }
+doradus-geo = { path = "../doradus-geo" }
+doradus-runtime = { path = "../doradus-runtime", default-features = false }
+doradus-store = { path = "../doradus-store" }
+doradus-tun = { path = "../doradus-tun" }
+doradus-protocol = { path = "../doradus-protocol", features = ["websocket"] }
+
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
+pprof = { version = "0.15.0", default-features = false, features = ["prost-codec"] }
+
+[target.'cfg(all(not(windows), not(target_os = "android")))'.dependencies]
+# PprofAlloc supplies sampled heap profiles while using mimalloc as its
+# underlying allocator. It is enabled in both Debug and Release builds.
+pprof-alloc = { version = "0.5.0", features = ["allocator-mimalloc"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.0"
+
+[dev-dependencies]
+boringtun = { version = "0.7.1", default-features = false }
+bytes = "1.12.1"
+h2 = "0.4.15"
+hyper = { version = "1.11.0", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+nix = { version = "0.30.1", default-features = false, features = ["net", "uio", "process", "signal"] }
+p256-tls-auto = { package = "p256", version = "0.13.2", default-features = false, features = ["ecdsa", "pem", "pkcs8", "std"] }
+rustls = { version = "0.23.41", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2.2.0"
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["tls12"] }
+tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["handshake"] }
+tower = { version = "0.5.2", features = ["util"] }
+x509-cert = { version = "0.2.5", default-features = false, features = ["builder", "std"] }
+doradus-chain = { path = "../doradus-chain" }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "doradus"
+path = "src/bin/doradus.rs"
+required-features = ["http-api"]

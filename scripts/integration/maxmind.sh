@@ -6,13 +6,13 @@ set -euo pipefail
 # Podman. The source URL is public and the checksum prevents a partial
 # or replaced download from becoming a test fixture.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_dir}/.cache/yuhaiin-rust}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_dir}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/maxmind}"
-fixture_dir="${YUHAIIN_MAXMIND_FIXTURE_DIR:-${cache_root}/fixtures}"
+scenario_dir="${DORADUS_INTEGRATION_DIR:-${cache_root}/integration/maxmind}"
+fixture_dir="${DORADUS_MAXMIND_FIXTURE_DIR:-${cache_root}/fixtures}"
 fixture="${fixture_dir}/Country-without-asn.mmdb"
 partial="${fixture}.partial"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
 url="https://raw.githubusercontent.com/Loyalsoldier/geoip/release/Country-without-asn.mmdb"
 expected_sha256="1d900f73aa4644d255793548319410ff559ef9294a662ec1a0354f106c794155"
 
@@ -30,14 +30,14 @@ echo "[maxmind] compiling the fixture harness in Podman"
 "${repo_dir}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   cargo test --locked \
-  -p yuhaiin-geo \
+  -p doradus-geo \
   --all-targets \
   --no-run \
   >"${scenario_dir}/build.log" 2>&1
 
 harness="$({
   find "${target_dir}/debug/deps" -maxdepth 1 -type f -executable \
-    -name 'yuhaiin_geo-*' -printf '%T@ %p\n'
+    -name 'doradus_geo-*' -printf '%T@ %p\n'
 } | sort -nr | head -n 1 | cut -d' ' -f2-)"
 test -x "${harness}"
 
@@ -45,7 +45,7 @@ echo "[maxmind] running the real database test in Podman"
 podman run --rm --network=none \
   -v "${harness}:/usr/local/bin/maxmind-test:ro" \
   -v "${fixture}:/state/Country-without-asn.mmdb:ro" \
-  -e YUHAIIN_MAXMIND_FIXTURE=/state/Country-without-asn.mmdb \
+  -e DORADUS_MAXMIND_FIXTURE=/state/Country-without-asn.mmdb \
   --entrypoint /usr/local/bin/maxmind-test \
   "${image}" \
   --ignored --nocapture --test-threads=1 downloaded_country_without_asn_fixture \

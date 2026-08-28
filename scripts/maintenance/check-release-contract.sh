@@ -65,7 +65,7 @@ required_literals=(
   'Upload native service logs'
   'cargo build --locked --release --target'
   'matrix.target'
-  '-p yuhaiin-api --bin yuhaiin --all-features'
+  '-p doradus-api --bin doradus --all-features'
   'actions/upload-artifact@v7'
   'actions/download-artifact@v7'
   'sha256sum -- * | sort -k2'
@@ -85,7 +85,7 @@ for literal in "${required_literals[@]}"; do
 done
 
 required_windows_cross_literals=(
-  'cargo_home="${YUHAIIN_RELEASE_WINDOWS_CARGO_HOME:-${cache_root}/release-windows-cargo-home}"'
+  'cargo_home="${DORADUS_RELEASE_WINDOWS_CARGO_HOME:-${cache_root}/release-windows-cargo-home}"'
   'g++-mingw-w64-x86-64'
   'cmake'
   'nasm'
@@ -129,12 +129,12 @@ if grep -Fq -- $'            checksums.txt' "${workflow}"; then
 fi
 
 for artifact in \
-  yuhaiin-linux-amd64 \
-  yuhaiin-linux-arm64 \
-  yuhaiin-darwin-amd64 \
-  yuhaiin-darwin-arm64 \
-  yuhaiin-windows-amd64.exe \
-  yuhaiin-windows-arm64.exe; do
+  doradus-linux-amd64 \
+  doradus-linux-arm64 \
+  doradus-darwin-amd64 \
+  doradus-darwin-arm64 \
+  doradus-windows-amd64.exe \
+  doradus-windows-arm64.exe; do
   if ! grep -Fq -- "${artifact}" "${workflow}"; then
     echo "[release-contract] missing release artifact: ${artifact}" >&2
     exit 1

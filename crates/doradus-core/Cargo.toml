@@ -1,0 +1,28 @@
+[package]
+name = "doradus-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+http = ["doradus-dns/http"]
+# Compatibility alias for callers that used the previous HTTP/2-only name.
+http2 = ["http"]
+tls-ring = []
+# Compatibility alias for callers using the former provider feature name.
+tls-rustcrypto = ["tls-ring"]
+
+[dependencies]
+futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
+socket2 = { version = "0.6.5", default-features = false, features = ["all"] }
+tokio = { version = "1.50.0", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+doradus-dns = { path = "../doradus-dns" }
+doradus-types = { path = "../doradus-types" }
+
+[[bin]]
+name = "nat-worker"
+path = "src/bin/nat_worker.rs"
+
+[lints]
+workspace = true

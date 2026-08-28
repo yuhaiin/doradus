@@ -1,11 +1,22 @@
-# yuhaiin-rust
+# Doradus
 
-Rust implementation of the yuhaiin network proxy runtime.
+Doradus is a new, standalone Rust network proxy project. It is being developed
+from the original `yuhaiin-rust` codebase while establishing its own product
+identity, runtime paths, service names, and release artifacts.
 
-> **Work in progress**
->
-> The project is still under active development. It is usable for development
-> and evaluation, but it is not presented as a production-ready release.
+The project intentionally keeps the established protocol contracts, API
+routes, configuration shape, and observable behavior compatible where they are
+already supported. Doradus uses its own service identity and a new native
+state database, separate from existing service installations.
+
+## Name
+
+The name comes from 30 Doradus, a large and active star-forming region in the
+Large Magellanic Cloud, also known as the Tarantula Nebula. NASA describes it
+as approximately 170,000 light-years away and one of the brightest nearby
+star-forming regions:
+
+[NASA Science: Hubble Probes Interior of Tarantula Nebula](https://science.nasa.gov/centers-and-facilities/goddard/hubble-probes-interior-of-tarantula-nebula/)
 
 ## Current status
 
@@ -51,26 +62,31 @@ the help target to see the available commands.
 The workspace separates runtime-independent types, reusable protocol and
 routing logic, persistence/platform adapters, and runtime/API assembly.
 
-- yuhaiin-types contains shared models and contracts.
-- yuhaiin-dns contains DNS models, codecs, cache, and transports.
-- yuhaiin-core contains async proxy, flow, socket, and NAT primitives.
-- yuhaiin-trie contains route indexes and matchers.
-- yuhaiin-protocol and yuhaiin-chain implement protocol and chain behavior.
-- yuhaiin-store handles SQLite, migration, and Go compatibility.
-- yuhaiin-tun handles the TUN packet engine.
-- yuhaiin-runtime assembles snapshots, selectors, inbounds, TUN, and DNS.
-- yuhaiin-api provides the HTTP API and service host.
+- `doradus-types` contains shared models and contracts.
+- `doradus-dns` contains DNS models, codecs, cache, and transports.
+- `doradus-core` contains async proxy, flow, socket, and NAT primitives.
+- `doradus-trie` contains route indexes and matchers.
+- `doradus-protocol` and `doradus-chain` implement protocol and chain behavior.
+- `doradus-store` handles SQLite and the future legacy compatibility boundary.
+- `doradus-tun` handles the TUN packet engine.
+- `doradus-runtime` assembles snapshots, selectors, inbounds, TUN, and DNS.
+- `doradus-api` provides the HTTP API and service host.
+
+The default HTTP API listener is `0.0.0.0:58080`. Use `-host` and `-path` at
+startup; runtime controls are not configured through the old service
+environment variables.
 
 See [the architecture and change guide](docs/ARCHITECTURE.md) for call paths,
 reload boundaries, testing guidance, and module navigation.
 
-## Replacing the Go service
+## Compatibility and future migration
 
-[Release replacement and rollback](docs/RELEASE_REPLACEMENT.md) documents the
-safe migration procedure, SQLite backup requirements, systemd/launchd
-integration, and rollback limitations.
+[Doradus compatibility and future migration](docs/COMPATIBILITY_MIGRATION.md)
+documents the current compatibility boundary and the design constraints for a
+future explicit migration from legacy state.
 
 ## License
 
-This project is licensed under the
+This project preserves the original license, copyright notices, and
+contribution history. It is licensed under the
 [GNU General Public License v3.0 or later](https://www.gnu.org/licenses/gpl-3.0.html).

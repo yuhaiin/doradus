@@ -3,19 +3,19 @@ set -euo pipefail
 
 # This test intentionally mutates the native launchd service paths. It is for
 # disposable CI runners; require an explicit CI environment or opt-in so a
-# local invocation cannot uninstall a user's yuhaiin service by accident.
-if [[ "${CI:-}" != "true" && "${YUHAIIN_NATIVE_SERVICE_ALLOW_GLOBAL:-}" != "1" ]]; then
-  echo "[native-service-macos] refusing to touch launchd outside CI; set YUHAIIN_NATIVE_SERVICE_ALLOW_GLOBAL=1 to opt in" >&2
+# local invocation cannot uninstall a user's doradus service by accident.
+if [[ "${CI:-}" != "true" && "${DORADUS_NATIVE_SERVICE_ALLOW_GLOBAL:-}" != "1" ]]; then
+  echo "[native-service-macos] refusing to touch launchd outside CI; set DORADUS_NATIVE_SERVICE_ALLOW_GLOBAL=1 to opt in" >&2
   exit 2
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
-scenario_root="${YUHAIIN_NATIVE_SERVICE_MACOS_DIR:-${cache_root}/integration/native-service-macos}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
+scenario_root="${DORADUS_NATIVE_SERVICE_MACOS_DIR:-${cache_root}/integration/native-service-macos}"
 run_id="$(date +%Y%m%d%H%M%S)-$$"
 run_dir="${scenario_root}/${run_id}"
-binary="${repo_root}/target/release/yuhaiin"
-staged="${run_dir}/staged-yuhaiin"
+binary="${repo_root}/target/release/doradus"
+staged="${run_dir}/staged-doradus"
 data_dir="${run_dir}/data"
 
 mkdir -p "${run_dir}" "${data_dir}"
@@ -52,11 +52,11 @@ trap cleanup EXIT INT TERM
 
 echo "[native-service-macos] building release binary in the native runner"
 cargo test --locked \
-  -p yuhaiin-api --bin yuhaiin --all-features \
+  -p doradus-api --bin doradus --all-features \
   service::macos::tests -- --nocapture \
   >"${run_dir}/unit-tests.log" 2>&1
 cargo build --locked --release \
-  -p yuhaiin-api --bin yuhaiin --all-features \
+  -p doradus-api --bin doradus --all-features \
   >"${run_dir}/build.log" 2>&1
 test -x "${binary}"
 
@@ -71,7 +71,7 @@ wait_for_health "${run_dir}/health-restart.log"
 
 echo "[native-service-macos] applying a staged update and checking rollback"
 cp "${binary}" "${staged}"
-sudo -n "${binary}" update-helper /usr/local/bin/yuhaiin "${staged}" \
+sudo -n "${binary}" update-helper /usr/local/bin/doradus "${staged}" \
   >"${run_dir}/update.log" 2>&1
 wait_for_health "${run_dir}/health-update.log"
 sudo -n "${binary}" rollback --host "${host}" --path "${data_dir}" \

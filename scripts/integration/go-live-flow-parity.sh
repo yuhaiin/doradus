@@ -9,11 +9,11 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${repo_root}/scripts/lib/cache.sh"
-go_root="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
+go_root="${DORADUS_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-scenario_root="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/go-live-flow-parity}"
-keep_runs="${YUHAIIN_KEEP_RUNS:-3}"
+scenario_root="${DORADUS_INTEGRATION_DIR:-${cache_root}/integration/go-live-flow-parity}"
+keep_runs="${DORADUS_KEEP_RUNS:-3}"
 
 command -v curl >/dev/null
 command -v jq >/dev/null
@@ -39,17 +39,18 @@ rust_inbound="$(reserve_port)"
 proxy_port="$(reserve_port)"
 go_address="127.0.0.1:${go_api}"
 rust_address="127.0.0.1:${rust_api}"
-container_api="0.0.0.0:50051"
+go_container_api="0.0.0.0:50051"
+rust_container_api="0.0.0.0:58080"
 container_inbound="0.0.0.0:18080"
 
-go_binary="${run_dir}/yuhaiin-go"
-rust_binary="${target_dir}/debug/yuhaiin"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
-proxy_image="${YUHAIIN_PROXY_IMAGE:-localhost/yuhaiin-nettools-python:testing}"
-go_container="yuhaiin-go-live-${run_id}"
-rust_container="yuhaiin-rust-live-${run_id}"
-go_proxy_container="yuhaiin-go-live-proxy-${run_id}"
-rust_proxy_container="yuhaiin-rust-live-proxy-${run_id}"
+go_binary="${run_dir}/doradus-go"
+rust_binary="${target_dir}/debug/doradus"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
+proxy_image="${DORADUS_PROXY_IMAGE:-localhost/doradus-nettools-python:testing}"
+go_container="doradus-go-live-${run_id}"
+rust_container="doradus-live-${run_id}"
+go_proxy_container="doradus-go-live-proxy-${run_id}"
+rust_proxy_container="doradus-live-proxy-${run_id}"
 go_flow_pid=""
 rust_flow_pid=""
 
@@ -76,13 +77,13 @@ trap cleanup EXIT INT TERM
 echo "[go-live-flow-parity] building Go and Rust services in Podman"
 "${repo_root}/scripts/integration/podman-go.sh" \
   --state-dir "${run_dir}" -- \
-  env GOEXPERIMENT=jsonv2,greenteagc go build -o /state/yuhaiin-go ./cmd/yuhaiin
+  env GOEXPERIMENT=jsonv2,greenteagc go build -o /state/doradus-go ./cmd/doradus
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${run_dir}" -- \
   cargo build --locked \
-  -p yuhaiin-api \
+  -p doradus-api \
   --all-features \
-  --bin yuhaiin \
+  --bin doradus \
   >"${run_dir}/rust-build.log"
 test -x "${rust_binary}"
 
@@ -142,23 +143,22 @@ podman run -d \
   -p "127.0.0.1:${go_inbound}:18080" \
   --userns=keep-id \
   -v "${run_dir}:/data" \
-  -v "${go_binary}:/usr/local/bin/yuhaiin:ro" \
-  --entrypoint /usr/local/bin/yuhaiin \
+  -v "${go_binary}:/usr/local/bin/doradus:ro" \
+  --entrypoint /usr/local/bin/doradus \
   "${image}" \
-  -host "${container_api}" -path /data/go \
+  -host "${go_container_api}" -path /data/go \
   >"${run_dir}/go-container-id"
 podman run -d \
   --name "${rust_container}" \
   --network=pasta \
-  -p "127.0.0.1:${rust_api}:50051" \
+  -p "127.0.0.1:${rust_api}:58080" \
   -p "127.0.0.1:${rust_inbound}:18080" \
   --userns=keep-id \
   -v "${run_dir}:/data" \
-  -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
-  -e "YUHAIIN_DB=/data/rust/state.sqlite" \
-  -e "YUHAIIN_HTTP=${container_api}" \
-  --entrypoint /usr/local/bin/yuhaiin \
+  -v "${rust_binary}:/usr/local/bin/doradus:ro" \
+  --entrypoint /usr/local/bin/doradus \
   "${image}" \
+  -host "${rust_container_api}" -path /data/rust \
   >"${run_dir}/rust-container-id"
 wait_ready "${go_address}"
 wait_ready "${rust_address}"

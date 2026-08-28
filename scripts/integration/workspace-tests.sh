@@ -7,12 +7,12 @@ set -euo pipefail
 # complete workspace-test command.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/workspace-tests}"
-cargo_home="${YUHAIIN_CARGO_HOME:-${cache_root}/cargo-home}"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
-build_image="${YUHAIIN_BUILD_IMAGE:-docker.io/library/rust:latest}"
+scenario_dir="${DORADUS_INTEGRATION_DIR:-${cache_root}/integration/workspace-tests}"
+cargo_home="${DORADUS_CARGO_HOME:-${cache_root}/cargo-home}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
+build_image="${DORADUS_BUILD_IMAGE:-docker.io/library/rust:latest}"
 
 command -v podman >/dev/null
 mkdir -p "${target_dir}" "${scenario_dir}" "${cargo_home}"
@@ -40,9 +40,9 @@ podman run --rm --network=host \
     CARGO_TERM_COLOR=never cargo build \
       --locked \
       --manifest-path /workspace/Cargo.toml \
-      -p yuhaiin-api \
+      -p doradus-api \
       --all-features \
-      --bin yuhaiin \
+      --bin doradus \
       >/state/runtime-build.log 2>&1
     CARGO_TERM_COLOR=never cargo test \
       --locked \
@@ -89,19 +89,18 @@ run_in_podman() {
   podman run --rm --privileged --network="${network_mode}" \
     -v "${target_dir}:/target:ro" \
     -v "${scenario_dir}:/state:Z" \
-    -v "${target_dir}/debug/yuhaiin:/usr/local/bin/yuhaiin:ro" \
-    -e YUHAIIN_RUNTIME_BIN=/usr/local/bin/yuhaiin \
+    -v "${target_dir}/debug/doradus:/usr/local/bin/doradus:ro" \
+    -e DORADUS_RUNTIME_BIN=/usr/local/bin/doradus \
     -e HOME=/state/home \
     -e TMPDIR=/state/cache/tmp \
-    -e YUHAIIN_CACHE_DIR=/state/cache \
-    -e YUHAIIN_CACHE_DIR=/state/cache/yuhaiin-rust \
-    -e YUHAIIN_INTEGRATION_DIR=/state/integration \
-    -e YUHAIIN_RESET_INTEGRATION_STATE=1 \
+    -e DORADUS_CACHE_DIR=/state/cache/doradus \
+    -e DORADUS_INTEGRATION_DIR=/state/integration \
+    -e DORADUS_RESET_INTEGRATION_STATE=1 \
     --entrypoint /bin/sh \
     "${image}" \
     -ec '
       set -eu
-      mkdir -p "$HOME" "$TMPDIR" "$YUHAIIN_CACHE_DIR" "$YUHAIIN_CACHE_DIR"
+      mkdir -p "$HOME" "$TMPDIR" "$DORADUS_CACHE_DIR"
       for test_binary do
         echo "[workspace-tests] ${test_binary}"
         case "${test_binary##*/}" in

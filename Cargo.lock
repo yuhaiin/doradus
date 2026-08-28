@@ -994,6 +994,351 @@ dependencies = [
 ]
 
 [[package]]
+name = "doradus-android"
+version = "0.1.0"
+dependencies = [
+ "doradus-api",
+ "doradus-runtime",
+ "doradus-tun",
+ "jni",
+ "tokio",
+]
+
+[[package]]
+name = "doradus-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "blake2",
+ "boringtun",
+ "bytes",
+ "doradus-backup",
+ "doradus-chain",
+ "doradus-core",
+ "doradus-dns",
+ "doradus-geo",
+ "doradus-protocol",
+ "doradus-runtime",
+ "doradus-store",
+ "doradus-tun",
+ "futures-util",
+ "h2",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "mimalloc",
+ "nix 0.30.1",
+ "p256",
+ "pprof",
+ "pprof-alloc",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "smoltcp",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "tower",
+ "tower-http",
+ "uuid",
+ "webpki-roots",
+ "windows-service",
+ "x509-cert",
+]
+
+[[package]]
+name = "doradus-backup"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hmac",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha2 0.11.0",
+ "time",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "doradus-chain"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "doradus-core",
+ "doradus-protocol",
+ "doradus-tun",
+ "futures-util",
+ "h2",
+ "http",
+ "rand 0.10.2",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "smoltcp",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "webpki-roots",
+]
+
+[[package]]
+name = "doradus-core"
+version = "0.1.0"
+dependencies = [
+ "doradus-dns",
+ "doradus-types",
+ "futures-util",
+ "socket2",
+ "tokio",
+]
+
+[[package]]
+name = "doradus-dns"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "doradus-types",
+ "ed25519-dalek",
+ "futures-util",
+ "hickory-proto",
+ "hickory-resolver",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "p256",
+ "quinn",
+ "rsa",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "sha2 0.10.9",
+ "signature",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots",
+]
+
+[[package]]
+name = "doradus-geo"
+version = "0.1.0"
+dependencies = [
+ "doradus-core",
+ "maxminddb",
+ "memmap2",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "doradus-masque"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "doradus-core",
+ "doradus-tun",
+ "futures-lite",
+ "p256",
+ "pem",
+ "quiche",
+ "rand_core 0.6.4",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "smoltcp",
+ "tempfile",
+ "time",
+ "tokio",
+ "x509-parser",
+]
+
+[[package]]
+name = "doradus-protocol"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "base64 0.22.1",
+ "bytes",
+ "chacha20 0.9.1",
+ "chacha20poly1305",
+ "crc32fast",
+ "criterion",
+ "doradus-core",
+ "doradus-types",
+ "ed25519-dalek",
+ "futures-util",
+ "h2",
+ "hkdf",
+ "hmac",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "md-5",
+ "nix 0.30.1",
+ "p256",
+ "quinn",
+ "rand 0.10.2",
+ "rsa",
+ "rustls",
+ "rustls-pemfile",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "sha2 0.11.0",
+ "signature",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "webpki-roots",
+ "x509-cert",
+]
+
+[[package]]
+name = "doradus-runtime"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake2",
+ "boringtun",
+ "bytes",
+ "doradus-chain",
+ "doradus-core",
+ "doradus-dns",
+ "doradus-geo",
+ "doradus-masque",
+ "doradus-protocol",
+ "doradus-store",
+ "doradus-trie",
+ "doradus-tun",
+ "doradus-types",
+ "doradus-wireguard",
+ "futures-util",
+ "h2",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "netlink-packet-core",
+ "netlink-packet-route 0.31.0",
+ "netlink-sys",
+ "nix 0.30.1",
+ "pprof",
+ "rand 0.10.2",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "smoltcp",
+ "socket2",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tower",
+ "url",
+ "uuid",
+ "webpki-roots",
+ "windows-service",
+]
+
+[[package]]
+name = "doradus-store"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "bytes",
+ "doradus-core",
+ "doradus-dns",
+ "doradus-protocol",
+ "doradus-tun",
+ "futures-util",
+ "h2",
+ "http",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "smoltcp",
+ "tokio",
+]
+
+[[package]]
+name = "doradus-trie"
+version = "0.1.0"
+dependencies = [
+ "doradus-core",
+ "doradus-protocol",
+ "doradus-store",
+ "doradus-tun",
+ "memmap2",
+ "smoltcp",
+ "tokio",
+]
+
+[[package]]
+name = "doradus-tun"
+version = "0.1.0"
+dependencies = [
+ "doradus-core",
+ "doradus-protocol",
+ "futures-lite",
+ "futures-util",
+ "getifaddrs",
+ "netlink-packet-core",
+ "netlink-packet-route 0.31.0",
+ "netlink-sys",
+ "nix 0.30.1",
+ "route_manager",
+ "smoltcp",
+ "tokio",
+ "tun-rs",
+]
+
+[[package]]
+name = "doradus-types"
+version = "0.1.0"
+
+[[package]]
+name = "doradus-wireguard"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "boringtun",
+ "doradus-core",
+ "doradus-tun",
+ "futures-lite",
+ "hex",
+ "serde",
+ "serde_json",
+ "smoltcp",
+ "socket2",
+ "tokio",
+]
+
+[[package]]
 name = "dtoa"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4685,351 +5030,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "synstructure",
-]
-
-[[package]]
-name = "yuhaiin-android"
-version = "0.1.0"
-dependencies = [
- "jni",
- "tokio",
- "yuhaiin-api",
- "yuhaiin-runtime",
- "yuhaiin-tun",
-]
-
-[[package]]
-name = "yuhaiin-api"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "blake2",
- "boringtun",
- "bytes",
- "futures-util",
- "h2",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "mimalloc",
- "nix 0.30.1",
- "p256",
- "pprof",
- "pprof-alloc",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "smoltcp",
- "time",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tokio-tungstenite",
- "tower",
- "tower-http",
- "uuid",
- "webpki-roots",
- "windows-service",
- "x509-cert",
- "yuhaiin-backup",
- "yuhaiin-chain",
- "yuhaiin-core",
- "yuhaiin-dns",
- "yuhaiin-geo",
- "yuhaiin-protocol",
- "yuhaiin-runtime",
- "yuhaiin-store",
- "yuhaiin-tun",
-]
-
-[[package]]
-name = "yuhaiin-backup"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "hmac",
- "http",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sha2 0.11.0",
- "time",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "yuhaiin-chain"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "bytes",
- "futures-util",
- "h2",
- "http",
- "rand 0.10.2",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "smoltcp",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "webpki-roots",
- "yuhaiin-core",
- "yuhaiin-protocol",
- "yuhaiin-tun",
-]
-
-[[package]]
-name = "yuhaiin-core"
-version = "0.1.0"
-dependencies = [
- "futures-util",
- "socket2",
- "tokio",
- "yuhaiin-dns",
- "yuhaiin-types",
-]
-
-[[package]]
-name = "yuhaiin-dns"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "ed25519-dalek",
- "futures-util",
- "hickory-proto",
- "hickory-resolver",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "p256",
- "quinn",
- "rsa",
- "rustls",
- "rustls-pemfile",
- "serde",
- "sha2 0.10.9",
- "signature",
- "tokio",
- "tokio-rustls",
- "webpki-roots",
- "yuhaiin-types",
-]
-
-[[package]]
-name = "yuhaiin-geo"
-version = "0.1.0"
-dependencies = [
- "maxminddb",
- "memmap2",
- "sha2 0.11.0",
- "yuhaiin-core",
-]
-
-[[package]]
-name = "yuhaiin-masque"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "futures-lite",
- "p256",
- "pem",
- "quiche",
- "rand_core 0.6.4",
- "rcgen",
- "serde",
- "serde_json",
- "smoltcp",
- "tempfile",
- "time",
- "tokio",
- "x509-parser",
- "yuhaiin-core",
- "yuhaiin-tun",
-]
-
-[[package]]
-name = "yuhaiin-protocol"
-version = "0.1.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "base64 0.22.1",
- "bytes",
- "chacha20 0.9.1",
- "chacha20poly1305",
- "crc32fast",
- "criterion",
- "ed25519-dalek",
- "futures-util",
- "h2",
- "hkdf",
- "hmac",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "md-5",
- "nix 0.30.1",
- "p256",
- "quinn",
- "rand 0.10.2",
- "rsa",
- "rustls",
- "rustls-pemfile",
- "serde_json",
- "sha1",
- "sha2 0.10.9",
- "sha2 0.11.0",
- "signature",
- "socket2",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "webpki-roots",
- "x509-cert",
- "yuhaiin-core",
- "yuhaiin-types",
-]
-
-[[package]]
-name = "yuhaiin-runtime"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "blake2",
- "boringtun",
- "bytes",
- "futures-util",
- "h2",
- "http",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "netlink-packet-core",
- "netlink-packet-route 0.31.0",
- "netlink-sys",
- "nix 0.30.1",
- "pprof",
- "rand 0.10.2",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "smoltcp",
- "socket2",
- "time",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tower",
- "url",
- "uuid",
- "webpki-roots",
- "windows-service",
- "yuhaiin-chain",
- "yuhaiin-core",
- "yuhaiin-dns",
- "yuhaiin-geo",
- "yuhaiin-masque",
- "yuhaiin-protocol",
- "yuhaiin-store",
- "yuhaiin-trie",
- "yuhaiin-tun",
- "yuhaiin-types",
- "yuhaiin-wireguard",
-]
-
-[[package]]
-name = "yuhaiin-store"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "blake3",
- "bytes",
- "futures-util",
- "h2",
- "http",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "smoltcp",
- "tokio",
- "yuhaiin-core",
- "yuhaiin-dns",
- "yuhaiin-protocol",
- "yuhaiin-tun",
-]
-
-[[package]]
-name = "yuhaiin-trie"
-version = "0.1.0"
-dependencies = [
- "memmap2",
- "smoltcp",
- "tokio",
- "yuhaiin-core",
- "yuhaiin-protocol",
- "yuhaiin-store",
- "yuhaiin-tun",
-]
-
-[[package]]
-name = "yuhaiin-tun"
-version = "0.1.0"
-dependencies = [
- "futures-lite",
- "futures-util",
- "getifaddrs",
- "netlink-packet-core",
- "netlink-packet-route 0.31.0",
- "netlink-sys",
- "nix 0.30.1",
- "route_manager",
- "smoltcp",
- "tokio",
- "tun-rs",
- "yuhaiin-core",
- "yuhaiin-protocol",
-]
-
-[[package]]
-name = "yuhaiin-types"
-version = "0.1.0"
-
-[[package]]
-name = "yuhaiin-wireguard"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "boringtun",
- "futures-lite",
- "hex",
- "serde",
- "serde_json",
- "smoltcp",
- "socket2",
- "tokio",
- "yuhaiin-core",
- "yuhaiin-tun",
 ]
 
 [[package]]

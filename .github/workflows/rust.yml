@@ -146,18 +146,18 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --release --target "${{ matrix.target }}" \
-            -p yuhaiin-api --bin yuhaiin --all-features
+            -p doradus-api --bin doradus --all-features
           mkdir -p dist
-          source_binary="target/${{ matrix.target }}/release/yuhaiin${{ matrix.platform == 'windows' && '.exe' || '' }}"
-          release_binary="dist/yuhaiin-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.platform == 'windows' && '.exe' || '' }}"
+          source_binary="target/${{ matrix.target }}/release/doradus${{ matrix.platform == 'windows' && '.exe' || '' }}"
+          release_binary="dist/doradus-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.platform == 'windows' && '.exe' || '' }}"
           test -f "${source_binary}"
           cp "${source_binary}" "${release_binary}"
 
       - name: Upload release binary
         uses: actions/upload-artifact@v7
         with:
-          name: yuhaiin-${{ matrix.platform }}-${{ matrix.arch }}
-          path: dist/yuhaiin-*
+          name: doradus-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/doradus-*
           if-no-files-found: error
           retention-days: 14
 
@@ -203,7 +203,7 @@ jobs:
           set -euo pipefail
           artifact_dir="${GITHUB_WORKSPACE}/native-service-artifacts"
           mkdir -p "${artifact_dir}"
-          source_dir="${GITHUB_WORKSPACE}/.cache/yuhaiin-rust/integration/native-service-macos"
+          source_dir="${GITHUB_WORKSPACE}/.cache/doradus/integration/native-service-macos"
           if [[ -d "${source_dir}" ]]; then
             cp -R "${source_dir}/." "${artifact_dir}/"
           fi
@@ -214,7 +214,7 @@ jobs:
         run: |
           $artifactDir = Join-Path $env:GITHUB_WORKSPACE "native-service-artifacts"
           New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
-          $sourceDir = Join-Path $env:GITHUB_WORKSPACE ".cache\yuhaiin-rust\integration\native-service-windows"
+          $sourceDir = Join-Path $env:GITHUB_WORKSPACE ".cache\doradus\integration\native-service-windows"
           if (Test-Path -LiteralPath $sourceDir) {
               Copy-Item -LiteralPath $sourceDir -Destination $artifactDir -Recurse -Force
           }
@@ -245,7 +245,7 @@ jobs:
       - name: Download release binaries
         uses: actions/download-artifact@v7
         with:
-          pattern: yuhaiin-*
+          pattern: doradus-*
           path: artifacts
 
       - name: Assemble release files
@@ -253,15 +253,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          find artifacts -type f -name 'yuhaiin-*' -exec cp '{}' release/ ';'
+          find artifacts -type f -name 'doradus-*' -exec cp '{}' release/ ';'
 
           expected=(
-            yuhaiin-linux-amd64
-            yuhaiin-linux-arm64
-            yuhaiin-darwin-amd64
-            yuhaiin-darwin-arm64
-            yuhaiin-windows-amd64.exe
-            yuhaiin-windows-arm64.exe
+            doradus-linux-amd64
+            doradus-linux-arm64
+            doradus-darwin-amd64
+            doradus-darwin-arm64
+            doradus-windows-amd64.exe
+            doradus-windows-arm64.exe
           )
           for file in "${expected[@]}"; do
             test -f "release/${file}"

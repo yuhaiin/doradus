@@ -2,7 +2,7 @@ SHELL := /bin/bash
 
 CARGO ?= cargo
 RUSTC ?= rustc
-CACHE_ROOT ?= $(CURDIR)/.cache/yuhaiin-rust
+CACHE_ROOT ?= $(CURDIR)/.cache/doradus
 # Empty means Cargo's native repository-local `target/` directory. Set this
 # explicitly when a separate target directory is desired.
 CARGO_TARGET_DIR ?=
@@ -86,9 +86,9 @@ ifneq ($(strip $(FEATURES)),)
 FEATURE_ARGS += --features "$(FEATURES)"
 endif
 
-RUNTIME_PACKAGE := yuhaiin-runtime
-API_PACKAGE := yuhaiin-api
-RUNTIME_BIN := yuhaiin
+RUNTIME_PACKAGE := doradus-runtime
+API_PACKAGE := doradus-api
+RUNTIME_BIN := doradus
 
 .PHONY: help cache-usage cache-prune checklist-check build build-debug build-release build-musl build-release-musl build-all-bins build-tun-smoke build-tun-service-smoke tun-service-smoke tun-long-service-smoke tun-udp-service-smoke tun-chain-service-smoke tun-connection-metadata-smoke tun-reload-smoke tun-reload-traffic-smoke tun-reset-reconnect-smoke tun-mtu-smoke tun-distro-smoke release-linux-cross-smoke release-windows-cross-smoke tun-ipv6-extension-smoke tun-route-matrix-smoke tun-api-process-smoke wireguard-smoke wireguard-chain-smoke wireguard-external-smoke maxmind-smoke s3-minio-smoke build-transparent-service-smoke transparent-service-smoke systemd-service-smoke api-contract-smoke api-reload-flow-smoke go-api-parity-smoke go-live-flow-parity-smoke go-termination-parity-smoke go-termination-https-smoke http-inbound-https-smoke go-protocol-interop-smoke refact-user-parity-smoke production-parity-smoke production-abnormal-parity-smoke legacy-v1-runtime-smoke go-rust-stats-smoke service-chain-smoke benchmark-throughput benchmark-tun-throughput benchmark-wireguard-throughput dns-source-smoke doh-source-smoke socks5-udp-associate-smoke socks5-protocol-smoke node-latency-dns-smoke stats-concurrency-smoke stats-soak-smoke startup-logs-smoke workspace-tests \
 	api-route-parity-smoke release-contract-smoke \
@@ -100,8 +100,8 @@ help:
 		'make cache-usage        show generated Rust cache usage' \
 		'make cache-prune        remove stale integration outputs; preserve cargo-target/fixtures' \
 		'make checklist-check    verify module coverage counts in IMPLEMENTATION_CHECKLIST.md' \
-		'make build              build the yuhaiin runtime binary with system Rust (debug)' \
-		'make build-release      build the yuhaiin runtime binary with system Rust (release)' \
+		'make build              build the doradus runtime binary with system Rust (debug)' \
+		'make build-release      build the doradus runtime binary with system Rust (release)' \
 		'make build MUSL=1       build a static musl debug binary with the local toolchain' \
 		'make build-musl         alias for make build MUSL=1' \
 		'make build-release-musl build a static musl release binary (native arch by default)' \
@@ -165,7 +165,7 @@ help:
 		'make fmt-check          verify Rust formatting' \
 		'make clippy             run workspace Clippy checks' \
 		'HOST_CARGO=0           opt into the Podman Cargo build adapter' \
-		'YUHAIIN_TEST_IMAGE=... override the Podman integration image (default Debian)' \
+		'DORADUS_TEST_IMAGE=... override the Podman integration image (default Debian)' \
 		'make android-aarch64   cross-build for Android arm64' \
 		'' \
 		'CARGO_TARGET_DIR=$(CARGO_OUTPUT_DIR)' \
@@ -174,10 +174,10 @@ help:
 		'MUSL=$(MUSL) MUSL_TARGET=$(MUSL_TARGET) MUSL_LINKER=$(MUSL_LINKER)'
 
 cache-usage:
-	YUHAIIN_CACHE_DIR="$(CACHE_ROOT)" ./scripts/maintenance/cache-usage.sh
+	DORADUS_CACHE_DIR="$(CACHE_ROOT)" ./scripts/maintenance/cache-usage.sh
 
 cache-prune:
-	YUHAIIN_CACHE_DIR="$(CACHE_ROOT)" ./scripts/maintenance/cache-prune.sh
+	DORADUS_CACHE_DIR="$(CACHE_ROOT)" ./scripts/maintenance/cache-prune.sh
 
 checklist-check:
 	./scripts/maintenance/checklist-stats.sh
@@ -202,7 +202,7 @@ build-all-bins:
 	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) --workspace --bins --all-features
 
 build-tun-smoke:
-	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p yuhaiin-core --bin tun-smoke --features tun
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p doradus-core --bin tun-smoke --features tun
 	@printf 'binary: %s/debug/tun-smoke\n' "$(CARGO_OUTPUT_DIR)"
 
 build-tun-service-smoke:
@@ -213,10 +213,10 @@ tun-service-smoke:
 	./scripts/integration/tun-service.sh
 
 tun-long-service-smoke:
-	YUHAIIN_TUN_TRAFFIC_BYTES=$${YUHAIIN_TUN_TRAFFIC_BYTES:-1048576} ./scripts/integration/tun-service.sh
+	DORADUS_TUN_TRAFFIC_BYTES=$${DORADUS_TUN_TRAFFIC_BYTES:-1048576} ./scripts/integration/tun-service.sh
 
 tun-udp-service-smoke:
-	YUHAIIN_TUN_UDP_TRAFFIC=1 YUHAIIN_TUN_TRAFFIC=1 ./scripts/integration/tun-service.sh
+	DORADUS_TUN_UDP_TRAFFIC=1 DORADUS_TUN_TRAFFIC=1 ./scripts/integration/tun-service.sh
 
 tun-chain-service-smoke:
 	./scripts/integration/tun-chain-service.sh
@@ -225,13 +225,13 @@ tun-connection-metadata-smoke:
 	./scripts/integration/tun-connection-metadata.sh
 
 tun-reload-smoke:
-	YUHAIIN_TUN_RELOAD=1 YUHAIIN_TUN_RELOAD_CYCLES=$${YUHAIIN_TUN_RELOAD_CYCLES:-4} YUHAIIN_TUN_RELOAD_ONLY=1 ./scripts/integration/tun-service.sh
+	DORADUS_TUN_RELOAD=1 DORADUS_TUN_RELOAD_CYCLES=$${DORADUS_TUN_RELOAD_CYCLES:-4} DORADUS_TUN_RELOAD_ONLY=1 ./scripts/integration/tun-service.sh
 
 tun-reload-traffic-smoke:
-	YUHAIIN_TUN_RELOAD=1 ./scripts/integration/tun-service.sh
+	DORADUS_TUN_RELOAD=1 ./scripts/integration/tun-service.sh
 
 tun-reset-reconnect-smoke:
-	YUHAIIN_TUN_RESET_RECONNECT=1 ./scripts/integration/tun-service.sh
+	DORADUS_TUN_RESET_RECONNECT=1 ./scripts/integration/tun-service.sh
 
 tun-mtu-smoke:
 	./scripts/integration/tun-mtu.sh
@@ -295,7 +295,7 @@ go-termination-parity-smoke:
 	./scripts/integration/go-termination-parity.sh
 
 go-termination-https-smoke:
-	YUHAIIN_TERMINATION_HTTPS_LIVE=1 ./scripts/integration/go-termination-parity.sh
+	DORADUS_TERMINATION_HTTPS_LIVE=1 ./scripts/integration/go-termination-parity.sh
 
 http-inbound-https-smoke:
 	./scripts/integration/http-inbound-https.sh
@@ -310,7 +310,7 @@ production-parity-smoke:
 	./scripts/integration/production-parity.sh
 
 production-abnormal-parity-smoke:
-	YUHAIIN_FORCE_STOP_REOPEN=1 ./scripts/integration/production-parity.sh
+	DORADUS_FORCE_STOP_REOPEN=1 ./scripts/integration/production-parity.sh
 
 api-route-parity-smoke:
 	./scripts/maintenance/check-api-route-parity.sh
@@ -319,11 +319,11 @@ release-contract-smoke:
 	./scripts/maintenance/check-release-contract.sh
 
 legacy-v1-runtime-smoke:
-	@test -n "$${YUHAIIN_GO_LEGACY_PRODUCTION_DB:-}" || { \
-		echo "set YUHAIIN_GO_LEGACY_PRODUCTION_DB to a copied Go v1 state.db" >&2; \
+	@test -n "$${DORADUS_GO_LEGACY_PRODUCTION_DB:-}" || { \
+		echo "set DORADUS_GO_LEGACY_PRODUCTION_DB to a copied Go v1 state.db" >&2; \
 		exit 1; \
 	}
-	YUHAIIN_GO_LEGACY_PRODUCTION_DB="$${YUHAIIN_GO_LEGACY_PRODUCTION_DB}" \
+	DORADUS_GO_LEGACY_PRODUCTION_DB="$${DORADUS_GO_LEGACY_PRODUCTION_DB}" \
 		./scripts/integration/legacy-v1-runtime.sh
 
 go-rust-stats-smoke:
@@ -360,16 +360,16 @@ stats-concurrency-smoke:
 	./scripts/integration/stats-concurrency.sh
 
 stats-soak-smoke:
-	YUHAIIN_STATS_READER_COUNT=$${YUHAIIN_STATS_READER_COUNT:-12} \
-	YUHAIIN_STATS_READER_ROUNDS=$${YUHAIIN_STATS_READER_ROUNDS:-160} \
-	YUHAIIN_STATS_WRITE_ROUNDS=$${YUHAIIN_STATS_WRITE_ROUNDS:-256} \
+	DORADUS_STATS_READER_COUNT=$${DORADUS_STATS_READER_COUNT:-12} \
+	DORADUS_STATS_READER_ROUNDS=$${DORADUS_STATS_READER_ROUNDS:-160} \
+	DORADUS_STATS_WRITE_ROUNDS=$${DORADUS_STATS_WRITE_ROUNDS:-256} \
 	./scripts/integration/stats-concurrency.sh
 
 startup-logs-smoke:
 	./scripts/integration/startup-logs.sh
 
 build-chain-smoke:
-	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p yuhaiin-chain --bin chain-smoke
+	$(CARGO_EXEC_BUILD_ENV) $(CARGO_EXEC) build $(CARGO_EXEC_COMMON_ARGS) $(CARGO_EXEC_TARGET_ARGS) -p doradus-chain --bin chain-smoke
 	@printf 'binary: %s/debug/chain-smoke\n' "$(CARGO_OUTPUT_DIR)"
 
 run:

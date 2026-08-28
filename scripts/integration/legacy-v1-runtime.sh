@@ -6,11 +6,11 @@ set -euo pipefail
 # never opened for writing.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-source_db="${YUHAIIN_GO_LEGACY_PRODUCTION_DB:?set YUHAIIN_GO_LEGACY_PRODUCTION_DB to a copied Go v1 state.db}"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
+source_db="${DORADUS_GO_LEGACY_PRODUCTION_DB:?set DORADUS_GO_LEGACY_PRODUCTION_DB to a copied Go v1 state.db}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/legacy-v1-runtime}"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+scenario_dir="${DORADUS_INTEGRATION_DIR:-${cache_root}/integration/legacy-v1-runtime}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
 
 command -v podman >/dev/null
 test -f "${source_db}"
@@ -21,7 +21,7 @@ echo "[legacy-v1-runtime] building ignored test binary in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   cargo test --locked \
-  -p yuhaiin-runtime \
+  -p doradus-runtime \
   --all-features \
   --test legacy_v1_runtime \
   --no-run \
@@ -36,13 +36,13 @@ test -n "${test_binary}"
 echo "[legacy-v1-runtime] running snapshot test in Podman"
 podman run --rm \
   --network=none \
-  -v "${test_binary}:/usr/local/bin/yuhaiin-legacy-v1:ro" \
+  -v "${test_binary}:/usr/local/bin/doradus-legacy-v1:ro" \
   -v "${scenario_dir}:/state:Z" \
-  -e YUHAIIN_CACHE_DIR=/state/cache \
-  -e YUHAIIN_GO_LEGACY_PRODUCTION_DB=/state/input-state.db \
+  -e DORADUS_CACHE_DIR=/state/cache \
+  -e DORADUS_GO_LEGACY_PRODUCTION_DB=/state/input-state.db \
   --entrypoint /bin/sh \
   "${image}" \
-  -ec '/usr/local/bin/yuhaiin-legacy-v1 --ignored --nocapture' \
+  -ec '/usr/local/bin/doradus-legacy-v1 --ignored --nocapture' \
   | tee "${scenario_dir}/podman.log"
 
 grep -q 'test result: ok' "${scenario_dir}/podman.log"

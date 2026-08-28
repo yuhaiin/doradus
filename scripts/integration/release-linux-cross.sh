@@ -2,11 +2,11 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
-scenario_dir="${YUHAIIN_RELEASE_LINUX_DIR:-${cache_root}/integration/release-linux-cross}"
-target_dir="${YUHAIIN_RELEASE_LINUX_TARGET_DIR:-${cache_root}/release-linux-target}"
-cargo_home="${YUHAIIN_RELEASE_LINUX_CARGO_HOME:-${cache_root}/release-linux-cargo-home}"
-target="${YUHAIIN_RELEASE_LINUX_TARGET:-aarch64-unknown-linux-musl}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
+scenario_dir="${DORADUS_RELEASE_LINUX_DIR:-${cache_root}/integration/release-linux-cross}"
+target_dir="${DORADUS_RELEASE_LINUX_TARGET_DIR:-${cache_root}/release-linux-target}"
+cargo_home="${DORADUS_RELEASE_LINUX_CARGO_HOME:-${cache_root}/release-linux-cargo-home}"
+target="${DORADUS_RELEASE_LINUX_TARGET:-aarch64-unknown-linux-musl}"
 
 case "${target}" in
   x86_64-unknown-linux-musl)
@@ -62,7 +62,7 @@ podman run --rm --network=host \
     eval "export AR_${target_env}=${toolchain_root}/bin/${target}-ar"
     cd /workspace
     cargo check --config net.offline=false --locked --target "${target}" \
-      -p yuhaiin-api --bin yuhaiin --all-features
+      -p doradus-api --bin doradus --all-features
   ' -- "${target}" "${sha256}"
 
 echo "[release-linux-cross] passed; target=${target} state=${scenario_dir}"

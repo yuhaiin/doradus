@@ -2,10 +2,10 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/startup-logs}"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+scenario_dir="${DORADUS_INTEGRATION_DIR:-${cache_root}/integration/startup-logs}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
 
 mkdir -p "${scenario_dir}"
 
@@ -13,27 +13,26 @@ echo "[startup-logs] building runtime in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   cargo build --locked \
-  -p yuhaiin-api \
+  -p doradus-api \
   --all-features \
-  --bin yuhaiin \
+  --bin doradus \
   >"${scenario_dir}/runtime-build.log"
-runtime_binary="${target_dir}/debug/yuhaiin"
+runtime_binary="${target_dir}/debug/doradus"
 test -x "${runtime_binary}"
 
 echo "[startup-logs] running foreground service in Podman"
 podman run --rm \
   --network=none \
-  -v "${runtime_binary}:/usr/local/bin/yuhaiin:ro" \
+  -v "${runtime_binary}:/usr/local/bin/doradus:ro" \
   -v "${scenario_dir}:/state" \
   -e HOME=/state/home \
-  -e XDG_CONFIG_HOME=/state/config \
   --entrypoint /bin/sh \
   "${image}" \
   -ec '
     set -eu
     : > /state/stdout.log
     : > /state/stderr.log
-    /usr/local/bin/yuhaiin >/state/stdout.log 2>/state/stderr.log &
+    /usr/local/bin/doradus -path /state >/state/stdout.log 2>/state/stderr.log &
     pid=$!
     ready=0
     for _ in $(seq 1 100); do
@@ -52,7 +51,7 @@ podman run --rm \
       wait "$pid" 2>/dev/null || true
       exit 1
     fi
-    grep -Fq "starting; database=/state/config/yuhaiin/state.db" /state/stderr.log
+    grep -Fq "starting; database=/state/state.sqlite" /state/stderr.log
     grep -Fq "HTTP API listening on" /state/stderr.log
     sleep 11
     state="$(grep '^State:' "/proc/$pid/status" 2>/dev/null || true)"

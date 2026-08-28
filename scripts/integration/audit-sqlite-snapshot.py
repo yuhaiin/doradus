@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit the SQLite schema retained by a Rust takeover of a Go snapshot.
+"""Audit the SQLite schema retained by the Rust compatibility projection.
 
 Both databases are opened immutable/read-only.  Rust may add compatibility
 objects or migrate rows, so this audit requires every source object and every
@@ -19,7 +19,7 @@ from typing import Any
 
 
 # These Go tables are intentionally replaced by Rust's typed compatibility
-# schema during takeover.  Their names and rows must remain addressable, but
+# schema during compatibility projection. Their names and rows must remain addressable, but
 # their legacy column/index layout is expected to change.
 EXPECTED_SCHEMA_MIGRATIONS = frozenset(
     {
@@ -116,7 +116,7 @@ def canonical_row_values(
             # the durable key is (dimension, value), not the surrogate id.
             continue
         if table in {"statistics_kv", "traffic_hourly"} and name == "updated_at":
-            # Projection time is necessarily different for a takeover.
+            # Projection time is necessarily different for a new database.
             continue
         if table == "connection_history" and name == "last_connection_json":
             if isinstance(value, str):
@@ -191,7 +191,7 @@ def main() -> int:
                 json.dumps(
                     {
                         "ok": False,
-                        "error": "source objects missing after Rust takeover",
+                        "error": "source objects missing after Rust compatibility projection",
                         "missing": [list(item) for item in missing_objects],
                     },
                     ensure_ascii=False,
@@ -271,7 +271,7 @@ def main() -> int:
                 json.dumps(
                     {
                         "ok": False,
-                        "error": "SQLite schema changed during Rust takeover",
+                        "error": "SQLite schema changed during Rust compatibility projection",
                         "column_diffs": column_diffs,
                         "index_diffs": index_diffs,
                     },

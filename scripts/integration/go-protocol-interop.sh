@@ -2,19 +2,19 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-go_checkout="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
+go_checkout="${DORADUS_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-scenario_dir="${YUHAIIN_GO_INTEROP_DIR:-${cache_root}/integration/go-protocol-interop}"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+scenario_dir="${DORADUS_GO_INTEROP_DIR:-${cache_root}/integration/go-protocol-interop}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
 
 command -v podman >/dev/null
 command -v go >/dev/null
 test -d "${go_checkout}"
 
 go_bin="$(readlink -f "$(command -v go)")"
-go_root="${YUHAIIN_GOROOT:-$(go env GOROOT)}"
-go_mod_cache="${YUHAIIN_GOMODCACHE:-$(go env GOMODCACHE)}"
+go_root="${DORADUS_GOROOT:-$(go env GOROOT)}"
+go_mod_cache="${DORADUS_GOMODCACHE:-$(go env GOMODCACHE)}"
 test -x "${go_bin}"
 test -d "${go_root}"
 test -d "${go_mod_cache}"
@@ -26,7 +26,7 @@ echo "[go-protocol-interop] compiling Rust harnesses in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   env CARGO_TERM_COLOR=never cargo test --locked \
-  -p yuhaiin-chain \
+  -p doradus-chain \
   --test go_yuubinsya_interop \
   --test go_websocket_interop \
   --test standalone_http2 \
@@ -36,7 +36,7 @@ echo "[go-protocol-interop] compiling Rust harnesses in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   env CARGO_TERM_COLOR=never cargo test --locked \
-  -p yuhaiin-protocol \
+  -p doradus-protocol \
   --all-features \
   --test go_vless_interop \
   --test go_vless_udp_interop \
@@ -77,9 +77,9 @@ for test_name in "${tests[@]}"; do
     -e GOMODCACHE=/go-mod \
     -e GOCACHE=/state/go-build \
     -e GOTMPDIR=/state/go-tmp \
-    -e YUHAIIN_CACHE_DIR=/state/cache \
+    -e DORADUS_CACHE_DIR=/state/cache \
     -e HOME=/state/home \
-    -e YUHAIIN_GO_ROOT="${go_checkout}" \
+    -e DORADUS_GO_ROOT="${go_checkout}" \
     --entrypoint "/target/debug/deps/${harness}" \
     "${image}" \
     --ignored --nocapture --test-threads=1 \
@@ -122,9 +122,9 @@ for test_name in "${protocol_tests[@]}"; do
     -e GOMODCACHE=/go-mod \
     -e GOCACHE=/state/go-build \
     -e GOTMPDIR=/state/go-tmp \
-    -e YUHAIIN_CACHE_DIR=/state/cache \
+    -e DORADUS_CACHE_DIR=/state/cache \
     -e HOME=/state/home \
-    -e YUHAIIN_GO_ROOT="${go_checkout}" \
+    -e DORADUS_GO_ROOT="${go_checkout}" \
     --entrypoint "/target/debug/deps/${harness}" \
     "${image}" \
     --ignored --nocapture --test-threads=1 \

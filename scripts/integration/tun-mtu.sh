@@ -2,10 +2,10 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_dir="${YUHAIIN_TUN_MTU_DIR:-${repo_dir}/.cache/yuhaiin-rust/integration/tun-mtu}"
-target_dir="${CARGO_TARGET_DIR:-${repo_dir}/.cache/yuhaiin-rust/cargo-target}"
-binary="${YUHAIIN_TUN_BINARY:-${target_dir}/debug/tun-service-smoke}"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+cache_dir="${DORADUS_TUN_MTU_DIR:-${repo_dir}/.cache/doradus/integration/tun-mtu}"
+target_dir="${CARGO_TARGET_DIR:-${repo_dir}/.cache/doradus/cargo-target}"
+binary="${DORADUS_TUN_BINARY:-${target_dir}/debug/tun-service-smoke}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
 tun_device_args=()
 if [[ -c /dev/net/tun ]]; then
   tun_device_args=(--device=/dev/net/tun)
@@ -21,17 +21,17 @@ source "${repo_dir}/scripts/integration/tun-container-common.sh"
 configure_tun_container_namespace tun-mtu
 
 fixture_env=()
-for tun_fixture_env in YUHAIIN_TUN_PORTAL YUHAIIN_TUN_PORTAL_V6 YUHAIIN_TUN_ROUTE YUHAIIN_TUN_SOURCE YUHAIIN_TUN_TARGET YUHAIIN_TUN_UDP_TARGET YUHAIIN_TUN_UDP_FIRST; do
+for tun_fixture_env in DORADUS_TUN_PORTAL DORADUS_TUN_PORTAL_V6 DORADUS_TUN_ROUTE DORADUS_TUN_SOURCE DORADUS_TUN_TARGET DORADUS_TUN_UDP_TARGET DORADUS_TUN_UDP_FIRST; do
   if [[ -n "${!tun_fixture_env:-}" ]]; then
     fixture_env+=( -e "${tun_fixture_env}=${!tun_fixture_env}" )
   fi
 done
 
 mkdir -p "${cache_dir}"
-if [[ "${YUHAIIN_SKIP_BUILD:-0}" != "1" ]]; then
+if [[ "${DORADUS_SKIP_BUILD:-0}" != "1" ]]; then
   "${repo_dir}/scripts/integration/podman-cargo.sh" \
     --target-dir "${target_dir}" --state-dir "${cache_dir}" -- \
-    cargo build --locked -p yuhaiin-runtime --bin tun-service-smoke --all-features \
+    cargo build --locked -p doradus-runtime --bin tun-service-smoke --all-features \
     >"${cache_dir}/build.log" 2>&1
 fi
 test -x "${binary}"
@@ -47,13 +47,13 @@ for mtu in 576 1280 1500 9000 9216; do
   # it for a faster smoke, but the default catches both smoltcp
   # fragmentation-buffer regressions and kernel reassembly regressions.
   if ! podman run --rm --privileged --network=none "${tun_device_args[@]}" \
-      -e YUHAIIN_DB=/state/state.sqlite \
-      -e YUHAIIN_TUN_NAME="${tun_name}" \
-      -e YUHAIIN_TUN_MTU="${mtu}" \
-      -e YUHAIIN_TUN_TRAFFIC=1 \
-      -e YUHAIIN_TUN_UDP_TRAFFIC=1 \
-      -e YUHAIIN_TUN_UDP_TRAFFIC_BYTES="${YUHAIIN_TUN_UDP_TRAFFIC_BYTES:-65507}" \
-      -e YUHAIIN_TUN_HOLD_MS=750 \
+      -e DORADUS_DB=/state/state.sqlite \
+      -e DORADUS_TUN_NAME="${tun_name}" \
+      -e DORADUS_TUN_MTU="${mtu}" \
+      -e DORADUS_TUN_TRAFFIC=1 \
+      -e DORADUS_TUN_UDP_TRAFFIC=1 \
+      -e DORADUS_TUN_UDP_TRAFFIC_BYTES="${DORADUS_TUN_UDP_TRAFFIC_BYTES:-65507}" \
+      -e DORADUS_TUN_HOLD_MS=750 \
       "${fixture_env[@]}" \
       -v "${binary}:/usr/local/bin/tun-service-smoke:ro" \
       -v "${database_dir}:/state:Z" \

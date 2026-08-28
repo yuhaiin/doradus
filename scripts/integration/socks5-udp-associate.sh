@@ -2,10 +2,10 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/socks5-udp-associate}"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+scenario_dir="${DORADUS_INTEGRATION_DIR:-${cache_root}/integration/socks5-udp-associate}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
 
 mkdir -p "${scenario_dir}"
 
@@ -13,7 +13,7 @@ echo "[socks5-udp-associate] building runtime test binary in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   cargo test --locked \
-  -p yuhaiin-runtime \
+  -p doradus-runtime \
   --all-features \
   --lib \
   --no-run \
@@ -21,19 +21,19 @@ echo "[socks5-udp-associate] building runtime test binary in Podman"
 
 test_binary="$({
   find "${target_dir}/debug/deps" -maxdepth 1 -type f -executable \
-    -name 'yuhaiin_runtime-*' -printf '%T@ %p\n'
+    -name 'doradus_runtime-*' -printf '%T@ %p\n'
 } | sort -nr | head -n 1 | cut -d' ' -f2-)"
 test -n "${test_binary}"
 
 echo "[socks5-udp-associate] running real SOCKS5 UDP chain in Podman"
 podman run --rm \
   --network=none \
-  -v "${test_binary}:/usr/local/bin/yuhaiin-runtime-test:ro" \
+  -v "${test_binary}:/usr/local/bin/doradus-runtime-test:ro" \
   --entrypoint /bin/sh \
   "${image}" \
   -ec '
     set -eu
-    /usr/local/bin/yuhaiin-runtime-test \
+    /usr/local/bin/doradus-runtime-test \
       inbound::tests::socks5_udp_associate_routes_through_the_shared_outbound \
       --exact --nocapture
   ' \

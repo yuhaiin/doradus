@@ -5,11 +5,11 @@ set -euo pipefail
 # still discover the resulting binary from the shared cache, but no host cargo
 # or rustc process is involved.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-state_dir="${YUHAIIN_PODMAN_BUILD_STATE:-${cache_root}/integration/podman-build}"
-cargo_home="${YUHAIIN_CARGO_HOME:-${cache_root}/cargo-home}"
-image="${YUHAIIN_BUILD_IMAGE:-docker.io/library/rust:latest}"
+state_dir="${DORADUS_PODMAN_BUILD_STATE:-${cache_root}/integration/podman-build}"
+cargo_home="${DORADUS_CARGO_HOME:-${cache_root}/cargo-home}"
+image="${DORADUS_BUILD_IMAGE:-docker.io/library/rust:latest}"
 
 usage() {
   echo "usage: podman-cargo.sh [--target-dir DIR] [--state-dir DIR] [--image IMAGE] [--env KEY=VALUE] [--install-target TARGET] [--install-component COMPONENT] [--install-musl-toolchain] -- cargo ..." >&2

@@ -7,12 +7,12 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${repo_root}/scripts/lib/cache.sh"
-go_root="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
+go_root="${DORADUS_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/go-rust-stats}"
-keep_runs="${YUHAIIN_KEEP_RUNS:-3}"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+scenario_dir="${DORADUS_INTEGRATION_DIR:-${cache_root}/integration/go-rust-stats}"
+keep_runs="${DORADUS_KEEP_RUNS:-3}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
 
 command -v curl >/dev/null
 command -v podman >/dev/null
@@ -33,10 +33,10 @@ rust_api="$(reserve_port)"
 rust_inbound="$(reserve_port)"
 go_api="$(reserve_port)"
 go_inbound="$(reserve_port)"
-rust_name="yuhaiin-rust-stats-${run_id}"
-go_name="yuhaiin-go-stats-${run_id}"
-go_binary="${run_dir}/yuhaiin-go"
-rust_binary="${target_dir}/debug/yuhaiin"
+rust_name="doradus-stats-${run_id}"
+go_name="doradus-go-stats-${run_id}"
+go_binary="${run_dir}/doradus-go"
+rust_binary="${target_dir}/debug/doradus"
 
 cleanup() {
   podman rm -f "${go_name}" "${rust_name}" >/dev/null 2>&1 || true
@@ -46,26 +46,26 @@ trap cleanup EXIT INT TERM
 echo "[go-rust-stats] building Go and Rust services in Podman"
 "${repo_root}/scripts/integration/podman-go.sh" \
   --state-dir "${run_dir}" -- \
-  env GOEXPERIMENT=jsonv2,greenteagc go build -o /state/yuhaiin-go ./cmd/yuhaiin
+  env GOEXPERIMENT=jsonv2,greenteagc go build -o /state/doradus-go ./cmd/doradus
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${run_dir}" -- \
   cargo build --locked \
-  -p yuhaiin-api \
+  -p doradus-api \
   --all-features \
-  --bin yuhaiin \
+  --bin doradus \
   >"${run_dir}/rust-build.log"
 test -x "${rust_binary}"
 
-echo "[go-rust-stats] starting Rust and Go with shared state ${run_dir}/state.db"
+echo "[go-rust-stats] starting Rust and Go with independent state files under ${run_dir}"
 podman run -d \
   --name "${rust_name}" \
-  -p "127.0.0.1:${rust_api}:50051" \
+  -p "127.0.0.1:${rust_api}:58080" \
   -p "127.0.0.1:${rust_inbound}:1080" \
   -v "${run_dir}:/data" \
-  -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
-  --entrypoint /usr/local/bin/yuhaiin \
+  -v "${rust_binary}:/usr/local/bin/doradus:ro" \
+  --entrypoint /usr/local/bin/doradus \
   "${image}" \
-  -host 0.0.0.0:50051 \
+  -host 0.0.0.0:58080 \
   -path /data \
   >"${run_dir}/rust-container-id"
 
@@ -94,8 +94,8 @@ podman run -d \
   -p "127.0.0.1:${go_api}:50051" \
   -p "127.0.0.1:${go_inbound}:1080" \
   -v "${run_dir}:/data" \
-  -v "${go_binary}:/usr/local/bin/yuhaiin:ro" \
-  --entrypoint /usr/local/bin/yuhaiin \
+  -v "${go_binary}:/usr/local/bin/doradus:ro" \
+  --entrypoint /usr/local/bin/doradus \
   "${image}" \
   -host 0.0.0.0:50051 \
   -path /data \
@@ -166,13 +166,16 @@ write_traffic() {
   for _ in $(seq 1 60); do
     # The request target is the service's internal API address. The mapped
     # mixed inbound receives the request and its direct outbound connects to
-    # 127.0.0.1:50051 inside the same container.
+    # 127.0.0.1:58080 inside the Rust container and 127.0.0.1:50051 inside
+    # the Go container.
+    local internal_api_port=50051
+    [[ "${label}" == "rust" ]] && internal_api_port=58080
     local response="${run_dir}/${label}-traffic-response.json"
     if ! curl -fsS --max-time 2 --noproxy '' \
       --proxy "http://127.0.0.1:${proxy_port}" \
       -H 'content-type: application/json' \
       --data '{}' \
-      "http://127.0.0.1:50051/api/v2/rpc/info" -o "${response}"; then
+      "http://127.0.0.1:${internal_api_port}/api/v2/rpc/info" -o "${response}"; then
       echo "${label} traffic failed through inbound ${proxy_port}" >&2
       sed -n '1,80p' "${response}" >&2 || true
       return 1

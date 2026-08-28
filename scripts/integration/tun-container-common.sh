@@ -8,7 +8,7 @@
 configure_tun_container_namespace() {
   local label="${1:-tun}"
   local command_path="${2:-/usr/local/bin/tun-service-smoke}"
-  local mode="${YUHAIIN_TUN_USER_NAMESPACE:-auto}"
+  local mode="${DORADUS_TUN_USER_NAMESPACE:-auto}"
   local cap_eff
   local use_user_namespace=0
 
@@ -25,7 +25,7 @@ configure_tun_container_namespace() {
       fi
       ;;
     *)
-      echo "YUHAIIN_TUN_USER_NAMESPACE must be auto, 0, or 1" >&2
+      echo "DORADUS_TUN_USER_NAMESPACE must be auto, 0, or 1" >&2
       return 2
       ;;
   esac

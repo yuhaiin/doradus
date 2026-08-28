@@ -5,15 +5,15 @@ set -euo pipefail
 # because Go main does not currently carry these handlers.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-source_db="${YUHAIIN_SOURCE_DB:?set YUHAIIN_SOURCE_DB to a stopped Go state.db snapshot}"
-go_root="${YUHAIIN_GO_REFAC_USER_DIR:-${cache_root}/go-refact-user}"
-scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/refact-user-parity}"
-go_http="${YUHAIIN_GO_HTTP:-127.0.0.1:55452}"
-rust_http="${YUHAIIN_RUST_HTTP:-127.0.0.1:55451}"
-prepare_http="${YUHAIIN_PREPARE_HTTP:-127.0.0.1:55450}"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+source_db="${DORADUS_SOURCE_DB:?set DORADUS_SOURCE_DB to a stopped Go state.db snapshot}"
+go_root="${DORADUS_GO_REFAC_USER_DIR:-${cache_root}/go-refact-user}"
+scenario_dir="${DORADUS_INTEGRATION_DIR:-${cache_root}/integration/refact-user-parity}"
+go_http="${DORADUS_GO_HTTP:-127.0.0.1:55452}"
+rust_http="${DORADUS_RUST_HTTP:-127.0.0.1:55451}"
+prepare_http="${DORADUS_PREPARE_HTTP:-127.0.0.1:55450}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
 
 test -f "${source_db}"
 test -f "${go_root}/go.mod" || {
@@ -29,23 +29,23 @@ mkdir -p "${scenario_dir}"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   cargo build --locked \
-  -p yuhaiin-api \
+  -p doradus-api \
   --all-features \
-  --bin yuhaiin \
+  --bin doradus \
   >"${scenario_dir}/rust-build.log"
-rust_binary="${target_dir}/debug/yuhaiin"
+rust_binary="${target_dir}/debug/doradus"
 test -x "${rust_binary}"
 
-go_binary="${YUHAIIN_GO_BIN:-${scenario_dir}/yuhaiin-go}"
-if [[ -z "${YUHAIIN_GO_BIN:-}" ]]; then
-  YUHAIIN_GO_DIR="${go_root}" \
+go_binary="${DORADUS_GO_BIN:-${scenario_dir}/doradus-go}"
+if [[ -z "${DORADUS_GO_BIN:-}" ]]; then
+  DORADUS_GO_DIR="${go_root}" \
     "${repo_root}/scripts/integration/podman-go.sh" \
     --state-dir "${scenario_dir}" -- \
-    env GOEXPERIMENT=jsonv2,greenteagc go build -o /state/yuhaiin-go ./cmd/yuhaiin
+    env GOEXPERIMENT=jsonv2,greenteagc go build -o /state/doradus-go ./cmd/doradus
 fi
 test -x "${go_binary}"
 
-run_id="${YUHAIIN_USER_SUFFIX:-${BASHPID}}"
+run_id="${DORADUS_USER_SUFFIX:-${BASHPID}}"
 run_root="${scenario_dir}/${run_id}"
 mkdir -p "${run_root}"
 cp --reflink=auto "${source_db}" "${run_root}/source.sqlite"
@@ -64,9 +64,9 @@ wait_ready() {
   return 1
 }
 
-prepare_container="yuhaiin-refact-user-prepare-${run_id}"
-go_container="yuhaiin-refact-user-go-${run_id}"
-rust_container="yuhaiin-refact-user-rust-${run_id}"
+prepare_container="doradus-refact-user-prepare-${run_id}"
+go_container="doradus-refact-user-go-${run_id}"
+rust_container="doradus-refact-user-rust-${run_id}"
 cleanup() {
   podman logs "${prepare_container}" >"${run_root}/prepare-container.log" 2>&1 || true
   podman logs "${go_container}" >"${run_root}/go-container.log" 2>&1 || true
@@ -80,14 +80,13 @@ prepared_db="${run_root}/prepared.sqlite"
 cp --reflink=auto "${run_root}/source.sqlite" "${prepared_db}"
 podman run -d \
   --name "${prepare_container}" \
-  -p "${prepare_http}:50051" \
+  -p "${prepare_http}:58080" \
   -v "${run_root}:/data:Z" \
-  -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
+  -v "${rust_binary}:/usr/local/bin/doradus:ro" \
   -e TMPDIR=/data/tmp \
-  -e YUHAIIN_DB=/data/prepared.sqlite \
-  -e YUHAIIN_HTTP=0.0.0.0:50051 \
-  --entrypoint /usr/local/bin/yuhaiin \
+  --entrypoint /usr/local/bin/doradus \
   "${image}" \
+  -host 0.0.0.0:58080 -path /data \
   >"${run_root}/prepare-container-id"
 wait_ready "${prepare_http}"
 podman stop "${prepare_container}" >"${run_root}/prepare-stop.log"
@@ -101,24 +100,23 @@ podman run -d \
   --name "${go_container}" \
   -p "${go_http}:50051" \
   -v "${run_root}:/data:Z" \
-  -v "${go_binary}:/usr/local/bin/yuhaiin:ro" \
+  -v "${go_binary}:/usr/local/bin/doradus:ro" \
   -e TMPDIR=/data/tmp \
   -e GOTMPDIR=/data/go-tmp \
   -e GOCACHE=/data/go-cache \
-  --entrypoint /usr/local/bin/yuhaiin \
+  --entrypoint /usr/local/bin/doradus \
   "${image}" \
   -host 0.0.0.0:50051 -path /data/go-path \
   >"${run_root}/go-container-id"
 podman run -d \
   --name "${rust_container}" \
-  -p "${rust_http}:50051" \
+  -p "${rust_http}:58080" \
   -v "${run_root}:/data:Z" \
-  -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
+  -v "${rust_binary}:/usr/local/bin/doradus:ro" \
   -e TMPDIR=/data/tmp \
-  -e YUHAIIN_DB=/data/rust.sqlite \
-  -e YUHAIIN_HTTP=0.0.0.0:50051 \
-  --entrypoint /usr/local/bin/yuhaiin \
+  --entrypoint /usr/local/bin/doradus \
   "${image}" \
+  -host 0.0.0.0:58080 -path /data \
   >"${run_root}/rust-container-id"
 wait_ready "${go_http}"
 wait_ready "${rust_http}"

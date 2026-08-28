@@ -1,0 +1,39 @@
+[package]
+name = "doradus-tun"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+tun-routes = ["dep:route_manager"]
+
+[dependencies]
+futures-lite = "2.6.1"
+futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv4-fragmentation", "proto-ipv6", "socket-tcp", "socket-tcp-cubic", "socket-udp", "socket-icmp", "auto-icmp-echo-reply", "async", "iface-max-addr-count-8"] }
+tokio = { version = "1.50.0", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tun-rs = { version = "2.8.8", default-features = false, features = ["async_io"] }
+doradus-core = { path = "../doradus-core" }
+doradus-protocol = { path = "../doradus-protocol" }
+
+# The platform module is the deliberate unsafe boundary around tun-rs's
+# owned-fd constructor and Linux netlink setup.
+[lints.rust]
+unsafe_code = "allow"
+
+[[bin]]
+name = "tun-smoke"
+path = "src/bin/tun_smoke.rs"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
+route_manager = { version = "0.2.13", optional = true, default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+getifaddrs = "0.6.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.30.1", default-features = false, features = ["net"] }
+netlink-packet-core = "0.8.2"
+netlink-packet-route = "0.31.0"
+netlink-sys = "0.8.8"

@@ -4,4 +4,4 @@
 *.pcap
 /target-*
 /.codebase-index
-/.cache
+.cache

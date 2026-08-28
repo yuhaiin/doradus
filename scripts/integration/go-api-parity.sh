@@ -7,17 +7,17 @@ set -euo pipefail
 # both happen in disposable Podman containers; the host only drives curl.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-go_root="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
-source_db="${YUHAIIN_SOURCE_DB:?set YUHAIIN_SOURCE_DB to a stopped, consistent Go state.db snapshot}"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
-scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/go-api-parity}"
-go_cache_root="${YUHAIIN_GO_CACHE_DIR:-${cache_root}/go-cache}"
+go_root="${DORADUS_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
+source_db="${DORADUS_SOURCE_DB:?set DORADUS_SOURCE_DB to a stopped, consistent Go state.db snapshot}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
+scenario_dir="${DORADUS_INTEGRATION_DIR:-${cache_root}/integration/go-api-parity}"
+go_cache_root="${DORADUS_GO_CACHE_DIR:-${cache_root}/go-cache}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-cargo_home="${YUHAIIN_CARGO_HOME:-${cache_root}/cargo-home}"
-go_http="${YUHAIIN_GO_HTTP:-127.0.0.1:55252}"
-rust_http="${YUHAIIN_RUST_HTTP:-127.0.0.1:55251}"
-prepare_http="${YUHAIIN_PREPARE_HTTP:-127.0.0.1:55250}"
-prepare_enabled="${YUHAIIN_PREPARE:-1}"
+cargo_home="${DORADUS_CARGO_HOME:-${cache_root}/cargo-home}"
+go_http="${DORADUS_GO_HTTP:-127.0.0.1:55252}"
+rust_http="${DORADUS_RUST_HTTP:-127.0.0.1:55251}"
+prepare_http="${DORADUS_PREPARE_HTTP:-127.0.0.1:55250}"
+prepare_enabled="${DORADUS_PREPARE:-1}"
 
 command -v curl >/dev/null
 command -v jq >/dev/null
@@ -26,17 +26,17 @@ test -f "${source_db}"
 mkdir -p "${scenario_dir}/go" "${scenario_dir}/rust" "${scenario_dir}/prepared" "${cargo_home}"
 mkdir -p "${go_cache_root}"
 
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
-rust_build_image="${YUHAIIN_BUILD_IMAGE:-docker.io/library/rust:latest}"
-go_build_image="${YUHAIIN_GO_BUILD_IMAGE:-docker.io/library/golang:latest}"
-sqlite_audit_image="${YUHAIIN_SQLITE_AUDIT_IMAGE:-docker.io/library/python:3.13-slim}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
+rust_build_image="${DORADUS_BUILD_IMAGE:-docker.io/library/rust:latest}"
+go_build_image="${DORADUS_GO_BUILD_IMAGE:-docker.io/library/golang:latest}"
+sqlite_audit_image="${DORADUS_SQLITE_AUDIT_IMAGE:-docker.io/library/python:3.13-slim}"
 run_id="${BASHPID}-$(date +%s)"
-go_container="yuhaiin-go-api-parity-${run_id}"
-rust_container="yuhaiin-rust-api-parity-${run_id}"
-prepare_container="yuhaiin-rust-api-parity-prepare-${run_id}"
+go_container="doradus-go-api-parity-${run_id}"
+rust_container="doradus-api-parity-${run_id}"
+prepare_container="doradus-api-parity-prepare-${run_id}"
 
 echo "[go-api-parity] building Go and Rust services"
-go_binary="${scenario_dir}/yuhaiin-go"
+go_binary="${scenario_dir}/doradus-go"
 podman run --rm --network=host \
   -v "${go_root}:/go-src:ro" \
   -v "${scenario_dir}:/state:Z" \
@@ -50,7 +50,7 @@ podman run --rm --network=host \
     export GOMODCACHE=/go-cache/mod
     export GOTMPDIR=/state/go-tmp
     cd /go-src
-    GOEXPERIMENT=jsonv2,greenteagc go build -o /state/yuhaiin-go ./cmd/yuhaiin
+    GOEXPERIMENT=jsonv2,greenteagc go build -o /state/doradus-go ./cmd/doradus
   ' >"${scenario_dir}/go-build.log" 2>&1
 podman run --rm --network=host \
   -v "${repo_root}:/workspace:ro" \
@@ -70,12 +70,12 @@ podman run --rm --network=host \
     cd /workspace
     cargo build --locked \
       --manifest-path /workspace/Cargo.toml \
-      -p yuhaiin-api \
+      -p doradus-api \
       --all-features \
-      --bin yuhaiin \
+      --bin doradus \
       >/state/rust-build.log 2>&1
   '
-rust_binary="${target_dir}/debug/yuhaiin"
+rust_binary="${target_dir}/debug/doradus"
 test -x "${go_binary}"
 test -x "${rust_binary}"
 
@@ -103,19 +103,18 @@ trap cleanup EXIT
 
 if [[ "${prepare_enabled}" == "1" ]]; then
   # Older Go production snapshots may not yet contain Go's telemetry tables.
-  # Let the current Rust takeover path create/migrate them on a disposable
+  # Let the current Rust compatibility path create/migrate them on a disposable
   # copy first, then give the prepared snapshot to two independent services.
   cp --reflink=auto "${source_db}" "${scenario_dir}/prepared/state.sqlite"
-  echo "[go-api-parity] preparing a disposable Rust takeover snapshot in Podman"
+  echo "[go-api-parity] preparing a disposable Rust compatibility snapshot in Podman"
   podman run -d \
     --name "${prepare_container}" \
-    -p "${prepare_http}:50051" \
+    -p "${prepare_http}:58080" \
     -v "${scenario_dir}/prepared:/data:Z" \
-    -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
-    -e YUHAIIN_DB=/data/state.sqlite \
-    -e YUHAIIN_HTTP=0.0.0.0:50051 \
-    --entrypoint /usr/local/bin/yuhaiin \
+    -v "${rust_binary}:/usr/local/bin/doradus:ro" \
+    --entrypoint /usr/local/bin/doradus \
     "${image}" \
+    -host 0.0.0.0:58080 -path /data \
     >"${scenario_dir}/prepare-container-id"
   wait_ready "${prepare_http}"
   podman stop "${prepare_container}" >"${scenario_dir}/prepare-stop.log"
@@ -123,7 +122,7 @@ if [[ "${prepare_enabled}" == "1" ]]; then
   cp --reflink=auto "${scenario_dir}/prepared/state.sqlite" "${scenario_dir}/go/state.db"
   cp --reflink=auto "${scenario_dir}/prepared/state.sqlite" "${scenario_dir}/rust/state.sqlite"
 
-  echo "[go-api-parity] auditing SQLite schema retained by the Rust takeover"
+  echo "[go-api-parity] auditing SQLite schema retained by the Rust compatibility path"
   podman run --rm --network=none \
     -v "${source_db}:/state/source.sqlite:ro" \
     -v "${scenario_dir}/prepared/state.sqlite:/state/prepared.sqlite:ro" \
@@ -145,20 +144,19 @@ start_services() {
     --name "${go_container}" \
     -p "${go_http}:50051" \
     -v "${scenario_dir}/go:/data:Z" \
-    -v "${go_binary}:/usr/local/bin/yuhaiin:ro" \
-    --entrypoint /usr/local/bin/yuhaiin \
+    -v "${go_binary}:/usr/local/bin/doradus:ro" \
+    --entrypoint /usr/local/bin/doradus \
     "${image}" \
     -host 0.0.0.0:50051 -path /data \
     >"${scenario_dir}/go-container-id"
   podman run -d \
     --name "${rust_container}" \
-    -p "${rust_http}:50051" \
+    -p "${rust_http}:58080" \
     -v "${scenario_dir}/rust:/data:Z" \
-    -v "${rust_binary}:/usr/local/bin/yuhaiin:ro" \
-    -e YUHAIIN_DB=/data/state.sqlite \
-    -e YUHAIIN_HTTP=0.0.0.0:50051 \
-    --entrypoint /usr/local/bin/yuhaiin \
+    -v "${rust_binary}:/usr/local/bin/doradus:ro" \
+    --entrypoint /usr/local/bin/doradus \
     "${image}" \
+    -host 0.0.0.0:58080 -path /data \
     >"${scenario_dir}/rust-container-id"
 }
 
@@ -355,7 +353,7 @@ declare -a operations=(
 # deterministic no-op); snapshots containing links may perform real network
 # refreshes, so subscription refresh remains an explicit deferred feature and
 # is not allowed to make a stopped-snapshot parity run hang on remote URLs.
-include_empty_subscription_update="${YUHAIIN_INCLUDE_EMPTY_SUBSCRIPTION_UPDATE:-0}"
+include_empty_subscription_update="${DORADUS_INCLUDE_EMPTY_SUBSCRIPTION_UPDATE:-0}"
 if [[ "${include_empty_subscription_update}" != "1" ]] \
   && command -v sqlite3 >/dev/null 2>&1; then
   subscription_count="$(sqlite3 "${source_db}" \
@@ -438,11 +436,11 @@ compare_mutation() {
   echo "[go-api-parity] mutation identical: ${operation}"
 }
 
-if [[ "${YUHAIIN_MUTATION_PARITY:-1}" == "1" ]]; then
+if [[ "${DORADUS_MUTATION_PARITY:-1}" == "1" ]]; then
   # These IDs are deliberately unique per invocation so the mutation matrix
   # can run against an unchanged production snapshot without deleting user
   # configuration. Both services receive the same body and path sequence.
-  mutation_suffix="${YUHAIIN_MUTATION_SUFFIX:-${BASHPID}}"
+  mutation_suffix="${DORADUS_MUTATION_SUFFIX:-${BASHPID}}"
   node_id="rust-api-parity-node-${mutation_suffix}"
   inbound_id="rust-api-parity-inbound-${mutation_suffix}"
   resolver_id="rust-api-parity-resolver-${mutation_suffix}"
@@ -607,7 +605,7 @@ compare_error() {
 }
 
 # These requests must not mutate either service. Keep them alongside the
-# success/mutation matrix so a frontend replacement is checked for the same
+# success/mutation matrix so a frontend implementation is checked for the same
 # HTTP status, rpc error code, and validation message as Go.
 declare -a error_operations=(
   'non-object-body|info|[]'
@@ -653,7 +651,7 @@ for request_spec in "${error_operations[@]}"; do
   compare_error "${error_name}" "${error_operation}" "${error_body}"
 done
 
-if [[ "${YUHAIIN_FORCE_STOP_REOPEN:-0}" == "1" ]]; then
+if [[ "${DORADUS_FORCE_STOP_REOPEN:-0}" == "1" ]]; then
   echo "[go-api-parity] force-stopping both services before persistence replay"
   podman kill --signal KILL "${go_container}" "${rust_container}" \
     >"${scenario_dir}/force-stop-status.log" 2>&1 || true

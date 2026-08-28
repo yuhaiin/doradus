@@ -2,16 +2,16 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_dir="${YUHAIIN_INTEGRATION_DIR:-${repo_dir}/.cache/yuhaiin-rust/integration/tun-service}"
-target_dir="${CARGO_TARGET_DIR:-${repo_dir}/.cache/yuhaiin-rust/cargo-target}"
-binary="${YUHAIIN_TUN_BINARY:-${target_dir}/debug/tun-service-smoke}"
+cache_dir="${DORADUS_INTEGRATION_DIR:-${repo_dir}/.cache/doradus/integration/tun-service}"
+target_dir="${CARGO_TARGET_DIR:-${repo_dir}/.cache/doradus/cargo-target}"
+binary="${DORADUS_TUN_BINARY:-${target_dir}/debug/tun-service-smoke}"
 database_dir="${cache_dir}/state"
 log_path="${cache_dir}/podman.log"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
 tun_name="yrtun0"
-chain_mode="${YUHAIIN_TUN_CHAIN:-}"
-container_name="yuhaiin-tun-service-$$"
-timeout_seconds="${YUHAIIN_TUN_SMOKE_TIMEOUT_SEC:-45}"
+chain_mode="${DORADUS_TUN_CHAIN:-}"
+container_name="doradus-tun-service-$$"
+timeout_seconds="${DORADUS_TUN_SMOKE_TIMEOUT_SEC:-45}"
 tun_device_args=()
 if [[ -c /dev/net/tun ]]; then
   tun_device_args=(--device=/dev/net/tun)
@@ -27,7 +27,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if ! [[ "${timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "YUHAIIN_TUN_SMOKE_TIMEOUT_SEC must be a positive integer" >&2
+  echo "DORADUS_TUN_SMOKE_TIMEOUT_SEC must be a positive integer" >&2
   exit 2
 fi
 
@@ -45,31 +45,31 @@ fi
 
 chain_env=()
 if [[ -n "${chain_mode}" ]]; then
-  chain_env=(-e "YUHAIIN_TUN_CHAIN=${chain_mode}")
+  chain_env=(-e "DORADUS_TUN_CHAIN=${chain_mode}")
 fi
-if [[ -n "${YUHAIIN_TUN_RELOAD:-}" ]]; then
-  chain_env+=( -e "YUHAIIN_TUN_RELOAD=${YUHAIIN_TUN_RELOAD}" )
+if [[ -n "${DORADUS_TUN_RELOAD:-}" ]]; then
+  chain_env+=( -e "DORADUS_TUN_RELOAD=${DORADUS_TUN_RELOAD}" )
 fi
-if [[ -n "${YUHAIIN_TUN_RELOAD_CYCLES:-}" ]]; then
-  chain_env+=( -e "YUHAIIN_TUN_RELOAD_CYCLES=${YUHAIIN_TUN_RELOAD_CYCLES}" )
+if [[ -n "${DORADUS_TUN_RELOAD_CYCLES:-}" ]]; then
+  chain_env+=( -e "DORADUS_TUN_RELOAD_CYCLES=${DORADUS_TUN_RELOAD_CYCLES}" )
 fi
-if [[ -n "${YUHAIIN_TUN_DEBUG:-}" ]]; then
-  chain_env+=( -e "YUHAIIN_TUN_DEBUG=${YUHAIIN_TUN_DEBUG}" )
+if [[ -n "${DORADUS_TUN_DEBUG:-}" ]]; then
+  chain_env+=( -e "DORADUS_TUN_DEBUG=${DORADUS_TUN_DEBUG}" )
 fi
-for tun_fixture_env in YUHAIIN_TUN_PORTAL YUHAIIN_TUN_PORTAL_V6 YUHAIIN_TUN_ROUTE YUHAIIN_TUN_SOURCE YUHAIIN_TUN_IPV6_SOURCE YUHAIIN_TUN_TARGET YUHAIIN_TUN_IPV6_TARGET YUHAIIN_TUN_UDP_TARGET YUHAIIN_TUN_UDP_FIRST YUHAIIN_TUN_IPV6_EXTENSION YUHAIIN_TUN_DNS_TEST YUHAIIN_TUN_DNS_TARGET; do
+for tun_fixture_env in DORADUS_TUN_PORTAL DORADUS_TUN_PORTAL_V6 DORADUS_TUN_ROUTE DORADUS_TUN_SOURCE DORADUS_TUN_IPV6_SOURCE DORADUS_TUN_TARGET DORADUS_TUN_IPV6_TARGET DORADUS_TUN_UDP_TARGET DORADUS_TUN_UDP_FIRST DORADUS_TUN_IPV6_EXTENSION DORADUS_TUN_DNS_TEST DORADUS_TUN_DNS_TARGET; do
   if [[ -n "${!tun_fixture_env:-}" ]]; then
     chain_env+=( -e "${tun_fixture_env}=${!tun_fixture_env}" )
   fi
 done
-if [[ "${YUHAIIN_TUN_RESET_RECONNECT:-0}" == "1" ]]; then
-  chain_env+=( -e YUHAIIN_TUN_RESET_RECONNECT=1 )
+if [[ "${DORADUS_TUN_RESET_RECONNECT:-0}" == "1" ]]; then
+  chain_env+=( -e DORADUS_TUN_RESET_RECONNECT=1 )
 fi
 
 mkdir -p "${database_dir}"
-if [[ "${YUHAIIN_SKIP_BUILD:-0}" != "1" ]]; then
+if [[ "${DORADUS_SKIP_BUILD:-0}" != "1" ]]; then
   "${repo_dir}/scripts/integration/podman-cargo.sh" \
     --target-dir "${target_dir}" --state-dir "${cache_dir}" -- \
-    cargo build --locked -p yuhaiin-runtime --bin tun-service-smoke --all-features
+    cargo build --locked -p doradus-runtime --bin tun-service-smoke --all-features
 fi
 test -x "${binary}"
 
@@ -77,9 +77,9 @@ common_args=(
   --privileged
   --network=none
   "${tun_device_args[@]}"
-  -e YUHAIIN_DB=/state/state.sqlite
-  -e YUHAIIN_TUN_NAME="${tun_name}"
-  -e YUHAIIN_TUN_MTU="${YUHAIIN_TUN_MTU:-1500}"
+  -e DORADUS_DB=/state/state.sqlite
+  -e DORADUS_TUN_NAME="${tun_name}"
+  -e DORADUS_TUN_MTU="${DORADUS_TUN_MTU:-1500}"
   "${chain_env[@]}"
   -v "${binary}:/usr/local/bin/tun-service-smoke:ro"
   -v "${database_dir}:/state:Z"
@@ -88,50 +88,50 @@ common_args=(
 )
 run_args=(
   "${common_args[@]:0:${#common_args[@]}-1}"
-  -e YUHAIIN_TUN_HOLD_MS=750
+  -e DORADUS_TUN_HOLD_MS=750
   "${common_args[@]: -1}"
 )
-if [[ "${YUHAIIN_TUN_RELOAD_ONLY:-0}" != "1" ]]; then
+if [[ "${DORADUS_TUN_RELOAD_ONLY:-0}" != "1" ]]; then
   run_args=(
     "${run_args[@]:0:${#run_args[@]}-1}"
-    -e YUHAIIN_TUN_TRAFFIC=1
-    -e YUHAIIN_TUN_TRAFFIC_BYTES="${YUHAIIN_TUN_TRAFFIC_BYTES:-32}"
+    -e DORADUS_TUN_TRAFFIC=1
+    -e DORADUS_TUN_TRAFFIC_BYTES="${DORADUS_TUN_TRAFFIC_BYTES:-32}"
     "${run_args[@]: -1}"
   )
 fi
-if [[ "${YUHAIIN_TUN_ASSERT_CONNECTIONS:-0}" == "1" ]]; then
+if [[ "${DORADUS_TUN_ASSERT_CONNECTIONS:-0}" == "1" ]]; then
   run_args=(
     "${run_args[@]:0:${#run_args[@]}-1}"
-    -e YUHAIIN_TUN_ASSERT_CONNECTIONS=1
-    -e YUHAIIN_TUN_CONNECTION_HOLD_MS="${YUHAIIN_TUN_CONNECTION_HOLD_MS:-250}"
+    -e DORADUS_TUN_ASSERT_CONNECTIONS=1
+    -e DORADUS_TUN_CONNECTION_HOLD_MS="${DORADUS_TUN_CONNECTION_HOLD_MS:-250}"
     "${run_args[@]: -1}"
   )
 fi
-if [[ "${YUHAIIN_TUN_ASSERT_PROCESS:-0}" == "1" ]]; then
+if [[ "${DORADUS_TUN_ASSERT_PROCESS:-0}" == "1" ]]; then
   run_args=(
     "${run_args[@]:0:${#run_args[@]}-1}"
-    -e YUHAIIN_TUN_ASSERT_PROCESS=1
+    -e DORADUS_TUN_ASSERT_PROCESS=1
     "${run_args[@]: -1}"
   )
 fi
-if [[ "${YUHAIIN_TUN_UDP_TRAFFIC:-0}" == "1" ]]; then
+if [[ "${DORADUS_TUN_UDP_TRAFFIC:-0}" == "1" ]]; then
   run_args=(
     "${run_args[@]:0:${#run_args[@]}-1}"
-    -e YUHAIIN_TUN_UDP_TRAFFIC=1
-    -e YUHAIIN_TUN_UDP_TRAFFIC_BYTES="${YUHAIIN_TUN_UDP_TRAFFIC_BYTES:-8192}"
+    -e DORADUS_TUN_UDP_TRAFFIC=1
+    -e DORADUS_TUN_UDP_TRAFFIC_BYTES="${DORADUS_TUN_UDP_TRAFFIC_BYTES:-8192}"
     "${run_args[@]: -1}"
   )
 fi
 force_args=(
   "${common_args[@]:0:${#common_args[@]}-1}"
-  -e YUHAIIN_TUN_TRAFFIC=1
-  -e YUHAIIN_TUN_TRAFFIC_BYTES=536870912
-  -e YUHAIIN_TUN_HOLD_MS=30000
+  -e DORADUS_TUN_TRAFFIC=1
+  -e DORADUS_TUN_TRAFFIC_BYTES=536870912
+  -e DORADUS_TUN_HOLD_MS=30000
   "${common_args[@]: -1}"
 )
 
-if [[ "${YUHAIIN_TUN_FORCE_STOP:-0}" == "1" ]]; then
-  force_name="yuhaiin-tun-force-stop-$$"
+if [[ "${DORADUS_TUN_FORCE_STOP:-0}" == "1" ]]; then
+  force_name="doradus-tun-force-stop-$$"
   force_log="${cache_dir}/force-stop.log"
   : >"${force_log}"
   podman rm -f "${force_name}" >/dev/null 2>&1 || true
@@ -171,29 +171,29 @@ fi
 output="$(<"${log_path}")"
 printf '%s\n' "${output}"
 grep -Fq "runtime-tun-opened name=${tun_name}" <<<"${output}"
-if [[ -n "${YUHAIIN_TUN_RELOAD:-}" ]]; then
+if [[ -n "${DORADUS_TUN_RELOAD:-}" ]]; then
   grep -Fq "runtime-tun-reload-ok name=${tun_name}" <<<"${output}"
 fi
-if [[ "${YUHAIIN_TUN_RELOAD_ONLY:-0}" != "1" ]]; then
+if [[ "${DORADUS_TUN_RELOAD_ONLY:-0}" != "1" ]]; then
   grep -Fq "runtime-tun-traffic-ok" <<<"${output}"
 fi
-if [[ -n "${YUHAIIN_TUN_DNS_TEST:-}" ]]; then
+if [[ -n "${DORADUS_TUN_DNS_TEST:-}" ]]; then
   grep -Fq "runtime-tun-dns-ok" <<<"${output}"
   grep -Eq "runtime-tun-dns-address=198\.18\." <<<"${output}"
 fi
-if [[ "${YUHAIIN_TUN_RESET_RECONNECT:-0}" == "1" ]]; then
+if [[ "${DORADUS_TUN_RESET_RECONNECT:-0}" == "1" ]]; then
   grep -Fq "runtime-tun-reset-ok" <<<"${output}"
   grep -Fq "runtime-tun-reconnect-ok" <<<"${output}"
 fi
-if [[ "${YUHAIIN_TUN_ASSERT_PROCESS:-0}" == "1" ]]; then
+if [[ "${DORADUS_TUN_ASSERT_PROCESS:-0}" == "1" ]]; then
   grep -Fq "runtime-tun-process-ok" <<<"${output}"
 fi
-if [[ "${YUHAIIN_TUN_UDP_TRAFFIC:-0}" == "1" ]]; then
-  if [[ "${YUHAIIN_TUN_IPV6_EXTENSION:-0}" != "1" ]]; then
+if [[ "${DORADUS_TUN_UDP_TRAFFIC:-0}" == "1" ]]; then
+  if [[ "${DORADUS_TUN_IPV6_EXTENSION:-0}" != "1" ]]; then
     grep -Fq "runtime-tun-udp-traffic-ok" <<<"${output}"
   fi
 fi
-if [[ "${YUHAIIN_TUN_IPV6_EXTENSION:-0}" == "1" ]]; then
+if [[ "${DORADUS_TUN_IPV6_EXTENSION:-0}" == "1" ]]; then
   grep -Fq "runtime-tun-ipv6-extension-ok" <<<"${output}"
 fi
 grep -Fq "runtime-tun-closed name=${tun_name}" <<<"${output}"

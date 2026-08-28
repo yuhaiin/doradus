@@ -10,11 +10,11 @@ set -euo pipefail
 # crate archive for every workspace feature, so this job deliberately uses a
 # writable Cargo cache and lets `--locked` enforce dependency reproducibility.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
-scenario_dir="${YUHAIIN_RELEASE_WINDOWS_DIR:-${cache_root}/integration/release-windows-cross}"
-target_dir="${YUHAIIN_RELEASE_WINDOWS_TARGET_DIR:-${cache_root}/release-windows-target}"
-cargo_home="${YUHAIIN_RELEASE_WINDOWS_CARGO_HOME:-${cache_root}/release-windows-cargo-home}"
-target="${YUHAIIN_RELEASE_WINDOWS_TARGET:-x86_64-pc-windows-gnu}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
+scenario_dir="${DORADUS_RELEASE_WINDOWS_DIR:-${cache_root}/integration/release-windows-cross}"
+target_dir="${DORADUS_RELEASE_WINDOWS_TARGET_DIR:-${cache_root}/release-windows-target}"
+cargo_home="${DORADUS_RELEASE_WINDOWS_CARGO_HOME:-${cache_root}/release-windows-cargo-home}"
+target="${DORADUS_RELEASE_WINDOWS_TARGET:-x86_64-pc-windows-gnu}"
 
 case "${target}" in
   x86_64-pc-windows-gnu)
@@ -69,7 +69,7 @@ podman run --rm --network=host \
     eval "export CXX_${target_env}=$cxx"
     cd /workspace
     cargo check --config net.offline=false --locked --target "$target" \
-      -p yuhaiin-api --bin yuhaiin --all-features \
+      -p doradus-api --bin doradus --all-features \
       >/state/cargo-check.log 2>&1 || {
         echo "[release-windows-cross] cargo check failed; see /state/cargo-check.log" >&2
         cat /state/cargo-check.log >&2

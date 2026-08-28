@@ -1,0 +1,33 @@
+[package]
+name = "doradus-trie"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+memmap2 = "0.9.11"
+doradus-core = { path = "../doradus-core" }
+
+[dev-dependencies]
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp"] }
+tokio = { version = "1.50.0", default-features = false, features = ["macros", "net", "rt", "sync", "time"] }
+doradus-core = { path = "../doradus-core" }
+doradus-protocol = { path = "../doradus-protocol" }
+doradus-tun = { path = "../doradus-tun" }
+doradus-store = { path = "../doradus-store" }
+
+[[test]]
+name = "p0_flow"
+path = "tests/p0_flow.rs"
+
+# Mapping immutable index files is the one deliberate unsafe boundary in this
+# crate; memmap2 validates the OS mapping and the rest of the trie remains safe.
+[lints.rust]
+unsafe_code = "allow"
+
+[[bench]]
+name = "ondisk"
+harness = false

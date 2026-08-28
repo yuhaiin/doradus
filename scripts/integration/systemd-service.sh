@@ -6,15 +6,15 @@ set -euo pipefail
 # unit, binary install path, database, and backups stay inside the container.
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_dir}/.cache/yuhaiin-rust}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_dir}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-scenario_dir="${YUHAIIN_SYSTEMD_DIR:-${cache_root}/integration/systemd-service}"
-image="${YUHAIIN_SYSTEMD_IMAGE:-quay.io/fedora/fedora:latest}"
-boot_command="${YUHAIIN_SYSTEMD_BOOT:-dnf -y install systemd dbus >/state/bootstrap.log 2>&1 && exec /sbin/init}"
+scenario_dir="${DORADUS_SYSTEMD_DIR:-${cache_root}/integration/systemd-service}"
+image="${DORADUS_SYSTEMD_IMAGE:-quay.io/fedora/fedora:latest}"
+boot_command="${DORADUS_SYSTEMD_BOOT:-dnf -y install systemd dbus >/state/bootstrap.log 2>&1 && exec /sbin/init}"
 run_id="$(date +%Y%m%d%H%M%S)-$$"
 run_dir="${scenario_dir}/${run_id}"
-container="yuhaiin-systemd-${run_id}"
-binary="${target_dir}/debug/yuhaiin"
+container="doradus-systemd-${run_id}"
+binary="${target_dir}/debug/doradus"
 
 command -v podman >/dev/null
 mkdir -p "${run_dir}"
@@ -23,9 +23,9 @@ echo "[systemd-service] building runtime binary in Podman"
 "${repo_dir}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${run_dir}" -- \
   cargo build --locked \
-  -p yuhaiin-api \
+  -p doradus-api \
   --all-features \
-  --bin yuhaiin \
+  --bin doradus \
   >"${run_dir}/build.log"
 test -x "${binary}"
 
@@ -39,7 +39,7 @@ podman run -d \
   --privileged \
   --systemd=always \
   --name "${container}" \
-  -v "${binary}:/build/yuhaiin:ro" \
+  -v "${binary}:/build/doradus:ro" \
   -v "${run_dir}:/state:Z" \
   --entrypoint /bin/sh \
   "${image}" \
@@ -62,27 +62,27 @@ if [[ "${systemd_ready}" -ne 1 ]]; then
 fi
 
 exec_service() {
-  podman exec "${container}" /build/yuhaiin "$@"
+  podman exec "${container}" /build/doradus "$@"
 }
 
 echo "[systemd-service] installing and checking service"
-exec_service install -host 127.0.0.1:50051 -path /var/lib/yuhaiin
-exec_service health -host 127.0.0.1:50051 -path /var/lib/yuhaiin
-podman exec "${container}" systemctl restart yuhaiin.service
-exec_service health -host 127.0.0.1:50051 -path /var/lib/yuhaiin
+exec_service install -host 127.0.0.1:58080 -path /var/lib/doradus
+exec_service health -host 127.0.0.1:58080 -path /var/lib/doradus
+podman exec "${container}" systemctl restart doradus.service
+exec_service health -host 127.0.0.1:58080 -path /var/lib/doradus
 
-echo "[systemd-service] forcing a bad install and verifying automatic rollback"
-if exec_service install -host not-an-endpoint -path /var/lib/yuhaiin; then
+echo "[systemd-service] forcing a bad install and verifying recovery"
+if exec_service install -host not-an-endpoint -path /var/lib/doradus; then
   echo "[systemd-service] bad install unexpectedly succeeded" >&2
   exit 1
 fi
-exec_service health -host 127.0.0.1:50051 -path /var/lib/yuhaiin
+exec_service health -host 127.0.0.1:58080 -path /var/lib/doradus
 
 echo "[systemd-service] exercising explicit rollback"
-exec_service rollback -host 127.0.0.1:50051 -path /var/lib/yuhaiin
-exec_service health -host 127.0.0.1:50051 -path /var/lib/yuhaiin
+exec_service rollback -host 127.0.0.1:58080 -path /var/lib/doradus
+exec_service health -host 127.0.0.1:58080 -path /var/lib/doradus
 
-podman exec "${container}" systemctl status yuhaiin.service \
+podman exec "${container}" systemctl status doradus.service \
   >"${run_dir}/systemctl-status.log" 2>&1 || true
 podman logs "${container}" >"${run_dir}/container.log" 2>&1 || true
 echo "[systemd-service] passed; logs=${run_dir}"

@@ -2,11 +2,11 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-scenario_dir="${YUHAIIN_WIREGUARD_BENCH_DIR:-${cache_root}/benchmarks/wireguard}"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
-bytes="${YUHAIIN_WIREGUARD_BENCH_BYTES:-67108864}"
+scenario_dir="${DORADUS_WIREGUARD_BENCH_DIR:-${cache_root}/benchmarks/wireguard}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
+bytes="${DORADUS_WIREGUARD_BENCH_BYTES:-67108864}"
 
 command -v podman >/dev/null
 mkdir -p "${scenario_dir}"
@@ -15,7 +15,7 @@ echo "[wireguard-throughput] compiling the release harness in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   env CARGO_TERM_COLOR=never cargo test \
-  -p yuhaiin-wireguard \
+  -p doradus-wireguard \
   --all-targets \
   --no-run \
   --release \
@@ -38,7 +38,7 @@ echo "[wireguard-throughput] running BoringTun packet benchmark in Podman"
 podman run --rm --network=none \
   -v "${target_dir}:/target:ro" \
   -v "${scenario_dir}:/state:Z" \
-  -e YUHAIIN_WIREGUARD_BENCH_BYTES="${bytes}" \
+  -e DORADUS_WIREGUARD_BENCH_BYTES="${bytes}" \
   --entrypoint "/target/release/deps/${harness}" \
   "${image}" \
   --ignored --exact --nocapture --test-threads=1 \

@@ -1,21 +1,21 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/yuhaiin-types",
-    "crates/yuhaiin-dns",
-    "crates/yuhaiin-core",
-    "crates/yuhaiin-tun",
-    "crates/yuhaiin-chain",
-    "crates/yuhaiin-geo",
-    "crates/yuhaiin-protocol",
-    "crates/yuhaiin-store",
-    "crates/yuhaiin-trie",
-    "crates/yuhaiin-wireguard",
-    "crates/yuhaiin-masque",
-    "crates/yuhaiin-backup",
-    "crates/yuhaiin-api",
-    "crates/yuhaiin-android",
-    "crates/yuhaiin-runtime",
+    "crates/doradus-types",
+    "crates/doradus-dns",
+    "crates/doradus-core",
+    "crates/doradus-tun",
+    "crates/doradus-chain",
+    "crates/doradus-geo",
+    "crates/doradus-protocol",
+    "crates/doradus-store",
+    "crates/doradus-trie",
+    "crates/doradus-wireguard",
+    "crates/doradus-masque",
+    "crates/doradus-backup",
+    "crates/doradus-api",
+    "crates/doradus-android",
+    "crates/doradus-runtime",
 ]
 
 [workspace.package]

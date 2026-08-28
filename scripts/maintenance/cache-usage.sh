@@ -5,11 +5,11 @@ set -euo pipefail
 # command is intentionally read-only: removal remains an explicit
 # cache-prune operation with its own allowlists.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
-warn_gib="${YUHAIIN_CACHE_WARN_GIB:-20}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
+warn_gib="${DORADUS_CACHE_WARN_GIB:-20}"
 
 if [[ ! "${warn_gib}" =~ ^[0-9]+$ ]] || [[ "${warn_gib}" -eq 0 ]]; then
-  echo "YUHAIIN_CACHE_WARN_GIB must be a positive integer" >&2
+  echo "DORADUS_CACHE_WARN_GIB must be a positive integer" >&2
   exit 2
 fi
 

@@ -5,11 +5,11 @@ set -euo pipefail
 # and build caches are reusable, while scratch files remain under the project
 # cache rather than the host /tmp.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
-go_root="${YUHAIIN_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
-cache_dir="${YUHAIIN_GO_CACHE_DIR:-${cache_root}/go-cache}"
-state_dir="${YUHAIIN_PODMAN_GO_STATE:-${cache_root}/integration/podman-go-build}"
-image="${YUHAIIN_GO_BUILD_IMAGE:-docker.io/library/golang:latest}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
+go_root="${DORADUS_GO_DIR:-$(cd "${repo_root}/../yuhaiin" && pwd)}"
+cache_dir="${DORADUS_GO_CACHE_DIR:-${cache_root}/go-cache}"
+state_dir="${DORADUS_PODMAN_GO_STATE:-${cache_root}/integration/podman-go-build}"
+image="${DORADUS_GO_BUILD_IMAGE:-docker.io/library/golang:latest}"
 
 usage() {
   echo "usage: podman-go.sh [--state-dir DIR] [--cache-dir DIR] [--image IMAGE] -- go build ..." >&2

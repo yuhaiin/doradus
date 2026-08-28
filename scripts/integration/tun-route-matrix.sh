@@ -8,19 +8,19 @@ set -euo pipefail
 # TUN owner exits or is force-stopped.
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_dir="${YUHAIIN_TUN_ROUTE_DIR:-${repo_dir}/.cache/yuhaiin-rust/integration/tun-route-matrix}"
-target_dir="${CARGO_TARGET_DIR:-${repo_dir}/.cache/yuhaiin-rust/cargo-target}"
-binary="${YUHAIIN_TUN_BINARY:-${target_dir}/debug/tun-smoke}"
-image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
-name="yuhaiin-tun-route-matrix-$$"
+cache_dir="${DORADUS_TUN_ROUTE_DIR:-${repo_dir}/.cache/doradus/integration/tun-route-matrix}"
+target_dir="${CARGO_TARGET_DIR:-${repo_dir}/.cache/doradus/cargo-target}"
+binary="${DORADUS_TUN_BINARY:-${target_dir}/debug/tun-smoke}"
+image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
+name="doradus-tun-route-matrix-$$"
 force_name="${name}-force"
-tun_name="${YUHAIIN_TUN_ROUTE_NAME:-yrtr-$$}"
-force_tun_name="${YUHAIIN_TUN_FORCE_ROUTE_NAME:-yrtf-$$}"
+tun_name="${DORADUS_TUN_ROUTE_NAME:-yrtr-$$}"
+force_tun_name="${DORADUS_TUN_FORCE_ROUTE_NAME:-yrtf-$$}"
 state_dir="${cache_dir}/state"
 log_path="${cache_dir}/podman.log"
 force_log_path="${cache_dir}/force.log"
-host_ip="${YUHAIIN_IP:-$(command -v ip || true)}"
-host_nsenter="${YUHAIIN_NSENTER:-$(command -v nsenter || true)}"
+host_ip="${DORADUS_IP:-$(command -v ip || true)}"
+host_nsenter="${DORADUS_NSENTER:-$(command -v nsenter || true)}"
 
 if [[ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || echo true)" == true ]]; then
   echo "[tun-route-matrix] requires rootful Podman (rootless=false); skipping with exit 77" >&2
@@ -43,10 +43,10 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if [[ "${YUHAIIN_SKIP_BUILD:-0}" != 1 ]]; then
+if [[ "${DORADUS_SKIP_BUILD:-0}" != 1 ]]; then
   "${repo_dir}/scripts/integration/podman-cargo.sh" \
     --target-dir "${target_dir}" --state-dir "${cache_dir}" -- \
-    cargo build --locked -p yuhaiin-core --bin tun-smoke \
+    cargo build --locked -p doradus-core --bin tun-smoke \
     --features tun-routes >"${cache_dir}/build.log" 2>&1
 fi
 test -x "${binary}"
@@ -55,9 +55,9 @@ common_args=(
   --privileged
   --network=none
   --device=/dev/net/tun
-  -e "YUHAIIN_TUN_NAME=${tun_name}"
-  -e YUHAIIN_TUN_ROUTE_SMOKE=1
-  -e YUHAIIN_TUN_HOLD_MS=2500
+  -e "DORADUS_TUN_NAME=${tun_name}"
+  -e DORADUS_TUN_ROUTE_SMOKE=1
+  -e DORADUS_TUN_HOLD_MS=2500
   -v "${binary}:/usr/local/bin/tun-smoke:ro"
   -v "${state_dir}:/state:Z"
   --entrypoint /bin/sh
@@ -110,9 +110,9 @@ podman wait "${name}" >/dev/null
 podman rm -f "${force_name}" >/dev/null 2>&1 || true
 podman run -d --name "${force_name}" \
   --privileged --network=none --device=/dev/net/tun \
-  -e "YUHAIIN_TUN_NAME=${force_tun_name}" \
-  -e YUHAIIN_TUN_ROUTE_SMOKE=1 \
-  -e YUHAIIN_TUN_HOLD_MS=30000 \
+  -e "DORADUS_TUN_NAME=${force_tun_name}" \
+  -e DORADUS_TUN_ROUTE_SMOKE=1 \
+  -e DORADUS_TUN_HOLD_MS=30000 \
   -v "${binary}:/usr/local/bin/tun-smoke:ro" \
   -v "${state_dir}:/state:Z" \
   --entrypoint /bin/sh "${image}" \

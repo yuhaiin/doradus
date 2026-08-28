@@ -5,16 +5,16 @@ set -euo pipefail
 # MinIO, the bucket helper and the binary build all run in disposable Podman
 # containers. State and logs stay below the repository-local cache directory.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cache_root="${YUHAIIN_CACHE_DIR:-${repo_root}/.cache/yuhaiin-rust}"
+cache_root="${DORADUS_CACHE_DIR:-${repo_root}/.cache/doradus}"
 target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
-scenario_dir="${YUHAIIN_INTEGRATION_DIR:-${cache_root}/integration/s3-minio}"
-image="${YUHAIIN_MINIO_IMAGE:-quay.io/minio/minio:latest}"
-mc_image="${YUHAIIN_MINIO_MC_IMAGE:-quay.io/minio/mc:latest}"
-test_image="${YUHAIIN_TEST_IMAGE:-docker.io/library/debian:testing}"
-http_address="${YUHAIIN_S3_MINIO_HTTP:-127.0.0.1:55253}"
-access_key="${YUHAIIN_MINIO_ACCESS_KEY:-yuhaiin-access}"
-secret_key="${YUHAIIN_MINIO_SECRET_KEY:-yuhaiin-secret-123}"
-bucket="${YUHAIIN_MINIO_BUCKET:-yuhaiin-smoke}"
+scenario_dir="${DORADUS_INTEGRATION_DIR:-${cache_root}/integration/s3-minio}"
+image="${DORADUS_MINIO_IMAGE:-quay.io/minio/minio:latest}"
+mc_image="${DORADUS_MINIO_MC_IMAGE:-quay.io/minio/mc:latest}"
+test_image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
+http_address="${DORADUS_S3_MINIO_HTTP:-127.0.0.1:55253}"
+access_key="${DORADUS_MINIO_ACCESS_KEY:-doradus-access}"
+secret_key="${DORADUS_MINIO_SECRET_KEY:-doradus-secret-123}"
+bucket="${DORADUS_MINIO_BUCKET:-doradus-smoke}"
 
 command -v curl >/dev/null
 command -v jq >/dev/null
@@ -36,12 +36,12 @@ echo "[s3-minio] building runtime in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   cargo build \
-  --locked -p yuhaiin-api --bin yuhaiin --all-features \
+  --locked -p doradus-api --bin doradus --all-features \
   >"${scenario_dir}/runtime-build.log" 2>&1
-runtime_binary="${target_dir}/debug/yuhaiin"
+runtime_binary="${target_dir}/debug/doradus"
 test -x "${runtime_binary}"
 
-network="yuhaiin-s3-minio-${BASHPID}"
+network="doradus-s3-minio-${BASHPID}"
 minio_container="${network}-server"
 runtime_container="${network}-runtime"
 state_dir="${scenario_dir}/state"
@@ -84,15 +84,14 @@ echo "[s3-minio] starting runtime in Podman"
 podman run -d \
   --name "${runtime_container}" \
   --network "${network}" \
-  -p "${http_address}:50051" \
-  -v "${runtime_binary}:/usr/local/bin/yuhaiin:ro" \
+  -p "${http_address}:58080" \
+  -v "${runtime_binary}:/usr/local/bin/doradus:ro" \
   -v "${state_dir}:/state:Z" \
   -e HOME=/state/home \
-  -e YUHAIIN_CACHE_DIR=/state/cache \
-  -e YUHAIIN_DB=/state/state.sqlite \
-  -e YUHAIIN_HTTP=0.0.0.0:50051 \
-  --entrypoint /usr/local/bin/yuhaiin \
+  -e DORADUS_CACHE_DIR=/state/cache \
+  --entrypoint /usr/local/bin/doradus \
   "${test_image}" \
+  -host 0.0.0.0:58080 -path /state \
   >"${scenario_dir}/runtime-container-id"
 
 rpc() {
@@ -139,7 +138,7 @@ for _ in $(seq 1 100); do
   [[ "${running}" == "false" ]] && break
   sleep 0.1
 done
-test -s "${state_dir}/cache/yuhaiin-rust/backups/remote-state.sqlite"
+test -s "${state_dir}/cache/doradus/backups/remote-state.sqlite"
 
 podman logs "${runtime_container}" >"${scenario_dir}/runtime.log" 2>&1 || true
 echo "[s3-minio] passed; object=${bucket}/s3-minio-state.db logs=${scenario_dir}"
