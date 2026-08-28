@@ -3,6 +3,8 @@
 //! The supervisor owns every inbound by id. This module contains the socket
 //! protocol branches; TUN is another factory branch in the same owner map.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::net::{TcpListener, UdpSocket};
@@ -108,7 +110,16 @@ fn push_listener(
     listeners.entry(id.to_owned()).or_default().push(supervised);
 }
 
-pub(super) async fn start_inbounds(
+pub(super) fn start_inbounds<'a>(
+    controller: &'a RuntimeController,
+    shutdown: &'a tokio::sync::watch::Receiver<bool>,
+    only_id: Option<&'a str>,
+    options: &'a mut InboundStartOptions,
+) -> Pin<Box<dyn Future<Output = Result<InboundOwners>> + 'a>> {
+    Box::pin(start_inbounds_inner(controller, shutdown, only_id, options))
+}
+
+async fn start_inbounds_inner(
     controller: &RuntimeController,
     shutdown: &tokio::sync::watch::Receiver<bool>,
     only_id: Option<&str>,
@@ -123,16 +134,15 @@ pub(super) async fn start_inbounds(
             .await?,
     ));
     let (tcp_proxy_id, udp_proxy_id) = selected_proxy_ids(controller).await?;
-    let selector = controller
-        .build_proxy_selector_with_udp(
-            "",
-            &tcp_proxy_id,
-            &udp_proxy_id,
-            "",
-            "",
-            Duration::from_secs(30),
-        )
-        .await?;
+    let selector = Box::pin(controller.build_proxy_selector_with_udp(
+        "",
+        &tcp_proxy_id,
+        &udp_proxy_id,
+        "",
+        "",
+        Duration::from_secs(30),
+    ))
+    .await?;
     let monitor = controller.monitor();
     let runtime = controller.inbound_runtime();
     for record in &records {

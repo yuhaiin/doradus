@@ -58,52 +58,12 @@ impl AsyncProxy for SocketPolicyProxy {
     }
 }
 
-/// Apply the Go happy-eyeballs dial budget at the runtime boundary. The
-/// permit covers only connection establishment; once a flow is connected it
-/// must not consume a slot for the lifetime of the relay.
-pub struct ConnectBudgetProxy {
-    pub(super) inner: Arc<dyn AsyncProxy>,
-    pub(super) semaphore: Arc<tokio::sync::Semaphore>,
-}
-
-impl AsyncProxy for ConnectBudgetProxy {
-    fn connect<'a>(
-        &'a self,
-        context: &'a FlowContext,
-    ) -> doradus_core::BoxFuture<'a, Result<doradus_core::proxy::BoxAsyncStream>> {
-        Box::pin(async move {
-            let _permit =
-                self.semaphore.clone().acquire_owned().await.map_err(|_| {
-                    Error::new(ErrorKind::Closed, "runtime connect budget is closed")
-                })?;
-            self.inner.connect(context).await
-        })
-    }
-
-    fn open_datagram<'a>(
-        &'a self,
-        context: &'a FlowContext,
-    ) -> doradus_core::BoxFuture<'a, Result<Box<dyn doradus_core::proxy::AsyncDatagram>>> {
-        self.inner.open_datagram(context)
-    }
-
-    fn ping<'a>(
-        &'a self,
-        context: &'a FlowContext,
-    ) -> doradus_core::BoxFuture<'a, Result<Duration>> {
-        self.inner.ping(context)
-    }
-
-    fn close(&self) -> doradus_core::BoxFuture<'_, Result<()>> {
-        self.inner.close()
-    }
-}
-
 pub async fn build_aead_proxy(
     config: &GoProxyRuntimeConfig,
     timeout: Duration,
     resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
     metrics: Arc<doradus_metrics::RuntimeMetrics>,
+    dialer: Arc<doradus_core::network::HappyEyeballsV2Dialer>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     let base = config
         .to_base_proxy_config_with_resolver(timeout, resolver)
@@ -112,10 +72,21 @@ pub async fn build_aead_proxy(
         BaseProxyKind::Fixed { address } => Some(*address),
         _ => None,
     };
-    #[cfg(feature = "doh-tls")]
-    let mut upstream: Arc<dyn AsyncProxy> = base.build_with_metrics(metrics)?;
-    #[cfg(not(feature = "doh-tls"))]
-    let upstream: Arc<dyn AsyncProxy> = base.build()?;
+    let mut upstream: Arc<dyn AsyncProxy> =
+        if let Some(endpoints) = super::fixed_tcp_candidates(&base.kind) {
+            Arc::new(super::HappyEyeballsFixedProxy::new(
+                endpoints, dialer, timeout,
+            )?)
+        } else {
+            #[cfg(feature = "doh-tls")]
+            {
+                base.build_with_metrics(metrics)?
+            }
+            #[cfg(not(feature = "doh-tls"))]
+            {
+                base.build()?
+            }
+        };
     if config
         .chain_types
         .iter()

@@ -1,4 +1,3 @@
-use futures_util::stream::{FuturesUnordered, StreamExt};
 use http::Request;
 use http_body_util::Empty;
 use hyper::client::conn::http2::SendRequest;
@@ -22,7 +21,6 @@ use doradus_metrics::RuntimeMetrics;
 const DEFAULT_MAX_CONNECTIONS_PER_ENDPOINT: usize = 4;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
-const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(650);
 type H2Body = Empty<bytes::Bytes>;
 
 /// One HTTP/2 connection that can own multiple independent CONNECT streams.
@@ -623,7 +621,7 @@ impl H2Pool {
         }
 
         let (endpoint, connection, stream) = self
-            .open_new_connection_happy_eyeballs(candidates, concurrency, &connect)
+            .open_new_connection(candidates, concurrency, &connect)
             .await?;
         let key = H2PoolKey {
             address: endpoint.address,
@@ -640,7 +638,7 @@ impl H2Pool {
         Ok(stream)
     }
 
-    async fn open_new_connection_happy_eyeballs<F, Fut>(
+    async fn open_new_connection<F, Fut>(
         &self,
         endpoints: Vec<H2PoolEndpoint>,
         concurrency: usize,
@@ -654,41 +652,28 @@ impl H2Pool {
         F: Fn(H2PoolEndpoint) -> Fut,
         Fut: Future<Output = Result<Arc<H2Connection>>>,
     {
-        let mut attempts = FuturesUnordered::new();
-        for (index, endpoint) in endpoints.into_iter().enumerate() {
-            let metrics = Arc::clone(&self.metrics);
-            attempts.push(async move {
-                if index > 0 {
-                    tokio::time::sleep(HAPPY_EYEBALLS_DELAY * index as u32).await;
-                }
-                metrics.connection_attempt();
-                let connection = match connect(endpoint.clone()).await {
-                    Ok(connection) => connection,
-                    Err(error) => {
-                        metrics.connection_failure();
-                        return Err(error);
-                    }
-                };
-                connection.attach_telemetry(Arc::clone(&metrics));
-                let stream = match connection
-                    .open_connect_stream_with_local_addr(concurrency)
-                    .await
-                {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        metrics.stream_open_failure();
-                        return Err(error);
-                    }
-                };
-                Ok((endpoint, connection, stream))
-            });
-        }
-
         let mut last_error = None;
-        while let Some(result) = attempts.next().await {
-            match result {
-                Ok(success) => return Ok(success),
-                Err(error) => last_error = Some(error),
+        for endpoint in endpoints {
+            let metrics = Arc::clone(&self.metrics);
+            metrics.connection_attempt();
+            let connection = match connect(endpoint.clone()).await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    metrics.connection_failure();
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            connection.attach_telemetry(Arc::clone(&metrics));
+            match connection
+                .open_connect_stream_with_local_addr(concurrency)
+                .await
+            {
+                Ok(stream) => return Ok((endpoint, connection, stream)),
+                Err(error) => {
+                    metrics.stream_open_failure();
+                    last_error = Some(error);
+                }
             }
         }
         Err(last_error.unwrap_or_else(|| protocol_error("HTTP/2 pool could not open a connection")))

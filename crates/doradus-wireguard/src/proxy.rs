@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::network::{DEFAULT_INTERFACE, bind_socket_to_interface};
 use doradus_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
-use doradus_core::{BoxFuture, Error, ErrorKind, FlowContext, Network, Result};
+use doradus_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
 
 use crate::config::{
     ParsedConfig, ParsedPeer, WireGuardConfig, decode_key, error_io, error_unsupported,
@@ -193,7 +193,9 @@ async fn resolve_flow_destination(context: &FlowContext) -> Result<SocketAddr> {
     let endpoint = context
         .resolved_destination
         .as_ref()
-        .unwrap_or(&context.destination);
+        .and_then(|addresses| addresses.first().copied())
+        .map(|address| Endpoint::ip(context.network, address))
+        .unwrap_or_else(|| context.destination.clone());
     if let Some(address) = endpoint.addr() {
         return Ok(address);
     }

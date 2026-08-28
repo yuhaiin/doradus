@@ -145,7 +145,7 @@ impl FixedTargetProxy {
         } else {
             self.tcp_target
         };
-        mapped.resolved_destination = Some(Endpoint::ip(context.network, target));
+        mapped.resolved_destination = Some(vec![target]);
         mapped
     }
 }

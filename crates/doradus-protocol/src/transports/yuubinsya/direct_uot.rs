@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use crate::yuubinsya::derive_salt;
 use doradus_core::dns_resolver::AsyncIpResolver;
-use doradus_core::network::connect_tokio_tcp_with_interface;
+use doradus_core::network::{HappyEyeballsV2Dialer, TcpDialCandidate};
 use doradus_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use doradus_core::{BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, Result};
 use serde_json::Value;
@@ -37,6 +37,7 @@ pub struct DirectUotProxy {
     password_hash: [u8; 32],
     udp_coalesce: bool,
     resolver: Arc<dyn AsyncIpResolver>,
+    dialer: Arc<HappyEyeballsV2Dialer>,
     active_datagrams: Arc<Mutex<Vec<Weak<DirectUotDatagram>>>>,
     closed: Arc<AtomicBool>,
 }
@@ -44,6 +45,18 @@ pub struct DirectUotProxy {
 pub fn parse_go_direct_uot(
     json_text: &str,
     resolver: Arc<dyn AsyncIpResolver>,
+) -> Result<Option<DirectUotProxy>> {
+    parse_go_direct_uot_with_dialer(
+        json_text,
+        resolver,
+        Arc::new(HappyEyeballsV2Dialer::new(None)),
+    )
+}
+
+pub fn parse_go_direct_uot_with_dialer(
+    json_text: &str,
+    resolver: Arc<dyn AsyncIpResolver>,
+    dialer: Arc<HappyEyeballsV2Dialer>,
 ) -> Result<Option<DirectUotProxy>> {
     let root: Value = serde_json::from_str(json_text)
         .map_err(|error| Error::new(ErrorKind::InvalidInput, format!("Go node JSON: {error}")))?;
@@ -119,6 +132,7 @@ pub fn parse_go_direct_uot(
             .and_then(Value::as_bool)
             .unwrap_or(false),
         resolver,
+        dialer,
         active_datagrams: Arc::new(Mutex::new(Vec::new())),
         closed: Arc::new(AtomicBool::new(false)),
     }))
@@ -316,47 +330,25 @@ impl DirectUotProxy {
         bind_interface: Option<&str>,
     ) -> Result<(Arc<DirectUotSession>, u64)> {
         let addresses = resolve_endpoints(&self.endpoints, self.resolver.as_ref()).await?;
-        let mut last_error = None;
-        for (address, endpoint_interface) in addresses {
-            let local_bind = local_bind_addresses
-                .iter()
-                .copied()
-                .find(|ip| ip.is_ipv4() == address.ip().is_ipv4())
-                .map(|ip| SocketAddr::new(ip, 0));
-            let endpoint_interface = endpoint_interface.as_deref().or(bind_interface);
-            let stream = match connect_tokio_tcp_with_interface(
-                address,
-                local_bind,
-                endpoint_interface,
-                CONNECT_TIMEOUT,
-            )
-            .await
-            {
-                Ok(stream) => stream,
-                Err(error) => {
-                    last_error = Some(error);
-                    continue;
-                }
-            };
-            let (reader, writer, assigned_id) = match AsyncYuubinsyaUotSession::connect_split(
-                stream,
-                self.password_hash,
-                migrate_id,
-            )
-            .await
-            {
-                Ok(parts) => parts,
-                Err(error) => {
-                    last_error = Some(error);
-                    continue;
-                }
-            };
-            return Ok((
-                DirectUotSession::new(reader, writer, self.udp_coalesce),
-                assigned_id,
-            ));
-        }
-        Err(last_error.unwrap_or_else(|| Error::invalid("Yuubinsya UOT has no resolved endpoint")))
+        let candidates = addresses
+            .into_iter()
+            .map(|(address, endpoint_interface)| {
+                TcpDialCandidate::new(
+                    address,
+                    endpoint_interface.or_else(|| bind_interface.map(str::to_owned)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let stream = self
+            .dialer
+            .dial_candidates(candidates, local_bind_addresses, CONNECT_TIMEOUT)
+            .await?;
+        let (reader, writer, assigned_id) =
+            AsyncYuubinsyaUotSession::connect_split(stream, self.password_hash, migrate_id).await?;
+        Ok((
+            DirectUotSession::new(reader, writer, self.udp_coalesce),
+            assigned_id,
+        ))
     }
 }
 

@@ -396,7 +396,6 @@ async fn pool_falls_back_to_next_endpoint_after_connection_failure() {
                 let io = Arc::clone(&io);
                 async move {
                     if address == unreachable_v6 {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
                         return Err(Error::new(
                             ErrorKind::Io,
                             "simulated unreachable IPv6 endpoint",
@@ -412,7 +411,7 @@ async fn pool_falls_back_to_next_endpoint_after_connection_failure() {
         }),
     )
     .await
-    .expect("IPv4 fallback did not race the stalled IPv6 endpoint")
+    .expect("IPv4 fallback did not follow the failed IPv6 endpoint")
     .unwrap();
     assert_eq!(pool.stats().connection_attempts, 2);
     drop(stream);

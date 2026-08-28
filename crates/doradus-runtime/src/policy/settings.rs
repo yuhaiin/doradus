@@ -50,7 +50,9 @@ impl Default for RuntimeSettings {
             udp_buffer_size: 2048,
             relay_buffer_size: 4096,
             udp_ringbuffer_size: 250,
-            happy_eyeballs_semaphore: 250,
+            // Zero is Go's unlimited mode.  The raw dialer only creates a
+            // semaphore for a positive configured limit.
+            happy_eyeballs_semaphore: 0,
         }
     }
 }
@@ -136,7 +138,7 @@ impl RuntimeSettings {
             happy_eyeballs_semaphore: bounded_or_default(
                 advanced.get("happyEyeballsSemaphore"),
                 defaults.happy_eyeballs_semaphore,
-                1,
+                0,
                 usize::MAX,
             ),
         }
@@ -211,7 +213,7 @@ impl RuntimeSettings {
                 }
                 ("advanced", "happyeyeballs_semaphore") => {
                     settings.happy_eyeballs_semaphore =
-                        bounded_from_json(&value, settings.happy_eyeballs_semaphore, 1, usize::MAX);
+                        bounded_from_json(&value, settings.happy_eyeballs_semaphore, 0, usize::MAX);
                 }
                 _ => {}
             }

@@ -73,7 +73,7 @@ pub(super) fn connection_value(id: &str, flow: TunFlow, context: &FlowContext) -
         "ip": context
             .resolved_destination
             .as_ref()
-            .and_then(Endpoint::addr)
+            .and_then(|addresses| addresses.first().copied())
             .or_else(|| {
                 context
                     .fake_ip

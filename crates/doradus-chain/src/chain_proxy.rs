@@ -72,6 +72,28 @@ impl ChainProxy {
         )?)
     }
 
+    pub fn from_go_json_with_resolver_and_metrics_and_dialer(
+        json: &str,
+        resolver: Arc<dyn AsyncIpResolver>,
+        metrics: Arc<doradus_metrics::RuntimeMetrics>,
+        dialer: Arc<HappyEyeballsV2Dialer>,
+    ) -> Result<Self> {
+        if let Some(proxy) = doradus_protocol::direct_uot::parse_go_direct_uot_with_dialer(
+            json,
+            Arc::clone(&resolver),
+            Arc::clone(&dialer),
+        )? {
+            return Ok(Self {
+                backend: ChainProxyBackend::DirectUot(proxy),
+            });
+        }
+        Self::final_proxy(
+            ChainClient::from_go_json_with_resolver_and_metrics_and_dialer(
+                json, resolver, metrics, dialer,
+            )?,
+        )
+    }
+
     /// Construct only the raw Go-compatible HTTP/2 transport from a node
     /// payload whose final protocol layer is supplied by the caller.
     ///
@@ -96,6 +118,24 @@ impl ChainProxy {
         metrics: Arc<doradus_metrics::RuntimeMetrics>,
     ) -> Result<Self> {
         let client = ChainClient::from_go_json_with_resolver_and_metrics(json, resolver, metrics)?;
+        if client.has_destination_protocol() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "raw HTTP/2 transport cannot contain a destination protocol",
+            ));
+        }
+        Ok(Self::new(client))
+    }
+
+    pub fn from_go_json_transport_with_resolver_and_metrics_and_dialer(
+        json: &str,
+        resolver: Arc<dyn AsyncIpResolver>,
+        metrics: Arc<doradus_metrics::RuntimeMetrics>,
+        dialer: Arc<HappyEyeballsV2Dialer>,
+    ) -> Result<Self> {
+        let client = ChainClient::from_go_json_with_resolver_and_metrics_and_dialer(
+            json, resolver, metrics, dialer,
+        )?;
         if client.has_destination_protocol() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,

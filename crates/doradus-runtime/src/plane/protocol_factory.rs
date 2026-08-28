@@ -311,6 +311,7 @@ pub(super) async fn build_protocol_h2_proxy(
     _timeout: Duration,
     resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
     metrics: Arc<doradus_metrics::RuntimeMetrics>,
+    dialer: Arc<doradus_core::network::HappyEyeballsV2Dialer>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     let protocol = match config.transport {
         doradus_store::GoProxyTransport::Vless => "vless",
@@ -347,10 +348,11 @@ pub(super) async fn build_protocol_h2_proxy(
     }
 
     let upstream = Arc::new(
-        ChainProxy::from_go_json_transport_with_resolver_and_metrics(
+        ChainProxy::from_go_json_transport_with_resolver_and_metrics_and_dialer(
             &node.to_string(),
             resolver,
             metrics,
+            dialer,
         )?,
     ) as Arc<dyn AsyncProxy>;
     build_protocol_proxy(config, upstream)

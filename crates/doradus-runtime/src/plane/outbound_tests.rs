@@ -4,7 +4,7 @@ use base64::Engine;
 use doradus_core::dns_resolver::SystemAsyncIpResolver;
 use doradus_core::{FlowContext, GeoLookup, RouteMode};
 use doradus_protocol::YuubinsyaUdpServer;
-use doradus_protocol::proxy::FixedAsyncProxy;
+use doradus_protocol::proxy::{DirectAsyncProxy, FixedAsyncProxy};
 use doradus_protocol::proxy_factory::{BaseProxyConfig, BaseProxyKind};
 use doradus_protocol::quic::{QuicServer, QuicServerConfig};
 use doradus_protocol::trojan::{self, Command};
@@ -23,10 +23,11 @@ fn snapshot_with_resolver(
     config: GoProxyRuntimeConfig,
     resolver: Arc<dyn AsyncIpResolver>,
 ) -> RuntimeSnapshot {
+    let metrics = Arc::new(doradus_metrics::RuntimeMetrics::new());
     RuntimeSnapshot {
-        metrics: Arc::new(doradus_metrics::RuntimeMetrics::new()),
+        metrics: Arc::clone(&metrics),
         settings: crate::RuntimeSettings::default(),
-        connect_semaphore: Arc::new(tokio::sync::Semaphore::new(250)),
+        happy_eyeballs: crate::proxy::new_dialer(0, metrics),
         socket_bind_addresses: Arc::from(Vec::<std::net::IpAddr>::new().into_boxed_slice()),
         socket_bind_interface: None,
         resolver: Arc::clone(&resolver),
@@ -803,6 +804,62 @@ async fn standalone_build_proxy_resolves_domain_destinations() {
     assert_eq!(server.await.unwrap(), *b"standalone-resolve");
 }
 
+#[tokio::test]
+async fn fixed_many_uses_one_raw_happy_eyeballs_race() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let stale_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stale = stale_listener.local_addr().unwrap();
+    drop(stale_listener);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let reachable = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut payload = [0u8; 10];
+        stream.read_exact(&mut payload).await.unwrap();
+        payload
+    });
+    let config = GoProxyRuntimeConfig {
+        id: "fixed-many".to_owned(),
+        name: "Fixed many".to_owned(),
+        group_name: String::new(),
+        origin: "test".to_owned(),
+        enabled: true,
+        chain_types: vec!["fixedv2".to_owned()],
+        layers: vec![GoProxyLayer {
+            kind: "fixedv2".to_owned(),
+            config: serde_json::json!({
+                "addresses": [
+                    {"host": stale.ip().to_string(), "port": stale.port()},
+                    {"host": reachable.ip().to_string(), "port": reachable.port()}
+                ]
+            }),
+        }],
+        transport: GoProxyTransport::Fixed,
+        data_json: Vec::new(),
+    };
+    let snapshot = snapshot(config);
+    let metrics = Arc::clone(&snapshot.metrics);
+    let proxy = snapshot
+        .build_proxy("fixed-many", Duration::from_secs(1))
+        .await
+        .unwrap()
+        .proxy;
+    let context = FlowContext::new(Endpoint::ip(
+        doradus_core::Network::Tcp,
+        "192.0.2.1:443".parse().unwrap(),
+    ));
+    let mut stream = proxy.connect(&context).await.unwrap();
+    stream.write_all(b"fixed-many").await.unwrap();
+    assert_eq!(server.await.unwrap(), *b"fixed-many");
+
+    let mut output = String::new();
+    metrics.encode(&mut output).unwrap();
+    assert!(output.contains("doradus_happy_eyeballs_addresses_attempted_total 2"));
+    assert!(output.contains("doradus_happy_eyeballs_tcp_attempts_total 2"));
+    assert!(output.contains("doradus_happy_eyeballs_tcp_failures_total 1"));
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "current_thread")]
 async fn runtime_proxy_carries_node_network_interface_into_direct_socket() {
@@ -1075,7 +1132,7 @@ async fn tun_fakeip_domain_uses_non_fakeip_resolver_for_direct_socket() {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_slice(),
-        ["ip.sb"]
+        ["ip.sb", "ip.sb"]
     );
 }
 
@@ -1170,7 +1227,7 @@ async fn tagged_direct_node_uses_proxy_resolver_for_proxy_mode_tun_fakeip() {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_slice(),
-        ["www.baidu.com"]
+        ["www.baidu.com", "www.baidu.com"]
     );
 }
 

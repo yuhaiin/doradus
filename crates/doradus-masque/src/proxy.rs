@@ -13,7 +13,9 @@ use tokio::sync::{mpsc, oneshot};
 use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::network::bind_tokio_udp_socket_for_target;
 use doradus_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
-use doradus_core::{BoxFuture, Error, ErrorKind, FlowContext, Network, ResolveStrategy, Result};
+use doradus_core::{
+    BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, ResolveStrategy, Result,
+};
 use doradus_tun::{SmoltcpStack, SmoltcpStackConfig};
 
 use crate::codec::{decode_datagram, encode_datagram};
@@ -676,7 +678,9 @@ async fn resolve_flow_destination(
     let endpoint = context
         .resolved_destination
         .as_ref()
-        .unwrap_or(&context.destination);
+        .and_then(|addresses| addresses.first().copied())
+        .map(|address| Endpoint::ip(context.network, address))
+        .unwrap_or_else(|| context.destination.clone());
     if let Some(address) = endpoint.addr() {
         return Ok(address);
     }

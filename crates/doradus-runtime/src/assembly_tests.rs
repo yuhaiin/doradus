@@ -431,10 +431,11 @@ fn route_settings_select_resolver_from_the_same_snapshot() {
         )
         .unwrap(),
     );
+    let metrics = Arc::new(doradus_metrics::RuntimeMetrics::new());
     let snapshot = RuntimeSnapshot {
-        metrics: Arc::new(doradus_metrics::RuntimeMetrics::new()),
+        metrics: Arc::clone(&metrics),
         settings: RuntimeSettings::default(),
-        connect_semaphore: Arc::new(Semaphore::new(250)),
+        happy_eyeballs: crate::proxy::new_dialer(0, metrics),
         socket_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
         socket_bind_interface: None,
         resolver: main,

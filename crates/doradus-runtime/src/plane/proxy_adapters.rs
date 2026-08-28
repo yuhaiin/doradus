@@ -728,12 +728,7 @@ impl ResolvingProxy {
             return Box::pin(async move { Ok(resolved) });
         }
         let destination = resolved.effective_destination();
-        let Endpoint::Domain {
-            network,
-            host,
-            port,
-        } = destination
-        else {
+        let Endpoint::Domain { host, port, .. } = destination else {
             return Box::pin(async move { Ok(resolved) });
         };
         let resolver = match context.route_mode {
@@ -751,8 +746,7 @@ impl ResolvingProxy {
                     format!("resolver returned no usable address for {host}"),
                 )
             })?;
-            resolved.resolved_destination =
-                Some(Endpoint::ip(network, SocketAddr::new(address, port)));
+            resolved.resolved_destination = Some(vec![SocketAddr::new(address, port)]);
             Ok(resolved)
         })
     }
@@ -796,19 +790,21 @@ pub fn select_resolved_address(
     strategy: ResolveStrategy,
 ) -> Option<std::net::IpAddr> {
     match strategy {
-        ResolveStrategy::OnlyIpv6 | ResolveStrategy::PreferIpv6 => addresses
+        ResolveStrategy::OnlyIpv6 => addresses.v6.first().copied().map(std::net::IpAddr::V6),
+        ResolveStrategy::OnlyIpv4 => addresses.v4.first().copied().map(std::net::IpAddr::V4),
+        ResolveStrategy::PreferIpv4 => addresses
+            .v4
+            .first()
+            .copied()
+            .map(std::net::IpAddr::V4)
+            .or_else(|| addresses.v6.first().copied().map(std::net::IpAddr::V6)),
+        // The v2 default is IPv6-first; a usable IPv4 answer remains a
+        // fallback when no IPv6 candidate is available.
+        ResolveStrategy::PreferIpv6 | ResolveStrategy::Default => addresses
             .v6
             .first()
             .copied()
             .map(std::net::IpAddr::V6)
             .or_else(|| addresses.v4.first().copied().map(std::net::IpAddr::V4)),
-        ResolveStrategy::OnlyIpv4 | ResolveStrategy::PreferIpv4 | ResolveStrategy::Default => {
-            addresses
-                .v4
-                .first()
-                .copied()
-                .map(std::net::IpAddr::V4)
-                .or_else(|| addresses.v6.first().copied().map(std::net::IpAddr::V6))
-        }
     }
 }

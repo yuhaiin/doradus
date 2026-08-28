@@ -165,10 +165,11 @@ pub struct FlowContext {
     /// connection contract exposes both the peer and `LocalAddr()`.
     pub local_addr: Option<Endpoint>,
     pub destination: Endpoint,
-    /// The address selected by the runtime resolver for the final direct
-    /// socket. Keep this separate from `destination`: protocol layers must
-    /// still see the original domain for routing, SNI and proxy framing.
-    pub resolved_destination: Option<Endpoint>,
+    /// The ordered addresses selected by the runtime resolver for the final
+    /// direct socket. Keep this separate from `destination`: protocol layers
+    /// must still see the original domain for routing, SNI and proxy framing.
+    /// The list is also used by Happy Eyeballs as the candidate order.
+    pub resolved_destination: Option<Vec<SocketAddr>>,
     /// Do not resolve the destination through the runtime resolver.  Proxy
     /// transports that can carry a domain remotely use this to avoid
     /// recursively invoking the resolver while that resolver is connecting
@@ -307,7 +308,22 @@ impl FlowContext {
     pub fn proxy_destination(&self) -> Endpoint {
         self.resolved_destination
             .clone()
+            .and_then(|addresses| addresses.into_iter().next())
+            .map(|address| Endpoint::ip(self.network, address))
             .unwrap_or_else(|| self.effective_destination())
+    }
+
+    /// Return the resolved candidates, or the single literal IP destination.
+    /// Domain destinations intentionally return no candidates: the resolver
+    /// and Happy Eyeballs coordinator must keep DNS in flight until dialing
+    /// can begin.
+    pub fn proxy_destinations(&self) -> Option<Vec<SocketAddr>> {
+        self.resolved_destination
+            .clone()
+            .or_else(|| match self.effective_destination() {
+                Endpoint::Ip { addr, .. } => Some(vec![addr]),
+                Endpoint::Domain { .. } => None,
+            })
     }
 
     pub fn local_bind_for(&self, remote: SocketAddr) -> Option<SocketAddr> {

@@ -212,6 +212,9 @@ pub struct RuntimeMetrics {
     chain_h2_connection_failures: Counter,
     chain_h2_stream_capacity_rejections: Counter,
     chain_h2_stream_open_failures: Counter,
+    happy_eyeballs_addresses_attempted: Counter,
+    happy_eyeballs_tcp_attempts: Counter,
+    happy_eyeballs_tcp_failures: Counter,
     quic_datagrams_sent: Counter,
     quic_datagrams_received: Counter,
     quic_datagrams_dropped: Counter,
@@ -266,6 +269,9 @@ impl RuntimeMetrics {
         let chain_h2_connection_failures = Counter::default();
         let chain_h2_stream_capacity_rejections = Counter::default();
         let chain_h2_stream_open_failures = Counter::default();
+        let happy_eyeballs_addresses_attempted = Counter::default();
+        let happy_eyeballs_tcp_attempts = Counter::default();
+        let happy_eyeballs_tcp_failures = Counter::default();
         let quic_datagrams_sent = Counter::default();
         let quic_datagrams_received = Counter::default();
         let quic_datagrams_dropped = Counter::default();
@@ -431,6 +437,21 @@ impl RuntimeMetrics {
             chain_h2_stream_open_failures.clone(),
         );
         registry.register(
+            "doradus_happy_eyeballs_addresses_attempted",
+            "Total resolved addresses considered by Happy Eyeballs",
+            happy_eyeballs_addresses_attempted.clone(),
+        );
+        registry.register(
+            "doradus_happy_eyeballs_tcp_attempts",
+            "Total raw TCP attempts made by Happy Eyeballs",
+            happy_eyeballs_tcp_attempts.clone(),
+        );
+        registry.register(
+            "doradus_happy_eyeballs_tcp_failures",
+            "Total failed raw TCP attempts made by Happy Eyeballs",
+            happy_eyeballs_tcp_failures.clone(),
+        );
+        registry.register(
             "doradus_quic_datagrams_sent",
             "Total QUIC datagrams sent",
             quic_datagrams_sent.clone(),
@@ -488,6 +509,9 @@ impl RuntimeMetrics {
             chain_h2_connection_failures,
             chain_h2_stream_capacity_rejections,
             chain_h2_stream_open_failures,
+            happy_eyeballs_addresses_attempted,
+            happy_eyeballs_tcp_attempts,
+            happy_eyeballs_tcp_failures,
             quic_datagrams_sent,
             quic_datagrams_received,
             quic_datagrams_dropped,
@@ -698,6 +722,21 @@ impl RuntimeMetrics {
     /// Record an HTTP/2 stream open failure.
     pub fn chain_h2_stream_open_failure(&self) {
         self.chain_h2_stream_open_failures.inc();
+    }
+
+    /// Record resolved addresses offered to Happy Eyeballs.
+    pub fn happy_eyeballs_addresses_attempted(&self, count: u64) {
+        self.happy_eyeballs_addresses_attempted.inc_by(count);
+    }
+
+    /// Record a raw TCP attempt started by Happy Eyeballs.
+    pub fn happy_eyeballs_tcp_attempt(&self) {
+        self.happy_eyeballs_tcp_attempts.inc();
+    }
+
+    /// Record a failed raw TCP attempt made by Happy Eyeballs.
+    pub fn happy_eyeballs_tcp_failure(&self) {
+        self.happy_eyeballs_tcp_failures.inc();
     }
 
     /// Record a QUIC datagram sent.

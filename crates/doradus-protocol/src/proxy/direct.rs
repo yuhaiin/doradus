@@ -3,7 +3,7 @@
 use super::*;
 
 use super::datagrams::{TokioDatagram, resolve_direct_addresses};
-use doradus_core::network::interface_for_address;
+use doradus_core::network::{HappyEyeballsV2Dialer, TcpDialCandidate, interface_for_address};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DirectAsyncProxy {
@@ -22,28 +22,21 @@ impl AsyncProxy for DirectAsyncProxy {
         let bind_interface = context.bind_interface.clone();
         Box::pin(async move {
             let addresses = resolve_direct_addresses(&destination, preferred_ipv4).await?;
-            let mut last_error = None;
-            for address in addresses {
-                match connect_tokio_tcp_with_interface(
-                    address,
-                    context.local_bind_for(address),
-                    bind_interface.as_deref(),
-                    self.timeout,
-                )
-                .await
-                {
-                    Ok(stream) => {
-                        let local_addr = stream.local_addr().ok();
-                        return Ok(with_stream_socket_addrs(
-                            Box::new(stream) as BoxAsyncStream,
-                            local_addr,
-                            Some(address),
-                        ));
-                    }
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            Err(last_error.unwrap_or_else(|| Error::invalid("direct destination has no address")))
+            let candidates = addresses
+                .into_iter()
+                .map(|address| TcpDialCandidate::new(address, bind_interface.clone()))
+                .collect();
+            let dialer = HappyEyeballsV2Dialer::new(None);
+            let stream = dialer
+                .dial_candidates(candidates, &context.local_bind_addresses, self.timeout)
+                .await?;
+            let local_addr = stream.local_addr().ok();
+            let remote_addr = stream.peer_addr().ok();
+            Ok(with_stream_socket_addrs(
+                Box::new(stream) as BoxAsyncStream,
+                local_addr,
+                remote_addr,
+            ))
         })
     }
 

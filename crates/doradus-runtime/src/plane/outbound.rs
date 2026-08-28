@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use doradus_chain::ChainProxy;
 use doradus_core::dns_resolver::AsyncIpResolver;
+use doradus_core::network::TcpDialCandidate;
 use doradus_core::proxy::{
     AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream, stream_local_addr,
     stream_remote_addr, with_stream_local_addr, with_stream_socket_addrs,
@@ -24,7 +25,7 @@ use doradus_core::{
     RouteMode,
 };
 use doradus_protocol::YuubinsyaUdpDatagram;
-use doradus_protocol::proxy::{DelayedDropAsyncProxy, DirectAsyncProxy, DropAsyncProxy};
+use doradus_protocol::proxy::{DelayedDropAsyncProxy, DropAsyncProxy};
 use doradus_protocol::proxy_factory::{BaseProxyConfig, BaseProxyKind};
 use doradus_store::fakeip::FakeIpViewStore;
 use doradus_store::{FakeIpPools, GoProxyLayer, GoProxyRuntimeConfig, GoProxyTransport};
@@ -51,11 +52,30 @@ use protocol_factory::*;
 mod proxy_slots;
 pub use proxy_slots::*;
 
+#[path = "happy_eyeballs.rs"]
+mod happy_eyeballs;
+pub(crate) use happy_eyeballs::{
+    HappyEyeballsDirectProxy, HappyEyeballsFixedProxy, new_dialer, reconfigure_dialer,
+};
+
 /// Go's `network_split` point keeps one already-built parent proxy and
 /// selects an independent wrapper for TCP and UDP.  The selection happens at
 /// the common async boundary so every inbound (including TUN) gets the same
 /// semantics.
 impl RuntimeSnapshot {
+    fn happy_eyeballs_direct(&self, timeout: Duration) -> Result<Arc<dyn AsyncProxy>> {
+        let direct_resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
+        let proxy_resolver = self.dns_resolver_for_route_mode(RouteMode::Proxy)?;
+        Ok(Arc::new(
+            HappyEyeballsDirectProxy::new_with_route_resolvers(
+                timeout,
+                direct_resolver,
+                proxy_resolver,
+                Arc::clone(&self.happy_eyeballs),
+            ),
+        ))
+    }
+
     async fn build_network_split_proxy(
         &self,
         config: &GoProxyRuntimeConfig,
@@ -79,8 +99,7 @@ impl RuntimeSnapshot {
 
         let parent_config = config.chain_prefix(split_index)?;
         let parent = if split_index == 0 {
-            let proxy: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy { timeout });
-            self.resolve_proxy(proxy)
+            self.happy_eyeballs_direct(timeout)?
         } else {
             let mut parent_snapshot = self.clone();
             parent_snapshot.proxies = vec![parent_config.clone()];
@@ -130,14 +149,14 @@ impl RuntimeSnapshot {
             "none" | "proxy" => Ok(parent),
             "direct" => {
                 let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Direct);
-                let proxy: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy { timeout });
+                let proxy = self.happy_eyeballs_direct(timeout)?;
                 let proxy = Arc::new(SocketPolicyProxy {
                     inner: proxy,
                     bind_addresses: self.socket_bind_addresses.clone(),
                     bind_interface: child.network_interface(),
                     global_bind_interface: self.socket_bind_interface.clone(),
                 }) as Arc<dyn AsyncProxy>;
-                Ok(self.resolve_proxy_with_route_resolvers(proxy)?)
+                Ok(proxy)
             }
             "reject" | "block" => Ok(Arc::new(DropAsyncProxy)),
             "drop" => Ok(Arc::new(DelayedDropAsyncProxy::new())),
@@ -348,6 +367,7 @@ impl RuntimeSnapshot {
                 timeout,
                 resolver.clone(),
                 Arc::clone(&self.metrics),
+                Arc::clone(&self.happy_eyeballs),
             )
             .await?
         } else if plan.kind == ProxyPlanKind::VlessWebSocket {
@@ -408,9 +428,17 @@ impl RuntimeSnapshot {
             let base = config
                 .to_base_proxy_config_with_resolver(timeout, resolver.clone())
                 .await?;
-            Arc::new(doradus_protocol::http_mock::HttpMockProxy::new(
-                base.build_with_metrics(Arc::clone(&self.metrics))?,
-            )) as Arc<dyn AsyncProxy>
+            let upstream = if let Some(endpoints) = fixed_tcp_candidates(&base.kind) {
+                Arc::new(HappyEyeballsFixedProxy::new(
+                    endpoints,
+                    Arc::clone(&self.happy_eyeballs),
+                    timeout,
+                )?) as Arc<dyn AsyncProxy>
+            } else {
+                base.build_with_metrics(Arc::clone(&self.metrics))?
+            };
+            Arc::new(doradus_protocol::http_mock::HttpMockProxy::new(upstream))
+                as Arc<dyn AsyncProxy>
         } else if plan.kind == ProxyPlanKind::HttpTermination {
             let index = config
                 .layers
@@ -418,7 +446,7 @@ impl RuntimeSnapshot {
                 .rposition(|layer| layer.kind.eq_ignore_ascii_case("http_termination"))
                 .ok_or_else(|| Error::invalid("HTTP termination layer is missing"))?;
             let parent = if index == 0 {
-                self.resolve_proxy(Arc::new(DirectAsyncProxy { timeout }))
+                self.happy_eyeballs_direct(timeout)?
             } else {
                 Box::pin(self.build_proxy_config(config.chain_prefix(index)?, timeout))
                     .await?
@@ -447,7 +475,7 @@ impl RuntimeSnapshot {
             // per-chain fact into the recursive prefix build so the reverse
             // proxy can choose the same upstream wire mode.
             let parent = if index == 0 {
-                self.resolve_proxy(Arc::new(DirectAsyncProxy { timeout }))
+                self.happy_eyeballs_direct(timeout)?
             } else {
                 Box::pin(self.build_proxy_config_with_tls_marker(
                     config.chain_prefix(index)?,
@@ -476,24 +504,36 @@ impl RuntimeSnapshot {
                     format!("proxy {:?} data_json is not UTF-8: {error}", config.id),
                 )
             })?;
-            Arc::new(ChainProxy::from_go_json_with_resolver_and_metrics(
-                json,
-                resolver.clone(),
-                Arc::clone(&self.metrics),
-            )?) as Arc<dyn AsyncProxy>
+            Arc::new(
+                ChainProxy::from_go_json_with_resolver_and_metrics_and_dialer(
+                    json,
+                    resolver.clone(),
+                    Arc::clone(&self.metrics),
+                    Arc::clone(&self.happy_eyeballs),
+                )?,
+            ) as Arc<dyn AsyncProxy>
         } else if plan.kind == ProxyPlanKind::Aead {
             build_aead_proxy(
                 &config,
                 timeout,
                 resolver.clone(),
                 Arc::clone(&self.metrics),
+                Arc::clone(&self.happy_eyeballs),
             )
             .await?
         } else if let ProxyPlanKind::Standard(protocol) = plan.kind {
             let base = config
                 .to_base_proxy_config_with_resolver(timeout, resolver.clone())
                 .await?;
-            let mut upstream = base.build_with_metrics(Arc::clone(&self.metrics))?;
+            let mut upstream = if let Some(endpoints) = fixed_tcp_candidates(&base.kind) {
+                Arc::new(HappyEyeballsFixedProxy::new(
+                    endpoints,
+                    Arc::clone(&self.happy_eyeballs),
+                    timeout,
+                )?) as Arc<dyn AsyncProxy>
+            } else {
+                base.build_with_metrics(Arc::clone(&self.metrics))?
+            };
             if plan.has_protocol_tls {
                 #[cfg(feature = "doh-tls")]
                 {
@@ -644,7 +684,15 @@ impl RuntimeSnapshot {
             let base = config
                 .to_base_proxy_config_with_resolver(timeout, resolver.clone())
                 .await?;
-            let mut proxy = base.build_with_metrics(Arc::clone(&self.metrics))?;
+            let mut proxy = if let Some(endpoints) = fixed_tcp_candidates(&base.kind) {
+                Arc::new(HappyEyeballsFixedProxy::new(
+                    endpoints,
+                    Arc::clone(&self.happy_eyeballs),
+                    timeout,
+                )?) as Arc<dyn AsyncProxy>
+            } else {
+                base.build_with_metrics(Arc::clone(&self.metrics))?
+            };
             if config.transport == GoProxyTransport::Yuubinsya
                 && config
                     .layers
@@ -682,19 +730,25 @@ impl RuntimeSnapshot {
             proxy
         };
 
-        let proxy = Arc::new(ConnectBudgetProxy {
-            inner: Arc::new(SocketPolicyProxy {
+        let proxy = if matches!(config.transport, doradus_store::GoProxyTransport::Direct) {
+            let direct = self.happy_eyeballs_direct(timeout)?;
+            Arc::new(SocketPolicyProxy {
+                inner: direct,
+                bind_addresses: self.socket_bind_addresses.clone(),
+                bind_interface: config.network_interface(),
+                global_bind_interface: self.socket_bind_interface.clone(),
+            }) as Arc<dyn AsyncProxy>
+        } else {
+            Arc::new(SocketPolicyProxy {
                 inner: proxy,
                 bind_addresses: self.socket_bind_addresses.clone(),
                 bind_interface: config.network_interface(),
                 global_bind_interface: self.socket_bind_interface.clone(),
-            }),
-            semaphore: self.connect_semaphore.clone(),
-        }) as Arc<dyn AsyncProxy>;
+            }) as Arc<dyn AsyncProxy>
+        };
         let proxy = if matches!(
             config.transport,
-            doradus_store::GoProxyTransport::Direct
-                | doradus_store::GoProxyTransport::Wireguard
+            doradus_store::GoProxyTransport::Wireguard
                 | doradus_store::GoProxyTransport::WarpMasque
         ) {
             // Direct and the userspace WireGuard stack both require an IP
@@ -852,22 +906,35 @@ impl RuntimeSnapshot {
                 timeout,
             }
             .build_with_metrics(Arc::clone(&self.metrics))?;
-            let proxy = Arc::new(ConnectBudgetProxy {
-                inner: Arc::new(SocketPolicyProxy {
-                    inner: proxy,
-                    bind_addresses: self.socket_bind_addresses.clone(),
-                    bind_interface: None,
-                    global_bind_interface: self.socket_bind_interface.clone(),
-                }),
-                semaphore: self.connect_semaphore.clone(),
-            }) as Arc<dyn AsyncProxy>;
-            return Ok(if is_direct {
-                self.resolve_proxy_with_route_resolvers(proxy)?
+            let proxy = if is_direct {
+                self.happy_eyeballs_direct(timeout)?
             } else {
                 proxy
-            });
+            };
+            let proxy = Arc::new(SocketPolicyProxy {
+                inner: proxy,
+                bind_addresses: self.socket_bind_addresses.clone(),
+                bind_interface: None,
+                global_bind_interface: self.socket_bind_interface.clone(),
+            }) as Arc<dyn AsyncProxy>;
+            return Ok(proxy);
         }
         Ok(self.build_proxy(id, timeout).await?.proxy)
+    }
+}
+
+fn fixed_tcp_candidates(kind: &BaseProxyKind) -> Option<Vec<TcpDialCandidate>> {
+    match kind {
+        BaseProxyKind::Fixed { address } => Some(vec![TcpDialCandidate::new(*address, None)]),
+        BaseProxyKind::FixedMany { endpoints } => Some(
+            endpoints
+                .iter()
+                .map(|endpoint| {
+                    TcpDialCandidate::new(endpoint.address, endpoint.bind_interface.clone())
+                })
+                .collect(),
+        ),
+        _ => None,
     }
 }
 

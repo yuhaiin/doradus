@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
 
 use crate::interfaces;
+use crate::proxy::{new_dialer, reconfigure_dialer};
 use doradus_core::dns_hosts::HostsTable;
 use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::dns_resolver_stack::AsyncHostsResolver;
@@ -108,10 +108,9 @@ pub struct RuntimeSnapshot {
     pub settings: RuntimeSettings,
     /// Inbound-wide policy shared by TUN and socket-based inbound servers.
     pub inbound_settings: InboundSettings,
-    /// Shared connect budget for the immutable snapshot. New flows acquire
-    /// one permit while establishing a TCP proxy connection; reload builds a
-    /// new budget without changing existing flows.
-    pub(crate) connect_semaphore: Arc<Semaphore>,
+    /// Shared Happy Eyeballs state for this immutable snapshot.  The state is
+    /// replaced on reload while existing flows retain their old dialer.
+    pub(crate) happy_eyeballs: Arc<doradus_core::network::HappyEyeballsV2Dialer>,
     /// Source addresses used when settings request a named/default network
     /// interface. An empty list preserves the OS default route.
     pub(crate) socket_bind_addresses: Arc<[IpAddr]>,
@@ -346,6 +345,7 @@ pub struct RuntimeBuilder {
     store: ConfigStore,
     upstream: Arc<dyn AsyncIpResolver>,
     metrics: Arc<RuntimeMetrics>,
+    happy_eyeballs: Arc<doradus_core::network::HappyEyeballsV2Dialer>,
     options: RuntimeBuildOptions,
     resolver_factory: Option<Arc<dyn ResolverTransportFactory>>,
     resolver_proxy_bridge: Option<Arc<ResolverProxyBridge>>,
@@ -375,10 +375,12 @@ struct RuntimeInputs {
 
 impl RuntimeBuilder {
     pub fn new(store: ConfigStore, upstream: Arc<dyn AsyncIpResolver>) -> Self {
+        let metrics = Arc::new(RuntimeMetrics::new());
         Self {
             store,
             upstream,
-            metrics: Arc::new(RuntimeMetrics::new()),
+            happy_eyeballs: new_dialer(0, Arc::clone(&metrics)),
+            metrics,
             options: RuntimeBuildOptions::default(),
             resolver_factory: None,
             resolver_proxy_bridge: None,
@@ -570,7 +572,11 @@ impl RuntimeBuilder {
             self.options.route_fallback.clone(),
             geo.clone(),
         )?;
-        let connect_semaphore = Arc::new(Semaphore::new(settings.happy_eyeballs_semaphore));
+        let happy_eyeballs = reconfigure_dialer(
+            &self.happy_eyeballs,
+            settings.happy_eyeballs_semaphore,
+            Arc::clone(&self.metrics),
+        );
         let ResolverRegistryParts {
             flow: resolver_by_id,
             inbound_dns: inbound_resolver_by_id,
@@ -583,7 +589,7 @@ impl RuntimeBuilder {
             dns_resolver,
             settings,
             inbound_settings,
-            connect_semaphore,
+            happy_eyeballs,
             socket_bind_addresses,
             socket_bind_interface,
             hosts,

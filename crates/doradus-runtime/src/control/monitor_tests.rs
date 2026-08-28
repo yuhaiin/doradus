@@ -247,10 +247,7 @@ fn monitor_reports_resolved_ip_separately_from_fakeip() {
     let pending = &monitor.connections_value()["connections"][0];
     assert_eq!(pending["ip"], "");
 
-    context.resolved_destination = Some(Endpoint::ip(
-        Network::Tcp,
-        std::net::SocketAddr::new(real_ip, 443),
-    ));
+    context.resolved_destination = Some(vec![std::net::SocketAddr::new(real_ip, 443)]);
 
     monitor.opened(flow, context);
 

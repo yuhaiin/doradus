@@ -40,19 +40,41 @@ impl ChainClient {
         resolver: Arc<dyn AsyncIpResolver>,
         metrics: Arc<doradus_metrics::RuntimeMetrics>,
     ) -> Result<Self> {
+        Self::new_with_resolver_and_metrics_and_dialer(
+            chain,
+            resolver,
+            metrics,
+            Arc::new(HappyEyeballsV2Dialer::new(None)),
+        )
+    }
+
+    pub fn new_with_resolver_and_metrics_and_dialer(
+        chain: ValidatedChain,
+        resolver: Arc<dyn AsyncIpResolver>,
+        metrics: Arc<doradus_metrics::RuntimeMetrics>,
+        dialer: Arc<HappyEyeballsV2Dialer>,
+    ) -> Result<Self> {
         // Go's ContractDialer starts with zeroproxy.  For transport purposes
         // that sentinel behaves like direct dialing until a node replaces it.
-        let direct: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy {
-            timeout: Duration::from_secs(15),
-        });
+        let direct: Arc<dyn AsyncProxy> = Arc::new(HappyEyeballsTcpProxy::new(
+            Arc::new(DirectAsyncProxy {
+                timeout: Duration::from_secs(15),
+            }),
+            Arc::clone(&dialer),
+            Duration::from_secs(15),
+        ));
         let mut proxy = Some(direct);
         let mut h2_layers = Vec::new();
         for (index, node) in chain.nodes.iter().enumerate() {
             match node {
                 ValidatedNode::Direct(config) => {
-                    let direct: Arc<dyn AsyncProxy> = Arc::new(DirectAsyncProxy {
-                        timeout: Duration::from_secs(15),
-                    });
+                    let direct: Arc<dyn AsyncProxy> = Arc::new(HappyEyeballsTcpProxy::new(
+                        Arc::new(DirectAsyncProxy {
+                            timeout: Duration::from_secs(15),
+                        }),
+                        Arc::clone(&dialer),
+                        Duration::from_secs(15),
+                    ));
                     proxy = Some(match &config.network_interface {
                         Some(interface) => {
                             Arc::new(BindInterfaceProxy::new(direct, Some(interface.clone())))
@@ -69,6 +91,7 @@ impl ChainClient {
                         config.clone(),
                         Arc::clone(&resolver),
                         upstream,
+                        Arc::clone(&dialer),
                     )));
                 }
                 ValidatedNode::Tls(config) => {
@@ -159,6 +182,20 @@ impl ChainClient {
         metrics: Arc<doradus_metrics::RuntimeMetrics>,
     ) -> Result<Self> {
         Self::new_with_resolver_and_metrics(parse_go_node(json)?, resolver, metrics)
+    }
+
+    pub fn from_go_json_with_resolver_and_metrics_and_dialer(
+        json: &str,
+        resolver: Arc<dyn AsyncIpResolver>,
+        metrics: Arc<doradus_metrics::RuntimeMetrics>,
+        dialer: Arc<HappyEyeballsV2Dialer>,
+    ) -> Result<Self> {
+        Self::new_with_resolver_and_metrics_and_dialer(
+            parse_go_node(json)?,
+            resolver,
+            metrics,
+            dialer,
+        )
     }
 
     pub fn chain(&self) -> &ValidatedChain {

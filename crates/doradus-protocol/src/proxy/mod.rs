@@ -32,7 +32,9 @@ mod wrappers;
 pub use direct::DirectAsyncProxy;
 pub use drop::{DelayedDropAsyncProxy, DropAsyncProxy};
 pub use socks5_client::Socks5AsyncProxy;
-pub use wrappers::{BindInterfaceProxy, FallbackAsyncProxy, FixedAsyncProxy};
+pub use wrappers::{
+    BindInterfaceProxy, FallbackAsyncProxy, FixedAsyncProxy, HappyEyeballsTcpProxy,
+};
 
 #[cfg(test)]
 mod tests;

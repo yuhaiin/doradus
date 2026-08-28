@@ -5,7 +5,10 @@
 /// before each outbound socket is bound.
 pub const DEFAULT_INTERFACE: &str = "__doradus_default_interface__";
 
+mod happy_eyeballs;
 mod socket;
+
+pub use happy_eyeballs::{HappyEyeballsObserver, HappyEyeballsV2Dialer, TcpDialCandidate};
 
 pub use socket::{
     bind_socket_to_interface, bind_tokio_udp_socket_for_target, connect_tokio_tcp,

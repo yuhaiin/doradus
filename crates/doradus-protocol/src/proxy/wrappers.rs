@@ -3,11 +3,76 @@
 use super::*;
 
 use super::datagrams::FixedDatagram;
+use doradus_core::network::{HappyEyeballsV2Dialer, TcpDialCandidate};
 
 #[derive(Debug, Clone, Copy)]
 pub struct FixedAsyncProxy {
     pub address: SocketAddr,
     pub timeout: Duration,
+}
+
+/// Reuse the raw TCP Happy Eyeballs scheduler for a proxy whose candidate
+/// addresses have already been selected by an outer transport.
+pub struct HappyEyeballsTcpProxy {
+    pub inner: Arc<dyn AsyncProxy>,
+    pub dialer: Arc<HappyEyeballsV2Dialer>,
+    pub timeout: Duration,
+}
+
+impl HappyEyeballsTcpProxy {
+    pub fn new(
+        inner: Arc<dyn AsyncProxy>,
+        dialer: Arc<HappyEyeballsV2Dialer>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            inner,
+            dialer,
+            timeout,
+        }
+    }
+}
+
+impl AsyncProxy for HappyEyeballsTcpProxy {
+    fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
+        let Some(addresses) = context.resolved_destination.clone() else {
+            return self.inner.connect(context);
+        };
+        let candidates = addresses
+            .into_iter()
+            .map(|address| TcpDialCandidate::new(address, context.bind_interface.clone()))
+            .collect();
+        let dialer = Arc::clone(&self.dialer);
+        let local_bind_addresses = context.local_bind_addresses.clone();
+        let timeout = self.timeout;
+        Box::pin(async move {
+            let stream = dialer
+                .dial_candidates(candidates, &local_bind_addresses, timeout)
+                .await?;
+            let local_addr = stream.local_addr().ok();
+            let remote_addr = stream.peer_addr().ok();
+            Ok(with_stream_socket_addrs(
+                Box::new(stream) as BoxAsyncStream,
+                local_addr,
+                remote_addr,
+            ))
+        })
+    }
+
+    fn open_datagram<'a>(
+        &'a self,
+        context: &'a FlowContext,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
+        self.inner.open_datagram(context)
+    }
+
+    fn ping<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<Duration>> {
+        self.inner.ping(context)
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<()>> {
+        self.inner.close()
+    }
 }
 
 /// Apply one node's per-endpoint interface policy before entering the actual

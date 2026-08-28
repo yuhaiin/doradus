@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use doradus_core::network::connect_tokio_tcp_with_interface;
+use doradus_core::network::{HappyEyeballsV2Dialer, TcpDialCandidate};
 use doradus_core::proxy::{BoxAsyncStream, stream_local_addr, with_stream_local_addr};
 use doradus_core::{Error, ErrorKind, Result};
 use rustls::pki_types::ServerName;
@@ -22,6 +22,7 @@ pub struct RustlsTlsDialer {
     timeout: Duration,
     local_bind_addresses: Arc<[IpAddr]>,
     bind_interface: Option<String>,
+    happy_eyeballs: Arc<HappyEyeballsV2Dialer>,
 }
 
 impl RustlsTlsDialer {
@@ -35,6 +36,7 @@ impl RustlsTlsDialer {
             timeout,
             local_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
             bind_interface: None,
+            happy_eyeballs: Arc::new(HappyEyeballsV2Dialer::new(None)),
         }
     }
 
@@ -48,39 +50,26 @@ impl RustlsTlsDialer {
         self
     }
 
+    pub fn with_happy_eyeballs(mut self, dialer: Arc<HappyEyeballsV2Dialer>) -> Self {
+        self.happy_eyeballs = dialer;
+        self
+    }
+
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
 
     pub async fn connect_tcp(&self, host: &str, port: u16) -> Result<TcpStream> {
-        let mut addresses = tokio::net::lookup_host((host, port))
+        let addresses = tokio::net::lookup_host((host, port))
             .await
             .map_err(|error| Error::new(ErrorKind::Io, format!("resolve TLS endpoint: {error}")))?;
-        let mut last_error = None;
-        let stream = loop {
-            let Some(remote) = addresses.next() else {
-                return Err(last_error.unwrap_or_else(|| {
-                    Error::new(ErrorKind::Io, "TLS endpoint has no addresses")
-                }));
-            };
-            let local_bind = self
-                .local_bind_addresses
-                .iter()
-                .copied()
-                .find(|address| address.is_ipv4() == remote.ip().is_ipv4())
-                .map(|address| std::net::SocketAddr::new(address, 0));
-            match connect_tokio_tcp_with_interface(
-                remote,
-                local_bind,
-                self.bind_interface.as_deref(),
-                self.timeout,
-            )
-            .await
-            {
-                Ok(stream) => break stream,
-                Err(error) => last_error = Some(error),
-            }
-        };
+        let candidates = addresses
+            .map(|remote| TcpDialCandidate::new(remote, self.bind_interface.clone()))
+            .collect::<Vec<_>>();
+        let stream = self
+            .happy_eyeballs
+            .dial_candidates(candidates, &self.local_bind_addresses, self.timeout)
+            .await?;
         stream
             .set_nodelay(true)
             .map_err(|error| Error::new(ErrorKind::Io, format!("TLS TCP_NODELAY: {error}")))?;

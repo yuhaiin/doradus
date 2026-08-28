@@ -50,7 +50,7 @@ pub(super) async fn run_tcp_proxy(
     if let Some(remote_addr) = stream_remote_addr(&*stream) {
         context.outbound_addr = Some(Endpoint::ip(context.network, remote_addr));
         if matches!(context.route_mode, RouteMode::Direct | RouteMode::Bypass) {
-            context.resolved_destination = Some(Endpoint::ip(context.network, remote_addr));
+            context.resolved_destination = Some(vec![remote_addr]);
         }
     }
     if let Some(observer) = observer {

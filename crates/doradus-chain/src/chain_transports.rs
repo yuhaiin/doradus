@@ -6,6 +6,7 @@ pub(super) struct FixedChainProxy {
     config: ValidatedFixedConfig,
     resolver: Arc<dyn AsyncIpResolver>,
     upstream: Option<Arc<dyn AsyncProxy>>,
+    dialer: Arc<HappyEyeballsV2Dialer>,
 }
 
 impl FixedChainProxy {
@@ -13,11 +14,13 @@ impl FixedChainProxy {
         config: ValidatedFixedConfig,
         resolver: Arc<dyn AsyncIpResolver>,
         upstream: Option<Arc<dyn AsyncProxy>>,
+        dialer: Arc<HappyEyeballsV2Dialer>,
     ) -> Self {
         Self {
             config,
             resolver,
             upstream,
+            dialer,
         }
     }
 
@@ -53,31 +56,52 @@ impl AsyncProxy for FixedChainProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         Box::pin(async move {
             let addresses = self.resolve_addresses().await?;
-            let mut last_error = None;
-            for (address, endpoint_interface) in addresses {
-                let mut candidate_context = context.clone();
-                candidate_context.network = Network::Tcp;
-                candidate_context.destination = Endpoint::ip(Network::Tcp, address);
-                candidate_context.resolved_destination = None;
-                candidate_context.original_domain = None;
-                candidate_context.bind_interface =
-                    endpoint_interface.or_else(|| context.bind_interface.clone());
-                let result = if let Some(upstream) = &self.upstream {
-                    upstream.connect(&candidate_context).await
-                } else {
-                    FixedAsyncProxy {
-                        address,
-                        timeout: Duration::from_secs(15),
-                    }
-                    .connect(&candidate_context)
-                    .await
-                };
-                match result {
-                    Ok(stream) => return Ok(stream),
-                    Err(error) => last_error = Some(error),
-                }
+            let candidates = addresses
+                .iter()
+                .map(|(address, endpoint_interface)| {
+                    TcpDialCandidate::new(
+                        *address,
+                        endpoint_interface
+                            .clone()
+                            .or_else(|| context.bind_interface.clone()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let (address, endpoint_interface) = addresses
+                .first()
+                .cloned()
+                .ok_or_else(|| Error::invalid("fixedv2 connection has no endpoints"))?;
+            let mut candidate_context = context.clone();
+            candidate_context.network = Network::Tcp;
+            candidate_context.destination = Endpoint::ip(Network::Tcp, address);
+            candidate_context.resolved_destination = Some(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.address)
+                    .collect(),
+            );
+            candidate_context.original_domain = None;
+            candidate_context.bind_interface =
+                endpoint_interface.or_else(|| context.bind_interface.clone());
+            if let Some(upstream) = &self.upstream {
+                upstream.connect(&candidate_context).await
+            } else {
+                let stream = self
+                    .dialer
+                    .dial_candidates(
+                        candidates,
+                        &context.local_bind_addresses,
+                        Duration::from_secs(15),
+                    )
+                    .await?;
+                let local_addr = stream.local_addr().ok();
+                let remote_addr = stream.peer_addr().ok();
+                Ok(doradus_core::stream_metadata::with_stream_socket_addrs(
+                    Box::new(stream) as BoxAsyncStream,
+                    local_addr,
+                    remote_addr,
+                ))
             }
-            Err(last_error.unwrap_or_else(|| Error::invalid("fixedv2 connection failed")))
         })
     }
 

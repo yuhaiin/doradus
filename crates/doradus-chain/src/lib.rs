@@ -35,13 +35,16 @@ use std::time::Duration;
 use std::time::Instant;
 
 use doradus_core::dns_resolver::{AsyncIpResolver, SystemAsyncIpResolver};
+use doradus_core::network::{HappyEyeballsV2Dialer, TcpDialCandidate};
 use doradus_core::proxy::{
     AsyncDatagram, AsyncProxy, BoxAsyncStream, stream_local_addr, with_stream_local_addr,
 };
 use doradus_core::{
     BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, ResolveStrategy, Result,
 };
-use doradus_protocol::proxy::{BindInterfaceProxy, DirectAsyncProxy, FixedAsyncProxy};
+use doradus_protocol::proxy::{
+    BindInterfaceProxy, DirectAsyncProxy, FixedAsyncProxy, HappyEyeballsTcpProxy,
+};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{Mutex, Notify, watch};
