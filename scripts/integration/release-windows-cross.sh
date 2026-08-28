@@ -3,7 +3,7 @@ set -euo pipefail
 
 # This is a source/cfg check for Windows from Linux.  The release workflow
 # still builds MSVC artifacts on native Windows runners; GNU is used here
-# because a Linux container can provide a reproducible MinGW linker.
+# because a Linux container can provide a reproducible MinGW toolchain.
 #
 # The cross check must be able to bootstrap a newly added locked dependency.
 # GitHub's Rust cache is not guaranteed to contain the sparse-index entry and
@@ -18,8 +18,14 @@ target="${YUHAIIN_RELEASE_WINDOWS_TARGET:-x86_64-pc-windows-gnu}"
 
 case "${target}" in
   x86_64-pc-windows-gnu)
-    mingw_package=gcc-mingw-w64-x86-64
+    mingw_packages=(
+      gcc-mingw-w64-x86-64
+      g++-mingw-w64-x86-64
+      cmake
+      nasm
+    )
     linker=x86_64-w64-mingw32-gcc
+    cxx=x86_64-w64-mingw32-g++
     ;;
   *)
     echo "unsupported Windows container target: ${target}" >&2
@@ -38,8 +44,9 @@ podman run --rm --network=host \
   docker.io/library/rust:latest sh -ec '
     set -eu
     target="$1"
-    mingw_package="$2"
-    linker="$3"
+    linker="$2"
+    cxx="$3"
+    shift 3
     mkdir -p /state/home /state/cache/tmp
     export HOME=/state/home
     export CARGO_HOME=/cargo-home
@@ -53,12 +60,13 @@ podman run --rm --network=host \
     unset CARGO_NET_OFFLINE
 
     apt-get update >/state/apt-update.log
-    DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends "$mingw_package" \
+    DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends "$@" \
       >/state/apt-install.log
     rustup target add "$target"
     target_env=$(printf "%s" "$target" | tr "[:lower:]-" "[:upper:]_")
     eval "export CARGO_TARGET_${target_env}_LINKER=$linker"
     eval "export CC_${target_env}=$linker"
+    eval "export CXX_${target_env}=$cxx"
     cd /workspace
     cargo check --config net.offline=false --locked --target "$target" \
       -p yuhaiin-api --bin yuhaiin --all-features \
@@ -67,6 +75,6 @@ podman run --rm --network=host \
         cat /state/cargo-check.log >&2
         exit 1
       }
-  ' -- "${target}" "${mingw_package}" "${linker}"
+  ' -- "${target}" "${linker}" "${cxx}" "${mingw_packages[@]}"
 
 echo "[release-windows-cross] passed; target=${target} state=${scenario_dir}"

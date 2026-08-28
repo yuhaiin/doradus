@@ -32,6 +32,11 @@ podman run --rm --network=host \
     export CARGO_HOME=/cargo-home
     export CARGO_TARGET_DIR=/target
     export TMPDIR=/state/cache/tmp
+    # quiche vendored BoringSSL build is driven by CMake.  The Rust image
+    # provides the native C/C++ toolchain but does not include CMake.
+    apt-get update >/state/apt-update.log
+    DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends cmake \
+      >/state/apt-install.log
     CARGO_TERM_COLOR=never cargo build \
       --locked \
       --manifest-path /workspace/Cargo.toml \

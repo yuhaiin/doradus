@@ -255,13 +255,12 @@ impl Driver {
                     }
                 }
             }
-            if !transport_failed {
-                if flush_quic_packets(session_ref, &mut output_buffer)
+            if !transport_failed
+                && flush_quic_packets(session_ref, &mut output_buffer)
                     .await
                     .is_err()
-                {
-                    transport_failed = true;
-                }
+            {
+                transport_failed = true;
             }
 
             if !transport_failed {
@@ -406,8 +405,6 @@ impl Driver {
             endpoint,
             flow_id,
             self.timeout,
-            &mut input_buffer,
-            &mut output_buffer,
         )
         .await?;
 
@@ -474,9 +471,9 @@ async fn wait_for_connect_response(
     peer_addr: SocketAddr,
     flow_id: u64,
     timeout: Duration,
-    input_buffer: &mut [u8],
-    output_buffer: &mut [u8],
 ) -> Result<()> {
+    let mut input_buffer = vec![0; MAX_QUIC_PACKET_SIZE];
+    let mut output_buffer = vec![0; MAX_QUIC_PACKET_SIZE];
     tokio::time::timeout(timeout, async {
         loop {
             loop {
@@ -521,10 +518,10 @@ async fn wait_for_connect_response(
                     "WARP QUIC connection closed before CONNECT-IP response",
                 ));
             }
-            flush_quic_packets_raw(connection, socket, output_buffer).await?;
+            flush_quic_packets_raw(connection, socket, &mut output_buffer).await?;
             let timer = connection.timeout().unwrap_or(Duration::from_millis(100));
             tokio::select! {
-                received = socket.recv_from(input_buffer) => {
+                received = socket.recv_from(&mut input_buffer) => {
                     let (length, peer) = received.map_err(error_io)?;
                     if peer == peer_addr {
                         receive_quic_packet(
