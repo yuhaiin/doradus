@@ -610,6 +610,7 @@ impl AsyncProxySelector for RoutedProxySelector {
 /// for existing flows.  New TUN flows should use this selector so a published
 /// route update is observed at selection time, while an already selected
 /// proxy/session continues to own the old snapshot and is not retargeted.
+#[derive(Clone)]
 pub struct RuntimeRoutedProxySelector {
     pub router: RouterRuntime,
     pub direct: Arc<dyn AsyncProxy>,

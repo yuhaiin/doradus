@@ -588,7 +588,6 @@ fn go_node_runtime_keeps_unknown_protocols_but_rejects_malformed_json() {
 
 #[test]
 fn go_proxy_runtime_converts_core_base_transports_and_rejects_chain_layers() {
-    use doradus_protocol::proxy_factory::BaseProxyKind;
     use std::time::Duration;
 
     let direct = GoNodeRecord {
@@ -607,7 +606,7 @@ fn go_proxy_runtime_converts_core_base_transports_and_rejects_chain_layers() {
             .to_base_proxy_config(Duration::from_secs(3))
             .unwrap()
             .kind,
-        BaseProxyKind::Direct
+        GoBaseProxyKind::Direct
     ));
 
     let http = GoNodeRecord {
@@ -626,7 +625,7 @@ fn go_proxy_runtime_converts_core_base_transports_and_rejects_chain_layers() {
         .unwrap();
     assert!(matches!(
         config.kind,
-        BaseProxyKind::Http {
+        GoBaseProxyKind::Http {
             proxy,
             username: Some(_),
             password: Some(_)

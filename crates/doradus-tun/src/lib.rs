@@ -69,7 +69,6 @@ mod dispatcher;
 #[cfg(target_os = "macos")]
 mod macos_dns;
 mod packet;
-#[path = "proxy.rs"]
 mod proxy_runtime;
 mod runtime;
 mod smoltcp_stack;

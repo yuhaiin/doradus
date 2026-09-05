@@ -52,9 +52,9 @@ pub async fn user_save_value(state: &ApiState, value: Value, id: Option<String>)
         let reload_id = id.clone();
         state
             .controller
-            .mutate_and_reload_inbounds(move |store| async move {
+            .mutate_and_reload_inbounds_blocking(move |store| {
                 let repository = store.repository();
-                let mut user: GoUserRecord = repository.get_go_user(&reload_id).await?;
+                let mut user: GoUserRecord = repository.get_go_user_sync(&reload_id)?;
                 user.name = request.name;
                 user.enabled = request.enabled;
                 user.usage = request.usage;
@@ -62,7 +62,7 @@ pub async fn user_save_value(state: &ApiState, value: Value, id: Option<String>)
                     user.credential = credential;
                 }
                 user.updated_at = unix_seconds();
-                repository.save_go_user(&user).await
+                repository.save_go_user_sync(&user)
             })
             .await?;
         let view = state
@@ -79,8 +79,8 @@ pub async fn user_save_value(state: &ApiState, value: Value, id: Option<String>)
         let id = record.id.clone();
         state
             .controller
-            .mutate_and_reload_inbounds(move |store| async move {
-                store.repository().save_go_user(&record).await
+            .mutate_and_reload_inbounds_blocking(move |store| {
+                store.repository().save_go_user_sync(&record)
             })
             .await?;
         let view = state
@@ -96,8 +96,8 @@ pub async fn user_save_value(state: &ApiState, value: Value, id: Option<String>)
 pub async fn user_delete_value(state: &ApiState, id: String) -> ApiResult {
     state
         .controller
-        .mutate_and_reload_inbounds(move |store| async move {
-            store.repository().delete_go_user(&id).await
+        .mutate_and_reload_inbounds_blocking(move |store| {
+            store.repository().delete_go_user_sync(&id)
         })
         .await?;
     empty()

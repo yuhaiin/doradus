@@ -64,9 +64,7 @@ pub async fn save_node_value(state: &ApiState, value: Value, _index: Option<usiz
     };
     state
         .controller
-        .mutate_and_reload(
-            move |store| async move { store.repository().put_go_node(&record).await },
-        )
+        .mutate_and_reload_blocking(move |store| store.repository().put_go_node_sync(&record))
         .await?;
     get_node_value(state, id).await
 }
@@ -90,7 +88,7 @@ pub async fn delete_node_value(state: &ApiState, id: String) -> ApiResult {
         .map_err(ApiError::from)?;
     let removed = state
         .controller
-        .mutate_and_reload(move |store| async move {
+        .mutate_and_reload_blocking(move |store| {
             let selected_fallback = br##"{"id":"direct"}"##.to_vec();
             for key in [
                 SELECTED_TCP_NODE_KEY,
@@ -98,15 +96,14 @@ pub async fn delete_node_value(state: &ApiState, id: String) -> ApiResult {
                 LEGACY_SELECTED_NODE_KEY,
             ] {
                 let selected = store
-                    .get_config(key)
-                    .await?
+                    .get_config_sync(key)?
                     .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                     .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned));
                 if selected.as_deref() == Some(id.as_str()) {
-                    store.put_config(key, &selected_fallback).await?;
+                    store.put_config_sync(key, &selected_fallback)?;
                 }
             }
-            if store.repository().delete_go_node(&id).await? {
+            if store.repository().delete_go_node_sync(&id)? {
                 Ok(())
             } else {
                 Err(doradus_core::Error::new(
@@ -212,14 +209,13 @@ pub async fn select_node_value(state: &ApiState, id: String) -> ApiResult {
     let bytes = serde_json::to_vec(&json!({"id": id}))?;
     state
         .controller
-        .mutate_and_reload_inbounds(move |store| async move {
-            store.put_config(SELECTED_TCP_NODE_KEY, &bytes).await?;
-            store.put_config(SELECTED_UDP_NODE_KEY, &bytes).await?;
-            store.put_config(LEGACY_SELECTED_NODE_KEY, &bytes).await?;
+        .mutate_and_reload_inbounds_blocking(move |store| {
+            store.put_config_sync(SELECTED_TCP_NODE_KEY, &bytes)?;
+            store.put_config_sync(SELECTED_UDP_NODE_KEY, &bytes)?;
+            store.put_config_sync(LEGACY_SELECTED_NODE_KEY, &bytes)?;
             store
                 .repository()
-                .put_go_selected_node_ids(&selected_id)
-                .await
+                .put_go_selected_node_ids_sync(&selected_id)
         })
         .await?;
     Ok(empty_json())

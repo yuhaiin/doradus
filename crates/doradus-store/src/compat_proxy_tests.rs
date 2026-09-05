@@ -98,13 +98,13 @@ fn preserves_fixedv2_alternate_endpoints_and_interface_policy() {
     let built = config.to_base_proxy_config(Duration::from_secs(3)).unwrap();
     assert_eq!(
         built.kind,
-        BaseProxyKind::FixedMany {
+        GoBaseProxyKind::FixedMany {
             endpoints: vec![
-                BaseProxyEndpoint {
+                GoBaseProxyEndpoint {
                     address: "127.0.0.1:18080".parse().unwrap(),
                     bind_interface: Some("lo".to_owned()),
                 },
-                BaseProxyEndpoint {
+                GoBaseProxyEndpoint {
                     address: "127.0.0.1:18081".parse().unwrap(),
                     bind_interface: Some("lo".to_owned()),
                 },
@@ -144,7 +144,7 @@ fn injected_resolver_builds_domain_fixed_proxy_without_system_dns() {
             .unwrap();
     assert_eq!(
         built.kind,
-        BaseProxyKind::Fixed {
+        GoBaseProxyKind::Fixed {
             address: "192.0.2.44:443".parse().unwrap()
         }
     );
@@ -187,9 +187,9 @@ fn native_yuubinsya_udp_reuses_fixed_endpoint_and_derives_password_hash() {
             .unwrap();
     assert_eq!(
         built.kind,
-        BaseProxyKind::YuubinsyaUdp {
+        GoBaseProxyKind::YuubinsyaUdp {
             server: "192.0.2.44:40501".parse().unwrap(),
-            password_hash: doradus_protocol::yuubinsya::derive_salt(b"password"),
+            password: "password".to_owned(),
             socks5_prefix: false,
         }
     );
@@ -238,7 +238,7 @@ fn quic_layer_uses_its_own_endpoint_and_tls_settings() {
             .unwrap();
     assert_eq!(
         built.kind,
-        BaseProxyKind::Quic {
+        GoBaseProxyKind::Quic {
             server: "192.0.2.44:784".parse().unwrap(),
             server_name: "edge.example".to_owned(),
             ca_certificates: vec![b"ca".to_vec()],

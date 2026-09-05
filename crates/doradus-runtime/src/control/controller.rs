@@ -421,6 +421,14 @@ impl RuntimeController {
             .await
     }
 
+    pub async fn mutate_and_reload_blocking<F>(&self, operation: F) -> Result<Arc<RuntimeSnapshot>>
+    where
+        F: FnOnce(ConfigStore) -> Result<()> + Send + 'static,
+    {
+        self.mutate_and_reload_blocking_with_plan(ReloadPlan::default(), operation)
+            .await
+    }
+
     pub async fn mutate_and_reload_inbounds<F, Fut>(
         &self,
         operation: F,
@@ -433,6 +441,20 @@ impl RuntimeController {
             .await
     }
 
+    pub async fn mutate_and_reload_inbounds_blocking<F>(
+        &self,
+        operation: F,
+    ) -> Result<Arc<RuntimeSnapshot>>
+    where
+        F: FnOnce(ConfigStore) -> Result<()> + Send + 'static,
+    {
+        self.mutate_and_reload_blocking_with_plan(
+            ReloadPlan::inbound(InboundReload::All),
+            operation,
+        )
+        .await
+    }
+
     pub async fn mutate_and_reload_inbound<F, Fut>(
         &self,
         id: impl Into<String>,
@@ -443,6 +465,21 @@ impl RuntimeController {
         Fut: Future<Output = Result<()>>,
     {
         self.mutate_and_reload_with_plan(
+            ReloadPlan::inbound(InboundReload::One(id.into())),
+            operation,
+        )
+        .await
+    }
+
+    pub async fn mutate_and_reload_inbound_blocking<F>(
+        &self,
+        id: impl Into<String>,
+        operation: F,
+    ) -> Result<Arc<RuntimeSnapshot>>
+    where
+        F: FnOnce(ConfigStore) -> Result<()> + Send + 'static,
+    {
+        self.mutate_and_reload_blocking_with_plan(
             ReloadPlan::inbound(InboundReload::One(id.into())),
             operation,
         )
@@ -485,14 +522,54 @@ impl RuntimeController {
             .await
     }
 
+    pub async fn mutate_and_reload_dns_blocking<F>(
+        &self,
+        operation: F,
+    ) -> Result<Arc<RuntimeSnapshot>>
+    where
+        F: FnOnce(ConfigStore) -> Result<()> + Send + 'static,
+    {
+        self.mutate_and_reload_blocking_with_plan(ReloadPlan::dns(), operation)
+            .await
+    }
+
     /// Commit generic configuration mutations, then rebuild the runtime from
     /// the same store.  If rebuilding fails, the committed configuration is
     /// retained and the previous snapshot remains active for existing/new
     /// flows; the returned error tells the management layer to report/retry it.
     pub async fn apply(&self, mutations: &[ConfigMutation]) -> Result<Arc<RuntimeSnapshot>> {
         let mutations = mutations.to_vec();
-        self.mutate_and_reload(|store| async move { store.apply(&mutations).await })
+        self.mutate_and_reload_blocking(move |store| store.apply_sync(&mutations))
             .await
+    }
+
+    async fn mutate_and_reload_blocking_with_plan<F>(
+        &self,
+        plan: ReloadPlan,
+        operation: F,
+    ) -> Result<Arc<RuntimeSnapshot>>
+    where
+        F: FnOnce(ConfigStore) -> Result<()> + Send + 'static,
+    {
+        let _guard = self.reload_lock.lock().await;
+        let store = self.store().clone();
+        let result = if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::spawn_blocking(move || operation(store))
+                .await
+                .map_err(|error| {
+                    doradus_core::Error::new(
+                        doradus_core::ErrorKind::Io,
+                        format!("blocking store mutation task failed: {error}"),
+                    )
+                })?
+        } else {
+            operation(store)
+        };
+        if let Err(error) = result {
+            self.set_reload_error(&error.to_string());
+            return Err(error);
+        }
+        self.rebuild_locked(plan).await
     }
 
     async fn mutate_and_reload_with_plan<F, Fut>(

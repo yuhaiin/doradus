@@ -58,16 +58,20 @@ impl AsyncProxy for SocketPolicyProxy {
     }
 }
 
-pub async fn build_aead_proxy(
+pub(super) async fn build_aead_proxy(
     config: &GoProxyRuntimeConfig,
+    plan: &AeadPlan,
+    protocol_tls: Option<&ProtocolTlsPlan>,
     timeout: Duration,
     resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
     metrics: Arc<doradus_metrics::RuntimeMetrics>,
     dialer: Arc<doradus_core::network::HappyEyeballsV2Dialer>,
 ) -> Result<Arc<dyn AsyncProxy>> {
-    let base = config
-        .to_base_proxy_config_with_resolver(timeout, resolver)
-        .await?;
+    let base = protocol_base_proxy_config(
+        config
+            .to_base_proxy_config_with_resolver(timeout, resolver)
+            .await?,
+    )?;
     let udp_server = match &base.kind {
         BaseProxyKind::Fixed { address } => Some(*address),
         _ => None,
@@ -87,14 +91,10 @@ pub async fn build_aead_proxy(
                 base.build()?
             }
         };
-    if config
-        .chain_types
-        .iter()
-        .any(|kind| kind.eq_ignore_ascii_case("tls"))
-    {
+    if let Some(tls) = protocol_tls {
         #[cfg(feature = "doh-tls")]
         {
-            upstream = build_protocol_tls_proxy(config, upstream)?;
+            upstream = build_protocol_tls_proxy(tls, upstream)?;
         }
         #[cfg(not(feature = "doh-tls"))]
         {
@@ -104,25 +104,11 @@ pub async fn build_aead_proxy(
             ));
         }
     }
-    let layer = config
-        .layers
-        .iter()
-        .find(|layer| layer.kind.eq_ignore_ascii_case("aead"))
-        .ok_or_else(|| Error::invalid("AEAD transport layer is missing"))?;
-    let password = layer
-        .config
-        .get("password")
-        .and_then(serde_json::Value::as_str)
-        .filter(|password| !password.is_empty())
-        .ok_or_else(|| Error::invalid("AEAD password is empty"))?;
-    let method = layer
-        .config
-        .get("cryptoMethod")
-        .or_else(|| layer.config.get("crypto_method"))
-        .and_then(serde_json::Value::as_str)
-        .map(doradus_protocol::aead::CryptoMethod::parse)
-        .unwrap_or(doradus_protocol::aead::CryptoMethod::Chacha20Poly1305);
+    let method = doradus_protocol::aead::CryptoMethod::parse(&plan.method);
     Ok(Arc::new(doradus_protocol::aead::AeadProxy::new(
-        upstream, password, method, udp_server,
+        upstream,
+        &plan.password,
+        method,
+        udp_server,
     )))
 }

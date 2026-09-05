@@ -439,8 +439,8 @@ pub async fn inbounds_config_put_value(state: &ApiState, value: Value) -> ApiRes
         .map_err(|error| ApiError::bad(format!("invalid inbound settings: {error}")))?;
     state
         .controller
-        .mutate_and_reload(move |store| async move {
-            store.repository().put_inbound_settings(settings).await
+        .mutate_and_reload_blocking(move |store| {
+            store.repository().put_inbound_settings_sync(settings)
         })
         .await?;
     json_value(serde_json::to_value(settings)?)

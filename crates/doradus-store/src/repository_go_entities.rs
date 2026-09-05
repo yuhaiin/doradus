@@ -7,7 +7,7 @@ impl ConfigRepository {
     /// original `data_json`.  These methods intentionally target the explicit
     /// `_v2` contract tables only; a Go v1 table renamed to
     /// `go_legacy_*` must first be migrated by an explicit schema migration.
-    pub async fn put_go_inbound(&self, record: &GoInboundRecord) -> Result<()> {
+    pub fn put_go_inbound_sync(&self, record: &GoInboundRecord) -> Result<()> {
         validate_go_texts(&[
             ("inbound id", &record.id),
             ("inbound name", &record.name),
@@ -57,7 +57,11 @@ impl ConfigRepository {
         })
     }
 
-    pub async fn put_go_node(&self, record: &GoNodeRecord) -> Result<()> {
+    pub async fn put_go_inbound(&self, record: &GoInboundRecord) -> Result<()> {
+        self.put_go_inbound_sync(record)
+    }
+
+    pub fn put_go_node_sync(&self, record: &GoNodeRecord) -> Result<()> {
         validate_go_texts(&[
             ("node id", &record.id),
             ("node name", &record.name),
@@ -107,7 +111,11 @@ impl ConfigRepository {
         })
     }
 
-    pub async fn put_go_node_tag(&self, record: &GoNodeTagRecord) -> Result<()> {
+    pub async fn put_go_node(&self, record: &GoNodeRecord) -> Result<()> {
+        self.put_go_node_sync(record)
+    }
+
+    pub fn put_go_node_tag_sync(&self, record: &GoNodeTagRecord) -> Result<()> {
         validate_go_texts(&[("node tag id", &record.id), ("node tag name", &record.name)])?;
         validate_go_timestamp(record.updated_at)?;
         validate_json_bytes(&record.members_json, "node_tags_v2.members_json")?;
@@ -133,7 +141,11 @@ impl ConfigRepository {
         })
     }
 
-    pub async fn put_go_resolver(&self, record: &GoResolverRecord) -> Result<()> {
+    pub async fn put_go_node_tag(&self, record: &GoNodeTagRecord) -> Result<()> {
+        self.put_go_node_tag_sync(record)
+    }
+
+    pub fn put_go_resolver_sync(&self, record: &GoResolverRecord) -> Result<()> {
         validate_go_texts(&[
             ("resolver id", &record.id),
             ("resolver type", &record.resolver_type),
@@ -163,5 +175,9 @@ impl ConfigRepository {
                 .map(|_| ())
                 .map_err(storage_error)
         })
+    }
+
+    pub async fn put_go_resolver(&self, record: &GoResolverRecord) -> Result<()> {
+        self.put_go_resolver_sync(record)
     }
 }

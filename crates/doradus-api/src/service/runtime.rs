@@ -19,7 +19,15 @@ impl RuntimeService {
         if let Some(parent) = options.database.parent() {
             std::fs::create_dir_all(parent).map_err(io_error)?;
         }
-        let store = ConfigStore::open(&options.database).await?;
+        let database_path = options.database.clone();
+        let store = tokio::task::spawn_blocking(move || ConfigStore::open_sync(database_path))
+            .await
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Io,
+                    format!("database startup worker failed: {error}"),
+                )
+            })??;
         let controller = build_controller(store.clone()).await?;
         let listener = tokio::net::TcpListener::bind(options.listen)
             .await

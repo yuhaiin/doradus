@@ -573,7 +573,7 @@ async fn udp_output_buffer_full_drops_packet_without_closing_flow() {
             flows: HashSet::from([flow]),
         },
     );
-    runtime.udp_flow_sources.insert(flow, source);
+    runtime.udp_tasks.flow_sources_mut().insert(flow, source);
 
     let mut dispatcher = TunDispatcher::new(32, 32, 1).unwrap();
     dispatcher.ensure_udp_socket(flow.destination).unwrap();
@@ -589,7 +589,7 @@ async fn udp_output_buffer_full_drops_packet_without_closing_flow() {
     runtime.process_proxy_outputs(&mut dispatcher).unwrap();
 
     assert!(runtime.udp_tasks.contains_key(&source));
-    assert_eq!(runtime.udp_flow_sources.get(&flow), Some(&source));
+    assert_eq!(runtime.udp_tasks.flow_sources().get(&flow), Some(&source));
     assert_eq!(runtime.nat_len().unwrap(), 1);
 
     runtime.close();
@@ -1339,7 +1339,7 @@ async fn translated_udp_endpoint_conflict_releases_only_the_conflicting_source()
                 flows: HashSet::from([flow]),
             },
         );
-        runtime.udp_flow_sources.insert(flow, source);
+        runtime.udp_tasks.flow_sources_mut().insert(flow, source);
     }
     let translated = "127.0.0.1:53000".parse().unwrap();
     runtime

@@ -14,32 +14,36 @@ impl TunProxyRuntime {
     }
 
     fn flush_pending_tcp_to_tun(&mut self, dispatcher: &mut TunDispatcher) -> Result<()> {
-        self.pending_tcp_keys.clear();
-        self.pending_tcp_keys
-            .extend(self.pending_tcp_to_tun.keys().copied());
-        let pending_tcp_keys = self.pending_tcp_keys.clone();
+        self.tasks.pending_keys.clear();
+        self.tasks
+            .pending_keys
+            .extend(self.tasks.pending_to_tun.keys().copied());
+        let pending_tcp_keys = self.tasks.pending_keys.clone();
         for flow in pending_tcp_keys {
             let mut drained = false;
             let mut failed = false;
             while let Some(payload) = self
-                .pending_tcp_to_tun
+                .tasks
+                .pending_to_tun
                 .get_mut(&flow)
                 .and_then(VecDeque::pop_front)
             {
                 match dispatcher.write_tcp(flow, &payload) {
                     Ok(written) if written == payload.len() => drained = true,
                     Ok(written) => {
-                        self.pending_tcp_to_tun
+                        self.tasks
+                            .pending_to_tun
                             .entry(flow)
                             .or_default()
                             .push_front(payload[written..].to_vec());
                         break;
                     }
                     Err(_) => {
-                        if self.pending_tcp_closes.contains(&flow) {
+                        if self.tasks.pending_closes.contains(&flow) {
                             failed = true;
                         } else {
-                            self.pending_tcp_to_tun
+                            self.tasks
+                                .pending_to_tun
                                 .entry(flow)
                                 .or_default()
                                 .push_front(payload);
@@ -52,12 +56,13 @@ impl TunProxyRuntime {
                 self.finish_tcp_close(dispatcher, flow)?;
             } else if drained
                 && self
-                    .pending_tcp_to_tun
+                    .tasks
+                    .pending_to_tun
                     .get(&flow)
                     .is_some_and(VecDeque::is_empty)
             {
-                self.pending_tcp_to_tun.remove(&flow);
-                if self.pending_tcp_closes.contains(&flow) {
+                self.tasks.pending_to_tun.remove(&flow);
+                if self.tasks.pending_closes.contains(&flow) {
                     self.finish_tcp_close(dispatcher, flow)?;
                 }
             }
@@ -71,8 +76,8 @@ impl TunProxyRuntime {
         if let Some(task) = self.tasks.remove(&flow) {
             task.join.abort();
         }
-        self.pending_tcp_to_tun.remove(&flow);
-        self.pending_tcp_closes.remove(&flow);
+        self.tasks.pending_to_tun.remove(&flow);
+        self.tasks.pending_closes.remove(&flow);
         self.untrack_flow(&flow)
     }
 
@@ -111,7 +116,8 @@ impl TunProxyRuntime {
                             "TCP output backpressure flow={flow:?}: wrote {written} of {}",
                             payload.len()
                         ));
-                        self.pending_tcp_to_tun
+                        self.tasks
+                            .pending_to_tun
                             .entry(flow)
                             .or_default()
                             .push_back(payload[written..].to_vec());
@@ -121,7 +127,8 @@ impl TunProxyRuntime {
                         tun_debug(format!(
                             "TCP output backpressure/close flow={flow:?}: {error}"
                         ));
-                        self.pending_tcp_to_tun
+                        self.tasks
+                            .pending_to_tun
                             .entry(flow)
                             .or_default()
                             .push_back(payload);
@@ -130,7 +137,7 @@ impl TunProxyRuntime {
                 }
             }
             ProxyOutput::UdpData { flow, payload } => {
-                if !self.tracked_flows.contains(&flow) {
+                if !self.flow_tracker.contains(&flow) {
                     tun_debug(format!(
                         "TUN UDP output dropped for stale flow={flow:?} bytes={}",
                         payload.len()
@@ -176,7 +183,7 @@ impl TunProxyRuntime {
                 Ok(true)
             }
             ProxyOutput::UdpClosed { flow } => {
-                let source = self.udp_flow_sources.get(&flow).copied();
+                let source = self.udp_tasks.source_for_flow(&flow);
                 let flows = source
                     .map(|source| self.remove_udp_source_task(source))
                     .unwrap_or_else(|| {
@@ -191,18 +198,19 @@ impl TunProxyRuntime {
             ProxyOutput::TcpClosed { flow } => {
                 tun_debug(format!("TCP proxy task closed flow={flow:?}"));
                 if self
-                    .pending_tcp_to_tun
+                    .tasks
+                    .pending_to_tun
                     .get(&flow)
                     .is_some_and(|pending| !pending.is_empty())
                 {
-                    self.pending_tcp_closes.insert(flow);
+                    self.tasks.pending_closes.insert(flow);
                 } else {
                     self.finish_tcp_close(dispatcher, flow)?;
                 }
                 Ok(true)
             }
             ProxyOutput::UdpBound { source, translated } => {
-                let Some(nat) = &self.nat else {
+                let Some(nat) = self.flow_tracker.nat() else {
                     return Ok(true);
                 };
                 if let Err(error) =
@@ -236,11 +244,12 @@ impl TunProxyRuntime {
             .collect();
         for flow in finished_tcp {
             let pending = self
-                .pending_tcp_to_tun
+                .tasks
+                .pending_to_tun
                 .get(&flow)
                 .is_some_and(|pending| !pending.is_empty());
             if pending {
-                self.pending_tcp_closes.insert(flow);
+                self.tasks.pending_closes.insert(flow);
             } else if let Some(task) = self.tasks.remove(&flow) {
                 if let Some(Err(error)) = task.join.now_or_never() {
                     tun_debug(format!(
@@ -315,7 +324,7 @@ impl TunProxyRuntime {
     }
 
     fn untrack_icmp_flow_if_idle(&mut self, flow: TunFlowKey) -> Result<()> {
-        if self.icmp_tasks.values().any(|task| task.flow == flow) {
+        if self.icmp_tasks.has_flow(flow) {
             return Ok(());
         }
         self.untrack_flow(&flow)
@@ -326,7 +335,7 @@ impl TunProxyRuntime {
             return Ok(());
         };
         let requested = self
-            .tracked_flows
+            .flow_tracker
             .iter()
             .copied()
             .filter(|flow| observer.close_requested(*flow))

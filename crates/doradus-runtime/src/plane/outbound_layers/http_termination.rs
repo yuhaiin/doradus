@@ -34,24 +34,32 @@ const PIPE_BUFFER_SIZE: usize = 128 * 1024;
 type ResponseBody = BoxBody<Bytes, hyper::Error>;
 type HeaderRules = DomainTrie<Vec<(HeaderName, HeaderValue)>>;
 
-/// Build the wrapper from the preserved Go layer JSON.  The config is kept at
-/// the runtime boundary so the public store/API structs do not grow a second
-/// DTO just for this transport.
+pub(crate) struct HttpTerminationPlan {
+    headers: HeaderRules,
+}
+
+impl HttpTerminationPlan {
+    pub(crate) fn compile(config: &GoProxyRuntimeConfig) -> Result<Self> {
+        let layer = config
+            .layers
+            .iter()
+            .rev()
+            .find(|layer| layer.kind.eq_ignore_ascii_case("http_termination"))
+            .ok_or_else(|| Error::invalid("HTTP termination layer is missing"))?;
+        Ok(Self {
+            headers: parse_header_rules(layer)?,
+        })
+    }
+}
+
 pub(crate) fn build(
-    config: &GoProxyRuntimeConfig,
+    plan: HttpTerminationPlan,
     upstream: Arc<dyn AsyncProxy>,
     tls_terminated: bool,
 ) -> Result<Arc<dyn AsyncProxy>> {
-    let layer = config
-        .layers
-        .iter()
-        .rev()
-        .find(|layer| layer.kind.eq_ignore_ascii_case("http_termination"))
-        .ok_or_else(|| Error::invalid("HTTP termination layer is missing"))?;
-    let rules = parse_header_rules(layer)?;
     Ok(Arc::new(HttpTerminationProxy::new(
         upstream,
-        rules,
+        plan.headers,
         tls_terminated,
     )))
 }

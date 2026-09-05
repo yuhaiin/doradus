@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -28,7 +28,10 @@ use doradus_protocol::YuubinsyaUdpDatagram;
 use doradus_protocol::proxy::{DelayedDropAsyncProxy, DropAsyncProxy};
 use doradus_protocol::proxy_factory::{BaseProxyConfig, BaseProxyKind};
 use doradus_store::fakeip::FakeIpViewStore;
-use doradus_store::{FakeIpPools, GoProxyLayer, GoProxyRuntimeConfig, GoProxyTransport};
+use doradus_store::{
+    FakeIpPools, GoBaseProxyConfig, GoBaseProxyEndpoint, GoBaseProxyKind, GoProxyLayer,
+    GoProxyRuntimeConfig, GoProxyTransport,
+};
 use doradus_trie::router::RuntimeRoutedProxySelector;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -43,6 +46,14 @@ pub use proxy_adapters::*;
 #[path = "selector.rs"]
 mod selector;
 pub use selector::*;
+
+#[path = "protocol_tls.rs"]
+mod protocol_tls;
+use protocol_tls::*;
+
+#[path = "proxy_plan.rs"]
+mod proxy_plan;
+use proxy_plan::*;
 
 #[path = "protocol_factory.rs"]
 mod protocol_factory;
@@ -163,10 +174,12 @@ impl RuntimeSnapshot {
             "fixed" | "simple" | "fixedv2" => {
                 let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Fixed);
                 let resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
-                Ok(child
-                    .to_base_proxy_config_with_resolver(timeout, resolver)
-                    .await?
-                    .build_with_metrics(Arc::clone(&self.metrics))?)
+                Ok(protocol_base_proxy_config(
+                    child
+                        .to_base_proxy_config_with_resolver(timeout, resolver)
+                        .await?,
+                )?
+                .build_with_metrics(Arc::clone(&self.metrics))?)
             }
             "http" | "http_proxy" => {
                 let user = layer_string(layer, "user").unwrap_or_default();
@@ -176,37 +189,27 @@ impl RuntimeSnapshot {
                 )))
             }
             "socks5" => {
-                let user = layer_string(layer, "user").unwrap_or_default();
-                let password = layer_string(layer, "password").unwrap_or_default();
-                let hostname = layer_string(layer, "hostname").unwrap_or_default();
-                let override_port = layer
-                    .config
-                    .get("override_port")
-                    .or_else(|| layer.config.get("overridePort"))
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-                let override_port = i32::try_from(override_port)
-                    .map_err(|_| Error::invalid("SOCKS5 override_port is out of range"))?;
+                let plan = Socks5Plan::compile_layer(layer)?;
                 Ok(Arc::new(doradus_protocol::socks5::Socks5Proxy::new(
                     parent,
-                    user,
-                    password,
-                    hostname,
-                    override_port,
+                    plan.user,
+                    plan.password,
+                    plan.hostname,
+                    plan.override_port,
                 )?))
             }
             "http_mock" => Ok(Arc::new(doradus_protocol::http_mock::HttpMockProxy::new(
                 parent,
             ))),
             "tls" => {
-                let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Tls);
+                let tls = ProtocolTlsPlan::compile_layer(layer)?;
                 #[cfg(feature = "doh-tls")]
                 {
-                    build_protocol_tls_proxy(&child, parent)
+                    build_protocol_tls_proxy(&tls, parent)
                 }
                 #[cfg(not(feature = "doh-tls"))]
                 {
-                    let _ = child;
+                    let _ = tls;
                     Err(Error::new(
                         ErrorKind::Unsupported,
                         "network_split TLS branch requires the doh-tls feature",
@@ -214,13 +217,8 @@ impl RuntimeSnapshot {
                 }
             }
             "websocket" => {
-                let child = GoProxyRuntimeConfig::single_layer(
-                    layer,
-                    GoProxyTransport::Unknown {
-                        name: "websocket".to_owned(),
-                    },
-                );
-                build_protocol_websocket_proxy(&child, parent)
+                let websocket = WebSocketPlan::compile_layer(layer)?;
+                build_protocol_websocket_proxy(&websocket, parent)
             }
             "shadowsocks" | "shadowsocksr" | "trojan" | "vless" | "vmess" => {
                 let transport = match kind.as_str() {
@@ -232,32 +230,33 @@ impl RuntimeSnapshot {
                     _ => unreachable!(),
                 };
                 let child = GoProxyRuntimeConfig::single_layer(layer, transport);
-                build_protocol_proxy(&child, parent)
+                let plan = ProxyPlan::from_config(&child)?;
+                build_protocol_proxy(
+                    plan.standard
+                        .as_ref()
+                        .expect("standard network-split protocol must compile a typed plan"),
+                    parent,
+                )
             }
             "aead" => {
-                let password = layer_string(layer, "password")
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| Error::invalid("AEAD password is empty"))?;
-                let method = layer
-                    .config
-                    .get("cryptoMethod")
-                    .or_else(|| layer.config.get("crypto_method"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(doradus_protocol::aead::CryptoMethod::parse)
-                    .unwrap_or(doradus_protocol::aead::CryptoMethod::Chacha20Poly1305);
+                let plan = AeadPlan::compile_layer(layer)?;
+                let method = doradus_protocol::aead::CryptoMethod::parse(&plan.method);
                 Ok(Arc::new(doradus_protocol::aead::AeadProxy::new(
-                    parent, password, method, None,
+                    parent,
+                    &plan.password,
+                    method,
+                    None,
                 )))
             }
             "yuubinsya" => {
-                let password = layer_string(layer, "password")
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| Error::invalid("Yuubinsya password is empty"))?;
+                let plan = YuubinsyaPlan::compile_layer(layer)?;
                 Ok(Arc::new(NetworkSplitYuubinsyaProxy {
                     upstream: parent,
-                    password_hash: doradus_protocol::yuubinsya::derive_salt(password.as_bytes()),
-                    udp_over_stream: layer_bool(layer, "udp_over_stream", "udpOverStream"),
-                    udp_coalesce: layer_bool(layer, "udp_coalesce", "udpCoalesce"),
+                    password_hash: doradus_protocol::yuubinsya::derive_salt(
+                        plan.password.as_bytes(),
+                    ),
+                    udp_over_stream: plan.udp_over_stream,
+                    udp_coalesce: plan.udp_coalesce,
                     udp_server,
                 }))
             }
@@ -267,35 +266,21 @@ impl RuntimeSnapshot {
             // with a direct socket.
             "bootstrap_dns_warp" | "bootstrapdnswarp" => Ok(parent),
             "http2" => {
-                let concurrency = layer
-                    .config
-                    .get("concurrency")
-                    .or_else(|| layer.config.get("max_concurrency"))
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .filter(|value| *value >= 7)
-                    .unwrap_or(10);
-                let max_streams = layer
-                    .config
-                    .get("max_streams")
-                    .or_else(|| layer.config.get("maxStreams"))
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .unwrap_or(128)
-                    .max(1);
+                let plan = Http2Plan::compile_layer(layer);
                 Ok(Arc::new(NetworkSplitHttp2Proxy {
                     upstream: parent,
                     connections: tokio::sync::Mutex::new(Vec::new()),
                     connect_lock: tokio::sync::Mutex::new(()),
-                    concurrency,
-                    max_streams,
+                    concurrency: plan.concurrency,
+                    max_streams: plan.max_streams,
                 }))
             }
             "wireguard" | "wire_guard" | "wg" => {
                 let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Wireguard);
+                let wireguard = compile_wireguard_config(layer)?;
                 let resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
                 build_wireguard_proxy(
-                    layer,
+                    &wireguard,
                     timeout,
                     resolver,
                     child
@@ -306,9 +291,10 @@ impl RuntimeSnapshot {
             }
             "warp_masque" | "warpmasque" => {
                 let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::WarpMasque);
+                let warp = compile_warp_masque_config(layer)?;
                 let resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
                 build_warp_masque_proxy(
-                    layer,
+                    &warp,
                     timeout,
                     resolver,
                     child
@@ -357,13 +343,18 @@ impl RuntimeSnapshot {
         // bootstrap resolver. Using the proxy DoH resolver here would make a
         // DoH resolver recursively resolve the node it needs to reach.
         let resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
-        let plan = ProxyPlan::from_config(&config);
+        let plan = ProxyPlan::from_config(&config)?;
 
         let proxy = if plan.kind == ProxyPlanKind::NetworkSplit {
             self.build_network_split_proxy(&config, timeout).await?
         } else if plan.kind == ProxyPlanKind::ProtocolH2 {
             build_protocol_h2_proxy(
-                &config,
+                plan.h2_transport_json
+                    .as_deref()
+                    .expect("HTTP/2 protocol must compile transport JSON"),
+                plan.standard
+                    .as_ref()
+                    .expect("HTTP/2 protocol must compile a typed protocol plan"),
                 timeout,
                 resolver.clone(),
                 Arc::clone(&self.metrics),
@@ -373,6 +364,11 @@ impl RuntimeSnapshot {
         } else if plan.kind == ProxyPlanKind::VlessWebSocket {
             build_vless_transport_proxy(
                 &config,
+                plan.standard
+                    .as_ref()
+                    .expect("VLESS transport must compile a typed protocol plan"),
+                plan.protocol_tls.as_ref(),
+                plan.websocket.as_ref(),
                 timeout,
                 resolver.clone(),
                 Arc::clone(&self.metrics),
@@ -381,6 +377,11 @@ impl RuntimeSnapshot {
         } else if plan.kind == ProxyPlanKind::VmessTransport {
             build_vmess_transport_proxy(
                 &config,
+                plan.standard
+                    .as_ref()
+                    .expect("VMess transport must compile a typed protocol plan"),
+                plan.protocol_tls.as_ref(),
+                plan.websocket.as_ref(),
                 timeout,
                 resolver.clone(),
                 Arc::clone(&self.metrics),
@@ -389,19 +390,21 @@ impl RuntimeSnapshot {
         } else if plan.kind == ProxyPlanKind::TrojanWebSocket {
             build_trojan_transport_proxy(
                 &config,
+                plan.standard
+                    .as_ref()
+                    .expect("Trojan transport must compile a typed protocol plan"),
+                plan.protocol_tls.as_ref(),
+                plan.websocket.as_ref(),
                 timeout,
                 resolver.clone(),
                 Arc::clone(&self.metrics),
             )
             .await?
         } else if plan.kind == ProxyPlanKind::Wireguard {
-            let layer = config
-                .layers
-                .iter()
-                .find(|layer| layer.kind.eq_ignore_ascii_case("wireguard"))
-                .ok_or_else(|| Error::invalid("WireGuard protocol layer is missing"))?;
             build_wireguard_proxy(
-                layer,
+                plan.wireguard
+                    .as_ref()
+                    .expect("WireGuard must compile a typed config"),
                 timeout,
                 resolver.clone(),
                 config
@@ -410,13 +413,10 @@ impl RuntimeSnapshot {
             )
             .await?
         } else if plan.kind == ProxyPlanKind::WarpMasque {
-            let layer = config
-                .layers
-                .iter()
-                .find(|layer| layer.kind.eq_ignore_ascii_case("warp_masque"))
-                .ok_or_else(|| Error::invalid("WARP MASQUE protocol layer is missing"))?;
             build_warp_masque_proxy(
-                layer,
+                plan.warp_masque
+                    .as_ref()
+                    .expect("WARP MASQUE must compile a typed config"),
                 timeout,
                 resolver.clone(),
                 config
@@ -425,9 +425,11 @@ impl RuntimeSnapshot {
             )
             .await?
         } else if plan.kind == ProxyPlanKind::HttpMock {
-            let base = config
-                .to_base_proxy_config_with_resolver(timeout, resolver.clone())
-                .await?;
+            let base = protocol_base_proxy_config(
+                config
+                    .to_base_proxy_config_with_resolver(timeout, resolver.clone())
+                    .await?,
+            )?;
             let upstream = if let Some(endpoints) = fixed_tcp_candidates(&base.kind) {
                 Arc::new(HappyEyeballsFixedProxy::new(
                     endpoints,
@@ -454,7 +456,12 @@ impl RuntimeSnapshot {
             };
             #[cfg(feature = "http-termination")]
             {
-                crate::proxy::http_termination::build(&config, parent, tls_terminated)?
+                crate::proxy::http_termination::build(
+                    plan.http_termination
+                        .expect("HTTP termination plan must be compiled"),
+                    parent,
+                    tls_terminated,
+                )?
             }
             #[cfg(not(feature = "http-termination"))]
             {
@@ -487,7 +494,11 @@ impl RuntimeSnapshot {
             };
             #[cfg(feature = "doh-tls")]
             {
-                build_tls_termination_proxy(&config, parent)?
+                build_tls_termination_proxy(
+                    plan.tls_termination
+                        .expect("TLS termination plan must be compiled"),
+                    parent,
+                )?
             }
             #[cfg(not(feature = "doh-tls"))]
             {
@@ -515,16 +526,22 @@ impl RuntimeSnapshot {
         } else if plan.kind == ProxyPlanKind::Aead {
             build_aead_proxy(
                 &config,
+                plan.aead
+                    .as_ref()
+                    .expect("AEAD transport must compile a typed plan"),
+                plan.protocol_tls.as_ref(),
                 timeout,
                 resolver.clone(),
                 Arc::clone(&self.metrics),
                 Arc::clone(&self.happy_eyeballs),
             )
             .await?
-        } else if let ProxyPlanKind::Standard(protocol) = plan.kind {
-            let base = config
-                .to_base_proxy_config_with_resolver(timeout, resolver.clone())
-                .await?;
+        } else if let ProxyPlanKind::Standard(_) = plan.kind {
+            let base = protocol_base_proxy_config(
+                config
+                    .to_base_proxy_config_with_resolver(timeout, resolver.clone())
+                    .await?,
+            )?;
             let mut upstream = if let Some(endpoints) = fixed_tcp_candidates(&base.kind) {
                 Arc::new(HappyEyeballsFixedProxy::new(
                     endpoints,
@@ -534,10 +551,10 @@ impl RuntimeSnapshot {
             } else {
                 base.build_with_metrics(Arc::clone(&self.metrics))?
             };
-            if plan.has_protocol_tls {
+            if let Some(tls) = &plan.protocol_tls {
                 #[cfg(feature = "doh-tls")]
                 {
-                    upstream = build_protocol_tls_proxy(&config, upstream)?;
+                    upstream = build_protocol_tls_proxy(tls, upstream)?;
                 }
                 #[cfg(not(feature = "doh-tls"))]
                 {
@@ -547,143 +564,23 @@ impl RuntimeSnapshot {
                     ));
                 }
             }
-            let layer = config
-                .layers
-                .iter()
-                .find(|layer| layer.kind.eq_ignore_ascii_case(protocol.layer_name()))
-                .ok_or_else(|| Error::invalid("proxy protocol layer is missing"))?;
-            if config
-                .layers
-                .iter()
-                .any(|layer| layer.kind.eq_ignore_ascii_case("obfs_http"))
-            {
-                if config.transport != doradus_store::GoProxyTransport::Shadowsocks {
-                    return Err(Error::new(
-                        ErrorKind::Unsupported,
-                        "obfs_http is only supported around the Go Shadowsocks protocol",
-                    ));
-                }
-                let obfs = config
-                    .layers
-                    .iter()
-                    .find(|layer| layer.kind.eq_ignore_ascii_case("obfs_http"))
-                    .expect("obfs_http layer was checked above");
-                let host = obfs
-                    .config
-                    .get("host")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| Error::invalid("obfs_http host is missing"))?;
-                let port = obfs
-                    .config
-                    .get("port")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| Error::invalid("obfs_http port is missing"))?;
+            if let Some(obfs) = &plan.http_obfs {
                 upstream = Arc::new(doradus_protocol::http_obfs::HttpObfsProxy::new(
-                    upstream, host, port,
+                    upstream, &obfs.host, &obfs.port,
                 )?);
             }
-            match protocol {
-                StandardProtocol::Shadowsocks => {
-                    let password = layer
-                        .config
-                        .get("password")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|password| !password.is_empty())
-                        .ok_or_else(|| Error::invalid("proxy protocol password is empty"))?;
-                    let method = layer
-                        .config
-                        .get("method")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| Error::invalid("Shadowsocks method is missing"))?;
-                    Arc::new(doradus_protocol::shadowsocks::ShadowsocksProxy::new(
-                        upstream, method, password,
-                    )?) as Arc<dyn AsyncProxy>
-                }
-                StandardProtocol::Shadowsocksr => {
-                    let password = layer
-                        .config
-                        .get("password")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let method = layer
-                        .config
-                        .get("method")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("chacha20-ietf");
-                    let protocol = layer
-                        .config
-                        .get("protocol")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("origin");
-                    let protocol_param = layer
-                        .config
-                        .get("protoparam")
-                        .or_else(|| layer.config.get("protocol_param"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let obfs = layer
-                        .config
-                        .get("obfs")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("plain");
-                    let obfs_param = layer
-                        .config
-                        .get("obfsparam")
-                        .or_else(|| layer.config.get("obfs_param"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    Arc::new(doradus_protocol::shadowsocksr::ShadowsocksrProxy::new(
-                        upstream,
-                        method,
-                        password,
-                        protocol,
-                        protocol_param,
-                        obfs,
-                        obfs_param,
-                    )?) as Arc<dyn AsyncProxy>
-                }
-                StandardProtocol::Trojan => {
-                    let password = layer
-                        .config
-                        .get("password")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|password| !password.is_empty())
-                        .ok_or_else(|| Error::invalid("proxy protocol password is empty"))?;
-                    Arc::new(doradus_protocol::trojan::TrojanProxy::new(
-                        upstream, password,
-                    )) as Arc<dyn AsyncProxy>
-                }
-                StandardProtocol::Vless => {
-                    let uuid = layer
-                        .config
-                        .get("uuid")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| Error::invalid("VLESS UUID is missing"))?;
-                    Arc::new(doradus_protocol::vless::VlessProxy::new(upstream, uuid)?)
-                        as Arc<dyn AsyncProxy>
-                }
-                StandardProtocol::Vmess => {
-                    let uuid = layer
-                        .config
-                        .get("id")
-                        .or_else(|| layer.config.get("uuid"))
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| Error::invalid("VMess UUID is missing"))?;
-                    let security = layer
-                        .config
-                        .get("security")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("auto");
-                    let alter_id = vmess_alter_id(&layer.config)?;
-                    Arc::new(doradus_protocol::vmess::VmessProxy::new(
-                        upstream, uuid, security, alter_id,
-                    )?) as Arc<dyn AsyncProxy>
-                }
-            }
+            build_protocol_proxy(
+                plan.standard
+                    .as_ref()
+                    .expect("standard protocol must compile a typed plan"),
+                upstream,
+            )?
         } else {
-            let base = config
-                .to_base_proxy_config_with_resolver(timeout, resolver.clone())
-                .await?;
+            let base = protocol_base_proxy_config(
+                config
+                    .to_base_proxy_config_with_resolver(timeout, resolver.clone())
+                    .await?,
+            )?;
             let mut proxy = if let Some(endpoints) = fixed_tcp_candidates(&base.kind) {
                 Arc::new(HappyEyeballsFixedProxy::new(
                     endpoints,
@@ -699,32 +596,19 @@ impl RuntimeSnapshot {
                     .iter()
                     .any(|layer| layer.kind.eq_ignore_ascii_case("quic"))
             {
-                let yuubinsya = config
-                    .layers
-                    .iter()
-                    .find(|layer| layer.kind.eq_ignore_ascii_case("yuubinsya"))
-                    .ok_or_else(|| Error::invalid("Yuubinsya layer is missing"))?;
-                let password = yuubinsya
-                    .config
-                    .get("password")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|password| !password.is_empty())
-                    .ok_or_else(|| Error::invalid("Yuubinsya password is empty"))?;
+                let yuubinsya = plan
+                    .yuubinsya
+                    .as_ref()
+                    .expect("Yuubinsya transport must compile a typed plan");
                 let server = config
                     .resolved_fixed_endpoint(resolver.as_ref())
                     .await?
                     .ok_or_else(|| Error::invalid("QUIC transport requires a server endpoint"))?;
-                let socks5_prefix = yuubinsya
-                    .config
-                    .get("socks5_prefix")
-                    .or_else(|| yuubinsya.config.get("socks5Prefix"))
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
                 proxy = Arc::new(doradus_protocol::YuubinsyaOverTransportProxy::new(
                     proxy,
-                    doradus_protocol::yuubinsya::derive_salt(password.as_bytes()),
+                    doradus_protocol::yuubinsya::derive_salt(yuubinsya.password.as_bytes()),
                     Endpoint::ip(doradus_core::Network::Udp, server),
-                    socks5_prefix,
+                    yuubinsya.socks5_prefix,
                 )?);
             }
             proxy

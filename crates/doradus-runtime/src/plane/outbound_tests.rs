@@ -219,10 +219,11 @@ fn tls_termination_rejects_empty_certificate_set_before_runtime_use() {
     let parent = Arc::new(DirectAsyncProxy {
         timeout: Duration::from_secs(1),
     });
-    let error = match build_tls_termination_proxy(&config, parent) {
-        Ok(_) => panic!("empty TLS termination certificate set must fail"),
+    let error = match TlsTerminationPlan::compile(&config) {
+        Ok(_) => panic!("empty TLS termination certificate set must fail during compile"),
         Err(error) => error,
     };
+    let _ = parent;
     assert!(error.to_string().contains("TLS termination"));
 }
 
@@ -290,23 +291,7 @@ async fn runtime_selector_uses_node_tag_for_tcp_and_udp() {
         context.route_mode = RouteMode::Proxy;
         context.tag = Some("edge".to_owned());
         let selected = selector.select(&context);
-        let tagged = if network == doradus_core::Network::Udp {
-            selector
-                .udp_tagged
-                .read()
-                .unwrap()
-                .get("edge")
-                .cloned()
-                .unwrap()
-        } else {
-            selector
-                .tagged
-                .read()
-                .unwrap()
-                .get("edge")
-                .cloned()
-                .unwrap()
-        };
+        let tagged = selector.tagged_proxy(network, "edge").unwrap();
         assert!(Arc::ptr_eq(&selected, &tagged));
     }
 }

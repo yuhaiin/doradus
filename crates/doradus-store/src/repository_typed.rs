@@ -196,7 +196,7 @@ impl ConfigRepository {
         })
     }
 
-    pub async fn list_nat_config(&self) -> Result<Vec<NatConfigRecord>> {
+    pub fn list_nat_config_sync(&self) -> Result<Vec<NatConfigRecord>> {
         let connection = self.store.lock_connection()?;
         let rows = connection
             .query("SELECT key, full_cone, idle_timeout_ms FROM nat_config ORDER BY key")
@@ -204,7 +204,11 @@ impl ConfigRepository {
         rows.iter().map(nat_config_from_row).collect()
     }
 
-    pub async fn get_nat_config(&self, key: &str) -> Result<Option<NatConfigRecord>> {
+    pub async fn list_nat_config(&self) -> Result<Vec<NatConfigRecord>> {
+        self.list_nat_config_sync()
+    }
+
+    pub fn get_nat_config_sync(&self, key: &str) -> Result<Option<NatConfigRecord>> {
         validate_id(key)?;
         let connection = self.store.lock_connection()?;
         let rows = connection
@@ -216,11 +220,15 @@ impl ConfigRepository {
         rows.first().map(nat_config_from_row).transpose()
     }
 
+    pub async fn get_nat_config(&self, key: &str) -> Result<Option<NatConfigRecord>> {
+        self.get_nat_config_sync(key)
+    }
+
     /// Return a persisted NAT profile when present, otherwise the safe
     /// migration default.  This is deliberately read-only: callers can
     /// decide when a default should become durable configuration.
-    pub async fn get_nat_config_or_default(&self, key: &str) -> Result<NatConfigRecord> {
-        if let Some(record) = self.get_nat_config(key).await? {
+    pub fn get_nat_config_or_default_sync(&self, key: &str) -> Result<NatConfigRecord> {
+        if let Some(record) = self.get_nat_config_sync(key)? {
             return Ok(record);
         }
         validate_id(key)?;
@@ -228,6 +236,10 @@ impl ConfigRepository {
             key: key.to_owned(),
             ..NatConfigRecord::default()
         })
+    }
+
+    pub async fn get_nat_config_or_default(&self, key: &str) -> Result<NatConfigRecord> {
+        self.get_nat_config_or_default_sync(key)
     }
 
     pub async fn delete_nat_config(&self, key: &str) -> Result<bool> {
@@ -269,12 +281,16 @@ impl ConfigRepository {
         })
     }
 
-    pub async fn list_maxmind_metadata(&self) -> Result<Vec<MaxMindMetadataRecord>> {
+    pub fn list_maxmind_metadata_sync(&self) -> Result<Vec<MaxMindMetadataRecord>> {
         let connection = self.store.lock_connection()?;
         let rows = connection
             .query("SELECT id, path, sha256, size, updated_at FROM maxmind_metadata ORDER BY id")
             .map_err(storage_error)?;
         rows.iter().map(maxmind_from_row).collect()
+    }
+
+    pub async fn list_maxmind_metadata(&self) -> Result<Vec<MaxMindMetadataRecord>> {
+        self.list_maxmind_metadata_sync()
     }
 
     pub async fn delete_maxmind_metadata(&self, id: &str) -> Result<bool> {

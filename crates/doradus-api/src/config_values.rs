@@ -151,9 +151,9 @@ pub async fn route_lists_config_put_value(state: &ApiState, value: Value) -> Api
     let bytes = serde_json::to_vec(&normalized)?;
     state
         .controller
-        .mutate_and_reload(move |store| async move {
-            store.put_config("route.lists.config", &bytes).await?;
-            store.repository().put_go_settings_kv(&settings).await
+        .mutate_and_reload_blocking(move |store| {
+            store.put_config_sync("route.lists.config", &bytes)?;
+            store.repository().put_go_settings_kv_sync(&settings)
         })
         .await?;
     Ok(Json(normalized))
@@ -284,10 +284,10 @@ pub async fn write_config_json(state: &ApiState, key: &str, value: Value) -> Api
     let settings_kv = (key == "settings").then(|| settings_kv_from_contract(&value));
     state
         .controller
-        .mutate_and_reload(move |store| async move {
-            store.put_config(&key, &bytes).await?;
+        .mutate_and_reload_blocking(move |store| {
+            store.put_config_sync(&key, &bytes)?;
             if let Some(settings_kv) = settings_kv {
-                store.repository().put_go_settings_kv(&settings_kv).await?;
+                store.repository().put_go_settings_kv_sync(&settings_kv)?;
             }
             Ok(())
         })

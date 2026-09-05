@@ -48,7 +48,10 @@ use sha2::{Digest, Sha256};
 use sqlite::{Connection, Row, SqliteValue};
 
 pub mod fakeip;
-pub use compat_proxy::{GoProxyLayer, GoProxyRuntimeConfig, GoProxyTransport};
+pub use compat_proxy::{
+    GoBaseProxyConfig, GoBaseProxyEndpoint, GoBaseProxyKind, GoProxyLayer, GoProxyRuntimeConfig,
+    GoProxyTransport,
+};
 pub use compat_runtime::{
     GoFakeIpRuntimeConfig, GoResolverRuntimeConfig, GoResolverTransport, GoRouteRuntimeConfig,
     GoUdpProxyFqdnStrategy,
@@ -125,18 +128,27 @@ pub struct ConfigRepository {
 }
 
 impl ConfigStore {
+    pub fn open_sync(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_legacy_import_sync(path, false)
+    }
+
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_legacy_import(path, false).await
+        Self::open_sync(path)
     }
 
     /// Open a legacy database for the explicit future migration helpers.
     /// Normal runtime startup deliberately refuses to adopt legacy state.
     #[doc(hidden)]
-    pub async fn open_legacy(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_legacy_import(path, true).await
+    pub fn open_legacy_sync(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_legacy_import_sync(path, true)
     }
 
-    async fn open_with_legacy_import(
+    #[doc(hidden)]
+    pub async fn open_legacy(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_legacy_sync(path)
+    }
+
+    fn open_with_legacy_import_sync(
         path: impl AsRef<Path>,
         allow_legacy_import: bool,
     ) -> Result<Self> {
@@ -157,18 +169,26 @@ impl ConfigStore {
         unreachable!("busy retry loop returns on its final iteration")
     }
 
+    pub fn open_memory_sync() -> Result<Self> {
+        Self::open_sync(":memory:")
+    }
+
     pub async fn open_memory() -> Result<Self> {
-        Self::open(":memory:").await
+        Self::open_memory_sync()
     }
 
     /// Compact the database only when SQLite reports enough reusable space.
     /// This keeps the expensive `VACUUM` operation thresholded rather than
     /// imposing a full database rewrite on every open.
+    pub fn compact_if_needed_sync(&self) -> Result<bool> {
+        self.compact_if_needed_inner()
+    }
+
     pub async fn compact_if_needed(&self) -> Result<bool> {
         self.compact_if_needed_sync()
     }
 
-    fn compact_if_needed_sync(&self) -> Result<bool> {
+    fn compact_if_needed_inner(&self) -> Result<bool> {
         self.with_write_retry(|connection| {
             connection
                 .execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -206,7 +226,7 @@ impl ConfigStore {
         })
     }
 
-    pub async fn get_config(&self, key: &str) -> Result<Option<Vec<u8>>> {
+    pub fn get_config_sync(&self, key: &str) -> Result<Option<Vec<u8>>> {
         validate_key(key)?;
         let connection = self.lock_connection()?;
         let rows = connection
@@ -224,10 +244,13 @@ impl ConfigStore {
         }
     }
 
-    pub async fn list_config(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    pub async fn get_config(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.get_config_sync(key)
+    }
+
+    pub fn list_config_sync(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
         // An empty prefix is the intentional "list all" form used by startup
-        // migration guards.  Non-empty prefixes retain the same key
-        // validation as get/put/delete.
+        // migration guards. Non-empty prefixes retain key validation.
         if !prefix.is_empty() {
             validate_key(prefix)?;
         }
@@ -254,16 +277,23 @@ impl ConfigStore {
         Ok(values)
     }
 
+    pub async fn list_config(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        self.list_config_sync(prefix)
+    }
+
+    pub fn put_config_sync(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.apply_sync(&[ConfigMutation::Put {
+            key: key.to_owned(),
+            value: value.to_vec(),
+        }])
+    }
+
     pub async fn put_config(&self, key: &str, value: &[u8]) -> Result<()> {
         // Route single-key writes through the same explicit BEGIN IMMEDIATE /
         // COMMIT path as batched mutations. SQLite's autocommit INSERT can
         // otherwise report success while concurrent processes race the WAL
         // root-page cursor and lose a frame.
-        self.apply(&[ConfigMutation::Put {
-            key: key.to_owned(),
-            value: value.to_vec(),
-        }])
-        .await
+        self.put_config_sync(key, value)
     }
 
     /// Best-effort single-key write used by runtime checkpoints. It never
@@ -282,7 +312,7 @@ impl ConfigStore {
         })
     }
 
-    pub async fn delete_config(&self, key: &str) -> Result<bool> {
+    pub fn delete_config_sync(&self, key: &str) -> Result<bool> {
         validate_key(key)?;
         self.with_write_retry(|connection| {
             connection
@@ -295,10 +325,18 @@ impl ConfigStore {
         })
     }
 
+    pub async fn delete_config(&self, key: &str) -> Result<bool> {
+        self.delete_config_sync(key)
+    }
+
     /// Apply a group of mutations atomically. Any validation or SQL failure
     /// rolls the whole group back.
-    pub async fn apply(&self, mutations: &[ConfigMutation]) -> Result<()> {
+    pub fn apply_sync(&self, mutations: &[ConfigMutation]) -> Result<()> {
         self.with_write_retry(|connection| apply_transaction(connection, mutations))
+    }
+
+    pub async fn apply(&self, mutations: &[ConfigMutation]) -> Result<()> {
+        self.apply_sync(mutations)
     }
 
     fn open_once(path: &str, allow_legacy_import: bool) -> Result<Self> {
@@ -345,7 +383,7 @@ impl ConfigStore {
         drop(_initialization_lock);
         // Match Go's state-db startup policy: reclaim substantial reusable
         // space, but do not rewrite a healthy database on every launch.
-        store.compact_if_needed_sync()?;
+        store.compact_if_needed_inner()?;
         Ok(store)
     }
 

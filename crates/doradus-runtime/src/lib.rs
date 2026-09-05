@@ -5,56 +5,28 @@
 
 use doradus_core::Result;
 
-// Control plane: snapshot publication, reload coordination and persistence.
-#[path = "control/controller.rs"]
-mod controller;
-#[path = "control/handle.rs"]
-mod handle;
-#[path = "control/inbound_runtime.rs"]
-mod inbound_runtime;
-#[path = "control/monitor.rs"]
-pub mod monitor;
+mod control;
+mod maintenance;
+mod plane;
+mod policy;
+mod support;
 
-// Data plane: inbound ownership, DNS/TUN execution and outbound proxy flows.
-#[path = "plane/data_plane.rs"]
-mod data_plane;
-#[path = "plane/inbounds/mod.rs"]
-pub mod inbound;
-#[path = "plane/outbound.rs"]
-mod proxy;
-
-// Policy/runtime assembly inputs: defaults, resolvers, routes and settings.
-#[path = "policy/defaults.rs"]
-mod defaults;
-#[path = "policy/resolver.rs"]
-mod resolver;
-#[cfg(feature = "doh-tls")]
-#[path = "policy/resolver_registry.rs"]
-mod resolver_registry;
-#[path = "policy/route.rs"]
-mod route;
-#[path = "policy/settings.rs"]
-mod settings;
-
-// Runtime support shared by the control and data planes.
-#[path = "support/interfaces.rs"]
-pub mod interfaces;
-#[path = "support/latency.rs"]
-pub mod latency;
-#[path = "support/loopback.rs"]
-mod loopback;
-#[path = "support/monitoring.rs"]
-mod monitoring;
-#[cfg(feature = "doh-tls")]
-#[path = "support/tls.rs"]
-mod tls;
-
-// Optional management-side maintenance features.
-#[path = "maintenance/log.rs"]
-pub mod log;
+// Preserve the crate's existing internal module names while the physical
+// layout follows the responsibility-based directory tree.
+pub use control::monitor;
+pub(crate) use control::{controller, handle, inbound_runtime};
+pub use maintenance::log;
 #[cfg(feature = "update")]
-#[path = "maintenance/update.rs"]
-pub mod update;
+pub use maintenance::update;
+pub use plane::inbounds as inbound;
+pub(crate) use plane::{data_plane, outbound as proxy};
+#[cfg(feature = "doh-tls")]
+pub(crate) use policy::resolver_registry;
+pub(crate) use policy::{defaults, resolver, route, settings};
+#[cfg(feature = "doh-tls")]
+pub(crate) use support::tls;
+pub use support::{interfaces, latency};
+pub(crate) use support::{loopback, monitoring};
 
 mod assembly;
 

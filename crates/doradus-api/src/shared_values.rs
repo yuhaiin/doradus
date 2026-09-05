@@ -63,9 +63,7 @@ pub async fn tag_put_value(state: &ApiState, value: Value) -> ApiResult {
     };
     state
         .controller
-        .mutate_and_reload(
-            move |store| async move { store.repository().put_go_node_tag(&record).await },
-        )
+        .mutate_and_reload_blocking(move |store| store.repository().put_go_node_tag_sync(&record))
         .await?;
     Ok(empty_json())
 }
@@ -74,8 +72,8 @@ pub async fn tag_delete_value(state: &ApiState, tag: String) -> ApiResult {
     let tag = tag.trim().to_owned();
     state
         .controller
-        .mutate_and_reload(move |store| async move {
-            let deleted = store.repository().delete_go_node_tag_by_name(&tag).await?;
+        .mutate_and_reload_blocking(move |store| {
+            let deleted = store.repository().delete_go_node_tag_by_name_sync(&tag)?;
             if deleted {
                 Ok(())
             } else {

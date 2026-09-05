@@ -1,137 +1,205 @@
 use super::*;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::plane::outbound) struct ProtocolTlsPlan {
+    pub(super) server_name: String,
+    pub(super) ca_certificates: Vec<Vec<u8>>,
+    pub(super) insecure_skip_verify: bool,
+    pub(super) next_protocols: Vec<String>,
+}
+
 #[cfg(feature = "doh-tls")]
-pub(in crate::proxy) fn build_protocol_tls_proxy(
-    config: &GoProxyRuntimeConfig,
+#[derive(Clone)]
+pub(in crate::plane::outbound) struct TlsTerminationPlan {
+    default: Vec<Arc<rustls::sign::CertifiedKey>>,
+    named: BTreeMap<String, Arc<rustls::sign::CertifiedKey>>,
+    alpn_protocols: Vec<Vec<u8>>,
+}
+
+#[cfg(feature = "doh-tls")]
+impl TlsTerminationPlan {
+    pub(in crate::plane::outbound) fn compile(config: &GoProxyRuntimeConfig) -> Result<Self> {
+        let layer = config
+            .layers
+            .iter()
+            .find(|layer| layer.kind.eq_ignore_ascii_case("tls_termination"))
+            .ok_or_else(|| Error::invalid("TLS termination layer is missing"))?;
+        let tls = layer.config.get("tls").unwrap_or(&layer.config);
+        let certificates = tls
+            .get("certificates")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| Error::invalid("TLS termination certificates are missing"))?;
+
+        let mut entries = Vec::new();
+        for certificate in certificates {
+            let certificate = certificate
+                .as_object()
+                .ok_or_else(|| Error::invalid("TLS termination certificate must be an object"))?;
+            entries.push((certificate, None));
+        }
+        if let Some(named_certificates) = tls
+            .get("serverNameCertificate")
+            .or_else(|| tls.get("server_name_certificate"))
+            .and_then(serde_json::Value::as_object)
+        {
+            for (name, certificate) in named_certificates {
+                let certificate = certificate.as_object().ok_or_else(|| {
+                    Error::invalid("TLS termination named certificate must be an object")
+                })?;
+                entries.push((certificate, Some(name.as_str())));
+            }
+        }
+
+        let mut default = Vec::new();
+        let mut named = BTreeMap::new();
+        for (certificate, name) in entries {
+            let certified = tls_termination_certified_key(certificate)?;
+            if let Some(name) = name {
+                let name = tls_termination_name(name);
+                if !name.is_empty() {
+                    named.insert(name, Arc::clone(&certified));
+                }
+            } else {
+                default.push(Arc::clone(&certified));
+            }
+        }
+        if default.is_empty() && named.is_empty() {
+            return Err(Error::invalid("TLS termination has no usable certificates"));
+        }
+        let alpn_protocols = tls
+            .get("nextProtos")
+            .or_else(|| tls.get("next_protos"))
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::as_bytes)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            default,
+            named,
+            alpn_protocols,
+        })
+    }
+}
+
+impl ProtocolTlsPlan {
+    pub(in crate::plane::outbound) fn compile(config: &GoProxyRuntimeConfig) -> Result<Self> {
+        let layer = config
+            .layers
+            .iter()
+            .find(|layer| layer.kind.eq_ignore_ascii_case("tls"))
+            .ok_or_else(|| Error::invalid("protocol TLS layer is missing"))?;
+        Self::compile_layer(layer)
+    }
+
+    pub(in crate::plane::outbound) fn compile_layer(layer: &GoProxyLayer) -> Result<Self> {
+        use base64::Engine;
+
+        let server_name = layer
+            .config
+            .get("servernames")
+            .or_else(|| layer.config.get("serverNames"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|values| values.iter().find_map(serde_json::Value::as_str))
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| Error::invalid("protocol TLS layer requires servernames"))?;
+        let ca_certificates = layer
+            .config
+            .get("ca_cert")
+            .or_else(|| layer.config.get("caCert"))
+            .and_then(serde_json::Value::as_array)
+            .map(|certificates| {
+                certificates
+                    .iter()
+                    .map(|certificate| {
+                        let encoded = certificate.as_str().ok_or_else(|| {
+                            Error::invalid("protocol TLS ca_cert must contain strings")
+                        })?;
+                        base64::engine::general_purpose::STANDARD
+                            .decode(encoded)
+                            .map_err(|error| {
+                                Error::new(
+                                    ErrorKind::InvalidInput,
+                                    format!("protocol TLS ca_cert: {error}"),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let insecure_skip_verify = layer
+            .config
+            .get("insecure_skip_verify")
+            .or_else(|| layer.config.get("insecureSkipVerify"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let next_protocols = layer
+            .config
+            .get("next_protos")
+            .or_else(|| layer.config.get("nextProtos"))
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            server_name,
+            ca_certificates,
+            insecure_skip_verify,
+            next_protocols,
+        })
+    }
+}
+
+#[cfg(feature = "doh-tls")]
+pub(in crate::plane::outbound) fn build_protocol_tls_proxy(
+    plan: &ProtocolTlsPlan,
     upstream: Arc<dyn AsyncProxy>,
 ) -> Result<Arc<dyn AsyncProxy>> {
-    use base64::Engine;
     use rustls::RootCertStore;
     use rustls::pki_types::CertificateDer;
 
-    let layer = config
-        .layers
-        .iter()
-        .find(|layer| layer.kind.eq_ignore_ascii_case("tls"))
-        .ok_or_else(|| Error::invalid("protocol TLS layer is missing"))?;
-    let server_name = layer
-        .config
-        .get("servernames")
-        .or_else(|| layer.config.get("serverNames"))
-        .and_then(serde_json::Value::as_array)
-        .and_then(|values| values.iter().find_map(serde_json::Value::as_str))
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::invalid("protocol TLS layer requires servernames"))?;
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    if let Some(certificates) = layer
-        .config
-        .get("ca_cert")
-        .or_else(|| layer.config.get("caCert"))
-        .and_then(serde_json::Value::as_array)
-    {
-        for certificate in certificates {
-            let encoded = certificate
-                .as_str()
-                .ok_or_else(|| Error::invalid("Trojan TLS ca_cert must contain strings"))?;
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .map_err(|error| {
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        format!("protocol TLS ca_cert: {error}"),
-                    )
-                })?;
-            roots.add(CertificateDer::from(bytes)).map_err(|error| {
+    for certificate in &plan.ca_certificates {
+        roots
+            .add(CertificateDer::from(certificate.clone()))
+            .map_err(|error| {
                 Error::new(ErrorKind::Protocol, format!("protocol TLS CA: {error}"))
             })?;
-        }
     }
-    let insecure_skip_verify = layer
-        .config
-        .get("insecure_skip_verify")
-        .or_else(|| layer.config.get("insecureSkipVerify"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let next_protocols = layer
-        .config
-        .get("next_protos")
-        .or_else(|| layer.config.get("nextProtos"))
-        .and_then(serde_json::Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     Ok(Arc::new(
         doradus_protocol::tls::RustCryptoTlsProxy::new_with_options(
             upstream,
             roots,
-            server_name,
-            &next_protocols,
-            insecure_skip_verify,
+            &plan.server_name,
+            &plan.next_protocols,
+            plan.insecure_skip_verify,
         )?,
     ))
 }
 
 #[cfg(feature = "doh-tls")]
-pub(in crate::proxy) fn build_tls_termination_proxy(
-    config: &GoProxyRuntimeConfig,
+pub(in crate::plane::outbound) fn build_tls_termination_proxy(
+    plan: TlsTerminationPlan,
     upstream: Arc<dyn AsyncProxy>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     use tokio_rustls::TlsAcceptor;
-
-    let layer = config
-        .layers
-        .iter()
-        .find(|layer| layer.kind.eq_ignore_ascii_case("tls_termination"))
-        .ok_or_else(|| Error::invalid("TLS termination layer is missing"))?;
-    let tls = layer.config.get("tls").unwrap_or(&layer.config);
-    let certificates = tls
-        .get("certificates")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| Error::invalid("TLS termination certificates are missing"))?;
-
-    let mut entries = Vec::new();
-    for certificate in certificates {
-        let certificate = certificate
-            .as_object()
-            .ok_or_else(|| Error::invalid("TLS termination certificate must be an object"))?;
-        entries.push((certificate, None));
-    }
-    if let Some(named_certificates) = tls
-        .get("serverNameCertificate")
-        .or_else(|| tls.get("server_name_certificate"))
-        .and_then(serde_json::Value::as_object)
-    {
-        for (name, certificate) in named_certificates {
-            let certificate = certificate.as_object().ok_or_else(|| {
-                Error::invalid("TLS termination named certificate must be an object")
-            })?;
-            entries.push((certificate, Some(name.as_str())));
-        }
-    }
-
-    let mut default = Vec::new();
-    let mut named = BTreeMap::new();
-    for (certificate, name) in entries {
-        let certified = tls_termination_certified_key(certificate)?;
-        if let Some(name) = name {
-            let name = tls_termination_name(name);
-            if !name.is_empty() {
-                named.insert(name, Arc::clone(&certified));
-            }
-        } else {
-            default.push(Arc::clone(&certified));
-        }
-    }
-    if default.is_empty() && named.is_empty() {
-        return Err(Error::invalid("TLS termination has no usable certificates"));
-    }
-    let resolver = StaticTlsTerminationResolver { default, named };
+    let resolver = StaticTlsTerminationResolver {
+        default: plan.default,
+        named: plan.named,
+    };
     let mut server = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -144,19 +212,7 @@ pub(in crate::proxy) fn build_tls_termination_proxy(
     })?
     .with_no_client_auth()
     .with_cert_resolver(Arc::new(resolver));
-    server.alpn_protocols = tls
-        .get("nextProtos")
-        .or_else(|| tls.get("next_protos"))
-        .and_then(serde_json::Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::as_bytes)
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
+    server.alpn_protocols = plan.alpn_protocols;
 
     Ok(Arc::new(TlsTerminationProxy {
         upstream,
@@ -165,7 +221,7 @@ pub(in crate::proxy) fn build_tls_termination_proxy(
 }
 
 #[cfg(feature = "doh-tls")]
-pub(super) fn tls_termination_certified_key(
+pub(in crate::plane::outbound) fn tls_termination_certified_key(
     value: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Arc<rustls::sign::CertifiedKey>> {
     // Go's x509KeyPair tries a complete file-path pair first, then falls back
@@ -194,7 +250,7 @@ pub(super) fn tls_termination_certified_key(
 }
 
 #[cfg(feature = "doh-tls")]
-pub(super) fn tls_termination_file_pair(
+pub(in crate::plane::outbound) fn tls_termination_file_pair(
     value: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
     let cert_path = value
@@ -216,7 +272,7 @@ pub(super) fn tls_termination_file_pair(
 }
 
 #[cfg(feature = "doh-tls")]
-pub(super) fn tls_termination_certified_key_from_bytes(
+pub(in crate::plane::outbound) fn tls_termination_certified_key_from_bytes(
     cert_bytes: Vec<u8>,
     key_bytes: Vec<u8>,
 ) -> Result<Arc<rustls::sign::CertifiedKey>> {
@@ -265,7 +321,7 @@ pub(super) fn tls_termination_certified_key_from_bytes(
 }
 
 #[cfg(feature = "doh-tls")]
-pub(in crate::proxy) fn tls_termination_name(name: &str) -> String {
+pub(in crate::plane::outbound) fn tls_termination_name(name: &str) -> String {
     let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
     if name.is_empty() || name.starts_with("*.") || name.parse::<std::net::IpAddr>().is_ok() {
         name
@@ -275,7 +331,7 @@ pub(in crate::proxy) fn tls_termination_name(name: &str) -> String {
 }
 
 #[cfg(feature = "doh-tls")]
-pub(in crate::proxy) fn tls_termination_bytes(
+pub(in crate::plane::outbound) fn tls_termination_bytes(
     value: &serde_json::Map<String, serde_json::Value>,
     encoded_keys: &[&str],
     file_keys: &[&str],
@@ -343,7 +399,7 @@ impl rustls::server::ResolvesServerCert for StaticTlsTerminationResolver {
 }
 
 #[cfg(feature = "doh-tls")]
-pub(in crate::proxy) fn tls_termination_match_name<'a, T>(
+pub(in crate::plane::outbound) fn tls_termination_match_name<'a, T>(
     server_name: Option<&str>,
     named: &'a BTreeMap<String, T>,
 ) -> Option<&'a T> {

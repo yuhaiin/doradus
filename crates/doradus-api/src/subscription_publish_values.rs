@@ -22,8 +22,8 @@ pub async fn subscriptions_put_value(state: &ApiState, value: Value) -> ApiResul
     let records = subscription_records(&value)?;
     state
         .controller
-        .mutate_and_reload(move |store| async move {
-            store.repository().put_go_subscription_links(&records).await
+        .mutate_and_reload_blocking(move |store| {
+            store.repository().put_go_subscription_links_sync(&records)
         })
         .await?;
     empty()
@@ -41,16 +41,12 @@ pub async fn subscriptions_delete_value(state: &ApiState, value: &Value) -> ApiR
     let groups = names.clone();
     state
         .controller
-        .mutate_and_reload(move |store| async move {
+        .mutate_and_reload_blocking(move |store| {
             store
                 .repository()
-                .delete_go_subscription_links(&names)
-                .await?;
+                .delete_go_subscription_links_sync(&names)?;
             if delete_nodes {
-                store
-                    .repository()
-                    .delete_go_nodes_by_groups(&groups)
-                    .await?;
+                store.repository().delete_go_nodes_by_groups_sync(&groups)?;
             }
             Ok(())
         })

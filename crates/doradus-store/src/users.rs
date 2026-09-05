@@ -320,12 +320,16 @@ impl ConfigRepository {
         Ok((views, total))
     }
 
-    pub async fn get_go_user(&self, id: &str) -> Result<GoUserRecord> {
+    pub fn get_go_user_sync(&self, id: &str) -> Result<GoUserRecord> {
         validate_id(id)?;
         self.list_go_user_records()?
             .into_iter()
             .find(|record| record.id == id)
             .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("user {id} was not found")))
+    }
+
+    pub async fn get_go_user(&self, id: &str) -> Result<GoUserRecord> {
+        self.get_go_user_sync(id)
     }
 
     pub async fn get_go_user_view(&self, id: &str) -> Result<GoUserView> {
@@ -341,7 +345,7 @@ impl ConfigRepository {
         Ok(record.view(0))
     }
 
-    pub async fn save_go_user(&self, record: &GoUserRecord) -> Result<()> {
+    pub fn save_go_user_sync(&self, record: &GoUserRecord) -> Result<()> {
         record.validate()?;
         let record = record.clone();
         self.store.with_write_transaction(move |connection| {
@@ -455,7 +459,11 @@ impl ConfigRepository {
         })
     }
 
-    pub async fn delete_go_user(&self, id: &str) -> Result<()> {
+    pub async fn save_go_user(&self, record: &GoUserRecord) -> Result<()> {
+        self.save_go_user_sync(record)
+    }
+
+    pub fn delete_go_user_sync(&self, id: &str) -> Result<()> {
         validate_id(id)?;
         let references = self
             .go_user_outbound_references()?
@@ -484,6 +492,10 @@ impl ConfigRepository {
             }
             Ok(())
         })
+    }
+
+    pub async fn delete_go_user(&self, id: &str) -> Result<()> {
+        self.delete_go_user_sync(id)
     }
 
     fn list_go_user_records(&self) -> Result<Vec<GoUserRecord>> {

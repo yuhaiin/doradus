@@ -29,8 +29,8 @@ pub async fn route_config_put_value(state: &ApiState, value: Value) -> ApiResult
     let returned = value.clone();
     state
         .controller
-        .mutate_and_reload(move |store| async move {
-            store.repository().put_go_route_settings(&record).await
+        .mutate_and_reload_blocking(move |store| {
+            store.repository().put_go_route_settings_sync(&record)
         })
         .await?;
     Ok(Json(returned))
@@ -95,11 +95,9 @@ pub async fn save_route_list_value(
     let returned = value.clone();
     state
         .controller
-        .mutate_and_reload(move |store| async move {
-            store.repository().put_go_route_list(&record).await?;
-            store
-                .put_config(ROUTE_LIST_ACTIVATION_KEY, &activation)
-                .await
+        .mutate_and_reload_blocking(move |store| {
+            store.repository().put_go_route_list_sync(&record)?;
+            store.put_config_sync(ROUTE_LIST_ACTIVATION_KEY, &activation)
         })
         .await?;
     Ok(Json(returned))
@@ -109,11 +107,9 @@ pub async fn delete_route_list_value(state: &ApiState, id: String) -> ApiResult 
     let activation = serde_json::to_vec(&pending_route_list_activation())?;
     let result = state
         .controller
-        .mutate_and_reload(move |store| async move {
-            if store.repository().delete_go_route_list(&id).await? {
-                store
-                    .put_config(ROUTE_LIST_ACTIVATION_KEY, &activation)
-                    .await
+        .mutate_and_reload_blocking(move |store| {
+            if store.repository().delete_go_route_list_sync(&id)? {
+                store.put_config_sync(ROUTE_LIST_ACTIVATION_KEY, &activation)
             } else {
                 Err(doradus_core::Error::new(
                     doradus_core::ErrorKind::NotFound,
@@ -235,15 +231,14 @@ pub async fn save_route_rule_value(
     let activation = serde_json::to_vec(&pending_route_rule_activation())?;
     state
         .controller
-        .mutate_and_reload(move |store| async move {
+        .mutate_and_reload_blocking(move |store| {
             if replace_legacy_id {
                 store
                     .repository()
-                    .delete_go_route_rule_by_name(&record.name)
-                    .await?;
+                    .delete_go_route_rule_by_name_sync(&record.name)?;
             }
-            store.repository().put_go_route_rule(&record).await?;
-            store.put_config(ROUTE_ACTIVATION_KEY, &activation).await
+            store.repository().put_go_route_rule_sync(&record)?;
+            store.put_config_sync(ROUTE_ACTIVATION_KEY, &activation)
         })
         .await?;
     Ok(Json(returned))
@@ -262,12 +257,11 @@ pub async fn delete_route_rule_value(state: &ApiState, name: String, _index: usi
     let activation = serde_json::to_vec(&pending_route_rule_activation())?;
     let result = state
         .controller
-        .mutate_and_reload(move |store| async move {
+        .mutate_and_reload_blocking(move |store| {
             store
                 .repository()
-                .delete_go_route_rule_by_name(&name)
-                .await?;
-            store.put_config(ROUTE_ACTIVATION_KEY, &activation).await
+                .delete_go_route_rule_by_name_sync(&name)?;
+            store.put_config_sync(ROUTE_ACTIVATION_KEY, &activation)
         })
         .await;
     result.map(|_| empty_json()).map_err(Into::into)
@@ -295,12 +289,13 @@ pub async fn route_rules_priority_value(state: &ApiState, value: &Value) -> ApiR
 
     let result = state
         .controller
-        .mutate_and_reload(move |store| async move {
-            store
-                .repository()
-                .change_go_route_rule_priority(&source_name, &target_name, &operate)
-                .await?;
-            store.put_config(ROUTE_ACTIVATION_KEY, &activation).await
+        .mutate_and_reload_blocking(move |store| {
+            store.repository().change_go_route_rule_priority_sync(
+                &source_name,
+                &target_name,
+                &operate,
+            )?;
+            store.put_config_sync(ROUTE_ACTIVATION_KEY, &activation)
         })
         .await;
     result
@@ -437,11 +432,9 @@ pub async fn route_apply_value(state: &ApiState) -> ApiResult {
     let list_bytes = serde_json::to_vec(&json!({"hostIndexRefreshAt": 0}))?;
     state
         .controller
-        .mutate_and_reload(move |store| async move {
-            store.put_config(ROUTE_ACTIVATION_KEY, &bytes).await?;
-            store
-                .put_config(ROUTE_LIST_ACTIVATION_KEY, &list_bytes)
-                .await
+        .mutate_and_reload_blocking(move |store| {
+            store.put_config_sync(ROUTE_ACTIVATION_KEY, &bytes)?;
+            store.put_config_sync(ROUTE_LIST_ACTIVATION_KEY, &list_bytes)
         })
         .await?;
     state
@@ -595,9 +588,9 @@ pub async fn resolver_server_put_value(state: &ApiState, value: Value) -> ApiRes
     let bytes = serde_json::to_vec(&config)?;
     state
         .controller
-        .mutate_and_reload_dns(move |store| async move {
-            store.put_config("resolver.server", &bytes).await?;
-            store.repository().put_go_dns_server(&server).await
+        .mutate_and_reload_dns_blocking(move |store| {
+            store.put_config_sync("resolver.server", &bytes)?;
+            store.repository().put_go_dns_server_sync(&server)
         })
         .await?;
     Ok(Json(config))

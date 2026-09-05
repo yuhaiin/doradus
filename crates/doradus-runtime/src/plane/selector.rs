@@ -1,4 +1,5 @@
 use super::*;
+use arc_swap::ArcSwap;
 use doradus_metrics::{RouteAction, RuntimeMetrics};
 
 /// A TUN-facing selector whose proxy slots can be replaced as one unit after
@@ -6,21 +7,26 @@ use doradus_metrics::{RouteAction, RuntimeMetrics};
 /// by the old slot; new flows observe the new snapshot after `replace`.
 pub struct RuntimeProxySelector {
     metrics: Arc<RuntimeMetrics>,
-    current: RwLock<RuntimeRoutedProxySelector>,
-    udp_current: RwLock<RuntimeRoutedProxySelector>,
-    pub(super) tagged: RwLock<BTreeMap<String, Arc<dyn AsyncProxy>>>,
-    pub(super) udp_tagged: RwLock<BTreeMap<String, Arc<dyn AsyncProxy>>>,
+    state: ArcSwap<SelectorState>,
     direct_id: String,
     proxy_id: String,
     udp_proxy_id: String,
     bypass_id: String,
     drop_id: String,
     timeout: Duration,
-    closed_nodes: RwLock<BTreeSet<String>>,
-    retargeted_nodes: RwLock<BTreeSet<String>>,
-    metadata: RwLock<Arc<ProxyContextMetadata>>,
-    settings: RwLock<crate::RuntimeSettings>,
     loopback: LoopbackDetector,
+}
+
+#[derive(Clone)]
+struct SelectorState {
+    current: RuntimeRoutedProxySelector,
+    udp_current: RuntimeRoutedProxySelector,
+    tagged: BTreeMap<String, Arc<dyn AsyncProxy>>,
+    udp_tagged: BTreeMap<String, Arc<dyn AsyncProxy>>,
+    closed_nodes: BTreeSet<String>,
+    retargeted_nodes: BTreeSet<String>,
+    metadata: Arc<ProxyContextMetadata>,
+    settings: crate::RuntimeSettings,
 }
 
 #[derive(Clone, Default)]
@@ -40,14 +46,7 @@ struct ProxyContextMetadata {
 
 impl RuntimeProxySelector {
     pub(crate) fn active_node_ids(&self) -> Vec<String> {
-        let closed_nodes = self
-            .closed_nodes
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let retargeted_nodes = self
-            .retargeted_nodes
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self.state.load();
         [
             self.direct_id.as_str(),
             self.proxy_id.as_str(),
@@ -57,7 +56,9 @@ impl RuntimeProxySelector {
         ]
         .into_iter()
         .filter(|id| {
-            !id.is_empty() && !closed_nodes.contains(*id) && !retargeted_nodes.contains(*id)
+            !id.is_empty()
+                && !state.closed_nodes.contains(*id)
+                && !state.retargeted_nodes.contains(*id)
         })
         .map(str::to_owned)
         .collect()
@@ -84,32 +85,29 @@ impl RuntimeProxySelector {
         // are Arc-backed and can be shared by TCP and UDP selectors; building
         // them twice would reopen every tagged node during startup/reload.
         let udp_tagged = tagged.clone();
+        let metadata = Arc::new(
+            snapshot
+                .proxy_context_metadata(direct_id, tcp_proxy_id, udp_proxy_id, bypass_id, drop_id)
+                .await?,
+        );
         Ok(Self {
             metrics: Arc::clone(&snapshot.metrics),
-            current: RwLock::new(track_selector(current, &loopback)),
-            udp_current: RwLock::new(track_selector(udp_current, &loopback)),
-            tagged: RwLock::new(track_tagged_proxies(tagged, &loopback)),
-            udp_tagged: RwLock::new(track_tagged_proxies(udp_tagged, &loopback)),
+            state: ArcSwap::from_pointee(SelectorState {
+                current: track_selector(current, &loopback),
+                udp_current: track_selector(udp_current, &loopback),
+                tagged: track_tagged_proxies(tagged, &loopback),
+                udp_tagged: track_tagged_proxies(udp_tagged, &loopback),
+                closed_nodes: BTreeSet::new(),
+                retargeted_nodes: BTreeSet::new(),
+                metadata,
+                settings: snapshot.settings.clone(),
+            }),
             direct_id: direct_id.to_owned(),
             proxy_id: tcp_proxy_id.to_owned(),
             udp_proxy_id: udp_proxy_id.to_owned(),
             bypass_id: bypass_id.to_owned(),
             drop_id: drop_id.to_owned(),
             timeout,
-            closed_nodes: RwLock::new(BTreeSet::new()),
-            retargeted_nodes: RwLock::new(BTreeSet::new()),
-            metadata: RwLock::new(Arc::new(
-                snapshot
-                    .proxy_context_metadata(
-                        direct_id,
-                        tcp_proxy_id,
-                        udp_proxy_id,
-                        bypass_id,
-                        drop_id,
-                    )
-                    .await?,
-            )),
-            settings: RwLock::new(snapshot.settings.clone()),
             loopback,
         })
     }
@@ -118,11 +116,12 @@ impl RuntimeProxySelector {
         &self,
         snapshot: &RuntimeSnapshot,
     ) -> Result<PreparedProxySelector> {
-        let direct_id = self.effective_node_id(&self.direct_id);
-        let proxy_id = self.effective_node_id(&self.proxy_id);
-        let udp_proxy_id = self.effective_node_id(&self.udp_proxy_id);
-        let bypass_id = self.effective_node_id(&self.bypass_id);
-        let drop_id = self.effective_node_id(&self.drop_id);
+        let state = self.state.load();
+        let direct_id = self.effective_node_id(&state, &self.direct_id);
+        let proxy_id = self.effective_node_id(&state, &self.proxy_id);
+        let udp_proxy_id = self.effective_node_id(&state, &self.udp_proxy_id);
+        let bypass_id = self.effective_node_id(&state, &self.bypass_id);
+        let drop_id = self.effective_node_id(&state, &self.drop_id);
         let tagged = snapshot.build_tagged_proxies(self.timeout).await?;
         let udp_tagged = tagged.clone();
         Ok(PreparedProxySelector {
@@ -168,39 +167,16 @@ impl RuntimeProxySelector {
     }
 
     pub(crate) fn replace(&self, next: PreparedProxySelector) {
-        let mut current = self
-            .current
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *current = next.selector;
-        *self
-            .udp_current
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.udp_selector;
-        *self
-            .tagged
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.tagged;
-        *self
-            .udp_tagged
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.udp_tagged;
-        self.closed_nodes
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-        self.retargeted_nodes
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-        *self
-            .metadata
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.metadata;
-        *self
-            .settings
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.settings;
+        self.state.store(Arc::new(SelectorState {
+            current: next.selector,
+            udp_current: next.udp_selector,
+            tagged: next.tagged,
+            udp_tagged: next.udp_tagged,
+            closed_nodes: BTreeSet::new(),
+            retargeted_nodes: BTreeSet::new(),
+            metadata: next.metadata,
+            settings: next.settings,
+        }));
     }
 
     /// Close every slot that currently points at `id`, then make new flows
@@ -208,62 +184,52 @@ impl RuntimeProxySelector {
     /// keep their selected `Arc`, so closing the old instances also mirrors
     /// Go's `ProxyStore.Delete` behavior for those flows.
     pub(crate) async fn close_node(&self, id: &str) {
+        self.close_node_with_retarget(id, false).await;
+    }
+
+    async fn close_node_with_retarget(&self, id: &str, retarget: bool) {
         let mut old_proxies = Vec::new();
         let mut closed_proxy_ids = BTreeSet::new();
-        {
-            let mut current = self
-                .current
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut closed_nodes = self
-                .closed_nodes
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self.state.load_full();
+        let mut next = (*current).clone();
 
-            macro_rules! close_slot {
-                ($slot_id:expr, $slot:expr) => {
-                    if $slot_id == id {
-                        let proxy = Arc::clone($slot);
-                        if closed_proxy_ids.insert(Arc::as_ptr(&proxy).cast::<()>() as usize) {
-                            old_proxies.push(proxy);
-                        }
-                        *$slot = Arc::new(DropAsyncProxy);
+        macro_rules! close_slot {
+            ($slot_id:expr, $slot:expr) => {
+                if $slot_id == id {
+                    let proxy = Arc::clone($slot);
+                    if closed_proxy_ids.insert(Arc::as_ptr(&proxy).cast::<()>() as usize) {
+                        old_proxies.push(proxy);
                     }
-                };
-            }
-            close_slot!(&self.direct_id, &mut current.direct);
-            close_slot!(&self.proxy_id, &mut current.proxy);
-            close_slot!(&self.bypass_id, &mut current.bypass);
-            close_slot!(&self.drop_id, &mut current.drop);
-            let mut udp_current = self
-                .udp_current
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            close_slot!(&self.direct_id, &mut udp_current.direct);
-            close_slot!(&self.udp_proxy_id, &mut udp_current.proxy);
-            close_slot!(&self.bypass_id, &mut udp_current.bypass);
-            close_slot!(&self.drop_id, &mut udp_current.drop);
-            let mut tagged = self
-                .tagged
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for proxy in std::mem::take(&mut *tagged).into_values() {
+                    *$slot = Arc::new(DropAsyncProxy);
+                }
+            };
+        }
+        close_slot!(&self.direct_id, &mut next.current.direct);
+        close_slot!(&self.proxy_id, &mut next.current.proxy);
+        close_slot!(&self.bypass_id, &mut next.current.bypass);
+        close_slot!(&self.drop_id, &mut next.current.drop);
+        close_slot!(&self.direct_id, &mut next.udp_current.direct);
+        close_slot!(&self.udp_proxy_id, &mut next.udp_current.proxy);
+        close_slot!(&self.bypass_id, &mut next.udp_current.bypass);
+        close_slot!(&self.drop_id, &mut next.udp_current.drop);
+        if !old_proxies.is_empty() {
+            for proxy in std::mem::take(&mut next.tagged).into_values() {
                 if closed_proxy_ids.insert(Arc::as_ptr(&proxy).cast::<()>() as usize) {
                     old_proxies.push(proxy);
                 }
             }
-            let mut udp_tagged = self
-                .udp_tagged
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for proxy in std::mem::take(&mut *udp_tagged).into_values() {
+            for proxy in std::mem::take(&mut next.udp_tagged).into_values() {
                 if closed_proxy_ids.insert(Arc::as_ptr(&proxy).cast::<()>() as usize) {
                     old_proxies.push(proxy);
                 }
             }
-            if !old_proxies.is_empty() {
-                closed_nodes.insert(id.to_owned());
-            }
+            next.closed_nodes.insert(id.to_owned());
+        }
+        if retarget {
+            next.retargeted_nodes.insert(id.to_owned());
+        }
+        if !old_proxies.is_empty() || retarget {
+            self.state.store(Arc::new(next));
         }
 
         for proxy in old_proxies {
@@ -278,20 +244,11 @@ impl RuntimeProxySelector {
     /// already closed by `close_node`; the next successful replacement then
     /// installs the direct fallback for new flows.
     pub(crate) async fn retarget_node_to_direct(&self, id: &str) {
-        self.close_node(id).await;
-        self.retargeted_nodes
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(id.to_owned());
+        self.close_node_with_retarget(id, true).await;
     }
 
-    fn effective_node_id(&self, id: &str) -> String {
-        if self
-            .retargeted_nodes
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(id)
-        {
+    fn effective_node_id(&self, state: &SelectorState, id: &str) -> String {
+        if state.retargeted_nodes.contains(id) {
             String::new()
         } else {
             id.to_owned()
@@ -299,24 +256,30 @@ impl RuntimeProxySelector {
     }
 
     pub(crate) fn relay_buffer_size(&self) -> usize {
-        self.settings
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .relay_buffer_size
+        self.state.load().settings.relay_buffer_size
     }
 
     pub(crate) fn udp_buffer_size(&self) -> usize {
-        self.settings
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .udp_buffer_size
+        self.state.load().settings.udp_buffer_size
     }
 
     pub(crate) fn udp_ringbuffer_size(&self) -> usize {
-        self.settings
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .udp_ringbuffer_size
+        self.state.load().settings.udp_ringbuffer_size
+    }
+
+    #[cfg(test)]
+    pub(super) fn tagged_proxy(
+        &self,
+        network: doradus_core::Network,
+        tag: &str,
+    ) -> Option<Arc<dyn AsyncProxy>> {
+        let state = self.state.load();
+        let tagged = if network == doradus_core::Network::Udp {
+            &state.udp_tagged
+        } else {
+            &state.tagged
+        };
+        tagged.get(tag).cloned()
     }
 }
 
@@ -412,27 +375,6 @@ impl RuntimeProxySelector {
         }
     }
 
-    /// Evaluate loopback and route rules against the list membership computed
-    /// from the immutable snapshot, then restore that complete membership for
-    /// metadata consumers after the trie applies a specific rule.
-    fn evaluate_route(&self, context: &mut FlowContext, metadata: &ProxyContextMetadata) {
-        let matched_lists = metadata.route_lists.matching_names(context);
-        context.lists = matched_lists.clone();
-        if let Some(reason) = self.loopback.reason(context) {
-            context.route_mode = RouteMode::Block;
-            context.skip_route = true;
-            context.tag = Some(reason.to_owned());
-            context.match_history.clear();
-        } else {
-            let current = self
-                .current
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            current.route_context(context);
-        }
-        context.lists = matched_lists;
-    }
-
     fn resolver_for_route_mode(
         &self,
         context: &FlowContext,
@@ -457,18 +399,25 @@ pub(crate) struct PreparedProxySelector {
 
 impl AsyncProxySelector for RuntimeProxySelector {
     fn route_context(&self, context: &mut FlowContext) {
-        let direct_id = self.effective_node_id(&self.direct_id);
-        let proxy_id = self.effective_node_id(&self.proxy_id);
-        let udp_proxy_id = self.effective_node_id(&self.udp_proxy_id);
-        let bypass_id = self.effective_node_id(&self.bypass_id);
-        let metadata = self
-            .metadata
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let state = self.state.load();
+        let direct_id = self.effective_node_id(&state, &self.direct_id);
+        let proxy_id = self.effective_node_id(&state, &self.proxy_id);
+        let udp_proxy_id = self.effective_node_id(&state, &self.udp_proxy_id);
+        let bypass_id = self.effective_node_id(&state, &self.bypass_id);
+        let metadata = Arc::clone(&state.metadata);
         self.restore_fakeip_destination(context, &metadata);
         self.apply_hosts_override(context, &metadata);
-        self.evaluate_route(context, &metadata);
+        let matched_lists = metadata.route_lists.matching_names(context);
+        context.lists = matched_lists.clone();
+        if let Some(reason) = self.loopback.reason(context) {
+            context.route_mode = RouteMode::Block;
+            context.skip_route = true;
+            context.tag = Some(reason.to_owned());
+            context.match_history.clear();
+        } else {
+            state.current.route_context(context);
+        }
+        context.lists = matched_lists;
         self.metrics.route_match(match context.route_mode {
             RouteMode::Direct => RouteAction::Direct,
             RouteMode::Proxy => RouteAction::Proxy,
@@ -487,15 +436,12 @@ impl AsyncProxySelector for RuntimeProxySelector {
     }
 
     fn select(&self, context: &FlowContext) -> Arc<dyn AsyncProxy> {
+        let state = self.state.load();
         if context.route_mode != doradus_core::RouteMode::Block {
             let tagged = if context.network == doradus_core::Network::Udp {
-                self.udp_tagged
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                &state.udp_tagged
             } else {
-                self.tagged
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                &state.tagged
             };
             if let Some(tag) = context.tag.as_deref().filter(|tag| !tag.trim().is_empty())
                 && let Some(proxy) = tagged.get(tag)
@@ -504,13 +450,9 @@ impl AsyncProxySelector for RuntimeProxySelector {
             }
         }
         let current = if context.network == doradus_core::Network::Udp {
-            self.udp_current
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            &state.udp_current
         } else {
-            self.current
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            &state.current
         };
         current.select(context)
     }

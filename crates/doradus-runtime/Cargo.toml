@@ -68,6 +68,7 @@ websocket = [
 ]
 
 [dependencies]
+arc-swap = "1.7.1"
 base64 = "0.22.1"
 blake2 = { version = "0.10.6", default-features = false }
 sha2 = { version = "0.11.0", default-features = false }

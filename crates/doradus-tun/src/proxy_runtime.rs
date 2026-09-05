@@ -1,14 +1,16 @@
 //! Async proxy task runtime for TUN flows.
 
 use super::*;
-use doradus_core::process::ProcessInfo;
 use doradus_metrics::RuntimeMetrics;
 
+#[path = "proxy_flow.rs"]
+mod proxy_flow;
 #[path = "proxy_output.rs"]
 mod proxy_output;
 #[path = "proxy_tasks.rs"]
 mod proxy_tasks;
 
+use proxy_flow::FlowTracker;
 use proxy_tasks::{run_icmp_proxy, run_tcp_proxy, run_udp_proxy};
 
 pub(crate) enum ProxyCommand {
@@ -185,9 +187,189 @@ pub(crate) struct IcmpProxyTask {
     join: tokio::task::JoinHandle<()>,
 }
 
-pub(crate) struct NatBinding {
-    table: NatTable,
-    idle_timeout: Duration,
+#[derive(Default)]
+pub(crate) struct TcpTaskManager {
+    tasks: HashMap<TunFlowKey, ProxyTask>,
+    pub(crate) pending_to_tun: HashMap<TunFlowKey, VecDeque<Vec<u8>>>,
+    pub(crate) pending_keys: Vec<TunFlowKey>,
+    pub(crate) pending_closes: HashSet<TunFlowKey>,
+}
+
+impl std::ops::Deref for TcpTaskManager {
+    type Target = HashMap<TunFlowKey, ProxyTask>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tasks
+    }
+}
+
+impl std::ops::DerefMut for TcpTaskManager {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tasks
+    }
+}
+
+impl TcpTaskManager {
+    fn send(&self, flow: &TunFlowKey, command: ProxyCommand) -> Result<()> {
+        let Some(task) = self.tasks.get(flow) else {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "TUN flow has no proxy task",
+            ));
+        };
+        task.command.try_send(command).map_err(|error| {
+            let message = error.to_string();
+            let kind = match &error {
+                mpsc::error::TrySendError::Full(_) => ErrorKind::Timeout,
+                mpsc::error::TrySendError::Closed(_) => ErrorKind::Closed,
+            };
+            Error::new(kind, format!("TUN proxy flow channel: {message}"))
+        })
+    }
+
+    fn abort_flow(&mut self, flow: &TunFlowKey) {
+        if let Some(task) = self.tasks.remove(flow) {
+            task.join.abort();
+        }
+        self.pending_to_tun.remove(flow);
+        self.pending_closes.remove(flow);
+    }
+
+    fn shutdown_senders(&self) -> Vec<mpsc::Sender<ProxyCommand>> {
+        self.tasks
+            .values()
+            .map(|task| task.command.clone())
+            .collect()
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct UdpTaskManager {
+    tasks: HashMap<UdpSourceKey, UdpProxyTask>,
+    flow_sources: HashMap<TunFlowKey, UdpSourceKey>,
+}
+
+impl std::ops::Deref for UdpTaskManager {
+    type Target = HashMap<UdpSourceKey, UdpProxyTask>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tasks
+    }
+}
+
+impl std::ops::DerefMut for UdpTaskManager {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tasks
+    }
+}
+
+impl UdpTaskManager {
+    fn send(&self, source: &UdpSourceKey, command: UdpProxyCommand) -> Result<()> {
+        let Some(task) = self.tasks.get(source) else {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "TUN UDP source has no proxy task",
+            ));
+        };
+        task.command.try_send(command).map_err(|error| {
+            let message = error.to_string();
+            let kind = match &error {
+                mpsc::error::TrySendError::Full(_) => ErrorKind::Timeout,
+                mpsc::error::TrySendError::Closed(_) => ErrorKind::Closed,
+            };
+            Error::new(kind, format!("TUN UDP source channel: {message}"))
+        })
+    }
+
+    fn shutdown_senders(&self) -> Vec<mpsc::Sender<UdpProxyCommand>> {
+        self.tasks
+            .values()
+            .map(|task| task.command.clone())
+            .collect()
+    }
+
+    fn source_for_flow(&self, flow: &TunFlowKey) -> Option<UdpSourceKey> {
+        self.flow_sources.get(flow).copied()
+    }
+
+    fn bind_flow(&mut self, flow: TunFlowKey, source: UdpSourceKey) {
+        self.flow_sources.insert(flow, source);
+    }
+
+    fn unbind_flow(&mut self, flow: &TunFlowKey) -> Option<UdpSourceKey> {
+        self.flow_sources.remove(flow)
+    }
+
+    fn remove_source(&mut self, source: UdpSourceKey) -> Vec<TunFlowKey> {
+        let Some(task) = self.tasks.remove(&source) else {
+            return Vec::new();
+        };
+        let _ = task.command.try_send(UdpProxyCommand::Shutdown);
+        task.join.abort();
+        let flows = task.flows.into_iter().collect::<Vec<_>>();
+        for flow in &flows {
+            self.flow_sources.remove(flow);
+        }
+        flows
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flow_sources(&self) -> &HashMap<TunFlowKey, UdpSourceKey> {
+        &self.flow_sources
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flow_sources_mut(&mut self) -> &mut HashMap<TunFlowKey, UdpSourceKey> {
+        &mut self.flow_sources
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct IcmpTaskManager {
+    tasks: HashMap<u64, IcmpProxyTask>,
+    next_id: u64,
+}
+
+impl IcmpTaskManager {
+    fn next_id(&mut self) -> u64 {
+        loop {
+            self.next_id = self.next_id.wrapping_add(1);
+            if !self.tasks.contains_key(&self.next_id) {
+                return self.next_id;
+            }
+        }
+    }
+
+    fn remove_for_flow(&mut self, flow: &TunFlowKey) {
+        let ids = self
+            .tasks
+            .iter()
+            .filter_map(|(id, task)| (task.flow == *flow).then_some(*id))
+            .collect::<Vec<_>>();
+        for id in ids {
+            if let Some(task) = self.tasks.remove(&id) {
+                task.join.abort();
+            }
+        }
+    }
+
+    fn has_flow(&self, flow: TunFlowKey) -> bool {
+        self.tasks.values().any(|task| task.flow == flow)
+    }
+}
+
+impl std::ops::Deref for IcmpTaskManager {
+    type Target = HashMap<u64, IcmpProxyTask>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tasks
+    }
+}
+
+impl std::ops::DerefMut for IcmpTaskManager {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tasks
+    }
 }
 
 /// Bridges owned TUN events to async proxy tasks.
@@ -203,19 +385,11 @@ pub struct TunProxyRuntime {
     context_provider: Arc<dyn Fn(TunFlow) -> crate::FlowContext + Send + Sync>,
     process_resolver: Option<Arc<dyn ProcessResolver>>,
     observer: Option<Arc<dyn TunFlowObserver>>,
-    nat: Option<NatBinding>,
-    pub(crate) tasks: HashMap<TunFlowKey, ProxyTask>,
-    icmp_tasks: HashMap<u64, IcmpProxyTask>,
-    next_icmp_id: u64,
-    pub(crate) udp_tasks: HashMap<UdpSourceKey, UdpProxyTask>,
-    pub(crate) udp_flow_sources: HashMap<TunFlowKey, UdpSourceKey>,
-    pending_tcp_to_tun: HashMap<TunFlowKey, VecDeque<Vec<u8>>>,
-    pending_tcp_keys: Vec<TunFlowKey>,
-    pending_tcp_closes: HashSet<TunFlowKey>,
+    flow_tracker: FlowTracker,
+    pub(crate) tasks: TcpTaskManager,
+    icmp_tasks: IcmpTaskManager,
+    pub(crate) udp_tasks: UdpTaskManager,
     pending_proxy_output: Option<ProxyOutput>,
-    tracked_flows: HashSet<TunFlowKey>,
-    process_cache: HashMap<UdpSourceKey, Option<ProcessInfo>>,
-    process_cache_refs: HashMap<UdpSourceKey, usize>,
     udp_buffer_size: usize,
     pub(crate) proxy_output_tx: mpsc::Sender<ProxyOutput>,
     proxy_output_rx: mpsc::Receiver<ProxyOutput>,
@@ -237,19 +411,11 @@ impl TunProxyRuntime {
             context_provider: Arc::new(|flow| flow.context()),
             process_resolver: default_process_resolver(),
             observer: None,
-            nat: None,
-            tasks: HashMap::new(),
-            icmp_tasks: HashMap::new(),
-            next_icmp_id: 0,
-            udp_tasks: HashMap::new(),
-            udp_flow_sources: HashMap::new(),
-            pending_tcp_to_tun: HashMap::new(),
-            pending_tcp_keys: Vec::new(),
-            pending_tcp_closes: HashSet::new(),
+            flow_tracker: FlowTracker::default(),
+            tasks: TcpTaskManager::default(),
+            icmp_tasks: IcmpTaskManager::default(),
+            udp_tasks: UdpTaskManager::default(),
             pending_proxy_output: None,
-            tracked_flows: HashSet::new(),
-            process_cache: HashMap::new(),
-            process_cache_refs: HashMap::new(),
             udp_buffer_size: u16::MAX as usize,
             proxy_output_tx,
             proxy_output_rx,
@@ -294,7 +460,7 @@ impl TunProxyRuntime {
 
     pub fn set_process_resolver(&mut self, resolver: Option<Arc<dyn ProcessResolver>>) {
         self.process_resolver = resolver;
-        self.process_cache.clear();
+        self.flow_tracker.clear_process_cache();
     }
 
     /// Replace the read-only flow context snapshot at a lifecycle boundary.
@@ -314,10 +480,7 @@ impl TunProxyRuntime {
         if idle_timeout.is_zero() {
             return Err(Error::invalid("TUN proxy NAT timeout must be non-zero"));
         }
-        self.nat = Some(NatBinding {
-            table,
-            idle_timeout,
-        });
+        self.flow_tracker.with_nat(table, idle_timeout);
         self.sync_nat_metrics();
         Ok(self)
     }
@@ -352,11 +515,11 @@ impl TunProxyRuntime {
     }
 
     pub fn nat_len(&self) -> Result<usize> {
-        self.nat.as_ref().map_or(Ok(0), |nat| nat.table.len())
+        self.flow_tracker.nat().map_or(Ok(0), |nat| nat.table.len())
     }
 
     fn sync_nat_metrics(&self) {
-        let Some(nat) = &self.nat else {
+        let Some(nat) = self.flow_tracker.nat() else {
             self.metrics.set_nat_state(0, 0, 0);
             return;
         };
@@ -397,7 +560,7 @@ impl TunProxyRuntime {
             context.process.is_none() || context.process_id.is_none() || context.user_id.is_none();
         let process = needs_process.then(|| {
             let source = udp_source_key(flow.key);
-            if let Some(process) = self.process_cache.get(&source) {
+            if let Some(process) = self.flow_tracker.cached_process(&source) {
                 return process.clone();
             }
             let process = self.process_resolver.as_ref().and_then(|resolver| {
@@ -406,7 +569,7 @@ impl TunProxyRuntime {
                     .ok()
                     .flatten()
             });
-            self.process_cache.insert(source, process.clone());
+            self.flow_tracker.cache_process(source, process.clone());
             process
         });
         if let Some(Some(process)) = process {
@@ -424,7 +587,7 @@ impl TunProxyRuntime {
     }
 
     pub fn sweep(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
-        let Some(nat) = &self.nat else {
+        let Some(nat) = self.flow_tracker.nat() else {
             return Ok(0);
         };
         let idle_timeout = nat.idle_timeout;
@@ -524,7 +687,7 @@ impl TunProxyRuntime {
             observer.bytes(flow.key, TunFlowDirection::Upload, packet.len());
         }
         let proxy = self.selector.select(&context);
-        let id = self.next_icmp_id();
+        let id = self.icmp_tasks.next_id();
         let output = self.proxy_output_tx.clone();
         let timeouts = self.timeouts;
         let join = tokio::spawn(async move {
@@ -540,17 +703,8 @@ impl TunProxyRuntime {
         Ok(())
     }
 
-    fn next_icmp_id(&mut self) -> u64 {
-        loop {
-            self.next_icmp_id = self.next_icmp_id.wrapping_add(1);
-            if !self.icmp_tasks.contains_key(&self.next_icmp_id) {
-                return self.next_icmp_id;
-            }
-        }
-    }
-
     fn handle_udp_datagram(&mut self, flow: TunFlow, payload: Vec<u8>) -> Result<()> {
-        let first = !self.tracked_flows.contains(&flow.key);
+        let first = !self.flow_tracker.contains(&flow.key);
         self.track_flow(flow.key)?;
         let mut context = self.context_for_flow(flow);
         self.selector.route_context(&mut context);
@@ -563,8 +717,8 @@ impl TunProxyRuntime {
         let target = context.effective_destination();
         let source = udp_source_key(flow.key);
         self.ensure_udp_proxy(source, context, flow.key)?;
-        self.udp_flow_sources.insert(flow.key, source);
-        if let Err(error) = self.send_udp_command(
+        self.udp_tasks.bind_flow(flow.key, source);
+        if let Err(error) = self.udp_tasks.send(
             &source,
             UdpProxyCommand::Data {
                 flow: flow.key,
@@ -660,16 +814,8 @@ impl TunProxyRuntime {
     /// force-abort whatever has not exited by `deadline`.
     pub async fn close_graceful(&mut self, deadline: Duration) {
         let end = tokio::time::Instant::now() + deadline;
-        let tcp_commands = self
-            .tasks
-            .values()
-            .map(|task| task.command.clone())
-            .collect::<Vec<_>>();
-        let udp_commands = self
-            .udp_tasks
-            .values()
-            .map(|task| task.command.clone())
-            .collect::<Vec<_>>();
+        let tcp_commands = self.tasks.shutdown_senders();
+        let udp_commands = self.udp_tasks.shutdown_senders();
         let remaining = end.saturating_duration_since(tokio::time::Instant::now());
         if !remaining.is_zero() {
             let send_commands = async move {
@@ -710,25 +856,8 @@ impl TunProxyRuntime {
         self.close();
     }
 
-    fn send_command(&self, flow: &TunFlowKey, command: ProxyCommand) -> Result<()> {
-        let Some(task) = self.tasks.get(flow) else {
-            return Err(Error::new(
-                ErrorKind::NotFound,
-                "TUN flow has no proxy task",
-            ));
-        };
-        task.command.try_send(command).map_err(|error| {
-            let message = error.to_string();
-            let kind = match &error {
-                mpsc::error::TrySendError::Full(_) => ErrorKind::Timeout,
-                mpsc::error::TrySendError::Closed(_) => ErrorKind::Closed,
-            };
-            Error::new(kind, format!("TUN proxy flow channel: {message}"))
-        })
-    }
-
     fn send_command_or_cleanup(&mut self, flow: &TunFlowKey, command: ProxyCommand) -> Result<()> {
-        match self.send_command(flow, command) {
+        match self.tasks.send(flow, command) {
             Ok(()) => Ok(()),
             Err(error) => {
                 if matches!(
@@ -744,30 +873,17 @@ impl TunProxyRuntime {
     }
 
     fn remove_task(&mut self, flow: &TunFlowKey) {
-        if let Some(task) = self.tasks.remove(flow) {
-            task.join.abort();
-        }
-        self.pending_tcp_to_tun.remove(flow);
-        self.pending_tcp_closes.remove(flow);
+        self.tasks.abort_flow(flow);
     }
 
     fn remove_icmp_tasks_for_flow(&mut self, flow: &TunFlowKey) {
-        let ids = self
-            .icmp_tasks
-            .iter()
-            .filter_map(|(id, task)| (task.flow == *flow).then_some(*id))
-            .collect::<Vec<_>>();
-        for id in ids {
-            if let Some(task) = self.icmp_tasks.remove(&id) {
-                task.join.abort();
-            }
-        }
+        self.icmp_tasks.remove_for_flow(flow);
     }
 
     fn remove_flow_task(&mut self, flow: &TunFlowKey) {
         self.remove_task(flow);
         self.remove_icmp_tasks_for_flow(flow);
-        let Some(source) = self.udp_flow_sources.remove(flow) else {
+        let Some(source) = self.udp_tasks.unbind_flow(flow) else {
             return;
         };
         let remove_source = if let Some(task) = self.udp_tasks.get_mut(&source) {
@@ -793,7 +909,7 @@ impl TunProxyRuntime {
     ) -> Result<()> {
         self.remove_flow_task(&flow);
 
-        let another_flow_uses_destination = self.tracked_flows.iter().any(|candidate| {
+        let another_flow_uses_destination = self.flow_tracker.iter().any(|candidate| {
             candidate.network == Network::Udp
                 && candidate.destination == flow.destination
                 && *candidate != flow
@@ -808,73 +924,26 @@ impl TunProxyRuntime {
         self.untrack_flow(&flow)
     }
 
-    fn send_udp_command(&self, source: &UdpSourceKey, command: UdpProxyCommand) -> Result<()> {
-        let Some(task) = self.udp_tasks.get(source) else {
-            return Err(Error::new(
-                ErrorKind::NotFound,
-                "TUN UDP source has no proxy task",
-            ));
-        };
-        task.command.try_send(command).map_err(|error| {
-            let message = error.to_string();
-            let kind = match &error {
-                mpsc::error::TrySendError::Full(_) => ErrorKind::Timeout,
-                mpsc::error::TrySendError::Closed(_) => ErrorKind::Closed,
-            };
-            Error::new(kind, format!("TUN UDP source channel: {message}"))
-        })
-    }
-
     fn remove_udp_source_task(&mut self, source: UdpSourceKey) -> Vec<TunFlowKey> {
-        let Some(task) = self.udp_tasks.remove(&source) else {
-            return Vec::new();
-        };
-        let _ = task.command.try_send(UdpProxyCommand::Shutdown);
-        task.join.abort();
-        let flows = task.flows.into_iter().collect::<Vec<_>>();
-        for flow in &flows {
-            self.udp_flow_sources.remove(flow);
-        }
-        flows
+        self.udp_tasks.remove_source(source)
     }
 
     pub(crate) fn track_flow(&mut self, flow: TunFlowKey) -> Result<()> {
-        if let Some(nat) = &self.nat {
-            let key = nat_key(flow);
-            if nat.table.touch(&key)?.is_none() {
-                nat.table.insert(key, flow.source, nat.idle_timeout)?;
-            }
-        }
-        if self.tracked_flows.insert(flow) {
-            let source = udp_source_key(flow);
-            *self.process_cache_refs.entry(source).or_default() += 1;
-        }
+        self.flow_tracker.track(flow)?;
         self.sync_nat_metrics();
         Ok(())
     }
 
     fn touch_flow(&self, flow: TunFlowKey) -> Result<()> {
-        let Some(nat) = &self.nat else {
-            return Ok(());
-        };
-        let key = nat_key(flow);
-        let _ = nat.table.touch(&key)?;
+        self.flow_tracker.touch(flow)?;
         self.sync_nat_metrics();
         Ok(())
     }
 
     fn untrack_flow(&mut self, flow: &TunFlowKey) -> Result<()> {
-        if !self.tracked_flows.remove(flow) {
+        if !self.flow_tracker.untrack(flow)? {
             return Ok(());
         }
-        self.release_process_cache(*flow);
-        let Some(nat) = &self.nat else {
-            if let Some(observer) = &self.observer {
-                observer.closed(*flow);
-            }
-            return Ok(());
-        };
-        let _ = nat.table.remove(&nat_key(*flow))?;
         if let Some(observer) = &self.observer {
             observer.closed(*flow);
         }
@@ -883,63 +952,29 @@ impl TunProxyRuntime {
     }
 
     fn clear_tracked_flows(&mut self) {
-        let flows = self.tracked_flows.drain().collect::<Vec<_>>();
+        let flows = self.flow_tracker.drain();
         for flow in flows {
-            self.release_process_cache(flow);
-            if let Some(nat) = &self.nat {
-                let _ = nat.table.remove(&nat_key(flow));
-            }
             if let Some(observer) = &self.observer {
                 observer.closed(flow);
             }
         }
         self.sync_nat_metrics();
     }
-
-    fn release_process_cache(&mut self, flow: TunFlowKey) {
-        let source = udp_source_key(flow);
-        let Some(references) = self.process_cache_refs.get_mut(&source) else {
-            return;
-        };
-        *references = references.saturating_sub(1);
-        if *references == 0 {
-            self.process_cache_refs.remove(&source);
-            self.process_cache.remove(&source);
-        }
-    }
 }
 
 impl Drop for TunProxyRuntime {
     fn drop(&mut self) {
-        let flows: Vec<_> = self.tasks.keys().copied().collect();
         for task in self.tasks.drain().map(|(_, task)| task) {
             task.join.abort();
         }
         for task in self.icmp_tasks.drain().map(|(_, task)| task) {
             task.join.abort();
         }
-        let nat_table = self.nat.as_ref().map(|nat| nat.table.clone());
-        if let Some(nat_table) = nat_table {
-            for flow in flows {
-                let _ = nat_table.remove(&nat_key(flow));
-            }
-            let sources: Vec<_> = self.udp_tasks.keys().copied().collect();
-            for source in sources {
-                let flows = self.remove_udp_source_task(source);
-                for flow in flows {
-                    let _ = nat_table.remove(&nat_key(flow));
-                }
-            }
-            for flow in self.tracked_flows.drain() {
-                let _ = nat_table.remove(&nat_key(flow));
-            }
-        } else {
-            let sources: Vec<_> = self.udp_tasks.keys().copied().collect();
-            for source in sources {
-                let _ = self.remove_udp_source_task(source);
-            }
-            self.tracked_flows.clear();
+        let sources: Vec<_> = self.udp_tasks.keys().copied().collect();
+        for source in sources {
+            let _ = self.remove_udp_source_task(source);
         }
+        self.flow_tracker.drain();
     }
 }
 

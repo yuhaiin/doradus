@@ -3,7 +3,7 @@
 use super::*;
 
 impl ConfigRepository {
-    pub async fn list_go_route_rules(&self) -> Result<Vec<GoRouteRuleRecord>> {
+    pub fn list_go_route_rules_sync(&self) -> Result<Vec<GoRouteRuleRecord>> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "route_rules_v2") {
             return Ok(Vec::new());
@@ -34,7 +34,11 @@ impl ConfigRepository {
             .collect()
     }
 
-    pub async fn list_go_route_lists(&self) -> Result<Vec<GoRouteListRecord>> {
+    pub async fn list_go_route_rules(&self) -> Result<Vec<GoRouteRuleRecord>> {
+        self.list_go_route_rules_sync()
+    }
+
+    pub fn list_go_route_lists_sync(&self) -> Result<Vec<GoRouteListRecord>> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "route_lists_v2") {
             return Ok(Vec::new());
@@ -60,9 +64,13 @@ impl ConfigRepository {
             .collect()
     }
 
+    pub async fn list_go_route_lists(&self) -> Result<Vec<GoRouteListRecord>> {
+        self.list_go_route_lists_sync()
+    }
+
     /// Write the Go route-rule contract to its native table while preserving
     /// unknown fields in `data_json` for round-trip compatibility.
-    pub async fn put_go_route_rule(&self, record: &GoRouteRuleRecord) -> Result<()> {
+    pub fn put_go_route_rule_sync(&self, record: &GoRouteRuleRecord) -> Result<()> {
         validate_go_texts(&[
             ("route rule id", &record.id),
             ("route rule name", &record.name),
@@ -111,7 +119,11 @@ impl ConfigRepository {
         })
     }
 
-    pub async fn put_go_route_list(&self, record: &GoRouteListRecord) -> Result<()> {
+    pub async fn put_go_route_rule(&self, record: &GoRouteRuleRecord) -> Result<()> {
+        self.put_go_route_rule_sync(record)
+    }
+
+    pub fn put_go_route_list_sync(&self, record: &GoRouteListRecord) -> Result<()> {
         validate_go_texts(&[
             ("route list name", &record.name),
             ("route list type", &record.list_type),
@@ -149,12 +161,24 @@ impl ConfigRepository {
         })
     }
 
-    pub async fn delete_go_inbound(&self, id: &str) -> Result<bool> {
+    pub async fn put_go_route_list(&self, record: &GoRouteListRecord) -> Result<()> {
+        self.put_go_route_list_sync(record)
+    }
+
+    pub fn delete_go_inbound_sync(&self, id: &str) -> Result<bool> {
         self.delete_go_compatibility_row("inbounds_v2", "id", id)
     }
 
-    pub async fn delete_go_node(&self, id: &str) -> Result<bool> {
+    pub async fn delete_go_inbound(&self, id: &str) -> Result<bool> {
+        self.delete_go_inbound_sync(id)
+    }
+
+    pub fn delete_go_node_sync(&self, id: &str) -> Result<bool> {
         self.delete_go_compatibility_row("nodes_v2", "id", id)
+    }
+
+    pub async fn delete_go_node(&self, id: &str) -> Result<bool> {
+        self.delete_go_node_sync(id)
     }
 
     pub async fn delete_go_node_tag(&self, id: &str) -> Result<bool> {
@@ -164,7 +188,7 @@ impl ConfigRepository {
     /// Delete a Go route-tag contract by its public name.  The current Go
     /// store addresses tags by `name`; older imported rows may have a
     /// compatibility `id` that is not identical to that name.
-    pub async fn delete_go_node_tag_by_name(&self, name: &str) -> Result<bool> {
+    pub fn delete_go_node_tag_by_name_sync(&self, name: &str) -> Result<bool> {
         validate_id(name)?;
         self.store.with_write_transaction(|connection| {
             require_go_table(
@@ -182,8 +206,16 @@ impl ConfigRepository {
         })
     }
 
-    pub async fn delete_go_resolver(&self, id: &str) -> Result<bool> {
+    pub async fn delete_go_node_tag_by_name(&self, name: &str) -> Result<bool> {
+        self.delete_go_node_tag_by_name_sync(name)
+    }
+
+    pub fn delete_go_resolver_sync(&self, id: &str) -> Result<bool> {
         self.delete_go_compatibility_row("resolvers_v2", "id", id)
+    }
+
+    pub async fn delete_go_resolver(&self, id: &str) -> Result<bool> {
+        self.delete_go_resolver_sync(id)
     }
 
     pub async fn delete_go_route_rule(&self, id: &str) -> Result<bool> {
@@ -194,7 +226,7 @@ impl ConfigRepository {
     /// remaining priorities, matching the v2 Go store.  The API addresses a
     /// rule by name; the compatibility row id is an import detail and may not
     /// equal that name in older snapshots.
-    pub async fn delete_go_route_rule_by_name(&self, name: &str) -> Result<bool> {
+    pub fn delete_go_route_rule_by_name_sync(&self, name: &str) -> Result<bool> {
         validate_id(name)?;
         self.store.with_write_transaction(|connection| {
             require_go_table(connection, "route_rules_v2", &["id", "name", "priority"])?;
@@ -241,10 +273,14 @@ impl ConfigRepository {
         })
     }
 
+    pub async fn delete_go_route_rule_by_name(&self, name: &str) -> Result<bool> {
+        self.delete_go_route_rule_by_name_sync(name)
+    }
+
     /// Reorder Go route rules atomically and renumber their persisted
     /// priorities.  The web API addresses rules by their user-visible name,
     /// matching Go's v2 contract; IDs and JSON payloads remain untouched.
-    pub async fn change_go_route_rule_priority(
+    pub fn change_go_route_rule_priority_sync(
         &self,
         source_name: &str,
         target_name: &str,
@@ -330,8 +366,21 @@ impl ConfigRepository {
         })
     }
 
-    pub async fn delete_go_route_list(&self, name: &str) -> Result<bool> {
+    pub async fn change_go_route_rule_priority(
+        &self,
+        source_name: &str,
+        target_name: &str,
+        operate: &str,
+    ) -> Result<()> {
+        self.change_go_route_rule_priority_sync(source_name, target_name, operate)
+    }
+
+    pub fn delete_go_route_list_sync(&self, name: &str) -> Result<bool> {
         self.delete_go_compatibility_row("route_lists_v2", "name", name)
+    }
+
+    pub async fn delete_go_route_list(&self, name: &str) -> Result<bool> {
+        self.delete_go_route_list_sync(name)
     }
 
     fn delete_go_compatibility_row(

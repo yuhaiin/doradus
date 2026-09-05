@@ -26,7 +26,7 @@ impl ConfigRepository {
 
     /// Upsert subscription links atomically.  This intentionally accepts the
     /// shared compatibility record instead of a second HTTP-only DTO tree.
-    pub async fn put_go_subscription_links(
+    pub fn put_go_subscription_links_sync(
         &self,
         records: &[GoSubscriptionLinkRecord],
     ) -> Result<()> {
@@ -104,7 +104,14 @@ impl ConfigRepository {
         })
     }
 
-    pub async fn delete_go_subscription_links(&self, names: &[String]) -> Result<()> {
+    pub async fn put_go_subscription_links(
+        &self,
+        records: &[GoSubscriptionLinkRecord],
+    ) -> Result<()> {
+        self.put_go_subscription_links_sync(records)
+    }
+
+    pub fn delete_go_subscription_links_sync(&self, names: &[String]) -> Result<()> {
         for name in names {
             validate_id(name)?;
         }
@@ -121,6 +128,10 @@ impl ConfigRepository {
             }
             Ok(())
         })
+    }
+
+    pub async fn delete_go_subscription_links(&self, names: &[String]) -> Result<()> {
+        self.delete_go_subscription_links_sync(names)
     }
 
     /// Read Go's publish contracts from the native `publishes` table.  Go

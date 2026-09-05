@@ -9,7 +9,6 @@ use base64::Engine;
 use doradus_core::DomainName;
 use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::{Error, ErrorKind, Result};
-use doradus_protocol::proxy_factory::{BaseProxyConfig, BaseProxyEndpoint, BaseProxyKind};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
@@ -73,6 +72,73 @@ pub enum GoProxyTransport {
     HttpTermination,
     Http2,
     Unknown { name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoBaseProxyEndpoint {
+    pub address: SocketAddr,
+    pub bind_interface: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoBaseProxyKind {
+    Direct,
+    Reject,
+    Drop,
+    Fixed {
+        address: SocketAddr,
+    },
+    FixedMany {
+        endpoints: Vec<GoBaseProxyEndpoint>,
+    },
+    Http {
+        proxy: SocketAddr,
+        username: Option<String>,
+        password: Option<String>,
+    },
+    HttpMany {
+        endpoints: Vec<GoBaseProxyEndpoint>,
+        username: Option<String>,
+        password: Option<String>,
+    },
+    Socks5 {
+        proxy: SocketAddr,
+        username: Option<String>,
+        password: Option<String>,
+    },
+    Socks5Many {
+        endpoints: Vec<GoBaseProxyEndpoint>,
+        username: Option<String>,
+        password: Option<String>,
+    },
+    YuubinsyaUdp {
+        server: SocketAddr,
+        password: String,
+        socks5_prefix: bool,
+    },
+    YuubinsyaUdpMany {
+        endpoints: Vec<GoBaseProxyEndpoint>,
+        password: String,
+        socks5_prefix: bool,
+    },
+    Quic {
+        server: SocketAddr,
+        server_name: String,
+        ca_certificates: Vec<Vec<u8>>,
+        insecure_skip_verify: bool,
+    },
+    QuicMany {
+        endpoints: Vec<GoBaseProxyEndpoint>,
+        server_name: String,
+        ca_certificates: Vec<Vec<u8>>,
+        insecure_skip_verify: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoBaseProxyConfig {
+    pub kind: GoBaseProxyKind,
+    pub timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -454,19 +520,19 @@ impl GoProxyRuntimeConfig {
     /// Convert a Go node whose base transport is implemented by core into the
     /// core factory input. Chain transports remain explicit unsupported values
     /// here and must go through `doradus-chain::parse_go_node` instead.
-    pub fn to_base_proxy_config(&self, timeout: Duration) -> Result<BaseProxyConfig> {
+    pub fn to_base_proxy_config(&self, timeout: Duration) -> Result<GoBaseProxyConfig> {
         self.ensure_base_transport()?;
         let endpoints = self
             .fixed_endpoints()?
             .into_iter()
             .map(|endpoint| {
-                Ok(BaseProxyEndpoint {
+                Ok(GoBaseProxyEndpoint {
                     address: resolve_socket_addr(&endpoint.text())?,
                     bind_interface: endpoint.bind_interface,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(BaseProxyConfig {
+        Ok(GoBaseProxyConfig {
             kind: self.base_proxy_kind(endpoints)?,
             timeout,
         })
@@ -479,18 +545,18 @@ impl GoProxyRuntimeConfig {
         &self,
         timeout: Duration,
         resolver: Arc<dyn AsyncIpResolver>,
-    ) -> Result<BaseProxyConfig> {
+    ) -> Result<GoBaseProxyConfig> {
         self.ensure_base_transport()?;
         let mut endpoints = Vec::new();
         for endpoint in self.fixed_endpoints()? {
             for address in resolve_endpoints(&endpoint, resolver.as_ref()).await? {
-                endpoints.push(BaseProxyEndpoint {
+                endpoints.push(GoBaseProxyEndpoint {
                     address,
                     bind_interface: endpoint.bind_interface.clone(),
                 });
             }
         }
-        Ok(BaseProxyConfig {
+        Ok(GoBaseProxyConfig {
             kind: self.base_proxy_kind(endpoints)?,
             timeout,
         })
@@ -612,22 +678,22 @@ impl GoProxyRuntimeConfig {
         }
     }
 
-    fn base_proxy_kind(&self, endpoints: Vec<BaseProxyEndpoint>) -> Result<BaseProxyKind> {
+    fn base_proxy_kind(&self, endpoints: Vec<GoBaseProxyEndpoint>) -> Result<GoBaseProxyKind> {
         let single_address = || {
             (endpoints.len() == 1 && endpoints[0].bind_interface.is_none())
                 .then(|| endpoints[0].address)
         };
         Ok(match &self.transport {
-            GoProxyTransport::Direct => BaseProxyKind::Direct,
-            GoProxyTransport::Reject => BaseProxyKind::Reject,
-            GoProxyTransport::Drop => BaseProxyKind::Drop,
+            GoProxyTransport::Direct => GoBaseProxyKind::Direct,
+            GoProxyTransport::Reject => GoBaseProxyKind::Reject,
+            GoProxyTransport::Drop => GoBaseProxyKind::Drop,
             GoProxyTransport::Fixed => match single_address() {
-                Some(address) => BaseProxyKind::Fixed { address },
-                None => BaseProxyKind::FixedMany { endpoints },
+                Some(address) => GoBaseProxyKind::Fixed { address },
+                None => GoBaseProxyKind::FixedMany { endpoints },
             },
             GoProxyTransport::HttpMock => match single_address() {
-                Some(address) => BaseProxyKind::Fixed { address },
-                None => BaseProxyKind::FixedMany { endpoints },
+                Some(address) => GoBaseProxyKind::Fixed { address },
+                None => GoBaseProxyKind::FixedMany { endpoints },
             },
             GoProxyTransport::HttpProxy => {
                 let config = layer_config(&self.layers, "http")
@@ -635,12 +701,12 @@ impl GoProxyRuntimeConfig {
                 let username = optional_string(config, "user");
                 let password = optional_string(config, "password");
                 match single_address() {
-                    Some(proxy) => BaseProxyKind::Http {
+                    Some(proxy) => GoBaseProxyKind::Http {
                         proxy,
                         username,
                         password,
                     },
-                    None => BaseProxyKind::HttpMany {
+                    None => GoBaseProxyKind::HttpMany {
                         endpoints,
                         username,
                         password,
@@ -652,12 +718,12 @@ impl GoProxyRuntimeConfig {
                 let username = optional_string(config, "user");
                 let password = optional_string(config, "password");
                 match single_address() {
-                    Some(proxy) => BaseProxyKind::Socks5 {
+                    Some(proxy) => GoBaseProxyKind::Socks5 {
                         proxy,
                         username,
                         password,
                     },
-                    None => BaseProxyKind::Socks5Many {
+                    None => GoBaseProxyKind::Socks5Many {
                         endpoints,
                         username,
                         password,
@@ -669,12 +735,12 @@ impl GoProxyRuntimeConfig {
             | GoProxyTransport::Trojan
             | GoProxyTransport::Vless
             | GoProxyTransport::Vmess => match single_address() {
-                Some(address) => BaseProxyKind::Fixed { address },
-                None => BaseProxyKind::FixedMany { endpoints },
+                Some(address) => GoBaseProxyKind::Fixed { address },
+                None => GoBaseProxyKind::FixedMany { endpoints },
             },
             GoProxyTransport::Aead => match single_address() {
-                Some(address) => BaseProxyKind::Fixed { address },
-                None => BaseProxyKind::FixedMany { endpoints },
+                Some(address) => GoBaseProxyKind::Fixed { address },
+                None => GoBaseProxyKind::FixedMany { endpoints },
             },
             GoProxyTransport::Yuubinsya => {
                 if self
@@ -688,13 +754,13 @@ impl GoProxyRuntimeConfig {
                     let (server_name, ca_certificates, insecure_skip_verify) =
                         self.quic_settings(endpoint.address)?;
                     return Ok(match single_address() {
-                        Some(server) => BaseProxyKind::Quic {
+                        Some(server) => GoBaseProxyKind::Quic {
                             server,
                             server_name,
                             ca_certificates,
                             insecure_skip_verify,
                         },
-                        None => BaseProxyKind::QuicMany {
+                        None => GoBaseProxyKind::QuicMany {
                             endpoints,
                             server_name,
                             ca_certificates,
@@ -704,20 +770,19 @@ impl GoProxyRuntimeConfig {
                 }
                 let config = layer_config(&self.layers, "yuubinsya")?;
                 let password = required_string(config, "password")?;
-                let password_hash = doradus_protocol::yuubinsya::derive_salt(password.as_bytes());
                 let socks5_prefix = config
                     .get("socks5_prefix")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 match single_address() {
-                    Some(server) => BaseProxyKind::YuubinsyaUdp {
+                    Some(server) => GoBaseProxyKind::YuubinsyaUdp {
                         server,
-                        password_hash,
+                        password,
                         socks5_prefix,
                     },
-                    None => BaseProxyKind::YuubinsyaUdpMany {
+                    None => GoBaseProxyKind::YuubinsyaUdpMany {
                         endpoints,
-                        password_hash,
+                        password,
                         socks5_prefix,
                     },
                 }
@@ -729,13 +794,13 @@ impl GoProxyRuntimeConfig {
                 let (server_name, ca_certificates, insecure_skip_verify) =
                     self.quic_settings(endpoint.address)?;
                 match single_address() {
-                    Some(server) => BaseProxyKind::Quic {
+                    Some(server) => GoBaseProxyKind::Quic {
                         server,
                         server_name,
                         ca_certificates,
                         insecure_skip_verify,
                     },
-                    None => BaseProxyKind::QuicMany {
+                    None => GoBaseProxyKind::QuicMany {
                         endpoints,
                         server_name,
                         ca_certificates,

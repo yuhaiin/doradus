@@ -158,6 +158,44 @@ pub struct RuntimeSnapshot {
 }
 
 impl RuntimeSnapshot {
+    fn route_resolver_id(&self, mode: RouteMode) -> Option<&str> {
+        self.route.as_ref().and_then(|route| {
+            let id = match mode {
+                RouteMode::Proxy => route.proxy_resolver.trim(),
+                RouteMode::Direct | RouteMode::Bypass => route.direct_resolver.trim(),
+                RouteMode::Block => "",
+            };
+            (!id.is_empty()).then_some(id)
+        })
+    }
+
+    fn resolver_for_route_mode_from(
+        &self,
+        mode: RouteMode,
+        default: &Arc<dyn AsyncIpResolver>,
+        registry: &BTreeMap<String, Arc<dyn AsyncIpResolver>>,
+    ) -> Result<Arc<dyn AsyncIpResolver>> {
+        let Some(id) = self.route_resolver_id(mode) else {
+            return Ok(default.clone());
+        };
+        if !self.resolver_registry_enabled {
+            return Ok(default.clone());
+        }
+        if let Some(resolver) = registry.get(id) {
+            return Ok(resolver.clone());
+        }
+        if let Some(error) = self.resolver_errors.get(id) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!("resolver {id:?} is unavailable: {error}"),
+            ));
+        }
+        Err(Error::new(
+            ErrorKind::NotFound,
+            format!("resolver {id:?} is not present in the runtime registry"),
+        ))
+    }
+
     pub fn proxy_config(&self, id: &str) -> Option<&GoProxyRuntimeConfig> {
         self.proxies.iter().find(|proxy| proxy.id == id)
     }
@@ -173,10 +211,6 @@ impl RuntimeSnapshot {
 
     pub fn resolver_for(&self, id: &str) -> Option<Arc<dyn AsyncIpResolver>> {
         self.resolver_by_id.get(id).cloned()
-    }
-
-    fn inbound_resolver_for(&self, id: &str) -> Option<Arc<dyn AsyncIpResolver>> {
-        self.inbound_resolver_by_id.get(id).cloned()
     }
 
     pub fn dns_resolver_for(&self, id: &str) -> Option<Arc<dyn AsyncIpResolver>> {
@@ -199,55 +233,12 @@ impl RuntimeSnapshot {
         ))
     }
 
-    fn require_dns_resolver(&self, id: &str) -> Result<Arc<dyn AsyncIpResolver>> {
-        if let Some(resolver) = self.dns_resolver_for(id) {
-            return Ok(resolver);
-        }
-        if let Some(error) = self.resolver_errors.get(id) {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                format!("resolver {id:?} is unavailable: {error}"),
-            ));
-        }
-        Err(Error::new(
-            ErrorKind::NotFound,
-            format!("resolver {id:?} is not present in the runtime registry"),
-        ))
-    }
-
-    fn require_inbound_resolver(&self, id: &str) -> Result<Arc<dyn AsyncIpResolver>> {
-        if let Some(resolver) = self.inbound_resolver_for(id) {
-            return Ok(resolver);
-        }
-        if let Some(error) = self.resolver_errors.get(id) {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                format!("resolver {id:?} is unavailable: {error}"),
-            ));
-        }
-        Err(Error::new(
-            ErrorKind::NotFound,
-            format!("resolver {id:?} is not present in the runtime registry"),
-        ))
-    }
-
     /// Select the resolver named by Go route settings.  An empty ID means the
     /// shared application resolver.  If no factory was supplied, the injected
     /// shared resolver is intentionally used for every route ID; this keeps
     /// the builder useful for callers that own transport construction.
     pub fn resolver_for_route_mode(&self, mode: RouteMode) -> Result<Arc<dyn AsyncIpResolver>> {
-        let Some(route) = &self.route else {
-            return Ok(self.resolver.clone());
-        };
-        let id = match mode {
-            RouteMode::Proxy => route.proxy_resolver.trim(),
-            RouteMode::Direct | RouteMode::Bypass => route.direct_resolver.trim(),
-            RouteMode::Block => "",
-        };
-        if id.is_empty() || !self.resolver_registry_enabled {
-            return Ok(self.resolver.clone());
-        }
-        self.require_resolver(id)
+        self.resolver_for_route_mode_from(mode, &self.resolver, &self.resolver_by_id)
     }
 
     /// Select the configured resolver for an inbound DNS query without
@@ -255,36 +246,18 @@ impl RuntimeSnapshot {
     /// same one used by `resolver_for_route_mode`, so toggling FakeIP cannot
     /// silently switch DNS back to the process/system resolver.
     pub fn dns_resolver_for_route_mode(&self, mode: RouteMode) -> Result<Arc<dyn AsyncIpResolver>> {
-        let Some(route) = &self.route else {
-            return Ok(self.dns_resolver.clone());
-        };
-        let id = match mode {
-            RouteMode::Proxy => route.proxy_resolver.trim(),
-            RouteMode::Direct | RouteMode::Bypass => route.direct_resolver.trim(),
-            RouteMode::Block => "",
-        };
-        if id.is_empty() || !self.resolver_registry_enabled {
-            return Ok(self.dns_resolver.clone());
-        }
-        self.require_dns_resolver(id)
+        self.resolver_for_route_mode_from(mode, &self.dns_resolver, &self.dns_resolver_by_id)
     }
 
     pub(crate) fn inbound_resolver_for_route_mode(
         &self,
         mode: RouteMode,
     ) -> Result<Arc<dyn AsyncIpResolver>> {
-        let Some(route) = &self.route else {
-            return Ok(self.inbound_resolver.clone());
-        };
-        let id = match mode {
-            RouteMode::Proxy => route.proxy_resolver.trim(),
-            RouteMode::Direct | RouteMode::Bypass => route.direct_resolver.trim(),
-            RouteMode::Block => "",
-        };
-        if id.is_empty() || !self.resolver_registry_enabled {
-            return Ok(self.inbound_resolver.clone());
-        }
-        self.require_inbound_resolver(id)
+        self.resolver_for_route_mode_from(
+            mode,
+            &self.inbound_resolver,
+            &self.inbound_resolver_by_id,
+        )
     }
 
     /// Apply route mode/policy and return the resolver selected by the same
@@ -308,14 +281,7 @@ impl RuntimeSnapshot {
         // Keep the same snapshot-derived list after routing as well. This is
         // the complete flow-level membership used by API and statistics.
         context.lists = matched_lists;
-        context.resolver = self.route.as_ref().and_then(|route| {
-            let id = match decision.mode {
-                RouteMode::Proxy => route.proxy_resolver.trim(),
-                RouteMode::Direct | RouteMode::Bypass => route.direct_resolver.trim(),
-                RouteMode::Block => "",
-            };
-            (!id.is_empty()).then(|| id.to_owned())
-        });
+        context.resolver = self.route_resolver_id(decision.mode).map(str::to_owned);
         decision
     }
 
@@ -373,6 +339,40 @@ struct RuntimeInputs {
     fakeip_policy: FakeIpPolicy,
 }
 
+struct BlockingRuntimeInputs {
+    settings: RuntimeSettings,
+    inbound_settings: InboundSettings,
+    nat: NatConfigRecord,
+    hosts: HostsTable,
+    resolvers: Vec<GoResolverRuntimeConfig>,
+    route: Option<GoRouteRuntimeConfig>,
+    route_rules: Vec<GoRouteRuleRecord>,
+    node_tags: Vec<GoNodeTagRecord>,
+    route_list_records: Vec<doradus_store::GoRouteListRecord>,
+    proxies: Vec<GoProxyRuntimeConfig>,
+    geo_metadata: Vec<MaxMindMetadataRecord>,
+    fakeip_config: Option<doradus_store::GoFakeIpRuntimeConfig>,
+    fakeip_policy: FakeIpPolicy,
+}
+
+async fn run_blocking_store<T, F>(operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    if tokio::runtime::Handle::try_current().is_err() {
+        return operation();
+    }
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("blocking runtime store task failed: {error}"),
+            )
+        })?
+}
+
 impl RuntimeBuilder {
     pub fn new(store: ConfigStore, upstream: Arc<dyn AsyncIpResolver>) -> Self {
         let metrics = Arc::new(RuntimeMetrics::new());
@@ -417,26 +417,61 @@ impl RuntimeBuilder {
     async fn load_inputs(&self) -> Result<RuntimeInputs> {
         crate::defaults::ensure_go_defaults(&self.store).await?;
         let repository = self.store.repository();
-        let settings = RuntimeSettings::load(&self.store).await?;
-        let inbound_settings = repository.get_inbound_settings().await?;
+        let blocking_store = self.store.clone();
+        let blocking_repository = repository.clone();
+        let BlockingRuntimeInputs {
+            settings,
+            inbound_settings,
+            nat,
+            hosts,
+            resolvers,
+            route,
+            route_rules,
+            node_tags,
+            route_list_records,
+            proxies,
+            geo_metadata,
+            fakeip_config,
+            fakeip_policy,
+        } = run_blocking_store(move || {
+            let settings = match blocking_store.get_config_sync("settings")? {
+                Some(bytes) => {
+                    let value =
+                        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|error| {
+                            Error::invalid(format!("settings is invalid JSON: {error}"))
+                        })?;
+                    RuntimeSettings::from_value(&value)
+                }
+                None => RuntimeSettings::from_go_settings_kv(
+                    &blocking_repository.list_go_settings_kv_sync()?,
+                ),
+            };
+            Ok::<_, doradus_core::Error>(BlockingRuntimeInputs {
+                settings,
+                inbound_settings: blocking_repository.get_inbound_settings_sync()?,
+                nat: blocking_repository.get_nat_config_or_default_sync("default")?,
+                hosts: load_hosts_sync(&blocking_repository, &blocking_store)?,
+                resolvers: blocking_repository.list_go_resolver_runtime_configs_sync()?,
+                route: blocking_repository.load_go_route_runtime_config_sync()?,
+                route_rules: blocking_repository.list_go_route_rules_sync()?,
+                node_tags: blocking_repository.list_go_node_tags_sync()?,
+                route_list_records: blocking_repository.list_go_route_lists_sync()?,
+                proxies: blocking_repository.list_go_proxy_runtime_configs_sync()?,
+                geo_metadata: blocking_repository.list_maxmind_metadata_sync()?,
+                fakeip_config: load_fakeip_config_sync(&blocking_store, &blocking_repository)?,
+                fakeip_policy: load_fakeip_policy_sync(&blocking_store, &blocking_repository)?,
+            })
+        })
+        .await?;
         let socket_bind_addresses =
             Arc::from(interfaces::bind_addresses_for_settings(&settings).into_boxed_slice());
         let socket_bind_interface = interfaces::bind_interface_for_settings(&settings);
-        let nat = repository.get_nat_config_or_default("default").await?;
-        let hosts = load_hosts(&repository, &self.store).await?;
-        let resolvers = repository.list_go_resolver_runtime_configs().await?;
-        let route = repository.load_go_route_runtime_config().await?;
         if let Some(bridge) = &self.resolver_proxy_bridge {
             bridge
                 .set_configured_resolver_ids(resolvers.iter().map(|resolver| resolver.id.as_str()));
             bridge.set_proxy_resolver_id(route.as_ref().map(|route| route.proxy_resolver.as_str()));
         }
-        let route_rules = repository.list_go_route_rules().await?;
-        let node_tags = repository.list_go_node_tags().await?;
-        let route_list_records = repository.list_go_route_lists().await?;
         let route_lists = Arc::new(load_route_lists(&route_list_records));
-        let proxies = repository.list_go_proxy_runtime_configs().await?;
-        let geo_metadata = repository.list_maxmind_metadata().await?;
         let geo_manager = GeoDatabaseManager::new();
         let geo = geo_metadata
             .first()
@@ -456,12 +491,6 @@ impl RuntimeBuilder {
             .transpose()?
             .map(|database| database as Arc<dyn GeoLookup>);
 
-        // The Rust/API overlay wins over the legacy Go row when present.
-        let fakeip_config = match load_fakeip_config(&self.store).await? {
-            Some(config) => Some(config),
-            None => repository.load_go_fakeip_runtime_config().await?,
-        };
-        let fakeip_policy = load_fakeip_policy(&self.store, &repository).await?;
         Ok(RuntimeInputs {
             settings,
             inbound_settings,
@@ -764,20 +793,20 @@ fn default_fakeip_runtime_config() -> Result<doradus_store::GoFakeIpRuntimeConfi
     .to_fakeip_runtime_config()
 }
 
-async fn load_hosts(
+fn load_hosts_sync(
     repository: &doradus_store::ConfigRepository,
     store: &ConfigStore,
 ) -> Result<HostsTable> {
     let hosts = HostsTable::new();
     load_system_hosts(&hosts);
 
-    let persisted = repository.list_go_dns_hosts().await?;
+    let persisted = repository.list_go_dns_hosts_sync()?;
     if !persisted.is_empty() {
-        let configured = repository.load_go_dns_hosts_table().await?;
+        let configured = repository.load_go_dns_hosts_table_sync()?;
         hosts.overlay(&configured)?;
         return Ok(hosts);
     }
-    let Some(bytes) = store.get_config("resolver.hosts").await? else {
+    let Some(bytes) = store.get_config_sync("resolver.hosts")? else {
         return Ok(hosts);
     };
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
@@ -846,47 +875,48 @@ fn parse_system_hosts(contents: &str) -> Vec<(IpAddr, DomainName)> {
     entries
 }
 
-async fn load_fakeip_config(
+fn load_fakeip_config_sync(
     store: &ConfigStore,
+    repository: &ConfigRepository,
 ) -> Result<Option<doradus_store::GoFakeIpRuntimeConfig>> {
-    let Some(bytes) = store.get_config("resolver.fakedns").await? else {
-        return Ok(None);
-    };
-    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
-        Error::new(
-            ErrorKind::InvalidInput,
-            format!("resolver.fakedns is invalid JSON: {error}"),
-        )
-    })?;
-    let enabled = value
-        .get("enabled")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let ipv4_range = value
-        .get("ipv4Range")
-        .or_else(|| value.get("ipv4_range"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("10.2.0.1/24");
-    let ipv6_range = value
-        .get("ipv6Range")
-        .or_else(|| value.get("ipv6_range"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("fc00::/64");
-    let record = doradus_store::GoDnsSettingsRecord {
-        id: 0,
-        server: String::new(),
-        fakedns_enabled: enabled,
-        fakedns_ipv4_range: ipv4_range.to_owned(),
-        fakedns_ipv6_range: ipv6_range.to_owned(),
-    };
-    record.to_fakeip_runtime_config().map(Some)
+    if let Some(bytes) = store.get_config_sync("resolver.fakedns")? {
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("resolver.fakedns is invalid JSON: {error}"),
+            )
+        })?;
+        let enabled = value
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let ipv4_range = value
+            .get("ipv4Range")
+            .or_else(|| value.get("ipv4_range"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("10.2.0.1/24");
+        let ipv6_range = value
+            .get("ipv6Range")
+            .or_else(|| value.get("ipv6_range"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("fc00::/64");
+        let record = doradus_store::GoDnsSettingsRecord {
+            id: 0,
+            server: String::new(),
+            fakedns_enabled: enabled,
+            fakedns_ipv4_range: ipv4_range.to_owned(),
+            fakedns_ipv6_range: ipv6_range.to_owned(),
+        };
+        return record.to_fakeip_runtime_config().map(Some);
+    }
+    repository.load_go_fakeip_runtime_config_sync()
 }
 
-async fn load_fakeip_policy(
+fn load_fakeip_policy_sync(
     store: &ConfigStore,
     repository: &ConfigRepository,
 ) -> Result<FakeIpPolicy> {
-    if let Some(bytes) = store.get_config("resolver.fakedns").await? {
+    if let Some(bytes) = store.get_config_sync("resolver.fakedns")? {
         let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
             Error::new(
                 ErrorKind::InvalidInput,
@@ -912,7 +942,7 @@ async fn load_fakeip_policy(
 
     let mut whitelist = Vec::new();
     let mut skip_check = Vec::new();
-    for record in repository.list_go_dns_fakedns_lists().await? {
+    for record in repository.list_go_dns_fakedns_lists_sync()? {
         match record.kind.as_str() {
             "whitelist" => whitelist.push(record.value),
             "skip_check" => skip_check.push(record.value),
@@ -920,6 +950,14 @@ async fn load_fakeip_policy(
         }
     }
     FakeIpPolicy::from_lists(&whitelist, &skip_check)
+}
+
+#[cfg(test)]
+async fn load_fakeip_policy(
+    store: &ConfigStore,
+    repository: &ConfigRepository,
+) -> Result<FakeIpPolicy> {
+    load_fakeip_policy_sync(store, repository)
 }
 
 fn parse_fakeip_list(

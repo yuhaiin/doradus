@@ -124,8 +124,8 @@ pub async fn save_inbound_value(
     };
     state
         .controller
-        .mutate_and_reload_inbound(id.clone(), move |store| async move {
-            store.repository().put_go_inbound(&record).await
+        .mutate_and_reload_inbound_blocking(id.clone(), move |store| {
+            store.repository().put_go_inbound_sync(&record)
         })
         .await?;
     // Go's saveInbound calls Inbounds.Get after Save, so the response is the
@@ -137,8 +137,8 @@ pub async fn save_inbound_value(
 pub async fn delete_inbound_value(state: &ApiState, id: String) -> ApiResult {
     let result = state
         .controller
-        .mutate_and_reload_inbound(id.clone(), move |store| async move {
-            if store.repository().delete_go_inbound(&id).await? {
+        .mutate_and_reload_inbound_blocking(id.clone(), move |store| {
+            if store.repository().delete_go_inbound_sync(&id)? {
                 Ok(())
             } else {
                 Err(doradus_core::Error::new(
@@ -225,9 +225,7 @@ pub async fn save_resolver_value(
     let returned = value.clone();
     state
         .controller
-        .mutate_and_reload(
-            move |store| async move { store.repository().put_go_resolver(&record).await },
-        )
+        .mutate_and_reload_blocking(move |store| store.repository().put_go_resolver_sync(&record))
         .await?;
     Ok(Json(returned))
 }
@@ -235,8 +233,8 @@ pub async fn save_resolver_value(
 pub async fn delete_resolver_value(state: &ApiState, id: String) -> ApiResult {
     let result = state
         .controller
-        .mutate_and_reload(move |store| async move {
-            if store.repository().delete_go_resolver(&id).await? {
+        .mutate_and_reload_blocking(move |store| {
+            if store.repository().delete_go_resolver_sync(&id)? {
                 Ok(())
             } else {
                 Err(doradus_core::Error::new(

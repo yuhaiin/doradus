@@ -60,23 +60,21 @@ impl ConfigRepository {
 
     /// Keep Go's selected-node metadata in sync when the frontend changes
     /// the active node. Go uses one id for both TCP and UDP selection.
-    pub async fn put_go_selected_node_ids(&self, id: &str) -> Result<()> {
+    pub fn put_go_selected_node_ids_sync(&self, id: &str) -> Result<()> {
         validate_id(id)?;
         let native_value = serde_json::to_vec(&serde_json::json!({"id": id})).map_err(|error| {
             Error::new(ErrorKind::Storage, format!("encode selection: {error}"))
         })?;
-        self.store
-            .apply(&[
-                ConfigMutation::Put {
-                    key: "selected_tcp_node_v2".to_owned(),
-                    value: native_value.clone(),
-                },
-                ConfigMutation::Put {
-                    key: "selected_udp_node_v2".to_owned(),
-                    value: native_value,
-                },
-            ])
-            .await?;
+        self.store.apply_sync(&[
+            ConfigMutation::Put {
+                key: "selected_tcp_node_v2".to_owned(),
+                value: native_value.clone(),
+            },
+            ConfigMutation::Put {
+                key: "selected_udp_node_v2".to_owned(),
+                value: native_value,
+            },
+        ])?;
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "metadata") {
             return Ok(());
@@ -96,11 +94,15 @@ impl ConfigRepository {
         })
     }
 
+    pub async fn put_go_selected_node_ids(&self, id: &str) -> Result<()> {
+        self.put_go_selected_node_ids_sync(id)
+    }
+
     /// Read Go's global settings KV table without converting it into a second
     /// lossy settings schema. Unknown sections remain available to future
     /// callers and malformed JSON is rejected for the same fail-closed
     /// startup behavior as the other Go compatibility tables.
-    pub async fn list_go_settings_kv(&self) -> Result<Vec<GoSettingsKvRecord>> {
+    pub fn list_go_settings_kv_sync(&self) -> Result<Vec<GoSettingsKvRecord>> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "settings_kv") {
             return Ok(Vec::new());
@@ -130,10 +132,14 @@ impl ConfigRepository {
             .collect()
     }
 
+    pub async fn list_go_settings_kv(&self) -> Result<Vec<GoSettingsKvRecord>> {
+        self.list_go_settings_kv_sync()
+    }
+
     /// Upsert only the scalar settings understood by the shared Go contract.
     /// Unknown/platform rows are intentionally untouched. Fresh Rust stores
     /// do not have this legacy table, so the operation is a no-op there.
-    pub async fn put_go_settings_kv(&self, values: &[GoSettingsKvRecord]) -> Result<()> {
+    pub fn put_go_settings_kv_sync(&self, values: &[GoSettingsKvRecord]) -> Result<()> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "settings_kv") {
             return Ok(());
@@ -176,6 +182,10 @@ impl ConfigRepository {
             }
             Ok(())
         })
+    }
+
+    pub async fn put_go_settings_kv(&self, values: &[GoSettingsKvRecord]) -> Result<()> {
+        self.put_go_settings_kv_sync(values)
     }
 
     /// Read Go's single-row backup contract without projecting away S3 or
@@ -268,7 +278,7 @@ impl ConfigRepository {
             .collect()
     }
 
-    pub async fn list_go_nodes(&self) -> Result<Vec<GoNodeRecord>> {
+    pub fn list_go_nodes_sync(&self) -> Result<Vec<GoNodeRecord>> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "nodes_v2") {
             return Ok(Vec::new());
@@ -298,6 +308,10 @@ impl ConfigRepository {
                 })
             })
             .collect()
+    }
+
+    pub async fn list_go_nodes(&self) -> Result<Vec<GoNodeRecord>> {
+        self.list_go_nodes_sync()
     }
 
     /// Count remote nodes owned by the named subscription groups.  Go removes
@@ -333,7 +347,7 @@ impl ConfigRepository {
         Ok(total)
     }
 
-    pub async fn delete_go_nodes_by_groups(&self, groups: &[String]) -> Result<usize> {
+    pub fn delete_go_nodes_by_groups_sync(&self, groups: &[String]) -> Result<usize> {
         for group in groups {
             validate_id(group)?;
         }
@@ -355,15 +369,23 @@ impl ConfigRepository {
         })
     }
 
-    pub async fn list_go_proxy_runtime_configs(&self) -> Result<Vec<GoProxyRuntimeConfig>> {
-        let nodes = self.list_go_nodes().await?;
+    pub async fn delete_go_nodes_by_groups(&self, groups: &[String]) -> Result<usize> {
+        self.delete_go_nodes_by_groups_sync(groups)
+    }
+
+    pub fn list_go_proxy_runtime_configs_sync(&self) -> Result<Vec<GoProxyRuntimeConfig>> {
+        let nodes = self.list_go_nodes_sync()?;
         self.resolve_go_node_runtime_records(&nodes)?
             .iter()
             .map(GoNodeRecord::to_proxy_runtime_config)
             .collect()
     }
 
-    pub async fn list_go_node_tags(&self) -> Result<Vec<GoNodeTagRecord>> {
+    pub async fn list_go_proxy_runtime_configs(&self) -> Result<Vec<GoProxyRuntimeConfig>> {
+        self.list_go_proxy_runtime_configs_sync()
+    }
+
+    pub fn list_go_node_tags_sync(&self) -> Result<Vec<GoNodeTagRecord>> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "node_tags_v2") {
             return Ok(Vec::new());
@@ -385,7 +407,11 @@ impl ConfigRepository {
             .collect()
     }
 
-    pub async fn list_go_resolvers(&self) -> Result<Vec<GoResolverRecord>> {
+    pub async fn list_go_node_tags(&self) -> Result<Vec<GoNodeTagRecord>> {
+        self.list_go_node_tags_sync()
+    }
+
+    pub fn list_go_resolvers_sync(&self) -> Result<Vec<GoResolverRecord>> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "resolvers_v2") {
             return Ok(Vec::new());
@@ -408,18 +434,25 @@ impl ConfigRepository {
             .collect()
     }
 
-    pub async fn list_go_resolver_runtime_configs(&self) -> Result<Vec<GoResolverRuntimeConfig>> {
-        self.list_go_resolvers()
-            .await?
+    pub async fn list_go_resolvers(&self) -> Result<Vec<GoResolverRecord>> {
+        self.list_go_resolvers_sync()
+    }
+
+    pub fn list_go_resolver_runtime_configs_sync(&self) -> Result<Vec<GoResolverRuntimeConfig>> {
+        self.list_go_resolvers_sync()?
             .iter()
             .map(GoResolverRecord::to_runtime_config)
             .collect()
     }
 
+    pub async fn list_go_resolver_runtime_configs(&self) -> Result<Vec<GoResolverRuntimeConfig>> {
+        self.list_go_resolver_runtime_configs_sync()
+    }
+
     /// Read Go's static DNS host overrides without rewriting the source table.
     /// Targets are intentionally returned as text: Go permits an address or a
     /// hostname target, and the resolver layer decides how to apply aliases.
-    pub async fn list_go_dns_hosts(&self) -> Result<Vec<GoDnsHostRecord>> {
+    pub fn list_go_dns_hosts_sync(&self) -> Result<Vec<GoDnsHostRecord>> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "dns_hosts") {
             return Ok(Vec::new());
@@ -438,11 +471,15 @@ impl ConfigRepository {
             .collect()
     }
 
+    pub async fn list_go_dns_hosts(&self) -> Result<Vec<GoDnsHostRecord>> {
+        self.list_go_dns_hosts_sync()
+    }
+
     /// Build the runtime hosts table from the persisted Go compatibility
     /// rows.  This keeps SQLite access out of the resolver while supporting
     /// both IP targets and hostname aliases.
-    pub async fn load_go_dns_hosts_table(&self) -> Result<HostsTable> {
-        let records = self.list_go_dns_hosts().await?;
+    pub fn load_go_dns_hosts_table_sync(&self) -> Result<HostsTable> {
+        let records = self.list_go_dns_hosts_sync()?;
         let hosts = HostsTable::new();
         for record in records {
             // Go's hosts dispatcher is fail-soft: malformed rows are skipped
@@ -459,7 +496,11 @@ impl ConfigRepository {
         Ok(hosts)
     }
 
-    pub async fn list_go_dns_settings(&self) -> Result<Vec<GoDnsSettingsRecord>> {
+    pub async fn load_go_dns_hosts_table(&self) -> Result<HostsTable> {
+        self.load_go_dns_hosts_table_sync()
+    }
+
+    pub fn list_go_dns_settings_sync(&self) -> Result<Vec<GoDnsSettingsRecord>> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "dns_settings") {
             return Ok(Vec::new());
@@ -482,6 +523,10 @@ impl ConfigRepository {
                 })
             })
             .collect()
+    }
+
+    pub async fn list_go_dns_settings(&self) -> Result<Vec<GoDnsSettingsRecord>> {
+        self.list_go_dns_settings_sync()
     }
 
     fn read_legacy_inbound_settings(&self) -> Result<Option<InboundSettings>> {
@@ -515,27 +560,31 @@ impl ConfigRepository {
     /// Load the inbound-wide policy from Go's `inbound_settings` row. Fresh
     /// Rust stores use the same JSON contract under `inbounds.config`, so the
     /// frontend and runtime have one source of truth on both database shapes.
-    pub async fn get_inbound_settings(&self) -> Result<InboundSettings> {
+    pub fn get_inbound_settings_sync(&self) -> Result<InboundSettings> {
         if let Some(settings) = self.read_legacy_inbound_settings()? {
             return Ok(settings);
         }
 
-        let Some(bytes) = self.store.get_config("inbounds.config").await? else {
+        let Some(bytes) = self.store.get_config_sync("inbounds.config")? else {
             return Ok(InboundSettings::default());
         };
         serde_json::from_slice(&bytes)
             .map_err(|error| Error::invalid(format!("inbounds.config is invalid JSON: {error}")))
     }
 
+    pub async fn get_inbound_settings(&self) -> Result<InboundSettings> {
+        self.get_inbound_settings_sync()
+    }
+
     /// Persist the policy in the native Go row when present, otherwise in
     /// the Rust config overlay. Existing Go databases are not altered with a
     /// second competing settings table.
-    pub async fn put_inbound_settings(&self, settings: InboundSettings) -> Result<()> {
+    pub fn put_inbound_settings_sync(&self, settings: InboundSettings) -> Result<()> {
         let has_legacy_table = self.has_legacy_inbound_settings()?;
         if !has_legacy_table {
             let bytes = serde_json::to_vec(&settings)
                 .map_err(|error| Error::invalid(format!("encode inbound settings: {error}")))?;
-            return self.store.put_config("inbounds.config", &bytes).await;
+            return self.store.put_config_sync("inbounds.config", &bytes);
         }
 
         self.store.with_write_transaction(|connection| {
@@ -565,10 +614,14 @@ impl ConfigRepository {
         })
     }
 
+    pub async fn put_inbound_settings(&self, settings: InboundSettings) -> Result<()> {
+        self.put_inbound_settings_sync(settings)
+    }
+
     /// Update only the Go resolver server field, preserving FakeDNS columns
     /// in `dns_settings`. Fresh Rust stores do not have this compatibility
     /// table and continue using the Rust config overlay.
-    pub async fn put_go_dns_server(&self, server: &str) -> Result<()> {
+    pub fn put_go_dns_server_sync(&self, server: &str) -> Result<()> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "dns_settings") {
             return Ok(());
@@ -600,15 +653,23 @@ impl ConfigRepository {
         })
     }
 
-    pub async fn load_go_fakeip_runtime_config(&self) -> Result<Option<GoFakeIpRuntimeConfig>> {
-        let records = self.list_go_dns_settings().await?;
+    pub async fn put_go_dns_server(&self, server: &str) -> Result<()> {
+        self.put_go_dns_server_sync(server)
+    }
+
+    pub fn load_go_fakeip_runtime_config_sync(&self) -> Result<Option<GoFakeIpRuntimeConfig>> {
+        let records = self.list_go_dns_settings_sync()?;
         records
             .first()
             .map(GoDnsSettingsRecord::to_fakeip_runtime_config)
             .transpose()
     }
 
-    pub async fn list_go_dns_fakedns_lists(&self) -> Result<Vec<GoDnsFakednsListRecord>> {
+    pub async fn load_go_fakeip_runtime_config(&self) -> Result<Option<GoFakeIpRuntimeConfig>> {
+        self.load_go_fakeip_runtime_config_sync()
+    }
+
+    pub fn list_go_dns_fakedns_lists_sync(&self) -> Result<Vec<GoDnsFakednsListRecord>> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "dns_fakedns_lists") {
             return Ok(Vec::new());
@@ -629,7 +690,11 @@ impl ConfigRepository {
             .collect()
     }
 
-    pub async fn list_go_route_settings(&self) -> Result<Vec<GoRouteSettingsRecord>> {
+    pub async fn list_go_dns_fakedns_lists(&self) -> Result<Vec<GoDnsFakednsListRecord>> {
+        self.list_go_dns_fakedns_lists_sync()
+    }
+
+    pub fn list_go_route_settings_sync(&self) -> Result<Vec<GoRouteSettingsRecord>> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "route_settings") {
             return Ok(Vec::new());
@@ -654,16 +719,23 @@ impl ConfigRepository {
             .collect()
     }
 
-    pub async fn load_go_route_runtime_config(&self) -> Result<Option<GoRouteRuntimeConfig>> {
+    pub async fn list_go_route_settings(&self) -> Result<Vec<GoRouteSettingsRecord>> {
+        self.list_go_route_settings_sync()
+    }
+
+    pub fn load_go_route_runtime_config_sync(&self) -> Result<Option<GoRouteRuntimeConfig>> {
         Ok(self
-            .list_go_route_settings()
-            .await?
+            .list_go_route_settings_sync()?
             .into_iter()
             .next()
             .map(|settings| settings.to_runtime_config()))
     }
 
-    pub async fn put_go_route_settings(&self, record: &GoRouteSettingsRecord) -> Result<()> {
+    pub async fn load_go_route_runtime_config(&self) -> Result<Option<GoRouteRuntimeConfig>> {
+        self.load_go_route_runtime_config_sync()
+    }
+
+    pub fn put_go_route_settings_sync(&self, record: &GoRouteSettingsRecord) -> Result<()> {
         if record.id < 0 {
             return Err(Error::invalid("route settings id cannot be negative"));
         }
@@ -686,6 +758,10 @@ impl ConfigRepository {
                 .map(|_| ())
                 .map_err(storage_error)
         })
+    }
+
+    pub async fn put_go_route_settings(&self, record: &GoRouteSettingsRecord) -> Result<()> {
+        self.put_go_route_settings_sync(record)
     }
 
     pub async fn delete_go_route_settings(&self, id: i64) -> Result<bool> {

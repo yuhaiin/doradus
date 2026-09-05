@@ -7,6 +7,7 @@ license.workspace = true
 [features]
 default = []
 tun-routes = ["dep:route_manager"]
+smoke = ["dep:doradus-protocol"]
 
 [dependencies]
 futures-lite = "2.6.1"
@@ -16,7 +17,7 @@ tokio = { version = "1.50.0", default-features = false, features = ["io-util", "
 tun-rs = { version = "2.8.8", default-features = false, features = ["async_io"] }
 doradus-core = { path = "../doradus-core" }
 doradus-metrics = { path = "../doradus-metrics" }
-doradus-protocol = { path = "../doradus-protocol" }
+doradus-protocol = { path = "../doradus-protocol", optional = true }
 
 # The platform module is the deliberate unsafe boundary around tun-rs's
 # owned-fd constructor and Linux netlink setup.
@@ -26,6 +27,7 @@ unsafe_code = "allow"
 [[bin]]
 name = "tun-smoke"
 path = "src/bin/tun_smoke.rs"
+required-features = ["smoke"]
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
 route_manager = { version = "0.2.13", optional = true, default-features = false }
@@ -38,3 +40,6 @@ nix = { version = "0.30.1", default-features = false, features = ["net"] }
 netlink-packet-core = "0.8.2"
 netlink-packet-route = "0.31.0"
 netlink-sys = "0.8.8"
+
+[dev-dependencies]
+doradus-protocol = { path = "../doradus-protocol" }
