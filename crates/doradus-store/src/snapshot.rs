@@ -314,3 +314,219 @@ async fn install_go_snapshot_inner(
     }
     result
 }
+
+// Shared database-file helpers used by backup/restore/snapshot installation.
+pub(crate) fn database_destination_parts(destination: &Path) -> Result<(PathBuf, String)> {
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    std::fs::create_dir_all(&parent).map_err(|error| {
+        Error::new(
+            ErrorKind::Storage,
+            format!("create SQLite destination directory: {error}"),
+        )
+    })?;
+    let name = destination
+        .file_name()
+        .and_then(|name| (!name.is_empty()).then(|| name.to_string_lossy().into_owned()))
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "SQLite destination must contain a file name",
+            )
+        })?;
+    Ok((parent, name))
+}
+
+pub(crate) fn ensure_destination_absent(destination: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(_) => Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing to overwrite SQLite destination: {}",
+                destination.display()
+            ),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::new(
+            ErrorKind::Storage,
+            format!("inspect SQLite destination: {error}"),
+        )),
+    }
+}
+
+pub(crate) fn ensure_destination_sidecars_absent(destination: &Path) -> Result<()> {
+    for suffix in [
+        "-journal",
+        "-wal",
+        "-shm",
+        "-wal-fec",
+        "-fsqlite-ns-use",
+        "-fsqlite-ns-gate",
+        "-doradus-write-lock",
+    ] {
+        let sidecar = PathBuf::from(format!("{}{}", destination.display(), suffix));
+        if sidecar.exists() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "refusing to use SQLite destination with an existing sidecar: {}",
+                    sidecar.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_restore_destination_safe(destination: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(Error::new(
+            ErrorKind::InvalidInput,
+            "SQLite restore destination must be a regular file",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ensure_destination_sidecars_absent(destination)
+        }
+        Err(error) => Err(Error::new(
+            ErrorKind::Storage,
+            format!("inspect SQLite restore destination: {error}"),
+        )),
+    }
+}
+
+pub(crate) fn database_staging_path(parent: &Path, name: &str, kind: &str) -> Result<PathBuf> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Error::new(ErrorKind::Storage, format!("read system clock: {error}")))?
+        .as_nanos();
+    let staging = parent.join(format!(
+        ".{name}.doradus-{kind}-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    if staging.exists() {
+        return Err(Error::new(
+            ErrorKind::Storage,
+            format!("SQLite staging path already exists: {}", staging.display()),
+        ));
+    }
+    Ok(staging)
+}
+
+pub(crate) fn remove_database_sidecars(path: &Path) {
+    // The fsqlite namespace files are retained only as compatibility cleanup
+    // for databases produced by the discarded experimental backend.
+    for suffix in [
+        "-journal",
+        "-wal",
+        "-shm",
+        "-wal-fec",
+        "-fsqlite-ns-use",
+        "-fsqlite-ns-gate",
+        "-doradus-write-lock",
+    ] {
+        let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
+        let _ = std::fs::remove_file(sidecar);
+    }
+}
+
+pub(crate) fn verify_go_snapshot_manifest(
+    source: &Path,
+    manifest_path: &Path,
+    source_bytes: u64,
+) -> Result<()> {
+    if !manifest_path.is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "Go snapshot manifest does not exist: {}",
+                manifest_path.display()
+            ),
+        ));
+    }
+    let mut file = File::open(manifest_path).map_err(|error| {
+        Error::new(
+            ErrorKind::Storage,
+            format!("open Go snapshot manifest: {error}"),
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        Error::new(
+            ErrorKind::Storage,
+            format!("read Go snapshot manifest: {error}"),
+        )
+    })?;
+    let manifest: GoSnapshotManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("decode Go snapshot manifest: {error}"),
+        )
+    })?;
+    if manifest.format_version != 1
+        || manifest.tool != "doradus-export"
+        || manifest.tool_version != "1"
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "unsupported Go snapshot manifest format or exporter version",
+        ));
+    }
+    if manifest.source_schema_version.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Go snapshot manifest has no source schema version",
+        ));
+    }
+    if manifest.snapshot_bytes != source_bytes {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "Go snapshot manifest byte count {} does not match source {}",
+                manifest.snapshot_bytes, source_bytes
+            ),
+        ));
+    }
+    let actual_hash = sha256_file(source)?;
+    if manifest.snapshot_sha256 != actual_hash {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "Go snapshot SHA-256 mismatch: manifest={}, actual={actual_hash}",
+                manifest.snapshot_sha256
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).map_err(|error| {
+        Error::new(
+            ErrorKind::Storage,
+            format!("open file for SHA-256: {error}"),
+        )
+    })?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            Error::new(
+                ErrorKind::Storage,
+                format!("read file for SHA-256: {error}"),
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}

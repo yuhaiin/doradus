@@ -2,17 +2,14 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-use super::listeners::{InboundOwners, push_listener};
+use super::listeners::{InboundOwners, ListenerStartContext, push_listener};
 #[cfg(feature = "http2")]
 use super::serve_h2_listener;
 #[cfg(all(feature = "websocket", feature = "http2"))]
 use super::serve_websocket_h2_listener;
 #[cfg(feature = "websocket")]
 use super::serve_websocket_listener;
-use super::{
-    ConnectionMonitor, InboundProtocolKind, InboundSpec, InboundTlsAcceptor, InboundTransportPlan,
-    RuntimeProxySelector, serve_listener,
-};
+use super::{ConnectionMonitor, InboundProtocolKind, InboundSpec, serve_listener};
 use crate::inbound_runtime::InboundRuntimeState;
 
 async fn bind_tcp_listener(
@@ -54,13 +51,14 @@ async fn bind_tcp_listener(
 pub(super) async fn start_stream_listener(
     listeners: &mut InboundOwners,
     spec: &mut InboundSpec,
-    protocol: &InboundProtocolKind,
-    transports: &InboundTransportPlan,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-    tls_acceptor: Option<InboundTlsAcceptor>,
-    runtime: &InboundRuntimeState,
+    start: &ListenerStartContext<'_>,
 ) -> bool {
+    let protocol = start.protocol;
+    let transports = start.transports;
+    let selector = &start.selector;
+    let monitor = &start.monitor;
+    let tls_acceptor = start.tls_acceptor.clone();
+    let runtime = start.runtime.as_ref();
     if transports.websocket {
         if spec.udp_mode.udp_enabled() {
             monitor.warn(format!(
@@ -69,12 +67,12 @@ pub(super) async fn start_stream_listener(
             ));
         }
         if spec.udp_mode.tcp_enabled() {
-            let Some(listener) = bind_tcp_listener(spec, &monitor, runtime).await else {
+            let Some(listener) = bind_tcp_listener(spec, monitor, runtime).await else {
                 return true;
             };
             spec.listen = listener.local_addr().unwrap_or(spec.listen);
-            let selector = selector.clone();
-            let monitor = monitor.clone();
+            let selector = Arc::clone(selector);
+            let monitor = Arc::clone(monitor);
             let listener_spec = spec.clone();
             let listener_id = listener_spec.id.clone();
             let tls_acceptor = tls_acceptor.clone();
@@ -168,12 +166,12 @@ pub(super) async fn start_stream_listener(
             ));
         }
         if spec.udp_mode.tcp_enabled() {
-            let Some(listener) = bind_tcp_listener(spec, &monitor, runtime).await else {
+            let Some(listener) = bind_tcp_listener(spec, monitor, runtime).await else {
                 return true;
             };
             spec.listen = listener.local_addr().unwrap_or(spec.listen);
-            let selector = selector.clone();
-            let monitor = monitor.clone();
+            let selector = Arc::clone(selector);
+            let monitor = Arc::clone(monitor);
             let listener_spec = spec.clone();
             let listener_id = listener_spec.id.clone();
             let tls_acceptor = tls_acceptor.clone();
@@ -204,14 +202,15 @@ pub(super) async fn start_stream_listener(
     if spec.udp_mode.tcp_enabled()
         || (matches!(protocol, InboundProtocolKind::Vless) && spec.udp_mode.udp_enabled())
     {
-        let Some(listener) = bind_tcp_listener(spec, &monitor, runtime).await else {
+        let Some(listener) = bind_tcp_listener(spec, monitor, runtime).await else {
             return false;
         };
         spec.listen = listener.local_addr().unwrap_or(spec.listen);
-        let selector = selector.clone();
-        let monitor = monitor.clone();
+        let selector = Arc::clone(selector);
+        let monitor = Arc::clone(monitor);
         let listener_spec = spec.clone();
         let listener_id = listener_spec.id.clone();
+        let tls_acceptor = tls_acceptor.clone();
         let logs = monitor.logs();
         push_listener(
             listeners,

@@ -1,22 +1,19 @@
 use std::sync::Arc;
 
-use super::listeners::{InboundOwners, push_listener};
-use super::{
-    ConnectionMonitor, InboundProtocolKind, InboundSpec, InboundTlsAcceptor, InboundTransportPlan,
-    RuntimeProxySelector,
-};
-use crate::inbound_runtime::InboundRuntimeState;
+use super::InboundSpec;
+use super::listeners::{InboundOwners, ListenerStartContext, push_listener};
 
 pub(super) async fn start_transparent_listener(
     listeners: &mut InboundOwners,
     spec: InboundSpec,
-    protocol: &InboundProtocolKind,
-    transports: &InboundTransportPlan,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-    tls_acceptor: Option<InboundTlsAcceptor>,
-    runtime: &Arc<InboundRuntimeState>,
+    start: &ListenerStartContext<'_>,
 ) {
+    let protocol = start.protocol;
+    let transports = start.transports;
+    let selector = &start.selector;
+    let monitor = &start.monitor;
+    let tls_acceptor = &start.tls_acceptor;
+    let runtime = &start.runtime;
     if spec.udp_mode.udp_enabled() && protocol.is_tproxy() {
         monitor.warn(format!(
             "start UDP inbound {}: Linux transparent UDP requires TPROXY ancillary data and CAP_NET_ADMIN",
@@ -44,8 +41,8 @@ pub(super) async fn start_transparent_listener(
         let udp_spec = spec.clone();
         let protocol_name = spec.protocol.clone();
         let listener_spec = spec;
-        let listener_selector = selector.clone();
-        let listener_monitor = monitor.clone();
+        let listener_selector = Arc::clone(selector);
+        let listener_monitor = Arc::clone(monitor);
         let listener_tls_acceptor = tls_acceptor.clone();
         let listener_runtime = runtime.clone();
         let logs = listener_monitor.logs();
@@ -70,8 +67,8 @@ pub(super) async fn start_transparent_listener(
             runtime,
         );
         if udp_enabled && is_tproxy {
-            let selector = selector.clone();
-            let monitor = monitor.clone();
+            let selector = Arc::clone(selector);
+            let monitor = Arc::clone(monitor);
             let spec = udp_spec;
             let listener_runtime = runtime.clone();
             let logs = monitor.logs();

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::net::UdpSocket;
 
-use super::listeners::{InboundOwners, push_listener};
+use super::listeners::{InboundOwners, ListenerStartContext, push_listener};
 use super::{
     ConnectionMonitor, InboundHandler, InboundProtocolKind, InboundProtocolPlan, InboundSpec,
     InboundTransportPlan, RuntimeProxySelector,
@@ -12,21 +12,22 @@ use crate::inbound_runtime::InboundRuntimeState;
 pub(super) async fn start_udp_listener(
     listeners: &mut InboundOwners,
     spec: InboundSpec,
-    protocol: &InboundProtocolKind,
-    protocol_config: &InboundProtocolPlan,
-    transports: &InboundTransportPlan,
-    selector: Arc<RuntimeProxySelector>,
-    monitor: Arc<ConnectionMonitor>,
-    runtime: &InboundRuntimeState,
+    start: &ListenerStartContext<'_>,
 ) {
+    let protocol = start.protocol;
+    let protocol_config = start.protocol_config;
+    let transports = start.transports;
+    let selector = &start.selector;
+    let monitor = &start.monitor;
+    let runtime = start.runtime.as_ref();
     if matches!(protocol, InboundProtocolKind::Yuubinsya) {
         start_yuubinsya_udp(
             listeners,
             spec,
             protocol_config,
             transports,
-            selector,
-            monitor,
+            Arc::clone(selector),
+            Arc::clone(monitor),
             runtime,
         )
         .await;
@@ -42,8 +43,8 @@ pub(super) async fn start_udp_listener(
             spec,
             protocol_config,
             transports,
-            selector,
-            monitor,
+            Arc::clone(selector),
+            Arc::clone(monitor),
             runtime,
         )
         .await;

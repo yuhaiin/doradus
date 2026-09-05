@@ -30,14 +30,24 @@ use doradus_store::{
 
 use crate::RuntimeLog;
 
+#[path = "monitor_dns.rs"]
+mod monitor_dns;
+#[path = "monitor_lifecycle.rs"]
+mod monitor_lifecycle;
 #[path = "monitor_persistence.rs"]
 mod monitor_persistence;
 #[path = "monitor_projection.rs"]
 mod monitor_projection;
+#[path = "monitor_projection_runtime.rs"]
+mod monitor_projection_runtime;
 #[path = "monitor_runtime.rs"]
 mod monitor_runtime;
+#[path = "monitor_runtime_persistence.rs"]
+mod monitor_runtime_persistence;
 #[path = "monitor_statistics.rs"]
 mod monitor_statistics;
+#[path = "monitor_traffic.rs"]
+mod monitor_traffic;
 use monitor_projection::{
     connection_value, merge_connection_metadata, normalize_persisted_telemetry_value,
     telemetry_dimensions, traffic_bucket_start,
@@ -98,12 +108,79 @@ pub struct MonitorEvent {
 }
 
 #[derive(Debug, Clone)]
-struct ConnectionEntry {
-    id: String,
-    value: Value,
-    telemetry: Arc<[(String, String)]>,
+struct ConnectionRecord {
+    projection: Value,
     inbound_id: Option<Arc<str>>,
     is_tun: bool,
+    mode: RouteMode,
+    protocol: Arc<str>,
+    host: Arc<str>,
+    process: Arc<str>,
+    node_id: Arc<str>,
+    inbound: Arc<str>,
+}
+
+impl ConnectionRecord {
+    fn from_projection(projection: Value, context: &FlowContext) -> Self {
+        let protocol: Arc<str> = Arc::from(
+            projection
+                .get("protocol")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        let host: Arc<str> = Arc::from(
+            projection
+                .get("domain")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .or_else(|| projection.get("addr").and_then(Value::as_str))
+                .unwrap_or_default(),
+        );
+        let process: Arc<str> = Arc::from(
+            projection
+                .get("process")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        let node_id: Arc<str> = Arc::from(
+            projection
+                .get("nodeId")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        let inbound: Arc<str> = Arc::from(
+            projection
+                .get("inbound")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        Self {
+            projection,
+            inbound_id: context
+                .inbound_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map(Arc::<str>::from),
+            is_tun: context.component.as_deref() == Some("tun"),
+            mode: context.route_mode,
+            protocol,
+            host,
+            process,
+            node_id,
+            inbound,
+        }
+    }
+
+    fn refresh_projection(&mut self, projection: Value, context: &FlowContext) {
+        *self = Self::from_projection(projection, context);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConnectionEntry {
+    id: String,
+    record: ConnectionRecord,
+    telemetry: Arc<[(String, String)]>,
 }
 
 #[derive(Debug, Clone)]
@@ -317,9 +394,9 @@ impl TunFlowObserver for ConnectionMonitor {
         self.metrics.connection_failed(failure_stage(stage));
         let metadata = self.lock().connections.get(&flow).map(|entry| {
             (
-                entry.value["nodeId"].as_str().unwrap_or("-").to_owned(),
-                entry.value["protocol"].as_str().unwrap_or("-").to_owned(),
-                entry.value["inbound"].as_str().unwrap_or("-").to_owned(),
+                entry.record.node_id.to_string(),
+                entry.record.protocol.to_string(),
+                entry.record.inbound.to_string(),
             )
         });
         let (node, protocol, inbound) =

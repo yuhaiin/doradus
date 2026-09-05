@@ -12,11 +12,25 @@ use super::listener_transparent::start_transparent_listener;
 #[cfg(feature = "tun")]
 use super::listener_tun::{TunSource, spawn_tun_owner, tun_owner_id};
 use super::listener_udp::start_udp_listener;
-use super::{InboundAuth, InboundPlan, RuntimeController, selected_proxy_ids};
+use super::{
+    ConnectionMonitor, InboundAuth, InboundPlan, InboundProtocolKind, InboundProtocolPlan,
+    InboundTlsAcceptor, InboundTransportPlan, RuntimeController, RuntimeProxySelector,
+    selected_proxy_ids,
+};
 use crate::inbound_runtime::InboundRuntimeState;
 use doradus_core::Result;
 
 pub(super) type InboundOwners = HashMap<String, Vec<tokio::task::JoinHandle<()>>>;
+
+pub(super) struct ListenerStartContext<'a> {
+    pub(super) protocol: &'a InboundProtocolKind,
+    pub(super) protocol_config: &'a InboundProtocolPlan,
+    pub(super) transports: &'a InboundTransportPlan,
+    pub(super) selector: Arc<RuntimeProxySelector>,
+    pub(super) monitor: Arc<ConnectionMonitor>,
+    pub(super) tls_acceptor: Option<InboundTlsAcceptor>,
+    pub(super) runtime: Arc<InboundRuntimeState>,
+}
 
 #[derive(Default)]
 pub(super) struct InboundStartOptions {
@@ -219,46 +233,24 @@ async fn start_inbounds_inner(
             ));
             continue;
         }
+        let start = ListenerStartContext {
+            protocol: &protocol,
+            protocol_config: &protocol_config,
+            transports: &transports,
+            selector: selector.clone(),
+            monitor: monitor.clone(),
+            tls_acceptor,
+            runtime: Arc::clone(&runtime),
+        };
         if protocol.is_transparent() {
-            start_transparent_listener(
-                &mut listeners,
-                spec,
-                &protocol,
-                &transports,
-                selector.clone(),
-                monitor.clone(),
-                tls_acceptor,
-                &runtime,
-            )
-            .await;
+            start_transparent_listener(&mut listeners, spec, &start).await;
             continue;
         }
-        if start_stream_listener(
-            &mut listeners,
-            &mut spec,
-            &protocol,
-            &transports,
-            selector.clone(),
-            monitor.clone(),
-            tls_acceptor.clone(),
-            &runtime,
-        )
-        .await
-        {
+        if start_stream_listener(&mut listeners, &mut spec, &start).await {
             continue;
         }
         if spec.udp_mode.udp_enabled() {
-            start_udp_listener(
-                &mut listeners,
-                spec.clone(),
-                &protocol,
-                &protocol_config,
-                &transports,
-                selector.clone(),
-                monitor.clone(),
-                &runtime,
-            )
-            .await;
+            start_udp_listener(&mut listeners, spec.clone(), &start).await;
         }
     }
 
