@@ -454,7 +454,9 @@ mod tests {
     use super::*;
     use doradus_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
     use std::future::pending;
+    use std::hint::black_box;
     use std::sync::Arc;
+    use std::time::Instant;
     use tokio::io::duplex;
     use tokio::time::{sleep, timeout};
 
@@ -621,5 +623,40 @@ mod tests {
             closed.is_ok(),
             "continuous upload masked the UDP receive timeout"
         );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode payload allocation benchmark"]
+    fn benchmark_payload_allocation_vs_reuse() {
+        fn run(name: &str, packet_size: usize, iterations: usize) {
+            let source = vec![0x5a; packet_size];
+
+            let started = Instant::now();
+            let mut checksum = 0usize;
+            for _ in 0..iterations {
+                let payload = black_box(source.as_slice()).to_vec();
+                checksum ^= black_box(payload.len());
+            }
+            let fresh = started.elapsed();
+
+            let started = Instant::now();
+            let mut reusable = Vec::with_capacity(packet_size);
+            let mut reused_checksum = 0usize;
+            for _ in 0..iterations {
+                reusable.clear();
+                reusable.extend_from_slice(black_box(source.as_slice()));
+                reused_checksum ^= black_box(reusable.len());
+            }
+            let reused = started.elapsed();
+
+            black_box((checksum, reused_checksum));
+            eprintln!(
+                "payload allocation benchmark {name}: size={packet_size} iterations={iterations} fresh={fresh:?} reused={reused:?} speedup={:.2}x",
+                fresh.as_secs_f64() / reused.as_secs_f64()
+            );
+        }
+
+        run("udp", 1500, 1_000_000);
+        run("tcp", 16 * 1024, 250_000);
     }
 }

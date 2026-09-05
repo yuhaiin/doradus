@@ -21,12 +21,16 @@ pub(crate) async fn handle_tcp(
     peer: SocketAddr,
     inbound: Arc<InboundHandler>,
 ) -> Result<()> {
-    let target = inbound.spec().reverse_target.clone().ok_or_else(|| {
-        Error::new(
-            ErrorKind::InvalidInput,
-            "reverse_tcp inbound target is missing",
-        )
-    })?;
+    let target = inbound
+        .protocol_plan()
+        .reverse_target()
+        .cloned()
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "reverse_tcp inbound target is missing",
+            )
+        })?;
     relay_to_target(stream, peer, target, inbound, &[], "reverse_tcp").await
 }
 
@@ -37,12 +41,16 @@ pub(crate) async fn handle_http(
     peer: SocketAddr,
     inbound: Arc<InboundHandler>,
 ) -> Result<()> {
-    let config = inbound.spec().reverse_http.clone().ok_or_else(|| {
-        Error::new(
-            ErrorKind::InvalidInput,
-            "reverse_http inbound URL is missing",
-        )
-    })?;
+    let config = inbound
+        .protocol_plan()
+        .reverse_http()
+        .cloned()
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "reverse_http inbound URL is missing",
+            )
+        })?;
     let forward_handler = ReverseHttpForwardHandler { inbound, config };
     reverse_http::handle(
         stream,

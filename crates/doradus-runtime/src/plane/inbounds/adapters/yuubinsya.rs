@@ -22,7 +22,11 @@ pub(crate) fn new_server(
             .map(|password| derive_salt(&password))
             .collect::<Vec<_>>()
     } else {
-        vec![derive_salt(spec.password.as_bytes())]
+        let plan = crate::inbound::InboundProtocolPlan::compile(
+            &crate::inbound::InboundProtocolKind::Yuubinsya,
+            spec,
+        );
+        vec![derive_salt(plan.password().unwrap_or_default().as_bytes())]
     };
     if password_hashes.is_empty() {
         return None;

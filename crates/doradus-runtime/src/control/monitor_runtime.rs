@@ -12,6 +12,7 @@ impl ConnectionMonitor {
         let (close_events, _) = broadcast::channel(256);
         Self {
             state: Arc::new(Mutex::new(MonitorState::default())),
+            traffic: Arc::new(MonitorTraffic::default()),
             sniff_enabled: Arc::new(AtomicBool::new(true)),
             dns_handler: Arc::new(RwLock::new(None)),
             events,
@@ -117,10 +118,16 @@ impl ConnectionMonitor {
 
     pub fn total_flow_value(&self) -> Value {
         let state = self.lock();
-        let counters = state
-            .counters
-            .iter()
-            .map(|(id, (download, upload))| {
+        let mut total_download = state.total_download;
+        let mut total_upload = state.total_upload;
+        let mut counters = serde_json::Map::new();
+        for shard in self.traffic.shards.iter() {
+            let traffic = shard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            total_download = total_download.saturating_add(traffic.total_download);
+            total_upload = total_upload.saturating_add(traffic.total_upload);
+            counters.extend(traffic.counters.iter().map(|(id, (download, upload))| {
                 (
                     id.clone(),
                     json!({
@@ -128,11 +135,11 @@ impl ConnectionMonitor {
                         "upload": upload.to_string(),
                     }),
                 )
-            })
-            .collect::<serde_json::Map<_, _>>();
+            }));
+        }
         json!({
-            "download": state.total_download.to_string(),
-            "upload": state.total_upload.to_string(),
+            "download": total_download.to_string(),
+            "upload": total_upload.to_string(),
             "counters": counters,
         })
     }
@@ -174,6 +181,21 @@ impl ConnectionMonitor {
                 entry.0 = entry.0.saturating_add(*download);
                 entry.1 = entry.1.saturating_add(*upload);
             }
+            drop(state);
+            for shard in self.traffic.shards.iter() {
+                let traffic = shard
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for (bucket, (download, upload)) in &traffic.buckets {
+                    if *bucket < start || *bucket >= end {
+                        continue;
+                    }
+                    let group = traffic_bucket_start(interval, *bucket);
+                    let entry = buckets.entry(group).or_default();
+                    entry.0 = entry.0.saturating_add(*download);
+                    entry.1 = entry.1.saturating_add(*upload);
+                }
+            }
         }
         let items = buckets
             .into_iter()
@@ -199,7 +221,7 @@ impl ConnectionMonitor {
             snapshot.telemetry
         } else {
             let state = self.lock();
-            state
+            let mut telemetry = state
                 .telemetry_buckets
                 .iter()
                 .map(
@@ -215,7 +237,27 @@ impl ConnectionMonitor {
                         }
                     },
                 )
-                .collect()
+                .collect::<Vec<_>>();
+            drop(state);
+            for shard in self.traffic.shards.iter() {
+                let traffic = shard
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                telemetry.extend(traffic.telemetry_buckets.iter().map(
+                    |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
+                        GoTelemetryBucketRecord {
+                            bucket: *bucket,
+                            span_seconds: *span_seconds,
+                            dimension: dimension.clone(),
+                            value: value.clone(),
+                            download: *download,
+                            upload: *upload,
+                            failures: *failures,
+                        }
+                    },
+                ));
+            }
+            telemetry
         };
         for item in telemetry {
             let span_seconds = normalize_telemetry_bucket_span_seconds(item.span_seconds);
@@ -578,12 +620,57 @@ impl ConnectionMonitor {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn traffic_shard_index(flow: TunFlowKey) -> usize {
+        let source = usize::from(flow.source.port());
+        let destination = usize::from(flow.destination.port());
+        source
+            .wrapping_mul(0x9e37)
+            .wrapping_add(destination.rotate_left(7))
+            % TRAFFIC_SHARD_COUNT
+    }
+
+    fn traffic_lock(&self, flow: TunFlowKey) -> std::sync::MutexGuard<'_, MonitorTrafficState> {
+        self.traffic.shards[Self::traffic_shard_index(flow)]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn durable_snapshot(&self) -> Option<GoStatisticsSnapshot> {
         let store = self.persistence.as_ref()?.store.clone();
         let mut snapshot = store.load_go_statistics().ok()?;
         let delta = {
             let state = self.lock();
-            pending_delta_from_state(&state)
+            let mut delta = pending_delta_from_state(&state);
+            delta.total_download = state.total_download;
+            delta.total_upload = state.total_upload;
+            for shard in self.traffic.shards.iter() {
+                let traffic = shard
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                delta.total_download = delta.total_download.saturating_add(traffic.total_download);
+                delta.total_upload = delta.total_upload.saturating_add(traffic.total_upload);
+                delta.traffic.extend(traffic.pending_traffic.iter().map(
+                    |(bucket, (download, upload))| GoTrafficBucketRecord {
+                        bucket: *bucket,
+                        upload: *upload,
+                        download: *download,
+                    },
+                ));
+                delta.telemetry.extend(traffic.pending_telemetry.iter().map(
+                    |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
+                        GoTelemetryBucketRecord {
+                            bucket: *bucket,
+                            span_seconds: *span_seconds,
+                            dimension: dimension.clone(),
+                            value: value.clone(),
+                            download: *download,
+                            upload: *upload,
+                            failures: *failures,
+                        }
+                    },
+                ));
+            }
+            delta
         };
         apply_delta_to_snapshot(&mut snapshot, delta);
         Some(snapshot)
@@ -603,6 +690,18 @@ impl ConnectionMonitor {
             let changed = merge_connection_metadata(&mut entry.value, update);
             if changed {
                 entry.telemetry = Arc::from(telemetry_dimensions(&entry.value));
+                entry.inbound_id = context
+                    .inbound_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .map(Arc::<str>::from);
+                entry.is_tun = context.component.as_deref() == Some("tun");
+                let mut traffic = self.traffic_lock(flow.key);
+                if let Some(flow_entry) = traffic.flows.get_mut(&flow.key) {
+                    flow_entry.telemetry = Arc::clone(&entry.telemetry);
+                    flow_entry.inbound_id = entry.inbound_id.clone();
+                    flow_entry.is_tun = entry.is_tun;
+                }
             }
             let value = entry.value.clone();
             drop(state);
@@ -620,6 +719,12 @@ impl ConnectionMonitor {
         let id = state.next_id.to_string();
         let value = connection_value(&id, flow, &context);
         let telemetry = Arc::from(telemetry_dimensions(&value));
+        let inbound_id = context
+            .inbound_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(Arc::<str>::from);
+        let is_tun = context.component.as_deref() == Some("tun");
         if let Some(inbound_id) = context.inbound_id.clone() {
             let statistics = state.inbound_statistics.entry(inbound_id).or_default();
             match flow.key.network {
@@ -635,24 +740,44 @@ impl ConnectionMonitor {
             }
         }
         state.ids.insert(id.clone(), flow.key);
-        state.counters.entry(id.clone()).or_default();
+        let traffic_entry = TrafficFlowEntry {
+            id: id.clone(),
+            telemetry: Arc::clone(&telemetry),
+            inbound_id: inbound_id.clone(),
+            is_tun,
+            upload: 0,
+            download: 0,
+        };
         state.connections.insert(
             flow.key,
             ConnectionEntry {
                 id,
                 value: value.clone(),
                 telemetry,
-                upload: 0,
-                download: 0,
+                inbound_id,
+                is_tun,
             },
         );
         drop(state);
+        {
+            let mut traffic = self.traffic_lock(flow.key);
+            traffic
+                .counters
+                .entry(traffic_entry.id.clone())
+                .or_default();
+            traffic.flows.insert(flow.key, traffic_entry);
+        }
         self.metrics.connection_opened();
         self.mark_dirty();
         self.emit("connections_added", json!({"connections": [value]}));
     }
 
-    pub(super) fn add_bytes(&self, flow: TunFlowKey, direction: TunFlowDirection, bytes: usize) {
+    pub(super) fn add_bytes(
+        &self,
+        flow: TunFlowKey,
+        direction: TunFlowDirection,
+        bytes: usize,
+    ) -> bool {
         let persistent = self.persistence.is_some();
         self.metrics.add_traffic(
             match direction {
@@ -661,7 +786,7 @@ impl ConnectionMonitor {
             },
             bytes as u64,
         );
-        let mut state = self.lock();
+        let mut state = self.traffic_lock(flow);
         let bytes = bytes as u64;
         match direction {
             TunFlowDirection::Upload => {
@@ -693,26 +818,20 @@ impl ConnectionMonitor {
                 state.buckets.remove(&first);
             }
         }
-        let Some((id, inbound_id)) = state.connections.get(&flow).map(|entry| {
-            (
-                entry.id.clone(),
-                entry
-                    .value
-                    .get("inboundId")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned),
-            )
-        }) else {
+        let Some((id, inbound_id, is_tun)) = state
+            .flows
+            .get(&flow)
+            .map(|entry| (entry.id.clone(), entry.inbound_id.clone(), entry.is_tun))
+        else {
             drop(state);
             self.mark_dirty();
-            return;
+            return false;
         };
         let telemetry = {
-            let Some(entry) = state.connections.get_mut(&flow) else {
+            let Some(entry) = state.flows.get_mut(&flow) else {
                 drop(state);
                 self.mark_dirty();
-                return;
+                return false;
             };
             match direction {
                 TunFlowDirection::Upload => {
@@ -730,13 +849,16 @@ impl ConnectionMonitor {
             TunFlowDirection::Download => counter.0 = counter.0.saturating_add(bytes),
         }
         if let Some(inbound_id) = inbound_id {
-            let statistics = state.inbound_statistics.entry(inbound_id).or_default();
+            let statistics = state
+                .inbound_bytes
+                .entry(inbound_id.to_string())
+                .or_default();
             match direction {
                 TunFlowDirection::Upload => {
-                    statistics.upload_bytes = statistics.upload_bytes.saturating_add(bytes);
+                    statistics.1 = statistics.1.saturating_add(bytes);
                 }
                 TunFlowDirection::Download => {
-                    statistics.download_bytes = statistics.download_bytes.saturating_add(bytes);
+                    statistics.0 = statistics.0.saturating_add(bytes);
                 }
             }
         }
@@ -794,6 +916,7 @@ impl ConnectionMonitor {
         }
         drop(state);
         self.mark_dirty();
+        is_tun
     }
 
     pub(super) fn close(&self, flow: TunFlowKey) {
@@ -802,6 +925,11 @@ impl ConnectionMonitor {
         let Some(entry) = state.connections.remove(&flow) else {
             return;
         };
+        {
+            let mut traffic = self.traffic_lock(flow);
+            traffic.flows.remove(&flow);
+            traffic.counters.remove(&entry.id);
+        }
         self.metrics.connection_closed();
         if let Some(inbound_id) = entry
             .value
@@ -826,7 +954,6 @@ impl ConnectionMonitor {
         // Go's `connections.total.counters` is a live-flow view.  The
         // per-connection counter is removed together with the connection;
         // durable totals and history are maintained separately below.
-        state.counters.remove(&entry.id);
         if entry.value.get("mode").and_then(Value::as_str) == Some("block") {
             let protocol = entry
                 .value
@@ -917,44 +1044,83 @@ impl ConnectionMonitor {
 
     pub(super) fn take_statistics_delta(&self) -> GoStatisticsDelta {
         let mut state = self.lock();
+        let mut telemetry = std::mem::take(&mut state.pending_telemetry)
+            .into_iter()
+            .map(
+                |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
+                    GoTelemetryBucketRecord {
+                        bucket,
+                        span_seconds,
+                        dimension,
+                        value,
+                        download,
+                        upload,
+                        failures,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut total_download = state.total_download;
+        let mut total_upload = state.total_upload;
+        let mut traffic_records = Vec::new();
+        for shard in self.traffic.shards.iter() {
+            let mut traffic_state = shard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            total_download = total_download.saturating_add(traffic_state.total_download);
+            total_upload = total_upload.saturating_add(traffic_state.total_upload);
+            traffic_records.extend(
+                std::mem::take(&mut traffic_state.pending_traffic)
+                    .into_iter()
+                    .map(|(bucket, (download, upload))| GoTrafficBucketRecord {
+                        bucket,
+                        upload,
+                        download,
+                    }),
+            );
+            telemetry.extend(
+                std::mem::take(&mut traffic_state.pending_telemetry)
+                    .into_iter()
+                    .map(
+                        |(
+                            (bucket, span_seconds, dimension, value),
+                            (download, upload, failures),
+                        )| {
+                            GoTelemetryBucketRecord {
+                                bucket,
+                                span_seconds,
+                                dimension,
+                                value,
+                                download,
+                                upload,
+                                failures,
+                            }
+                        },
+                    ),
+            );
+        }
         GoStatisticsDelta {
-            total_download: state.total_download,
-            total_upload: state.total_upload,
-            traffic: std::mem::take(&mut state.pending_traffic)
-                .into_iter()
-                .map(|(bucket, (download, upload))| GoTrafficBucketRecord {
-                    bucket,
-                    upload,
-                    download,
-                })
-                .collect(),
+            total_download,
+            total_upload,
+            traffic: traffic_records,
             history: std::mem::take(&mut state.pending_history),
             failed_history: std::mem::take(&mut state.pending_failed_history)
                 .into_values()
                 .collect(),
-            telemetry: std::mem::take(&mut state.pending_telemetry)
-                .into_iter()
-                .map(
-                    |((bucket, span_seconds, dimension, value), (download, upload, failures))| {
-                        GoTelemetryBucketRecord {
-                            bucket,
-                            span_seconds,
-                            dimension,
-                            value,
-                            download,
-                            upload,
-                            failures,
-                        }
-                    },
-                )
-                .collect(),
+            telemetry,
         }
     }
 
     pub(super) fn merge_statistics_delta(&self, delta: GoStatisticsDelta) {
         let mut state = self.lock();
+        let mut traffic_state = self.traffic.shards[0]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for traffic in delta.traffic {
-            let item = state.pending_traffic.entry(traffic.bucket).or_default();
+            let item = traffic_state
+                .pending_traffic
+                .entry(traffic.bucket)
+                .or_default();
             item.0 = item.0.saturating_add(traffic.download);
             item.1 = item.1.saturating_add(traffic.upload);
         }
@@ -984,7 +1150,7 @@ impl ConnectionMonitor {
             }
         }
         for telemetry in delta.telemetry {
-            let item = state
+            let item = traffic_state
                 .pending_telemetry
                 .entry((
                     telemetry.bucket,
@@ -1000,10 +1166,29 @@ impl ConnectionMonitor {
     }
 
     pub fn inbound_statistics(&self) -> Vec<InboundStatisticsRecord> {
-        self.lock()
+        let state = self.lock();
+        let mut inbound_bytes = BTreeMap::<String, (u64, u64)>::new();
+        for shard in self.traffic.shards.iter() {
+            let traffic = shard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (id, (download, upload)) in &traffic.inbound_bytes {
+                let entry = inbound_bytes.entry(id.clone()).or_default();
+                entry.0 = entry.0.saturating_add(*download);
+                entry.1 = entry.1.saturating_add(*upload);
+            }
+        }
+        state
             .inbound_statistics
             .iter()
-            .map(|(id, statistics)| statistics.record(id.clone()))
+            .map(|(id, statistics)| {
+                let mut statistics = statistics.clone();
+                if let Some((download, upload)) = inbound_bytes.get(id) {
+                    statistics.download_bytes = statistics.download_bytes.saturating_add(*download);
+                    statistics.upload_bytes = statistics.upload_bytes.saturating_add(*upload);
+                }
+                statistics.record(id.clone())
+            })
             .collect()
     }
 

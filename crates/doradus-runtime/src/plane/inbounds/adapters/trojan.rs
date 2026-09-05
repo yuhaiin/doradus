@@ -19,7 +19,17 @@ pub(crate) fn password_hashes(spec: &InboundSpec) -> Vec<[u8; trojan::PASSWORD_H
                 .collect::<Vec<_>>()
         })
         .filter(|hashes| !hashes.is_empty())
-        .unwrap_or_else(|| vec![trojan::password_hash(spec.password.as_bytes())])
+        .unwrap_or_else(|| {
+            let password = crate::inbound::InboundProtocolPlan::compile(
+                &crate::inbound::InboundProtocolKind::Trojan,
+                spec,
+            )
+            .password()
+            .unwrap_or_default()
+            .as_bytes()
+            .to_vec();
+            vec![trojan::password_hash(&password)]
+        })
 }
 
 impl<R, W> InboundUdpFlowPolicy for doradus_protocol::trojan::UdpServer<R, W>

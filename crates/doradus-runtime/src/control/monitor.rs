@@ -49,6 +49,7 @@ use monitor_statistics::*;
 const HISTORY_LIMIT: usize = 2048;
 const GO_HISTORY_SIZE: usize = 1000;
 const BUCKET_LIMIT: usize = 90 * 24 * 60;
+const TRAFFIC_SHARD_COUNT: usize = 16;
 const PERSISTENCE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 const PERSISTENCE_KEY: &str = "statistics.runtime";
 const PERSISTENCE_VERSION: u32 = 1;
@@ -101,8 +102,47 @@ struct ConnectionEntry {
     id: String,
     value: Value,
     telemetry: Arc<[(String, String)]>,
+    inbound_id: Option<Arc<str>>,
+    is_tun: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TrafficFlowEntry {
+    id: String,
+    telemetry: Arc<[(String, String)]>,
+    inbound_id: Option<Arc<str>>,
+    is_tun: bool,
     upload: u64,
     download: u64,
+}
+
+#[derive(Debug, Default)]
+struct MonitorTrafficState {
+    total_upload: u64,
+    total_download: u64,
+    flows: HashMap<TunFlowKey, TrafficFlowEntry>,
+    counters: BTreeMap<String, (u64, u64)>,
+    inbound_bytes: BTreeMap<String, (u64, u64)>,
+    buckets: BTreeMap<i64, (u64, u64)>,
+    telemetry: BTreeMap<(String, String), (u64, u64, u64)>,
+    telemetry_buckets: BTreeMap<TelemetryBucketKey, TelemetryBucketValue>,
+    pending_traffic: BTreeMap<i64, (u64, u64)>,
+    pending_telemetry: BTreeMap<TelemetryBucketKey, TelemetryBucketValue>,
+}
+
+#[derive(Debug)]
+struct MonitorTraffic {
+    shards: Box<[Mutex<MonitorTrafficState>]>,
+}
+
+impl Default for MonitorTraffic {
+    fn default() -> Self {
+        let shards = (0..TRAFFIC_SHARD_COUNT)
+            .map(|_| Mutex::new(MonitorTrafficState::default()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { shards }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -225,6 +265,7 @@ struct PersistedMonitor {
 #[derive(Clone)]
 pub struct ConnectionMonitor {
     state: Arc<Mutex<MonitorState>>,
+    traffic: Arc<MonitorTraffic>,
     sniff_enabled: Arc<AtomicBool>,
     dns_handler: Arc<RwLock<Option<Arc<dyn SocketDnsHandler>>>>,
     events: broadcast::Sender<MonitorEvent>,
@@ -246,32 +287,26 @@ impl TunFlowObserver for ConnectionMonitor {
     }
 
     fn bytes(&self, flow: TunFlowKey, direction: TunFlowDirection, bytes: usize) {
-        let tun = self
-            .lock()
-            .connections
-            .get(&flow)
-            .and_then(|entry| entry.value.get("component"))
-            .and_then(Value::as_str)
-            == Some("tun");
-        if tun {
-            let direction = match direction {
-                TunFlowDirection::Upload => doradus_metrics::Direction::Upload,
-                TunFlowDirection::Download => doradus_metrics::Direction::Download,
-            };
-            self.metrics.tun_packet(direction);
-            match flow.network {
-                doradus_core::Network::Tcp => {
-                    self.metrics
-                        .add_packet(direction, doradus_metrics::MetricNetwork::Tcp);
-                }
-                doradus_core::Network::Udp => {
-                    self.metrics
-                        .add_packet(direction, doradus_metrics::MetricNetwork::Udp);
-                }
-                doradus_core::Network::Icmp | doradus_core::Network::Any => {}
-            }
+        let is_tun = self.add_bytes(flow, direction, bytes);
+        if !is_tun {
+            return;
         }
-        self.add_bytes(flow, direction, bytes);
+        let direction = match direction {
+            TunFlowDirection::Upload => doradus_metrics::Direction::Upload,
+            TunFlowDirection::Download => doradus_metrics::Direction::Download,
+        };
+        self.metrics.tun_packet(direction);
+        match flow.network {
+            doradus_core::Network::Tcp => {
+                self.metrics
+                    .add_packet(direction, doradus_metrics::MetricNetwork::Tcp);
+            }
+            doradus_core::Network::Udp => {
+                self.metrics
+                    .add_packet(direction, doradus_metrics::MetricNetwork::Udp);
+            }
+            doradus_core::Network::Icmp | doradus_core::Network::Any => {}
+        }
     }
 
     fn closed(&self, flow: TunFlowKey) {

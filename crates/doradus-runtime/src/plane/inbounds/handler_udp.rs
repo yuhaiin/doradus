@@ -33,7 +33,7 @@ struct UdpIngress {
     target: Endpoint,
     payload: Vec<u8>,
     reply_tx: mpsc::Sender<InboundUdpResponse>,
-    event_tx: mpsc::UnboundedSender<InboundUdpSessionEvent>,
+    event_tx: mpsc::Sender<InboundUdpSessionEvent>,
 }
 
 impl UdpIngress {
@@ -85,7 +85,7 @@ enum UdpFlowEvent {
 /// or network I/O.
 pub(crate) struct InboundUdpManager {
     ingress_tx: mpsc::Sender<UdpIngress>,
-    command_tx: mpsc::UnboundedSender<UdpManagerCommand>,
+    command_tx: mpsc::Sender<UdpManagerCommand>,
     next_session_id: AtomicU64,
 }
 
@@ -93,14 +93,15 @@ struct InboundUdpSessionChannels {
     session_id: u64,
     reply_tx: mpsc::Sender<InboundUdpResponse>,
     reply_rx: mpsc::Receiver<InboundUdpResponse>,
-    event_rx: mpsc::UnboundedReceiver<InboundUdpSessionEvent>,
-    event_tx: mpsc::UnboundedSender<InboundUdpSessionEvent>,
+    event_rx: mpsc::Receiver<InboundUdpSessionEvent>,
+    event_tx: mpsc::Sender<InboundUdpSessionEvent>,
 }
 
 impl InboundUdpManager {
     pub(super) fn new(inbound: Weak<InboundHandler>, capacity: usize) -> Self {
-        let (ingress_tx, ingress_rx) = mpsc::channel(capacity.max(1));
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let capacity = capacity.max(1);
+        let (ingress_tx, ingress_rx) = mpsc::channel(capacity);
+        let (command_tx, command_rx) = mpsc::channel(capacity.max(16));
         tokio::spawn(run_udp_manager(
             inbound.clone(),
             ingress_rx,
@@ -116,8 +117,9 @@ impl InboundUdpManager {
 
     fn open_session(&self, capacity: usize) -> InboundUdpSessionChannels {
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
-        let (reply_tx, reply_rx) = mpsc::channel(capacity.max(1));
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let capacity = capacity.max(1);
+        let (reply_tx, reply_rx) = mpsc::channel(capacity);
+        let (event_tx, event_rx) = mpsc::channel(capacity);
         InboundUdpSessionChannels {
             session_id,
             reply_tx,
@@ -135,14 +137,18 @@ impl InboundUdpManager {
         }
     }
 
-    fn close_flow(&self, flow: TunFlowKey) {
-        let _ = self.command_tx.send(UdpManagerCommand::CloseFlow(flow));
-    }
-
-    fn close_session(&self, session_id: u64) {
+    async fn close_flow(&self, flow: TunFlowKey) {
         let _ = self
             .command_tx
-            .send(UdpManagerCommand::CloseSession(session_id));
+            .send(UdpManagerCommand::CloseFlow(flow))
+            .await;
+    }
+
+    async fn close_session(&self, session_id: u64) {
+        let _ = self
+            .command_tx
+            .send(UdpManagerCommand::CloseSession(session_id))
+            .await;
     }
 }
 
@@ -155,10 +161,10 @@ enum UdpDispatchResult {
 async fn run_udp_manager(
     inbound: Weak<InboundHandler>,
     mut ingress_rx: mpsc::Receiver<UdpIngress>,
-    mut command_rx: mpsc::UnboundedReceiver<UdpManagerCommand>,
+    mut command_rx: mpsc::Receiver<UdpManagerCommand>,
     capacity: usize,
 ) {
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = mpsc::channel(capacity.max(16));
     let mut flows = HashMap::<UdpSourceKey, UdpFlowHandle>::new();
     let mut pending_close = std::collections::HashSet::<TunFlowKey>::new();
     let mut next_generation = 1u64;
@@ -263,7 +269,7 @@ fn spawn_udp_flow(
     generation: u64,
     capacity: usize,
     first: UdpIngress,
-    event_tx: mpsc::UnboundedSender<UdpFlowEvent>,
+    event_tx: mpsc::Sender<UdpFlowEvent>,
 ) -> UdpFlowHandle {
     let (data_tx, data_rx) = mpsc::channel(capacity.max(1));
     let first_tx = data_tx.clone();
@@ -288,10 +294,12 @@ fn spawn_udp_flow(
         }
         .run()
         .await;
-        let _ = event_tx.send(UdpFlowEvent::Closed {
-            key: key_for_task,
-            generation,
-        });
+        let _ = event_tx
+            .send(UdpFlowEvent::Closed {
+                key: key_for_task,
+                generation,
+            })
+            .await;
     });
     UdpFlowHandle {
         generation,
@@ -309,7 +317,7 @@ struct UdpFlowWorker {
     generation: u64,
     rx: mpsc::Receiver<UdpIngress>,
     cancel_rx: watch::Receiver<bool>,
-    event_tx: mpsc::UnboundedSender<UdpFlowEvent>,
+    event_tx: mpsc::Sender<UdpFlowEvent>,
     datagram: Option<Arc<dyn AsyncDatagram>>,
     flow: Option<TunFlowKey>,
     reply_id: Option<UdpFlowId>,
@@ -412,14 +420,18 @@ impl UdpFlowWorker {
             self.reply_id = Some(packet.id.clone());
             self.reply_peer = Some(packet.peer.clone());
             self.reply_tx = Some(packet.reply_tx.clone());
-            let _ = self.event_tx.send(UdpFlowEvent::Opened {
-                key: self.key.clone(),
-                generation: self.generation,
-                flow,
-            });
+            let _ = self
+                .event_tx
+                .send(UdpFlowEvent::Opened {
+                    key: self.key.clone(),
+                    generation: self.generation,
+                    flow,
+                })
+                .await;
             let _ = packet
                 .event_tx
-                .send(InboundUdpSessionEvent::FlowOpened(flow));
+                .send(InboundUdpSessionEvent::FlowOpened(flow))
+                .await;
         }
 
         let Some(datagram) = self.datagram.as_ref() else {
@@ -485,9 +497,9 @@ pub(crate) struct InboundUdpSession<C> {
     manager: Arc<InboundUdpManager>,
     session_id: u64,
     reply_rx: mpsc::Receiver<InboundUdpResponse>,
-    event_rx: mpsc::UnboundedReceiver<InboundUdpSessionEvent>,
+    event_rx: mpsc::Receiver<InboundUdpSessionEvent>,
     reply_tx: mpsc::Sender<InboundUdpResponse>,
-    event_tx: mpsc::UnboundedSender<InboundUdpSessionEvent>,
+    event_tx: mpsc::Sender<InboundUdpSessionEvent>,
 }
 
 impl<C> InboundUdpSession<C>
@@ -553,7 +565,7 @@ where
                         match close_event {
                             Ok(flow) => {
                                 let stop = self.codec.owns_flow(flow);
-                                self.manager.close_flow(flow);
+                                self.manager.close_flow(flow).await;
                                 if stop {
                                     break;
                                 }
@@ -568,7 +580,7 @@ where
             Ok(())
         }
         .await;
-        self.manager.close_session(self.session_id);
+        self.manager.close_session(self.session_id).await;
         result
     }
 }

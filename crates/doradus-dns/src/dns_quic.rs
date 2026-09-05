@@ -22,6 +22,7 @@ use crate::dns_datagram::{AsyncDnsDatagram, DnsDatagramConnector, resolve_server
 use crate::dns_resolver::{AsyncDnsQuery, AsyncDnsResolver, AsyncIpResolver, SendAsyncDnsQuery};
 use crate::transport::bind_udp_socket;
 use crate::{BoxFuture, DomainName, Error, ErrorKind, LocalBoxFuture, Result};
+use futures_util::task::AtomicWaker;
 use rustls::{ClientConfig, RootCertStore};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
@@ -38,6 +39,7 @@ const DOQ_ALPN_PROTOCOLS: &[&[u8]] = &[
 const DOQ_DEFAULT_PORT: u16 = 784;
 const MAX_DNS_FRAME: usize = u16::MAX as usize;
 const MAX_QUIC_DATAGRAM: usize = 65_535;
+const QUINN_DATAGRAM_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct DoqResolverConfig {
@@ -582,8 +584,9 @@ struct OutboundDatagram {
 
 struct QuinnDatagram {
     local_addr: SocketAddr,
-    send: mpsc::UnboundedSender<OutboundDatagram>,
-    recv: Mutex<mpsc::UnboundedReceiver<InboundDatagram>>,
+    send: mpsc::Sender<OutboundDatagram>,
+    recv: Mutex<mpsc::Receiver<InboundDatagram>>,
+    send_waker: Arc<AtomicWaker>,
     send_closed: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
     closed: Arc<AtomicBool>,
@@ -602,8 +605,9 @@ impl QuinnDatagram {
     fn new(datagram: Box<dyn AsyncDnsDatagram>) -> Result<Self> {
         let datagram: Arc<dyn AsyncDnsDatagram> = Arc::from(datagram);
         let local_addr = datagram.local_addr()?;
-        let (send, mut send_rx) = mpsc::unbounded_channel::<OutboundDatagram>();
-        let (recv_tx, recv) = mpsc::unbounded_channel::<InboundDatagram>();
+        let (send, mut send_rx) = mpsc::channel::<OutboundDatagram>(QUINN_DATAGRAM_QUEUE_CAPACITY);
+        let (recv_tx, recv) = mpsc::channel::<InboundDatagram>(QUINN_DATAGRAM_QUEUE_CAPACITY);
+        let send_waker = Arc::new(AtomicWaker::new());
         let send_closed = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(Notify::new());
         let closed = Arc::new(AtomicBool::new(false));
@@ -612,6 +616,7 @@ impl QuinnDatagram {
         let sender_shutdown = shutdown.clone();
         let sender_closed = closed.clone();
         let sender_send_closed = send_closed.clone();
+        let sender_send_waker = send_waker.clone();
         tokio::spawn(async move {
             loop {
                 let packet = tokio::select! {
@@ -621,6 +626,9 @@ impl QuinnDatagram {
                 let Some(packet) = packet else {
                     break;
                 };
+                // Receiving from the bounded queue frees at least one slot.
+                // Wake Quinn if it previously observed WouldBlock.
+                sender_send_waker.wake();
                 if sender_datagram
                     .send_to(&packet.payload, packet.target)
                     .await
@@ -632,6 +640,7 @@ impl QuinnDatagram {
             }
             let _ = sender_datagram.close().await;
             sender_closed.store(true, Ordering::Release);
+            sender_send_waker.wake();
         });
 
         let receiver_datagram = datagram;
@@ -655,6 +664,7 @@ impl QuinnDatagram {
                         payload: buffer[..length].to_vec(),
                         source,
                     })
+                    .await
                     .is_err()
                 {
                     break;
@@ -666,6 +676,7 @@ impl QuinnDatagram {
             local_addr,
             send,
             recv: Mutex::new(recv),
+            send_waker,
             send_closed,
             shutdown,
             closed,
@@ -682,8 +693,12 @@ impl Drop for QuinnDatagram {
 
 impl quinn::AsyncUdpSocket for QuinnDatagram {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
-        let _ = self;
-        Box::pin(AlwaysWritablePoller)
+        Box::pin(QuinnDatagramPoller {
+            send: self.send.clone(),
+            send_waker: self.send_waker.clone(),
+            send_closed: self.send_closed.clone(),
+            closed: self.closed.clone(),
+        })
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
@@ -699,11 +714,18 @@ impl quinn::AsyncUdpSocket for QuinnDatagram {
         }
         for payload in transmit.contents.chunks(segment_size) {
             self.send
-                .send(OutboundDatagram {
+                .try_send(OutboundDatagram {
                     payload: payload.to_vec(),
                     target: transmit.destination,
                 })
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "DoQ UDP sender closed"))?;
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => {
+                        io::Error::new(io::ErrorKind::WouldBlock, "DoQ UDP send queue is full")
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "DoQ UDP sender closed")
+                    }
+                })?;
         }
         Ok(())
     }
@@ -762,18 +784,94 @@ impl quinn::AsyncUdpSocket for QuinnDatagram {
 }
 
 #[derive(Debug)]
-struct AlwaysWritablePoller;
+struct QuinnDatagramPoller {
+    send: mpsc::Sender<OutboundDatagram>,
+    send_waker: Arc<AtomicWaker>,
+    send_closed: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
+}
 
-impl quinn::UdpPoller for AlwaysWritablePoller {
-    fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let _ = self;
-        Poll::Ready(Ok(()))
+impl quinn::UdpPoller for QuinnDatagramPoller {
+    fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.send_closed.load(Ordering::Acquire)
+            || self.closed.load(Ordering::Acquire)
+            || self.send.is_closed()
+        {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "DoQ UDP sender closed",
+            )));
+        }
+        if self.send.capacity() > 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        self.send_waker.register(cx.waker());
+
+        // Check again after registering to close the race where the worker
+        // freed capacity immediately before the waker became visible.
+        if self.send_closed.load(Ordering::Acquire)
+            || self.closed.load(Ordering::Acquire)
+            || self.send.is_closed()
+        {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "DoQ UDP sender closed",
+            )))
+        } else if self.send.capacity() > 0 {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BlockingDatagram {
+        local_addr: SocketAddr,
+        send_gate: Arc<Notify>,
+    }
+
+    impl AsyncDnsDatagram for BlockingDatagram {
+        fn send_to<'a>(
+            &'a self,
+            payload: &'a [u8],
+            _target: SocketAddr,
+        ) -> BoxFuture<'a, Result<usize>> {
+            Box::pin(async move {
+                self.send_gate.notified().await;
+                Ok(payload.len())
+            })
+        }
+
+        fn recv_from<'a>(
+            &'a self,
+            _buffer: &'a mut [u8],
+        ) -> BoxFuture<'a, Result<(usize, SocketAddr)>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn local_addr(&self) -> Result<SocketAddr> {
+            Ok(self.local_addr)
+        }
+
+        fn close(&self) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn test_transmit(payload: &[u8]) -> quinn::udp::Transmit<'_> {
+        quinn::udp::Transmit {
+            destination: "192.0.2.53:853".parse().unwrap(),
+            ecn: None,
+            contents: payload,
+            segment_size: None,
+            src_ip: None,
+        }
+    }
 
     #[test]
     fn doq_response_frame_requires_exact_length() {
@@ -830,5 +928,42 @@ mod tests {
             })
             .unwrap();
         let _ = resolver;
+    }
+
+    #[tokio::test]
+    async fn quinn_datagram_backpressures_and_wakes_after_capacity_returns() {
+        let send_gate = Arc::new(Notify::new());
+        let socket = Arc::new(
+            QuinnDatagram::new(Box::new(BlockingDatagram {
+                local_addr: "127.0.0.1:53000".parse().unwrap(),
+                send_gate: send_gate.clone(),
+            }))
+            .unwrap(),
+        );
+        let transmit = test_transmit(&[1]);
+
+        // Let the worker take one datagram and block in the underlying
+        // transport, then fill every bounded queue slot behind it.
+        quinn::AsyncUdpSocket::try_send(socket.as_ref(), &transmit).unwrap();
+        tokio::task::yield_now().await;
+        for _ in 0..QUINN_DATAGRAM_QUEUE_CAPACITY {
+            quinn::AsyncUdpSocket::try_send(socket.as_ref(), &transmit).unwrap();
+        }
+        let error = quinn::AsyncUdpSocket::try_send(socket.as_ref(), &transmit).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        let mut poller = quinn::AsyncUdpSocket::create_io_poller(socket.clone());
+        let release = send_gate.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            release.notify_one();
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| poller.as_mut().poll_writable(cx)),
+        )
+        .await
+        .expect("Quinn send poller was not woken after queue capacity returned")
+        .unwrap();
     }
 }

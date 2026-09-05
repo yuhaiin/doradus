@@ -40,6 +40,11 @@ pub(crate) mod adapters;
 
 // Outbound SOCKS5 lives in doradus-protocol; this module owns inbound policy
 // and flow lifetime.
+mod listener_stream;
+mod listener_transparent;
+#[cfg(feature = "tun")]
+mod listener_tun;
+mod listener_udp;
 mod listeners;
 mod socks5;
 use listeners::{InboundOwners, InboundStartOptions, start_inbounds};
@@ -47,6 +52,10 @@ use listeners::{InboundOwners, InboundStartOptions, start_inbounds};
 #[path = "inbound_spec.rs"]
 mod inbound_spec;
 pub(crate) use inbound_spec::*;
+
+#[path = "inbound_plan.rs"]
+mod inbound_plan;
+pub(crate) use inbound_plan::*;
 
 #[path = "inbound_protocols.rs"]
 mod inbound_protocols;
@@ -99,6 +108,11 @@ fn is_supported_inbound_transport(transport: &str) -> bool {
         || transport.eq_ignore_ascii_case("tls_auto")
 }
 
+#[cfg(test)]
+fn supports_socks5_udp(protocol: &str, protocol_udp: bool) -> bool {
+    InboundProtocolKind::compile(protocol).supports_socks5_udp(protocol_udp)
+}
+
 /// Return whether a transport can be applied before the transparent protocol
 /// without losing the original destination address.
 ///
@@ -114,12 +128,6 @@ pub(crate) fn is_supported_transparent_transport(transport: &str) -> bool {
         || transport.eq_ignore_ascii_case("tls_auto")
         || transport.eq_ignore_ascii_case("aead")
         || transport.eq_ignore_ascii_case("http_mock")
-}
-
-fn supports_socks5_udp(protocol: &str, protocol_udp: bool) -> bool {
-    let protocol = protocol.trim();
-    (protocol.eq_ignore_ascii_case("mixed") || protocol.eq_ignore_ascii_case("mix"))
-        || (protocol.eq_ignore_ascii_case("socks5") && protocol_udp)
 }
 
 fn inbound_process_resolver() -> Option<&'static dyn ProcessResolver> {

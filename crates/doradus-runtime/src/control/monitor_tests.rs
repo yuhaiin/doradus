@@ -89,6 +89,71 @@ fn monitor_tracks_live_connections_and_precise_string_counters() {
 }
 
 #[test]
+fn monitor_bytes_do_not_wait_for_control_state_lock() {
+    let monitor = ConnectionMonitor::new();
+    let (flow, context) = flow();
+    monitor.opened(flow, context);
+
+    let control = monitor.lock();
+    let worker_monitor = monitor.clone();
+    let worker = std::thread::spawn(move || {
+        worker_monitor.bytes(flow.key, TunFlowDirection::Upload, 64 * 1024);
+    });
+
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        worker.is_finished(),
+        "traffic accounting must not wait for the connection/history state lock"
+    );
+    drop(control);
+    worker.join().unwrap();
+    assert_eq!(monitor.total_flow_value()["upload"], "65536");
+}
+
+#[test]
+#[ignore = "manual release-mode monitor throughput benchmark"]
+fn benchmark_monitor_bytes_concurrency() {
+    const ITERATIONS_PER_THREAD: usize = 250_000;
+
+    for threads in [1usize, 2, 4, 8] {
+        let monitor = Arc::new(ConnectionMonitor::new());
+        let mut flows = Vec::with_capacity(threads);
+        for index in 0..threads {
+            let source_port = 20_000 + u16::try_from(index).unwrap();
+            let destination_port = 30_000 + u16::try_from(index).unwrap();
+            let key = TunFlowKey {
+                network: Network::Tcp,
+                source: format!("10.0.0.2:{source_port}").parse().unwrap(),
+                destination: format!("203.0.113.10:{destination_port}").parse().unwrap(),
+            };
+            monitor.opened(
+                TunFlow { key },
+                FlowContext::new(Endpoint::ip(Network::Tcp, key.destination)),
+            );
+            flows.push(key);
+        }
+
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for flow in flows.iter().copied() {
+                let monitor = Arc::clone(&monitor);
+                scope.spawn(move || {
+                    for _ in 0..ITERATIONS_PER_THREAD {
+                        monitor.bytes(flow, TunFlowDirection::Upload, 1_400);
+                    }
+                });
+            }
+        });
+        let elapsed = started.elapsed();
+        let operations = threads * ITERATIONS_PER_THREAD;
+        let operations_per_second = operations as f64 / elapsed.as_secs_f64();
+        eprintln!(
+            "monitor bytes: threads={threads} ops={operations} elapsed={elapsed:?} ops/s={operations_per_second:.0}"
+        );
+    }
+}
+
+#[test]
 fn monitor_tracks_inbound_tcp_udp_flows_and_bytes() {
     let monitor = ConnectionMonitor::new();
     let (tcp, mut tcp_context) = flow();

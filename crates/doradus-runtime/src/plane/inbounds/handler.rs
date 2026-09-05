@@ -17,7 +17,7 @@ use doradus_core::proxy::{AsyncDatagram, AsyncProxySelector, BoxAsyncStream};
 use doradus_core::{BoxFuture, Endpoint, FlowContext, Network, Result};
 use doradus_metrics::{InboundProtocol, MetricNetwork, ResultKind};
 
-use super::InboundSpec;
+use super::{InboundProtocolKind, InboundProtocolPlan, InboundSpec};
 use crate::inbound::adapters::common::{
     record_outbound_datagram, record_outbound_stream, relay_counted_with_buffer,
     relay_counted_with_prefix_and_buffer,
@@ -155,6 +155,7 @@ impl doradus_tun::ProxyInputInterceptor for InboundInputInterceptor {
 
 pub(crate) struct InboundHandler {
     spec: InboundSpec,
+    protocol: InboundProtocolPlan,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
     dns: InboundDnsPolicy,
@@ -167,6 +168,17 @@ impl InboundHandler {
         selector: Arc<RuntimeProxySelector>,
         monitor: Arc<ConnectionMonitor>,
     ) -> Arc<Self> {
+        let kind = InboundProtocolKind::compile(&spec.protocol);
+        let protocol = InboundProtocolPlan::compile(&kind, &spec);
+        Self::new_with_protocol_plan(spec, protocol, selector, monitor)
+    }
+
+    pub(crate) fn new_with_protocol_plan(
+        spec: InboundSpec,
+        protocol: InboundProtocolPlan,
+        selector: Arc<RuntimeProxySelector>,
+        monitor: Arc<ConnectionMonitor>,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|inbound| Self {
             dns: InboundDnsPolicy::new(Arc::clone(&monitor)),
             udp: Arc::new(InboundUdpManager::new(
@@ -174,6 +186,7 @@ impl InboundHandler {
                 selector.udp_ringbuffer_size().max(1),
             )),
             spec,
+            protocol,
             selector,
             monitor,
         })
@@ -181,6 +194,10 @@ impl InboundHandler {
 
     pub(crate) fn spec(&self) -> &InboundSpec {
         &self.spec
+    }
+
+    pub(crate) fn protocol_plan(&self) -> &InboundProtocolPlan {
+        &self.protocol
     }
 
     pub(crate) fn selector(&self) -> &Arc<RuntimeProxySelector> {

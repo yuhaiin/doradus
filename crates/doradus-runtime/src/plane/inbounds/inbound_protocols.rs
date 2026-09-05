@@ -409,7 +409,7 @@ trait InboundProtocol: Send + Sync {
 }
 
 pub(crate) struct ProtocolHandler {
-    protocol: String,
+    protocol: InboundProtocolKind,
     inbound: Arc<InboundHandler>,
     yuubinsya_server: Option<Arc<doradus_chain::YuubinsyaServerProxy>>,
 }
@@ -417,8 +417,8 @@ pub(crate) struct ProtocolHandler {
 impl InboundProtocol for ProtocolHandler {
     fn handle<'a>(&'a self, stream: BoxAsyncStream, peer: SocketAddr) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            match self.protocol.as_str() {
-                "socks4a" => {
+            match &self.protocol {
+                InboundProtocolKind::Socks4a => {
                     let username = self.inbound.spec().username.clone();
                     doradus_protocol::socks4a_server::handle(
                         stream,
@@ -428,14 +428,14 @@ impl InboundProtocol for ProtocolHandler {
                     )
                     .await
                 }
-                "socks5" => {
+                InboundProtocolKind::Socks5 => {
                     crate::inbound::socks5::handle(stream, peer, Arc::clone(&self.inbound)).await
                 }
-                "http" => {
+                InboundProtocolKind::Http => {
                     let stream = crate::inbound::adapters::http::HttpInboundStream(stream);
                     serve_http(stream, peer, Arc::clone(&self.inbound)).await
                 }
-                "reverse_tcp" => {
+                InboundProtocolKind::ReverseTcp => {
                     crate::inbound::adapters::reverse::handle_tcp(
                         stream,
                         peer,
@@ -443,7 +443,7 @@ impl InboundProtocol for ProtocolHandler {
                     )
                     .await
                 }
-                "reverse_http" => {
+                InboundProtocolKind::ReverseHttp => {
                     crate::inbound::adapters::reverse::handle_http(
                         stream,
                         peer,
@@ -451,8 +451,10 @@ impl InboundProtocol for ProtocolHandler {
                     )
                     .await
                 }
-                "mixed" => serve_mixed(stream, peer, Arc::clone(&self.inbound)).await,
-                "trojan" => {
+                InboundProtocolKind::Mixed => {
+                    serve_mixed(stream, peer, Arc::clone(&self.inbound)).await
+                }
+                InboundProtocolKind::Trojan => {
                     let hashes =
                         crate::inbound::adapters::trojan::password_hashes(self.inbound.spec());
                     let udp_inbound = Arc::clone(&self.inbound);
@@ -468,8 +470,13 @@ impl InboundProtocol for ProtocolHandler {
                     )
                     .await
                 }
-                "vless" => {
-                    let uuid = doradus_protocol::vless::parse_uuid(&self.inbound.spec().password)?;
+                InboundProtocolKind::Vless => {
+                    let uuid = doradus_protocol::vless::parse_uuid(
+                        self.inbound
+                            .protocol_plan()
+                            .vless_uuid()
+                            .unwrap_or_default(),
+                    )?;
                     let udp_inbound = Arc::clone(&self.inbound);
                     doradus_protocol::vless::handle(
                         stream,
@@ -487,7 +494,7 @@ impl InboundProtocol for ProtocolHandler {
                     )
                     .await
                 }
-                "yuubinsya" => {
+                InboundProtocolKind::Yuubinsya => {
                     let server = self
                         .yuubinsya_server
                         .clone()
@@ -524,10 +531,14 @@ impl InboundProtocol for ProtocolHandler {
                         )
                         .await
                 }
-                "none" => Ok(()),
-                other => Err(Error::new(
+                InboundProtocolKind::None => Ok(()),
+                InboundProtocolKind::Other(other) => Err(Error::new(
                     ErrorKind::Unsupported,
                     format!("inbound protocol {other:?} is not implemented"),
+                )),
+                InboundProtocolKind::Tproxy | InboundProtocolKind::Redir => Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "transparent inbound must use the transparent listener path",
                 )),
             }
         })
@@ -564,7 +575,7 @@ pub(crate) fn protocol_handler(
     yuubinsya_server: Option<Arc<doradus_chain::YuubinsyaServerProxy>>,
 ) -> Arc<ProtocolHandler> {
     Arc::new(ProtocolHandler {
-        protocol,
+        protocol: InboundProtocolKind::compile(&protocol),
         inbound: InboundHandler::new(spec, selector, monitor),
         yuubinsya_server,
     })
