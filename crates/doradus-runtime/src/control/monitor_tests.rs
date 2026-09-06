@@ -1054,7 +1054,7 @@ fn monitor_recovers_checkpoint_after_force_abort() {
     let executable = std::env::current_exe().unwrap();
     let mut child = Command::new(executable)
         .arg("--exact")
-        .arg("monitor::tests::monitor_force_abort_child")
+        .arg("control::monitor::tests::monitor_force_abort_child")
         .arg("--nocapture")
         .env("DORADUS_RUNTIME_MONITOR_CRASH_CHILD_PATH", &path)
         .stdout(Stdio::null())
