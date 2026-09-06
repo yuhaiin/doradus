@@ -7,9 +7,12 @@
 use doradus_protocol::trojan;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::inbound::{InboundSpec, InboundUdpFlowPolicy};
+use crate::inbound::{InboundProtocolPlan, InboundSpec, InboundUdpFlowPolicy};
 
-pub(crate) fn password_hashes(spec: &InboundSpec) -> Vec<[u8; trojan::PASSWORD_HASH_LENGTH]> {
+pub(crate) fn password_hashes_with_protocol_plan(
+    spec: &InboundSpec,
+    protocol: &InboundProtocolPlan,
+) -> Vec<[u8; trojan::PASSWORD_HASH_LENGTH]> {
     spec.auth
         .as_ref()
         .map(|auth| {
@@ -20,16 +23,15 @@ pub(crate) fn password_hashes(spec: &InboundSpec) -> Vec<[u8; trojan::PASSWORD_H
         })
         .filter(|hashes| !hashes.is_empty())
         .unwrap_or_else(|| {
-            let password = crate::inbound::InboundProtocolPlan::compile(
-                &crate::inbound::InboundProtocolKind::Trojan,
-                spec,
-            )
-            .password()
-            .unwrap_or_default()
-            .as_bytes()
-            .to_vec();
+            let password = protocol.password().unwrap_or_default().as_bytes().to_vec();
             vec![trojan::password_hash(&password)]
         })
+}
+
+#[cfg(test)]
+pub(crate) fn password_hashes(spec: &InboundSpec) -> Vec<[u8; trojan::PASSWORD_HASH_LENGTH]> {
+    let protocol = InboundProtocolPlan::compile(&crate::inbound::InboundProtocolKind::Trojan, spec);
+    password_hashes_with_protocol_plan(spec, &protocol)
 }
 
 impl<R, W> InboundUdpFlowPolicy for doradus_protocol::trojan::UdpServer<R, W>

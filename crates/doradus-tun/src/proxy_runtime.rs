@@ -187,6 +187,15 @@ pub(crate) struct IcmpProxyTask {
     join: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Clone)]
+struct ProxyTaskRuntime {
+    output: mpsc::Sender<ProxyOutput>,
+    channel_capacity: usize,
+    timeouts: ProxyTimeouts,
+    observer: Option<Arc<dyn TunFlowObserver>>,
+    udp_buffer_size: usize,
+}
+
 #[derive(Default)]
 pub(crate) struct TcpTaskManager {
     tasks: HashMap<TunFlowKey, ProxyTask>,
@@ -210,6 +219,24 @@ impl std::ops::DerefMut for TcpTaskManager {
 }
 
 impl TcpTaskManager {
+    fn spawn(
+        &mut self,
+        flow: TunFlowKey,
+        proxy: Arc<dyn AsyncProxy>,
+        context: FlowContext,
+        runtime: &ProxyTaskRuntime,
+    ) {
+        self.abort_flow(&flow);
+        let (command, commands) = mpsc::channel(runtime.channel_capacity);
+        let output = runtime.output.clone();
+        let timeouts = runtime.timeouts;
+        let observer = runtime.observer.clone();
+        let join = tokio::spawn(async move {
+            run_tcp_proxy(proxy, context, flow, commands, output, timeouts, observer).await;
+        });
+        self.tasks.insert(flow, ProxyTask { command, join });
+    }
+
     fn send(&self, flow: &TunFlowKey, command: ProxyCommand) -> Result<()> {
         let Some(task) = self.tasks.get(flow) else {
             return Err(Error::new(
@@ -241,6 +268,17 @@ impl TcpTaskManager {
             .map(|task| task.command.clone())
             .collect()
     }
+
+    fn abort_all(&mut self) -> Vec<TunFlowKey> {
+        let flows = self.tasks.keys().copied().collect::<Vec<_>>();
+        for (_, task) in self.tasks.drain() {
+            task.join.abort();
+        }
+        self.pending_to_tun.clear();
+        self.pending_keys.clear();
+        self.pending_closes.clear();
+        flows
+    }
 }
 
 #[derive(Default)]
@@ -264,6 +302,48 @@ impl std::ops::DerefMut for UdpTaskManager {
 }
 
 impl UdpTaskManager {
+    fn ensure_source(
+        &mut self,
+        source: UdpSourceKey,
+        flow: TunFlowKey,
+        proxy: Arc<dyn AsyncProxy>,
+        context: FlowContext,
+        runtime: &ProxyTaskRuntime,
+    ) {
+        if let Some(task) = self.tasks.get_mut(&source) {
+            task.flows.insert(flow);
+            self.bind_flow(flow, source);
+            return;
+        }
+        let (command, commands) = mpsc::channel(runtime.channel_capacity);
+        let output = runtime.output.clone();
+        let timeouts = runtime.timeouts;
+        let observer = runtime.observer.clone();
+        let udp_buffer_size = runtime.udp_buffer_size;
+        let join = tokio::spawn(async move {
+            run_udp_proxy(
+                proxy,
+                context,
+                flow,
+                commands,
+                output,
+                timeouts,
+                observer,
+                udp_buffer_size,
+            )
+            .await;
+        });
+        self.tasks.insert(
+            source,
+            UdpProxyTask {
+                command,
+                join,
+                flows: HashSet::from([flow]),
+            },
+        );
+        self.bind_flow(flow, source);
+    }
+
     fn send(&self, source: &UdpSourceKey, command: UdpProxyCommand) -> Result<()> {
         let Some(task) = self.tasks.get(source) else {
             return Err(Error::new(
@@ -313,6 +393,16 @@ impl UdpTaskManager {
         flows
     }
 
+    fn abort_all(&mut self) -> Vec<TunFlowKey> {
+        let sources = self.tasks.keys().copied().collect::<Vec<_>>();
+        let mut flows = Vec::new();
+        for source in sources {
+            flows.extend(self.remove_source(source));
+        }
+        self.flow_sources.clear();
+        flows
+    }
+
     #[cfg(test)]
     pub(crate) fn flow_sources(&self) -> &HashMap<TunFlowKey, UdpSourceKey> {
         &self.flow_sources
@@ -340,6 +430,23 @@ impl IcmpTaskManager {
         }
     }
 
+    fn spawn(
+        &mut self,
+        flow: TunFlowKey,
+        packet: Vec<u8>,
+        proxy: Arc<dyn AsyncProxy>,
+        context: FlowContext,
+        runtime: &ProxyTaskRuntime,
+    ) {
+        let id = self.next_id();
+        let output = runtime.output.clone();
+        let timeouts = runtime.timeouts;
+        let join = tokio::spawn(async move {
+            run_icmp_proxy(proxy, context, id, flow, packet, output, timeouts).await;
+        });
+        self.tasks.insert(id, IcmpProxyTask { flow, join });
+    }
+
     fn remove_for_flow(&mut self, flow: &TunFlowKey) {
         let ids = self
             .tasks
@@ -355,6 +462,16 @@ impl IcmpTaskManager {
 
     fn has_flow(&self, flow: TunFlowKey) -> bool {
         self.tasks.values().any(|task| task.flow == flow)
+    }
+
+    fn abort_all(&mut self) -> Vec<TunFlowKey> {
+        self.tasks
+            .drain()
+            .map(|(_, task)| {
+                task.join.abort();
+                task.flow
+            })
+            .collect()
     }
 }
 
@@ -542,6 +659,16 @@ impl TunProxyRuntime {
         );
     }
 
+    fn task_runtime(&self) -> ProxyTaskRuntime {
+        ProxyTaskRuntime {
+            output: self.proxy_output_tx.clone(),
+            channel_capacity: self.channel_capacity,
+            timeouts: self.timeouts,
+            observer: self.observer.clone(),
+            udp_buffer_size: self.udp_buffer_size,
+        }
+    }
+
     /// Number of currently registered proxy flow tasks.
     ///
     /// This is intentionally a small lifecycle metric: callers can assert
@@ -632,22 +759,14 @@ impl TunProxyRuntime {
 
     fn open_tcp_flow(&mut self, flow: TunFlow) -> Result<()> {
         self.track_flow(flow.key)?;
-        self.remove_task(&flow.key);
         let mut context = self.context_for_flow(flow);
         self.selector.route_context(&mut context);
         if let Some(observer) = &self.observer {
             observer.opened(flow, context.clone());
         }
         let proxy = self.selector.select(&context);
-        let (command, commands) = mpsc::channel(self.channel_capacity);
-        let output = self.proxy_output_tx.clone();
-        let key = flow.key;
-        let timeouts = self.timeouts;
-        let observer = self.observer.clone();
-        let join = tokio::spawn(async move {
-            run_tcp_proxy(proxy, context, key, commands, output, timeouts, observer).await;
-        });
-        self.tasks.insert(key, ProxyTask { command, join });
+        let task_runtime = self.task_runtime();
+        self.tasks.spawn(flow.key, proxy, context, &task_runtime);
         Ok(())
     }
 
@@ -687,19 +806,9 @@ impl TunProxyRuntime {
             observer.bytes(flow.key, TunFlowDirection::Upload, packet.len());
         }
         let proxy = self.selector.select(&context);
-        let id = self.icmp_tasks.next_id();
-        let output = self.proxy_output_tx.clone();
-        let timeouts = self.timeouts;
-        let join = tokio::spawn(async move {
-            run_icmp_proxy(proxy, context, id, flow.key, packet, output, timeouts).await;
-        });
-        self.icmp_tasks.insert(
-            id,
-            IcmpProxyTask {
-                flow: flow.key,
-                join,
-            },
-        );
+        let task_runtime = self.task_runtime();
+        self.icmp_tasks
+            .spawn(flow.key, packet, proxy, context, &task_runtime);
         Ok(())
     }
 
@@ -716,8 +825,10 @@ impl TunProxyRuntime {
         }
         let target = context.effective_destination();
         let source = udp_source_key(flow.key);
-        self.ensure_udp_proxy(source, context, flow.key)?;
-        self.udp_tasks.bind_flow(flow.key, source);
+        let proxy = self.selector.select(&context);
+        let task_runtime = self.task_runtime();
+        self.udp_tasks
+            .ensure_source(source, flow.key, proxy, context, &task_runtime);
         if let Err(error) = self.udp_tasks.send(
             &source,
             UdpProxyCommand::Data {
@@ -739,73 +850,17 @@ impl TunProxyRuntime {
         Ok(())
     }
 
-    fn ensure_udp_proxy(
-        &mut self,
-        source: UdpSourceKey,
-        context: FlowContext,
-        flow: TunFlowKey,
-    ) -> Result<()> {
-        if let Some(task) = self.udp_tasks.get_mut(&source) {
-            task.flows.insert(flow);
-            return Ok(());
-        }
-        let proxy = self.selector.select(&context);
-        let (command, commands) = mpsc::channel(self.channel_capacity);
-        let output = self.proxy_output_tx.clone();
-        let timeouts = self.timeouts;
-        let observer = self.observer.clone();
-        let udp_buffer_size = self.udp_buffer_size;
-        let join = tokio::spawn(async move {
-            run_udp_proxy(
-                proxy,
-                context,
-                flow,
-                commands,
-                output,
-                timeouts,
-                observer,
-                udp_buffer_size,
-            )
-            .await;
-        });
-        self.udp_tasks.insert(
-            source,
-            UdpProxyTask {
-                command,
-                join,
-                flows: HashSet::from([flow]),
-            },
-        );
-        Ok(())
-    }
-
     pub fn close(&mut self) {
         // This is the force-stop path. The async path below gives transports a
         // bounded opportunity to flush/shutdown before falling back here.
-        let flows: Vec<_> = self.tasks.keys().copied().collect();
-        for (_, task) in self.tasks.drain() {
-            task.join.abort();
-        }
-        for flow in flows {
+        for flow in self.tasks.abort_all() {
             let _ = self.untrack_flow(&flow);
         }
-        let icmp_flows: Vec<_> = self
-            .icmp_tasks
-            .drain()
-            .map(|(_, task)| {
-                task.join.abort();
-                task.flow
-            })
-            .collect();
-        for flow in icmp_flows {
+        for flow in self.icmp_tasks.abort_all() {
             let _ = self.untrack_flow(&flow);
         }
-        let sources: Vec<_> = self.udp_tasks.keys().copied().collect();
-        for source in sources {
-            let flows = self.remove_udp_source_task(source);
-            for flow in flows {
-                let _ = self.untrack_flow(&flow);
-            }
+        for flow in self.udp_tasks.abort_all() {
+            let _ = self.untrack_flow(&flow);
         }
         self.clear_tracked_flows();
     }
@@ -964,16 +1019,9 @@ impl TunProxyRuntime {
 
 impl Drop for TunProxyRuntime {
     fn drop(&mut self) {
-        for task in self.tasks.drain().map(|(_, task)| task) {
-            task.join.abort();
-        }
-        for task in self.icmp_tasks.drain().map(|(_, task)| task) {
-            task.join.abort();
-        }
-        let sources: Vec<_> = self.udp_tasks.keys().copied().collect();
-        for source in sources {
-            let _ = self.remove_udp_source_task(source);
-        }
+        let _ = self.tasks.abort_all();
+        let _ = self.icmp_tasks.abort_all();
+        let _ = self.udp_tasks.abort_all();
         self.flow_tracker.drain();
     }
 }

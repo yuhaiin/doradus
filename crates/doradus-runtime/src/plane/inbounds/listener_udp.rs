@@ -142,8 +142,12 @@ async fn start_yuubinsya_udp(
     };
 
     let logs = monitor.logs();
-    let inbound_handler =
-        InboundHandler::new(spec.clone(), Arc::clone(&selector), Arc::clone(&monitor));
+    let inbound_handler = InboundHandler::new_with_protocol_plan(
+        spec.clone(),
+        protocol_config.clone(),
+        Arc::clone(&selector),
+        Arc::clone(&monitor),
+    );
     push_listener(
         listeners,
         &spec.id,
@@ -200,8 +204,12 @@ async fn start_socks5_udp(
     };
 
     let logs = monitor.logs();
-    let inbound_handler =
-        InboundHandler::new(spec.clone(), Arc::clone(&selector), Arc::clone(&monitor));
+    let inbound_handler = InboundHandler::new_with_protocol_plan(
+        spec.clone(),
+        protocol_config.clone(),
+        Arc::clone(&selector),
+        Arc::clone(&monitor),
+    );
     if let Some(aead) = transports.aead.clone() {
         let socket = doradus_protocol::socks5_server::AeadUdpTransport::new(
             crate::inbound::socks5::RuntimeUdpTransport(Box::new(socket)),

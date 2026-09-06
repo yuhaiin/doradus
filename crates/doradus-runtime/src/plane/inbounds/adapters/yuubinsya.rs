@@ -8,10 +8,13 @@ use doradus_protocol::yuubinsya_udp::YuubinsyaUdpServer;
 
 use super::common::RoutedProxy;
 use crate::RuntimeProxySelector;
-use crate::inbound::{InboundHandler, InboundSpec, InboundUdpFlowPolicy, InboundUdpSession};
+use crate::inbound::{
+    InboundHandler, InboundProtocolPlan, InboundSpec, InboundUdpFlowPolicy, InboundUdpSession,
+};
 
 pub(crate) fn new_server(
     spec: &InboundSpec,
+    protocol: &InboundProtocolPlan,
     selector: Arc<RuntimeProxySelector>,
 ) -> Option<Arc<YuubinsyaServerProxy>> {
     let udp_buffer_size = selector.udp_buffer_size().max(512);
@@ -22,11 +25,9 @@ pub(crate) fn new_server(
             .map(|password| derive_salt(&password))
             .collect::<Vec<_>>()
     } else {
-        let plan = crate::inbound::InboundProtocolPlan::compile(
-            &crate::inbound::InboundProtocolKind::Yuubinsya,
-            spec,
-        );
-        vec![derive_salt(plan.password().unwrap_or_default().as_bytes())]
+        vec![derive_salt(
+            protocol.password().unwrap_or_default().as_bytes(),
+        )]
     };
     if password_hashes.is_empty() {
         return None;

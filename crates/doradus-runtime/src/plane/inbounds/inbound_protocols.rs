@@ -1,21 +1,26 @@
 use super::*;
 
 #[cfg(feature = "http2")]
-pub(crate) async fn serve_h2_listener(
+pub(crate) async fn serve_h2_listener_with_protocol_plan(
     listener: TcpListener,
     spec: InboundSpec,
+    protocol: InboundProtocolKind,
+    protocol_plan: InboundProtocolPlan,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
     tls_acceptor: Option<InboundTlsAcceptor>,
 ) -> Result<()> {
     use tokio::task::JoinSet;
 
-    let yuubinsya_server = (spec.protocol == "yuubinsya")
-        .then(|| crate::inbound::adapters::yuubinsya::new_server(&spec, selector.clone()))
+    let yuubinsya_server = matches!(protocol, InboundProtocolKind::Yuubinsya)
+        .then(|| {
+            crate::inbound::adapters::yuubinsya::new_server(&spec, &protocol_plan, selector.clone())
+        })
         .flatten();
-    let handler = protocol_handler(
-        spec.protocol.clone(),
+    let handler = protocol_handler_with_protocol_plan(
+        protocol.clone(),
         spec.clone(),
+        protocol_plan.clone(),
         selector,
         monitor.clone(),
         yuubinsya_server.clone(),
@@ -198,22 +203,26 @@ pub(crate) async fn bridge_h2_stream(
     }
 }
 
-pub(crate) async fn serve_listener(
+pub(crate) async fn serve_listener_with_protocol_plan(
     listener: TcpListener,
     spec: InboundSpec,
+    protocol: InboundProtocolKind,
+    protocol_plan: InboundProtocolPlan,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
     tls_acceptor: Option<InboundTlsAcceptor>,
 ) -> Result<()> {
     use tokio::task::JoinSet;
 
-    let protocol = spec.protocol.clone();
-    let yuubinsya_server = (protocol == "yuubinsya")
-        .then(|| crate::inbound::adapters::yuubinsya::new_server(&spec, selector.clone()))
+    let yuubinsya_server = matches!(protocol, InboundProtocolKind::Yuubinsya)
+        .then(|| {
+            crate::inbound::adapters::yuubinsya::new_server(&spec, &protocol_plan, selector.clone())
+        })
         .flatten();
-    let handler = protocol_handler(
+    let handler = protocol_handler_with_protocol_plan(
         protocol.clone(),
         spec.clone(),
+        protocol_plan.clone(),
         selector,
         monitor.clone(),
         yuubinsya_server.clone(),
@@ -258,22 +267,26 @@ pub(crate) async fn serve_listener(
 }
 
 #[cfg(feature = "websocket")]
-pub(crate) async fn serve_websocket_listener(
+pub(crate) async fn serve_websocket_listener_with_protocol_plan(
     listener: TcpListener,
     spec: InboundSpec,
+    protocol: InboundProtocolKind,
+    protocol_plan: InboundProtocolPlan,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
     tls_acceptor: Option<InboundTlsAcceptor>,
 ) -> Result<()> {
     use tokio::task::JoinSet;
 
-    let protocol = spec.protocol.clone();
-    let yuubinsya_server = (protocol == "yuubinsya")
-        .then(|| crate::inbound::adapters::yuubinsya::new_server(&spec, selector.clone()))
+    let yuubinsya_server = matches!(protocol, InboundProtocolKind::Yuubinsya)
+        .then(|| {
+            crate::inbound::adapters::yuubinsya::new_server(&spec, &protocol_plan, selector.clone())
+        })
         .flatten();
-    let handler = protocol_handler(
+    let handler = protocol_handler_with_protocol_plan(
         protocol.clone(),
         spec.clone(),
+        protocol_plan.clone(),
         selector,
         monitor.clone(),
         yuubinsya_server.clone(),
@@ -328,21 +341,26 @@ where
 }
 
 #[cfg(all(feature = "websocket", feature = "http2"))]
-pub(crate) async fn serve_websocket_h2_listener(
+pub(crate) async fn serve_websocket_h2_listener_with_protocol_plan(
     listener: TcpListener,
     spec: InboundSpec,
+    protocol: InboundProtocolKind,
+    protocol_plan: InboundProtocolPlan,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
     tls_acceptor: Option<InboundTlsAcceptor>,
 ) -> Result<()> {
     use tokio::task::JoinSet;
 
-    let yuubinsya_server = (spec.protocol == "yuubinsya")
-        .then(|| crate::inbound::adapters::yuubinsya::new_server(&spec, selector.clone()))
+    let yuubinsya_server = matches!(protocol, InboundProtocolKind::Yuubinsya)
+        .then(|| {
+            crate::inbound::adapters::yuubinsya::new_server(&spec, &protocol_plan, selector.clone())
+        })
         .flatten();
-    let handler = protocol_handler(
-        spec.protocol.clone(),
+    let handler = protocol_handler_with_protocol_plan(
+        protocol.clone(),
         spec.clone(),
+        protocol_plan.clone(),
         selector,
         monitor.clone(),
         yuubinsya_server.clone(),
@@ -456,7 +474,10 @@ impl InboundProtocol for ProtocolHandler {
                 }
                 InboundProtocolKind::Trojan => {
                     let hashes =
-                        crate::inbound::adapters::trojan::password_hashes(self.inbound.spec());
+                        crate::inbound::adapters::trojan::password_hashes_with_protocol_plan(
+                            self.inbound.spec(),
+                            self.inbound.protocol_plan(),
+                        );
                     let udp_inbound = Arc::clone(&self.inbound);
                     doradus_protocol::trojan::handle(
                         stream,
@@ -501,6 +522,7 @@ impl InboundProtocol for ProtocolHandler {
                         .or_else(|| {
                             crate::inbound::adapters::yuubinsya::new_server(
                                 self.inbound.spec(),
+                                self.inbound.protocol_plan(),
                                 Arc::clone(self.inbound.selector()),
                             )
                         })
@@ -567,6 +589,113 @@ pub(crate) async fn serve_http(
     .await
 }
 
+pub(crate) fn protocol_handler_with_protocol_plan(
+    protocol: InboundProtocolKind,
+    spec: InboundSpec,
+    protocol_plan: InboundProtocolPlan,
+    selector: Arc<RuntimeProxySelector>,
+    monitor: Arc<ConnectionMonitor>,
+    yuubinsya_server: Option<Arc<doradus_chain::YuubinsyaServerProxy>>,
+) -> Arc<ProtocolHandler> {
+    Arc::new(ProtocolHandler {
+        protocol,
+        inbound: InboundHandler::new_with_protocol_plan(spec, protocol_plan, selector, monitor),
+        yuubinsya_server,
+    })
+}
+
+#[cfg(test)]
+fn compile_test_protocol(spec: &InboundSpec) -> (InboundProtocolKind, InboundProtocolPlan) {
+    let protocol = InboundProtocolKind::compile(&spec.protocol);
+    let plan = InboundProtocolPlan::compile(&protocol, spec);
+    (protocol, plan)
+}
+
+#[cfg(test)]
+pub(crate) async fn serve_listener(
+    listener: TcpListener,
+    spec: InboundSpec,
+    selector: Arc<RuntimeProxySelector>,
+    monitor: Arc<ConnectionMonitor>,
+    tls_acceptor: Option<InboundTlsAcceptor>,
+) -> Result<()> {
+    let (protocol, protocol_plan) = compile_test_protocol(&spec);
+    serve_listener_with_protocol_plan(
+        listener,
+        spec,
+        protocol,
+        protocol_plan,
+        selector,
+        monitor,
+        tls_acceptor,
+    )
+    .await
+}
+
+#[cfg(all(test, feature = "http2"))]
+pub(crate) async fn serve_h2_listener(
+    listener: TcpListener,
+    spec: InboundSpec,
+    selector: Arc<RuntimeProxySelector>,
+    monitor: Arc<ConnectionMonitor>,
+    tls_acceptor: Option<InboundTlsAcceptor>,
+) -> Result<()> {
+    let (protocol, protocol_plan) = compile_test_protocol(&spec);
+    serve_h2_listener_with_protocol_plan(
+        listener,
+        spec,
+        protocol,
+        protocol_plan,
+        selector,
+        monitor,
+        tls_acceptor,
+    )
+    .await
+}
+
+#[cfg(all(test, feature = "websocket"))]
+pub(crate) async fn serve_websocket_listener(
+    listener: TcpListener,
+    spec: InboundSpec,
+    selector: Arc<RuntimeProxySelector>,
+    monitor: Arc<ConnectionMonitor>,
+    tls_acceptor: Option<InboundTlsAcceptor>,
+) -> Result<()> {
+    let (protocol, protocol_plan) = compile_test_protocol(&spec);
+    serve_websocket_listener_with_protocol_plan(
+        listener,
+        spec,
+        protocol,
+        protocol_plan,
+        selector,
+        monitor,
+        tls_acceptor,
+    )
+    .await
+}
+
+#[cfg(all(test, feature = "websocket", feature = "http2"))]
+pub(crate) async fn serve_websocket_h2_listener(
+    listener: TcpListener,
+    spec: InboundSpec,
+    selector: Arc<RuntimeProxySelector>,
+    monitor: Arc<ConnectionMonitor>,
+    tls_acceptor: Option<InboundTlsAcceptor>,
+) -> Result<()> {
+    let (protocol, protocol_plan) = compile_test_protocol(&spec);
+    serve_websocket_h2_listener_with_protocol_plan(
+        listener,
+        spec,
+        protocol,
+        protocol_plan,
+        selector,
+        monitor,
+        tls_acceptor,
+    )
+    .await
+}
+
+#[cfg(test)]
 pub(crate) fn protocol_handler(
     protocol: String,
     spec: InboundSpec,
@@ -574,11 +703,9 @@ pub(crate) fn protocol_handler(
     monitor: Arc<ConnectionMonitor>,
     yuubinsya_server: Option<Arc<doradus_chain::YuubinsyaServerProxy>>,
 ) -> Arc<ProtocolHandler> {
-    Arc::new(ProtocolHandler {
-        protocol: InboundProtocolKind::compile(&protocol),
-        inbound: InboundHandler::new(spec, selector, monitor),
-        yuubinsya_server,
-    })
+    let kind = InboundProtocolKind::compile(&protocol);
+    let plan = InboundProtocolPlan::compile(&kind, &spec);
+    protocol_handler_with_protocol_plan(kind, spec, plan, selector, monitor, yuubinsya_server)
 }
 
 pub(crate) async fn serve_connection(

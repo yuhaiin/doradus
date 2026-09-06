@@ -335,12 +335,23 @@ mod async_tcp {
                     result.v6 = self.query(domain, DnsRecordType::Aaaa).await?.addresses.v6;
                 }
                 ResolveStrategy::PreferIpv4 | ResolveStrategy::Default => {
-                    result.v4 = self.query(domain, DnsRecordType::A).await?.addresses.v4;
-                    result.v6 = self.query(domain, DnsRecordType::Aaaa).await?.addresses.v6;
+                    let (v4, v6) = tokio::join!(
+                        self.query(domain, DnsRecordType::A),
+                        self.query(domain, DnsRecordType::Aaaa),
+                    );
+                    // Preserve the old A-then-AAAA error precedence while
+                    // overlapping both TCP DNS round trips.
+                    result.v4 = v4?.addresses.v4;
+                    result.v6 = v6?.addresses.v6;
                 }
                 ResolveStrategy::PreferIpv6 => {
-                    result.v6 = self.query(domain, DnsRecordType::Aaaa).await?.addresses.v6;
-                    result.v4 = self.query(domain, DnsRecordType::A).await?.addresses.v4;
+                    let (v4, v6) = tokio::join!(
+                        self.query(domain, DnsRecordType::A),
+                        self.query(domain, DnsRecordType::Aaaa),
+                    );
+                    // PreferIpv6 previously observed AAAA failures first.
+                    result.v6 = v6?.addresses.v6;
+                    result.v4 = v4?.addresses.v4;
                 }
             }
             Ok(result)
@@ -779,6 +790,71 @@ mod async_tcp {
                     second.unwrap().addresses.v4,
                     vec![Ipv4Addr::new(192, 0, 2, 53)]
                 );
+            });
+        }
+
+        #[test]
+        fn async_tcp_resolve_queries_a_and_aaaa_concurrently() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    // Do not answer the first connection until the second one
+                    // has arrived. A sequential resolver would time out here.
+                    let (first, _) = listener.accept().await.unwrap();
+                    let (second, _) = listener.accept().await.unwrap();
+                    for mut stream in [first, second] {
+                        let request = read_frame(&mut stream, 2048).await.unwrap();
+                        let question = decode_query(&request).unwrap();
+                        let addresses = match question.record_type {
+                            DnsRecordType::A => IpSet {
+                                v4: vec!["192.0.2.61".parse().unwrap()],
+                                v6: Vec::new(),
+                            },
+                            DnsRecordType::Aaaa => IpSet {
+                                v4: Vec::new(),
+                                v6: vec!["2001:db8::61".parse().unwrap()],
+                            },
+                            _ => unreachable!(),
+                        };
+                        let response = encode_response(
+                            &request,
+                            &DnsResponse {
+                                addresses,
+                                ptr_names: Vec::new(),
+                                service_bindings: Vec::new(),
+                                minimum_ttl: Some(30),
+                            },
+                        )
+                        .unwrap();
+                        write_frame(&mut stream, &response).await.unwrap();
+                    }
+                });
+
+                let client = AsyncTcpDnsClient {
+                    server: address,
+                    timeout: Duration::from_millis(500),
+                    max_packet_size: 2048,
+                    local_bind_addresses: Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
+                    bind_interface: None,
+                };
+                let answer = client
+                    .resolve(
+                        &DomainName::new("example.com").unwrap(),
+                        ResolveStrategy::Default,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(answer.v4, vec!["192.0.2.61".parse::<Ipv4Addr>().unwrap()]);
+                assert_eq!(
+                    answer.v6,
+                    vec!["2001:db8::61".parse::<std::net::Ipv6Addr>().unwrap()]
+                );
+                server.await.unwrap();
             });
         }
     }

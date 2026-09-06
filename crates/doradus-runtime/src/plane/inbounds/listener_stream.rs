@@ -4,12 +4,14 @@ use tokio::net::TcpListener;
 
 use super::listeners::{InboundOwners, ListenerStartContext, push_listener};
 #[cfg(feature = "http2")]
-use super::serve_h2_listener;
+use super::serve_h2_listener_with_protocol_plan;
 #[cfg(all(feature = "websocket", feature = "http2"))]
-use super::serve_websocket_h2_listener;
+use super::serve_websocket_h2_listener_with_protocol_plan;
 #[cfg(feature = "websocket")]
-use super::serve_websocket_listener;
-use super::{ConnectionMonitor, InboundProtocolKind, InboundSpec, serve_listener};
+use super::serve_websocket_listener_with_protocol_plan;
+use super::{
+    ConnectionMonitor, InboundProtocolKind, InboundSpec, serve_listener_with_protocol_plan,
+};
 use crate::inbound_runtime::InboundRuntimeState;
 
 async fn bind_tcp_listener(
@@ -53,7 +55,8 @@ pub(super) async fn start_stream_listener(
     spec: &mut InboundSpec,
     start: &ListenerStartContext<'_>,
 ) -> bool {
-    let protocol = start.protocol;
+    let protocol = start.protocol.to_owned();
+    let protocol_plan = start.protocol_config.to_owned();
     let transports = start.transports;
     let selector = &start.selector;
     let monitor = &start.monitor;
@@ -84,9 +87,11 @@ pub(super) async fn start_stream_listener(
                         listeners,
                         &listener_id,
                         tokio::spawn(async move {
-                            if let Err(error) = serve_websocket_h2_listener(
+                            if let Err(error) = serve_websocket_h2_listener_with_protocol_plan(
                                 listener,
                                 listener_spec,
+                                protocol.to_owned(),
+                                protocol_plan.to_owned(),
                                 selector,
                                 monitor,
                                 tls_acceptor,
@@ -105,9 +110,11 @@ pub(super) async fn start_stream_listener(
                         listeners,
                         &listener_id,
                         tokio::spawn(async move {
-                            if let Err(error) = serve_websocket_listener(
+                            if let Err(error) = serve_websocket_listener_with_protocol_plan(
                                 listener,
                                 listener_spec,
+                                protocol.to_owned(),
+                                protocol_plan.to_owned(),
                                 selector,
                                 monitor,
                                 tls_acceptor,
@@ -133,9 +140,11 @@ pub(super) async fn start_stream_listener(
                         listeners,
                         &listener_spec.id,
                         tokio::spawn(async move {
-                            if let Err(error) = serve_websocket_listener(
+                            if let Err(error) = serve_websocket_listener_with_protocol_plan(
                                 listener,
                                 listener_spec,
+                                protocol.to_owned(),
+                                protocol_plan.to_owned(),
                                 selector,
                                 monitor,
                                 tls_acceptor,
@@ -181,9 +190,16 @@ pub(super) async fn start_stream_listener(
                 listeners,
                 &listener_id,
                 tokio::spawn(async move {
-                    if let Err(error) =
-                        serve_h2_listener(listener, listener_spec, selector, monitor, tls_acceptor)
-                            .await
+                    if let Err(error) = serve_h2_listener_with_protocol_plan(
+                        listener,
+                        listener_spec,
+                        protocol.to_owned(),
+                        protocol_plan.to_owned(),
+                        selector,
+                        monitor,
+                        tls_acceptor,
+                    )
+                    .await
                     {
                         logs.error(format!("HTTP/2 inbound listener stopped: {error}"));
                     }
@@ -200,7 +216,7 @@ pub(super) async fn start_stream_listener(
     }
 
     if spec.udp_mode.tcp_enabled()
-        || (matches!(protocol, InboundProtocolKind::Vless) && spec.udp_mode.udp_enabled())
+        || (matches!(&protocol, InboundProtocolKind::Vless) && spec.udp_mode.udp_enabled())
     {
         let Some(listener) = bind_tcp_listener(spec, monitor, runtime).await else {
             return false;
@@ -216,8 +232,16 @@ pub(super) async fn start_stream_listener(
             listeners,
             &listener_id,
             tokio::spawn(async move {
-                if let Err(error) =
-                    serve_listener(listener, listener_spec, selector, monitor, tls_acceptor).await
+                if let Err(error) = serve_listener_with_protocol_plan(
+                    listener,
+                    listener_spec,
+                    protocol.to_owned(),
+                    protocol_plan.to_owned(),
+                    selector,
+                    monitor,
+                    tls_acceptor,
+                )
+                .await
                 {
                     logs.error(format!("inbound listener stopped: {error}"));
                 }

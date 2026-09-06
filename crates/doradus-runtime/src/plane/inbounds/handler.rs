@@ -17,7 +17,9 @@ use doradus_core::proxy::{AsyncDatagram, AsyncProxySelector, BoxAsyncStream};
 use doradus_core::{BoxFuture, Endpoint, FlowContext, Network, Result};
 use doradus_metrics::{InboundProtocol, MetricNetwork, ResultKind};
 
-use super::{InboundProtocolKind, InboundProtocolPlan, InboundSpec};
+#[cfg(test)]
+use super::InboundProtocolKind;
+use super::{InboundProtocolPlan, InboundSpec};
 use crate::inbound::adapters::common::{
     record_outbound_datagram, record_outbound_stream, relay_counted_with_buffer,
     relay_counted_with_prefix_and_buffer,
@@ -163,6 +165,7 @@ pub(crate) struct InboundHandler {
 }
 
 impl InboundHandler {
+    #[cfg(test)]
     pub(crate) fn new(
         spec: InboundSpec,
         selector: Arc<RuntimeProxySelector>,

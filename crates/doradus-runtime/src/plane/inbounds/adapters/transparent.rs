@@ -17,21 +17,22 @@ use doradus_core::{Endpoint, Error, ErrorKind, Network, Result};
 
 use super::common::io_error;
 use crate::inbound::{
-    InboundHandler, InboundSpec, InboundTlsAcceptor, InboundUdpFlowPolicy, InboundUdpSession,
-    prepare_inbound_stream,
+    InboundHandler, InboundProtocolPlan, InboundSpec, InboundTlsAcceptor, InboundUdpFlowPolicy,
+    InboundUdpSession, prepare_inbound_stream,
 };
 use crate::inbound_runtime::InboundRuntimeState;
 use crate::{ConnectionMonitor, RuntimeProxySelector};
 
 pub(crate) async fn serve_listener(
-    listen: SocketAddr,
     protocol: String,
     spec: InboundSpec,
+    protocol_plan: InboundProtocolPlan,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
     tls_acceptor: Option<InboundTlsAcceptor>,
     runtime: Arc<InboundRuntimeState>,
 ) -> Result<()> {
+    let listen = spec.listen;
     let id = spec.id.clone();
     let listener = match doradus_protocol::transparent::bind_listener(
         listen,
@@ -44,7 +45,12 @@ pub(crate) async fn serve_listener(
         }
     };
     runtime.listener_ready(&spec.id, "tcp", Some(listen.to_string()));
-    let inbound = InboundHandler::new(spec, Arc::clone(&selector), Arc::clone(&monitor));
+    let inbound = InboundHandler::new_with_protocol_plan(
+        spec,
+        protocol_plan,
+        Arc::clone(&selector),
+        Arc::clone(&monitor),
+    );
     let mut connections = JoinSet::new();
     let result = async {
         loop {
@@ -84,12 +90,18 @@ pub(crate) async fn serve_listener(
 pub(crate) async fn serve_udp_listener(
     listen: SocketAddr,
     spec: InboundSpec,
+    protocol_plan: InboundProtocolPlan,
     selector: Arc<RuntimeProxySelector>,
     monitor: Arc<ConnectionMonitor>,
     runtime: Arc<InboundRuntimeState>,
 ) -> Result<()> {
     let id = spec.id.clone();
-    let inbound = InboundHandler::new(spec, Arc::clone(&selector), Arc::clone(&monitor));
+    let inbound = InboundHandler::new_with_protocol_plan(
+        spec,
+        protocol_plan,
+        Arc::clone(&selector),
+        Arc::clone(&monitor),
+    );
     let codec = match doradus_protocol::transparent::UdpServer::bind(
         listen,
         inbound.selector().udp_buffer_size(),

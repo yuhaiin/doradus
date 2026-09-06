@@ -271,12 +271,24 @@ impl AsyncUdpDnsClient {
                 result.v6 = self.query(domain, DnsRecordType::Aaaa).await?.addresses.v6;
             }
             ResolveStrategy::PreferIpv4 | ResolveStrategy::Default => {
-                result.v4 = self.query(domain, DnsRecordType::A).await?.addresses.v4;
-                result.v6 = self.query(domain, DnsRecordType::Aaaa).await?.addresses.v6;
+                let (v4, v6) = tokio::join!(
+                    self.query(domain, DnsRecordType::A),
+                    self.query(domain, DnsRecordType::Aaaa),
+                );
+                // Preserve the previous sequential error priority while
+                // overlapping the two network round trips.
+                result.v4 = v4?.addresses.v4;
+                result.v6 = v6?.addresses.v6;
             }
             ResolveStrategy::PreferIpv6 => {
-                result.v6 = self.query(domain, DnsRecordType::Aaaa).await?.addresses.v6;
-                result.v4 = self.query(domain, DnsRecordType::A).await?.addresses.v4;
+                let (v4, v6) = tokio::join!(
+                    self.query(domain, DnsRecordType::A),
+                    self.query(domain, DnsRecordType::Aaaa),
+                );
+                // PreferIpv6 used to await AAAA first, so keep that error
+                // precedence even though both queries now start together.
+                result.v6 = v6?.addresses.v6;
+                result.v4 = v4?.addresses.v4;
             }
         }
         Ok(result)
@@ -589,6 +601,71 @@ mod tests {
             let (answer, server_result) = tokio::join!(client_future, server_future);
             answer.unwrap();
             server_result.unwrap();
+        });
+    }
+
+    #[test]
+    fn async_udp_resolve_queries_a_and_aaaa_concurrently() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = socket.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::with_capacity(2);
+                for _ in 0..2 {
+                    let mut packet = vec![0; 2048];
+                    let (size, peer) = socket.recv_from(&mut packet).await.unwrap();
+                    packet.truncate(size);
+                    requests.push((packet, peer));
+                }
+
+                for (request, peer) in requests {
+                    let question = decode_query(&request).unwrap();
+                    let addresses = match question.record_type {
+                        DnsRecordType::A => IpSet {
+                            v4: vec!["192.0.2.60".parse().unwrap()],
+                            v6: Vec::new(),
+                        },
+                        DnsRecordType::Aaaa => IpSet {
+                            v4: Vec::new(),
+                            v6: vec!["2001:db8::60".parse().unwrap()],
+                        },
+                        _ => unreachable!(),
+                    };
+                    let response = encode_response(
+                        &request,
+                        &DnsResponse {
+                            addresses,
+                            ptr_names: Vec::new(),
+                            service_bindings: Vec::new(),
+                            minimum_ttl: Some(30),
+                        },
+                    )
+                    .unwrap();
+                    socket.send_to(&response, peer).await.unwrap();
+                }
+            });
+
+            let client = AsyncUdpDnsClient::new(
+                address,
+                Duration::from_millis(500),
+                2048,
+                Arc::from(Vec::<IpAddr>::new().into_boxed_slice()),
+                None,
+            );
+            let answer = client
+                .resolve(
+                    &DomainName::new("example.com").unwrap(),
+                    ResolveStrategy::Default,
+                )
+                .await
+                .unwrap();
+            assert_eq!(answer.v4, vec!["192.0.2.60".parse::<Ipv4Addr>().unwrap()]);
+            assert_eq!(answer.v6, vec!["2001:db8::60".parse::<Ipv6Addr>().unwrap()]);
+            server.await.unwrap();
         });
     }
 }

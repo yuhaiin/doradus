@@ -9,6 +9,7 @@ pub(super) async fn start_transparent_listener(
     start: &ListenerStartContext<'_>,
 ) {
     let protocol = start.protocol;
+    let protocol_plan = start.protocol_config;
     let transports = start.transports;
     let selector = &start.selector;
     let monitor = &start.monitor;
@@ -41,6 +42,7 @@ pub(super) async fn start_transparent_listener(
         let udp_spec = spec.clone();
         let protocol_name = spec.protocol.clone();
         let listener_spec = spec;
+        let listener_protocol_plan = protocol_plan.to_owned();
         let listener_selector = Arc::clone(selector);
         let listener_monitor = Arc::clone(monitor);
         let listener_tls_acceptor = tls_acceptor.clone();
@@ -51,9 +53,9 @@ pub(super) async fn start_transparent_listener(
             &listener_spec.id.clone(),
             tokio::spawn(async move {
                 if let Err(error) = crate::inbound::adapters::transparent::serve_listener(
-                    listener_spec.listen,
                     protocol_name,
                     listener_spec,
+                    listener_protocol_plan,
                     listener_selector,
                     listener_monitor,
                     listener_tls_acceptor,
@@ -70,6 +72,7 @@ pub(super) async fn start_transparent_listener(
             let selector = Arc::clone(selector);
             let monitor = Arc::clone(monitor);
             let spec = udp_spec;
+            let protocol_plan = protocol_plan.to_owned();
             let listener_runtime = runtime.clone();
             let logs = monitor.logs();
             push_listener(
@@ -79,6 +82,7 @@ pub(super) async fn start_transparent_listener(
                     if let Err(error) = crate::inbound::adapters::transparent::serve_udp_listener(
                         spec.listen,
                         spec,
+                        protocol_plan,
                         selector,
                         monitor,
                         listener_runtime,

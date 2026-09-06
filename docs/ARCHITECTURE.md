@@ -96,7 +96,7 @@ graph TD
 | doradus-protocol | Async base proxy factory plus SOCKS, HTTP, VLESS, VMess, Trojan, Shadowsocks, H2, WebSocket, and Yuubinsya | proxy_factory.rs → session.rs/tls.rs |
 | doradus-chain | Composition of nodes, transports, and protocols into outbound chains, including TLS/WebSocket/H2/UOT, retries, and UDP | config.rs → go_node.rs → lib.rs |
 | doradus-store | Typed repositories, SQLite, schema, Go v6/legacy compatibility, FakeIP mapping, statistics, and state | lib.rs → sqlite.rs/schema.rs → repository.rs |
-| doradus-tun | OS TUN descriptor, smoltcp packet/socket engine, dispatcher, proxy runtime, and packet write-back | runtime.rs → dispatcher.rs → packet.rs → proxy.rs |
+| doradus-tun | OS TUN descriptor, smoltcp packet/socket engine, dispatcher, proxy runtime, and packet write-back | runtime.rs → dispatcher.rs → packet.rs → proxy_runtime.rs → proxy_flow.rs/proxy_tasks.rs |
 | doradus-geo | GeoIP/Geo metadata loading and lookup | lib.rs |
 | doradus-wireguard | WireGuard engine, driver, and proxy adapter | config.rs → engine.rs → proxy.rs |
 | doradus-backup | Backup data format and transport helpers | lib.rs |
@@ -279,6 +279,17 @@ flowchart LR
     CTRL --> RELOAD[InboundReload All, One, or DNS]
 ~~~
 
+Runtime assembly is split by responsibility rather than kept in one startup
+file:
+
+- assembly_config_loader.rs reads store-backed runtime inputs, system hosts,
+  FakeIP compatibility settings, and other startup-only configuration.
+- assembly.rs is the orchestration layer: it builds resolver registries,
+  FakeIP/router state, and the final snapshot without owning persistence
+  parsing details.
+- assembly_snapshot.rs owns RuntimeSnapshot and the immutable helpers used by
+  route, resolver, and NAT selection.
+
 The RuntimeBuilder helpers set runtime-only options, inject resolver factories
 or bridges, load hosts/FakeIP, build resolvers/routes/proxies, and form one
 complete snapshot. RuntimeController::reload rebuilds and publishes everything;
@@ -286,6 +297,24 @@ mutate_and_reload writes and rebuilds under one control lock;
 mutate_and_reload_inbound reloads one inbound; mutate_and_reload_dns notifies
 only the DNS supervisor; rebuild_locked_with_events publishes the handle and
 sends events under the reload lock.
+
+RuntimeProxySelector also publishes one coherent selector generation at a
+time. It stores an `ArcSwap<SelectorState>` containing the current TCP/UDP
+routed selectors, tagged proxies, closed/retargeted node sets, metadata, and
+runtime settings. Reload constructs the complete SelectorState and swaps one
+Arc. A single route_context or select operation therefore never observes a
+mixture of old tags with new metadata or old UDP state with new TCP state.
+
+The selector implementation is physically separated into:
+
+- selector.rs for SelectorState, reload, close/retarget, and proxy ownership.
+- selector_routing.rs for FakeIP restoration, hosts override, route_context,
+  and final proxy selection.
+- selector_metadata.rs for node/tag/endpoint observability metadata.
+
+The trait boundary still permits a reload between a caller's route_context
+and later select call. True per-flow generation pinning would require changing
+FlowContext or the selector trait; do not fake that guarantee in one adapter.
 
 ### 6.2 Reload boundaries
 
@@ -309,7 +338,7 @@ restart, the snapshot owns immutable data, and the controller coordinates both.
 sequenceDiagram
     participant L as TcpListener
     participant O as start_inbounds
-    participant S as serve_listener
+    participant S as serve_listener_with_protocol_plan
     participant H as ProtocolHandler
     participant P as protocol server
     participant IH as runtime handler port
@@ -318,7 +347,7 @@ sequenceDiagram
     participant T as target
 
     O->>L: bind one listener per Go inbound record
-    O->>S: serve_listener(listener, spec, selector, monitor, tls)
+    O->>S: serve_listener_with_protocol_plan(listener, spec, kind, plan, selector, monitor, tls)
     S->>L: accept()
     S->>S: prepare_inbound_stream()
     S->>H: serve_connection(stream, peer, handler)
@@ -335,9 +364,11 @@ sequenceDiagram
 ~~~
 
 The path is run_until or run_until_with_selector_ready, then run_until_inner
-and start_inbounds, serve_listener, serve_connection, ProtocolHandler::handle,
-and finally the protocol handler port. Runtime creates FlowContext, stream or
-datagram state, and selector operations after protocol parsing.
+and start_inbounds, serve_listener_with_protocol_plan, serve_connection,
+ProtocolHandler::handle, and finally the protocol handler port. Runtime creates
+FlowContext, stream or datagram state, and selector operations after protocol
+parsing. Test-only listener wrappers may compile a plan for compact fixtures;
+production startup passes the plan compiled by InboundPlan.
 
 ### 7.2 FlowContext is the cross-layer connection envelope
 
@@ -386,18 +417,25 @@ framing remain in doradus-protocol.
 
 UdpSourceKey is inbound_id + session_id + source + authentication; it
 intentionally excludes target so one full-cone source can use many destinations.
-InboundUdpManager::dispatch uses bounded try_send. UdpFlowWorker owns
+InboundUdpManager::dispatch uses a bounded data queue. UdpFlowWorker owns
 AsyncDatagram, flow observation, idle timing, reply metadata, and every
 potentially blocking DNS/route/open/send/receive operation.
 
 ### 8.2 Queue and close semantics
 
-- A full data queue may drop packets: UdpDispatchResult::Dropped is intentional.
-- Close commands use an unbounded control channel and must not be lost.
+- A full packet-data queue may drop packets: UdpDispatchResult::Dropped is
+  intentional data-plane backpressure.
+- Manager commands, manager flow events, and per-session FlowOpened events use
+  bounded Tokio channels. Lifecycle commands/events use async send and must not
+  be silently discarded when the queue is full.
 - pending_close handles close arriving before a worker finishes opening.
 - generation prevents an old Closed event from deleting a replacement.
 - Sessions and managers must not await worker network I/O.
 - Idle cleanup closes the datagram and releases FlowObserverGuard.
+
+There are no unbounded channels in the normal inbound UDP module. Do not
+replace bounded lifecycle sends with try_send merely to make a path look more
+"non-blocking"; losing a close event just moves cleanup into an idle timeout.
 
 When changing UDP, choose one clear boundary among codec, manager, and worker,
 then test full queues, close-before-open, replacement, multiple targets, idle
@@ -430,6 +468,28 @@ builds TunProxyRuntime, creates the interceptor/dispatcher, and waits for
 shutdown or matching inbound reload. The runtime helper
 build_tun_proxy_runtime_with_dns_and_udp connects TUN, DNS interception,
 UDP/full-cone NAT, and selector behavior.
+
+TunProxyRuntime is now primarily an orchestrator. FlowTracker owns tracked-flow
+lifetime, NAT bindings, process metadata cache/refcounts, and flow cleanup.
+Transport task ownership is split across three managers:
+
+- TcpTaskManager owns TCP task spawn/register/send/abort/shutdown and pending
+  TUN output state.
+- UdpTaskManager owns source-scoped UDP task creation, flow-to-source binding,
+  task removal, shutdown, and full-cone source sharing.
+- IcmpTaskManager owns ICMP task IDs, spawn, flow lookup, and abort.
+
+ProxyTaskRuntime carries the shared task-launch environment (output sender,
+channel capacity, timeouts, observer, and UDP buffer size). TunProxyRuntime
+prepares FlowContext, applies routing, selects a proxy, and asks the owning
+manager to spawn or reuse a task; it should not grow another parallel task map.
+
+Payload allocation was benchmarked before introducing a buffer pool. Reusing a
+1500-byte UDP Vec improved the isolated copy/allocation micro-benchmark by about
+1.24x, while 16 KiB TCP was about 1.02x. That is not sufficient evidence for a
+cross-queue buffer pool or project-wide Bytes conversion. Keep the current
+owned Vec boundary unless profiling a real workload shows allocation as a
+material bottleneck.
 
 ### 9.2 TUN and socket inbounds share policy
 
@@ -473,6 +533,13 @@ The default AsyncIpResolver::query maps A/AAAA answers to ResolveStrategy and
 returns the minimum TTL. A transport may preserve ptr_names, service bindings,
 and the authoritative TTL.
 
+Dual-stack async address resolution sends A and AAAA queries concurrently for
+Default, PreferIpv4, and PreferIpv6. AsyncDnsResolver does this in both Local
+and Send paths, and the direct AsyncUdpDnsClient/AsyncTcpDnsClient convenience
+resolve APIs follow the same behavior. Preference controls result/error
+ordering; it does not serialize the two network round trips. OnlyIpv4 and
+OnlyIpv6 still issue one query.
+
 ### 10.3 RoutedDnsClient query flow
 
 1. query/query_packet applies TimeoutResolver.
@@ -485,6 +552,14 @@ and the authoritative TTL.
    truncated UDP may be retried over TCP.
 6. decode_response produces DnsResponse, after which cache/FakeIP/hosts policy
    determines the final answer.
+
+DNS-over-QUIC uses bounded send and receive queues. QuinnDatagram::try_send maps
+a full outbound queue to WouldBlock, and its custom AsyncUdpSocket poller only
+reports writable after capacity actually returns. The sender worker wakes the
+poller when it consumes a queue slot; the receiver awaits bounded delivery
+instead of growing an unbounded packet backlog. Keep the post-waker capacity
+recheck in the poller: it closes the otherwise easy lost-wakeup race between
+checking a full queue and registering the task waker.
 
 Do not read API or SQLite directly from RoutedDnsClient. RuntimeBuilder loads
 typed configuration from the store; the client consumes constructed endpoints,
@@ -506,7 +581,7 @@ DNS entry point; resolver transports are the client-side upstream path.
 - InboundDnsHandler decides whether to intercept and what packet to return; it
   does not choose every ordinary resolver transport.
 
-## 11. Proxy, protocol, and chain relationships
+## 11. Proxy plans, protocol, and chain relationships
 
 ### 11.1 Three layers
 
@@ -521,17 +596,41 @@ DNS entry point; resolver transports are the client-side upstream path.
 - doradus-chain combines nodes, TLS, WebSocket, H2, UOT, and UDP stages.
   ChainClient owns connection/cache/retry behavior; ChainProxy and ChainDatagram
   expose the capability to runtime.
-- runtime/src/plane/outbound.rs maps Go node/proxy configuration and registers
-  the resulting objects with RuntimeProxySelector.
+- runtime/src/plane/proxy_plan.rs is the typed compatibility boundary between
+  persisted Go-shaped configuration and protocol construction. It validates
+  and normalizes standard protocols, HTTP/TLS/H2/WebSocket/AEAD/Yuubinsya,
+  SOCKS5, WireGuard/WARP, and related transport plans before a proxy is built.
+- runtime/src/plane/outbound.rs consumes typed plans and registers the resulting
+  objects with RuntimeProxySelector. It should not become another raw JSON
+  protocol parser.
+- runtime/src/plane/protocol_factory.rs builds protocol capabilities from typed
+  plans. Protocol implementations do not read ConfigStore or Go records.
 
 The direction is:
 
 ~~~text
 Go node/proxy config
-  -> BaseProxyConfig::build or ChainClient
+  -> proxy_plan compile/validation
+  -> protocol_factory / BaseProxyConfig::build or ChainClient
   -> TLS, HTTP, and protocol-session wrappers
   -> runtime relay or TUN proxy task
 ~~~
+
+StandardProxyPlan uses a typed StandardProtocol enum for Shadowsocks,
+ShadowsocksR, Trojan, VLESS, and VMess. Required passwords/UUIDs/methods and
+legacy defaults are validated once during plan compilation instead of being
+re-read from serde_json::Value inside the protocol builder. The same rule
+applies to inbound startup: compile compatibility-shaped configuration once,
+then pass a typed plan through the runtime.
+
+InboundPlan owns InboundProtocolKind, InboundProtocolPlan,
+InboundTransportPlan, InboundSpec compatibility data, and the TLS acceptor.
+After central auth is applied, prepare_runtime refreshes the typed protocol
+plan once. Production listener paths then pass the already compiled kind/plan
+through ListenerStartContext into stream/UDP/transparent listeners,
+ProtocolHandler, InboundHandler, and Trojan/Yuubinsya adapters. Production
+code must not recompile a protocol plan from spec.password or spec.protocol.
+Small #[cfg(test)] wrappers may compile plans for concise fixtures.
 
 AsyncProxy is a core runtime-facing capability. It should not move to
 doradus-types merely because it is a trait; only runtime-independent DNS,
@@ -539,11 +638,12 @@ inbound policy, endpoint, and network models belong there.
 
 ### 11.2 Adding an outbound protocol
 
-Add configuration parsing and factory dispatch in composition/base_proxy.rs, implement
-handshake/session without reading store or controller, reuse chain stages for
-new H2/WebSocket/TLS/UOT transports, map persisted configuration in runtime
-outbound construction, complete Go-node conversion, and add protocol, chain,
-selector, and workspace tests.
+Add persisted compatibility parsing/validation to runtime/plane/proxy_plan.rs,
+add typed factory dispatch in protocol_factory.rs (or the appropriate reusable
+protocol constructor), implement handshake/session without reading store or
+controller, reuse chain stages for H2/WebSocket/TLS/UOT transports, complete
+Go-node conversion, and add plan, protocol, chain, selector, and workspace
+tests.
 
 Avoid direct ConfigStore dependencies in protocol crates, wire framing inside
 the runtime selector, a stream-only trait shared by UDP and TCP, or a global
@@ -563,6 +663,20 @@ terminal result. Keep these decisions in route policy and selector code.
 doradus-store owns SQLite setup, schema validation, migration, Go-compatible
 records, typed repositories, FakeIP persistence, and runtime statistics
 persistence. It must not own live sockets, supervisors, or handshakes.
+
+The main ConfigStore CRUD core is synchronous because rusqlite work is
+synchronous. open_sync/open_memory_sync/get_config_sync/list_config_sync,
+put_config_sync/delete_config_sync/apply_sync and related primitives are the
+real storage boundary; async compatibility methods are thin wrappers. Runtime
+startup or mutation paths that might block a Tokio worker use spawn_blocking or
+the runtime run_blocking_store helper. Do not add fake async to new SQLite
+helpers merely to match an old call-site spelling.
+
+Store source files are also separated by physical responsibility: lib.rs is
+the facade and core CRUD/transaction boundary, snapshot.rs owns database
+staging/sidecar/manifest/restore file operations, and row.rs owns SQLite row
+decoding and typed validation. Keep new restore-file helpers out of lib.rs and
+new row extraction helpers out of repositories.
 
 ### 12.2 Startup loading and migration
 
@@ -650,6 +764,26 @@ and capped at the newest 1000 rows per inbound. Aggregate TCP/UDP flow counts
 and upload/download bytes are kept hot in the monitor, periodically checkpointed
 to `inbound_statistics`, and restored on restart; active flow counts are reset
 to zero because active sockets are not persisted.
+
+ConnectionMonitor no longer uses API JSON as its runtime data model.
+ConnectionRecord stores the typed fields read by lifecycle/statistics logic
+(route mode, protocol, host, process, node, inbound id, and TUN marker) while a
+serde_json::Value projection is retained for API/SSE compatibility. Runtime
+code should read the typed fields; only projection code should depend on JSON
+field names.
+
+Monitor implementation is split by responsibility:
+
+- monitor_runtime.rs: construction and shared runtime glue.
+- monitor_lifecycle.rs: open/close/failure/close-request lifetime.
+- monitor_traffic.rs: byte counters, traffic shards, inbound statistics.
+- monitor_projection_runtime.rs: connections/traffic/telemetry/history views.
+- monitor_runtime_persistence.rs: durable snapshots, deltas, and restore.
+- monitor_dns.rs plus monitor_projection.rs/monitor_persistence.rs/
+  monitor_statistics.rs: DNS and supporting projection/persistence helpers.
+
+Hot traffic accounting is sharded; control/lifecycle state is not held under
+the traffic lock. Do not collapse those locks back into one convenient Mutex.
 
 The API embeds the Vite output under `crates/doradus-api/web` at compile time.
 The repository keeps that directory as an empty `.gitkeep` placeholder; the
@@ -777,14 +911,16 @@ missing capabilities, and sandbox limitations separately from source failures.
 | Need to inspect | Start at |
 | --- | --- |
 | Public contracts | crates/doradus-types/src/{lib,dns,net,inbound}.rs |
-| Runtime assembly | crates/doradus-runtime/src/assembly.rs |
+| Runtime assembly | crates/doradus-runtime/src/{assembly,assembly_config_loader,assembly_snapshot}.rs |
 | Controller/reload | crates/doradus-runtime/src/control/ |
+| Selector state/routing/metadata | crates/doradus-runtime/src/plane/{selector,selector_routing,selector_metadata}.rs |
 | Inbound owners | crates/doradus-runtime/src/plane/inbounds/ |
 | TUN and DNS supervisors | crates/doradus-runtime/src/plane/data_plane*.rs |
 | Route policy | runtime/src/policy/route.rs and doradus-trie/src/router.rs |
-| Outbound construction | runtime/src/plane/outbound.rs and protocol/src/composition/base_proxy.rs |
+| Outbound plan/construction | runtime/src/plane/{proxy_plan,outbound,protocol_factory}.rs and protocol/src/composition/base_proxy.rs |
 | Chain validation and connect | doradus-chain/src/{config,go_node,chain_client}.rs |
-| Persistence | doradus-store/src/{sqlite,schema,repository,migration}.rs |
+| Persistence | doradus-store/src/{lib,sqlite,schema,repository,migration,snapshot,row}.rs |
+| Monitor lifecycle/traffic/projection | runtime/src/control/monitor*.rs |
 | HTTP API | doradus-api/src/api.rs and src/service/ |
 
 ## 19. Change checklist
@@ -860,10 +996,13 @@ Runtime also owns monitoring, latency probing, loopback detection, interface
 discovery, bounded logs, defaults, update control, and proxy wrappers. These
 should not become a second configuration store or owner supervisor.
 
-RuntimeProxySelector stores each capability in a replaceable live slot. New
-flows read the new slot; existing flows keep their already acquired proxy.
-Resolver, local-bind policy, connect budgets, and loopback tracking are separate
-wrappers rather than one untestable connect function.
+RuntimeProxySelector publishes a coherent ArcSwap<SelectorState>. New
+route/select operations read one selector generation; already acquired proxy
+objects remain owned by existing flows. Resolver, local-bind policy, connect
+budgets, and loopback tracking are separate wrappers rather than one untestable
+connect function. Keep route behavior in selector_routing.rs and observability
+metadata in selector_metadata.rs instead of growing selector.rs back into a
+single reload/routing/metadata file.
 
 ### 20.10 doradus-api: HTTP adapter, RPC, and service management
 
@@ -941,6 +1080,7 @@ OS TUN packet
   -> context_for_flow (process and FakeIP context)
   -> selector.route_context
   -> selector.select
+  -> TcpTaskManager::spawn
   -> run_tcp_proxy
   -> AsyncProxy::connect
   -> bidirectional relay
@@ -1053,7 +1193,7 @@ flowchart TD
 
 ## 24. Documentation scope and use
 
-This guide covers the 13 crates, production source modules, major tests,
+This guide covers the 15 workspace crates, production source modules, major tests,
 startup/control plane, TCP/UDP/TUN/DNS data planes, routing, proxy/protocol/
 chain/store/API boundaries, and the main change entry points. Complete means
 that each component has an indexed responsibility, boundary, main flow, and
@@ -1070,23 +1210,36 @@ For code reading, use this order:
 Source line numbers change as code evolves. Function names and paths are the
 stable index; links with line numbers are only navigation hints.
 
-## 25. Migration quick reference after add0b04
+## 25. Current architecture quick reference
 
-The recent layering work separated public contracts, async runtime capability,
-protocol wrappers, and TUN smoke entry points:
+The 2026 maintenance pass deliberately moved compatibility parsing, runtime
+state, task ownership, and observability toward explicit boundaries without
+adding new crates for every concern:
 
-| Old location or entry point | Current entry point | Meaning |
+| Concern | Current boundary | Important invariant |
 | --- | --- | --- |
-| Endpoint and Network defined independently by core/crates | doradus-types::{Endpoint, Network} | One canonical address/network definition; core re-exports it |
-| DNS model/handlers split between DNS and runtime | doradus-types::{DnsResponse, DnsHandler, AsyncDnsHandler, AsyncIpResolver} | Wire codec, transport, and cache remain in doradus-dns |
-| Separate runtime/TUN inbound DNS contracts | doradus-types::InboundDnsHandler | Shared interception decision and answer interface |
-| StreamConnector, BlockingStreamProxy, sync HTTP/SOCKS | doradus-core::proxy::{AsyncProxy, AsyncDatagram, AsyncStream} | Outbound capability is async; no parallel blocking API |
-| doradus-protocol/src/tls_sync.rs | doradus-protocol/src/tls.rs::RustCryptoTlsProxy | TLS is an async wrapper over an existing AsyncProxy |
-| Runtime-built basic HTTP/SOCKS/direct proxy | doradus-protocol::proxy_factory::BaseProxyConfig::build | Protocol builds reusable capabilities; runtime maps persisted configuration |
-| TUN benchmark in core with old async features | doradus-tun smoke binary with tun-routes | TUN async implementation belongs to doradus-tun; route installation is separate |
-| TUN smoke directly injected a DNS handler | FakeIpDnsProxy plus FakeIpDnsDatagram | DNS interception uses the common datagram capability |
+| Public address/DNS/inbound contracts | doradus-types | Keep Tokio/store/platform ownership out |
+| Persisted outbound compatibility data | runtime/plane/proxy_plan.rs | Validate/normalize once, then build from typed plans |
+| Persisted inbound compatibility data | inbounds/InboundPlan | prepare_runtime refreshes typed plan once; production listeners consume it directly |
+| Runtime immutable configuration | assembly_snapshot.rs / RuntimeSnapshot | Publish only complete snapshots |
+| Live selector generation | ArcSwap<SelectorState> | Swap TCP/UDP/tag/metadata/settings coherently |
+| Selector routing vs metadata | selector_routing.rs / selector_metadata.rs | Do not recombine unrelated change reasons |
+| Monitor runtime data | typed ConnectionRecord + JSON projection | Runtime logic reads typed fields, API reads projection |
+| Monitor hot traffic | sharded traffic state | Never take the control-state lock per byte update |
+| Inbound UDP queues | bounded data/control/event channels | Packet data may drop under pressure; lifecycle events must not silently disappear |
+| DoQ socket adapter | bounded queues + real Quinn writable poller | Full queue reports WouldBlock and wakes on capacity return |
+| TUN async task ownership | Tcp/Udp/IcmpTaskManager + FlowTracker | Runtime orchestrates; managers own spawn/register/abort |
+| SQLite execution | synchronous ConfigStore core + blocking runtime bridge | Do not pretend rusqlite I/O is async |
+| Store file/row helpers | snapshot.rs / row.rs | Keep lib.rs as facade rather than a utility dump |
 
-Adding a public trait does not mean putting every proxy trait in doradus-types.
-First decide whether it expresses a platform-independent value or contract. If
-it needs FlowContext, Tokio I/O, socket metadata, or async resource lifetime,
-keep it in the corresponding core/protocol/runtime layer.
+The preferred maintenance rule is now conservative: preserve these ownership
+boundaries, measure before changing hot-path allocation or containers, and do
+not split a cohesive protocol implementation merely because the source file is
+large. QUIC and AEAD modules may legitimately be long when one wire protocol
+owns the handshake, framing, session, and UDP behavior.
+
+Adding a public trait still does not mean putting every proxy trait in
+doradus-types. First decide whether it expresses a platform-independent value
+or contract. If it needs FlowContext, Tokio I/O, socket metadata, store state,
+or async resource lifetime, keep it in the corresponding
+core/protocol/runtime layer.
