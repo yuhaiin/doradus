@@ -23,6 +23,9 @@ case "${target}" in
       g++-mingw-w64-x86-64
       cmake
       nasm
+      libclang-dev
+      curl
+      ca-certificates
     )
     linker=x86_64-w64-mingw32-gcc
     cxx=x86_64-w64-mingw32-g++
@@ -47,7 +50,7 @@ podman run --rm --network=host \
     linker="$2"
     cxx="$3"
     shift 3
-    mkdir -p /state/home /state/cache/tmp
+    mkdir -p /state/home /state/cache/tmp /state/tap-windows/include
     export HOME=/state/home
     export CARGO_HOME=/cargo-home
     export CARGO_TARGET_DIR=/target
@@ -62,11 +65,20 @@ podman run --rm --network=host \
     apt-get update >/state/apt-update.log
     DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends "$@" \
       >/state/apt-install.log
+
+    tap_header=/state/tap-windows/include/tap-windows.h
+    curl -fsSL \
+      https://raw.githubusercontent.com/OpenVPN/tap-windows6/0e30f5c13b3c7b0bdd60da915350f653e4c14d92/src/tap-windows.h \
+      -o "$tap_header"
+    echo "ca2aca307cbabb0400dea8f1823490762bbd2fa9720a1da511701b975330d621  $tap_header" \
+      | sha256sum -c -
+
     rustup target add "$target"
     target_env=$(printf "%s" "$target" | tr "[:lower:]-" "[:upper:]_")
     eval "export CARGO_TARGET_${target_env}_LINKER=$linker"
     eval "export CC_${target_env}=$linker"
     eval "export CXX_${target_env}=$cxx"
+    eval "export CXXFLAGS_${target_env}=\"-Wa,-mbig-obj -I/state/tap-windows/include\""
     cd /workspace
     cargo check --config net.offline=false --locked --target "$target" \
       -p doradus-api --bin doradus --all-features \
