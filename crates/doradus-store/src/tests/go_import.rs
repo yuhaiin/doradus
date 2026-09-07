@@ -432,6 +432,7 @@ fn go_node_runtime_preserves_proxy_layers_and_selects_supported_base() {
         ("vmess", GoProxyTransport::Vmess),
         ("yuubinsya", GoProxyTransport::Yuubinsya),
         ("quic", GoProxyTransport::Quic),
+        ("openvpn", GoProxyTransport::Openvpn),
         ("warp_masque", GoProxyTransport::WarpMasque),
         ("aead", GoProxyTransport::Aead),
         // Go's bootstrap_dns_warp point is a no-op wrapper; without a
@@ -587,9 +588,7 @@ fn go_node_runtime_keeps_unknown_protocols_but_rejects_malformed_json() {
 }
 
 #[test]
-fn go_proxy_runtime_converts_core_base_transports_and_rejects_chain_layers() {
-    use std::time::Duration;
-
+fn go_proxy_runtime_preserves_unresolved_base_transport_specs() {
     let direct = GoNodeRecord {
         id: "direct".to_owned(),
         name: "direct".to_owned(),
@@ -601,13 +600,8 @@ fn go_proxy_runtime_converts_core_base_transports_and_rejects_chain_layers() {
         data_json: br#"{"chain":[{"type":"direct","direct":{}}]}"#.to_vec(),
     };
     let runtime = direct.to_proxy_runtime_config().unwrap();
-    assert!(matches!(
-        runtime
-            .to_base_proxy_config(Duration::from_secs(3))
-            .unwrap()
-            .kind,
-        GoBaseProxyKind::Direct
-    ));
+    assert_eq!(runtime.transport, GoProxyTransport::Direct);
+    assert!(runtime.base_proxy_endpoints().unwrap().is_empty());
 
     let http = GoNodeRecord {
         id: "http".to_owned(),
@@ -620,17 +614,15 @@ fn go_proxy_runtime_converts_core_base_transports_and_rejects_chain_layers() {
         data_json: br#"{"chain":[{"type":"fixed","fixed":{"host":"127.0.0.1","port":8080}},{"type":"http","http":{"user":"u","password":"p"}}]}"#.to_vec(),
     };
     let runtime = http.to_proxy_runtime_config().unwrap();
-    let config = runtime
-        .to_base_proxy_config(Duration::from_secs(3))
-        .unwrap();
-    assert!(matches!(
-        config.kind,
-        GoBaseProxyKind::Http {
-            proxy,
-            username: Some(_),
-            password: Some(_)
-        } if proxy == "127.0.0.1:8080".parse().unwrap()
-    ));
+    assert_eq!(runtime.transport, GoProxyTransport::HttpProxy);
+    assert_eq!(
+        runtime.base_proxy_endpoints().unwrap(),
+        vec![GoProxyEndpoint {
+            host: "127.0.0.1".to_owned(),
+            port: 8080,
+            bind_interface: None,
+        }]
+    );
 
     let yuubinsya = GoNodeRecord {
         chain_types_json: br#"["fixedv2","tls","http2","yuubinsya"]"#.to_vec(),
@@ -638,11 +630,10 @@ fn go_proxy_runtime_converts_core_base_transports_and_rejects_chain_layers() {
         ..http
     };
     let runtime = yuubinsya.to_proxy_runtime_config().unwrap();
-    let error = match runtime.to_base_proxy_config(Duration::from_secs(3)) {
-        Ok(_) => panic!("Yuubinsya must use chain construction"),
-        Err(error) => error,
-    };
-    assert_eq!(error.kind, ErrorKind::Unsupported);
+    assert_eq!(
+        runtime.chain_types,
+        ["fixedv2", "tls", "http2", "yuubinsya"]
+    );
 }
 
 #[test]

@@ -13,13 +13,10 @@ use crate::DEFAULT_MTU;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
-use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::network::DEFAULT_INTERFACE;
 use doradus_core::proxy::AsyncProxy;
-use doradus_core::{
-    BoxFuture, DomainName, Endpoint, ErrorKind, FlowContext, IpSet, Network, ResolveStrategy,
-    Result,
-};
+use doradus_core::{Endpoint, ErrorKind, FlowContext, IpSet, Network, Result};
+use doradus_types::{AsyncIpResolver, BoxFuture, DomainName, ResolveStrategy};
 use smoltcp::wire::{IpAddress, IpCidr};
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::mpsc;
@@ -398,6 +395,7 @@ async fn userspace_proxy_crosses_two_local_wireguard_peers() {
     let proxy = WireGuardProxy {
         command_tx: first_tx.clone(),
         closed: Arc::clone(&first_closed),
+        driver_task: tokio::sync::Mutex::new(Some(first_task)),
     };
     let context = FlowContext::new(Endpoint::ip(Network::Tcp, "192.0.2.1:80".parse().unwrap()));
     let mut stream = proxy.connect(&context).await.unwrap();
@@ -421,6 +419,7 @@ async fn userspace_proxy_crosses_two_local_wireguard_peers() {
     let second_proxy = WireGuardProxy {
         command_tx: second_tx.clone(),
         closed: Arc::clone(&second_closed),
+        driver_task: tokio::sync::Mutex::new(Some(second_task)),
     };
     let second_datagram = second_proxy
         .open_datagram(&FlowContext::new(Endpoint::ip(
@@ -467,12 +466,10 @@ async fn userspace_proxy_crosses_two_local_wireguard_peers() {
     first_datagram.close().await.unwrap();
     second_datagram.close().await.unwrap();
 
-    first_closed.store(true, Ordering::Release);
-    second_closed.store(true, Ordering::Release);
-    let _ = first_tx.send(DriverCommand::Close).await;
-    let _ = second_tx.send(DriverCommand::Close).await;
-    let _ = first_task.await;
-    let _ = second_task.await;
+    proxy.close().await.unwrap();
+    second_proxy.close().await.unwrap();
+    assert!(first_closed.load(Ordering::Acquire));
+    assert!(second_closed.load(Ordering::Acquire));
 }
 
 #[test]

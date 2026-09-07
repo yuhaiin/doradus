@@ -49,10 +49,7 @@ use sha2::{Digest, Sha256};
 use sqlite::{Connection, Row, SqliteValue};
 
 pub mod fakeip;
-pub use compat_proxy::{
-    GoBaseProxyConfig, GoBaseProxyEndpoint, GoBaseProxyKind, GoProxyLayer, GoProxyRuntimeConfig,
-    GoProxyTransport,
-};
+pub use compat_proxy::{GoProxyEndpoint, GoProxyLayer, GoProxyRuntimeConfig, GoProxyTransport};
 pub use compat_runtime::{
     GoFakeIpRuntimeConfig, GoResolverRuntimeConfig, GoResolverTransport, GoRouteRuntimeConfig,
     GoUdpProxyFqdnStrategy,

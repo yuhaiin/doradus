@@ -11,7 +11,6 @@ use std::time::Duration;
 use crate::interfaces;
 use crate::proxy::{new_dialer, reconfigure_dialer};
 use doradus_core::dns_hosts::HostsTable;
-use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::dns_resolver_stack::AsyncHostsResolver;
 use doradus_core::nat::NatTable;
 use doradus_core::{
@@ -26,6 +25,7 @@ use doradus_store::{
     InboundSettings, MaxMindMetadataRecord, NatConfigRecord,
 };
 use doradus_trie::router::{RouteDecision, RouterRuntime};
+use doradus_types::AsyncIpResolver;
 
 pub use crate::controller::RuntimeController;
 pub use crate::data_plane::{

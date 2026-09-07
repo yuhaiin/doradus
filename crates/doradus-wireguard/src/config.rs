@@ -6,8 +6,8 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
-use doradus_core::dns_resolver::AsyncIpResolver;
-use doradus_core::{DomainName, Error, ErrorKind, ResolveStrategy, Result};
+use doradus_core::{Error, ErrorKind, Result};
+use doradus_types::{AsyncIpResolver, DomainName, ResolveStrategy};
 use serde::Deserialize;
 use smoltcp::wire::{IpAddress, IpCidr};
 

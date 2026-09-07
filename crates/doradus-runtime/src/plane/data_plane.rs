@@ -18,13 +18,13 @@ use std::time::Duration;
 use doradus_core::dns::{
     AsyncDnsHandler, DnsRecordType, DnsResponse, decode_query, encode_response,
 };
-use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::dns_tcp::AsyncTcpDnsServer;
 use doradus_core::{BoxFuture, Result, RouteMode};
 #[cfg(feature = "tun")]
 use doradus_core::{Error, ErrorKind};
 #[cfg(feature = "tun")]
 use doradus_store::GoInboundRecord;
+use doradus_types::AsyncIpResolver;
 use serde_json::Value;
 use tokio::sync::watch;
 

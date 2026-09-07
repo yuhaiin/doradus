@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use doradus_core::GeoLookup;
-use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::proxy::{AsyncProxy, BoxAsyncStream};
 use doradus_core::{
     BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, Network, ResolveStrategy,
@@ -22,6 +21,7 @@ use doradus_core::{
 use doradus_store::{GoRouteListRecord, GoRouteRuleRecord};
 use doradus_trie::HostTrie;
 use doradus_trie::router::{RouteDecision, RouteRule, Router, RouterRuntime, RuleAction};
+use doradus_types::AsyncIpResolver;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;

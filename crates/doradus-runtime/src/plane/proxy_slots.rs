@@ -63,15 +63,11 @@ pub(super) async fn build_aead_proxy(
     plan: &AeadPlan,
     protocol_tls: Option<&ProtocolTlsPlan>,
     timeout: Duration,
-    resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
+    resolver: Arc<dyn doradus_types::AsyncIpResolver>,
     metrics: Arc<doradus_metrics::RuntimeMetrics>,
     dialer: Arc<doradus_core::network::HappyEyeballsV2Dialer>,
 ) -> Result<Arc<dyn AsyncProxy>> {
-    let base = protocol_base_proxy_config(
-        config
-            .to_base_proxy_config_with_resolver(timeout, resolver)
-            .await?,
-    )?;
+    let base = compile_base_proxy_config(config, timeout, resolver.as_ref()).await?;
     let udp_server = match &base.kind {
         BaseProxyKind::Fixed { address } => Some(*address),
         _ => None,

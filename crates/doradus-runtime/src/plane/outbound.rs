@@ -14,7 +14,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use doradus_chain::ChainProxy;
-use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::network::TcpDialCandidate;
 use doradus_core::proxy::{
     AsyncDatagram, AsyncProxy, AsyncProxySelector, BoxAsyncStream, stream_local_addr,
@@ -28,11 +27,9 @@ use doradus_protocol::YuubinsyaUdpDatagram;
 use doradus_protocol::proxy::{DelayedDropAsyncProxy, DropAsyncProxy};
 use doradus_protocol::proxy_factory::{BaseProxyConfig, BaseProxyKind};
 use doradus_store::fakeip::FakeIpViewStore;
-use doradus_store::{
-    FakeIpPools, GoBaseProxyConfig, GoBaseProxyEndpoint, GoBaseProxyKind, GoProxyLayer,
-    GoProxyRuntimeConfig, GoProxyTransport,
-};
+use doradus_store::{FakeIpPools, GoProxyLayer, GoProxyRuntimeConfig, GoProxyTransport};
 use doradus_trie::router::RuntimeRoutedProxySelector;
+use doradus_types::AsyncIpResolver;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::RuntimeSnapshot;
@@ -55,6 +52,13 @@ use protocol_tls::*;
 mod proxy_plan;
 use proxy_plan::*;
 
+#[path = "base_proxy.rs"]
+mod base_proxy;
+use base_proxy::*;
+
+#[path = "network_split.rs"]
+mod network_split;
+
 #[path = "protocol_factory.rs"]
 mod protocol_factory;
 use protocol_factory::*;
@@ -69,10 +73,6 @@ pub(crate) use happy_eyeballs::{
     HappyEyeballsDirectProxy, HappyEyeballsFixedProxy, new_dialer, reconfigure_dialer,
 };
 
-/// Go's `network_split` point keeps one already-built parent proxy and
-/// selects an independent wrapper for TCP and UDP.  The selection happens at
-/// the common async boundary so every inbound (including TUN) gets the same
-/// semantics.
 impl RuntimeSnapshot {
     fn happy_eyeballs_direct(&self, timeout: Duration) -> Result<Arc<dyn AsyncProxy>> {
         let direct_resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
@@ -87,235 +87,134 @@ impl RuntimeSnapshot {
         ))
     }
 
-    async fn build_network_split_proxy(
+    async fn build_base_proxy(
         &self,
         config: &GoProxyRuntimeConfig,
         timeout: Duration,
+        resolver: Arc<dyn AsyncIpResolver>,
     ) -> Result<Arc<dyn AsyncProxy>> {
-        let (split_index, split) = config
-            .layers
-            .iter()
-            .enumerate()
-            .find(|(_, layer)| layer.kind.eq_ignore_ascii_case("network_split"))
-            .ok_or_else(|| Error::invalid("network_split protocol layer is missing"))?;
-        let object = split
-            .config
-            .as_object()
-            .ok_or_else(|| Error::invalid("network_split configuration must be an object"))?;
-        let tcp = network_split_branch(object.get("tcp"))?;
-        let udp = network_split_branch(object.get("udp"))?;
-        if tcp.is_none() && udp.is_none() {
-            return Err(Error::invalid("network_split protocols are empty"));
-        }
-
-        let parent_config = config.chain_prefix(split_index)?;
-        let parent = if split_index == 0 {
-            self.happy_eyeballs_direct(timeout)?
+        let base = compile_base_proxy_config(config, timeout, resolver.as_ref()).await?;
+        if let Some(endpoints) = fixed_tcp_candidates(&base.kind) {
+            Ok(Arc::new(HappyEyeballsFixedProxy::new(
+                endpoints,
+                Arc::clone(&self.happy_eyeballs),
+                timeout,
+            )?))
         } else {
-            let mut parent_snapshot = self.clone();
-            parent_snapshot.proxies = vec![parent_config.clone()];
-            Box::pin(parent_snapshot.build_proxy(&parent_config.id, timeout))
-                .await?
-                .proxy
-        };
-        let proxy_resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
-        let udp_server = parent_config
-            .resolved_fixed_endpoint(proxy_resolver.as_ref())
-            .await?
-            .map(|address| Endpoint::ip(doradus_core::Network::Udp, address));
-        let tcp = match tcp {
-            Some(layer) => {
-                self.build_network_split_branch(
-                    &layer,
-                    Arc::clone(&parent),
-                    timeout,
-                    udp_server.clone(),
-                )
-                .await?
-            }
-            None => Arc::clone(&parent),
-        };
-        let udp = match udp {
-            Some(layer) => {
-                self.build_network_split_branch(&layer, Arc::clone(&parent), timeout, udp_server)
-                    .await?
-            }
-            None => Arc::clone(&parent),
-        };
-        Ok(Arc::new(NetworkSplitProxy { tcp, udp, parent }))
+            base.build_with_metrics(Arc::clone(&self.metrics))
+        }
     }
 
-    async fn build_network_split_branch(
+    async fn build_http_mock_proxy(
         &self,
-        layer: &GoProxyLayer,
-        parent: Arc<dyn AsyncProxy>,
+        config: &GoProxyRuntimeConfig,
         timeout: Duration,
-        udp_server: Option<Endpoint>,
+        resolver: Arc<dyn AsyncIpResolver>,
     ) -> Result<Arc<dyn AsyncProxy>> {
-        let kind = layer.kind.to_ascii_lowercase();
-        match kind.as_str() {
-            // Go registers `none` and `proxy` as parent-preserving no-op
-            // wrappers. Neither may replace the already-built prefix with a
-            // fresh direct socket.
-            "none" | "proxy" => Ok(parent),
-            "direct" => {
-                let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Direct);
-                let proxy = self.happy_eyeballs_direct(timeout)?;
-                let proxy = Arc::new(SocketPolicyProxy {
-                    inner: proxy,
-                    bind_addresses: self.socket_bind_addresses.clone(),
-                    bind_interface: child.network_interface(),
-                    global_bind_interface: self.socket_bind_interface.clone(),
-                }) as Arc<dyn AsyncProxy>;
-                Ok(proxy)
-            }
-            "reject" | "block" => Ok(Arc::new(DropAsyncProxy)),
-            "drop" => Ok(Arc::new(DelayedDropAsyncProxy::new())),
-            "fixed" | "simple" | "fixedv2" => {
-                let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Fixed);
-                let resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
-                Ok(protocol_base_proxy_config(
-                    child
-                        .to_base_proxy_config_with_resolver(timeout, resolver)
-                        .await?,
-                )?
-                .build_with_metrics(Arc::clone(&self.metrics))?)
-            }
-            "http" | "http_proxy" => {
-                let user = layer_string(layer, "user").unwrap_or_default();
-                let password = layer_string(layer, "password").unwrap_or_default();
-                Ok(Arc::new(doradus_protocol::http::HttpProxy::new(
-                    parent, user, password,
-                )))
-            }
-            "socks5" => {
-                let plan = Socks5Plan::compile_layer(layer)?;
-                Ok(Arc::new(doradus_protocol::socks5::Socks5Proxy::new(
-                    parent,
-                    plan.user,
-                    plan.password,
-                    plan.hostname,
-                    plan.override_port,
-                )?))
-            }
-            "http_mock" => Ok(Arc::new(doradus_protocol::http_mock::HttpMockProxy::new(
-                parent,
-            ))),
-            "tls" => {
-                let tls = ProtocolTlsPlan::compile_layer(layer)?;
-                #[cfg(feature = "doh-tls")]
-                {
-                    build_protocol_tls_proxy(&tls, parent)
-                }
-                #[cfg(not(feature = "doh-tls"))]
-                {
-                    let _ = tls;
-                    Err(Error::new(
-                        ErrorKind::Unsupported,
-                        "network_split TLS branch requires the doh-tls feature",
-                    ))
-                }
-            }
-            "websocket" => {
-                let websocket = WebSocketPlan::compile_layer(layer)?;
-                build_protocol_websocket_proxy(&websocket, parent)
-            }
-            "shadowsocks" | "shadowsocksr" | "trojan" | "vless" | "vmess" => {
-                let transport = match kind.as_str() {
-                    "shadowsocks" => GoProxyTransport::Shadowsocks,
-                    "shadowsocksr" => GoProxyTransport::Shadowsocksr,
-                    "trojan" => GoProxyTransport::Trojan,
-                    "vless" => GoProxyTransport::Vless,
-                    "vmess" => GoProxyTransport::Vmess,
-                    _ => unreachable!(),
-                };
-                let child = GoProxyRuntimeConfig::single_layer(layer, transport);
-                let plan = ProxyPlan::from_config(&child)?;
-                build_protocol_proxy(
-                    plan.standard
-                        .as_ref()
-                        .expect("standard network-split protocol must compile a typed plan"),
-                    parent,
-                )
-            }
-            "aead" => {
-                let plan = AeadPlan::compile_layer(layer)?;
-                let method = doradus_protocol::aead::CryptoMethod::parse(&plan.method);
-                Ok(Arc::new(doradus_protocol::aead::AeadProxy::new(
-                    parent,
-                    &plan.password,
-                    method,
-                    None,
-                )))
-            }
-            "yuubinsya" => {
-                let plan = YuubinsyaPlan::compile_layer(layer)?;
-                Ok(Arc::new(NetworkSplitYuubinsyaProxy {
-                    upstream: parent,
-                    password_hash: doradus_protocol::yuubinsya::derive_salt(
-                        plan.password.as_bytes(),
-                    ),
-                    udp_over_stream: plan.udp_over_stream,
-                    udp_coalesce: plan.udp_coalesce,
-                    udp_server,
-                }))
-            }
-            // Go's bootstrap_dns_warp point currently only embeds and returns
-            // its parent proxy. Keep that no-op behavior instead of treating
-            // it as an unknown protocol or accidentally replacing the parent
-            // with a direct socket.
-            "bootstrap_dns_warp" | "bootstrapdnswarp" => Ok(parent),
-            "http2" => {
-                let plan = Http2Plan::compile_layer(layer);
-                Ok(Arc::new(NetworkSplitHttp2Proxy {
-                    upstream: parent,
-                    connections: tokio::sync::Mutex::new(Vec::new()),
-                    connect_lock: tokio::sync::Mutex::new(()),
-                    concurrency: plan.concurrency,
-                    max_streams: plan.max_streams,
-                }))
-            }
-            "wireguard" | "wire_guard" | "wg" => {
-                let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::Wireguard);
-                let wireguard = compile_wireguard_config(layer)?;
-                let resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
-                build_wireguard_proxy(
-                    &wireguard,
-                    timeout,
-                    resolver,
-                    child
-                        .network_interface()
-                        .or_else(|| self.socket_bind_interface.clone()),
-                )
-                .await
-            }
-            "warp_masque" | "warpmasque" => {
-                let child = GoProxyRuntimeConfig::single_layer(layer, GoProxyTransport::WarpMasque);
-                let warp = compile_warp_masque_config(layer)?;
-                let resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
-                build_warp_masque_proxy(
-                    &warp,
-                    timeout,
-                    resolver,
-                    child
-                        .network_interface()
-                        .or_else(|| self.socket_bind_interface.clone()),
-                )
-                .await
-            }
-            "network_split" | "networksplit" => {
-                Err(Error::invalid("nested network_split is not supported"))
-            }
-            other => Err(Error::new(
-                ErrorKind::Unsupported,
-                format!("network_split branch protocol {other:?} is not supported"),
-            )),
+        let upstream = self.build_base_proxy(config, timeout, resolver).await?;
+        Ok(Arc::new(doradus_protocol::http_mock::HttpMockProxy::new(
+            upstream,
+        )))
+    }
+
+    async fn build_termination_parent(
+        &self,
+        config: &GoProxyRuntimeConfig,
+        layer_kind: &str,
+        timeout: Duration,
+        tls_terminated: bool,
+    ) -> Result<Arc<dyn AsyncProxy>> {
+        let index = config
+            .layers
+            .iter()
+            .rposition(|layer| layer.kind.eq_ignore_ascii_case(layer_kind))
+            .ok_or_else(|| Error::invalid(format!("{layer_kind} layer is missing")))?;
+        if index == 0 {
+            return self.happy_eyeballs_direct(timeout);
         }
+        let prefix = config.chain_prefix(index)?;
+        if tls_terminated {
+            Ok(
+                Box::pin(self.build_proxy_config_with_tls_marker(prefix, timeout, true))
+                    .await?
+                    .proxy,
+            )
+        } else {
+            Ok(Box::pin(self.build_proxy_config(prefix, timeout))
+                .await?
+                .proxy)
+        }
+    }
+
+    async fn build_standard_proxy(
+        &self,
+        config: &GoProxyRuntimeConfig,
+        protocol: &StandardProxyPlan,
+        tls: Option<&ProtocolTlsPlan>,
+        http_obfs: Option<&HttpObfsPlan>,
+        timeout: Duration,
+        resolver: Arc<dyn AsyncIpResolver>,
+    ) -> Result<Arc<dyn AsyncProxy>> {
+        let mut upstream = self.build_base_proxy(config, timeout, resolver).await?;
+        if let Some(tls) = tls {
+            #[cfg(feature = "doh-tls")]
+            {
+                upstream = build_protocol_tls_proxy(tls, upstream)?;
+            }
+            #[cfg(not(feature = "doh-tls"))]
+            {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "protocol TLS requires the doh-tls feature",
+                ));
+            }
+        }
+        if let Some(obfs) = http_obfs {
+            upstream = Arc::new(doradus_protocol::http_obfs::HttpObfsProxy::new(
+                upstream, &obfs.host, &obfs.port,
+            )?);
+        }
+        build_protocol_proxy(protocol, upstream)
+    }
+
+    async fn build_generic_proxy(
+        &self,
+        config: &GoProxyRuntimeConfig,
+        yuubinsya: Option<&YuubinsyaPlan>,
+        timeout: Duration,
+        resolver: Arc<dyn AsyncIpResolver>,
+    ) -> Result<Arc<dyn AsyncProxy>> {
+        let mut proxy = self
+            .build_base_proxy(config, timeout, resolver.clone())
+            .await?;
+        if config.transport == GoProxyTransport::Yuubinsya
+            && config
+                .layers
+                .iter()
+                .any(|layer| layer.kind.eq_ignore_ascii_case("quic"))
+        {
+            let yuubinsya = yuubinsya.ok_or_else(|| {
+                Error::invalid("Yuubinsya transport did not compile a typed plan")
+            })?;
+            let server = resolve_fixed_endpoint(config, resolver.as_ref())
+                .await?
+                .ok_or_else(|| Error::invalid("QUIC transport requires a server endpoint"))?;
+            proxy = Arc::new(doradus_protocol::YuubinsyaOverTransportProxy::new(
+                proxy,
+                doradus_protocol::yuubinsya::derive_salt(yuubinsya.password.as_bytes()),
+                Endpoint::ip(doradus_core::Network::Udp, server),
+                yuubinsya.socks5_prefix,
+            )?);
+        }
+        Ok(proxy)
     }
 
     pub async fn build_proxy(&self, id: &str, timeout: Duration) -> Result<ProxyBuild> {
         let config = self.require_proxy_config(id)?.clone();
-        self.build_proxy_config(config, timeout).await
+        // Keep the all-feature protocol assembly future off caller stacks.
+        // TLS/termination plans make that future large enough to overflow the
+        // default test-thread stack when selectors build several slots.
+        Box::pin(self.build_proxy_config(config, timeout)).await
     }
 
     async fn build_proxy_config(
@@ -345,275 +244,163 @@ impl RuntimeSnapshot {
         let resolver = self.dns_resolver_for_route_mode(RouteMode::Direct)?;
         let plan = ProxyPlan::from_config(&config)?;
 
-        let proxy = if plan.kind == ProxyPlanKind::NetworkSplit {
-            self.build_network_split_proxy(&config, timeout).await?
-        } else if plan.kind == ProxyPlanKind::ProtocolH2 {
-            build_protocol_h2_proxy(
-                plan.h2_transport_json
-                    .as_deref()
-                    .expect("HTTP/2 protocol must compile transport JSON"),
-                plan.standard
-                    .as_ref()
-                    .expect("HTTP/2 protocol must compile a typed protocol plan"),
-                timeout,
-                resolver.clone(),
-                Arc::clone(&self.metrics),
-                Arc::clone(&self.happy_eyeballs),
-            )
-            .await?
-        } else if plan.kind == ProxyPlanKind::VlessWebSocket {
-            build_vless_transport_proxy(
-                &config,
-                plan.standard
-                    .as_ref()
-                    .expect("VLESS transport must compile a typed protocol plan"),
-                plan.protocol_tls.as_ref(),
-                plan.websocket.as_ref(),
-                timeout,
-                resolver.clone(),
-                Arc::clone(&self.metrics),
-            )
-            .await?
-        } else if plan.kind == ProxyPlanKind::VmessTransport {
-            build_vmess_transport_proxy(
-                &config,
-                plan.standard
-                    .as_ref()
-                    .expect("VMess transport must compile a typed protocol plan"),
-                plan.protocol_tls.as_ref(),
-                plan.websocket.as_ref(),
-                timeout,
-                resolver.clone(),
-                Arc::clone(&self.metrics),
-            )
-            .await?
-        } else if plan.kind == ProxyPlanKind::TrojanWebSocket {
-            build_trojan_transport_proxy(
-                &config,
-                plan.standard
-                    .as_ref()
-                    .expect("Trojan transport must compile a typed protocol plan"),
-                plan.protocol_tls.as_ref(),
-                plan.websocket.as_ref(),
-                timeout,
-                resolver.clone(),
-                Arc::clone(&self.metrics),
-            )
-            .await?
-        } else if plan.kind == ProxyPlanKind::Wireguard {
-            build_wireguard_proxy(
-                plan.wireguard
-                    .as_ref()
-                    .expect("WireGuard must compile a typed config"),
-                timeout,
-                resolver.clone(),
-                config
-                    .network_interface()
-                    .or_else(|| self.socket_bind_interface.clone()),
-            )
-            .await?
-        } else if plan.kind == ProxyPlanKind::WarpMasque {
-            build_warp_masque_proxy(
-                plan.warp_masque
-                    .as_ref()
-                    .expect("WARP MASQUE must compile a typed config"),
-                timeout,
-                resolver.clone(),
-                config
-                    .network_interface()
-                    .or_else(|| self.socket_bind_interface.clone()),
-            )
-            .await?
-        } else if plan.kind == ProxyPlanKind::HttpMock {
-            let base = protocol_base_proxy_config(
-                config
-                    .to_base_proxy_config_with_resolver(timeout, resolver.clone())
-                    .await?,
-            )?;
-            let upstream = if let Some(endpoints) = fixed_tcp_candidates(&base.kind) {
-                Arc::new(HappyEyeballsFixedProxy::new(
-                    endpoints,
-                    Arc::clone(&self.happy_eyeballs),
+        let proxy = match plan {
+            ProxyPlan::NetworkSplit => self.build_network_split_proxy(&config, timeout).await?,
+            ProxyPlan::ProtocolH2 {
+                transport_json,
+                protocol,
+            } => {
+                build_protocol_h2_proxy(
+                    &transport_json,
+                    &protocol,
                     timeout,
-                )?) as Arc<dyn AsyncProxy>
-            } else {
-                base.build_with_metrics(Arc::clone(&self.metrics))?
-            };
-            Arc::new(doradus_protocol::http_mock::HttpMockProxy::new(upstream))
-                as Arc<dyn AsyncProxy>
-        } else if plan.kind == ProxyPlanKind::HttpTermination {
-            let index = config
-                .layers
-                .iter()
-                .rposition(|layer| layer.kind.eq_ignore_ascii_case("http_termination"))
-                .ok_or_else(|| Error::invalid("HTTP termination layer is missing"))?;
-            let parent = if index == 0 {
-                self.happy_eyeballs_direct(timeout)?
-            } else {
-                Box::pin(self.build_proxy_config(config.chain_prefix(index)?, timeout))
-                    .await?
-                    .proxy
-            };
-            #[cfg(feature = "http-termination")]
-            {
-                crate::proxy::http_termination::build(
-                    plan.http_termination
-                        .expect("HTTP termination plan must be compiled"),
-                    parent,
-                    tls_terminated,
-                )?
-            }
-            #[cfg(not(feature = "http-termination"))]
-            {
-                let _ = parent;
-                return Err(Error::new(
-                    ErrorKind::Unsupported,
-                    "HTTP termination requires the http-termination feature",
-                ));
-            }
-        } else if plan.kind == ProxyPlanKind::TlsTermination {
-            let index = config
-                .layers
-                .iter()
-                .rposition(|layer| layer.kind.eq_ignore_ascii_case("tls_termination"))
-                .ok_or_else(|| Error::invalid("TLS termination layer is missing"))?;
-            // The Go TLS unwrap point marks its parent HTTP-termination
-            // connection before putting the TLS server on top. Propagate that
-            // per-chain fact into the recursive prefix build so the reverse
-            // proxy can choose the same upstream wire mode.
-            let parent = if index == 0 {
-                self.happy_eyeballs_direct(timeout)?
-            } else {
-                Box::pin(self.build_proxy_config_with_tls_marker(
-                    config.chain_prefix(index)?,
-                    timeout,
-                    true,
-                ))
-                .await?
-                .proxy
-            };
-            #[cfg(feature = "doh-tls")]
-            {
-                build_tls_termination_proxy(
-                    plan.tls_termination
-                        .expect("TLS termination plan must be compiled"),
-                    parent,
-                )?
-            }
-            #[cfg(not(feature = "doh-tls"))]
-            {
-                let _ = parent;
-                return Err(Error::new(
-                    ErrorKind::Unsupported,
-                    "TLS termination requires the doh-tls feature",
-                ));
-            }
-        } else if plan.kind == ProxyPlanKind::Chain {
-            let json = std::str::from_utf8(&config.data_json).map_err(|error| {
-                Error::new(
-                    ErrorKind::InvalidInput,
-                    format!("proxy {:?} data_json is not UTF-8: {error}", config.id),
-                )
-            })?;
-            Arc::new(
-                ChainProxy::from_go_json_with_resolver_and_metrics_and_dialer(
-                    json,
                     resolver.clone(),
                     Arc::clone(&self.metrics),
                     Arc::clone(&self.happy_eyeballs),
-                )?,
-            ) as Arc<dyn AsyncProxy>
-        } else if plan.kind == ProxyPlanKind::Aead {
-            build_aead_proxy(
-                &config,
-                plan.aead
-                    .as_ref()
-                    .expect("AEAD transport must compile a typed plan"),
-                plan.protocol_tls.as_ref(),
-                timeout,
-                resolver.clone(),
-                Arc::clone(&self.metrics),
-                Arc::clone(&self.happy_eyeballs),
-            )
-            .await?
-        } else if let ProxyPlanKind::Standard(_) = plan.kind {
-            let base = protocol_base_proxy_config(
-                config
-                    .to_base_proxy_config_with_resolver(timeout, resolver.clone())
-                    .await?,
-            )?;
-            let mut upstream = if let Some(endpoints) = fixed_tcp_candidates(&base.kind) {
-                Arc::new(HappyEyeballsFixedProxy::new(
-                    endpoints,
-                    Arc::clone(&self.happy_eyeballs),
+                )
+                .await?
+            }
+            ProxyPlan::StreamTransport {
+                protocol,
+                tls,
+                websocket,
+            } => {
+                build_standard_transport_proxy(
+                    &config,
+                    &protocol,
+                    tls.as_ref(),
+                    Some(&websocket),
                     timeout,
-                )?) as Arc<dyn AsyncProxy>
-            } else {
-                base.build_with_metrics(Arc::clone(&self.metrics))?
-            };
-            if let Some(tls) = &plan.protocol_tls {
-                #[cfg(feature = "doh-tls")]
+                    resolver.clone(),
+                    Arc::clone(&self.metrics),
+                )
+                .await?
+            }
+            ProxyPlan::Wireguard(wireguard) => {
+                build_wireguard_proxy(
+                    &wireguard,
+                    timeout,
+                    resolver.clone(),
+                    config
+                        .network_interface()
+                        .or_else(|| self.socket_bind_interface.clone()),
+                )
+                .await?
+            }
+            ProxyPlan::Openvpn(openvpn) => {
+                build_openvpn_proxy(
+                    &openvpn,
+                    timeout,
+                    resolver.clone(),
+                    config
+                        .network_interface()
+                        .or_else(|| self.socket_bind_interface.clone()),
+                )
+                .await?
+            }
+            ProxyPlan::WarpMasque(warp_masque) => {
+                build_warp_masque_proxy(
+                    &warp_masque,
+                    timeout,
+                    resolver.clone(),
+                    config
+                        .network_interface()
+                        .or_else(|| self.socket_bind_interface.clone()),
+                )
+                .await?
+            }
+            ProxyPlan::HttpMock => {
+                self.build_http_mock_proxy(&config, timeout, resolver.clone())
+                    .await?
+            }
+            ProxyPlan::HttpTermination {
+                #[cfg(feature = "http-termination")]
+                plan,
+            } => {
+                let parent = self
+                    .build_termination_parent(&config, "http_termination", timeout, false)
+                    .await?;
+                #[cfg(feature = "http-termination")]
                 {
-                    upstream = build_protocol_tls_proxy(tls, upstream)?;
+                    crate::proxy::http_termination::build(plan, parent, tls_terminated)?
                 }
-                #[cfg(not(feature = "doh-tls"))]
+                #[cfg(not(feature = "http-termination"))]
                 {
+                    let _ = parent;
                     return Err(Error::new(
                         ErrorKind::Unsupported,
-                        "protocol TLS requires the doh-tls feature",
+                        "HTTP termination requires the http-termination feature",
                     ));
                 }
             }
-            if let Some(obfs) = &plan.http_obfs {
-                upstream = Arc::new(doradus_protocol::http_obfs::HttpObfsProxy::new(
-                    upstream, &obfs.host, &obfs.port,
-                )?);
+            ProxyPlan::TlsTermination {
+                #[cfg(feature = "doh-tls")]
+                plan,
+            } => {
+                let parent = self
+                    .build_termination_parent(&config, "tls_termination", timeout, true)
+                    .await?;
+                #[cfg(feature = "doh-tls")]
+                {
+                    build_tls_termination_proxy(plan, parent)?
+                }
+                #[cfg(not(feature = "doh-tls"))]
+                {
+                    let _ = parent;
+                    return Err(Error::new(
+                        ErrorKind::Unsupported,
+                        "TLS termination requires the doh-tls feature",
+                    ));
+                }
             }
-            build_protocol_proxy(
-                plan.standard
-                    .as_ref()
-                    .expect("standard protocol must compile a typed plan"),
-                upstream,
-            )?
-        } else {
-            let base = protocol_base_proxy_config(
-                config
-                    .to_base_proxy_config_with_resolver(timeout, resolver.clone())
-                    .await?,
-            )?;
-            let mut proxy = if let Some(endpoints) = fixed_tcp_candidates(&base.kind) {
-                Arc::new(HappyEyeballsFixedProxy::new(
-                    endpoints,
-                    Arc::clone(&self.happy_eyeballs),
+            ProxyPlan::Chain => {
+                let json = std::str::from_utf8(&config.data_json).map_err(|error| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("proxy {:?} data_json is not UTF-8: {error}", config.id),
+                    )
+                })?;
+                Arc::new(
+                    ChainProxy::from_go_json_with_resolver_and_metrics_and_dialer(
+                        json,
+                        resolver.clone(),
+                        Arc::clone(&self.metrics),
+                        Arc::clone(&self.happy_eyeballs),
+                    )?,
+                ) as Arc<dyn AsyncProxy>
+            }
+            ProxyPlan::Aead { plan, tls } => {
+                build_aead_proxy(
+                    &config,
+                    &plan,
+                    tls.as_ref(),
                     timeout,
-                )?) as Arc<dyn AsyncProxy>
-            } else {
-                base.build_with_metrics(Arc::clone(&self.metrics))?
-            };
-            if config.transport == GoProxyTransport::Yuubinsya
-                && config
-                    .layers
-                    .iter()
-                    .any(|layer| layer.kind.eq_ignore_ascii_case("quic"))
-            {
-                let yuubinsya = plan
-                    .yuubinsya
-                    .as_ref()
-                    .expect("Yuubinsya transport must compile a typed plan");
-                let server = config
-                    .resolved_fixed_endpoint(resolver.as_ref())
-                    .await?
-                    .ok_or_else(|| Error::invalid("QUIC transport requires a server endpoint"))?;
-                proxy = Arc::new(doradus_protocol::YuubinsyaOverTransportProxy::new(
-                    proxy,
-                    doradus_protocol::yuubinsya::derive_salt(yuubinsya.password.as_bytes()),
-                    Endpoint::ip(doradus_core::Network::Udp, server),
-                    yuubinsya.socks5_prefix,
-                )?);
+                    resolver.clone(),
+                    Arc::clone(&self.metrics),
+                    Arc::clone(&self.happy_eyeballs),
+                )
+                .await?
             }
-            proxy
+            ProxyPlan::Standard {
+                protocol,
+                tls,
+                http_obfs,
+            } => {
+                self.build_standard_proxy(
+                    &config,
+                    &protocol,
+                    tls.as_ref(),
+                    http_obfs.as_ref(),
+                    timeout,
+                    resolver.clone(),
+                )
+                .await?
+            }
+            ProxyPlan::Generic { yuubinsya } => {
+                self.build_generic_proxy(&config, yuubinsya.as_ref(), timeout, resolver.clone())
+                    .await?
+            }
         };
-
         let proxy = if matches!(config.transport, doradus_store::GoProxyTransport::Direct) {
             let direct = self.happy_eyeballs_direct(timeout)?;
             Arc::new(SocketPolicyProxy {
@@ -630,11 +417,7 @@ impl RuntimeSnapshot {
                 global_bind_interface: self.socket_bind_interface.clone(),
             }) as Arc<dyn AsyncProxy>
         };
-        let proxy = if matches!(
-            config.transport,
-            doradus_store::GoProxyTransport::Wireguard
-                | doradus_store::GoProxyTransport::WarpMasque
-        ) {
+        let proxy = if config.transport.is_stateful_tunnel() {
             // Direct and the userspace WireGuard stack both require an IP
             // endpoint before opening their final socket. Keep their lookup
             // on the runtime resolver boundary so route resolver policy,

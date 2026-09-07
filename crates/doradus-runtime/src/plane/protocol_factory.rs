@@ -12,18 +12,14 @@ pub(super) async fn build_stream_transport_upstream(
     protocol_tls: Option<&ProtocolTlsPlan>,
     websocket: Option<&WebSocketPlan>,
     timeout: Duration,
-    resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
+    resolver: Arc<dyn doradus_types::AsyncIpResolver>,
     protocol_name: &str,
     metrics: Arc<doradus_metrics::RuntimeMetrics>,
 ) -> Result<Arc<dyn AsyncProxy>> {
     #[cfg(feature = "doh-tls")]
     let _ = protocol_name;
 
-    let base = protocol_base_proxy_config(
-        config
-            .to_base_proxy_config_with_resolver(timeout, resolver)
-            .await?,
-    )?;
+    let base = compile_base_proxy_config(config, timeout, resolver.as_ref()).await?;
     let mut upstream: Arc<dyn AsyncProxy> = base.build_with_metrics(metrics)?;
     if let Some(tls) = protocol_tls {
         #[cfg(feature = "doh-tls")]
@@ -61,6 +57,23 @@ pub(super) async fn build_wireguard_proxy(
     ))
 }
 
+pub(super) async fn build_openvpn_proxy(
+    openvpn: &doradus_openvpn::OpenVpnConfig,
+    timeout: Duration,
+    resolver: Arc<dyn AsyncIpResolver>,
+    bind_interface: Option<String>,
+) -> Result<Arc<dyn AsyncProxy>> {
+    Ok(Arc::new(
+        doradus_openvpn::build_proxy_with_interface_and_resolver(
+            openvpn.clone(),
+            timeout,
+            bind_interface.as_deref(),
+            Some(resolver),
+        )
+        .await?,
+    ))
+}
+
 pub(super) async fn build_warp_masque_proxy(
     warp: &doradus_masque::WarpMasqueConfig,
     timeout: Duration,
@@ -82,7 +95,7 @@ pub(super) async fn build_protocol_h2_proxy(
     transport_json: &str,
     protocol_plan: &StandardProxyPlan,
     _timeout: Duration,
-    resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
+    resolver: Arc<dyn doradus_types::AsyncIpResolver>,
     metrics: Arc<doradus_metrics::RuntimeMetrics>,
     dialer: Arc<doradus_core::network::HappyEyeballsV2Dialer>,
 ) -> Result<Arc<dyn AsyncProxy>> {
@@ -149,66 +162,23 @@ pub(super) fn build_protocol_proxy(
     }
 }
 
-pub(super) async fn build_vless_transport_proxy(
+pub(super) async fn build_standard_transport_proxy(
     config: &GoProxyRuntimeConfig,
     protocol_plan: &StandardProxyPlan,
     protocol_tls: Option<&ProtocolTlsPlan>,
     websocket: Option<&WebSocketPlan>,
     timeout: Duration,
-    resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
+    resolver: Arc<dyn doradus_types::AsyncIpResolver>,
     metrics: Arc<doradus_metrics::RuntimeMetrics>,
 ) -> Result<Arc<dyn AsyncProxy>> {
+    let protocol_name = protocol_plan.protocol().layer_name();
     let upstream = build_stream_transport_upstream(
         config,
         protocol_tls,
         websocket,
         timeout,
         resolver,
-        "VLESS",
-        metrics,
-    )
-    .await?;
-    build_protocol_proxy(protocol_plan, upstream)
-}
-
-pub(super) async fn build_vmess_transport_proxy(
-    config: &GoProxyRuntimeConfig,
-    protocol_plan: &StandardProxyPlan,
-    protocol_tls: Option<&ProtocolTlsPlan>,
-    websocket: Option<&WebSocketPlan>,
-    timeout: Duration,
-    resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
-    metrics: Arc<doradus_metrics::RuntimeMetrics>,
-) -> Result<Arc<dyn AsyncProxy>> {
-    let upstream = build_stream_transport_upstream(
-        config,
-        protocol_tls,
-        websocket,
-        timeout,
-        resolver,
-        "VMess",
-        metrics,
-    )
-    .await?;
-    build_protocol_proxy(protocol_plan, upstream)
-}
-
-pub(super) async fn build_trojan_transport_proxy(
-    config: &GoProxyRuntimeConfig,
-    protocol_plan: &StandardProxyPlan,
-    protocol_tls: Option<&ProtocolTlsPlan>,
-    websocket: Option<&WebSocketPlan>,
-    timeout: Duration,
-    resolver: Arc<dyn doradus_core::dns_resolver::AsyncIpResolver>,
-    metrics: Arc<doradus_metrics::RuntimeMetrics>,
-) -> Result<Arc<dyn AsyncProxy>> {
-    let upstream = build_stream_transport_upstream(
-        config,
-        protocol_tls,
-        websocket,
-        timeout,
-        resolver,
-        "Trojan",
+        protocol_name,
         metrics,
     )
     .await?;

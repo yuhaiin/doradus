@@ -7,9 +7,9 @@
 use std::sync::Arc;
 
 use doradus_core::dns::{DnsRecordType, DnsResponse, DnsServiceParam};
-use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::{BoxFuture, DomainName, IpSet, ResolveStrategy, Result};
 use doradus_store::{ConfigStore, GoSettingsKvRecord};
+use doradus_types::AsyncIpResolver;
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,7 +439,7 @@ impl AsyncIpResolver for Ipv6PolicyResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use doradus_core::dns_resolver::AsyncIpResolver;
+    use doradus_types::AsyncIpResolver;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     struct StaticResolver;

@@ -354,8 +354,8 @@ impl RuntimeSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use doradus_core::dns_resolver::AsyncIpResolver;
     use doradus_core::{BoxFuture, DomainName, IpSet, ResolveStrategy};
+    use doradus_types::AsyncIpResolver;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
 

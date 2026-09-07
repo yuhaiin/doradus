@@ -9,11 +9,11 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::proxy::AsyncDatagram;
 use doradus_core::{Endpoint, Error, ErrorKind, Network, Result};
 use doradus_dns::{AsyncDnsDatagram, DnsDatagramConnector, DoqResolverConfig, DoqResolverFactory};
 use doradus_store::{GoResolverRuntimeConfig, GoResolverTransport};
+use doradus_types::AsyncIpResolver;
 use rustls::ClientConfig;
 
 use crate::{

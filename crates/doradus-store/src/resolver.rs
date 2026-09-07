@@ -4,9 +4,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use doradus_core::dns::{DnsRecordType, DnsResponse, DnsServiceParam};
-use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::{BoxFuture, DomainName, IpSet, ResolveStrategy, Result};
 pub use doradus_dns::FakeIpPolicy;
+use doradus_types::AsyncIpResolver;
 
 use crate::fakeip::{FakeIpPool, FakeIpV6Pool, FakeIpView, FakeIpViewStore, reverse_name_to_ip};
 

@@ -20,6 +20,7 @@ time = "0.3.44"
 x509-parser = "0.16.0"
 doradus-core = { path = "../doradus-core" }
 doradus-tun = { path = "../doradus-tun" }
+doradus-types = { path = "../doradus-types" }
 
 [target.'cfg(all(target_os = "windows", target_arch = "aarch64"))'.dependencies]
 # cmake-rs passes ARM64 to quiche's vendored BoringSSL, which quiche 0.22

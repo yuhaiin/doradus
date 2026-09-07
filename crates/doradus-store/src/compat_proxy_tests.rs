@@ -1,24 +1,16 @@
 //! Go compatibility proxy tests.
 
 use super::*;
-use doradus_core::{BoxFuture, IpSet};
-use std::net::Ipv4Addr;
 
-struct StaticResolver;
-
-impl AsyncIpResolver for StaticResolver {
-    fn resolve<'a>(
-        &'a self,
-        _domain: &'a DomainName,
-        _strategy: doradus_core::ResolveStrategy,
-    ) -> BoxFuture<'a, Result<IpSet>> {
-        Box::pin(async {
-            Ok(IpSet {
-                v4: vec![Ipv4Addr::new(192, 0, 2, 44)],
-                v6: Vec::new(),
-            })
-        })
-    }
+#[test]
+fn proxy_transport_owns_aliases_names_and_lifecycle_classification() {
+    assert_eq!(GoProxyTransport::parse("fixedv2"), GoProxyTransport::Fixed);
+    assert_eq!(GoProxyTransport::parse("OVPN"), GoProxyTransport::Openvpn);
+    assert_eq!(GoProxyTransport::Openvpn.as_str(), "openvpn");
+    assert!(GoProxyTransport::Wireguard.is_stateful_tunnel());
+    assert!(GoProxyTransport::Openvpn.is_stateful_tunnel());
+    assert!(GoProxyTransport::WarpMasque.is_stateful_tunnel());
+    assert!(!GoProxyTransport::Direct.is_stateful_tunnel());
 }
 
 #[test]
@@ -95,154 +87,41 @@ fn preserves_fixedv2_alternate_endpoints_and_interface_policy() {
         transport: GoProxyTransport::Fixed,
         data_json: Vec::new(),
     };
-    let built = config.to_base_proxy_config(Duration::from_secs(3)).unwrap();
+    let endpoints = config.base_proxy_endpoints().unwrap();
     assert_eq!(
-        built.kind,
-        GoBaseProxyKind::FixedMany {
-            endpoints: vec![
-                GoBaseProxyEndpoint {
-                    address: "127.0.0.1:18080".parse().unwrap(),
-                    bind_interface: Some("lo".to_owned()),
-                },
-                GoBaseProxyEndpoint {
-                    address: "127.0.0.1:18081".parse().unwrap(),
-                    bind_interface: Some("lo".to_owned()),
-                },
-            ],
-        }
+        endpoints,
+        vec![
+            GoProxyEndpoint {
+                host: "127.0.0.1".to_owned(),
+                port: 18080,
+                bind_interface: Some("lo".to_owned()),
+            },
+            GoProxyEndpoint {
+                host: "127.0.0.1".to_owned(),
+                port: 18081,
+                bind_interface: Some("lo".to_owned()),
+            },
+        ]
     );
 }
 
 #[test]
-fn injected_resolver_builds_domain_fixed_proxy_without_system_dns() {
-    let config = GoProxyRuntimeConfig {
-        id: "fixed".to_owned(),
-        name: "fixed".to_owned(),
-        group_name: "default".to_owned(),
-        origin: "local".to_owned(),
-        enabled: true,
-        chain_types: vec!["fixedv2".to_owned()],
-        layers: vec![GoProxyLayer {
-            kind: "fixedv2".to_owned(),
+fn openvpn_layer_serialization_redacts_every_profile_alias() {
+    for field in ["profile", "config", "content", "ovpn"] {
+        let layer = GoProxyLayer {
+            kind: "openvpn".to_owned(),
             config: serde_json::json!({
-                "addresses": [{ "host": "proxy.example", "port": 443 }]
+                field: "client\n<key>private</key>",
+                "username": "alice",
+                "password": "secret"
             }),
-        }],
-        transport: GoProxyTransport::Fixed,
-        data_json: Vec::new(),
-    };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let built =
-        runtime
-            .block_on(config.to_base_proxy_config_with_resolver(
-                Duration::from_secs(3),
-                Arc::new(StaticResolver),
-            ))
-            .unwrap();
-    assert_eq!(
-        built.kind,
-        GoBaseProxyKind::Fixed {
-            address: "192.0.2.44:443".parse().unwrap()
-        }
-    );
-}
+        };
 
-#[test]
-fn native_yuubinsya_udp_reuses_fixed_endpoint_and_derives_password_hash() {
-    let config = GoProxyRuntimeConfig {
-        id: "yuubinsya-udp".to_owned(),
-        name: "yuubinsya-udp".to_owned(),
-        group_name: "default".to_owned(),
-        origin: "local".to_owned(),
-        enabled: true,
-        chain_types: vec!["fixedv2".to_owned(), "yuubinsya".to_owned()],
-        layers: vec![
-            GoProxyLayer {
-                kind: "fixedv2".to_owned(),
-                config: serde_json::json!({
-                    "addresses": [{ "host": "yuubinsya.example", "port": 40501 }]
-                }),
-            },
-            GoProxyLayer {
-                kind: "yuubinsya".to_owned(),
-                config: serde_json::json!({ "password": "password" }),
-            },
-        ],
-        transport: GoProxyTransport::Yuubinsya,
-        data_json: Vec::new(),
-    };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let built =
-        runtime
-            .block_on(config.to_base_proxy_config_with_resolver(
-                Duration::from_secs(3),
-                Arc::new(StaticResolver),
-            ))
-            .unwrap();
-    assert_eq!(
-        built.kind,
-        GoBaseProxyKind::YuubinsyaUdp {
-            server: "192.0.2.44:40501".parse().unwrap(),
-            password: "password".to_owned(),
-            socks5_prefix: false,
-        }
-    );
-}
-
-#[test]
-fn quic_layer_uses_its_own_endpoint_and_tls_settings() {
-    let config = GoProxyRuntimeConfig {
-        id: "quic".to_owned(),
-        name: "quic".to_owned(),
-        group_name: "default".to_owned(),
-        origin: "local".to_owned(),
-        enabled: true,
-        chain_types: vec!["fixedv2".to_owned(), "quic".to_owned()],
-        layers: vec![
-            GoProxyLayer {
-                kind: "fixedv2".to_owned(),
-                config: serde_json::json!({
-                    "addresses": [{ "host": "wrong.example", "port": 443 }]
-                }),
-            },
-            GoProxyLayer {
-                kind: "quic".to_owned(),
-                config: serde_json::json!({
-                    "host": "quic.example:784",
-                    "tls": {
-                        "serverName": "edge.example",
-                        "caCert": [base64::engine::general_purpose::STANDARD.encode(b"ca")]
-                    }
-                }),
-            },
-        ],
-        transport: GoProxyTransport::Quic,
-        data_json: Vec::new(),
-    };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let built =
-        runtime
-            .block_on(config.to_base_proxy_config_with_resolver(
-                Duration::from_secs(3),
-                Arc::new(StaticResolver),
-            ))
-            .unwrap();
-    assert_eq!(
-        built.kind,
-        GoBaseProxyKind::Quic {
-            server: "192.0.2.44:784".parse().unwrap(),
-            server_name: "edge.example".to_owned(),
-            ca_certificates: vec![b"ca".to_vec()],
-            insecure_skip_verify: false,
-        }
-    );
+        let serialized = serde_json::to_value(layer).unwrap();
+        assert_eq!(serialized["config"][field], "***", "alias {field}");
+        assert_eq!(serialized["config"]["username"], "alice");
+        assert_eq!(serialized["config"]["password"], "***");
+        assert!(!serialized.to_string().contains("private"));
+        assert!(!serialized.to_string().contains("secret"));
+    }
 }

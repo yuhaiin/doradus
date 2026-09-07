@@ -1,0 +1,17 @@
+[package]
+name = "doradus-openvpn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+openvpn-connect = { version = "0.1.1", default-features = false, features = ["tokio", "external-tun", "external-transport", "vendor"] }
+serde = { version = "1.0.228", features = ["derive"] }
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "async"] }
+tokio = { version = "1.50.0", default-features = false, features = ["io-util", "net", "rt", "sync", "time"] }
+doradus-core = { path = "../doradus-core" }
+doradus-tun = { path = "../doradus-tun" }
+doradus-types = { path = "../doradus-types" }
+
+[lints]
+workspace = true

@@ -1,20 +1,19 @@
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 
-use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::{DomainName, Error, ErrorKind, Result};
 use serde_json::Value;
 
 use super::{GoProxyLayer, network_interface_field};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ProxyEndpoint {
-    pub(super) host: String,
-    pub(super) port: u16,
-    pub(super) bind_interface: Option<String>,
+pub struct GoProxyEndpoint {
+    pub host: String,
+    pub port: u16,
+    pub bind_interface: Option<String>,
 }
 
-impl ProxyEndpoint {
-    pub(super) fn text(&self) -> String {
+impl GoProxyEndpoint {
+    pub fn socket_text(&self) -> String {
         if self.host.contains(':') && !self.host.starts_with('[') {
             format!("[{}]:{}", self.host, self.port)
         } else {
@@ -23,7 +22,7 @@ impl ProxyEndpoint {
     }
 }
 
-pub(super) fn fixed_endpoints(layers: &[GoProxyLayer]) -> Result<Vec<ProxyEndpoint>> {
+pub(super) fn fixed_endpoints(layers: &[GoProxyLayer]) -> Result<Vec<GoProxyEndpoint>> {
     let config = layers
         .iter()
         .find(|layer| matches!(layer.kind.as_str(), "fixed" | "simple" | "fixedv2"))
@@ -71,17 +70,17 @@ pub(super) fn fixed_endpoints(layers: &[GoProxyLayer]) -> Result<Vec<ProxyEndpoi
     Ok(endpoints)
 }
 
-pub(super) fn proxy_endpoint_value(value: &Value) -> Result<ProxyEndpoint> {
+pub(super) fn proxy_endpoint_value(value: &Value) -> Result<GoProxyEndpoint> {
     if let Some(value) = value.as_str() {
         if let Ok(address) = value.parse::<SocketAddr>() {
-            return Ok(ProxyEndpoint {
+            return Ok(GoProxyEndpoint {
                 host: address.ip().to_string(),
                 port: address.port(),
                 bind_interface: None,
             });
         }
         let (host, port) = split_endpoint_text(value)?;
-        return Ok(ProxyEndpoint {
+        return Ok(GoProxyEndpoint {
             host,
             port,
             bind_interface: None,
@@ -98,7 +97,7 @@ pub(super) fn proxy_endpoint_value(value: &Value) -> Result<ProxyEndpoint> {
     if port == 0 || port > u64::from(u16::MAX) {
         return Err(Error::invalid("Go proxy endpoint port is out of range"));
     }
-    Ok(ProxyEndpoint {
+    Ok(GoProxyEndpoint {
         host: host.to_owned(),
         port: u16::try_from(port)
             .map_err(|_| Error::invalid("Go proxy endpoint port is out of range"))?,
@@ -129,48 +128,4 @@ fn split_endpoint_text(value: &str) -> Result<(String, u16)> {
         DomainName::new(host)?;
     }
     Ok((host.to_owned(), port))
-}
-
-pub(super) fn resolve_socket_addr(value: &str) -> Result<SocketAddr> {
-    if let Ok(address) = value.parse() {
-        return Ok(address);
-    }
-    value
-        .to_socket_addrs()
-        .map_err(|error| {
-            Error::new(
-                ErrorKind::InvalidInput,
-                format!("Go proxy endpoint {value:?} cannot be resolved: {error}"),
-            )
-        })?
-        .next()
-        .ok_or_else(|| {
-            Error::invalid(format!(
-                "Go proxy endpoint {value:?} resolved to no address"
-            ))
-        })
-}
-
-pub(super) async fn resolve_endpoints(
-    endpoint: &ProxyEndpoint,
-    resolver: &dyn AsyncIpResolver,
-) -> Result<Vec<SocketAddr>> {
-    if let Ok(address) = endpoint.text().parse() {
-        return Ok(vec![address]);
-    }
-    let domain = DomainName::new(&endpoint.host)?;
-    let addresses = resolver
-        .resolve(&domain, doradus_core::ResolveStrategy::Default)
-        .await?;
-    let addresses = addresses
-        .iter()
-        .map(|address| SocketAddr::new(address, endpoint.port))
-        .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        return Err(Error::invalid(format!(
-            "proxy endpoint {} resolved to no address",
-            domain
-        )));
-    }
-    Ok(addresses)
 }

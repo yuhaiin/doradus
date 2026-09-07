@@ -103,6 +103,7 @@ doradus-tun = { path = "../doradus-tun" }
 doradus-trie = { path = "../doradus-trie" }
 doradus-types = { path = "../doradus-types" }
 doradus-wireguard = { path = "../doradus-wireguard" }
+doradus-openvpn = { path = "../doradus-openvpn" }
 doradus-masque = { path = "../doradus-masque" }
 socket2 = { version = "0.6.5", features = ["all"] }
 

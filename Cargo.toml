@@ -12,6 +12,7 @@ members = [
     "crates/doradus-trie",
     "crates/doradus-metrics",
     "crates/doradus-wireguard",
+    "crates/doradus-openvpn",
     "crates/doradus-masque",
     "crates/doradus-backup",
     "crates/doradus-api",

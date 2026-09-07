@@ -12,10 +12,10 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crate::yuubinsya::derive_salt;
-use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::network::{HappyEyeballsV2Dialer, TcpDialCandidate};
 use doradus_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use doradus_core::{BoxFuture, DomainName, Endpoint, Error, ErrorKind, FlowContext, Result};
+use doradus_types::AsyncIpResolver;
 use serde_json::Value;
 use tokio::sync::Mutex;
 

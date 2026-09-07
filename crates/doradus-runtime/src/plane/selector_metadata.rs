@@ -29,9 +29,8 @@ impl RuntimeSnapshot {
             let Some(config) = self.proxy_config(id) else {
                 continue;
             };
-            if let Ok(Some(endpoint)) = config
-                .resolved_fixed_endpoint(endpoint_resolver.as_ref())
-                .await
+            if let Ok(Some(endpoint)) =
+                resolve_fixed_endpoint(config, endpoint_resolver.as_ref()).await
             {
                 endpoints.insert(id.to_owned(), endpoint);
             }
@@ -103,9 +102,8 @@ impl RuntimeSnapshot {
                     continue;
                 }
                 node_ids.entry(tag.clone()).or_insert_with(|| id.clone());
-                if let Ok(Some(endpoint)) = config
-                    .resolved_fixed_endpoint(endpoint_resolver.as_ref())
-                    .await
+                if let Ok(Some(endpoint)) =
+                    resolve_fixed_endpoint(config, endpoint_resolver.as_ref()).await
                 {
                     endpoints.insert(tag.clone(), endpoint);
                     break;

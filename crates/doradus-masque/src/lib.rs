@@ -7,7 +7,9 @@
 
 mod codec;
 mod config;
+mod driver;
 mod proxy;
+mod session;
 mod tls;
 
 pub use config::WarpMasqueConfig;

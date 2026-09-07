@@ -8,7 +8,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::network::{HappyEyeballsObserver, HappyEyeballsV2Dialer, TcpDialCandidate};
 use doradus_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use doradus_core::stream_metadata::with_stream_socket_addrs;
@@ -17,6 +16,7 @@ use doradus_core::{
 };
 use doradus_metrics::RuntimeMetrics;
 use doradus_protocol::proxy::{DirectAsyncProxy, FixedAsyncProxy};
+use doradus_types::AsyncIpResolver;
 use tokio::sync::mpsc;
 
 const DNS_FAMILY_DELAY: Duration = Duration::from_millis(50);

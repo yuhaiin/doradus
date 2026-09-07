@@ -6,17 +6,20 @@ use std::sync::{
 use std::time::Duration;
 
 use tokio::net::UdpSocket as TokioUdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::JoinHandle;
 
-use doradus_core::dns_resolver::AsyncIpResolver;
 use doradus_core::network::{DEFAULT_INTERFACE, bind_socket_to_interface};
 use doradus_core::proxy::{AsyncDatagram, AsyncProxy, BoxAsyncStream};
 use doradus_core::{BoxFuture, Endpoint, Error, ErrorKind, FlowContext, Network, Result};
+use doradus_types::AsyncIpResolver;
 
 use crate::config::{
     ParsedConfig, ParsedPeer, WireGuardConfig, decode_key, error_io, error_unsupported,
 };
 use crate::driver::{Driver, DriverCommand};
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Construct the running WireGuard proxy. The returned proxy owns one
 /// userspace IP stack and one UDP underlay; individual doradus flows become
@@ -59,6 +62,7 @@ pub async fn build_proxy_with_interface_and_resolver(
 pub struct WireGuardProxy {
     pub(crate) command_tx: mpsc::Sender<DriverCommand>,
     pub(crate) closed: Arc<AtomicBool>,
+    pub(crate) driver_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl WireGuardProxy {
@@ -78,18 +82,35 @@ impl WireGuardProxy {
         let (ready_tx, ready_rx) = oneshot::channel();
         let closed = Arc::new(AtomicBool::new(false));
         let task_closed = Arc::clone(&closed);
-        tokio::spawn(async move {
+        let driver_task = tokio::spawn(async move {
             Driver::new(config, private_key, underlay, command_rx, task_closed)
                 .run(Some(ready_tx))
                 .await;
         });
-        ready_rx.await.map_err(|_| {
+        let ready = ready_rx.await.map_err(|_| {
             Error::new(
                 ErrorKind::Closed,
                 "WireGuard driver exited before it became ready",
             )
-        })??;
-        Ok(Self { command_tx, closed })
+        });
+        if let Err(error) = ready.and_then(|result| result) {
+            closed.store(true, Ordering::Release);
+            finish_task(driver_task).await;
+            return Err(error);
+        }
+        Ok(Self {
+            command_tx,
+            closed,
+            driver_task: Mutex::new(Some(driver_task)),
+        })
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            Err(Error::new(ErrorKind::Closed, "WireGuard proxy is closed"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -140,6 +161,7 @@ pub(crate) async fn bind_udp_underlay(
 impl AsyncProxy for WireGuardProxy {
     fn connect<'a>(&'a self, context: &'a FlowContext) -> BoxFuture<'a, Result<BoxAsyncStream>> {
         Box::pin(async move {
+            self.ensure_open()?;
             if context.network != Network::Tcp {
                 return Err(error_unsupported(
                     "WireGuard TCP proxy received a non-TCP flow",
@@ -165,6 +187,7 @@ impl AsyncProxy for WireGuardProxy {
         context: &'a FlowContext,
     ) -> BoxFuture<'a, Result<Box<dyn AsyncDatagram>>> {
         Box::pin(async move {
+            self.ensure_open()?;
             if context.network != Network::Udp && context.network != Network::Any {
                 return Err(error_unsupported(
                     "WireGuard UDP proxy received a non-UDP flow",
@@ -182,10 +205,37 @@ impl AsyncProxy for WireGuardProxy {
     }
 
     fn close(&self) -> BoxFuture<'_, Result<()>> {
-        if !self.closed.swap(true, Ordering::AcqRel) {
+        Box::pin(async move {
+            let mut driver_task = self.driver_task.lock().await;
+            self.closed.store(true, Ordering::Release);
             let _ = self.command_tx.try_send(DriverCommand::Close);
+            if let Some(task) = driver_task.take() {
+                finish_task(task).await;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl Drop for WireGuardProxy {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+        let _ = self.command_tx.try_send(DriverCommand::Close);
+        if let Ok(mut driver_task) = self.driver_task.try_lock()
+            && let Some(task) = driver_task.take()
+        {
+            task.abort();
         }
-        Box::pin(async { Ok(()) })
+    }
+}
+
+async fn finish_task(mut task: JoinHandle<()>) {
+    if tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
     }
 }
 

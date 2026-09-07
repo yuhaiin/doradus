@@ -1,106 +1,5 @@
 use super::*;
 
-fn protocol_endpoint(
-    endpoint: GoBaseProxyEndpoint,
-) -> doradus_protocol::proxy_factory::BaseProxyEndpoint {
-    doradus_protocol::proxy_factory::BaseProxyEndpoint {
-        address: endpoint.address,
-        bind_interface: endpoint.bind_interface,
-    }
-}
-
-pub(super) fn protocol_base_proxy_config(config: GoBaseProxyConfig) -> Result<BaseProxyConfig> {
-    let kind = match config.kind {
-        GoBaseProxyKind::Direct => BaseProxyKind::Direct,
-        GoBaseProxyKind::Reject => BaseProxyKind::Reject,
-        GoBaseProxyKind::Drop => BaseProxyKind::Drop,
-        GoBaseProxyKind::Fixed { address } => BaseProxyKind::Fixed { address },
-        GoBaseProxyKind::FixedMany { endpoints } => BaseProxyKind::FixedMany {
-            endpoints: endpoints.into_iter().map(protocol_endpoint).collect(),
-        },
-        GoBaseProxyKind::Http {
-            proxy,
-            username,
-            password,
-        } => BaseProxyKind::Http {
-            proxy,
-            username,
-            password,
-        },
-        GoBaseProxyKind::HttpMany {
-            endpoints,
-            username,
-            password,
-        } => BaseProxyKind::HttpMany {
-            endpoints: endpoints.into_iter().map(protocol_endpoint).collect(),
-            username,
-            password,
-        },
-        GoBaseProxyKind::Socks5 {
-            proxy,
-            username,
-            password,
-        } => BaseProxyKind::Socks5 {
-            proxy,
-            username,
-            password,
-        },
-        GoBaseProxyKind::Socks5Many {
-            endpoints,
-            username,
-            password,
-        } => BaseProxyKind::Socks5Many {
-            endpoints: endpoints.into_iter().map(protocol_endpoint).collect(),
-            username,
-            password,
-        },
-        GoBaseProxyKind::YuubinsyaUdp {
-            server,
-            password,
-            socks5_prefix,
-        } => BaseProxyKind::YuubinsyaUdp {
-            server,
-            password_hash: doradus_protocol::yuubinsya::derive_salt(password.as_bytes()),
-            socks5_prefix,
-        },
-        GoBaseProxyKind::YuubinsyaUdpMany {
-            endpoints,
-            password,
-            socks5_prefix,
-        } => BaseProxyKind::YuubinsyaUdpMany {
-            endpoints: endpoints.into_iter().map(protocol_endpoint).collect(),
-            password_hash: doradus_protocol::yuubinsya::derive_salt(password.as_bytes()),
-            socks5_prefix,
-        },
-        GoBaseProxyKind::Quic {
-            server,
-            server_name,
-            ca_certificates,
-            insecure_skip_verify,
-        } => BaseProxyKind::Quic {
-            server,
-            server_name,
-            ca_certificates,
-            insecure_skip_verify,
-        },
-        GoBaseProxyKind::QuicMany {
-            endpoints,
-            server_name,
-            ca_certificates,
-            insecure_skip_verify,
-        } => BaseProxyKind::QuicMany {
-            endpoints: endpoints.into_iter().map(protocol_endpoint).collect(),
-            server_name,
-            ca_certificates,
-            insecure_skip_verify,
-        },
-    };
-    Ok(BaseProxyConfig {
-        kind,
-        timeout: config.timeout,
-    })
-}
-
 pub(super) fn network_split_branch(
     value: Option<&serde_json::Value>,
 ) -> Result<Option<GoProxyLayer>> {
@@ -412,13 +311,14 @@ impl StandardProtocol {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProxyPlanKind {
+enum DetectedProxyKind {
     NetworkSplit,
     ProtocolH2,
     VlessWebSocket,
     VmessTransport,
     TrojanWebSocket,
     Wireguard,
+    Openvpn,
     WarpMasque,
     HttpMock,
     HttpTermination,
@@ -429,21 +329,42 @@ pub(super) enum ProxyPlanKind {
     Generic,
 }
 
-pub(super) struct ProxyPlan {
-    pub(super) kind: ProxyPlanKind,
-    pub(super) standard: Option<StandardProxyPlan>,
-    pub(super) http_obfs: Option<HttpObfsPlan>,
-    pub(super) protocol_tls: Option<ProtocolTlsPlan>,
-    pub(super) websocket: Option<WebSocketPlan>,
-    pub(super) aead: Option<AeadPlan>,
-    pub(super) wireguard: Option<doradus_wireguard::WireGuardConfig>,
-    pub(super) warp_masque: Option<doradus_masque::WarpMasqueConfig>,
-    pub(super) yuubinsya: Option<YuubinsyaPlan>,
-    pub(super) h2_transport_json: Option<String>,
-    #[cfg(feature = "http-termination")]
-    pub(super) http_termination: Option<crate::proxy::http_termination::HttpTerminationPlan>,
-    #[cfg(feature = "doh-tls")]
-    pub(super) tls_termination: Option<TlsTerminationPlan>,
+pub(super) enum ProxyPlan {
+    NetworkSplit,
+    ProtocolH2 {
+        transport_json: String,
+        protocol: StandardProxyPlan,
+    },
+    StreamTransport {
+        protocol: StandardProxyPlan,
+        tls: Option<ProtocolTlsPlan>,
+        websocket: WebSocketPlan,
+    },
+    Wireguard(doradus_wireguard::WireGuardConfig),
+    Openvpn(doradus_openvpn::OpenVpnConfig),
+    WarpMasque(doradus_masque::WarpMasqueConfig),
+    HttpMock,
+    HttpTermination {
+        #[cfg(feature = "http-termination")]
+        plan: crate::proxy::http_termination::HttpTerminationPlan,
+    },
+    TlsTermination {
+        #[cfg(feature = "doh-tls")]
+        plan: TlsTerminationPlan,
+    },
+    Chain,
+    Aead {
+        plan: AeadPlan,
+        tls: Option<ProtocolTlsPlan>,
+    },
+    Standard {
+        protocol: StandardProxyPlan,
+        tls: Option<ProtocolTlsPlan>,
+        http_obfs: Option<HttpObfsPlan>,
+    },
+    Generic {
+        yuubinsya: Option<YuubinsyaPlan>,
+    },
 }
 
 impl ProxyPlan {
@@ -522,167 +443,163 @@ impl ProxyPlan {
             config.transport,
             doradus_store::GoProxyTransport::NetworkSplit
         ) {
-            ProxyPlanKind::NetworkSplit
+            DetectedProxyKind::NetworkSplit
         } else if protocol_h2 {
-            ProxyPlanKind::ProtocolH2
+            DetectedProxyKind::ProtocolH2
         } else if vless_websocket {
-            ProxyPlanKind::VlessWebSocket
+            DetectedProxyKind::VlessWebSocket
         } else if vmess_transport {
-            ProxyPlanKind::VmessTransport
+            DetectedProxyKind::VmessTransport
         } else if trojan_websocket {
-            ProxyPlanKind::TrojanWebSocket
+            DetectedProxyKind::TrojanWebSocket
         } else if matches!(config.transport, doradus_store::GoProxyTransport::Wireguard) {
-            ProxyPlanKind::Wireguard
+            DetectedProxyKind::Wireguard
+        } else if matches!(config.transport, doradus_store::GoProxyTransport::Openvpn) {
+            DetectedProxyKind::Openvpn
         } else if matches!(
             config.transport,
             doradus_store::GoProxyTransport::WarpMasque
         ) {
-            ProxyPlanKind::WarpMasque
+            DetectedProxyKind::WarpMasque
         } else if matches!(config.transport, doradus_store::GoProxyTransport::HttpMock) {
-            ProxyPlanKind::HttpMock
+            DetectedProxyKind::HttpMock
         } else if matches!(
             config.transport,
             doradus_store::GoProxyTransport::HttpTermination
         ) {
-            ProxyPlanKind::HttpTermination
+            DetectedProxyKind::HttpTermination
         } else if matches!(
             config.transport,
             doradus_store::GoProxyTransport::TlsTermination
         ) {
-            ProxyPlanKind::TlsTermination
+            DetectedProxyKind::TlsTermination
         } else if is_chain {
-            ProxyPlanKind::Chain
+            DetectedProxyKind::Chain
         } else if matches!(config.transport, doradus_store::GoProxyTransport::Aead) {
-            ProxyPlanKind::Aead
+            DetectedProxyKind::Aead
         } else if let Some(protocol) = standard_protocol {
-            ProxyPlanKind::Standard(protocol)
+            DetectedProxyKind::Standard(protocol)
         } else {
-            ProxyPlanKind::Generic
+            DetectedProxyKind::Generic
         };
-        let compiled_protocol = match kind {
-            ProxyPlanKind::Standard(protocol) => Some(protocol),
-            ProxyPlanKind::ProtocolH2 => standard_protocol,
-            ProxyPlanKind::VlessWebSocket => Some(StandardProtocol::Vless),
-            ProxyPlanKind::VmessTransport => Some(StandardProtocol::Vmess),
-            ProxyPlanKind::TrojanWebSocket => Some(StandardProtocol::Trojan),
-            _ => None,
+        let compile_tls = || {
+            has_protocol_tls
+                .then(|| ProtocolTlsPlan::compile(config))
+                .transpose()
         };
-        let standard = compiled_protocol
-            .map(|protocol| StandardProxyPlan::compile(config, protocol))
-            .transpose()?;
-        let h2_transport_json = if matches!(kind, ProxyPlanKind::ProtocolH2) {
-            let protocol = standard
-                .as_ref()
-                .expect("HTTP/2 protocol kind must compile a protocol plan")
-                .protocol()
-                .layer_name();
-            Some(compile_protocol_h2_transport(config, protocol)?)
-        } else {
-            None
-        };
-        let http_obfs = if matches!(kind, ProxyPlanKind::Standard(StandardProtocol::Shadowsocks)) {
-            config
-                .layers
-                .iter()
-                .find(|layer| layer.kind.eq_ignore_ascii_case("obfs_http"))
-                .map(|layer| {
-                    Ok(HttpObfsPlan {
-                        host: layer
-                            .config
-                            .get("host")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                            .ok_or_else(|| Error::invalid("obfs_http host is missing"))?,
-                        port: layer
-                            .config
-                            .get("port")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                            .ok_or_else(|| Error::invalid("obfs_http port is missing"))?,
-                    })
+        match kind {
+            DetectedProxyKind::NetworkSplit => Ok(Self::NetworkSplit),
+            DetectedProxyKind::ProtocolH2 => {
+                let protocol = standard_protocol.ok_or_else(|| {
+                    Error::invalid("HTTP/2 protocol transport has no final protocol")
+                })?;
+                let protocol = StandardProxyPlan::compile(config, protocol)?;
+                let transport_json =
+                    compile_protocol_h2_transport(config, protocol.protocol().layer_name())?;
+                Ok(Self::ProtocolH2 {
+                    transport_json,
+                    protocol,
                 })
-                .transpose()?
-        } else {
-            None
-        };
-        let uses_compiled_stream_transport = matches!(
-            kind,
-            ProxyPlanKind::VlessWebSocket
-                | ProxyPlanKind::VmessTransport
-                | ProxyPlanKind::TrojanWebSocket
-                | ProxyPlanKind::Aead
-                | ProxyPlanKind::Standard(_)
-        );
-        let protocol_tls = if uses_compiled_stream_transport && has_protocol_tls {
-            Some(ProtocolTlsPlan::compile(config)?)
-        } else {
-            None
-        };
-        let websocket = if matches!(
-            kind,
-            ProxyPlanKind::VlessWebSocket
-                | ProxyPlanKind::VmessTransport
-                | ProxyPlanKind::TrojanWebSocket
-        ) && chain_kinds.contains("websocket")
-        {
-            Some(WebSocketPlan::compile(config)?)
-        } else {
-            None
-        };
-        let aead = if matches!(kind, ProxyPlanKind::Aead) {
-            Some(AeadPlan::compile(config)?)
-        } else {
-            None
-        };
-        let wireguard = if matches!(kind, ProxyPlanKind::Wireguard) {
-            let layer = config
-                .layers
-                .iter()
-                .find(|layer| layer.kind.eq_ignore_ascii_case("wireguard"))
-                .ok_or_else(|| Error::invalid("WireGuard protocol layer is missing"))?;
-            Some(compile_wireguard_config(layer)?)
-        } else {
-            None
-        };
-        let warp_masque = if matches!(kind, ProxyPlanKind::WarpMasque) {
-            let layer = config
-                .layers
-                .iter()
-                .find(|layer| layer.kind.eq_ignore_ascii_case("warp_masque"))
-                .ok_or_else(|| Error::invalid("WARP MASQUE protocol layer is missing"))?;
-            Some(compile_warp_masque_config(layer)?)
-        } else {
-            None
-        };
-        #[cfg(feature = "http-termination")]
-        let http_termination = if matches!(kind, ProxyPlanKind::HttpTermination) {
-            Some(crate::proxy::http_termination::HttpTerminationPlan::compile(config)?)
-        } else {
-            None
-        };
-        #[cfg(feature = "doh-tls")]
-        let tls_termination = if matches!(kind, ProxyPlanKind::TlsTermination) {
-            Some(TlsTerminationPlan::compile(config)?)
-        } else {
-            None
-        };
-        Ok(Self {
-            kind,
-            standard,
-            http_obfs,
-            protocol_tls,
-            websocket,
-            aead,
-            wireguard,
-            warp_masque,
-            yuubinsya,
-            h2_transport_json,
-            #[cfg(feature = "http-termination")]
-            http_termination,
-            #[cfg(feature = "doh-tls")]
-            tls_termination,
-        })
+            }
+            DetectedProxyKind::VlessWebSocket => {
+                compile_stream_transport(config, StandardProtocol::Vless, has_protocol_tls)
+            }
+            DetectedProxyKind::VmessTransport => {
+                compile_stream_transport(config, StandardProtocol::Vmess, has_protocol_tls)
+            }
+            DetectedProxyKind::TrojanWebSocket => {
+                compile_stream_transport(config, StandardProtocol::Trojan, has_protocol_tls)
+            }
+            DetectedProxyKind::Wireguard => {
+                let layer = required_layer(config, "wireguard", "WireGuard")?;
+                Ok(Self::Wireguard(compile_wireguard_config(layer)?))
+            }
+            DetectedProxyKind::Openvpn => {
+                let layer = required_layer(config, "openvpn", "OpenVPN")?;
+                Ok(Self::Openvpn(compile_openvpn_config(layer)?))
+            }
+            DetectedProxyKind::WarpMasque => {
+                let layer = required_layer(config, "warp_masque", "WARP MASQUE")?;
+                Ok(Self::WarpMasque(compile_warp_masque_config(layer)?))
+            }
+            DetectedProxyKind::HttpMock => Ok(Self::HttpMock),
+            DetectedProxyKind::HttpTermination => Ok(Self::HttpTermination {
+                #[cfg(feature = "http-termination")]
+                plan: crate::proxy::http_termination::HttpTerminationPlan::compile(config)?,
+            }),
+            DetectedProxyKind::TlsTermination => Ok(Self::TlsTermination {
+                #[cfg(feature = "doh-tls")]
+                plan: TlsTerminationPlan::compile(config)?,
+            }),
+            DetectedProxyKind::Chain => Ok(Self::Chain),
+            DetectedProxyKind::Aead => Ok(Self::Aead {
+                plan: AeadPlan::compile(config)?,
+                tls: compile_tls()?,
+            }),
+            DetectedProxyKind::Standard(protocol) => {
+                let http_obfs = (protocol == StandardProtocol::Shadowsocks)
+                    .then(|| compile_http_obfs(config))
+                    .transpose()?
+                    .flatten();
+                Ok(Self::Standard {
+                    protocol: StandardProxyPlan::compile(config, protocol)?,
+                    tls: compile_tls()?,
+                    http_obfs,
+                })
+            }
+            DetectedProxyKind::Generic => Ok(Self::Generic { yuubinsya }),
+        }
     }
+}
+
+fn compile_stream_transport(
+    config: &GoProxyRuntimeConfig,
+    protocol: StandardProtocol,
+    has_protocol_tls: bool,
+) -> Result<ProxyPlan> {
+    Ok(ProxyPlan::StreamTransport {
+        protocol: StandardProxyPlan::compile(config, protocol)?,
+        tls: has_protocol_tls
+            .then(|| ProtocolTlsPlan::compile(config))
+            .transpose()?,
+        websocket: WebSocketPlan::compile(config)?,
+    })
+}
+
+fn required_layer<'a>(
+    config: &'a GoProxyRuntimeConfig,
+    kind: &str,
+    display_name: &str,
+) -> Result<&'a GoProxyLayer> {
+    config
+        .layers
+        .iter()
+        .find(|layer| layer.kind.eq_ignore_ascii_case(kind))
+        .ok_or_else(|| Error::invalid(format!("{display_name} protocol layer is missing")))
+}
+
+fn compile_http_obfs(config: &GoProxyRuntimeConfig) -> Result<Option<HttpObfsPlan>> {
+    config
+        .layers
+        .iter()
+        .find(|layer| layer.kind.eq_ignore_ascii_case("obfs_http"))
+        .map(|layer| {
+            Ok(HttpObfsPlan {
+                host: layer
+                    .config
+                    .get("host")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| Error::invalid("obfs_http host is missing"))?,
+                port: layer
+                    .config
+                    .get("port")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| Error::invalid("obfs_http port is missing"))?,
+            })
+        })
+        .transpose()
 }
 
 fn compile_protocol_h2_transport(config: &GoProxyRuntimeConfig, protocol: &str) -> Result<String> {
@@ -719,6 +636,17 @@ pub(super) fn compile_wireguard_config(
         Error::new(
             ErrorKind::InvalidInput,
             format!("invalid WireGuard node configuration: {error}"),
+        )
+    })
+}
+
+pub(super) fn compile_openvpn_config(
+    layer: &GoProxyLayer,
+) -> Result<doradus_openvpn::OpenVpnConfig> {
+    serde_json::from_value(layer.config.clone()).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid OpenVPN node configuration: {error}"),
         )
     })
 }

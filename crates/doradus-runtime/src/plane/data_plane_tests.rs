@@ -510,21 +510,30 @@ async fn empty_store_uses_go_default_dns_server() {
 
 #[tokio::test]
 async fn dns_server_binds_udp_and_tcp_on_the_same_configured_address() {
-    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let address = probe.local_addr().unwrap();
-    drop(probe);
     let handler = RuntimeDnsHandler {
         resolver: Arc::new(SystemAsyncIpResolver),
         fakeip: None,
     };
-    let udp = doradus_core::dns::AsyncUdpDnsServer::bind(address, handler.clone(), 4096)
+    for _ in 0..16 {
+        let tcp = AsyncTcpDnsServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            handler.clone(),
+            65535,
+            Duration::from_secs(5),
+        )
         .await
         .unwrap();
-    let tcp = AsyncTcpDnsServer::bind(address, handler, 65535, Duration::from_secs(5))
-        .await
-        .unwrap();
-    assert_eq!(udp.local_addr().unwrap(), address);
-    assert_eq!(tcp.local_addr().unwrap(), address);
+        let address = tcp.local_addr().unwrap();
+        let Ok(udp) =
+            doradus_core::dns::AsyncUdpDnsServer::bind(address, handler.clone(), 4096).await
+        else {
+            continue;
+        };
+        assert_eq!(udp.local_addr().unwrap(), address);
+        assert_eq!(tcp.local_addr().unwrap(), address);
+        return;
+    }
+    panic!("could not reserve one loopback port for both UDP and TCP DNS");
 }
 
 #[tokio::test]

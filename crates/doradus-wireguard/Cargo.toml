@@ -14,6 +14,7 @@ smoltcp = { version = "0.13.1", default-features = false, features = ["std", "me
 tokio = { version = "1.50.0", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 doradus-core = { path = "../doradus-core" }
 doradus-tun = { path = "../doradus-tun" }
+doradus-types = { path = "../doradus-types" }
 
 [lints]
 workspace = true
