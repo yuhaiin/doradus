@@ -95,7 +95,12 @@ required_windows_cross_literals=(
   'export TMPDIR=/state/cache/tmp'
   'unset CARGO_NET_OFFLINE'
   'cargo check --config net.offline=false --locked --target'
-  'eval "export CXX_${target_env}=$cxx"'
+  'cargo_target_env=$(printf "%s" "$target" | tr "[:lower:]-" "[:upper:]_")'
+  'cc_target_env=$(printf "%s" "$target" | tr "-" "_")'
+  'eval "export CARGO_TARGET_${cargo_target_env}_LINKER=$linker"'
+  'eval "export CC_${cc_target_env}=$linker"'
+  'eval "export CXX_${cc_target_env}=$cxx"'
+  'eval "export CXXFLAGS_${cc_target_env}=\"-Wa,-mbig-obj -I/state/tap-windows/include\""'
 )
 
 for literal in "${required_windows_cross_literals[@]}"; do
