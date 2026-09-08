@@ -74,11 +74,12 @@ podman run --rm --network=host \
       | sha256sum -c -
 
     rustup target add "$target"
-    target_env=$(printf "%s" "$target" | tr "[:lower:]-" "[:upper:]_")
-    eval "export CARGO_TARGET_${target_env}_LINKER=$linker"
-    eval "export CC_${target_env}=$linker"
-    eval "export CXX_${target_env}=$cxx"
-    eval "export CXXFLAGS_${target_env}=\"-Wa,-mbig-obj -I/state/tap-windows/include\""
+    cargo_target_env=$(printf "%s" "$target" | tr "[:lower:]-" "[:upper:]_")
+    cc_target_env=$(printf "%s" "$target" | tr "-" "_")
+    eval "export CARGO_TARGET_${cargo_target_env}_LINKER=$linker"
+    eval "export CC_${cc_target_env}=$linker"
+    eval "export CXX_${cc_target_env}=$cxx"
+    eval "export CXXFLAGS_${cc_target_env}=\"-Wa,-mbig-obj -I/state/tap-windows/include\""
     cd /workspace
     cargo check --config net.offline=false --locked --target "$target" \
       -p doradus-api --bin doradus --all-features \
