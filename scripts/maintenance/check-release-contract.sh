@@ -8,10 +8,12 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 workflow="${repo_root}/.github/workflows/rust.yml"
 windows_cross="${repo_root}/scripts/integration/release-windows-cross.sh"
+linux_cross="${repo_root}/scripts/integration/release-linux-cross.sh"
 native_macos="${repo_root}/scripts/integration/native-service-macos.sh"
 
 test -f "${workflow}"
 test -f "${windows_cross}"
+test -f "${linux_cross}"
 test -f "${native_macos}"
 
 matrix_entry_exists() {
@@ -68,6 +70,9 @@ required_literals=(
   '-p doradus-api --bin doradus --all-features'
   'actions/upload-artifact@v7'
   'actions/download-artifact@v7'
+  'Install OpenVPN Windows TAP header'
+  'BINDGEN_EXTRA_CLANG_ARGS_${cc_target_env}=--sysroot=${sysroot}'
+  'CXXFLAGS_${targetEnv}=/I`"$tapInclude`"'
   'sha256sum -- * | sort -k2'
   ') > release/checksums.txt'
   'github.ref_type == '\''tag'\'' || (github.ref_type == '\''branch'\'' && github.ref_name == '\''main'\'')'
@@ -102,6 +107,35 @@ required_windows_cross_literals=(
   'eval "export CXX_${cc_target_env}=$cxx"'
   'eval "export CXXFLAGS_${cc_target_env}=\"-Wa,-mbig-obj -I/state/tap-windows/include\""'
 )
+
+required_native_windows_literals=(
+  'tap-windows6/0e30f5c13b3c7b0bdd60da915350f653e4c14d92/src/tap-windows.h'
+  'Get-FileHash -Algorithm SHA256'
+  '$env:CXXFLAGS_X86_64_PC_WINDOWS_MSVC = "/I`"$tapInclude`""'
+)
+
+required_linux_cross_literals=(
+  'cmake libclang-dev clang nasm curl ca-certificates'
+  'test -x "${toolchain_root}/bin/${target}-g++"'
+  'test -d "${toolchain_root}/${target}/sysroot"'
+  'cc_target_env=$(printf "%s" "${target}" | tr "-" "_")'
+  'eval "export CXX_${cc_target_env}=${toolchain_root}/bin/${target}-g++"'
+  'eval "export BINDGEN_EXTRA_CLANG_ARGS_${cc_target_env}=--sysroot=${toolchain_root}/${target}/sysroot"'
+)
+
+for literal in "${required_linux_cross_literals[@]}"; do
+  if ! grep -Fq -- "${literal}" "${linux_cross}"; then
+    echo "[release-contract] missing Linux cross literal: ${literal}" >&2
+    exit 1
+  fi
+done
+
+for literal in "${required_native_windows_literals[@]}"; do
+  if ! grep -Fq -- "${literal}" "${repo_root}/scripts/integration/native-service-windows.ps1"; then
+    echo "[release-contract] missing native Windows literal: ${literal}" >&2
+    exit 1
+  fi
+done
 
 for literal in "${required_windows_cross_literals[@]}"; do
   if ! grep -Fq -- "${literal}" "${windows_cross}"; then

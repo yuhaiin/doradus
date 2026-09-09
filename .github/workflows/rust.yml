@@ -137,17 +137,43 @@ jobs:
 
           toolchain_root="${RUNNER_TEMP}/${toolchain_target}"
           compiler="${toolchain_root}/bin/${toolchain_target}-gcc"
+          cxx="${toolchain_root}/bin/${toolchain_target}-g++"
           archiver="${toolchain_root}/bin/${toolchain_target}-ar"
-          target_env="$(echo "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')"
+          sysroot="${toolchain_root}/${toolchain_target}/sysroot"
+          cargo_target_env="$(echo "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')"
+          cc_target_env="$(echo "${{ matrix.target }}" | tr '-' '_')"
           test -x "${compiler}"
+          test -x "${cxx}"
           test -x "${archiver}"
+          test -d "${sysroot}"
 
           echo "${toolchain_root}/bin" >> "${GITHUB_PATH}"
           {
-            echo "CARGO_TARGET_${target_env}_LINKER=${compiler}"
-            echo "CC_${target_env}=${compiler}"
-            echo "AR_${target_env}=${archiver}"
+            echo "CARGO_TARGET_${cargo_target_env}_LINKER=${compiler}"
+            echo "CC_${cc_target_env}=${compiler}"
+            echo "CXX_${cc_target_env}=${cxx}"
+            echo "AR_${cc_target_env}=${archiver}"
+            echo "BINDGEN_EXTRA_CLANG_ARGS_${cc_target_env}=--sysroot=${sysroot}"
           } >> "${GITHUB_ENV}"
+
+      - name: Install OpenVPN Windows TAP header
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $tapRoot = Join-Path $env:RUNNER_TEMP "doradus-tap-windows"
+          $tapInclude = Join-Path $tapRoot "include"
+          $tapHeader = Join-Path $tapInclude "tap-windows.h"
+          New-Item -ItemType Directory -Force -Path $tapInclude | Out-Null
+          Invoke-WebRequest `
+            -Uri "https://raw.githubusercontent.com/OpenVPN/tap-windows6/0e30f5c13b3c7b0bdd60da915350f653e4c14d92/src/tap-windows.h" `
+            -OutFile $tapHeader
+          $expected = "ca2aca307cbabb0400dea8f1823490762bbd2fa9720a1da511701b975330d621"
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $tapHeader).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+              throw "tap-windows.h checksum mismatch: $actual"
+          }
+          $targetEnv = "${{ matrix.target }}".Replace("-", "_").ToUpperInvariant()
+          "CXXFLAGS_${targetEnv}=/I`"$tapInclude`"" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Build release binary
         shell: bash

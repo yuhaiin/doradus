@@ -39,6 +39,11 @@ podman run --rm --network=host \
     export TMPDIR=/state/cache/tmp
     unset CARGO_NET_OFFLINE
 
+    apt-get update >/state/apt-update.log
+    DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+      cmake libclang-dev clang nasm curl ca-certificates \
+      >/state/apt-install.log
+
     archive="/state/${target}.tar.xz"
     url="https://github.com/cross-tools/musl-cross/releases/download/20260515/${target}.tar.xz"
     if test ! -f "${archive}"; then
@@ -53,13 +58,18 @@ podman run --rm --network=host \
       tar --extract --xz --file "${archive}" --strip-components=1 --directory "${toolchain_root}"
     fi
     test -x "${toolchain_root}/bin/${target}-gcc"
+    test -x "${toolchain_root}/bin/${target}-g++"
+    test -d "${toolchain_root}/${target}/sysroot"
     rustup target add "${target}"
 
     export PATH="${toolchain_root}/bin:${PATH}"
-    target_env=$(printf "%s" "${target}" | tr "[:lower:]-" "[:upper:]_")
-    eval "export CARGO_TARGET_${target_env}_LINKER=${toolchain_root}/bin/${target}-gcc"
-    eval "export CC_${target_env}=${toolchain_root}/bin/${target}-gcc"
-    eval "export AR_${target_env}=${toolchain_root}/bin/${target}-ar"
+    cargo_target_env=$(printf "%s" "${target}" | tr "[:lower:]-" "[:upper:]_")
+    cc_target_env=$(printf "%s" "${target}" | tr "-" "_")
+    eval "export CARGO_TARGET_${cargo_target_env}_LINKER=${toolchain_root}/bin/${target}-gcc"
+    eval "export CC_${cc_target_env}=${toolchain_root}/bin/${target}-gcc"
+    eval "export CXX_${cc_target_env}=${toolchain_root}/bin/${target}-g++"
+    eval "export AR_${cc_target_env}=${toolchain_root}/bin/${target}-ar"
+    eval "export BINDGEN_EXTRA_CLANG_ARGS_${cc_target_env}=--sysroot=${toolchain_root}/${target}/sysroot"
     cd /workspace
     cargo check --config net.offline=false --locked --target "${target}" \
       -p doradus-api --bin doradus --all-features

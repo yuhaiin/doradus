@@ -23,8 +23,19 @@ $runDir = Join-Path $scenarioRoot $runId
 $dataDir = Join-Path $runDir "data"
 $binary = Join-Path $repoRoot "target\release\doradus.exe"
 $installed = $false
+$tapInclude = Join-Path $cacheRoot "tap-windows\include"
+$tapHeader = Join-Path $tapInclude "tap-windows.h"
+$tapUri = "https://raw.githubusercontent.com/OpenVPN/tap-windows6/0e30f5c13b3c7b0bdd60da915350f653e4c14d92/src/tap-windows.h"
+$tapExpectedHash = "ca2aca307cbabb0400dea8f1823490762bbd2fa9720a1da511701b975330d621"
 
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+New-Item -ItemType Directory -Force -Path $tapInclude | Out-Null
+Invoke-WebRequest -Uri $tapUri -OutFile $tapHeader
+$tapActualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $tapHeader).Hash.ToLowerInvariant()
+if ($tapActualHash -ne $tapExpectedHash) {
+    throw "tap-windows.h checksum mismatch: $tapActualHash"
+}
+$env:CXXFLAGS_X86_64_PC_WINDOWS_MSVC = "/I`"$tapInclude`""
 
 $probe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
 $probe.Start()
