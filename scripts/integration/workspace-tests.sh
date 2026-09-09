@@ -35,7 +35,7 @@ podman run --rm --network=host \
     # quiche vendored BoringSSL build is driven by CMake.  The Rust image
     # provides the native C/C++ toolchain but does not include CMake.
     apt-get update >/state/apt-update.log
-    DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends cmake \
+    DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends cmake libclang-dev \
       >/state/apt-install.log
     CARGO_TERM_COLOR=never cargo build \
       --locked \
