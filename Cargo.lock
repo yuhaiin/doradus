@@ -1208,6 +1208,7 @@ dependencies = [
  "doradus-types",
  "ed25519-dalek",
  "futures-util",
+ "hashlink",
  "hickory-proto",
  "hickory-resolver",
  "http",

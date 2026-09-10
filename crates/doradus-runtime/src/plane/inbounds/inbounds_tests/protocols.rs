@@ -83,10 +83,7 @@ async fn vless_inbound_routes_a_real_tcp_flow_through_shared_outbound() {
             inbound.selector().udp_buffer_size(),
             inbound.as_ref(),
             move |server| async move {
-                let codec = crate::inbound::adapters::vless::VlessUdpCodec {
-                    server,
-                    flow_key: None,
-                };
+                let codec = crate::inbound::adapters::vless::VlessUdpCodec { server };
                 InboundUdpSession::new(codec, udp_inbound).run().await
             },
         )
@@ -148,10 +145,7 @@ async fn vless_udp_command_routes_length_prefixed_packets_through_shared_outboun
             inbound.selector().udp_buffer_size(),
             inbound.as_ref(),
             move |server| async move {
-                let codec = crate::inbound::adapters::vless::VlessUdpCodec {
-                    server,
-                    flow_key: None,
-                };
+                let codec = crate::inbound::adapters::vless::VlessUdpCodec { server };
                 InboundUdpSession::new(codec, udp_inbound).run().await
             },
         )

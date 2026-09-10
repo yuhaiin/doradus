@@ -20,7 +20,7 @@ use super::{
 use crate::inbound_runtime::InboundRuntimeState;
 use doradus_core::Result;
 
-pub(super) type InboundOwners = HashMap<String, Vec<tokio::task::JoinHandle<()>>>;
+pub(super) type InboundOwners = HashMap<String, Vec<AbortOnDrop>>;
 
 pub(super) struct ListenerStartContext<'a> {
     pub(super) protocol: &'a InboundProtocolKind,
@@ -79,7 +79,26 @@ impl InboundStartOptions {
     }
 }
 
-struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+pub(super) struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    pub(super) fn abort(&self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
+impl Future for AbortOnDrop {
+    type Output = std::result::Result<(), tokio::task::JoinError>;
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        Pin::new(self.0.as_mut().expect("listener handle exists")).poll(cx)
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -89,12 +108,7 @@ impl Drop for AbortOnDrop {
     }
 }
 
-async fn supervise_listener(
-    id: String,
-    runtime: InboundRuntimeState,
-    listener: tokio::task::JoinHandle<()>,
-) {
-    let mut listener = AbortOnDrop(Some(listener));
+async fn supervise_listener(id: String, runtime: InboundRuntimeState, mut listener: AbortOnDrop) {
     let result = listener.0.as_mut().expect("listener handle exists").await;
     if runtime.is_stopping(&id) || runtime.has_failed_listener(&id) {
         return;
@@ -112,8 +126,17 @@ pub(super) fn push_listener(
     listener: tokio::task::JoinHandle<()>,
     runtime: &InboundRuntimeState,
 ) {
-    let supervised = tokio::spawn(supervise_listener(id.to_owned(), runtime.clone(), listener));
-    listeners.entry(id.to_owned()).or_default().push(supervised);
+    // Own the raw task before spawning the supervisor: cancellation before
+    // its first poll must also stop the listener.
+    let supervised = tokio::spawn(supervise_listener(
+        id.to_owned(),
+        runtime.clone(),
+        AbortOnDrop(Some(listener)),
+    ));
+    listeners
+        .entry(id.to_owned())
+        .or_default()
+        .push(AbortOnDrop(Some(supervised)));
 }
 
 pub(super) fn start_inbounds<'a>(
@@ -332,4 +355,27 @@ async fn start_inbounds_inner(
         }
     }
     Ok(listeners)
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropping_owner_stops_listener_even_before_supervisor_is_polled() {
+        let (released, done) = tokio::sync::oneshot::channel::<()>();
+        let listener = tokio::spawn(async move {
+            let _released = released;
+            std::future::pending::<()>().await;
+        });
+        let store = doradus_store::ConfigStore::open_memory().await.unwrap();
+        let runtime = InboundRuntimeState::new(store);
+        let mut owners = InboundOwners::new();
+        push_listener(&mut owners, "test", listener, &runtime);
+        drop(owners);
+        tokio::time::timeout(Duration::from_secs(1), done)
+            .await
+            .expect("listener outlived its dropped owner")
+            .expect_err("aborted listener must drop its sender");
+    }
 }

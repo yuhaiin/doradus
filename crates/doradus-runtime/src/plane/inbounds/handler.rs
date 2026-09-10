@@ -494,9 +494,10 @@ pub(crate) struct ObservedDatagram {
 /// the TUN flow key, but a stream-scoped inbound (currently VLESS) still needs
 /// to close when its one outbound flow is closed.
 pub(crate) trait InboundUdpFlowPolicy: InboundUdpCodec {
-    fn note_flow(&mut self, _flow: TunFlowKey) {}
-
-    fn owns_flow(&self, _flow: TunFlowKey) -> bool {
+    /// Whether this protocol session ends with its one outbound UDP flow.
+    /// Socket and multi-destination protocols retain their session when an
+    /// individual source flow ends.
+    fn close_on_flow_end(&self) -> bool {
         false
     }
 }

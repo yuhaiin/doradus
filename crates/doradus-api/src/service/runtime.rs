@@ -66,7 +66,7 @@ impl RuntimeService {
                 route_refresh_shutdown,
             ));
             let inbound_controller = task_controller.clone();
-            let inbound_task = tokio::task::spawn_local(async move {
+            let mut inbound_task = tokio::task::spawn_local(async move {
                 #[cfg(all(feature = "tun", unix))]
                 if let Some(injected_tun) = injected_tun {
                     return doradus_runtime::inbound::run_until_with_tun_fd_selector_ready(
@@ -124,10 +124,12 @@ impl RuntimeService {
             // and force-close the API task after a bounded grace period.
             let shutdown_signal = wait_for_shutdown(task_shutdown.subscribe());
             tokio::pin!(shutdown_signal);
+            let mut inbound_finished = false;
             let api_result = tokio::select! {
                 result = &mut api_task => {
                     let result = result
-                        .map_err(|error| Error::new(ErrorKind::Io, format!("HTTP API task: {error}")))?;
+                        .map_err(|error| std::io::Error::other(format!("HTTP API task: {error}")))
+                        .and_then(|result| result);
                     if *task_shutdown.borrow() {
                         logs.warn(format!(
                             "HTTP API task exited during an already-requested shutdown (source=shutdown-request, result={:?})",
@@ -145,18 +147,26 @@ impl RuntimeService {
                     logs.warn(
                         "runtime shutdown channel signaled (source=API request or runtime task)",
                     );
-                    match tokio::time::timeout(SHUTDOWN_CHILD_TIMEOUT, &mut api_task).await {
-                        Ok(result) => result
-                            .map_err(|error| Error::new(ErrorKind::Io, format!("HTTP API task: {error}")))?,
-                        Err(_) => {
-                            api_task.abort();
-                            let _ = api_task.await;
-                            logs.warn(format!(
-                                "HTTP API graceful shutdown exceeded {:?}; task aborted",
-                                SHUTDOWN_CHILD_TIMEOUT
-                            ));
-                            Ok(())
-                        }
+                    stop_api(&mut api_task, &logs).await
+                },
+                result = &mut inbound_task => {
+                    inbound_finished = true;
+                    let failure = if *task_shutdown.borrow() {
+                        None
+                    } else {
+                        Some(match result {
+                            Ok(Ok(())) => "inbound supervisor exited unexpectedly".to_owned(),
+                            Ok(Err(error)) => format!("inbound supervisor failed: {error}"),
+                            Err(error) => format!("inbound supervisor task failed: {error}"),
+                        })
+                    };
+                    let _ = task_shutdown.send(true);
+                    let api_result = stop_api(&mut api_task, &logs).await;
+                    if let Some(failure) = failure {
+                        logs.error(&failure);
+                        Err(std::io::Error::other(failure))
+                    } else {
+                        api_result
                     }
                 }
             };
@@ -164,7 +174,9 @@ impl RuntimeService {
             if let Some(Err(error)) = await_child(dns_task, "DNS", &logs).await {
                 logs.error(format!("inbound DNS task stopped: {error}"));
             }
-            if let Some(Err(error)) = await_child(inbound_task, "inbound", &logs).await {
+            if !inbound_finished
+                && let Some(Err(error)) = await_child(inbound_task, "inbound", &logs).await
+            {
                 logs.error(format!("inbound task stopped: {error}"));
             }
             let _ = await_child(route_refresh_task, "route refresh", &logs).await;
@@ -182,5 +194,25 @@ impl RuntimeService {
             task: Some(task),
             child_aborts,
         })
+    }
+}
+
+async fn stop_api(
+    task: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    logs: &doradus_runtime::RuntimeLog,
+) -> std::io::Result<()> {
+    match tokio::time::timeout(SHUTDOWN_CHILD_TIMEOUT, &mut *task).await {
+        Ok(result) => {
+            result.map_err(|error| std::io::Error::other(format!("HTTP API task: {error}")))?
+        }
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            logs.warn(format!(
+                "HTTP API graceful shutdown exceeded {:?}; task aborted",
+                SHUTDOWN_CHILD_TIMEOUT
+            ));
+            Ok(())
+        }
     }
 }

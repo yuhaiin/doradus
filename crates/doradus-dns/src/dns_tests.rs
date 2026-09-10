@@ -351,7 +351,7 @@ fn raw_dns_cache_has_the_same_lru_promotion_behavior() {
             packet(2, &second, Ipv4Addr::new(192, 0, 2, 2)),
         )
         .unwrap();
-    assert!(cache.get_raw_optimistic(&first, 1).unwrap().is_some());
+    assert!(cache.get_raw_with_stale(&first, 1, true).unwrap().is_some());
     cache
         .insert_raw(
             third.clone(),
@@ -359,9 +359,290 @@ fn raw_dns_cache_has_the_same_lru_promotion_behavior() {
             packet(3, &third, Ipv4Addr::new(192, 0, 2, 3)),
         )
         .unwrap();
-    assert!(cache.get_raw_optimistic(&first, 1).unwrap().is_some());
-    assert!(cache.get_raw_optimistic(&second, 1).unwrap().is_none());
-    assert!(cache.get_raw_optimistic(&third, 1).unwrap().is_some());
+    assert!(cache.get_raw_with_stale(&first, 1, true).unwrap().is_some());
+    assert!(
+        cache
+            .get_raw_with_stale(&second, 1, true)
+            .unwrap()
+            .is_none()
+    );
+    assert!(cache.get_raw_with_stale(&third, 1, true).unwrap().is_some());
+}
+
+#[test]
+fn raw_dns_cache_uses_all_answer_ttls_and_ages_cached_records() {
+    let cache = DnsCache::new(2).unwrap();
+    let domain = DomainName::new("ttl.example").unwrap();
+    let query = encode_query(1, &domain, DnsRecordType::A).unwrap();
+    let request = Message::from_vec(&query).unwrap();
+    let mut response = Message::response(request.metadata.id, request.metadata.op_code);
+    response.add_query(request.queries[0].clone());
+    response.add_answer(hickory_proto::rr::Record::from_rdata(
+        request.queries[0].name().clone(),
+        5,
+        RData::A(Ipv4Addr::new(192, 0, 2, 1).into()),
+    ));
+    response.add_answer(hickory_proto::rr::Record::from_rdata(
+        request.queries[0].name().clone(),
+        2,
+        RData::A(Ipv4Addr::new(192, 0, 2, 2).into()),
+    ));
+    let packet = response.to_vec().unwrap();
+    cache.insert_raw(domain.clone(), 1, packet).unwrap();
+
+    cache
+        .advance_raw_for_test(&domain, 1, Duration::from_secs(1))
+        .unwrap();
+    let (aged, stale) = cache.get_raw_with_stale(&domain, 1, true).unwrap().unwrap();
+    assert!(!stale);
+    let aged = Message::from_vec(&aged).unwrap();
+    assert_eq!(aged.answers[0].ttl, 4);
+    assert_eq!(aged.answers[1].ttl, 1);
+
+    cache
+        .advance_raw_for_test(&domain, 1, Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        cache
+            .get_raw_with_stale(&domain, 1, false)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn raw_dns_cache_uses_soa_for_negative_answers_and_drops_expired_entries() {
+    let cache = DnsCache::new(2).unwrap();
+    let domain = DomainName::new("missing.example").unwrap();
+    let query = encode_query(2, &domain, DnsRecordType::A).unwrap();
+    let request = Message::from_vec(&query).unwrap();
+    let mut response = Message::error_msg(
+        request.metadata.id,
+        request.metadata.op_code,
+        hickory_proto::op::ResponseCode::NXDomain,
+    );
+    response.add_query(request.queries[0].clone());
+    response.add_authority(hickory_proto::rr::Record::from_rdata(
+        Name::from_utf8("example.").unwrap(),
+        5,
+        RData::SOA(hickory_proto::rr::rdata::SOA::new(
+            Name::from_utf8("ns.example.").unwrap(),
+            Name::from_utf8("hostmaster.example.").unwrap(),
+            1,
+            60,
+            60,
+            60,
+            2,
+        )),
+    ));
+    cache
+        .insert_raw(domain.clone(), 1, response.to_vec().unwrap())
+        .unwrap();
+
+    cache
+        .advance_raw_for_test(&domain, 1, Duration::from_secs(1))
+        .unwrap();
+    let (aged, stale) = cache.get_raw_with_stale(&domain, 1, true).unwrap().unwrap();
+    assert!(!stale);
+    let aged = Message::from_vec(&aged).unwrap();
+    assert_eq!(aged.authorities[0].ttl, 1);
+
+    cache
+        .advance_raw_for_test(&domain, 1, Duration::from_secs(1))
+        .unwrap();
+    let (expired, stale) = cache.get_raw_with_stale(&domain, 1, true).unwrap().unwrap();
+    assert!(stale);
+    let expired = Message::from_vec(&expired).unwrap();
+    assert_eq!(expired.authorities[0].ttl, 0);
+    assert!(
+        cache
+            .get_raw_with_stale(&domain, 1, false)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn raw_dns_cache_limits_cname_with_nodata_authority_to_negative_ttl() {
+    let cache = DnsCache::new(2).unwrap();
+    let domain = DomainName::new("alias.example").unwrap();
+    let query = encode_query(5, &domain, DnsRecordType::A).unwrap();
+    let request = Message::from_vec(&query).unwrap();
+    let mut response = Message::response(request.metadata.id, request.metadata.op_code);
+    response.add_query(request.queries[0].clone());
+    response.add_answer(hickory_proto::rr::Record::from_rdata(
+        request.queries[0].name().clone(),
+        30,
+        RData::CNAME(hickory_proto::rr::rdata::CNAME(
+            Name::from_utf8("target.example.").unwrap(),
+        )),
+    ));
+    response.add_authority(hickory_proto::rr::Record::from_rdata(
+        Name::from_utf8("target.example.").unwrap(),
+        20,
+        RData::SOA(hickory_proto::rr::rdata::SOA::new(
+            Name::from_utf8("ns.example.").unwrap(),
+            Name::from_utf8("hostmaster.example.").unwrap(),
+            1,
+            60,
+            60,
+            60,
+            5,
+        )),
+    ));
+    cache
+        .insert_raw(domain.clone(), 1, response.to_vec().unwrap())
+        .unwrap();
+
+    cache
+        .advance_raw_for_test(&domain, 1, Duration::from_secs(4))
+        .unwrap();
+    let (aged, stale) = cache.get_raw_with_stale(&domain, 1, true).unwrap().unwrap();
+    assert!(!stale);
+    let aged = Message::from_vec(&aged).unwrap();
+    assert_eq!(aged.answers[0].ttl, 26);
+    assert_eq!(aged.authorities[0].ttl, 1);
+
+    cache
+        .advance_raw_for_test(&domain, 1, Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        cache
+            .get_raw_with_stale(&domain, 1, false)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn raw_dns_cache_limits_nxdomain_cname_to_the_shortest_answer_ttl() {
+    let cache = DnsCache::new(2).unwrap();
+    let domain = DomainName::new("missing-alias.example").unwrap();
+    let query = encode_query(6, &domain, DnsRecordType::A).unwrap();
+    let request = Message::from_vec(&query).unwrap();
+    let mut response = Message::error_msg(
+        request.metadata.id,
+        request.metadata.op_code,
+        hickory_proto::op::ResponseCode::NXDomain,
+    );
+    response.add_query(request.queries[0].clone());
+    response.add_answer(hickory_proto::rr::Record::from_rdata(
+        request.queries[0].name().clone(),
+        3,
+        RData::CNAME(hickory_proto::rr::rdata::CNAME(
+            Name::from_utf8("target.example.").unwrap(),
+        )),
+    ));
+    response.add_authority(hickory_proto::rr::Record::from_rdata(
+        Name::from_utf8("example.").unwrap(),
+        20,
+        RData::SOA(hickory_proto::rr::rdata::SOA::new(
+            Name::from_utf8("ns.example.").unwrap(),
+            Name::from_utf8("hostmaster.example.").unwrap(),
+            1,
+            60,
+            60,
+            60,
+            10,
+        )),
+    ));
+    cache
+        .insert_raw(domain.clone(), 1, response.to_vec().unwrap())
+        .unwrap();
+
+    cache
+        .advance_raw_for_test(&domain, 1, Duration::from_secs(2))
+        .unwrap();
+    let (aged, stale) = cache.get_raw_with_stale(&domain, 1, true).unwrap().unwrap();
+    assert!(!stale);
+    let aged = Message::from_vec(&aged).unwrap();
+    assert_eq!(aged.answers[0].ttl, 1);
+    assert_eq!(aged.authorities[0].ttl, 8);
+
+    cache
+        .advance_raw_for_test(&domain, 1, Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        cache
+            .get_raw_with_stale(&domain, 1, false)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn raw_dns_cache_does_not_cache_transient_errors_or_truncated_responses() {
+    let cache = DnsCache::new(2).unwrap();
+    let domain = DomainName::new("error.example").unwrap();
+    let query = encode_query(3, &domain, DnsRecordType::A).unwrap();
+    let request = Message::from_vec(&query).unwrap();
+
+    for response_code in [
+        hickory_proto::op::ResponseCode::ServFail,
+        hickory_proto::op::ResponseCode::Refused,
+    ] {
+        let mut response =
+            Message::error_msg(request.metadata.id, request.metadata.op_code, response_code);
+        response.add_query(request.queries[0].clone());
+        cache
+            .insert_raw(domain.clone(), 1, response.to_vec().unwrap())
+            .unwrap();
+        assert!(
+            cache
+                .get_raw_with_stale(&domain, 1, true)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    let mut truncated = Message::response(request.metadata.id, request.metadata.op_code);
+    truncated.metadata.truncation = true;
+    truncated.add_query(request.queries[0].clone());
+    truncated.add_answer(hickory_proto::rr::Record::from_rdata(
+        request.queries[0].name().clone(),
+        60,
+        RData::A(Ipv4Addr::new(192, 0, 2, 3).into()),
+    ));
+    cache
+        .insert_raw(domain.clone(), 1, truncated.to_vec().unwrap())
+        .unwrap();
+    assert!(
+        cache
+            .get_raw_with_stale(&domain, 1, true)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn raw_dns_cache_ttl_zero_replaces_an_existing_entry() {
+    let cache = DnsCache::new(2).unwrap();
+    let domain = DomainName::new("zero.example").unwrap();
+    let query = encode_query(4, &domain, DnsRecordType::A).unwrap();
+    let request = Message::from_vec(&query).unwrap();
+    let response = |ttl: u32, address: Ipv4Addr| {
+        let mut response = Message::response(request.metadata.id, request.metadata.op_code);
+        response.add_query(request.queries[0].clone());
+        response.add_answer(hickory_proto::rr::Record::from_rdata(
+            request.queries[0].name().clone(),
+            ttl,
+            RData::A(address.into()),
+        ));
+        response.to_vec().unwrap()
+    };
+
+    cache
+        .insert_raw(domain.clone(), 1, response(60, Ipv4Addr::new(192, 0, 2, 4)))
+        .unwrap();
+    cache
+        .insert_raw(domain.clone(), 1, response(0, Ipv4Addr::new(192, 0, 2, 5)))
+        .unwrap();
+    assert!(
+        cache
+            .get_raw_with_stale(&domain, 1, true)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

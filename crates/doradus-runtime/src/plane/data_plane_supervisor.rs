@@ -111,6 +111,10 @@ pub async fn run_dns_supervisor(
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     loop {
+        // Subscribe before reading configuration or binding either transport.
+        // Both listeners must observe changes published during their setup.
+        let mut udp_reload = controller.subscribe_dns_reload();
+        let mut tcp_reload = controller.subscribe_dns_reload();
         // A reload and process shutdown can become ready at the same time.
         // Do not start another bind cycle after shutdown has already won.
         if *shutdown.borrow() {
@@ -118,7 +122,7 @@ pub async fn run_dns_supervisor(
         }
         let server = configured_dns_server(controller.store()).await?;
         let Some(server) = server else {
-            if wait_for_shutdown_or_dns_reload(&controller, shutdown.clone()).await {
+            if wait_for_dns_reload(&mut udp_reload, shutdown.clone()).await {
                 return Ok(());
             }
             continue;
@@ -162,20 +166,18 @@ pub async fn run_dns_supervisor(
                 }
             };
         if udp.is_none() && tcp.is_none() {
-            if wait_for_shutdown_or_dns_reload(&controller, shutdown.clone()).await {
+            if wait_for_dns_reload(&mut udp_reload, shutdown.clone()).await {
                 return Ok(());
             }
             continue;
         }
-        let udp_controller = controller.clone();
         let udp_shutdown_receiver = shutdown.clone();
         let udp_shutdown = async move {
-            let _ = wait_for_shutdown_or_dns_reload(&udp_controller, udp_shutdown_receiver).await;
+            let _ = wait_for_dns_reload(&mut udp_reload, udp_shutdown_receiver).await;
         };
-        let tcp_controller = controller.clone();
         let tcp_shutdown_receiver = shutdown.clone();
         let tcp_shutdown = async move {
-            let _ = wait_for_shutdown_or_dns_reload(&tcp_controller, tcp_shutdown_receiver).await;
+            let _ = wait_for_dns_reload(&mut tcp_reload, tcp_shutdown_receiver).await;
         };
         match (udp, tcp) {
             (Some(udp), Some(tcp)) => {
@@ -236,14 +238,13 @@ pub async fn wait_for_shutdown_or_reload(
     }
 }
 
-pub async fn wait_for_shutdown_or_dns_reload(
-    controller: &RuntimeController,
+async fn wait_for_dns_reload(
+    reload: &mut tokio::sync::broadcast::Receiver<()>,
     mut shutdown: watch::Receiver<bool>,
 ) -> bool {
     if *shutdown.borrow() {
         return true;
     }
-    let mut reload = controller.subscribe_dns_reload();
     tokio::select! {
         changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
         changed = reload.recv() => changed.is_err() && *shutdown.borrow(),
@@ -284,5 +285,28 @@ pub async fn wait_for_shutdown_or_matching_inbound_reload(
                 Err(_) => return *shutdown.borrow(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn both_dns_transports_observe_reload_published_during_setup() {
+        let (updates, mut udp) = tokio::sync::broadcast::channel(32);
+        let mut tcp = updates.subscribe();
+        let (_stop, shutdown) = watch::channel(false);
+        // Reading settings and binding can yield before either waiter runs.
+        updates.send(()).unwrap();
+        let (udp, tcp) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                wait_for_dns_reload(&mut udp, shutdown.clone()),
+                wait_for_dns_reload(&mut tcp, shutdown.clone())
+            )
+        })
+        .await
+        .expect("setup-time reload must reach both listeners");
+        assert!(!udp && !tcp);
     }
 }

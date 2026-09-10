@@ -46,6 +46,60 @@ impl SendAsyncDnsQuery for StaticQuery {
     }
 }
 
+struct ExpiringLocalQuery {
+    calls: Arc<AtomicUsize>,
+}
+
+impl AsyncDnsQuery for ExpiringLocalQuery {
+    fn query<'a>(
+        &'a self,
+        _domain: &'a DomainName,
+        _record_type: DnsRecordType,
+    ) -> LocalBoxFuture<'a, Result<DnsResponse>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(DnsResponse {
+                addresses: IpSet {
+                    v4: vec![Ipv4Addr::new(192, 0, 2, 80)],
+                    v6: Vec::new(),
+                },
+                ptr_names: Vec::new(),
+                service_bindings: Vec::new(),
+                minimum_ttl: Some(1),
+            })
+        })
+    }
+}
+
+struct RefreshingSendQuery {
+    calls: Arc<AtomicUsize>,
+    refreshed: Arc<Notify>,
+}
+
+impl SendAsyncDnsQuery for RefreshingSendQuery {
+    fn query_send<'a>(
+        &'a self,
+        _domain: &'a DomainName,
+        _record_type: DnsRecordType,
+    ) -> BoxFuture<'a, Result<DnsResponse>> {
+        Box::pin(async move {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call > 0 {
+                self.refreshed.notify_one();
+            }
+            Ok(DnsResponse {
+                addresses: IpSet {
+                    v4: vec![Ipv4Addr::new(192, 0, 2, if call == 0 { 81 } else { 82 })],
+                    v6: Vec::new(),
+                },
+                ptr_names: Vec::new(),
+                service_bindings: Vec::new(),
+                minimum_ttl: Some(if call == 0 { 1 } else { 60 }),
+            })
+        })
+    }
+}
+
 struct SlowQuery {
     calls: Arc<AtomicUsize>,
     started: Arc<Notify>,
@@ -172,6 +226,79 @@ fn async_resolver_caches_and_preserves_packet_transaction() {
         assert_eq!(first, second);
         assert_eq!(*calls.lock().unwrap(), 1);
     });
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_resolver_local_query_requeries_after_raw_cache_expiry() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver = AsyncDnsResolver::new(ExpiringLocalQuery {
+        calls: calls.clone(),
+    })
+    .with_cache(DnsCache::new(8).unwrap());
+    let domain = DomainName::new("expired-local.example").unwrap();
+
+    resolver.query(&domain, DnsRecordType::A).await.unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    resolver
+        .cache
+        .as_ref()
+        .unwrap()
+        .advance_raw_for_test(&domain, 1, std::time::Duration::from_secs(1))
+        .unwrap();
+    resolver.query(&domain, DnsRecordType::A).await.unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_resolver_send_query_serves_stale_then_refreshes_in_background() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let refreshed = Arc::new(Notify::new());
+    let resolver = Arc::new(
+        AsyncDnsResolver::new(RefreshingSendQuery {
+            calls: calls.clone(),
+            refreshed: refreshed.clone(),
+        })
+        .with_cache(DnsCache::new(8).unwrap()),
+    );
+    let domain = DomainName::new("stale-send.example").unwrap();
+
+    let first = <AsyncDnsResolver<RefreshingSendQuery> as AsyncIpResolver>::query(
+        &resolver,
+        &domain,
+        DnsRecordType::A,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.addresses.v4, vec![Ipv4Addr::new(192, 0, 2, 81)]);
+    resolver
+        .cache
+        .as_ref()
+        .unwrap()
+        .advance_raw_for_test(&domain, 1, std::time::Duration::from_secs(1))
+        .unwrap();
+
+    let stale = <AsyncDnsResolver<RefreshingSendQuery> as AsyncIpResolver>::query(
+        &resolver,
+        &domain,
+        DnsRecordType::A,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stale.addresses.v4, vec![Ipv4Addr::new(192, 0, 2, 81)]);
+    assert_eq!(stale.minimum_ttl, Some(0));
+    tokio::time::timeout(std::time::Duration::from_secs(1), refreshed.notified())
+        .await
+        .expect("stale cache entry was not refreshed");
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    let fresh = <AsyncDnsResolver<RefreshingSendQuery> as AsyncIpResolver>::query(
+        &resolver,
+        &domain,
+        DnsRecordType::A,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fresh.addresses.v4, vec![Ipv4Addr::new(192, 0, 2, 82)]);
 }
 
 #[tokio::test(flavor = "current_thread")]

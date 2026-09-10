@@ -33,8 +33,8 @@ use tokio::sync::{Mutex, mpsc};
 pub use codec::{
     DecodeError, EncodeError, EncodedDatagrams, FRAGMENT_HEADER_LEN, FRAGMENT_REASSEMBLY_TIMEOUT,
     FragmentReassembler, Frame, MAX_ASSOCIATION_ID, MAX_FRAGMENT_COUNT,
-    MAX_INCOMPLETE_BYTES_PER_ASSOCIATION, MAX_REASSEMBLED_PAYLOAD, decode_frame, encode_datagrams,
-    varint_len,
+    MAX_INCOMPLETE_BYTES_PER_ASSOCIATION, MAX_INCOMPLETE_MESSAGES_PER_ASSOCIATION,
+    MAX_REASSEMBLED_PAYLOAD, decode_frame, encode_datagrams, varint_len,
 };
 
 pub const ALPN: &[u8] = b"doradus-quic-v1";

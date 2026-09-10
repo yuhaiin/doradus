@@ -698,3 +698,44 @@ fn controller_can_install_packet_dns_handler_during_tun_assembly() {
     .unwrap();
     assert_eq!(runtime.task_len(), 0);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn inbound_supervisor_survives_a_burst_exceeding_reload_capacity() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let controller = RuntimeController::from_builder(RuntimeBuilder::new(
+                ConfigStore::open_memory().await.unwrap(),
+                Arc::new(SystemAsyncIpResolver),
+            ))
+            .await
+            .unwrap();
+            let (stop, shutdown) = tokio::sync::watch::channel(false);
+            let (ready, started) = tokio::sync::oneshot::channel();
+            let mut task = tokio::task::spawn_local(crate::inbound::run_until_with_selector_ready(
+                controller.clone(),
+                shutdown,
+                ready,
+            ));
+            started.await.unwrap();
+            // No yield: force a lagged receiver while the real supervisor is paused.
+            for id in 0..33 {
+                controller
+                    .inbound_reload_events
+                    .send(InboundReload::One(id.to_string()))
+                    .unwrap();
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut task)
+                    .await
+                    .is_err(),
+                "reload overflow stopped the inbound supervisor"
+            );
+            stop.send(true).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        })
+        .await;
+}

@@ -16,11 +16,13 @@
 //! its bounded memory budget is exceeded.
 
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::time::{Duration, Instant};
 
 pub const MAX_REASSEMBLED_PAYLOAD: usize = 128 * 1024;
 pub const MAX_FRAGMENT_COUNT: usize = 1024;
 pub const MAX_INCOMPLETE_BYTES_PER_ASSOCIATION: usize = 1024 * 1024;
+pub const MAX_INCOMPLETE_MESSAGES_PER_ASSOCIATION: usize = 256;
 pub const FRAGMENT_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(2);
 pub const FRAGMENT_HEADER_LEN: usize = 8;
 pub const MAX_ASSOCIATION_ID: u32 = (1 << 29) - 1;
@@ -272,6 +274,10 @@ impl FragmentReassembler {
         }
     }
 
+    /// Returns the estimated memory reserved by incomplete messages.
+    ///
+    /// This includes the fragment payloads, the partial message metadata, and
+    /// the slots reserved for every possible fragment.
     pub fn incomplete_bytes(&self) -> usize {
         self.incomplete_bytes
     }
@@ -292,36 +298,74 @@ impl FragmentReassembler {
         payload: &[u8],
         now: Instant,
     ) -> Option<Vec<u8>> {
-        let fragment_count_usize = usize::from(fragment_count);
-        let entry = self.messages.entry(key).or_insert_with(|| PartialMessage {
-            created_at: now,
-            fragment_count,
-            fragments: vec![None; fragment_count_usize],
-            received: 0,
-        });
-        if entry.fragment_count != fragment_count {
-            self.remove(&key);
-            return None;
-        }
-        if entry.fragments[usize::from(fragment_index)].is_some() {
-            return None;
-        }
-        let next_size = self.incomplete_bytes.saturating_add(payload.len());
-        if entry.received.saturating_add(payload.len()) > MAX_REASSEMBLED_PAYLOAD
-            || next_size > self.max_incomplete_bytes
+        if fragment_count < 2
+            || usize::from(fragment_count) > MAX_FRAGMENT_COUNT
+            || fragment_index >= fragment_count
+            || payload.is_empty()
+            || payload.len() > MAX_REASSEMBLED_PAYLOAD
         {
-            self.remove(&key);
             return None;
         }
-        entry.fragments[usize::from(fragment_index)] = Some(payload.to_vec());
-        entry.received += payload.len();
-        self.incomplete_bytes += payload.len();
-        if entry.received == 0 || entry.fragments.iter().any(Option::is_none) {
+
+        let fragment_count_usize = usize::from(fragment_count);
+        let fragment_index = usize::from(fragment_index);
+
+        if let Some(existing_fragment_count) =
+            self.messages.get(&key).map(|entry| entry.fragment_count)
+        {
+            if existing_fragment_count != fragment_count {
+                self.remove(&key);
+                return None;
+            }
+            if self.messages[&key].fragments[fragment_index].is_some() {
+                return None;
+            }
+
+            let received = self.messages[&key].received;
+            if received.saturating_add(payload.len()) > MAX_REASSEMBLED_PAYLOAD
+                || !self.budget_allows(payload.len())
+            {
+                self.remove(&key);
+                return None;
+            }
+
+            let entry = self.messages.get_mut(&key).unwrap();
+            entry.fragments[fragment_index] = Some(payload.to_vec());
+            entry.received += payload.len();
+            self.incomplete_bytes += payload.len();
+            if entry.received == 0 || entry.fragments.iter().any(Option::is_none) {
+                return None;
+            }
+        } else {
+            if self.messages.len() >= MAX_INCOMPLETE_MESSAGES_PER_ASSOCIATION {
+                return None;
+            }
+
+            let overhead = partial_message_overhead(fragment_count_usize);
+            let reservation = overhead.saturating_add(payload.len());
+            if !self.budget_allows(reservation) {
+                return None;
+            }
+
+            // Check the reservation before allocating the fragment slot
+            // vector or copying the attacker-controlled payload.
+            let mut entry = PartialMessage {
+                created_at: now,
+                fragment_count,
+                fragments: vec![None; fragment_count_usize],
+                received: payload.len(),
+            };
+            entry.fragments[fragment_index] = Some(payload.to_vec());
+            self.messages.insert(key, entry);
+            self.incomplete_bytes += reservation;
             return None;
         }
 
         let entry = self.messages.remove(&key).unwrap();
-        self.incomplete_bytes -= entry.received;
+        self.incomplete_bytes = self
+            .incomplete_bytes
+            .saturating_sub(partial_message_overhead(usize::from(entry.fragment_count)))
+            .saturating_sub(entry.received);
         let mut output = Vec::with_capacity(entry.received);
         for fragment in entry.fragments.into_iter().flatten() {
             output.extend_from_slice(&fragment);
@@ -346,14 +390,44 @@ impl FragmentReassembler {
 
     fn remove(&mut self, key: &(u32, u32)) {
         if let Some(message) = self.messages.remove(key) {
-            self.incomplete_bytes = self.incomplete_bytes.saturating_sub(message.received);
+            self.incomplete_bytes = self
+                .incomplete_bytes
+                .saturating_sub(partial_message_overhead(usize::from(
+                    message.fragment_count,
+                )))
+                .saturating_sub(message.received);
         }
     }
+
+    fn budget_allows(&self, additional: usize) -> bool {
+        self.incomplete_bytes <= self.max_incomplete_bytes
+            && additional <= self.max_incomplete_bytes - self.incomplete_bytes
+    }
+}
+
+fn partial_message_overhead(fragment_count: usize) -> usize {
+    size_of::<((u32, u32), PartialMessage)>()
+        .saturating_add(fragment_count.saturating_mul(size_of::<Option<Vec<u8>>>()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fragment_datagram(
+        message_id: u32,
+        fragment_index: u16,
+        fragment_count: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut datagram = Vec::with_capacity(1 + FRAGMENT_HEADER_LEN + payload.len());
+        datagram.push(3);
+        datagram.extend_from_slice(&message_id.to_be_bytes());
+        datagram.extend_from_slice(&fragment_index.to_be_bytes());
+        datagram.extend_from_slice(&fragment_count.to_be_bytes());
+        datagram.extend_from_slice(payload);
+        datagram
+    }
 
     #[test]
     fn single_frame_round_trips_with_compact_tag() {
@@ -393,11 +467,15 @@ mod tests {
         let mut reassembler = FragmentReassembler::new(Duration::from_secs(2), 1024);
         let now = Instant::now();
         let frame = decode_frame(&datagrams[0]).unwrap();
+        let fragment_count = match frame {
+            Frame::Fragment { fragment_count, .. } => usize::from(fragment_count),
+            Frame::Single { .. } => unreachable!(),
+        };
         assert!(reassembler.push(frame, now).is_none());
         assert!(reassembler.push(frame, now).is_none());
         assert_eq!(
             reassembler.incomplete_bytes(),
-            datagrams[0].len() - 1 - FRAGMENT_HEADER_LEN
+            partial_message_overhead(fragment_count) + datagrams[0].len() - 1 - FRAGMENT_HEADER_LEN
         );
     }
 
@@ -425,6 +503,39 @@ mod tests {
             decode_frame(&[3, 0, 0, 0, 0, 0, 1, 0, 0]),
             Err(DecodeError::InvalidFragmentCount)
         );
+    }
+
+    #[test]
+    fn directly_constructed_fragments_are_validated_before_reassembly() {
+        let mut reassembler = FragmentReassembler::new(Duration::from_secs(2), 1024);
+        let now = Instant::now();
+        for frame in [
+            Frame::Fragment {
+                association_id: 1,
+                message_id: 1,
+                fragment_index: 2,
+                fragment_count: 2,
+                payload: b"x",
+            },
+            Frame::Fragment {
+                association_id: 1,
+                message_id: 2,
+                fragment_index: 0,
+                fragment_count: 1,
+                payload: b"x",
+            },
+            Frame::Fragment {
+                association_id: 1,
+                message_id: 3,
+                fragment_index: 0,
+                fragment_count: 2,
+                payload: b"",
+            },
+        ] {
+            assert!(reassembler.push(frame, now).is_none());
+        }
+        assert!(reassembler.is_empty());
+        assert_eq!(reassembler.incomplete_bytes(), 0);
     }
 
     #[test]
@@ -505,5 +616,73 @@ mod tests {
         );
         assert_eq!(reassembler.len(), 0);
         assert_eq!(reassembler.incomplete_bytes(), 0);
+    }
+
+    #[test]
+    fn legal_max_fragment_count_is_budgeted_before_slot_allocation() {
+        let mut reassembler =
+            FragmentReassembler::new(Duration::from_secs(2), MAX_INCOMPLETE_BYTES_PER_ASSOCIATION);
+        let now = Instant::now();
+        for message_id in 0..1000 {
+            let datagram = fragment_datagram(message_id, 0, MAX_FRAGMENT_COUNT as u16, &[0xaa]);
+            let frame = decode_frame(&datagram).unwrap();
+            assert!(reassembler.push(frame, now).is_none());
+        }
+
+        assert!(reassembler.len() < 1000);
+        assert!(reassembler.len() <= MAX_INCOMPLETE_MESSAGES_PER_ASSOCIATION);
+        assert!(reassembler.incomplete_bytes() <= MAX_INCOMPLETE_BYTES_PER_ASSOCIATION);
+        assert!(reassembler.incomplete_bytes() > reassembler.len());
+    }
+
+    #[test]
+    fn incomplete_message_count_is_bounded_for_small_fragments() {
+        let mut reassembler = FragmentReassembler::new(Duration::from_secs(2), usize::MAX);
+        let now = Instant::now();
+        for message_id in 0..=MAX_INCOMPLETE_MESSAGES_PER_ASSOCIATION as u32 {
+            let datagram = fragment_datagram(message_id, 0, 2, &[0xaa]);
+            let frame = decode_frame(&datagram).unwrap();
+            assert!(reassembler.push(frame, now).is_none());
+        }
+
+        assert_eq!(reassembler.len(), MAX_INCOMPLETE_MESSAGES_PER_ASSOCIATION);
+        assert_eq!(
+            reassembler.incomplete_bytes(),
+            MAX_INCOMPLETE_MESSAGES_PER_ASSOCIATION * (partial_message_overhead(2) + 1)
+        );
+    }
+
+    #[test]
+    fn over_budget_message_is_reclaimed_before_accepting_another() {
+        let budget = partial_message_overhead(2) + 1;
+        let mut reassembler = FragmentReassembler::new(Duration::from_secs(2), budget);
+        let now = Instant::now();
+
+        let first = fragment_datagram(1, 0, 2, &[0xaa]);
+        assert!(
+            reassembler
+                .push(decode_frame(&first).unwrap(), now)
+                .is_none()
+        );
+        assert_eq!(reassembler.len(), 1);
+        assert_eq!(reassembler.incomplete_bytes(), budget);
+
+        let second = fragment_datagram(1, 1, 2, &[0xbb]);
+        assert!(
+            reassembler
+                .push(decode_frame(&second).unwrap(), now)
+                .is_none()
+        );
+        assert!(reassembler.is_empty());
+        assert_eq!(reassembler.incomplete_bytes(), 0);
+
+        let replacement = fragment_datagram(2, 0, 2, &[0xcc]);
+        assert!(
+            reassembler
+                .push(decode_frame(&replacement).unwrap(), now)
+                .is_none()
+        );
+        assert_eq!(reassembler.len(), 1);
+        assert_eq!(reassembler.incomplete_bytes(), budget);
     }
 }

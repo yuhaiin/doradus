@@ -1,5 +1,7 @@
 //! Snapshot loading and replacement for the Go-compatible statistics projection.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,7 +9,49 @@ use super::*;
 use crate::schema::table_has_column;
 use crate::sqlite::Connection;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_TELEMETRY_SCHEMA_PROBE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
 pub(super) fn load(connection: &Connection) -> Result<GoStatisticsSnapshot> {
+    // Schema probes and SELECTs must use one snapshot. A writer may convert
+    // the legacy telemetry tables between two otherwise independent reads.
+    connection
+        .execute("BEGIN DEFERRED")
+        .map_err(storage_error)?;
+    let result = load_snapshot(connection);
+    match result {
+        Ok(snapshot) => match connection.execute("COMMIT") {
+            Ok(_) => Ok(snapshot),
+            Err(error) => {
+                let _ = connection.execute("ROLLBACK");
+                Err(storage_error(error))
+            }
+        },
+        Err(error) => {
+            let _ = connection.execute("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_test_telemetry_schema_probe(hook: impl FnOnce() + 'static) {
+    TEST_TELEMETRY_SCHEMA_PROBE.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_test_telemetry_schema_probe() {
+    let hook = TEST_TELEMETRY_SCHEMA_PROBE.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+fn load_snapshot(connection: &Connection) -> Result<GoStatisticsSnapshot> {
     let mut snapshot = GoStatisticsSnapshot::default();
 
     if table_exists(connection, "statistics_kv") {
@@ -102,7 +146,10 @@ fn load_telemetry(
     connection: &Connection,
     output: &mut Vec<GoTelemetryBucketRecord>,
 ) -> Result<()> {
-    if !table_exists(connection, "telemetry_dimension_values") {
+    let compact_telemetry = table_exists(connection, "telemetry_dimension_values");
+    #[cfg(test)]
+    run_test_telemetry_schema_probe();
+    if !compact_telemetry {
         return load_legacy_telemetry(connection, output);
     }
     let mut merged = BTreeMap::<(i64, i64, String, String), (u64, u64, u64)>::new();

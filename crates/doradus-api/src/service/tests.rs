@@ -17,7 +17,7 @@ fn test_database() -> PathBuf {
 }
 
 fn remove_database(path: &std::path::Path) {
-    for suffix in ["", "-wal", "-shm"] {
+    for suffix in ["", "-wal", "-shm", "-doradus-write-lock"] {
         let mut candidate = path.as_os_str().to_os_string();
         candidate.push(suffix);
         let _ = std::fs::remove_file(candidate);
@@ -80,6 +80,39 @@ async fn shutdown_aborts_a_half_open_http_connection() {
                 .await
                 .expect("shutdown must not wait for a half-open HTTP connection")
                 .unwrap();
+            remove_database(&database);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn inbound_supervisor_failure_stops_service_and_reports_error() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let database = test_database();
+            let service = RuntimeService::start(ServiceOptions::new(
+                database.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let abort = service.child_aborts.lock().unwrap().get(2).cloned();
+                    if let Some(abort) = abort {
+                        abort.abort();
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("service children did not start");
+            let error = tokio::time::timeout(Duration::from_secs(8), service.wait())
+                .await
+                .expect("service ignored inbound supervisor failure")
+                .expect_err("inbound failure must reach service caller");
+            assert!(error.to_string().contains("inbound supervisor"), "{error}");
             remove_database(&database);
         })
         .await;

@@ -134,6 +134,17 @@ impl<Q> AsyncDnsResolver<Q> {
         }
     }
 
+    fn cached_packet(
+        &self,
+        domain: &DomainName,
+        record_type: u16,
+        allow_stale: bool,
+    ) -> Result<Option<(Vec<u8>, bool)>> {
+        self.cache.as_ref().map_or(Ok(None), |cache| {
+            cache.get_raw_with_stale(domain, record_type, allow_stale)
+        })
+    }
+
     fn start_refresh(&self, domain: DomainName, record_type: u16)
     where
         Q: SendAsyncDnsQuery + 'static,
@@ -185,15 +196,9 @@ impl<Q: AsyncDnsQuery> AsyncDnsResolver<Q> {
             let (domain, record_type) = crate::dns::decode_raw_query_key(packet)?;
             let key = (domain.clone(), record_type);
             loop {
-                if let Some(cache) = &self.cache
-                    && let Some((response, expired)) =
-                        cache.get_raw_optimistic(&domain, record_type)?
+                if let Some((response, _expired)) =
+                    self.cached_packet(&domain, record_type, false)?
                 {
-                    // The local-future variant is used by embedders that do
-                    // not guarantee a Tokio Send task. It still returns stale
-                    // data immediately; the Send variant below also starts
-                    // Go-compatible background refresh.
-                    let _ = expired;
                     return crate::dns::rewrite_dns_response_for_query(response, packet);
                 }
 
@@ -289,10 +294,7 @@ impl<Q: SendAsyncDnsQuery + 'static> AsyncDnsResolver<Q> {
             let (domain, record_type) = crate::dns::decode_raw_query_key(packet)?;
             let key = (domain.clone(), record_type);
             loop {
-                if let Some(cache) = &self.cache
-                    && let Some((response, expired)) =
-                        cache.get_raw_optimistic(&domain, record_type)?
-                {
+                if let Some((response, expired)) = self.cached_packet(&domain, record_type, true)? {
                     if expired {
                         self.start_refresh(domain.clone(), record_type);
                     }

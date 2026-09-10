@@ -1,10 +1,36 @@
 //! Go-compatible statistics projection tests.
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::schema::table_has_column;
 
 use super::*;
+
+fn statistics_test_database_path() -> PathBuf {
+    let cache = std::env::var_os("DORADUS_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".cache"));
+    let directory = cache.join("doradus-statistics-tests");
+    fs::create_dir_all(&directory).unwrap();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    directory.join(format!("snapshot-{nonce}.db"))
+}
+
+fn remove_statistics_database_artifacts(path: &Path) {
+    for suffix in ["", "-journal", "-wal", "-shm", "-doradus-write-lock"] {
+        let target = if suffix.is_empty() {
+            path.to_path_buf()
+        } else {
+            PathBuf::from(format!("{}{}", path.display(), suffix))
+        };
+        let _ = fs::remove_file(target);
+    }
+}
 
 #[tokio::test]
 async fn go_statistics_round_trip_creates_compatible_projection() {
@@ -289,6 +315,114 @@ async fn missing_go_statistics_tables_are_an_empty_snapshot() {
         store.load_go_statistics().unwrap(),
         GoStatisticsSnapshot::default()
     );
+}
+
+#[tokio::test]
+async fn failed_go_statistics_read_rolls_back_before_schema_repair() {
+    let store = ConfigStore::open_memory().await.unwrap();
+    {
+        let connection = store.lock_connection().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE telemetry_dimension_values (
+                     id INTEGER PRIMARY KEY,
+                     value TEXT NOT NULL
+                 );
+                 CREATE TABLE traffic_dimension_hourly (
+                     bucket_start_utc INTEGER NOT NULL,
+                     value_id INTEGER NOT NULL,
+                     upload_bytes INTEGER NOT NULL,
+                     download_bytes INTEGER NOT NULL,
+                     PRIMARY KEY (bucket_start_utc, value_id)
+                 );",
+            )
+            .unwrap();
+    }
+
+    assert!(store.load_go_statistics().is_err());
+
+    {
+        let connection = store.lock_connection().unwrap();
+        connection
+            .execute("ALTER TABLE telemetry_dimension_values ADD COLUMN dimension TEXT")
+            .unwrap();
+    }
+    assert_eq!(
+        store.load_go_statistics().unwrap(),
+        GoStatisticsSnapshot::default()
+    );
+}
+
+#[tokio::test]
+async fn go_statistics_reader_keeps_one_schema_snapshot_during_compaction() {
+    let path = statistics_test_database_path();
+    let writer = ConfigStore::open(&path).await.unwrap();
+    let reader = ConfigStore::open(&path).await.unwrap();
+    {
+        let connection = writer.lock_connection().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE traffic_dimension_hourly (
+                     bucket_start_utc INTEGER NOT NULL,
+                     dimension TEXT NOT NULL,
+                     value TEXT NOT NULL,
+                     upload_bytes INTEGER NOT NULL DEFAULT 0,
+                     download_bytes INTEGER NOT NULL DEFAULT 0,
+                     updated_at INTEGER NOT NULL,
+                     PRIMARY KEY (bucket_start_utc, dimension, value)
+                 );
+                 CREATE TABLE failure_dimension_hourly (
+                     bucket_start_utc INTEGER NOT NULL,
+                     dimension TEXT NOT NULL,
+                     value TEXT NOT NULL,
+                     failed_count INTEGER NOT NULL DEFAULT 0,
+                     updated_at INTEGER NOT NULL,
+                     PRIMARY KEY (bucket_start_utc, dimension, value)
+                 );
+                 INSERT INTO traffic_dimension_hourly
+                     VALUES (1, 'protocol', 'tcp', 7, 11, 1);",
+            )
+            .unwrap();
+    }
+
+    let reader_for_thread = reader.clone();
+    let (probe_sender, probe_receiver) = std::sync::mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+    let reader_thread = std::thread::spawn(move || {
+        let connection = reader_for_thread.lock_connection().unwrap();
+        super::statistics_projection::install_test_telemetry_schema_probe(move || {
+            probe_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+        });
+        super::statistics_projection::load(&connection)
+    });
+    probe_receiver.recv().unwrap();
+
+    writer
+        .replace_go_statistics(&GoStatisticsSnapshot {
+            telemetry: vec![GoTelemetryBucketRecord {
+                bucket: 1_700_000_000,
+                span_seconds: TELEMETRY_HOURLY_BUCKET_SECONDS,
+                dimension: "protocol".to_owned(),
+                value: "udp".to_owned(),
+                download: 13,
+                upload: 17,
+                failures: 0,
+            }],
+            ..GoStatisticsSnapshot::default()
+        })
+        .unwrap();
+    release_sender.send(()).unwrap();
+
+    let observed = reader_thread.join().unwrap().unwrap();
+    assert_eq!(observed.telemetry.len(), 1);
+    assert_eq!(observed.telemetry[0].value, "tcp");
+    assert_eq!(observed.telemetry[0].download, 11);
+
+    let current = reader.load_go_statistics().unwrap();
+    assert_eq!(current.telemetry.len(), 1);
+    assert_eq!(current.telemetry[0].value, "udp");
+    remove_statistics_database_artifacts(&path);
 }
 
 #[tokio::test]

@@ -51,7 +51,7 @@ pub(crate) use dns::{ReloadableAsyncDnsHandler, inbound_dns_handler};
 use supervisor::configured_dns_server;
 #[allow(unused_imports)]
 pub use supervisor::{
-    run_dns_supervisor, wait_for_shutdown_or_dns_reload, wait_for_shutdown_or_inbound_reload,
+    run_dns_supervisor, wait_for_shutdown_or_inbound_reload,
     wait_for_shutdown_or_matching_inbound_reload, wait_for_shutdown_or_reload,
 };
 #[cfg(feature = "tun")]

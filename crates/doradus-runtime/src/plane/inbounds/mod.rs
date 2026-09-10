@@ -348,8 +348,8 @@ async fn run_until_inner(
                         break;
                     }
                 }
-                changed = reload.recv() => {
-                    let Ok(event) = changed else { break; };
+                changed = next_inbound_reload(&mut reload) => {
+                    let Some(event) = changed else { break; };
                     match event {
                         crate::controller::InboundReload::All => {
                             // A single API operation can publish several
@@ -400,6 +400,43 @@ async fn run_until_inner(
     abort_inbounds(&mut listeners, &controller.inbound_runtime()).await;
 
     result
+}
+
+// A lagged receiver has lost owner identities, so reconcile every owner from
+// the current store. Lag is not a request to stop serving traffic.
+async fn next_inbound_reload(
+    reload: &mut tokio::sync::broadcast::Receiver<crate::controller::InboundReload>,
+) -> Option<crate::controller::InboundReload> {
+    match reload.recv().await {
+        Ok(event) => Some(event),
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            Some(crate::controller::InboundReload::All)
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reload_overflow_reconciles_all_inbounds_and_keeps_receiving() {
+        let (updates, mut reload) = tokio::sync::broadcast::channel(32);
+        for id in 0..33 {
+            updates
+                .send(crate::controller::InboundReload::One(id.to_string()))
+                .unwrap();
+        }
+        assert_eq!(
+            next_inbound_reload(&mut reload).await,
+            Some(crate::controller::InboundReload::All)
+        );
+        assert!(matches!(
+            next_inbound_reload(&mut reload).await,
+            Some(crate::controller::InboundReload::One(_))
+        ));
+    }
 }
 
 pub async fn selected_proxy_ids(controller: &RuntimeController) -> Result<(String, String)> {

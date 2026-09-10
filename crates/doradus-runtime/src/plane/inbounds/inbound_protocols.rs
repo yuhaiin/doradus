@@ -506,10 +506,7 @@ impl InboundProtocol for ProtocolHandler {
                         self.inbound.selector().udp_buffer_size(),
                         self.inbound.as_ref(),
                         move |server| async move {
-                            let codec = crate::inbound::adapters::vless::VlessUdpCodec {
-                                server,
-                                flow_key: None,
-                            };
+                            let codec = crate::inbound::adapters::vless::VlessUdpCodec { server };
                             InboundUdpSession::new(codec, udp_inbound).run().await
                         },
                     )
