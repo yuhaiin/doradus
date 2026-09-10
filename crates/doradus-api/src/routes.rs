@@ -4,11 +4,17 @@ use axum::routing::{get, post, put};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
+const FAVICON_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/icon.svg"
+));
+
 pub(super) fn build(state: ApiState) -> Router {
     let auth = state.auth.clone();
     let web_root = state.web_root.clone();
     let router = Router::new()
         .route("/health", get(health))
+        .route("/favicon.svg", get(favicon))
         .route("/metrics", get(metrics))
         .route("/api/v2/info", get(info))
         .route("/api/v2/update/check", post(update_check))
@@ -156,6 +162,17 @@ pub(super) fn build(state: ApiState) -> Router {
     } else {
         router.fallback(embedded_web_fallback)
     }
+}
+
+async fn favicon() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("image/svg+xml"),
+        )],
+        FAVICON_SVG,
+    )
+        .into_response()
 }
 
 async fn embedded_web_fallback(uri: axum::http::Uri) -> Response {

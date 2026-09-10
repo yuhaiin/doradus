@@ -1,4 +1,12 @@
-# Doradus
+<p align="center">
+  <img src="assets/icon.svg" alt="Doradus" width="144" />
+</p>
+
+<h1 align="center">Doradus</h1>
+
+<p align="center">
+  A standalone Rust network proxy.
+</p>
 
 Doradus is a new, standalone Rust network proxy project. It is being developed
 from the original `yuhaiin-rust` codebase while establishing its own product

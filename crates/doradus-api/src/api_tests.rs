@@ -458,6 +458,30 @@ async fn external_web_root_serves_assets_and_react_fallback_without_hiding_api()
 }
 
 #[tokio::test]
+async fn favicon_serves_the_doradus_brand_asset() {
+    let response = router(state().await)
+        .oneshot(Request::get("/favicon.svg").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[axum::http::header::CONTENT_TYPE],
+        "image/svg+xml"
+    );
+    assert_eq!(
+        to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .as_ref(),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/icon.svg"
+        ))
+    );
+}
+
+#[tokio::test]
 async fn embedded_web_serves_assets_and_react_fallback_by_default() {
     let app = router(state().await);
     let index = app

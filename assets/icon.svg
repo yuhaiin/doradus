@@ -1,0 +1,94 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="route" x1="220" y1="180" x2="820" y2="820" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22D3EE"/>
+      <stop offset="0.48" stop-color="#3B82F6"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+
+    <linearGradient id="route2" x1="300" y1="250" x2="720" y2="710" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#38BDF8"/>
+      <stop offset="0.55" stop-color="#4F46E5"/>
+      <stop offset="1" stop-color="#C084FC"/>
+    </linearGradient>
+
+    <linearGradient id="nodeCyan" x1="240" y1="150" x2="340" y2="250" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#38BDF8"/>
+    </linearGradient>
+
+    <linearGradient id="nodeBlue" x1="290" y1="790" x2="390" y2="890" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#60A5FA"/>
+      <stop offset="1" stop-color="#2563EB"/>
+    </linearGradient>
+
+    <linearGradient id="nodeViolet" x1="790" y1="470" x2="870" y2="560" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A78BFA"/>
+      <stop offset="1" stop-color="#C084FC"/>
+    </linearGradient>
+
+    <radialGradient id="hub" cx="0" cy="0" r="1" gradientTransform="translate(520 520) rotate(90) scale(24)">
+      <stop stop-color="#F8FBFF"/>
+      <stop offset="0.55" stop-color="#C7D2FE"/>
+      <stop offset="1" stop-color="#C7D2FE" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- background -->
+  <rect x="24" y="24" width="976" height="976" rx="180" fill="#071733"/>
+
+  <!-- outer D-shaped routing mark -->
+  <path d="M278 187
+           H496
+           C687 187 828 321 828 512
+           C828 704 687 837 496 837
+           H331"
+        stroke="url(#route)" stroke-width="26"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <path d="M278 187
+           V470"
+        stroke="#2ECDF3" stroke-width="18"
+        stroke-linecap="round"/>
+
+  <!-- inner routes converging at center -->
+  <path d="M278 470
+           C292 388 366 334 446 348
+           C505 359 546 417 520 520"
+        stroke="url(#route2)" stroke-width="17"
+        stroke-linecap="round"/>
+
+  <path d="M278 470
+           C272 568 298 675 382 760
+           C411 790 438 813 472 837"
+        stroke="url(#route)" stroke-width="18"
+        stroke-linecap="round"/>
+
+  <path d="M278 200
+           C392 216 501 278 553 362
+           C585 413 563 468 520 520"
+        stroke="url(#route2)" stroke-width="15"
+        stroke-linecap="round"/>
+
+  <path d="M829 519
+           C773 580 704 620 638 606
+           C582 594 542 566 520 520"
+        stroke="url(#route2)" stroke-width="16"
+        stroke-linecap="round"/>
+
+  <!-- center hub -->
+  <circle cx="520" cy="520" r="10" fill="url(#hub)"/>
+
+  <!-- nodes -->
+  <circle cx="278" cy="187" r="54" fill="url(#nodeCyan)"/>
+  <circle cx="331" cy="837" r="56" fill="url(#nodeBlue)"/>
+  <circle cx="828" cy="512" r="54" fill="url(#nodeViolet)"/>
+
+  <circle cx="278" cy="470" r="34" fill="#38BDF8"/>
+  <circle cx="579" cy="349" r="24" fill="#60A5FA"/>
+  <circle cx="642" cy="612" r="20" fill="#A78BFA"/>
+  <circle cx="681" cy="784" r="22" fill="#C084FC"/>
+
+  <!-- small accent nodes -->
+  <circle cx="531" cy="330" r="8" fill="#BAE6FD" opacity="0.95"/>
+</svg>
