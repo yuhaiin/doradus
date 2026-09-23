@@ -190,6 +190,14 @@ fn service_info(options: &ServiceOptions, target: &Path) -> ServiceInfo {
         OsString::from("-path"),
         options.path.clone().into_os_string(),
     ]);
+    if options.auth_enabled() {
+        launch_arguments.extend([
+            OsString::from("--username"),
+            OsString::from(&options.username),
+            OsString::from("--password"),
+            OsString::from(&options.password),
+        ]);
+    }
     if options.nfs_mode {
         launch_arguments.push(OsString::from("-nfs-mode"));
     }
@@ -467,6 +475,8 @@ mod tests {
         let options = ServiceOptions {
             host: "127.0.0.1:58080".to_owned(),
             path: PathBuf::from(r"C:\ProgramData\doradus"),
+            username: String::new(),
+            password: String::new(),
             nfs_mode: true,
         };
         let info = service_info(&options, Path::new(TARGET_BIN));

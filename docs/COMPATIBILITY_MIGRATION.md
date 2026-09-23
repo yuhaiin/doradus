@@ -60,6 +60,10 @@ explicitly when integrating with a service manager:
   -path /var/lib/doradus
 ~~~
 
+To protect the HTTP management UI and API with Basic Auth, add
+`--username NAME --password PASSWORD` to the `install` command. The native
+service configuration retains these credentials and applies them on restart.
+
 Use the matching Doradus `health`, `start`, `stop`, and `restart` commands for
 that installation. Do not point those commands at an old service's state or
 unit directory.

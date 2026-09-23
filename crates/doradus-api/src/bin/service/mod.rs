@@ -28,6 +28,8 @@ use doradus_core::{Error, ErrorKind, Result};
 struct ServiceOptions {
     host: String,
     path: PathBuf,
+    username: String,
+    password: String,
     nfs_mode: bool,
 }
 
@@ -37,8 +39,17 @@ impl Default for ServiceOptions {
         Self {
             host: "0.0.0.0:58080".to_owned(),
             path: default_service_path(),
+            username: String::new(),
+            password: String::new(),
             nfs_mode: false,
         }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+impl ServiceOptions {
+    fn auth_enabled(&self) -> bool {
+        !self.username.is_empty() || !self.password.is_empty()
     }
 }
 
@@ -79,6 +90,12 @@ fn parse_options(args: &[OsString]) -> Result<ServiceOptions> {
             }
             "-path" | "--path" | "-p" => {
                 options.path = PathBuf::from(required_value(args, &mut index, &flag)?);
+            }
+            "--username" => {
+                options.username = required_value(args, &mut index, &flag)?;
+            }
+            "--password" => {
+                options.password = required_value(args, &mut index, &flag)?;
             }
             "-nfs-mode" | "--nfs-mode" => options.nfs_mode = true,
             other if other.starts_with('-') => {
@@ -352,6 +369,8 @@ mod tests {
             ServiceOptions {
                 host: "127.0.0.1:58080".to_owned(),
                 path: PathBuf::from("/var/lib/doradus"),
+                username: String::new(),
+                password: String::new(),
                 nfs_mode: true,
             }
         );

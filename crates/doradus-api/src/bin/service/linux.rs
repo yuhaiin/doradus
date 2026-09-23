@@ -64,7 +64,7 @@ fn install_inner(options: &ServiceOptions, executable: &Path, target: &Path) -> 
     write_atomic(
         Path::new(SERVICE_PATH),
         render_unit(options).as_bytes(),
-        0o644,
+        0o600,
     )?;
     command_output("systemctl", &["daemon-reload"])?;
     command_output("systemctl", &["enable", SERVICE_NAME])?;
@@ -218,7 +218,7 @@ fn restore_backup(backup: &Path, target: &Path, unit: &Path) -> Result<()> {
     let target_kind = manifest_kind(&manifest, "target")?;
     let unit_kind = manifest_kind(&manifest, "unit")?;
     restore_entry(target_kind, &backup.join("target"), target, 0o755)?;
-    restore_entry(unit_kind, &backup.join("unit"), unit, 0o644)
+    restore_entry(unit_kind, &backup.join("unit"), unit, 0o600)
 }
 
 fn manifest_kind<'a>(manifest: &'a str, key: &str) -> Result<&'a str> {
@@ -252,14 +252,43 @@ fn restore_entry(kind: &str, backup: &Path, destination: &Path, mode: u32) -> Re
 
 fn render_unit(options: &ServiceOptions) -> String {
     let nfs = if options.nfs_mode { " -nfs-mode" } else { "" };
+    let auth = if options.auth_enabled() {
+        format!(
+            " --username {} --password {}",
+            systemd_escape_exec_arg(&options.username),
+            systemd_escape_exec_arg(&options.password),
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "[Unit]\nDescription=doradus transparent proxy\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={} -host {} -path {}{}\nRestart=on-failure\nRestartSec=5\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=doradus transparent proxy\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={} -host {} -path {}{}{}\nRestart=on-failure\nRestartSec=5\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=multi-user.target\n",
         systemd_escape(&options.path.to_string_lossy()),
         systemd_escape(TARGET_BIN),
         systemd_escape(&options.host),
         systemd_escape(&options.path.to_string_lossy()),
-        nfs
+        nfs,
+        auth
     )
+}
+
+fn systemd_escape_exec_arg(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '$' => escaped.push_str("$$"),
+            '%' => escaped.push_str("%%"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character => escaped.push(character),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 fn systemd_escape(value: &str) -> String {
@@ -282,6 +311,8 @@ mod tests {
         let unit = render_unit(&ServiceOptions {
             host: "127.0.0.1:58080".to_owned(),
             path: PathBuf::from("/var/lib/doradus data"),
+            username: String::new(),
+            password: String::new(),
             nfs_mode: true,
         });
         assert!(unit.contains(
@@ -311,6 +342,8 @@ mod tests {
         let options = ServiceOptions {
             host: "127.0.0.1:58080".to_owned(),
             path: root.clone(),
+            username: String::new(),
+            password: String::new(),
             nfs_mode: false,
         };
         let backup = backup_current(&options, &target, &unit).unwrap();

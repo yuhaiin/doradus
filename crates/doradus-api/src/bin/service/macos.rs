@@ -463,6 +463,13 @@ fn render_plist(options: &ServiceOptions) -> String {
     if options.nfs_mode {
         arguments.push_str("        <string>-nfs-mode</string>\n");
     }
+    if options.auth_enabled() {
+        arguments.push_str(&format!(
+            "        <string>--username</string>\n        <string>{}</string>\n        <string>--password</string>\n        <string>{}</string>\n",
+            xml_escape(&options.username),
+            xml_escape(&options.password),
+        ));
+    }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>{SERVICE}</string>\n    <key>ProgramArguments</key>\n    <array>\n{arguments}    </array>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>KeepAlive</key>\n    <true/>\n    <key>UserName</key>\n    <string>root</string>\n    <key>StandardOutPath</key>\n    <string>/var/log/doradus.log</string>\n    <key>StandardErrorPath</key>\n    <string>/var/log/doradus.log</string>\n</dict>\n</plist>\n"
     )
@@ -486,6 +493,8 @@ mod tests {
         let plist = render_plist(&ServiceOptions {
             host: "127.0.0.1:58080".to_owned(),
             path: PathBuf::from("/Library/Application Support/doradus"),
+            username: String::new(),
+            password: String::new(),
             nfs_mode: true,
         });
         assert!(plist.contains("com.asutorufa.doradus"));
