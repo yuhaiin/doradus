@@ -1,11 +1,9 @@
 use super::*;
 pub async fn tags_get_value(state: &ApiState, input: &Value) -> ApiResult {
-    let values = state
-        .controller
-        .store()
-        .repository()
-        .list_go_node_tags()
-        .await?
+    let store = state.controller.store().clone();
+    let records =
+        store_blocking(store, |store| store.repository().list_go_node_tags_sync()).await?;
+    let values = records
         .into_iter()
         .map(|record| {
             let mut value = serde_json::from_slice::<Value>(&record.members_json)?;

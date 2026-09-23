@@ -1,22 +1,14 @@
 use super::*;
 pub async fn nodes_get_value(state: &ApiState, input: &Value) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_nodes()
-        .await?;
+    let store = state.controller.store().clone();
+    let records = store_blocking(store, |store| store.repository().list_go_nodes_sync()).await?;
     let values = records.into_iter().map(node_json).collect::<Vec<_>>();
     Ok(Json(page_with_filter(values, input, node_matches_query)))
 }
 
 pub async fn get_node_value(state: &ApiState, id: String) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_nodes()
-        .await?;
+    let store = state.controller.store().clone();
+    let records = store_blocking(store, |store| store.repository().list_go_nodes_sync()).await?;
     records
         .into_iter()
         .find(|record| record.id == id)
@@ -70,11 +62,8 @@ pub async fn save_node_value(state: &ApiState, value: Value, _index: Option<usiz
 }
 
 pub async fn delete_node_value(state: &ApiState, id: String) -> ApiResult {
-    if !state
-        .controller
-        .store()
-        .repository()
-        .list_go_nodes()
+    let store = state.controller.store().clone();
+    if !store_blocking(store, |store| store.repository().list_go_nodes_sync())
         .await?
         .iter()
         .any(|node| node.id == id)
@@ -123,12 +112,8 @@ pub async fn delete_node_value(state: &ApiState, id: String) -> ApiResult {
 }
 
 pub async fn selected_nodes_value(state: &ApiState) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_nodes()
-        .await?;
+    let store = state.controller.store().clone();
+    let records = store_blocking(store, |store| store.repository().list_go_nodes_sync()).await?;
     let tcp = selected_node_record(state, &records, SELECTED_TCP_NODE_KEY).await?;
     let udp = selected_node_record(state, &records, SELECTED_UDP_NODE_KEY).await?;
     let mut selection = Map::new();
@@ -142,32 +127,31 @@ pub async fn selected_nodes_value(state: &ApiState) -> ApiResult {
 }
 
 pub async fn selected_node_id(state: &ApiState, key: &str) -> Result<Option<String>, ApiError> {
-    let selected = state
-        .controller
-        .store()
-        .get_config(key)
+    let store = state.controller.store().clone();
+    let config_key = key.to_owned();
+    let selected = store_blocking(store, move |store| store.get_config_sync(&config_key))
         .await?
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned));
     if selected.is_some() || key == LEGACY_SELECTED_NODE_KEY {
         return Ok(selected);
     }
-    let legacy = state
-        .controller
-        .store()
-        .get_config(LEGACY_SELECTED_NODE_KEY)
-        .await?
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned));
+    let store = state.controller.store().clone();
+    let legacy = store_blocking(store, |store| {
+        store.get_config_sync(LEGACY_SELECTED_NODE_KEY)
+    })
+    .await?
+    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned));
     if legacy.is_some() {
         return Ok(legacy);
     }
-    Ok(state
-        .controller
-        .store()
-        .repository()
-        .get_go_selected_node_id(key)
-        .await?)
+    let store = state.controller.store().clone();
+    let config_key = key.to_owned();
+    Ok(store_blocking(store, move |store| {
+        store.repository().get_go_selected_node_id_sync(&config_key)
+    })
+    .await?)
 }
 
 pub async fn selected_node_record(
@@ -183,12 +167,8 @@ pub async fn selected_node_record(
 }
 
 pub async fn active_nodes_value(state: &ApiState) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_nodes()
-        .await?;
+    let store = state.controller.store().clone();
+    let records = store_blocking(store, |store| store.repository().list_go_nodes_sync()).await?;
     let active_ids = state.controller.active_proxy_ids();
     Ok(Json(
         json!({"items": records.into_iter().filter(|record| active_ids.binary_search(&record.id).is_ok()).map(node_json).collect::<Vec<_>>() }),
@@ -196,12 +176,8 @@ pub async fn active_nodes_value(state: &ApiState) -> ApiResult {
 }
 
 pub async fn select_node_value(state: &ApiState, id: String) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_nodes()
-        .await?;
+    let store = state.controller.store().clone();
+    let records = store_blocking(store, |store| store.repository().list_go_nodes_sync()).await?;
     if !records.iter().any(|record| record.id == id) {
         return Err(ApiError::not_found(format!("node {id:?} was not found")));
     }

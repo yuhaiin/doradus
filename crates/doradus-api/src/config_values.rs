@@ -1,6 +1,8 @@
 use super::*;
 pub async fn config_items(state: &ApiState, key: &str) -> Result<Vec<Value>, ApiError> {
-    let Some(bytes) = state.controller.store().get_config(key).await? else {
+    let store = state.controller.store().clone();
+    let key = key.to_owned();
+    let Some(bytes) = store_blocking(store, move |store| store.get_config_sync(&key)).await? else {
         return Ok(Vec::new());
     };
     let value = raw_json(&bytes, json!({"items": []}));
@@ -159,23 +161,16 @@ pub async fn route_lists_config_put_value(state: &ApiState, value: Value) -> Api
     Ok(Json(normalized))
 }
 
-pub async fn load_route_list_config_value(
-    state: &ApiState,
-) -> std::result::Result<Value, doradus_core::Error> {
-    let settings = state
-        .controller
-        .store()
-        .repository()
-        .list_go_settings_kv()
-        .await?;
+pub async fn load_route_list_config_value(state: &ApiState) -> Result<Value, doradus_core::Error> {
+    let store = state.controller.store().clone();
+    let settings =
+        store_blocking(store, |store| store.repository().list_go_settings_kv_sync()).await?;
     if let Some(value) = route_list_config_from_go_settings(&settings) {
         return Ok(value);
     }
-    Ok(state
-        .controller
-        .store()
-        .get_config("route.lists.config")
-        .await?
+    let store = state.controller.store().clone();
+    let config = store_blocking(store, |store| store.get_config_sync("route.lists.config")).await?;
+    Ok(config
         .map(|bytes| raw_json(&bytes, default_route_list_config()))
         .unwrap_or_else(default_route_list_config))
 }
@@ -263,10 +258,9 @@ pub fn json_u64_string(value: &Value, key: &str) -> String {
 }
 
 pub async fn read_config_json(state: &ApiState, key: &str, default: Value) -> ApiResult {
-    let value = state
-        .controller
-        .store()
-        .get_config(key)
+    let store = state.controller.store().clone();
+    let key = key.to_owned();
+    let value = store_blocking(store, move |store| store.get_config_sync(&key))
         .await?
         .map(|bytes| raw_json(&bytes, default.clone()))
         .unwrap_or(default);

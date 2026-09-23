@@ -79,14 +79,13 @@ pub async fn refresh_geo_database(
     if url.trim().is_empty() {
         return Ok(None);
     }
-    let current = state
-        .controller
-        .store()
-        .repository()
-        .list_maxmind_metadata()
-        .await?
-        .into_iter()
-        .next();
+    let store = state.controller.store().clone();
+    let current = store_blocking(store, |store| {
+        store.repository().list_maxmind_metadata_sync()
+    })
+    .await?
+    .into_iter()
+    .next();
     let path = current
         .as_ref()
         .map(|metadata| PathBuf::from(&metadata.path))
@@ -130,12 +129,9 @@ pub async fn route_lists_activation(State(state): State<ApiState>) -> ApiResult 
 
 pub async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
     let _refresh_guard = RouteListRefreshGuard::acquire(&state.route_list_refreshing)?;
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_route_lists()
-        .await?;
+    let store = state.controller.store().clone();
+    let records =
+        store_blocking(store, |store| store.repository().list_go_route_lists_sync()).await?;
     let timeout = Duration::from_secs(90);
     let proxy_id = doradus_runtime::inbound::selected_proxy_id(&state.controller).await?;
     let snapshot = state.controller.handle().load();
@@ -241,13 +237,13 @@ pub async fn route_lists_refresh_value(state: &ApiState) -> ApiResult {
 }
 
 pub async fn route_lists_activation_value(state: &ApiState) -> ApiResult {
-    let mut value = state
-        .controller
-        .store()
-        .get_config(ROUTE_LIST_ACTIVATION_KEY)
-        .await?
-        .map(|bytes| raw_json(&bytes, json!({"hostIndexRefreshAt": 0})))
-        .unwrap_or_else(|| json!({"hostIndexRefreshAt": 0}));
+    let store = state.controller.store().clone();
+    let mut value = store_blocking(store, |store| {
+        store.get_config_sync(ROUTE_LIST_ACTIVATION_KEY)
+    })
+    .await?
+    .map(|bytes| raw_json(&bytes, json!({"hostIndexRefreshAt": 0})))
+    .unwrap_or_else(|| json!({"hostIndexRefreshAt": 0}));
     let refresh_at = effective_activation_at(&value, "hostIndexRefreshAt");
     if let Some(object) = value.as_object_mut() {
         object.insert("hostIndexRefreshAt".to_owned(), json!(refresh_at));

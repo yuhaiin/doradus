@@ -10,13 +10,17 @@ pub async fn users_get_value(state: &ApiState, input: &Value) -> ApiResult {
         .or_else(|| input.get("pageSize"))
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
-    let query = input.get("query").and_then(Value::as_str);
-    let (items, total) = state
-        .controller
-        .store()
-        .repository()
-        .list_go_user_views(query, page, page_size)
-        .await?;
+    let query = input
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let store = state.controller.store().clone();
+    let (items, total) = store_blocking(store, move |store| {
+        store
+            .repository()
+            .list_go_user_views_sync(query.as_deref(), page, page_size)
+    })
+    .await?;
     json_value(json!({
         "items": items,
         "page": {"page": page, "pageSize": page_size, "total": total}
@@ -24,12 +28,12 @@ pub async fn users_get_value(state: &ApiState, input: &Value) -> ApiResult {
 }
 
 pub async fn user_get_value(state: &ApiState, id: String) -> ApiResult {
-    let user = state
-        .controller
-        .store()
-        .repository()
-        .get_go_user_view(&id)
-        .await?;
+    let lookup_id = id.clone();
+    let store = state.controller.store().clone();
+    let user = store_blocking(store, move |store| {
+        store.repository().get_go_user_view_sync(&lookup_id)
+    })
+    .await?;
     json_value(serde_json::to_value(user)?)
 }
 
@@ -65,12 +69,11 @@ pub async fn user_save_value(state: &ApiState, value: Value, id: Option<String>)
                 repository.save_go_user_sync(&user)
             })
             .await?;
-        let view = state
-            .controller
-            .store()
-            .repository()
-            .get_go_user_view(&id)
-            .await?;
+        let store = state.controller.store().clone();
+        let view = store_blocking(store, move |store| {
+            store.repository().get_go_user_view_sync(&id)
+        })
+        .await?;
         json_value(serde_json::to_value(view)?)
     } else {
         let write: GoUserWrite = serde_json::from_value(value)
@@ -83,12 +86,11 @@ pub async fn user_save_value(state: &ApiState, value: Value, id: Option<String>)
                 store.repository().save_go_user_sync(&record)
             })
             .await?;
-        let view = state
-            .controller
-            .store()
-            .repository()
-            .get_go_user_view(&id)
-            .await?;
+        let store = state.controller.store().clone();
+        let view = store_blocking(store, move |store| {
+            store.repository().get_go_user_view_sync(&id)
+        })
+        .await?;
         json_value(serde_json::to_value(view)?)
     }
 }

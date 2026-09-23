@@ -133,7 +133,7 @@ async fn go_shadowsocksr_client_round_trips_against_rust_wire_server() {
         let mut response_cipher =
             StreamCipher::new(CipherMethod::Aes256Ctr, &key, &response_iv, false).unwrap();
         let mut response = ProtocolState::new(ProtocolKind::AuthAes128Md5, &key, "");
-        response.sent_header = true;
+        response.mark_stream_header_sent();
         let mut frame = response.encode_stream(b"pong").unwrap();
         response_cipher.apply(&mut frame).unwrap();
         stream.write_all(&frame).await.unwrap();

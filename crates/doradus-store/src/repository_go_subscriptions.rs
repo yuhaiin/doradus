@@ -4,6 +4,10 @@ use super::*;
 
 impl ConfigRepository {
     pub async fn list_go_subscription_links(&self) -> Result<Vec<GoSubscriptionLinkRecord>> {
+        self.list_go_subscription_links_sync()
+    }
+
+    pub fn list_go_subscription_links_sync(&self) -> Result<Vec<GoSubscriptionLinkRecord>> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "subscriptions") {
             return Ok(Vec::new());
@@ -138,6 +142,10 @@ impl ConfigRepository {
     /// orders these rows by their primary-key name and leaves contract
     /// normalization to the decode boundary.
     pub async fn list_go_publishes(&self) -> Result<Vec<GoPublishRecord>> {
+        self.list_go_publishes_sync()
+    }
+
+    pub fn list_go_publishes_sync(&self) -> Result<Vec<GoPublishRecord>> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "publishes") {
             return Ok(Vec::new());
@@ -164,6 +172,10 @@ impl ConfigRepository {
     /// Upsert one Go publish contract without exposing SQLite to the API
     /// layer.  The caller supplies the already-normalized JSON contract.
     pub async fn put_go_publish(&self, record: &GoPublishRecord) -> Result<()> {
+        self.put_go_publish_sync(record)
+    }
+
+    pub fn put_go_publish_sync(&self, record: &GoPublishRecord) -> Result<()> {
         let name = record.name.trim().to_owned();
         if name.is_empty() {
             return Err(Error::invalid("publish name is empty"));
@@ -205,6 +217,10 @@ impl ConfigRepository {
     /// Delete one publish and report whether the Go row existed.  The HTTP
     /// layer maps `false` to Go's 404/not_found response.
     pub async fn delete_go_publish(&self, name: &str) -> Result<bool> {
+        self.delete_go_publish_sync(name)
+    }
+
+    pub fn delete_go_publish_sync(&self, name: &str) -> Result<bool> {
         let name = name.trim();
         if name.is_empty() {
             return Err(Error::invalid("publish name is empty"));

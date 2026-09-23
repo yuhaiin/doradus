@@ -285,6 +285,15 @@ impl ConfigRepository {
         page: usize,
         page_size: usize,
     ) -> Result<(Vec<GoUserView>, usize)> {
+        self.list_go_user_views_sync(query, page, page_size)
+    }
+
+    pub fn list_go_user_views_sync(
+        &self,
+        query: Option<&str>,
+        page: usize,
+        page_size: usize,
+    ) -> Result<(Vec<GoUserView>, usize)> {
         let records = self.list_go_user_records()?;
         let references = self.go_user_outbound_references()?;
         let query = query
@@ -333,7 +342,11 @@ impl ConfigRepository {
     }
 
     pub async fn get_go_user_view(&self, id: &str) -> Result<GoUserView> {
-        let record = self.get_go_user(id).await?;
+        self.get_go_user_view_sync(id)
+    }
+
+    pub fn get_go_user_view_sync(&self, id: &str) -> Result<GoUserView> {
+        let record = self.get_go_user_sync(id)?;
         let references = self.go_user_outbound_references()?;
         Ok(record.view(references.get(id).copied().unwrap_or_default()))
     }

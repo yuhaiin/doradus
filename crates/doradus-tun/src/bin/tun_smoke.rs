@@ -17,6 +17,13 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpVersion, Ipv4Packet};
 
 fn main() -> std::io::Result<()> {
+    if env::var_os("DORADUS_TUN_BENCH_SERVER").is_some() {
+        return run_proxy_throughput_server();
+    }
+    if env::var_os("DORADUS_TUN_BENCH_CLIENT").is_some() {
+        return run_proxy_throughput_client();
+    }
+
     let name = env::var("DORADUS_TUN_NAME").ok();
     let hold_ms = env::var("DORADUS_TUN_HOLD_MS")
         .ok()
@@ -49,7 +56,7 @@ fn main() -> std::io::Result<()> {
     let queue_capacity = env::var("DORADUS_TUN_QUEUE_CAPACITY")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(8);
+        .unwrap_or(doradus_tun::DEFAULT_QUEUE_CAPACITY);
     let mut runtime = TunRuntime::open(TunConfig {
         name,
         ipv4: ipv6
@@ -148,10 +155,6 @@ fn main() -> std::io::Result<()> {
     }
     if udp_proxy_echo {
         return run_udp_proxy_echo(runtime);
-    }
-    #[cfg(any())]
-    if env::var_os("DORADUS_TUN_DNS_ECHO").is_some() {
-        return run_dns_echo(runtime);
     }
     println!("tun-opened");
     println!(
@@ -344,9 +347,138 @@ fn read_process_usage() -> Option<ProcessReading> {
     })
 }
 
-fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
+fn run_proxy_throughput_server() -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let bytes = env::var("DORADUS_TUN_BENCH_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4 * 1024 * 1024)
+        .max(1);
+    let download =
+        env::var("DORADUS_TUN_BENCH_DIRECTION").is_ok_and(|direction| direction == "download");
+    let ready_file = env::var_os("DORADUS_TUN_BENCH_SERVER_READY")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| std::io::Error::other("benchmark server ready path is missing"))?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        std::fs::write(&ready_file, listener.local_addr()?.to_string())?;
+        let (mut stream, _) = listener.accept().await?;
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let chunk_len = remaining.min(buffer.len());
+            if download {
+                buffer[..chunk_len].fill(0x5a);
+                stream.write_all(&buffer[..chunk_len]).await?;
+                remaining -= chunk_len;
+            } else {
+                let length = stream.read(&mut buffer[..chunk_len]).await?;
+                if length == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "benchmark client closed before sending the payload",
+                    ));
+                }
+                stream.write_all(&buffer[..length]).await?;
+                remaining -= length;
+            }
+        }
+        Ok(())
+    })
+}
+
+fn run_proxy_throughput_client() -> std::io::Result<()> {
     use std::io::{Read, Write};
-    use std::sync::{Arc, mpsc};
+    use std::time::Instant;
+
+    let total_bytes = env::var("DORADUS_TUN_BENCH_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4 * 1024 * 1024)
+        .max(1);
+    let direction = env::var("DORADUS_TUN_BENCH_DIRECTION").unwrap_or_else(|_| "echo".to_owned());
+    let download = direction == "download";
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &"10.0.0.2:18080".parse().unwrap(),
+        Duration::from_secs(10),
+    )?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let started = Instant::now();
+    #[cfg(target_os = "linux")]
+    let mut usage = ProcessUsage::default();
+    let writer = if download {
+        None
+    } else {
+        let mut writer_stream = stream.try_clone()?;
+        writer_stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+        let payload = vec![0x5a; 64 * 1024];
+        Some(thread::spawn(move || -> std::io::Result<()> {
+            let mut sent = 0usize;
+            while sent < total_bytes {
+                let length = (total_bytes - sent).min(payload.len());
+                writer_stream.write_all(&payload[..length])?;
+                sent += length;
+            }
+            writer_stream.shutdown(std::net::Shutdown::Write)
+        }))
+    };
+    let mut received = 0usize;
+    let mut response = vec![0u8; 64 * 1024];
+    #[cfg(target_os = "linux")]
+    let mut next_usage_sample = Instant::now();
+    while received < total_bytes {
+        let length = stream.read(&mut response)?;
+        if length == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("TUN proxy closed after {received} of {total_bytes} bytes"),
+            ));
+        }
+        if response[..length].iter().any(|byte| *byte != 0x5a) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "TUN proxy throughput payload mismatch",
+            ));
+        }
+        received += length;
+        #[cfg(target_os = "linux")]
+        if Instant::now() >= next_usage_sample {
+            if let Some(reading) = read_process_usage() {
+                usage.peak_rss_kib = usage.peak_rss_kib.max(reading.rss_kib);
+                usage.samples = usage.samples.saturating_add(1);
+                usage.first_cpu_ticks.get_or_insert(reading.cpu_ticks);
+                usage.last_cpu_ticks = Some(reading.cpu_ticks);
+            }
+            next_usage_sample = Instant::now() + Duration::from_millis(10);
+        }
+    }
+    if let Some(writer) = writer {
+        writer
+            .join()
+            .map_err(|_| std::io::Error::other("TUN benchmark writer thread panicked"))??;
+    }
+    #[cfg(target_os = "linux")]
+    let (peak_rss_kib, cpu_ticks, proc_samples) =
+        (usage.peak_rss_kib, usage.cpu_ticks(), usage.samples);
+    #[cfg(not(target_os = "linux"))]
+    let (peak_rss_kib, cpu_ticks, proc_samples) = (0, 0, 0);
+    let elapsed = started.elapsed();
+    println!(
+        "BENCHMARK {{\"scenario\":\"tun-inbound-fixed-proxy-loopback-{direction}\",\"bytes\":{received},\"elapsed_ms\":{},\"mib_per_sec\":{},\"peak_rss_kib\":{peak_rss_kib},\"cpu_ticks\":{cpu_ticks},\"proc_samples\":{proc_samples}}}",
+        elapsed.as_secs_f64() * 1000.0,
+        (received as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64(),
+    );
+    Ok(())
+}
+
+fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use doradus_core::proxy::{AsyncProxy, StaticProxySelector};
@@ -358,103 +490,85 @@ fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(4 * 1024 * 1024)
         .max(1);
+    let direction = env::var("DORADUS_TUN_BENCH_DIRECTION").unwrap_or_else(|_| "echo".to_owned());
+    if !matches!(direction.as_str(), "echo" | "download") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "DORADUS_TUN_BENCH_DIRECTION must be echo or download",
+        ));
+    }
+    let ready_file = std::env::temp_dir().join(format!(
+        "doradus-tun-bench-server-{}.addr",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&ready_file);
+    let mut target_server = Command::new(std::env::current_exe()?)
+        .env("DORADUS_TUN_BENCH_SERVER", "1")
+        .env("DORADUS_TUN_BENCH_SERVER_READY", &ready_file)
+        .env("DORADUS_TUN_BENCH_DIRECTION", &direction)
+        .env("DORADUS_TUN_BENCH_BYTES", total_bytes.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let server_started = Instant::now();
+    let target_address = loop {
+        if let Ok(address) = std::fs::read_to_string(&ready_file)
+            && let Ok(address) = address.trim().parse::<std::net::SocketAddr>()
+        {
+            break address;
+        }
+        if let Some(status) = target_server.try_wait()? {
+            let _ = std::fs::remove_file(&ready_file);
+            return Err(std::io::Error::other(format!(
+                "TUN benchmark server exited before ready: {status}"
+            )));
+        }
+        if server_started.elapsed() >= Duration::from_secs(5) {
+            let _ = target_server.kill();
+            let _ = target_server.wait();
+            let _ = std::fs::remove_file(&ready_file);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "TUN benchmark server did not become ready",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
     let async_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    async_runtime.block_on(async move {
-        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let target_address = target.local_addr()?;
-        let (target_release_tx, target_release_rx) = tokio::sync::oneshot::channel::<()>();
-        let target_task = tokio::spawn(async move {
-            let (mut stream, _) = target.accept().await?;
-            let mut buffer = vec![0u8; 64 * 1024];
-            let mut remaining = total_bytes;
-            while remaining > 0 {
-                let chunk_len = remaining.min(buffer.len());
-                let length = tokio::io::AsyncReadExt::read(
-                    &mut stream,
-                    &mut buffer[..chunk_len],
-                )
-                .await?;
-                if length == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "TUN benchmark client closed before target received the payload",
-                    ));
-                }
-                tokio::io::AsyncWriteExt::write_all(&mut stream, &buffer[..length]).await?;
-                remaining -= length;
-            }
-            let _ = target_release_rx.await;
-            Ok::<(), std::io::Error>(())
-        });
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-        let (metrics_tx, metrics_rx) = mpsc::channel();
-        let client = std::thread::spawn(move || -> std::io::Result<()> {
-            let result = (|| -> std::io::Result<()> {
-                let mut stream = std::net::TcpStream::connect_timeout(
-                    &"10.0.0.2:18080".parse().unwrap(),
-                    Duration::from_secs(10),
-                )?;
-                stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-                let mut writer_stream = stream.try_clone()?;
-                writer_stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-                let payload = vec![0x5a; 64 * 1024];
-                let started = Instant::now();
-                #[cfg(target_os = "linux")]
-                let mut usage = ProcessUsage::default();
-                let writer = std::thread::spawn(move || -> std::io::Result<()> {
-                    let mut sent = 0usize;
-                    while sent < total_bytes {
-                        let length = (total_bytes - sent).min(payload.len());
-                        writer_stream.write_all(&payload[..length])?;
-                        sent += length;
+    let result = async_runtime.block_on(async move {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+        let client = Command::new(std::env::current_exe()?)
+            .env("DORADUS_TUN_BENCH_CLIENT", "1")
+            .env("DORADUS_TUN_BENCH_DIRECTION", &direction)
+            .env("DORADUS_TUN_BENCH_BYTES", total_bytes.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let client_waiter = thread::spawn(move || {
+            let result = client
+                .wait_with_output()
+                .map_err(|error| error.to_string())
+                .and_then(|output| {
+                    if !output.status.success() {
+                        return Err(format!(
+                            "TUN benchmark client exited with {}: {}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        ));
                     }
-                    writer_stream.shutdown(std::net::Shutdown::Write)
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .find(|line| line.starts_with("BENCHMARK "))
+                        .map(str::to_owned)
+                        .ok_or_else(|| "TUN benchmark client omitted its result".to_owned())
                 });
-                let mut received = 0usize;
-                let mut response = vec![0u8; 64 * 1024];
-                while received < total_bytes {
-                    let length = stream.read(&mut response)?;
-                    if length == 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            format!("TUN proxy closed after {received} of {total_bytes} bytes"),
-                        ));
-                    }
-                    if response[..length].iter().any(|byte| *byte != 0x5a) {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "TUN proxy throughput payload mismatch",
-                        ));
-                    }
-                    received += length;
-                    #[cfg(target_os = "linux")]
-                    if let Some(reading) = read_process_usage() {
-                        usage.peak_rss_kib = usage.peak_rss_kib.max(reading.rss_kib);
-                        usage.samples = usage.samples.saturating_add(1);
-                        usage.first_cpu_ticks.get_or_insert(reading.cpu_ticks);
-                        usage.last_cpu_ticks = Some(reading.cpu_ticks);
-                    }
-                }
-                let _ = target_release_tx.send(());
-                writer
-                    .join()
-                    .map_err(|_| std::io::Error::other("TUN benchmark writer thread panicked"))??;
-                #[cfg(target_os = "linux")]
-                let (peak_rss_kib, cpu_ticks, proc_samples) =
-                    (usage.peak_rss_kib, usage.cpu_ticks(), usage.samples);
-                #[cfg(not(target_os = "linux"))]
-                let (peak_rss_kib, cpu_ticks, proc_samples) = (0, 0, 0);
-                metrics_tx
-                    .send((received, started.elapsed(), peak_rss_kib, cpu_ticks, proc_samples))
-                    .map_err(|_| std::io::Error::other("benchmark metrics receiver closed"))?;
-                Ok(())
-            })();
-            let signal = result.as_ref().map(|_| ()).map_err(ToString::to_string);
-            let _ = done_tx.send(signal);
-            result
+            let _ = done_tx.send(());
+            let _ = result_tx.send(result);
         });
 
         let proxy: Arc<dyn AsyncProxy> = Arc::new(FixedAsyncProxy {
@@ -477,43 +591,25 @@ fn run_proxy_throughput(mut runtime: TunRuntime) -> std::io::Result<()> {
         let mut dispatcher = TunDispatcher::new(4 * 1024 * 1024, 4 * 1024 * 1024, 16 * 1024)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         runtime
-            .run_dispatcher_until(
-                &mut dispatcher,
-                &mut proxy_runtime,
-                None,
-                async move {
-                    let result = done_rx.await.unwrap_or_else(|_| Err("shutdown".into()));
-                    let _ = result_tx.send(result);
-                },
-            )
+            .run_dispatcher_until(&mut dispatcher, &mut proxy_runtime, None, async move {
+                let _ = done_rx.await;
+            })
             .await?;
         proxy_runtime.close();
-        if let Err(message) = result_rx
+        let benchmark_line = result_rx
             .await
             .map_err(|_| std::io::Error::other("TUN benchmark result channel closed"))?
-        {
-            let _ = client.join();
-            return Err(std::io::Error::other(message));
-        }
-        client
+            .map_err(std::io::Error::other)?;
+        client_waiter
             .join()
-            .map_err(|_| std::io::Error::other("TUN benchmark client thread panicked"))??;
-        target_task
-            .await
-            .map_err(|error| std::io::Error::other(error.to_string()))??;
-        let (bytes, elapsed, peak_rss_kib, cpu_ticks, proc_samples) = metrics_rx
-            .recv()
-            .map_err(|_| std::io::Error::other("TUN benchmark metrics missing"))?;
-        println!(
-            "BENCHMARK {{\"scenario\":\"tun-inbound-fixed-proxy-loopback\",\"bytes\":{bytes},\"elapsed_ms\":{},\"mib_per_sec\":{},\"peak_rss_kib\":{},\"cpu_ticks\":{},\"proc_samples\":{}}}",
-            elapsed.as_secs_f64() * 1000.0,
-            (bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64(),
-            peak_rss_kib,
-            cpu_ticks,
-            proc_samples
-        );
+            .map_err(|_| std::io::Error::other("TUN benchmark client waiter panicked"))?;
+        println!("{benchmark_line}");
         Ok(())
-    })
+    });
+    let _ = target_server.kill();
+    let _ = target_server.wait();
+    let _ = std::fs::remove_file(&ready_file);
+    result
 }
 
 fn run_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
@@ -688,124 +784,6 @@ fn run_udp_proxy_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
             .await
             .map_err(|error| std::io::Error::other(error.to_string()))??;
         println!("tun-udp-proxy-echo-ok");
-        Ok(())
-    })
-}
-
-#[cfg(any())]
-fn run_dns_echo(mut runtime: TunRuntime) -> std::io::Result<()> {
-    use std::net::{SocketAddr, UdpSocket};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use doradus_core::dns::{
-        AsyncDnsHandler, DnsHandler, DnsRecordType, DnsResponse, answer_query, decode_response,
-        encode_query,
-    };
-    use doradus_core::proxy::{AsyncProxy, StaticProxySelector};
-    use doradus_core::{BoxFuture, DomainName, IpSet, Result as CoreResult};
-    use doradus_protocol::proxy::DropAsyncProxy;
-    use doradus_tun::{TunDispatcher, TunProxyRuntime};
-
-    struct FixedDns;
-    impl DnsHandler for FixedDns {
-        fn resolve(
-            &self,
-            _domain: &DomainName,
-            _record_type: DnsRecordType,
-        ) -> CoreResult<DnsResponse> {
-            Ok(DnsResponse {
-                addresses: IpSet {
-                    v4: vec!["192.0.2.53".parse().expect("literal IPv4")],
-                    v6: Vec::new(),
-                },
-                ptr_names: Vec::new(),
-                service_bindings: Vec::new(),
-                minimum_ttl: Some(30),
-            })
-        }
-    }
-    impl AsyncDnsHandler for FixedDns {
-        fn answer<'a>(&'a self, packet: &'a [u8]) -> BoxFuture<'a, CoreResult<Vec<u8>>> {
-            Box::pin(async move { answer_query(packet, self) })
-        }
-    }
-
-    let async_runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    async_runtime.block_on(async move {
-        let dns_port = env::var("DORADUS_TUN_DNS_PORT")
-            .ok()
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(53);
-        let query = encode_query(
-            dns_port,
-            &DomainName::new("example.com").map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
-            })?,
-            DnsRecordType::A,
-        )
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-        let client = std::thread::spawn(move || -> std::io::Result<()> {
-            let result = (|| -> std::io::Result<()> {
-                let socket = UdpSocket::bind("0.0.0.0:0")?;
-                socket.set_read_timeout(Some(Duration::from_secs(5)))?;
-                socket.send_to(
-                    &query,
-                    SocketAddr::new("10.0.0.2".parse().unwrap(), dns_port),
-                )?;
-                let mut response = [0u8; 4096];
-                let (length, _) = socket.recv_from(&mut response)?;
-                let response = decode_response(&response[..length], dns_port, DnsRecordType::A)
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
-                if response.addresses.v4
-                    != vec!["192.0.2.53".parse::<std::net::Ipv4Addr>().unwrap()]
-                {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "TUN DNS response address mismatch",
-                    ));
-                }
-                Ok(())
-            })();
-            let signal = result.as_ref().map(|_| ()).map_err(ToString::to_string);
-            let _ = done_tx.send(signal);
-            result
-        });
-
-        let drop_proxy: Arc<dyn AsyncProxy> = Arc::new(DropAsyncProxy);
-        let selector = Arc::new(StaticProxySelector {
-            direct: Arc::clone(&drop_proxy),
-            proxy: Arc::clone(&drop_proxy),
-            bypass: Arc::clone(&drop_proxy),
-            drop: Arc::clone(&drop_proxy),
-        });
-        let mut proxy_runtime = TunProxyRuntime::new(selector, 32)
-            .map_err(|error| std::io::Error::other(error.to_string()))?
-            .with_async_dns_handler(Arc::new(FixedDns));
-        let mut dispatcher = TunDispatcher::new(2048, 2048, 16)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        runtime
-            .run_dispatcher_until(&mut dispatcher, &mut proxy_runtime, None, async move {
-                let result = done_rx.await.unwrap_or_else(|_| Err("shutdown".into()));
-                let _ = result_tx.send(result);
-            })
-            .await?;
-        proxy_runtime.close();
-        if let Err(message) = result_rx
-            .await
-            .map_err(|_| std::io::Error::other("TUN DNS result channel closed"))?
-        {
-            let _ = client.join();
-            return Err(std::io::Error::other(message));
-        }
-        client
-            .join()
-            .map_err(|_| std::io::Error::other("TUN DNS client thread panicked"))??;
-        println!("tun-dns-echo-ok");
         Ok(())
     })
 }

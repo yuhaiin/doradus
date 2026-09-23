@@ -35,7 +35,7 @@ fn node_tag_parser_accepts_legacy_and_extended_member_shapes() {
     let parsed = parse_node_tag(&extended).unwrap();
     assert_eq!(parsed.kind, "mirror");
     assert_eq!(parsed.targets, ["edge"]);
-    assert!(parsed.round_robin);
+    assert_eq!(parsed.strategy, NodeSelectionStrategy::RoundRobin);
 }
 
 #[test]
@@ -46,7 +46,7 @@ fn node_tag_mirror_resolution_stops_on_cycles() {
             NodeTagDefinition {
                 kind: "mirror".to_owned(),
                 targets: vec!["b".to_owned()],
-                round_robin: false,
+                strategy: NodeSelectionStrategy::Random,
             },
         ),
         (
@@ -54,7 +54,7 @@ fn node_tag_mirror_resolution_stops_on_cycles() {
             NodeTagDefinition {
                 kind: "mirror".to_owned(),
                 targets: vec!["a".to_owned()],
-                round_robin: false,
+                strategy: NodeSelectionStrategy::Random,
             },
         ),
         (
@@ -62,7 +62,7 @@ fn node_tag_mirror_resolution_stops_on_cycles() {
             NodeTagDefinition {
                 kind: "node".to_owned(),
                 targets: vec!["node-a".to_owned(), "node-b".to_owned()],
-                round_robin: false,
+                strategy: NodeSelectionStrategy::Random,
             },
         ),
     ]);
@@ -183,7 +183,7 @@ async fn node_set_proxy_retries_a_failed_member() {
                 timeout: Duration::from_secs(1),
             }),
         ],
-        true,
+        NodeSelectionStrategy::RoundRobin,
     )
     .unwrap();
     let context = FlowContext::new(doradus_core::Endpoint::ip(

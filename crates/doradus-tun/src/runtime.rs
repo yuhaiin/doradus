@@ -420,6 +420,40 @@ impl TunRuntime {
 
     pub async fn recv_from_tun(&mut self) -> io::Result<usize> {
         let length = self.device.recv(&mut self.buffer).await?;
+        self.process_tun_packet(length)?;
+        Ok(length)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn recv_available_from_tun(&mut self) -> io::Result<usize> {
+        // Bound each burst so ready packets share the event-loop work without
+        // letting sustained input starve proxy completions.
+        const MAX_BATCH_PACKETS: usize = 64;
+
+        let mut total_bytes = self.recv_from_tun().await?;
+        let available = self
+            .smoltcp_device
+            .available_rx_slots()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        for _ in 0..available.min(MAX_BATCH_PACKETS.saturating_sub(1)) {
+            let length = match self.device.try_recv(&mut self.buffer) {
+                Ok(length) => length,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            self.process_tun_packet(length)?;
+            total_bytes = total_bytes.saturating_add(length);
+        }
+        Ok(total_bytes)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn recv_available_from_tun(&mut self) -> io::Result<usize> {
+        self.recv_from_tun().await
+    }
+
+    fn process_tun_packet(&mut self, length: usize) -> io::Result<()> {
         if let Some(capture) = &self.pcap_capture {
             capture.record(&self.buffer[..length]);
         }
@@ -437,7 +471,7 @@ impl TunRuntime {
             // has been deliberately discarded (overlap, size, or capacity).
             // The TUN read itself succeeded, so do not tear down the whole
             // inbound just because one hostile datagram was dropped.
-            return Ok(length);
+            return Ok(());
         };
         let packet = normalize_ipv6_extension_headers(packet.as_ref())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
@@ -450,9 +484,9 @@ impl TunRuntime {
             tun_debug(format!(
                 "TUN RX queue is full, dropping packet length={length}"
             ));
-            return Ok(length);
+            return Ok(());
         }
-        Ok(length)
+        Ok(())
     }
 
     fn expire_ipv6_fragments(&mut self) {
@@ -541,7 +575,7 @@ impl TunRuntime {
             let next_poll_delay = dispatcher.poll_delay(&mut self.interface, timestamp);
 
             let interceptor_output = tokio::select! {
-                result = self.recv_from_tun() => {
+                result = self.recv_available_from_tun() => {
                     if let Err(error) = result {
                         proxy_runtime.close();
                         return Err(error);

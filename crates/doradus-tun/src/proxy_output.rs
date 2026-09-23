@@ -14,39 +14,23 @@ impl TunProxyRuntime {
     }
 
     fn flush_pending_tcp_to_tun(&mut self, dispatcher: &mut TunDispatcher) -> Result<()> {
-        self.tasks.pending_keys.clear();
-        self.tasks
-            .pending_keys
-            .extend(self.tasks.pending_to_tun.keys().copied());
-        let pending_tcp_keys = self.tasks.pending_keys.clone();
+        let pending_tcp_keys = self.tasks.pending_flows();
         for flow in pending_tcp_keys {
             let mut drained = false;
             let mut failed = false;
-            while let Some(payload) = self
-                .tasks
-                .pending_to_tun
-                .get_mut(&flow)
-                .and_then(VecDeque::pop_front)
-            {
+            while let Some(payload) = self.tasks.pop_pending_output(&flow) {
                 match dispatcher.write_tcp(flow, &payload) {
                     Ok(written) if written == payload.len() => drained = true,
                     Ok(written) => {
                         self.tasks
-                            .pending_to_tun
-                            .entry(flow)
-                            .or_default()
-                            .push_front(payload[written..].to_vec());
+                            .requeue_pending_output(flow, payload[written..].to_vec());
                         break;
                     }
                     Err(_) => {
-                        if self.tasks.pending_closes.contains(&flow) {
+                        if self.tasks.pending_close_requested(&flow) {
                             failed = true;
                         } else {
-                            self.tasks
-                                .pending_to_tun
-                                .entry(flow)
-                                .or_default()
-                                .push_front(payload);
+                            self.tasks.requeue_pending_output(flow, payload);
                         }
                         break;
                     }
@@ -54,15 +38,10 @@ impl TunProxyRuntime {
             }
             if failed {
                 self.finish_tcp_close(dispatcher, flow)?;
-            } else if drained
-                && self
-                    .tasks
-                    .pending_to_tun
-                    .get(&flow)
-                    .is_some_and(VecDeque::is_empty)
-            {
-                self.tasks.pending_to_tun.remove(&flow);
-                if self.tasks.pending_closes.contains(&flow) {
+            } else if drained && !self.tasks.has_pending_output(&flow) {
+                let close_requested = self.tasks.pending_close_requested(&flow);
+                self.tasks.clear_pending_output(&flow);
+                if close_requested {
                     self.finish_tcp_close(dispatcher, flow)?;
                 }
             }
@@ -73,11 +52,10 @@ impl TunProxyRuntime {
     fn finish_tcp_close(&mut self, dispatcher: &mut TunDispatcher, flow: TunFlowKey) -> Result<()> {
         tun_debug(format!("TCP proxy flow fully closed flow={flow:?}"));
         let _ = dispatcher.close_tcp(flow);
-        if let Some(task) = self.tasks.remove(&flow) {
+        if let Some(task) = self.tasks.remove_task(&flow) {
             task.join.abort();
         }
-        self.tasks.pending_to_tun.remove(&flow);
-        self.tasks.pending_closes.remove(&flow);
+        self.tasks.clear_pending_output(&flow);
         self.untrack_flow(&flow)
     }
 
@@ -117,21 +95,14 @@ impl TunProxyRuntime {
                             payload.len()
                         ));
                         self.tasks
-                            .pending_to_tun
-                            .entry(flow)
-                            .or_default()
-                            .push_back(payload[written..].to_vec());
+                            .queue_pending_output(flow, payload[written..].to_vec());
                         Ok(false)
                     }
                     Err(error) => {
                         tun_debug(format!(
                             "TCP output backpressure/close flow={flow:?}: {error}"
                         ));
-                        self.tasks
-                            .pending_to_tun
-                            .entry(flow)
-                            .or_default()
-                            .push_back(payload);
+                        self.tasks.queue_pending_output(flow, payload);
                         Ok(false)
                     }
                 }
@@ -197,13 +168,8 @@ impl TunProxyRuntime {
             }
             ProxyOutput::TcpClosed { flow } => {
                 tun_debug(format!("TCP proxy task closed flow={flow:?}"));
-                if self
-                    .tasks
-                    .pending_to_tun
-                    .get(&flow)
-                    .is_some_and(|pending| !pending.is_empty())
-                {
-                    self.tasks.pending_closes.insert(flow);
+                if self.tasks.has_pending_output(&flow) {
+                    self.tasks.request_pending_close(flow);
                 } else {
                     self.finish_tcp_close(dispatcher, flow)?;
                 }
@@ -236,21 +202,12 @@ impl TunProxyRuntime {
     }
 
     fn reap_finished_tasks(&mut self, dispatcher: &mut TunDispatcher) -> Result<()> {
-        let finished_tcp: Vec<_> = self
-            .tasks
-            .iter()
-            .filter(|(_, task)| task.join.is_finished())
-            .map(|(flow, _)| *flow)
-            .collect();
+        let finished_tcp = self.tasks.finished_flows();
         for flow in finished_tcp {
-            let pending = self
-                .tasks
-                .pending_to_tun
-                .get(&flow)
-                .is_some_and(|pending| !pending.is_empty());
+            let pending = self.tasks.has_pending_output(&flow);
             if pending {
-                self.tasks.pending_closes.insert(flow);
-            } else if let Some(task) = self.tasks.remove(&flow) {
+                self.tasks.request_pending_close(flow);
+            } else if let Some(task) = self.tasks.take_finished(&flow) {
                 if let Some(Err(error)) = task.join.now_or_never() {
                     tun_debug(format!(
                         "TCP proxy task ended with join error flow={flow:?}: {error}"
@@ -260,30 +217,17 @@ impl TunProxyRuntime {
             }
         }
 
-        let finished_icmp: Vec<_> = self
-            .icmp_tasks
-            .iter()
-            .filter(|(_, task)| task.join.is_finished())
-            .map(|(id, _)| *id)
-            .collect();
-        for id in finished_icmp {
-            if let Some(task) = self.icmp_tasks.remove(&id) {
-                if let Some(Err(error)) = task.join.now_or_never() {
-                    tun_debug(format!(
-                        "ICMP proxy task ended with join error flow={:?}: {error}",
-                        task.flow
-                    ));
-                }
-                self.untrack_icmp_flow_if_idle(task.flow)?;
+        for (_, task) in self.icmp_tasks.take_finished() {
+            if let Some(Err(error)) = task.join.now_or_never() {
+                tun_debug(format!(
+                    "ICMP proxy task ended with join error flow={:?}: {error}",
+                    task.flow
+                ));
             }
+            self.untrack_icmp_flow_if_idle(task.flow)?;
         }
 
-        let finished_udp: Vec<_> = self
-            .udp_tasks
-            .iter()
-            .filter(|(_, task)| task.join.is_finished())
-            .map(|(source, _)| *source)
-            .collect();
+        let finished_udp = self.udp_tasks.finished_sources();
         for source in finished_udp {
             let flows = self.remove_udp_source_task(source);
             tun_debug(format!(
@@ -310,7 +254,7 @@ impl TunProxyRuntime {
         flow: TunFlowKey,
         packet: Vec<u8>,
     ) -> Result<()> {
-        self.icmp_tasks.remove(&id);
+        self.icmp_tasks.remove_task(id);
         self.touch_flow(flow)?;
         if let Some(observer) = &self.observer {
             observer.bytes(flow, TunFlowDirection::Download, packet.len());

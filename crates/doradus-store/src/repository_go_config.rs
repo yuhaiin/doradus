@@ -11,6 +11,10 @@ impl ConfigRepository {
     /// depending on SQLite table details and allows native and imported
     /// databases to share the same behavior.
     pub async fn get_go_selected_node_id(&self, key: &str) -> Result<Option<String>> {
+        self.get_go_selected_node_id_sync(key)
+    }
+
+    pub fn get_go_selected_node_id_sync(&self, key: &str) -> Result<Option<String>> {
         if !matches!(key, "selected_tcp_node_v2" | "selected_udp_node_v2") {
             return Err(Error::invalid(format!(
                 "unsupported Go selected-node metadata key {key:?}"
@@ -192,6 +196,10 @@ impl ConfigRepository {
     /// future fields. Older databases may not have the table yet, in which
     /// case callers use their private compatibility fallback.
     pub async fn get_go_backup_settings(&self) -> Result<Option<GoBackupSettingsRecord>> {
+        self.get_go_backup_settings_sync()
+    }
+
+    pub fn get_go_backup_settings_sync(&self) -> Result<Option<GoBackupSettingsRecord>> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "backup_settings") {
             return Ok(None);
@@ -246,6 +254,10 @@ impl ConfigRepository {
     /// table. The paired `put_go_inbound` method writes only the known columns
     /// and preserves `data_json` supplied by the caller.
     pub async fn list_go_inbounds(&self) -> Result<Vec<GoInboundRecord>> {
+        self.list_go_inbounds_sync()
+    }
+
+    pub fn list_go_inbounds_sync(&self) -> Result<Vec<GoInboundRecord>> {
         let connection = self.store.lock_connection()?;
         if !table_exists(&connection, "inbounds_v2") {
             return Ok(Vec::new());
@@ -318,6 +330,10 @@ impl ConfigRepository {
     /// only remote subscription nodes, leaving locally configured nodes with
     /// the same display group untouched.
     pub async fn count_go_nodes_by_groups(&self, groups: &[String]) -> Result<usize> {
+        self.count_go_nodes_by_groups_sync(groups)
+    }
+
+    pub fn count_go_nodes_by_groups_sync(&self, groups: &[String]) -> Result<usize> {
         for group in groups {
             validate_id(group)?;
         }

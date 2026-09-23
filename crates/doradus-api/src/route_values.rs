@@ -1,6 +1,11 @@
 use super::*;
 pub async fn route_config_get_value(state: &ApiState) -> ApiResult {
-    let value = state.controller.store().repository().list_go_route_settings().await?.into_iter().next().map(|record| json!({
+    let store = state.controller.store().clone();
+    let records = store_blocking(store, |store| {
+        store.repository().list_go_route_settings_sync()
+    })
+    .await?;
+    let value = records.into_iter().next().map(|record| json!({
         "directResolver": record.direct_resolver,
         "proxyResolver": record.proxy_resolver,
         "resolveLocally": record.resolve_locally,
@@ -37,12 +42,9 @@ pub async fn route_config_put_value(state: &ApiState, value: Value) -> ApiResult
 }
 
 pub async fn route_lists_get_value(state: &ApiState, input: &Value) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_route_lists()
-        .await?;
+    let store = state.controller.store().clone();
+    let records =
+        store_blocking(store, |store| store.repository().list_go_route_lists_sync()).await?;
     let values = records
         .into_iter()
         .map(route_list_item_json)
@@ -55,12 +57,9 @@ pub async fn route_lists_get_value(state: &ApiState, input: &Value) -> ApiResult
 }
 
 pub async fn get_route_list_value(state: &ApiState, id: String) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_route_lists()
-        .await?;
+    let store = state.controller.store().clone();
+    let records =
+        store_blocking(store, |store| store.repository().list_go_route_lists_sync()).await?;
     records
         .into_iter()
         .find(|record| record.name == id)
@@ -128,12 +127,9 @@ pub async fn delete_route_list_value(state: &ApiState, id: String) -> ApiResult 
 }
 
 pub async fn route_rules_get_value(state: &ApiState, input: &Value) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_route_rules()
-        .await?;
+    let store = state.controller.store().clone();
+    let records =
+        store_blocking(store, |store| store.repository().list_go_route_rules_sync()).await?;
     let values = records
         .into_iter()
         .map(route_rule_item_json)
@@ -146,12 +142,9 @@ pub async fn route_rules_get_value(state: &ApiState, input: &Value) -> ApiResult
 }
 
 pub async fn get_route_rule_value(state: &ApiState, name: String, _index: usize) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_route_rules()
-        .await?;
+    let store = state.controller.store().clone();
+    let records =
+        store_blocking(store, |store| store.repository().list_go_route_rules_sync()).await?;
     records
         .into_iter()
         .find(|record| record.name == name)
@@ -169,12 +162,9 @@ pub async fn save_route_rule_value(
     if name.is_empty() {
         return Err(ApiError::bad("route rule name is empty"));
     }
-    let current = state
-        .controller
-        .store()
-        .repository()
-        .list_go_route_rules()
-        .await?;
+    let store = state.controller.store().clone();
+    let current =
+        store_blocking(store, |store| store.repository().list_go_route_rules_sync()).await?;
     let existing = current.iter().find(|record| record.name == name);
     let replace_legacy_id = existing.is_some_and(|record| record.id != name);
     let priority = existing.map(|record| record.priority).unwrap_or_else(|| {
@@ -245,12 +235,9 @@ pub async fn save_route_rule_value(
 }
 
 pub async fn delete_route_rule_value(state: &ApiState, name: String, _index: usize) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_route_rules()
-        .await?;
+    let store = state.controller.store().clone();
+    let records =
+        store_blocking(store, |store| store.repository().list_go_route_rules_sync()).await?;
     if !records.iter().any(|record| record.name == name) {
         return Err(ApiError::not_found("route rule not found"));
     }
@@ -446,20 +433,18 @@ pub async fn route_apply_value(state: &ApiState) -> ApiResult {
 }
 
 pub async fn route_activation_value(state: &ApiState) -> ApiResult {
-    let rule_value = state
-        .controller
-        .store()
-        .get_config(ROUTE_ACTIVATION_KEY)
+    let store = state.controller.store().clone();
+    let rule_value = store_blocking(store, |store| store.get_config_sync(ROUTE_ACTIVATION_KEY))
         .await?
         .map(|bytes| raw_json(&bytes, json!({"hostIndexRefreshAt": 0, "ruleApplyAt": 0})))
         .unwrap_or_else(|| json!({"hostIndexRefreshAt": 0, "ruleApplyAt": 0}));
-    let list_value = state
-        .controller
-        .store()
-        .get_config(ROUTE_LIST_ACTIVATION_KEY)
-        .await?
-        .map(|bytes| raw_json(&bytes, json!({"hostIndexRefreshAt": 0})))
-        .unwrap_or_else(|| json!({"hostIndexRefreshAt": 0}));
+    let store = state.controller.store().clone();
+    let list_value = store_blocking(store, |store| {
+        store.get_config_sync(ROUTE_LIST_ACTIVATION_KEY)
+    })
+    .await?
+    .map(|bytes| raw_json(&bytes, json!({"hostIndexRefreshAt": 0})))
+    .unwrap_or_else(|| json!({"hostIndexRefreshAt": 0}));
     let value = json!({
         "hostIndexRefreshAt": effective_activation_at(&list_value, "hostIndexRefreshAt"),
         "ruleApplyAt": effective_activation_at(&rule_value, "ruleApplyAt"),
@@ -484,22 +469,17 @@ pub fn pending_route_rule_activation() -> Value {
 }
 
 pub async fn hosts_get_value(state: &ApiState) -> ApiResult {
-    if let Some(value) = state
-        .controller
-        .store()
-        .get_config("resolver.hosts")
-        .await?
+    let store = state.controller.store().clone();
+    if let Some(value) =
+        store_blocking(store, |store| store.get_config_sync("resolver.hosts")).await?
     {
         return Ok(Json(raw_json(&value, json!({"hosts": {}}))));
     }
     let mut hosts = Map::new();
-    for record in state
-        .controller
-        .store()
-        .repository()
-        .list_go_dns_hosts()
-        .await?
-    {
+    let store = state.controller.store().clone();
+    let records =
+        store_blocking(store, |store| store.repository().list_go_dns_hosts_sync()).await?;
+    for record in records {
         hosts.insert(record.host, Value::String(record.target));
     }
     Ok(Json(json!({"hosts": hosts})))
@@ -515,17 +495,21 @@ pub async fn hosts_put_value(state: &ApiState, value: Value) -> ApiResult {
 }
 
 pub async fn fakedns_get_value(state: &ApiState) -> ApiResult {
-    if let Some(value) = state
-        .controller
-        .store()
-        .get_config("resolver.fakedns")
-        .await?
+    let store = state.controller.store().clone();
+    if let Some(value) =
+        store_blocking(store, |store| store.get_config_sync("resolver.fakedns")).await?
     {
         return Ok(Json(raw_json(&value, default_fakedns())));
     }
-    let repository = state.controller.store().repository();
-    let settings = repository.list_go_dns_settings().await?;
-    let lists = repository.list_go_dns_fakedns_lists().await?;
+    let store = state.controller.store().clone();
+    let (settings, lists) = store_blocking(store, |store| {
+        let repository = store.repository();
+        Ok((
+            repository.list_go_dns_settings_sync()?,
+            repository.list_go_dns_fakedns_lists_sync()?,
+        ))
+    })
+    .await?;
     let mut value = settings
         .into_iter()
         .next()
@@ -561,24 +545,21 @@ pub async fn fakedns_put_value(state: &ApiState, value: Value) -> ApiResult {
 }
 
 pub async fn resolver_server_get_value(state: &ApiState) -> ApiResult {
-    if let Some(value) = state
-        .controller
-        .store()
-        .get_config("resolver.server")
-        .await?
+    let store = state.controller.store().clone();
+    if let Some(value) =
+        store_blocking(store, |store| store.get_config_sync("resolver.server")).await?
     {
         return Ok(Json(raw_json(&value, json!({"server": ""}))));
     }
-    let server = state
-        .controller
-        .store()
-        .repository()
-        .list_go_dns_settings()
-        .await?
-        .into_iter()
-        .next()
-        .map(|r| r.server)
-        .unwrap_or_default();
+    let store = state.controller.store().clone();
+    let server = store_blocking(store, |store| {
+        store.repository().list_go_dns_settings_sync()
+    })
+    .await?
+    .into_iter()
+    .next()
+    .map(|r| r.server)
+    .unwrap_or_default();
     Ok(Json(json!({"server": server})))
 }
 

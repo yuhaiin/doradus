@@ -1,11 +1,7 @@
 use super::*;
 pub async fn inbounds_get_value(state: &ApiState, input: &Value) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_inbounds()
-        .await?;
+    let store = state.controller.store().clone();
+    let records = store_blocking(store, |store| store.repository().list_go_inbounds_sync()).await?;
     Ok(Json(page_with_filter(
         records.into_iter().map(inbound_json).collect(),
         input,
@@ -14,12 +10,8 @@ pub async fn inbounds_get_value(state: &ApiState, input: &Value) -> ApiResult {
 }
 
 pub async fn get_inbound_value(state: &ApiState, id: String) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_inbounds()
-        .await?;
+    let store = state.controller.store().clone();
+    let records = store_blocking(store, |store| store.repository().list_go_inbounds_sync()).await?;
     records
         .into_iter()
         .find(|record| record.id == id)
@@ -28,12 +20,8 @@ pub async fn get_inbound_value(state: &ApiState, id: String) -> ApiResult {
 }
 
 pub async fn inbounds_status_value(state: &ApiState) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_inbounds()
-        .await?;
+    let store = state.controller.store().clone();
+    let records = store_blocking(store, |store| store.repository().list_go_inbounds_sync()).await?;
     let runtime = state.controller.inbound_runtime().snapshot();
     let statistics = state.controller.monitor().inbound_statistics();
     let items = records
@@ -158,12 +146,9 @@ pub async fn delete_inbound_value(state: &ApiState, id: String) -> ApiResult {
 }
 
 pub async fn resolvers_get_value(state: &ApiState, input: &Value) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_resolvers()
-        .await?;
+    let store = state.controller.store().clone();
+    let records =
+        store_blocking(store, |store| store.repository().list_go_resolvers_sync()).await?;
     Ok(Json(page_with_filter(
         records.into_iter().map(resolver_json).collect(),
         input,
@@ -172,12 +157,9 @@ pub async fn resolvers_get_value(state: &ApiState, input: &Value) -> ApiResult {
 }
 
 pub async fn get_resolver_value(state: &ApiState, id: String) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_resolvers()
-        .await?;
+    let store = state.controller.store().clone();
+    let records =
+        store_blocking(store, |store| store.repository().list_go_resolvers_sync()).await?;
     records
         .into_iter()
         .find(|record| record.id == id)

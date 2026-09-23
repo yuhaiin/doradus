@@ -33,7 +33,7 @@ Classify a problem before editing:
 
 ## 2. Workspace overview
 
-Workspace members are defined in Cargo.toml. The current workspace contains 15
+Workspace members are defined in Cargo.toml. The current workspace contains 17
 crates:
 
 ~~~mermaid
@@ -47,7 +47,9 @@ graph TD
     STORE[doradus-store<br/>SQLite, Go schema, and FakeIP]
     TUN[doradus-tun<br/>TUN packet/socket engine]
     GEO[doradus-geo<br/>GeoIP and Geo metadata]
+    METRICS[doradus-metrics<br/>Runtime metrics]
     WG[doradus-wireguard<br/>WireGuard adapter]
+    OPENVPN[doradus-openvpn<br/>OpenVPN adapter]
     BACKUP[doradus-backup<br/>Backup model and transport]
     MASQUE[doradus-masque<br/>MASQUE transport]
     ANDROID[doradus-android<br/>Android JNI bridge]
@@ -61,6 +63,7 @@ graph TD
     CORE --> TRIE
     CORE --> PROTOCOL
     PROTOCOL --> CHAIN
+    PROTOCOL --> METRICS
     STORE --> DNS
     STORE --> CORE
     STORE --> TRIE
@@ -74,6 +77,8 @@ graph TD
     RUNTIME --> TUN
     RUNTIME --> GEO
     RUNTIME --> WG
+    RUNTIME --> OPENVPN
+    RUNTIME --> METRICS
     API --> RUNTIME
     API --> STORE
     API --> CORE
@@ -93,12 +98,14 @@ graph TD
 | doradus-dns | DNS model, wire codec, cache, hosts, FakeIP view, and UDP/TCP/QUIC/DoH/DoT transports | dns.rs/cache.rs → dns_resolver.rs → transport.rs |
 | doradus-core | Async socket/proxy primitives, NAT, process information, sniffing, and compatibility re-exports | lib.rs → flow.rs → proxy.rs → nat.rs → process.rs |
 | doradus-trie | Domain, CIDR, on-disk trie, and combined route indexes | router.rs → ondisk.rs → lib.rs |
-| doradus-protocol | Async base proxy factory plus SOCKS, HTTP, VLESS, VMess, Trojan, Shadowsocks, H2, WebSocket, and Yuubinsya | proxy_factory.rs → session.rs/tls.rs |
+| doradus-protocol | Async base proxy factory plus SOCKS, HTTP, VLESS, VMess, Trojan, Shadowsocks, H2, WebSocket, and Yuubinsya | composition/base_proxy.rs → protocols/ → transports/ |
 | doradus-chain | Composition of nodes, transports, and protocols into outbound chains, including TLS/WebSocket/H2/UOT, retries, and UDP | config.rs → go_node.rs → lib.rs |
 | doradus-store | Typed repositories, SQLite, schema, Go v6/legacy compatibility, FakeIP mapping, statistics, and state | lib.rs → sqlite.rs/schema.rs → repository.rs |
-| doradus-tun | OS TUN descriptor, smoltcp packet/socket engine, dispatcher, proxy runtime, and packet write-back | runtime.rs → dispatcher.rs → packet.rs → proxy_runtime.rs → proxy_flow.rs/proxy_tasks.rs |
+| doradus-tun | OS TUN descriptor, smoltcp packet/socket engine, dispatcher, proxy runtime, and packet write-back | runtime.rs → dispatcher.rs → packet.rs → proxy_runtime.rs → proxy_flow.rs/proxy_tasks.rs/proxy_output.rs |
 | doradus-geo | GeoIP/Geo metadata loading and lookup | lib.rs |
+| doradus-metrics | Shared runtime and protocol metrics | lib.rs |
 | doradus-wireguard | WireGuard engine, driver, and proxy adapter | config.rs → engine.rs → proxy.rs |
+| doradus-openvpn | OpenVPN configuration, transport, and runtime adapter | config.rs → transport.rs → proxy.rs |
 | doradus-backup | Backup data format and transport helpers | lib.rs |
 | doradus-masque | MASQUE transport, codec, proxy, and TLS support | config.rs → proxy.rs → codec.rs |
 | doradus-android | Android JNI bridge for API, runtime, and TUN integration | lib.rs |

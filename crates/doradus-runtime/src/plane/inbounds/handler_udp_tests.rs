@@ -1,15 +1,16 @@
 use super::*;
 
 use std::future::pending;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use doradus_core::flow::FlowKey as TunFlowKey;
 use doradus_core::proxy::AsyncDatagram;
 use doradus_core::{BoxFuture, Endpoint, Network, Result};
 use doradus_store::{ConfigStore, GoNodeRecord};
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
+use crate::inbound::adapters::common::UdpFlowId;
 use crate::inbound::{InboundHandler, InboundSpec, UdpMode};
 use crate::{RuntimeBuilder, RuntimeController};
 
@@ -59,12 +60,7 @@ fn pending_close_requires_the_opening_worker_session_and_source() {
 async fn manager_owner_drop_signals_and_reaps_manager_task() {
     for _ in 0..8 {
         let mut owner = InboundUdpManager::new(Weak::new(), 1);
-        let _ingress_keepalive = owner.ingress_tx.clone();
-        let _command_keepalive = owner.command_tx.clone();
-        let join = owner
-            .join
-            .take()
-            .expect("manager owner must retain its task handle");
+        let join = owner.take_join_for_test();
 
         drop(owner);
 

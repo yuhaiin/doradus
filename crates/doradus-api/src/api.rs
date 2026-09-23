@@ -34,9 +34,10 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use doradus_store::{
-    GoBackupSettingsRecord, GoInboundRecord, GoNodeRecord, GoPublishRecord, GoResolverRecord,
-    GoRouteListRecord, GoRouteRuleRecord, GoRouteSettingsRecord, GoSettingsKvRecord,
-    GoSubscriptionLinkRecord, GoUserRecord, GoUserWrite, InboundSettings, MaxMindMetadataRecord,
+    ConfigStore, GoBackupSettingsRecord, GoInboundRecord, GoNodeRecord, GoPublishRecord,
+    GoResolverRecord, GoRouteListRecord, GoRouteRuleRecord, GoRouteSettingsRecord,
+    GoSettingsKvRecord, GoSubscriptionLinkRecord, GoUserRecord, GoUserWrite, InboundSettings,
+    MaxMindMetadataRecord,
 };
 
 use crate::backup_transport::ProxyS3Transport;
@@ -165,6 +166,21 @@ struct ApiError {
 }
 
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
+
+async fn store_blocking<T, F>(store: ConfigStore, operation: F) -> doradus_core::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&ConfigStore) -> doradus_core::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || operation(&store))
+        .await
+        .map_err(|error| {
+            doradus_core::Error::new(
+                doradus_core::ErrorKind::Storage,
+                format!("store worker failed: {error}"),
+            )
+        })?
+}
 
 impl ApiError {
     fn bad(message: impl Into<String>) -> Self {

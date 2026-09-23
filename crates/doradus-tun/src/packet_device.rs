@@ -103,6 +103,14 @@ impl SmoltcpTunDevice {
         self.mtu
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn available_rx_slots(&self) -> Result<usize> {
+        self.queue
+            .lock()
+            .map(|queue| queue.capacity.saturating_sub(queue.rx.len()))
+            .map_err(|_| Error::new(crate::ErrorKind::Io, "TUN packet queue poisoned"))
+    }
+
     pub fn enqueue_rx(&self, packet: Vec<u8>) -> Result<bool> {
         inspect_ip_packet_with_mtu(&packet, self.mtu)?;
         self.enqueue_rx_validated(packet)

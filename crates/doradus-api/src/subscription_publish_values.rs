@@ -1,11 +1,10 @@
 use super::*;
 pub async fn subscriptions_get_value(state: &ApiState) -> ApiResult {
-    let records = state
-        .controller
-        .store()
-        .repository()
-        .list_go_subscription_links()
-        .await?;
+    let store = state.controller.store().clone();
+    let records = store_blocking(store, |store| {
+        store.repository().list_go_subscription_links_sync()
+    })
+    .await?;
     if !records.is_empty() {
         return Ok(Json(json!({
             "items": records.into_iter().map(subscription_json).collect::<Vec<_>>()
@@ -56,12 +55,11 @@ pub async fn subscriptions_delete_value(state: &ApiState, value: &Value) -> ApiR
 
 pub async fn subscriptions_delete_preview_value(state: &ApiState, value: &Value) -> ApiResult {
     let names = subscription_names(value, "subscriptions delete preview")?;
-    let nodes = state
-        .controller
-        .store()
-        .repository()
-        .count_go_nodes_by_groups(&names)
-        .await?;
+    let store = state.controller.store().clone();
+    let nodes = store_blocking(store, move |store| {
+        store.repository().count_go_nodes_by_groups_sync(&names)
+    })
+    .await?;
     Ok(Json(json!({"nodes": nodes, "users": 0})))
 }
 
@@ -150,12 +148,10 @@ pub fn subscription_json(record: GoSubscriptionLinkRecord) -> Value {
 }
 
 pub async fn publishes_get_value(state: &ApiState) -> ApiResult {
-    let items = state
-        .controller
-        .store()
-        .repository()
-        .list_go_publishes()
-        .await?
+    let store = state.controller.store().clone();
+    let records =
+        store_blocking(store, |store| store.repository().list_go_publishes_sync()).await?;
+    let items = records
         .into_iter()
         .map(decode_publish_record)
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -170,26 +166,26 @@ pub async fn publish_put_value(state: &ApiState, value: Value) -> ApiResult {
     }
     let data_json = serde_json::to_vec(&publish)
         .map_err(|error| ApiError::bad(format!("encode publish failed: {error}")))?;
-    state
-        .controller
-        .store()
-        .repository()
-        .put_go_publish(&GoPublishRecord {
-            name: publish.name.clone(),
-            updated_at: unix_seconds(),
-            data_json,
-        })
-        .await?;
+    let record = GoPublishRecord {
+        name: publish.name.clone(),
+        updated_at: unix_seconds(),
+        data_json,
+    };
+    let store = state.controller.store().clone();
+    store_blocking(store, move |store| {
+        store.repository().put_go_publish_sync(&record)
+    })
+    .await?;
     empty()
 }
 
 pub async fn publish_delete_value(state: &ApiState, name: String) -> ApiResult {
-    let deleted = state
-        .controller
-        .store()
-        .repository()
-        .delete_go_publish(&name)
-        .await?;
+    let lookup_name = name.clone();
+    let store = state.controller.store().clone();
+    let deleted = store_blocking(store, move |store| {
+        store.repository().delete_go_publish_sync(&lookup_name)
+    })
+    .await?;
     if !deleted {
         return Err(ApiError::not_found(format!(
             "publish {name:?} was not found"
@@ -200,12 +196,11 @@ pub async fn publish_delete_value(state: &ApiState, name: String) -> ApiResult {
 
 pub async fn publish_resolve_value(state: &ApiState, value: &Value) -> ApiResult {
     let name = required_string(value, "name")?;
-    let publish = state
-        .controller
-        .store()
-        .repository()
-        .list_go_publishes()
-        .await?
+    let store = state.controller.store().clone();
+    let records =
+        store_blocking(store, |store| store.repository().list_go_publishes_sync()).await?;
+    let publish = records
+        .into_iter()
         .into_iter()
         .find(|record| record.name == name)
         .map(decode_publish_contract)
@@ -222,11 +217,8 @@ pub async fn publish_resolve_value(state: &ApiState, value: &Value) -> ApiResult
         .points
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
-    let nodes = state
-        .controller
-        .store()
-        .repository()
-        .list_go_nodes()
+    let store = state.controller.store().clone();
+    let nodes = store_blocking(store, |store| store.repository().list_go_nodes_sync())
         .await?
         .into_iter()
         .filter(|node| points.contains(node.id.as_str()))

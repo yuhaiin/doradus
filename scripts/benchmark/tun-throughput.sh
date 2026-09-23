@@ -7,7 +7,12 @@ target_dir="${CARGO_TARGET_DIR:-${cache_root}/cargo-target}"
 scenario_dir="${DORADUS_TUN_BENCH_DIR:-${cache_root}/benchmarks/tun-throughput}"
 image="${DORADUS_TEST_IMAGE:-docker.io/library/debian:testing}"
 bytes="${DORADUS_TUN_BENCH_BYTES:-4194304}"
+direction="${DORADUS_TUN_BENCH_DIRECTION:-echo}"
 binary="${target_dir}/release/tun-smoke"
+if [[ "${direction}" != echo && "${direction}" != download ]]; then
+  echo "DORADUS_TUN_BENCH_DIRECTION must be echo or download" >&2
+  exit 2
+fi
 if [[ ! -c /dev/net/tun ]]; then
   echo "[tun-throughput] /dev/net/tun is not available for the Podman container; skipped (77)" >&2
   exit 77
@@ -22,13 +27,18 @@ fi
 
 mkdir -p "${scenario_dir}"
 
+queue_capacity_env=()
+if [[ -n "${DORADUS_TUN_QUEUE_CAPACITY:-}" ]]; then
+  queue_capacity_env=(-e "DORADUS_TUN_QUEUE_CAPACITY=${DORADUS_TUN_QUEUE_CAPACITY}")
+fi
+
 echo "[tun-throughput] building release TUN smoke benchmark in Podman"
 "${repo_root}/scripts/integration/podman-cargo.sh" \
   --target-dir "${target_dir}" --state-dir "${scenario_dir}" -- \
   cargo build \
   -p doradus-tun \
   --bin tun-smoke \
-  --features tun-routes \
+  --features tun-routes,smoke \
   --release \
   >"${scenario_dir}/build.log"
 test -x "${binary}"
@@ -38,7 +48,9 @@ podman run --rm --privileged --network=none "${tun_device_args[@]}" \
   -v "${binary}:/usr/local/bin/tun-smoke:ro" \
   -v "${scenario_dir}:/state:Z" \
   -e DORADUS_TUN_NAME=yrtun-bench0 \
+  "${queue_capacity_env[@]}" \
   -e DORADUS_TUN_PROXY_THROUGHPUT=1 \
+  -e DORADUS_TUN_BENCH_DIRECTION="${direction}" \
   -e DORADUS_TUN_BENCH_BYTES="${bytes}" \
   "${debug_env[@]}" \
   --entrypoint "${TUN_CONTAINER_ENTRYPOINT}" \

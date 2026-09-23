@@ -343,7 +343,7 @@ impl RuntimeSnapshot {
             let proxy = if members.len() == 1 {
                 members.pop().expect("one node tag member was checked")
             } else {
-                Arc::new(NodeSetProxy::new(members, definition.round_robin)?)
+                Arc::new(NodeSetProxy::new(members, definition.strategy)?)
             };
             tagged.insert(tag.clone(), proxy);
         }

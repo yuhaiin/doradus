@@ -34,18 +34,16 @@ pub async fn settings_get(State(state): State<ApiState>) -> ApiResult {
 }
 
 pub async fn settings_get_value(state: &ApiState) -> ApiResult {
-    if let Some(bytes) = state.controller.store().get_config("settings").await? {
+    let store = state.controller.store().clone();
+    if let Some(bytes) = store_blocking(store, |store| store.get_config_sync("settings")).await? {
         return json_value(canonical_settings_value(&raw_json(
             &bytes,
             default_settings(),
         )));
     }
-    let values = state
-        .controller
-        .store()
-        .repository()
-        .list_go_settings_kv()
-        .await?;
+    let store = state.controller.store().clone();
+    let values =
+        store_blocking(store, |store| store.repository().list_go_settings_kv_sync()).await?;
     if !values.is_empty() {
         return json_value(settings_value_from_go_kv(&values));
     }
@@ -72,16 +70,16 @@ pub async fn backup_config_get_value(state: &ApiState) -> ApiResult {
 }
 
 pub async fn load_backup_config_value(state: &ApiState) -> Result<Value, ApiError> {
-    let value = if let Some(record) = state
-        .controller
-        .store()
-        .repository()
-        .get_go_backup_settings()
-        .await?
-    {
+    let store = state.controller.store().clone();
+    let record = store_blocking(store, |store| {
+        store.repository().get_go_backup_settings_sync()
+    })
+    .await?;
+    let value = if let Some(record) = record {
         raw_json(&record.data_json, default_backup_config())
     } else {
-        let value = state.controller.store().get_config("backup.config").await?;
+        let store = state.controller.store().clone();
+        let value = store_blocking(store, |store| store.get_config_sync("backup.config")).await?;
         value
             .as_deref()
             .map(|bytes| raw_json(bytes, default_backup_config()))
@@ -425,12 +423,11 @@ pub async fn inbounds_config_put(
 }
 
 pub async fn inbounds_config_get_value(state: &ApiState) -> ApiResult {
-    let settings = state
-        .controller
-        .store()
-        .repository()
-        .get_inbound_settings()
-        .await?;
+    let store = state.controller.store().clone();
+    let settings = store_blocking(store, |store| {
+        store.repository().get_inbound_settings_sync()
+    })
+    .await?;
     json_value(serde_json::to_value(settings)?)
 }
 
