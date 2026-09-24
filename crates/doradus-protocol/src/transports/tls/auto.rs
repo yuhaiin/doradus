@@ -850,9 +850,7 @@ fn generate_ca() -> Result<(Vec<u8>, Vec<u8>)> {
 
 fn pem_block(label: &str, der: &[u8]) -> Vec<u8> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(der);
-    let mut pem = Vec::with_capacity(
-        label.len() * 2 + encoded.len() + 32 + encoded.len() / 64,
-    );
+    let mut pem = Vec::with_capacity(label.len() * 2 + encoded.len() + 32 + encoded.len() / 64);
     pem.extend_from_slice(b"-----BEGIN ");
     pem.extend_from_slice(label.as_bytes());
     pem.extend_from_slice(b"-----\n");
