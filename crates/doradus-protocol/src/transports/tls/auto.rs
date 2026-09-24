@@ -840,7 +840,30 @@ fn generate_ca() -> Result<(Vec<u8>, Vec<u8>)> {
             format!("TLS-auto CA private key: {error}"),
         )
     })?;
-    Ok((certificate, key.as_bytes().to_vec()))
+    // Go's contract stores Base64-encoded PEM, which the management UI decodes
+    // back to text. Keep the decoded CA fields readable instead of exposing DER.
+    Ok((
+        pem_block("CERTIFICATE", &certificate),
+        pem_block("PRIVATE KEY", key.as_bytes()),
+    ))
+}
+
+fn pem_block(label: &str, der: &[u8]) -> Vec<u8> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut pem = Vec::with_capacity(
+        label.len() * 2 + encoded.len() + 32 + encoded.len() / 64,
+    );
+    pem.extend_from_slice(b"-----BEGIN ");
+    pem.extend_from_slice(label.as_bytes());
+    pem.extend_from_slice(b"-----\n");
+    for line in encoded.as_bytes().chunks(64) {
+        pem.extend_from_slice(line);
+        pem.push(b'\n');
+    }
+    pem.extend_from_slice(b"-----END ");
+    pem.extend_from_slice(label.as_bytes());
+    pem.extend_from_slice(b"-----\n");
+    pem
 }
 
 #[cfg(test)]
