@@ -96,10 +96,7 @@ impl ConnectionMonitor {
             TunFlowDirection::Download => counter.0 = counter.0.saturating_add(bytes),
         }
         if let Some(inbound_id) = inbound_id {
-            let statistics = state
-                .inbound_bytes
-                .entry(inbound_id.to_string())
-                .or_default();
+            let statistics = state.inbound_bytes.entry(inbound_id).or_default();
             match direction {
                 TunFlowDirection::Upload => {
                     statistics.1 = statistics.1.saturating_add(bytes);
@@ -173,7 +170,7 @@ impl ConnectionMonitor {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for (id, (download, upload)) in &traffic.inbound_bytes {
-                let entry = inbound_bytes.entry(id.clone()).or_default();
+                let entry = inbound_bytes.entry(id.to_string()).or_default();
                 entry.0 = entry.0.saturating_add(*download);
                 entry.1 = entry.1.saturating_add(*upload);
             }

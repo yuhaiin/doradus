@@ -102,41 +102,11 @@ pub fn track_datagram(
     })
 }
 
-pub fn track_tagged_proxies(
-    proxies: BTreeMap<String, Arc<dyn AsyncProxy>>,
-    detector: &LoopbackDetector,
-) -> BTreeMap<String, Arc<dyn AsyncProxy>> {
-    proxies
-        .into_iter()
-        .map(|(tag, proxy)| {
-            (
-                tag,
-                Arc::new(LoopbackTrackingProxy {
-                    inner: proxy,
-                    detector: detector.clone(),
-                }) as Arc<dyn AsyncProxy>,
-            )
-        })
-        .collect()
-}
-
-pub fn track_selector(
-    selector: RuntimeRoutedProxySelector,
-    detector: &LoopbackDetector,
-) -> RuntimeRoutedProxySelector {
-    let wrap = |inner: Arc<dyn AsyncProxy>| {
-        Arc::new(LoopbackTrackingProxy {
-            inner,
-            detector: detector.clone(),
-        }) as Arc<dyn AsyncProxy>
-    };
-    RuntimeRoutedProxySelector {
-        router: selector.router,
-        direct: wrap(selector.direct),
-        proxy: wrap(selector.proxy),
-        bypass: wrap(selector.bypass),
-        drop: wrap(selector.drop),
-    }
+pub fn track_proxy(inner: Arc<dyn AsyncProxy>, detector: &LoopbackDetector) -> Arc<dyn AsyncProxy> {
+    Arc::new(LoopbackTrackingProxy {
+        inner,
+        detector: detector.clone(),
+    })
 }
 
 impl AsyncProxy for LoopbackTrackingProxy {

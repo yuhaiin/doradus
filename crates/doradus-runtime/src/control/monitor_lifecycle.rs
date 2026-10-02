@@ -148,7 +148,7 @@ impl ConnectionMonitor {
             let mut projection = entry.record.projection.clone();
             let changed = merge_connection_metadata(&mut projection, update);
             if changed {
-                entry.telemetry = Arc::from(telemetry_dimensions(&projection));
+                entry.telemetry = shared_telemetry(&projection);
                 entry.record.refresh_projection(projection, &context);
                 let mut traffic = self.traffic_lock(flow.key);
                 if let Some(flow_entry) = traffic.flows.get_mut(&flow.key) {
@@ -172,7 +172,7 @@ impl ConnectionMonitor {
         state.next_id = state.next_id.saturating_add(1);
         let id = state.next_id.to_string();
         let value = connection_value(&id, flow, &context);
-        let telemetry = Arc::from(telemetry_dimensions(&value));
+        let telemetry = shared_telemetry(&value);
         let record = ConnectionRecord::from_projection(value.clone(), &context);
         if let Some(inbound_id) = context.inbound_id.clone() {
             let statistics = state.inbound_statistics.entry(inbound_id).or_default();
@@ -190,7 +190,7 @@ impl ConnectionMonitor {
         }
         state.ids.insert(id.clone(), flow.key);
         let traffic_entry = TrafficFlowEntry {
-            id: id.clone(),
+            id: Arc::from(id.as_str()),
             telemetry: Arc::clone(&telemetry),
             inbound_id: record.inbound_id.clone(),
             is_tun: record.is_tun,
@@ -227,7 +227,7 @@ impl ConnectionMonitor {
         {
             let mut traffic = self.traffic_lock(flow);
             traffic.flows.remove(&flow);
-            traffic.counters.remove(&entry.id);
+            traffic.counters.remove(entry.id.as_str());
         }
         self.metrics.connection_closed();
         if let Some(inbound_id) = entry.record.inbound_id.as_deref() {
@@ -313,4 +313,11 @@ impl ConnectionMonitor {
         self.mark_dirty();
         self.emit("connections_removed", json!({"ids": [id]}));
     }
+}
+
+fn shared_telemetry(value: &Value) -> Arc<[(Arc<str>, Arc<str>)]> {
+    telemetry_dimensions(value)
+        .into_iter()
+        .map(|(dimension, value)| (Arc::from(dimension), Arc::from(value)))
+        .collect()
 }

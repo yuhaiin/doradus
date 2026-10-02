@@ -66,9 +66,9 @@ pub(crate) use snapshot::{
 };
 pub use snapshot::{install_go_snapshot, install_go_snapshot_with_manifest, restore_database};
 pub use statistics::{
-    GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsDelta, GoStatisticsSnapshot,
-    GoTelemetryBucketRecord, GoTrafficBucketRecord, TELEMETRY_DAILY_BUCKET_SECONDS,
-    TELEMETRY_HOURLY_BUCKET_SECONDS,
+    GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsDelta, GoStatisticsQuery,
+    GoStatisticsSnapshot, GoTelemetryBucketRecord, GoTrafficBucketRecord,
+    TELEMETRY_DAILY_BUCKET_SECONDS, TELEMETRY_HOURLY_BUCKET_SECONDS,
 };
 pub use status::StorageStatus;
 pub use users::{

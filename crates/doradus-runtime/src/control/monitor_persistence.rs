@@ -47,6 +47,7 @@ impl ConnectionMonitor {
         let persistence = Arc::new(PersistenceState {
             store,
             dirty: AtomicBool::new(false),
+            snapshot_lock: Mutex::new(()),
             shutdown,
             worker: AsyncMutex::new(None),
         });
@@ -70,39 +71,7 @@ impl ConnectionMonitor {
                 if !worker_persistence.dirty.swap(false, Ordering::AcqRel) {
                     continue;
                 }
-                let delta = writer_monitor.take_statistics_delta();
-                let inbound_statistics = writer_monitor.inbound_statistics();
-                let store = worker_persistence.store.clone();
-                let write_delta = delta.clone();
-                let result = match tokio::task::spawn_blocking(move || {
-                    store.try_apply_go_statistics_delta(&write_delta)
-                })
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => Err(doradus_core::Error::new(
-                        doradus_core::ErrorKind::Storage,
-                        format!("statistics persistence task: {error}"),
-                    )),
-                };
-                if result.is_err() {
-                    writer_monitor.merge_statistics_delta(delta);
-                    worker_persistence.dirty.store(true, Ordering::Release);
-                    continue;
-                }
-                let store = worker_persistence.store.clone();
-                let result = match tokio::task::spawn_blocking(move || {
-                    store.replace_inbound_statistics(&inbound_statistics)
-                })
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => Err(doradus_core::Error::new(
-                        doradus_core::ErrorKind::Storage,
-                        format!("inbound statistics persistence task: {error}"),
-                    )),
-                };
-                if result.is_err() {
+                if writer_monitor.persist_now().await.is_err() {
                     worker_persistence.dirty.store(true, Ordering::Release);
                 }
             }
@@ -139,43 +108,40 @@ impl ConnectionMonitor {
         Ok(())
     }
 
-    async fn persist_now(&self) -> doradus_core::Result<()> {
+    pub(super) async fn persist_now(&self) -> doradus_core::Result<()> {
         let Some(persistence) = self.persistence.clone() else {
             return Ok(());
         };
-        let delta = self.take_statistics_delta();
-        let inbound_statistics = self.inbound_statistics();
-        let store = persistence.store.clone();
-        let write_delta = delta.clone();
-        let result = match tokio::task::spawn_blocking(move || {
-            store.try_apply_go_statistics_delta(&write_delta)
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                self.merge_statistics_delta(delta);
-                return Err(doradus_core::Error::new(
-                    doradus_core::ErrorKind::Storage,
-                    format!("statistics persistence task: {error}"),
-                ));
-            }
-        };
-        if let Err(error) = result {
-            self.merge_statistics_delta(delta);
-            return Err(error);
-        }
-        let store = persistence.store.clone();
-        match tokio::task::spawn_blocking(move || {
-            store.replace_inbound_statistics(&inbound_statistics)
-        })
-        .await
+        let monitor = self.clone();
+        match tokio::task::spawn_blocking(move || monitor.persist_statistics_blocking(&persistence))
+            .await
         {
             Ok(result) => result,
             Err(error) => Err(doradus_core::Error::new(
                 doradus_core::ErrorKind::Storage,
-                format!("inbound statistics persistence task: {error}"),
+                format!("statistics persistence task: {error}"),
             )),
         }
+    }
+
+    fn persist_statistics_blocking(
+        &self,
+        persistence: &PersistenceState,
+    ) -> doradus_core::Result<()> {
+        // Readers must see either the pending delta or its committed rows.
+        // Keep the transfer under one gate, entirely on the blocking worker.
+        let _snapshot = persistence
+            .snapshot_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let delta = self.take_statistics_delta();
+        if let Err(error) = persistence.store.try_apply_go_statistics_delta(&delta) {
+            self.merge_statistics_delta(delta);
+            persistence.dirty.store(true, Ordering::Release);
+            return Err(error);
+        }
+        persistence
+            .store
+            .replace_inbound_statistics(&self.inbound_statistics())
     }
 }

@@ -82,6 +82,14 @@ impl TunProxyRuntime {
         output: ProxyOutput,
     ) -> Result<bool> {
         match output {
+            ProxyOutput::ProcessResolved {
+                source,
+                id,
+                process,
+            } => {
+                self.complete_process_lookup(source, id, process, dispatcher)?;
+                Ok(true)
+            }
             ProxyOutput::TcpData { flow, payload } => {
                 self.touch_flow(flow)?;
                 if let Some(observer) = &self.observer {

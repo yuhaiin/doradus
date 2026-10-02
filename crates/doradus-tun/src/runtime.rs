@@ -573,6 +573,7 @@ impl TunRuntime {
             let timestamp = elapsed_timestamp(started);
 
             let next_poll_delay = dispatcher.poll_delay(&mut self.interface, timestamp);
+            let maintenance_deadline = proxy_runtime.maintenance_deadline();
 
             let interceptor_output = tokio::select! {
                 result = self.recv_available_from_tun() => {
@@ -591,6 +592,13 @@ impl TunRuntime {
                 output = interceptor.wait_for_output() => {
                     Some(output)
                 }
+
+                _ = async {
+                    match maintenance_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => { None }
 
                 _ = TunRuntime::wait_smoltcp_timer(next_poll_delay) => {
                     None
@@ -692,7 +700,7 @@ impl TunRuntime {
 
         // Lifecycle / maintenance
         proxy_runtime
-            .sweep(dispatcher)
+            .maintain(dispatcher)
             .map_err(|error| io::Error::other(error.to_string()))?;
 
         // smoltcp -> OS TUN

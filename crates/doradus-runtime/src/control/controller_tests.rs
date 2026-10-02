@@ -603,6 +603,8 @@ fn tun_runtime_restores_fakeip_domain_before_route_and_monitor_open() {
         8,
     ))
     .unwrap();
+    // Synthetic socket tuples have no OS owner; this test exercises FakeIP restoration.
+    runtime.set_process_resolver(None);
     let flow = doradus_core::flow::Flow {
         key: doradus_core::flow::FlowKey {
             network: Network::Tcp,
@@ -738,4 +740,115 @@ async fn inbound_supervisor_survives_a_burst_exceeding_reload_capacity() {
                 .unwrap();
         })
         .await;
+}
+
+fn direct_node(id: &str) -> GoNodeRecord {
+    GoNodeRecord {
+        id: id.into(),
+        name: id.into(),
+        group_name: "test".into(),
+        origin: "test".into(),
+        enabled: true,
+        chain_types_json: br#"["direct"]"#.to_vec(),
+        updated_at: 1,
+        data_json: br#"{"protocol":"direct"}"#.to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn deleting_selected_node_keeps_fallback_across_repeated_reloads() {
+    let controller = RuntimeController::from_builder(RuntimeBuilder::new(
+        ConfigStore::open_memory().await.unwrap(),
+        Arc::new(SystemAsyncIpResolver),
+    ))
+    .await
+    .unwrap();
+    controller
+        .store()
+        .repository()
+        .put_go_node(&direct_node("victim"))
+        .await
+        .unwrap();
+    controller.reload().await.unwrap();
+    let selector = controller
+        .build_proxy_selector("", "victim", "", "", std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    controller.retarget_node_to_direct("victim").await.unwrap();
+    controller
+        .mutate_and_reload(|store| async move {
+            store.repository().delete_go_node("victim").await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    controller.reload().await.unwrap();
+    controller.reload().await.unwrap();
+    assert!(controller.active_proxy_ids().is_empty());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut context = FlowContext::new(Endpoint::ip(Network::Tcp, listener.local_addr().unwrap()));
+    context.route_mode = RouteMode::Proxy;
+    assert!(selector.select(&context).connect(&context).await.is_ok());
+}
+
+#[tokio::test]
+async fn closing_tag_member_preserves_other_tags_and_remaining_members() {
+    let controller = RuntimeController::from_builder(RuntimeBuilder::new(
+        ConfigStore::open_memory().await.unwrap(),
+        Arc::new(SystemAsyncIpResolver),
+    ))
+    .await
+    .unwrap();
+    for id in ["victim", "survivor"] {
+        controller
+            .store()
+            .repository()
+            .put_go_node(&direct_node(id))
+            .await
+            .unwrap();
+    }
+    for (tag, members) in [
+        ("only-victim", vec!["victim"]),
+        ("only-survivor", vec!["survivor"]),
+        ("both", vec!["victim", "survivor"]),
+    ] {
+        controller
+            .store()
+            .repository()
+            .put_go_node_tag(&doradus_store::GoNodeTagRecord {
+                id: tag.into(),
+                name: tag.into(),
+                updated_at: 1,
+                members_json: serde_json::to_vec(
+                    &serde_json::json!({"type":"node","hash":members}),
+                )
+                .unwrap(),
+            })
+            .await
+            .unwrap();
+    }
+    controller.reload().await.unwrap();
+    // The victim is deliberately referenced by tags only.
+    let selector = controller
+        .build_proxy_selector("", "survivor", "", "", std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut context = FlowContext::new(Endpoint::ip(Network::Tcp, listener.local_addr().unwrap()));
+    context.route_mode = RouteMode::Proxy;
+    context.tag = Some("only-survivor".into());
+    let unaffected = selector.select(&context);
+    controller.close_node("victim").await.unwrap();
+    assert!(Arc::ptr_eq(&unaffected, &selector.select(&context)));
+    context.tag = Some("only-victim".into());
+    assert!(selector.select(&context).connect(&context).await.is_err());
+    context.tag = Some("both".into());
+    assert!(selector.select(&context).connect(&context).await.is_ok());
+    // Closing a selected node must also leave unrelated tags untouched.
+    controller.reload().await.unwrap();
+    context.tag = Some("only-victim".into());
+    let unaffected = selector.select(&context);
+    controller.close_node("survivor").await.unwrap();
+    assert!(Arc::ptr_eq(&unaffected, &selector.select(&context)));
+    assert!(unaffected.connect(&context).await.is_ok());
 }

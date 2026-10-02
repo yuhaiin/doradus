@@ -111,10 +111,10 @@ impl RuntimeProxySelector {
 impl AsyncProxySelector for RuntimeProxySelector {
     fn route_context(&self, context: &mut FlowContext) {
         let state = self.state.load();
-        let direct_id = self.effective_node_id(&state, &self.direct_id);
-        let proxy_id = self.effective_node_id(&state, &self.proxy_id);
-        let udp_proxy_id = self.effective_node_id(&state, &self.udp_proxy_id);
-        let bypass_id = self.effective_node_id(&state, &self.bypass_id);
+        let direct_id = &state.selection.direct;
+        let proxy_id = &state.selection.tcp;
+        let udp_proxy_id = &state.selection.udp;
+        let bypass_id = &state.selection.bypass;
         let metadata = Arc::clone(&state.metadata);
         self.restore_fakeip_destination(context, &metadata);
         self.apply_hosts_override(context, &metadata);
@@ -139,26 +139,20 @@ impl AsyncProxySelector for RuntimeProxySelector {
         annotate_connection_metadata(
             context,
             &metadata,
-            &direct_id,
-            &proxy_id,
-            &udp_proxy_id,
-            &bypass_id,
+            direct_id,
+            proxy_id,
+            udp_proxy_id,
+            bypass_id,
         );
     }
 
     fn select(&self, context: &FlowContext) -> Arc<dyn AsyncProxy> {
         let state = self.state.load();
-        if context.route_mode != doradus_core::RouteMode::Block {
-            let tagged = if context.network == doradus_core::Network::Udp {
-                &state.udp_tagged
-            } else {
-                &state.tagged
-            };
-            if let Some(tag) = context.tag.as_deref().filter(|tag| !tag.trim().is_empty())
-                && let Some(proxy) = tagged.get(tag)
-            {
-                return Arc::clone(proxy);
-            }
+        if context.route_mode != doradus_core::RouteMode::Block
+            && let Some(tag) = context.tag.as_deref().filter(|tag| !tag.trim().is_empty())
+            && let Some(binding) = state.tagged.get(tag)
+        {
+            return Arc::clone(&binding.proxy);
         }
         let current = if context.network == doradus_core::Network::Udp {
             &state.udp_current

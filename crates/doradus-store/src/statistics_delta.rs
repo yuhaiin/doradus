@@ -17,7 +17,7 @@ pub(super) fn apply_delta(connection: &Connection, delta: &GoStatisticsDelta) ->
         && table_has_column(connection, "traffic_dimension_hourly", "dimension")
             .map_err(storage_error)?
     {
-        let existing = load(connection)?;
+        let existing = load(connection, GoStatisticsQuery::All)?;
         replace(connection, &existing)?;
     }
     connection

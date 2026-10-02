@@ -75,13 +75,34 @@ pub struct GoStatisticsDelta {
     pub telemetry: Vec<GoTelemetryBucketRecord>,
 }
 
+/// Select only the durable projection needed by an API request.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum GoStatisticsQuery {
+    #[default]
+    All,
+    Traffic {
+        from: i64,
+        to: i64,
+    },
+    Telemetry {
+        from: i64,
+        to: i64,
+    },
+    History,
+    FailedHistory,
+}
+
 impl ConfigStore {
     /// Read the durable statistics written by the Go runtime, if those tables
     /// exist. Missing optional tables are treated as an empty snapshot so a
     /// fresh Rust database does not need a fake Go bootstrap migration.
     pub fn load_go_statistics(&self) -> Result<GoStatisticsSnapshot> {
+        self.query_go_statistics(GoStatisticsQuery::All)
+    }
+
+    pub fn query_go_statistics(&self, query: GoStatisticsQuery) -> Result<GoStatisticsSnapshot> {
         let connection = self.lock_connection()?;
-        load(&connection)
+        load(&connection, query)
     }
 
     /// Read only the two durable totals needed to initialise the live

@@ -57,6 +57,17 @@ struct NatBinding {
 struct NatState {
     entries: HashMap<NatBindingKey, NatBinding>,
     translated: HashMap<NatEndpointKey, NatBindingKey>,
+    active_destinations: usize,
+}
+
+impl NatState {
+    fn remove_binding(&mut self, key: &NatBindingKey) -> Option<NatBinding> {
+        let binding = self.entries.remove(key)?;
+        self.translated
+            .remove(&NatEndpointKey::new(key.network, binding.entry.translated));
+        self.active_destinations -= binding.destinations.len();
+        Some(binding)
+    }
 }
 
 /// A point-in-time view of the endpoint-independent Full Cone NAT table.
@@ -124,6 +135,7 @@ impl NatTable {
             state: Arc::new(Mutex::new(NatState {
                 entries: HashMap::new(),
                 translated: HashMap::new(),
+                active_destinations: 0,
             })),
             metrics: Arc::new(NatMetrics::default()),
         }
@@ -154,7 +166,9 @@ impl NatTable {
                 ));
             }
             binding.entry.last_seen = now;
-            binding.destinations.insert(key.destination);
+            if binding.destinations.insert(key.destination) {
+                state.active_destinations += 1;
+            }
             self.metrics.reuses.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
@@ -182,6 +196,7 @@ impl NatTable {
         state
             .translated
             .insert(NatEndpointKey::new(key.network, translated), binding_key);
+        state.active_destinations += 1;
         self.metrics.allocations.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -197,12 +212,7 @@ impl NatTable {
             .get(&binding_key)
             .is_some_and(|binding| binding.entry.is_expired(Instant::now()));
         if expired {
-            let removed = state.entries.remove(&binding_key);
-            if let Some(binding) = removed {
-                state.translated.remove(&NatEndpointKey::new(
-                    binding_key.network,
-                    binding.entry.translated,
-                ));
+            if state.remove_binding(&binding_key).is_some() {
                 self.metrics
                     .expired_bindings
                     .fetch_add(1, Ordering::Relaxed);
@@ -216,9 +226,11 @@ impl NatTable {
         };
         let now = Instant::now();
         binding.entry.last_seen = now;
-        binding.destinations.insert(key.destination);
+        let inserted = binding.destinations.insert(key.destination);
+        let entry = binding.entry.clone();
+        state.active_destinations += usize::from(inserted);
         self.metrics.touch_hits.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(binding.entry.clone()))
+        Ok(Some(entry))
     }
 
     /// Bind the endpoint-independent source mapping to the endpoint that the
@@ -243,13 +255,9 @@ impl NatTable {
             .get(&binding_key)
             .is_some_and(|binding| binding.entry.is_expired(now));
         if expired {
-            let removed = state
-                .entries
-                .remove(&binding_key)
-                .expect("binding was present");
             state
-                .translated
-                .remove(&NatEndpointKey::new(network, removed.entry.translated));
+                .remove_binding(&binding_key)
+                .expect("binding was present");
             self.metrics
                 .expired_bindings
                 .fetch_add(1, Ordering::Relaxed);
@@ -304,18 +312,16 @@ impl NatTable {
         let Some(binding) = state.entries.get_mut(&binding_key) else {
             return Ok(None);
         };
-        binding.destinations.remove(&key.destination);
-        if !binding.destinations.is_empty() {
-            return Ok(Some(binding.entry.clone()));
+        let removed = binding.destinations.remove(&key.destination);
+        let empty = binding.destinations.is_empty();
+        let entry = binding.entry.clone();
+        state.active_destinations -= usize::from(removed);
+        if !empty {
+            return Ok(Some(entry));
         }
         let binding = state
-            .entries
-            .remove(&binding_key)
+            .remove_binding(&binding_key)
             .expect("binding was present");
-        state.translated.remove(&NatEndpointKey::new(
-            binding_key.network,
-            binding.entry.translated,
-        ));
         self.metrics.explicit_closes.fetch_add(1, Ordering::Relaxed);
         Ok(Some(binding.entry))
     }
@@ -330,13 +336,10 @@ impl NatTable {
             .state
             .lock()
             .map_err(|_| Error::new(ErrorKind::Closed, "NAT table lock poisoned"))?;
-        let binding = state.entries.remove(&binding_key);
+        let binding = state.remove_binding(&binding_key);
         let Some(binding) = binding else {
             return Ok(0);
         };
-        state
-            .translated
-            .remove(&NatEndpointKey::new(network, binding.entry.translated));
         self.metrics.explicit_closes.fetch_add(1, Ordering::Relaxed);
         Ok(binding.destinations.len())
     }
@@ -365,19 +368,16 @@ impl NatTable {
                         destination: *destination,
                     })
                     .collect::<Vec<_>>();
-                (*binding_key, binding.entry.translated, keys)
+                (*binding_key, keys)
             })
             .collect();
-        for (binding_key, translated, _) in &expired {
-            state.entries.remove(binding_key);
-            state
-                .translated
-                .remove(&NatEndpointKey::new(binding_key.network, *translated));
+        for (binding_key, _) in &expired {
+            state.remove_binding(binding_key);
         }
         self.metrics
             .expired_bindings
             .fetch_add(expired.len() as u64, Ordering::Relaxed);
-        Ok(expired.into_iter().flat_map(|(_, _, keys)| keys).collect())
+        Ok(expired.into_iter().flat_map(|(_, keys)| keys).collect())
     }
 
     /// Look up a translated endpoint without checking the external source.
@@ -405,13 +405,9 @@ impl NatTable {
             return Ok(None);
         };
         if current.entry.is_expired(Instant::now()) {
-            let binding = state
-                .entries
-                .remove(&binding_key)
-                .expect("binding was present");
             state
-                .translated
-                .remove(&NatEndpointKey::new(network, binding.entry.translated));
+                .remove_binding(&binding_key)
+                .expect("binding was present");
             self.metrics
                 .expired_bindings
                 .fetch_add(1, Ordering::Relaxed);
@@ -448,13 +444,9 @@ impl NatTable {
             return Ok(None);
         };
         if current.entry.is_expired(Instant::now()) {
-            let binding = state
-                .entries
-                .remove(&binding_key)
-                .expect("binding was present");
             state
-                .translated
-                .remove(&NatEndpointKey::new(network, binding.entry.translated));
+                .remove_binding(&binding_key)
+                .expect("binding was present");
             self.metrics
                 .expired_bindings
                 .fetch_add(1, Ordering::Relaxed);
@@ -486,11 +478,7 @@ impl NatTable {
             .map_err(|_| Error::new(ErrorKind::Closed, "NAT table lock poisoned"))?;
         Ok(NatStats {
             active_bindings: state.entries.len(),
-            active_destinations: state
-                .entries
-                .values()
-                .map(|binding| binding.destinations.len())
-                .sum(),
+            active_destinations: state.active_destinations,
             reverse_mappings: state.translated.len(),
             allocations: self.metrics.allocations.load(Ordering::Relaxed),
             reuses: self.metrics.reuses.load(Ordering::Relaxed),

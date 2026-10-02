@@ -392,6 +392,48 @@ pub fn decode_raw_query_key(packet: &[u8]) -> Result<(DomainName, u16)> {
     ))
 }
 
+/// Canonical request semantics shared by the raw cache and singleflight.
+/// Keep every flag and EDNS option; only the ID and question spelling are
+/// caller-specific. Signed and multi-question messages bypass this machinery.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RawDnsCacheKey(Vec<u8>);
+
+impl RawDnsCacheKey {
+    pub(crate) fn from_packet(packet: &[u8]) -> Result<Option<Self>> {
+        let mut message = Message::from_vec(packet)
+            .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
+        if message.queries.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "DNS request has no question",
+            ));
+        }
+        if message.queries.len() != 1
+            || message.metadata.message_type != MessageType::Query
+            || message.metadata.op_code != hickory_proto::op::OpCode::Query
+            || !message.answers.is_empty()
+            || !message.authorities.is_empty()
+            || !message.additionals.is_empty()
+            || message.signature.is_some()
+        {
+            return Ok(None);
+        }
+        message.metadata.id = 0;
+        let query = &mut message.queries[0];
+        query.set_name(query.name().to_lowercase());
+        message
+            .to_vec()
+            .map(|packet| Some(Self(packet)))
+            .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_question(domain: &DomainName, record_type: u16) -> Result<Self> {
+        Self::from_packet(&encode_raw_query(0, domain, record_type)?)?
+            .ok_or_else(|| Error::invalid("typed DNS query is not cacheable"))
+    }
+}
+
 /// Rewrite a DNS transaction ID after serving a response from the raw cache.
 pub fn rewrite_dns_transaction_id(mut packet: Vec<u8>, id: u16) -> Result<Vec<u8>> {
     if packet.len() < 2 {
@@ -487,6 +529,23 @@ pub fn validate_response_packet(query: &[u8], response: &[u8]) -> Result<()> {
         return Err(Error::new(
             ErrorKind::Protocol,
             "DNS upstream returned a query instead of a response",
+        ));
+    }
+    if response_message.metadata.op_code != query.metadata.op_code
+        || response_message.queries.len() != query.queries.len()
+        || !response_message
+            .queries
+            .iter()
+            .zip(&query.queries)
+            .all(|(answer, question)| {
+                answer.name() == question.name()
+                    && answer.query_type() == question.query_type()
+                    && answer.query_class() == question.query_class()
+            })
+    {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "DNS response question mismatch",
         ));
     }
     Ok(())

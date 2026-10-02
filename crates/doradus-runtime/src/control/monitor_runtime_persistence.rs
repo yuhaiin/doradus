@@ -3,9 +3,21 @@
 use super::*;
 
 impl ConnectionMonitor {
+    #[cfg(test)]
     pub(super) fn durable_snapshot(&self) -> Option<GoStatisticsSnapshot> {
-        let store = self.persistence.as_ref()?.store.clone();
-        let mut snapshot = store.load_go_statistics().ok()?;
+        self.durable_snapshot_for(GoStatisticsQuery::All)
+    }
+
+    pub(super) fn durable_snapshot_for(
+        &self,
+        query: GoStatisticsQuery,
+    ) -> Option<GoStatisticsSnapshot> {
+        let persistence = self.persistence.as_ref()?;
+        let _snapshot = persistence
+            .snapshot_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut snapshot = persistence.store.query_go_statistics(query).ok()?;
         let delta = {
             let state = self.lock();
             let mut delta = pending_delta_from_state(&state);
@@ -29,8 +41,8 @@ impl ConnectionMonitor {
                         GoTelemetryBucketRecord {
                             bucket: *bucket,
                             span_seconds: *span_seconds,
-                            dimension: dimension.clone(),
-                            value: value.clone(),
+                            dimension: dimension.to_string(),
+                            value: value.to_string(),
                             download: *download,
                             upload: *upload,
                             failures: *failures,
@@ -40,6 +52,42 @@ impl ConnectionMonitor {
             }
             delta
         };
+        let mut delta = delta;
+        match query {
+            GoStatisticsQuery::Traffic { from, to } => {
+                delta
+                    .traffic
+                    .retain(|item| item.bucket >= from && item.bucket < to);
+                delta.telemetry.clear();
+                delta.history.clear();
+                delta.failed_history.clear();
+            }
+            GoStatisticsQuery::Telemetry { from, to } => {
+                delta.telemetry.retain(|item| {
+                    let span = normalize_telemetry_bucket_span_seconds(item.span_seconds);
+                    item.bucket < to
+                        && if span == TELEMETRY_DAILY_BUCKET_SECONDS {
+                            item.bucket.saturating_add(span) > from
+                        } else {
+                            item.bucket >= from
+                        }
+                });
+                delta.traffic.clear();
+                delta.history.clear();
+                delta.failed_history.clear();
+            }
+            GoStatisticsQuery::History => {
+                delta.traffic.clear();
+                delta.telemetry.clear();
+                delta.failed_history.clear();
+            }
+            GoStatisticsQuery::FailedHistory => {
+                delta.traffic.clear();
+                delta.telemetry.clear();
+                delta.history.clear();
+            }
+            GoStatisticsQuery::All => {}
+        }
         apply_delta_to_snapshot(&mut snapshot, delta);
         Some(snapshot)
     }
@@ -95,8 +143,8 @@ impl ConnectionMonitor {
                             GoTelemetryBucketRecord {
                                 bucket,
                                 span_seconds,
-                                dimension,
-                                value,
+                                dimension: dimension.to_string(),
+                                value: value.to_string(),
                                 download,
                                 upload,
                                 failures,
@@ -160,8 +208,8 @@ impl ConnectionMonitor {
                 .entry((
                     telemetry.bucket,
                     telemetry.span_seconds,
-                    telemetry.dimension,
-                    telemetry.value,
+                    Arc::from(telemetry.dimension),
+                    Arc::from(telemetry.value),
                 ))
                 .or_default();
             item.0 = item.0.saturating_add(telemetry.download);

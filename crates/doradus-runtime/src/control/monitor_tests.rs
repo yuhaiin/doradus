@@ -1041,9 +1041,29 @@ fn monitor_force_abort_child() {
         monitor.closed(flow.key);
         monitor.record_failure("tcp", "resolver.example:443", "selected tcp node not found");
 
-        // Keep the process alive so the parent can kill it before any
-        // graceful monitor shutdown or Drop-based cleanup can run.
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Signal only after the periodic worker has committed all records.
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let snapshot = monitor
+                    .persistence
+                    .as_ref()
+                    .unwrap()
+                    .store
+                    .load_go_statistics()
+                    .unwrap();
+                if snapshot.total_upload == 29
+                    && snapshot.history.len() == 1
+                    && snapshot.failed_history.len() == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child checkpoint did not become durable");
+        println!("CHECKPOINT_READY");
+        std::future::pending::<()>().await;
     });
 }
 
@@ -1057,18 +1077,27 @@ fn monitor_recovers_checkpoint_after_force_abort() {
         .arg("control::monitor::tests::monitor_force_abort_child")
         .arg("--nocapture")
         .env("DORADUS_RUNTIME_MONITOR_CRASH_CHILD_PATH", &path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
 
-    // The persistence worker's first interval tick is immediate, but the
-    // SQLite checkpoint may wait for a blocking worker under load. Keep a
-    // bounded window that is long enough for CI while still terminating the
-    // child far before its ten-second sleep ends.
-    std::thread::sleep(Duration::from_secs(2));
-    child.kill().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            if line.unwrap_or_default().trim() == "CHECKPOINT_READY" {
+                let _ = ready_tx.send(());
+                break;
+            }
+        }
+    });
+    let ready = ready_rx.recv_timeout(Duration::from_secs(10));
+    let _ = child.kill();
     let status = child.wait().unwrap();
+    reader.join().unwrap();
+    ready.expect("crash child did not report a durable checkpoint");
     assert!(!status.success(), "crash child must not exit gracefully");
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1192,5 +1221,48 @@ async fn monitor_migrates_legacy_runtime_blob_into_go_tables_once() {
     let statistics = store.load_go_statistics().unwrap();
     assert_eq!(statistics.total_upload, 7);
     assert_eq!(statistics.history[0].count, 2);
+    monitor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn live_statistics_stay_consistent_while_batches_are_persisted() {
+    let monitor = ConnectionMonitor::load_with_store(ConfigStore::open_memory().await.unwrap())
+        .await
+        .unwrap();
+    let (flow, context) = flow();
+    monitor.opened(flow, context);
+    let producer = monitor.clone();
+    let writer = tokio::spawn(async move {
+        for index in 0..300 {
+            producer.bytes(flow.key, TunFlowDirection::Upload, 1);
+            if index % 3 == 0 {
+                producer.persist_now().await.unwrap();
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    let reader = monitor.clone();
+    tokio::task::spawn_blocking(move || {
+        for _ in 0..300 {
+            let snapshot = reader.durable_snapshot().unwrap();
+            assert_eq!(
+                snapshot.traffic.iter().map(|item| item.upload).sum::<u64>(),
+                snapshot.total_upload
+            );
+            assert_eq!(
+                snapshot
+                    .telemetry
+                    .iter()
+                    .filter(|item| item.dimension == "protocol")
+                    .map(|item| item.upload)
+                    .sum::<u64>(),
+                snapshot.total_upload
+            );
+        }
+    })
+    .await
+    .unwrap();
+    writer.await.unwrap();
+    assert_eq!(monitor.total_flow_value()["upload"], "300");
     monitor.shutdown().await.unwrap();
 }

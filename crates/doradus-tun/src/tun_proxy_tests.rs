@@ -3,8 +3,8 @@ use super::*;
 use smoltcp::iface::{Config, Interface};
 use smoltcp::wire::HardwareAddress;
 
-#[test]
-fn proxy_runtime_enriches_context_with_injected_process_metadata() {
+#[tokio::test]
+async fn proxy_runtime_enriches_context_with_injected_process_metadata() {
     use crate::process::{ProcessInfo, ProcessResolver};
     use crate::proxy::{AsyncProxy, DirectAsyncProxy, StaticProxySelector};
     use std::io;
@@ -34,7 +34,7 @@ fn proxy_runtime_enriches_context_with_injected_process_metadata() {
         bypass: Arc::clone(&direct),
         drop: Arc::new(crate::proxy::DropAsyncProxy),
     });
-    let mut runtime = TunProxyRuntime::new(selector, 4)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 4)
         .unwrap()
         .with_process_resolver(FixedResolver);
     let flow = TunFlow {
@@ -44,6 +44,10 @@ fn proxy_runtime_enriches_context_with_injected_process_metadata() {
             destination: "93.184.216.34:443".parse().unwrap(),
         },
     };
+    runtime
+        .handle_proxy_input(ProxyInput::TcpOpened { flow })
+        .unwrap();
+    complete_process_lookup_for_test(&mut runtime).await;
     let context = runtime.context_for_flow(flow);
     assert_eq!(context.component.as_deref(), Some("tun"));
     assert_eq!(context.process.as_deref(), Some("/usr/bin/test-client"));
@@ -51,8 +55,8 @@ fn proxy_runtime_enriches_context_with_injected_process_metadata() {
     assert_eq!(context.user_id, Some(1000));
 }
 
-#[test]
-fn proxy_runtime_reuses_process_metadata_for_one_local_udp_socket() {
+#[tokio::test]
+async fn proxy_runtime_reuses_process_metadata_for_one_local_udp_socket() {
     use crate::process::{ProcessInfo, ProcessResolver};
     use crate::proxy::{AsyncProxy, DirectAsyncProxy, StaticProxySelector};
     use std::io;
@@ -88,7 +92,7 @@ fn proxy_runtime_reuses_process_metadata_for_one_local_udp_socket() {
         drop: Arc::new(crate::proxy::DropAsyncProxy),
     });
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut runtime = TunProxyRuntime::new(selector, 4)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 4)
         .unwrap()
         .with_process_resolver(CountingResolver {
             calls: Arc::clone(&calls),
@@ -109,6 +113,19 @@ fn proxy_runtime_reuses_process_metadata_for_one_local_udp_socket() {
         },
     };
 
+    runtime
+        .handle_proxy_input(ProxyInput::UdpDatagram {
+            flow: first,
+            payload: vec![1],
+        })
+        .unwrap();
+    runtime
+        .handle_proxy_input(ProxyInput::UdpDatagram {
+            flow: second,
+            payload: vec![2],
+        })
+        .unwrap();
+    complete_process_lookup_for_test(&mut runtime).await;
     assert!(runtime.context_for_flow(first).process.is_some());
     assert!(runtime.context_for_flow(second).process.is_some());
     assert_eq!(calls.load(Ordering::Acquire), 1);
@@ -156,7 +173,7 @@ async fn proxy_runtime_relays_udp_event_through_direct_proxy() {
         bypass: Arc::clone(&direct),
         drop: Arc::new(crate::proxy::DropAsyncProxy),
     });
-    let mut proxy_runtime = TunProxyRuntime::new(selector, 8)
+    let mut proxy_runtime = proxy_runtime_without_process_lookup(selector, 8)
         .unwrap()
         .with_nat(NatTable::new(), Duration::from_secs(30))
         .unwrap();
@@ -301,7 +318,7 @@ async fn proxy_runtime_shares_one_udp_proxy_per_source_for_full_cone_nat() {
         drop: Arc::clone(&proxy),
     });
     let table = NatTable::new();
-    let mut runtime = TunProxyRuntime::new(selector, 8)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 8)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap();
@@ -472,7 +489,7 @@ async fn full_cone_udp_long_flow_reuses_one_relay_and_force_close_releases_it() 
         drop: Arc::clone(&proxy) as Arc<dyn AsyncProxy>,
     });
     let table = NatTable::new();
-    let mut runtime = TunProxyRuntime::new(proxy_selector, 256)
+    let mut runtime = proxy_runtime_without_process_lookup(proxy_selector, 256)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap();
@@ -576,7 +593,7 @@ async fn full_cone_real_direct_tun_accepts_unseen_peer_and_force_closes_source()
         drop: Arc::new(crate::proxy::DropAsyncProxy),
     });
     let table = NatTable::new();
-    let mut runtime = TunProxyRuntime::new(selector, 128)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 128)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap();
@@ -843,7 +860,7 @@ async fn full_cone_runtime_restarts_after_aborting_multiple_real_udp_sockets() {
     let table = NatTable::new();
     let source_count = destinations.len();
 
-    let mut runtime = TunProxyRuntime::new(Arc::clone(&selector), 32)
+    let mut runtime = proxy_runtime_without_process_lookup(Arc::clone(&selector), 32)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap();
@@ -890,7 +907,7 @@ async fn full_cone_runtime_restarts_after_aborting_multiple_real_udp_sockets() {
     // Recreate the runtime with the same table and sources.  A restart
     // starts from no stale translated endpoint while the next generation
     // can allocate fresh real sockets normally.
-    let mut restarted = TunProxyRuntime::new(selector, 32)
+    let mut restarted = proxy_runtime_without_process_lookup(selector, 32)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap();
@@ -928,4 +945,11 @@ async fn full_cone_runtime_restarts_after_aborting_multiple_real_udp_sockets() {
     }
     assert_eq!(dropped.load(Ordering::Acquire), source_count * 2);
     assert_eq!(table.len().unwrap(), 0);
+}
+
+async fn complete_process_lookup_for_test(runtime: &mut TunProxyRuntime) {
+    runtime.wait_for_output().await;
+    runtime
+        .process_proxy_outputs(&mut TunDispatcher::new(2048, 2048, 4).unwrap())
+        .unwrap();
 }

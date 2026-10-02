@@ -32,7 +32,7 @@ impl ConnectionMonitor {
             total_upload = total_upload.saturating_add(traffic.total_upload);
             counters.extend(traffic.counters.iter().map(|(id, (download, upload))| {
                 (
-                    id.clone(),
+                    id.to_string(),
                     json!({
                         "download": download.to_string(),
                         "upload": upload.to_string(),
@@ -61,7 +61,10 @@ impl ConnectionMonitor {
         let start = start.min(end);
         let end = end.max(start);
         let mut buckets = BTreeMap::<i64, (u64, u64)>::new();
-        if let Some(snapshot) = self.durable_snapshot() {
+        if let Some(snapshot) = self.durable_snapshot_for(GoStatisticsQuery::Traffic {
+            from: start,
+            to: end,
+        }) {
             for item in snapshot.traffic {
                 if item.bucket < start || item.bucket >= end {
                     continue;
@@ -116,7 +119,9 @@ impl ConnectionMonitor {
     }
     pub fn telemetry_value_range(&self, from: i64, to: i64, limit: usize) -> Value {
         let mut dimensions: BTreeMap<String, BTreeMap<String, (u64, u64, u64)>> = BTreeMap::new();
-        let telemetry = if let Some(snapshot) = self.durable_snapshot() {
+        let telemetry = if let Some(snapshot) =
+            self.durable_snapshot_for(GoStatisticsQuery::Telemetry { from, to })
+        {
             snapshot.telemetry
         } else {
             let state = self.lock();
@@ -128,8 +133,8 @@ impl ConnectionMonitor {
                         GoTelemetryBucketRecord {
                             bucket: *bucket,
                             span_seconds: *span_seconds,
-                            dimension: dimension.clone(),
-                            value: value.clone(),
+                            dimension: dimension.to_string(),
+                            value: value.to_string(),
                             download: *download,
                             upload: *upload,
                             failures: *failures,
@@ -147,8 +152,8 @@ impl ConnectionMonitor {
                         GoTelemetryBucketRecord {
                             bucket: *bucket,
                             span_seconds: *span_seconds,
-                            dimension: dimension.clone(),
-                            value: value.clone(),
+                            dimension: dimension.to_string(),
+                            value: value.to_string(),
                             download: *download,
                             upload: *upload,
                             failures: *failures,
@@ -219,49 +224,50 @@ impl ConnectionMonitor {
         json!({"groups": groups})
     }
     pub fn failed_history_value(&self) -> Value {
-        let (mut items, dump_process_enabled) = if let Some(snapshot) = self.durable_snapshot() {
-            let items = snapshot
-                .failed_history
-                .into_iter()
-                .map(|entry| {
-                    json!({
-                        "protocol": entry.protocol,
-                        "host": entry.host,
-                        "error": entry.error,
-                        "process": entry.process,
-                        "time": format_time(entry.last_seen),
-                        "failedCount": entry.count.to_string(),
+        let (mut items, dump_process_enabled) =
+            if let Some(snapshot) = self.durable_snapshot_for(GoStatisticsQuery::FailedHistory) {
+                let items = snapshot
+                    .failed_history
+                    .into_iter()
+                    .map(|entry| {
+                        json!({
+                            "protocol": entry.protocol,
+                            "host": entry.host,
+                            "error": entry.error,
+                            "process": entry.process,
+                            "time": format_time(entry.last_seen),
+                            "failedCount": entry.count.to_string(),
+                        })
                     })
-                })
-                .collect::<Vec<_>>();
-            let dump = items.iter().any(|item| {
-                item.get("process")
-                    .and_then(Value::as_str)
-                    .is_some_and(|process| !process.is_empty())
-            });
-            (items, dump)
-        } else {
-            let state = self.lock();
-            let items = state
-                .failed_history
-                .values()
-                .map(|entry| {
-                    json!({
-                        "protocol": entry.protocol,
-                        "host": entry.host,
-                        "error": entry.error,
-                        "process": entry.process,
-                        "time": format_time(entry.time),
-                        "failedCount": entry.count.to_string(),
+                    .collect::<Vec<_>>();
+                let dump = items.iter().any(|item| {
+                    item.get("process")
+                        .and_then(Value::as_str)
+                        .is_some_and(|process| !process.is_empty())
+                });
+                (items, dump)
+            } else {
+                let state = self.lock();
+                let items = state
+                    .failed_history
+                    .values()
+                    .map(|entry| {
+                        json!({
+                            "protocol": entry.protocol,
+                            "host": entry.host,
+                            "error": entry.error,
+                            "process": entry.process,
+                            "time": format_time(entry.time),
+                            "failedCount": entry.count.to_string(),
+                        })
                     })
-                })
-                .collect::<Vec<_>>();
-            let dump = state
-                .failed_history
-                .values()
-                .any(|entry| !entry.process.is_empty());
-            (items, dump)
-        };
+                    .collect::<Vec<_>>();
+                let dump = state
+                    .failed_history
+                    .values()
+                    .any(|entry| !entry.process.is_empty());
+                (items, dump)
+            };
         items.sort_by(|left, right| {
             right
                 .get("time")
@@ -275,30 +281,31 @@ impl ConnectionMonitor {
         })
     }
     pub fn all_history_value(&self) -> Value {
-        let (mut items, dump_process_enabled) = if let Some(snapshot) = self.durable_snapshot() {
-            let items = snapshot
-                .history
-                .into_iter()
-                .filter_map(history_record_value)
-                .collect::<Vec<_>>();
-            let dump = items.iter().any(|item| {
-                item.get("connection")
-                    .and_then(|connection| connection.get("process"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|process| !process.is_empty())
-            });
-            (coalesce_history(items), dump)
-        } else {
-            let state = self.lock();
-            let items = coalesce_history(state.history.clone());
-            let dump = items.iter().any(|item| {
-                item.get("connection")
-                    .and_then(|connection| connection.get("process"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|process| !process.is_empty())
-            });
-            (items, dump)
-        };
+        let (mut items, dump_process_enabled) =
+            if let Some(snapshot) = self.durable_snapshot_for(GoStatisticsQuery::History) {
+                let items = snapshot
+                    .history
+                    .into_iter()
+                    .filter_map(history_record_value)
+                    .collect::<Vec<_>>();
+                let dump = items.iter().any(|item| {
+                    item.get("connection")
+                        .and_then(|connection| connection.get("process"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|process| !process.is_empty())
+                });
+                (coalesce_history(items), dump)
+            } else {
+                let state = self.lock();
+                let items = coalesce_history(state.history.clone());
+                let dump = items.iter().any(|item| {
+                    item.get("connection")
+                        .and_then(|connection| connection.get("process"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|process| !process.is_empty())
+                });
+                (items, dump)
+            };
         items.sort_by(|left, right| {
             history_time(right)
                 .cmp(&history_time(left))

@@ -7,12 +7,12 @@ use hashlink::LinkedHashMap;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::RData;
 
-use crate::dns::{DnsHandler, DnsRecordType, DnsResponse};
+use crate::dns::{DnsHandler, DnsRecordType, DnsResponse, RawDnsCacheKey};
 use crate::{DomainName, Error, ErrorKind, Result};
 #[derive(Clone)]
 pub struct DnsCache {
     entries: Arc<Mutex<LruMap<(DomainName, DnsRecordType), CachedDnsResponse>>>,
-    raw_entries: Arc<Mutex<LruMap<(DomainName, u16), CachedDnsPacket>>>,
+    raw_entries: Arc<Mutex<LruMap<RawDnsCacheKey, CachedDnsPacket>>>,
 }
 
 #[derive(Clone)]
@@ -276,24 +276,22 @@ impl DnsCache {
     /// Return a raw DNS response while optionally retaining stale entries for
     /// a background refresh. The cache key intentionally excludes the DNS
     /// transaction ID, just like Go's `CacheKeyFromQuestion`.
-    pub(crate) fn get_raw_with_stale(
+    pub(crate) fn get_packet(
         &self,
-        domain: &DomainName,
-        record_type: u16,
+        key: &RawDnsCacheKey,
         allow_stale: bool,
     ) -> Result<Option<(Vec<u8>, bool)>> {
-        let key = (domain.clone(), record_type);
         let mut entries = self
             .raw_entries
             .lock()
             .map_err(|_| Error::new(ErrorKind::Closed, "DNS raw cache lock poisoned"))?;
-        let Some(entry) = entries.get_cloned(&key) else {
+        let Some(entry) = entries.get_cloned(key) else {
             return Ok(None);
         };
         let now = std::time::Instant::now();
         let stale = entry.expires_at <= now;
         if stale && !allow_stale {
-            entries.remove(&key);
+            entries.remove(key);
         }
         drop(entries);
         if stale && !allow_stale {
@@ -312,17 +310,52 @@ impl DnsCache {
     }
 
     #[cfg(test)]
+    pub(crate) fn get_raw_with_stale(
+        &self,
+        domain: &DomainName,
+        record_type: u16,
+        allow_stale: bool,
+    ) -> Result<Option<(Vec<u8>, bool)>> {
+        self.get_packet(
+            &RawDnsCacheKey::from_question(domain, record_type)?,
+            allow_stale,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_raw(
+        &self,
+        domain: DomainName,
+        record_type: u16,
+        packet: Vec<u8>,
+    ) -> Result<()> {
+        self.insert_packet(RawDnsCacheKey::from_question(&domain, record_type)?, packet)
+    }
+
+    #[cfg(test)]
     pub(crate) fn advance_raw_for_test(
         &self,
         domain: &DomainName,
         record_type: u16,
         elapsed: Duration,
     ) -> Result<()> {
+        self.advance_packet_for_test(
+            &RawDnsCacheKey::from_question(domain, record_type)?,
+            elapsed,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance_packet_for_test(
+        &self,
+        key: &RawDnsCacheKey,
+        elapsed: Duration,
+    ) -> Result<()> {
         let mut entries = self
             .raw_entries
             .lock()
             .map_err(|_| Error::new(ErrorKind::Closed, "DNS raw cache lock poisoned"))?;
-        if let Some(entry) = entries.map.get_mut(&(domain.clone(), record_type)) {
+        if let Some(entry) = entries.map.get_mut(key) {
             entry.cached_at = entry
                 .cached_at
                 .checked_sub(elapsed)
@@ -335,15 +368,9 @@ impl DnsCache {
         Ok(())
     }
 
-    pub(crate) fn insert_raw(
-        &self,
-        domain: DomainName,
-        record_type: u16,
-        packet: Vec<u8>,
-    ) -> Result<()> {
+    pub(crate) fn insert_packet(&self, key: RawDnsCacheKey, packet: Vec<u8>) -> Result<()> {
         let message = Message::from_vec(&packet)
             .map_err(|error| Error::new(ErrorKind::Protocol, error.to_string()))?;
-        let key = (domain.clone(), record_type);
         let Some((ttl, negative_ttl)) = raw_cache_ttl(&message) else {
             // Keep an optimistic stale entry across transient upstream
             // failures. A successful NoError/NXDomain response without a

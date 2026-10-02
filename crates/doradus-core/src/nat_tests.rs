@@ -9,6 +9,80 @@ fn key() -> NatKey {
 }
 
 #[test]
+fn destination_gauge_tracks_reuse_removal_and_all_expiry_paths() {
+    let table = NatTable::new();
+    let first = key();
+    let second = NatKey {
+        destination: "198.51.100.2:53".parse().unwrap(),
+        ..first.clone()
+    };
+    let translated = "203.0.113.10:50000".parse().unwrap();
+    table
+        .insert(first.clone(), translated, Duration::from_secs(30))
+        .unwrap();
+    table
+        .insert(first.clone(), translated, Duration::from_secs(30))
+        .unwrap();
+    table.touch(&second).unwrap();
+    table.touch(&second).unwrap();
+    assert_eq!(table.stats().unwrap().active_destinations, 2);
+    table.remove(&first).unwrap();
+    table.remove(&first).unwrap();
+    assert_eq!(table.stats().unwrap().active_destinations, 1);
+    table.remove_source(first.network, first.source).unwrap();
+    assert_eq!(table.stats().unwrap().active_destinations, 0);
+
+    for path in 0..5 {
+        table
+            .insert(first.clone(), translated, Duration::from_secs(30))
+            .unwrap();
+        table.touch(&second).unwrap();
+        // Expire without sleeps, including the shared destination references.
+        table
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(&NatBindingKey::from(&first))
+            .unwrap()
+            .entry
+            .last_seen = Instant::now() - Duration::from_secs(31);
+        match path {
+            0 => {
+                table.touch(&first).unwrap();
+            }
+            1 => {
+                table.lookup_source(first.network, first.source).unwrap();
+            }
+            2 => {
+                table
+                    .lookup_translated(first.network, translated, first.destination)
+                    .unwrap();
+            }
+            3 => {
+                assert_eq!(table.sweep().unwrap(), 2);
+            }
+            _ => {
+                assert!(
+                    table
+                        .bind_translated(first.network, first.source, translated)
+                        .is_err()
+                );
+            }
+        }
+        let stats = table.stats().unwrap();
+        assert_eq!(
+            (
+                stats.active_bindings,
+                stats.active_destinations,
+                stats.reverse_mappings
+            ),
+            (0, 0, 0)
+        );
+    }
+}
+
+#[test]
 fn nat_entry_can_be_touched_and_removed() {
     let table = NatTable::new();
     let key = key();

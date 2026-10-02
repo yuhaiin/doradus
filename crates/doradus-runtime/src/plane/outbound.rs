@@ -492,40 +492,6 @@ impl RuntimeSnapshot {
         .await
     }
 
-    async fn build_routed_proxy_selector(
-        &self,
-        direct_id: &str,
-        proxy_id: &str,
-        bypass_id: &str,
-        drop_id: &str,
-        timeout: Duration,
-    ) -> Result<RuntimeRoutedProxySelector> {
-        let direct = self
-            .build_proxy_slot(direct_id, timeout, BaseProxyKind::Direct)
-            .await?;
-        // Go's empty selected-node state means the built-in direct transport;
-        // it does not create a synthetic `direct` node row. Keep the proxy
-        // slot fail-closed for non-empty unknown IDs while treating only an
-        // empty ID as this explicit direct fallback.
-        let proxy = self
-            .build_proxy_slot(proxy_id, timeout, BaseProxyKind::Direct)
-            .await?;
-        let bypass = self
-            .build_proxy_slot(bypass_id, timeout, BaseProxyKind::Direct)
-            .await?;
-        let drop = self
-            .build_proxy_slot(drop_id, timeout, BaseProxyKind::Reject)
-            .await?;
-
-        Ok(RuntimeRoutedProxySelector {
-            router: self.router.clone(),
-            direct,
-            proxy,
-            bypass,
-            drop,
-        })
-    }
-
     /// Wrap a proxy with the resolver used for final outbound sockets.
     ///
     /// `self.resolver` may include the FakeIP answer policy because it is also

@@ -129,6 +129,11 @@ pub(crate) enum UdpProxyCommand {
 }
 
 pub(crate) enum ProxyOutput {
+    ProcessResolved {
+        source: UdpSourceKey,
+        id: u64,
+        process: Option<doradus_core::process::ProcessInfo>,
+    },
     TcpData {
         flow: TunFlowKey,
         payload: Vec<u8>,
@@ -340,6 +345,9 @@ pub(crate) struct UdpTaskManager {
 }
 
 impl UdpTaskManager {
+    pub(super) fn has_flow(&self, flow: &TunFlowKey) -> bool {
+        self.flow_sources.contains_key(flow)
+    }
     pub(super) fn ensure_source(
         &mut self,
         source: UdpSourceKey,

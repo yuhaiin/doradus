@@ -68,7 +68,7 @@ async fn external_icmp_flow_uses_proxy_ping_and_writes_back_echo_reply() {
         bypass: Arc::clone(&proxy),
         drop: Arc::clone(&proxy),
     });
-    let mut runtime = TunProxyRuntime::new(selector, 1).unwrap();
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 1).unwrap();
     let flow = TunFlow {
         key: TunFlowKey {
             network: Network::Icmp,
@@ -148,7 +148,7 @@ async fn dropping_proxy_runtime_releases_full_cone_nat_tracking() {
         drop: Arc::clone(&drop_proxy),
     });
     let table = NatTable::new();
-    let mut runtime = TunProxyRuntime::new(selector, 4)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 4)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap();
@@ -180,7 +180,7 @@ async fn graceful_proxy_runtime_close_signals_owned_tasks_then_releases_nat() {
         drop: Arc::clone(&drop_proxy),
     });
     let table = NatTable::new();
-    let mut runtime = TunProxyRuntime::new(selector, 4)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 4)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap();
@@ -217,7 +217,7 @@ async fn graceful_proxy_runtime_broadcasts_shutdown_when_one_command_queue_is_fu
         bypass: Arc::clone(&drop_proxy),
         drop: Arc::clone(&drop_proxy),
     });
-    let mut runtime = TunProxyRuntime::new(selector, 4).unwrap();
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 4).unwrap();
     let mut fixtures = Vec::new();
     for port in 40000..40003 {
         let flow = TunFlowKey {
@@ -272,7 +272,7 @@ async fn tcp_input_backpressure_releases_only_the_affected_flow() {
         drop: Arc::clone(&drop_proxy),
     });
     let table = NatTable::new();
-    let mut runtime = TunProxyRuntime::new(selector, 1)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 1)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap();
@@ -324,7 +324,7 @@ async fn quiet_tcp_flow_stays_until_local_close_and_releases_nat() {
         drop: Arc::clone(&direct),
     });
     let table = NatTable::new();
-    let mut runtime = TunProxyRuntime::new(selector, 4)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 4)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap()
@@ -432,7 +432,7 @@ async fn idle_timeout_closes_quiet_udp_source_and_releases_full_cone_nat() {
         drop: Arc::clone(&proxy),
     });
     let table = NatTable::new();
-    let mut runtime = TunProxyRuntime::new(selector, 1)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 1)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap()
@@ -509,7 +509,7 @@ async fn full_cone_udp_input_backpressure_releases_the_shared_source() {
         drop: Arc::clone(&proxy),
     });
     let table = NatTable::new();
-    let mut runtime = TunProxyRuntime::new(selector, 1)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 1)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap();
@@ -560,7 +560,7 @@ async fn udp_output_buffer_full_drops_packet_without_closing_flow() {
         drop: Arc::clone(&drop_proxy),
     });
     let table = NatTable::new();
-    let mut runtime = TunProxyRuntime::new(selector, 1)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 1)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap();
@@ -615,7 +615,7 @@ fn udp_shared_destination_keeps_socket_for_other_source_flow() {
         bypass: Arc::clone(&drop_proxy),
         drop: Arc::clone(&drop_proxy),
     });
-    let mut runtime = TunProxyRuntime::new(selector, 4).unwrap();
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 4).unwrap();
 
     let local = Ipv4Address::new(10, 0, 0, 1);
     let source_a = Ipv4Address::new(10, 0, 0, 2);
@@ -708,7 +708,7 @@ fn stale_udp_output_is_dropped_without_writing_to_tun() {
         bypass: Arc::clone(&drop_proxy),
         drop: Arc::clone(&drop_proxy),
     });
-    let mut runtime = TunProxyRuntime::new(selector, 4).unwrap();
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 4).unwrap();
     let flow = TunFlowKey {
         network: Network::Udp,
         source: "10.0.0.2:41000".parse().unwrap(),
@@ -835,7 +835,7 @@ async fn full_cone_udp_output_to_missing_socket_releases_nat() {
         drop: Arc::clone(&proxy),
     });
     let table = NatTable::new();
-    let mut runtime = TunProxyRuntime::new(selector, 1)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 1)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap()
@@ -973,7 +973,7 @@ async fn full_cone_udp_repeated_transport_errors_release_shared_sources() {
         drop: Arc::clone(&proxy),
     });
     let table = NatTable::new();
-    let mut runtime = TunProxyRuntime::new(selector, 4)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 4)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap();
@@ -1035,7 +1035,7 @@ async fn polling_finished_tcp_task_releases_nat_tracking() {
         drop: Arc::clone(&drop_proxy),
     });
     let table = NatTable::new();
-    let mut runtime = TunProxyRuntime::new(selector, 4)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 4)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap();
@@ -1072,7 +1072,7 @@ async fn translated_udp_endpoint_conflict_releases_only_the_conflicting_source()
         drop: Arc::clone(&drop_proxy),
     });
     let table = NatTable::new();
-    let mut runtime = TunProxyRuntime::new(selector, 2)
+    let mut runtime = proxy_runtime_without_process_lookup(selector, 2)
         .unwrap()
         .with_nat(table.clone(), Duration::from_secs(30))
         .unwrap();
@@ -1177,7 +1177,7 @@ async fn proxy_runtime_relays_established_tcp_flow_through_direct_proxy() {
         bypass: Arc::clone(&direct),
         drop: Arc::new(crate::proxy::DropAsyncProxy),
     });
-    let mut proxy_runtime = TunProxyRuntime::new(selector, 8).unwrap();
+    let mut proxy_runtime = proxy_runtime_without_process_lookup(selector, 8).unwrap();
 
     device
         .enqueue_rx(tcp_syn_packet(

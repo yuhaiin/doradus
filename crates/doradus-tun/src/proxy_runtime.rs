@@ -7,6 +7,8 @@ use doradus_metrics::RuntimeMetrics;
 mod proxy_flow;
 #[path = "proxy_output.rs"]
 mod proxy_output;
+#[path = "proxy_process.rs"]
+mod proxy_process;
 #[path = "proxy_task_manager.rs"]
 mod proxy_task_manager;
 #[path = "proxy_tasks.rs"]
@@ -36,6 +38,7 @@ pub struct TunProxyRuntime {
     context_provider: Arc<dyn Fn(TunFlow) -> crate::FlowContext + Send + Sync>,
     process_resolver: Option<Arc<dyn ProcessResolver>>,
     observer: Option<Arc<dyn TunFlowObserver>>,
+    process_lookups: proxy_process::ProcessLookups,
     flow_tracker: FlowTracker,
     pub(crate) tasks: TcpTaskManager,
     icmp_tasks: IcmpTaskManager,
@@ -46,6 +49,7 @@ pub struct TunProxyRuntime {
     proxy_output_rx: mpsc::Receiver<ProxyOutput>,
     channel_capacity: usize,
     timeouts: ProxyTimeouts,
+    next_nat_maintenance: std::time::Instant,
 }
 
 impl TunProxyRuntime {
@@ -62,6 +66,7 @@ impl TunProxyRuntime {
             context_provider: Arc::new(|flow| flow.context()),
             process_resolver: default_process_resolver(),
             observer: None,
+            process_lookups: proxy_process::ProcessLookups::default(),
             flow_tracker: FlowTracker::default(),
             tasks: TcpTaskManager::default(),
             icmp_tasks: IcmpTaskManager::default(),
@@ -72,6 +77,7 @@ impl TunProxyRuntime {
             proxy_output_rx,
             channel_capacity,
             timeouts: ProxyTimeouts::default(),
+            next_nat_maintenance: std::time::Instant::now(),
         })
     }
 
@@ -112,6 +118,7 @@ impl TunProxyRuntime {
     pub fn set_process_resolver(&mut self, resolver: Option<Arc<dyn ProcessResolver>>) {
         self.process_resolver = resolver;
         self.flow_tracker.clear_process_cache();
+        self.restart_process_lookups();
     }
 
     /// Replace the read-only flow context snapshot at a lifecycle boundary.
@@ -203,13 +210,13 @@ impl TunProxyRuntime {
         }
     }
 
-    /// Number of currently registered proxy flow tasks.
+    /// Number of registered proxy flow tasks and pending process lookups.
     ///
     /// This is intentionally a small lifecycle metric: callers can assert
     /// that timeout, close, and cancellation paths have released their task
     /// owner without reaching into the task map.
     pub fn task_len(&self) -> usize {
-        self.tasks.len() + self.icmp_tasks.len() + self.udp_tasks.len()
+        self.tasks.len() + self.icmp_tasks.len() + self.udp_tasks.len() + self.process_lookups.len()
     }
 
     pub(crate) fn context_for_flow(&mut self, flow: TunFlow) -> crate::FlowContext {
@@ -220,18 +227,10 @@ impl TunProxyRuntime {
         let needs_process =
             context.process.is_none() || context.process_id.is_none() || context.user_id.is_none();
         let process = needs_process.then(|| {
-            let source = udp_source_key(flow.key);
-            if let Some(process) = self.flow_tracker.cached_process(&source) {
-                return process.clone();
-            }
-            let process = self.process_resolver.as_ref().and_then(|resolver| {
-                resolver
-                    .resolve(flow.key.network, flow.key.source, flow.key.destination)
-                    .ok()
-                    .flatten()
-            });
-            self.flow_tracker.cache_process(source, process.clone());
-            process
+            self.flow_tracker
+                .cached_process(&udp_source_key(flow.key))
+                .cloned()
+                .flatten()
         });
         if let Some(Some(process)) = process {
             if context.process.is_none() {
@@ -247,11 +246,24 @@ impl TunProxyRuntime {
         context
     }
 
+    pub(crate) fn maintenance_deadline(&self) -> Option<std::time::Instant> {
+        self.flow_tracker.nat().map(|_| self.next_nat_maintenance)
+    }
+
+    pub(crate) fn maintain(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
+        if std::time::Instant::now() < self.next_nat_maintenance {
+            return Ok(0);
+        }
+        self.sweep(dispatcher)
+    }
+
     pub fn sweep(&mut self, dispatcher: &mut TunDispatcher) -> Result<usize> {
         let Some(nat) = self.flow_tracker.nat() else {
             return Ok(0);
         };
         let idle_timeout = nat.idle_timeout;
+        self.next_nat_maintenance =
+            std::time::Instant::now() + idle_timeout.min(Duration::from_secs(1));
         let expired = nat.table.sweep_keys()?;
         for key in &expired {
             let flow = TunFlowKey {
@@ -279,7 +291,17 @@ impl TunProxyRuntime {
         Ok(expired.len())
     }
 
+    /// Accept an owned event without performing blocking process lookup.
+    /// New source sockets wait in bounded queues until their ownership is
+    /// known; `process_proxy_outputs` then routes and replays those events.
     pub fn handle_proxy_input(&mut self, event: ProxyInput) -> Result<()> {
+        let Some(event) = self.defer_process_lookup(event)? else {
+            return Ok(());
+        };
+        self.handle_ready_input(event)
+    }
+
+    fn handle_ready_input(&mut self, event: ProxyInput) -> Result<()> {
         match event {
             ProxyInput::TcpOpened { flow } => self.open_tcp_flow(flow)?,
             ProxyInput::TcpData { flow, payload } => self.send_tcp_data(flow, payload)?,
@@ -347,7 +369,7 @@ impl TunProxyRuntime {
     }
 
     fn handle_udp_datagram(&mut self, flow: TunFlow, payload: Vec<u8>) -> Result<()> {
-        let first = !self.flow_tracker.contains(&flow.key);
+        let first = !self.udp_tasks.has_flow(&flow.key);
         self.track_flow(flow.key)?;
         let mut context = self.context_for_flow(flow);
         self.selector.route_context(&mut context);
@@ -385,6 +407,7 @@ impl TunProxyRuntime {
     }
 
     pub fn close(&mut self) {
+        self.process_lookups.clear();
         // This is the force-stop path. The async path below gives transports a
         // bounded opportunity to flush/shutdown before falling back here.
         for flow in self.tasks.abort_all() {
@@ -467,6 +490,7 @@ impl TunProxyRuntime {
     }
 
     fn remove_flow_task(&mut self, flow: &TunFlowKey) {
+        self.process_lookups.remove_flow(flow);
         self.remove_task(flow);
         self.remove_icmp_tasks_for_flow(flow);
         let Some(source) = self.udp_tasks.unbind_flow(flow) else {
@@ -511,9 +535,7 @@ impl TunProxyRuntime {
     }
 
     fn touch_flow(&self, flow: TunFlowKey) -> Result<()> {
-        self.flow_tracker.touch(flow)?;
-        self.sync_nat_metrics();
-        Ok(())
+        self.flow_tracker.touch(flow)
     }
 
     fn untrack_flow(&mut self, flow: &TunFlowKey) -> Result<()> {
@@ -540,6 +562,7 @@ impl TunProxyRuntime {
 
 impl Drop for TunProxyRuntime {
     fn drop(&mut self) {
+        self.process_lookups.clear();
         let _ = self.tasks.abort_all();
         let _ = self.icmp_tasks.abort_all();
         let _ = self.udp_tasks.abort_all();

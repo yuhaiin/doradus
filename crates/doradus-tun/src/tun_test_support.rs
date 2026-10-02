@@ -213,3 +213,14 @@ pub(super) fn icmpv6_echo_packet(
     }
     bytes
 }
+
+/// Packet fixtures use virtual socket tuples with no OS process owner.
+/// Process lookup behavior is exercised separately with injected resolvers.
+pub(super) fn proxy_runtime_without_process_lookup(
+    selector: std::sync::Arc<dyn crate::proxy::AsyncProxySelector>,
+    capacity: usize,
+) -> crate::Result<crate::TunProxyRuntime> {
+    let mut runtime = crate::TunProxyRuntime::new(selector, capacity)?;
+    runtime.set_process_resolver(None);
+    Ok(runtime)
+}

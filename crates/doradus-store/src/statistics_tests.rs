@@ -8,6 +8,86 @@ use crate::schema::table_has_column;
 
 use super::*;
 
+#[tokio::test]
+async fn scoped_statistics_queries_exclude_unrelated_tables_and_outside_rows() {
+    let store = ConfigStore::open_memory().await.unwrap();
+    store
+        .replace_go_statistics(&GoStatisticsSnapshot {
+            traffic: vec![GoTrafficBucketRecord {
+                bucket: 3_600,
+                upload: 11,
+                download: 7,
+            }],
+            telemetry: vec![
+                GoTelemetryBucketRecord {
+                    bucket: 0,
+                    span_seconds: TELEMETRY_DAILY_BUCKET_SECONDS,
+                    dimension: "protocol".into(),
+                    value: "udp".into(),
+                    upload: 5,
+                    ..Default::default()
+                },
+                GoTelemetryBucketRecord {
+                    bucket: 86_400,
+                    span_seconds: TELEMETRY_DAILY_BUCKET_SECONDS,
+                    dimension: "protocol".into(),
+                    value: "tcp".into(),
+                    upload: 9,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+    {
+        let connection = store.lock_connection().unwrap();
+        connection
+            .execute("INSERT INTO traffic_hourly (bucket_start_utc, upload_bytes, download_bytes, updated_at) VALUES (0, 'invalid', 0, 0)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO connection_history (protocol, addr, process_name, hit_count, last_seen_at, last_connection_json) VALUES ('tcp', 'bad', '', 'invalid', 0, X'')")
+            .unwrap();
+    }
+    assert!(store.load_go_statistics().is_err());
+    let snapshot = store
+        .query_go_statistics(GoStatisticsQuery::Traffic {
+            from: 3_600,
+            to: 7_200,
+        })
+        .unwrap();
+    assert_eq!(
+        snapshot.traffic,
+        vec![GoTrafficBucketRecord {
+            bucket: 3_600,
+            upload: 11,
+            download: 7
+        }]
+    );
+    assert!(snapshot.history.is_empty());
+    assert!(snapshot.telemetry.is_empty());
+    let snapshot = store
+        .query_go_statistics(GoStatisticsQuery::Telemetry {
+            from: 43_200,
+            to: 86_400,
+        })
+        .unwrap();
+    assert_eq!(snapshot.telemetry.len(), 1);
+    assert_eq!(
+        (snapshot.telemetry[0].bucket, snapshot.telemetry[0].upload),
+        (0, 5)
+    );
+    assert!(
+        store
+            .query_go_statistics(GoStatisticsQuery::Telemetry {
+                from: 86_400,
+                to: 86_400
+            })
+            .unwrap()
+            .telemetry
+            .is_empty()
+    );
+}
+
 fn statistics_test_database_path() -> PathBuf {
     let cache = std::env::var_os("DORADUS_CACHE_DIR")
         .map(PathBuf::from)
@@ -394,7 +474,7 @@ async fn go_statistics_reader_keeps_one_schema_snapshot_during_compaction() {
             probe_sender.send(()).unwrap();
             release_receiver.recv().unwrap();
         });
-        super::statistics_projection::load(&connection)
+        super::statistics_projection::load(&connection, GoStatisticsQuery::All)
     });
     probe_receiver.recv().unwrap();
 

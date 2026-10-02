@@ -2,8 +2,8 @@
 //!
 //! Process lookup is deliberately a small, synchronous boundary.  The TUN
 //! runtime only calls it when a flow is opened, so a platform implementation
-//! can inspect the operating system without putting a blocking lookup inside
-//! the proxy I/O task. Linux and Android use the proc filesystem; all other
+//! can inspect the operating system. The TUN adapter runs this boundary on
+//! bounded blocking workers before selecting a route. Linux and Android use the proc filesystem; all other
 //! platforms safely fall back to `None` until they provide their native
 //! socket-ownership implementation.
 

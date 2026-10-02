@@ -14,13 +14,16 @@ thread_local! {
     static TEST_TELEMETRY_SCHEMA_PROBE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
-pub(super) fn load(connection: &Connection) -> Result<GoStatisticsSnapshot> {
+pub(super) fn load(
+    connection: &Connection,
+    query: GoStatisticsQuery,
+) -> Result<GoStatisticsSnapshot> {
     // Schema probes and SELECTs must use one snapshot. A writer may convert
     // the legacy telemetry tables between two otherwise independent reads.
     connection
         .execute("BEGIN DEFERRED")
         .map_err(storage_error)?;
-    let result = load_snapshot(connection);
+    let result = load_snapshot(connection, query);
     match result {
         Ok(snapshot) => match connection.execute("COMMIT") {
             Ok(_) => Ok(snapshot),
@@ -51,10 +54,13 @@ fn run_test_telemetry_schema_probe() {
     }
 }
 
-fn load_snapshot(connection: &Connection) -> Result<GoStatisticsSnapshot> {
+fn load_snapshot(
+    connection: &Connection,
+    query: GoStatisticsQuery,
+) -> Result<GoStatisticsSnapshot> {
     let mut snapshot = GoStatisticsSnapshot::default();
 
-    if table_exists(connection, "statistics_kv") {
+    if matches!(query, GoStatisticsQuery::All) && table_exists(connection, "statistics_kv") {
         let rows = connection
             .query("SELECT key, value_int FROM statistics_kv")
             .map_err(storage_error)?;
@@ -69,13 +75,18 @@ fn load_snapshot(connection: &Connection) -> Result<GoStatisticsSnapshot> {
         }
     }
 
-    if table_exists(connection, "traffic_hourly") {
-        let rows = connection
-            .query(
-                "SELECT bucket_start_utc, upload_bytes, download_bytes
-                 FROM traffic_hourly ORDER BY bucket_start_utc",
-            )
-            .map_err(storage_error)?;
+    if matches!(
+        query,
+        GoStatisticsQuery::All | GoStatisticsQuery::Traffic { .. }
+    ) && table_exists(connection, "traffic_hourly")
+    {
+        let rows = query_buckets(
+            connection,
+            "SELECT bucket_start_utc, upload_bytes, download_bytes FROM traffic_hourly",
+            query,
+            TELEMETRY_HOURLY_BUCKET_SECONDS,
+            "bucket_start_utc",
+        )?;
         snapshot.traffic = rows
             .iter()
             .map(|row| {
@@ -88,7 +99,9 @@ fn load_snapshot(connection: &Connection) -> Result<GoStatisticsSnapshot> {
             .collect::<Result<Vec<_>>>()?;
     }
 
-    if table_exists(connection, "connection_history") {
+    if matches!(query, GoStatisticsQuery::All | GoStatisticsQuery::History)
+        && table_exists(connection, "connection_history")
+    {
         let rows = connection
             .query(
                 "SELECT protocol, addr, process_name, hit_count, last_seen_at,
@@ -115,7 +128,11 @@ fn load_snapshot(connection: &Connection) -> Result<GoStatisticsSnapshot> {
             .collect::<Result<Vec<_>>>()?;
     }
 
-    if table_exists(connection, "failed_connection_history") {
+    if matches!(
+        query,
+        GoStatisticsQuery::All | GoStatisticsQuery::FailedHistory
+    ) && table_exists(connection, "failed_connection_history")
+    {
         let rows = connection
             .query(
                 "SELECT protocol, host, process_name, failed_count, last_seen_at,
@@ -138,19 +155,25 @@ fn load_snapshot(connection: &Connection) -> Result<GoStatisticsSnapshot> {
             .collect::<Result<Vec<_>>>()?;
     }
 
-    load_telemetry(connection, &mut snapshot.telemetry)?;
+    if matches!(
+        query,
+        GoStatisticsQuery::All | GoStatisticsQuery::Telemetry { .. }
+    ) {
+        load_telemetry(connection, &mut snapshot.telemetry, query)?;
+    }
     Ok(snapshot)
 }
 
 fn load_telemetry(
     connection: &Connection,
     output: &mut Vec<GoTelemetryBucketRecord>,
+    query: GoStatisticsQuery,
 ) -> Result<()> {
     let compact_telemetry = table_exists(connection, "telemetry_dimension_values");
     #[cfg(test)]
     run_test_telemetry_schema_probe();
     if !compact_telemetry {
-        return load_legacy_telemetry(connection, output);
+        return load_legacy_telemetry(connection, output, query);
     }
     let mut merged = BTreeMap::<(i64, i64, String, String), (u64, u64, u64)>::new();
     for (table, span_seconds) in [
@@ -166,7 +189,7 @@ fn load_telemetry(
              FROM {table} t
              JOIN telemetry_dimension_values v ON v.id = t.value_id"
         );
-        for row in connection.query(&sql).map_err(storage_error)? {
+        for row in query_buckets(connection, &sql, query, span_seconds, "t.bucket_start_utc")? {
             let key = (
                 row_i64(&row, 0, "traffic_dimension.bucket_start_utc")?,
                 span_seconds,
@@ -194,7 +217,7 @@ fn load_telemetry(
              FROM {table} t
              JOIN telemetry_dimension_values v ON v.id = t.value_id"
         );
-        for row in connection.query(&sql).map_err(storage_error)? {
+        for row in query_buckets(connection, &sql, query, span_seconds, "t.bucket_start_utc")? {
             let key = (
                 row_i64(&row, 0, "failure_dimension.bucket_start_utc")?,
                 span_seconds,
@@ -229,17 +252,19 @@ fn load_telemetry(
 fn load_legacy_telemetry(
     connection: &Connection,
     output: &mut Vec<GoTelemetryBucketRecord>,
+    query: GoStatisticsQuery,
 ) -> Result<()> {
     let mut merged = BTreeMap::<(i64, i64, String, String), (u64, u64, u64)>::new();
     if table_exists(connection, "traffic_dimension_hourly") {
-        for row in connection
-            .query(
-                "SELECT bucket_start_utc, dimension, value,
+        for row in query_buckets(
+            connection,
+            "SELECT bucket_start_utc, dimension, value,
                         download_bytes, upload_bytes
                  FROM traffic_dimension_hourly",
-            )
-            .map_err(storage_error)?
-        {
+            query,
+            TELEMETRY_HOURLY_BUCKET_SECONDS,
+            "bucket_start_utc",
+        )? {
             let key = (
                 row_i64(&row, 0, "traffic_dimension_hourly.bucket_start_utc")?,
                 TELEMETRY_HOURLY_BUCKET_SECONDS,
@@ -259,13 +284,14 @@ fn load_legacy_telemetry(
         }
     }
     if table_exists(connection, "failure_dimension_hourly") {
-        for row in connection
-            .query(
-                "SELECT bucket_start_utc, dimension, value, failed_count
+        for row in query_buckets(
+            connection,
+            "SELECT bucket_start_utc, dimension, value, failed_count
                  FROM failure_dimension_hourly",
-            )
-            .map_err(storage_error)?
-        {
+            query,
+            TELEMETRY_HOURLY_BUCKET_SECONDS,
+            "bucket_start_utc",
+        )? {
             let key = (
                 row_i64(&row, 0, "failure_dimension_hourly.bucket_start_utc")?,
                 TELEMETRY_HOURLY_BUCKET_SECONDS,
@@ -296,6 +322,41 @@ fn load_legacy_telemetry(
         )
         .collect();
     Ok(())
+}
+
+fn query_buckets(
+    connection: &Connection,
+    sql: &str,
+    query: GoStatisticsQuery,
+    span: i64,
+    column: &str,
+) -> Result<Vec<crate::sqlite::Row>> {
+    let range = match query {
+        GoStatisticsQuery::Traffic { from, to } | GoStatisticsQuery::Telemetry { from, to } => {
+            Some((from, to))
+        }
+        _ => None,
+    };
+    if let Some((from, to)) = range {
+        if from >= to {
+            return Ok(Vec::new());
+        }
+        let lower = if span == TELEMETRY_DAILY_BUCKET_SECONDS {
+            from.saturating_sub(span - 1)
+        } else {
+            from
+        };
+        connection
+            .query_with_params(
+                &format!("{sql} WHERE {column} >= ?1 AND {column} < ?2 ORDER BY {column}"),
+                &[SqliteValue::Integer(lower), SqliteValue::Integer(to)],
+            )
+            .map_err(storage_error)
+    } else {
+        connection
+            .query(&format!("{sql} ORDER BY {column}"))
+            .map_err(storage_error)
+    }
 }
 
 pub(super) fn replace(connection: &Connection, snapshot: &GoStatisticsSnapshot) -> Result<()> {

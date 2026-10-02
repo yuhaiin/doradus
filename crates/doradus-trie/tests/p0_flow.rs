@@ -822,6 +822,8 @@ async fn tcp_half_close_forwards_eof_and_close_releases_task() {
         .unwrap()
         .with_io_timeout(Duration::from_secs(1))
         .unwrap();
+    // Virtual tuples have no OS owner; exercise the proxy lifecycle directly.
+    runtime.set_process_resolver(None);
     let flow = doradus_tun::TunFlow {
         key: TunFlowKey {
             network: Network::Tcp,
@@ -914,6 +916,8 @@ async fn dropping_proxy_runtime_aborts_owned_flow_tasks() {
     });
     {
         let mut runtime = TunProxyRuntime::new(selector, 8).unwrap();
+        // Virtual tuples have no OS owner; exercise the proxy lifecycle directly.
+        runtime.set_process_resolver(None);
         let flow = doradus_tun::TunFlow {
             key: TunFlowKey {
                 network: Network::Tcp,

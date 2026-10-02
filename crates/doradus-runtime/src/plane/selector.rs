@@ -6,6 +6,9 @@ use doradus_metrics::{RouteAction, RuntimeMetrics};
 mod selector_metadata;
 #[path = "selector_routing.rs"]
 mod selector_routing;
+#[path = "selector_state.rs"]
+mod selector_state;
+use selector_state::*;
 
 /// A TUN-facing selector whose proxy slots can be replaced as one unit after
 /// a successful configuration reload. Existing flows keep the `Arc` returned
@@ -13,23 +16,18 @@ mod selector_routing;
 pub struct RuntimeProxySelector {
     metrics: Arc<RuntimeMetrics>,
     state: ArcSwap<SelectorState>,
-    direct_id: String,
-    proxy_id: String,
-    udp_proxy_id: String,
-    bypass_id: String,
-    drop_id: String,
     timeout: Duration,
     loopback: LoopbackDetector,
 }
 
 #[derive(Clone)]
-struct SelectorState {
+pub(crate) struct SelectorState {
     current: RuntimeRoutedProxySelector,
     udp_current: RuntimeRoutedProxySelector,
-    tagged: BTreeMap<String, Arc<dyn AsyncProxy>>,
-    udp_tagged: BTreeMap<String, Arc<dyn AsyncProxy>>,
+    selection: ProxySelection,
+    nodes: BTreeMap<String, Arc<dyn AsyncProxy>>,
+    tagged: BTreeMap<String, TaggedProxy>,
     closed_nodes: BTreeSet<String>,
-    retargeted_nodes: BTreeSet<String>,
     metadata: Arc<ProxyContextMetadata>,
     settings: crate::RuntimeSettings,
 }
@@ -52,21 +50,16 @@ struct ProxyContextMetadata {
 impl RuntimeProxySelector {
     pub(crate) fn active_node_ids(&self) -> Vec<String> {
         let state = self.state.load();
-        [
-            self.direct_id.as_str(),
-            self.proxy_id.as_str(),
-            self.udp_proxy_id.as_str(),
-            self.bypass_id.as_str(),
-            self.drop_id.as_str(),
-        ]
-        .into_iter()
-        .filter(|id| {
-            !id.is_empty()
-                && !state.closed_nodes.contains(*id)
-                && !state.retargeted_nodes.contains(*id)
-        })
-        .map(str::to_owned)
-        .collect()
+        state
+            .selection
+            .ids()
+            .into_iter()
+            .chain(state.nodes.keys().map(String::as_str))
+            .filter(|id| !id.is_empty() && !state.closed_nodes.contains(*id))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     pub(super) async fn from_snapshot(
@@ -79,109 +72,28 @@ impl RuntimeProxySelector {
         timeout: Duration,
     ) -> Result<Self> {
         let loopback = LoopbackDetector::new();
-        let current = snapshot
-            .build_routed_proxy_selector(direct_id, tcp_proxy_id, bypass_id, drop_id, timeout)
+        let selection =
+            ProxySelection::new(direct_id, tcp_proxy_id, udp_proxy_id, bypass_id, drop_id);
+        let state = SelectorBuild::new(snapshot, timeout, &loopback)
+            .build(selection)
             .await?;
-        let udp_current = snapshot
-            .build_routed_proxy_selector(direct_id, udp_proxy_id, bypass_id, drop_id, timeout)
-            .await?;
-        let tagged = snapshot.build_tagged_proxies(timeout).await?;
-        // Tags describe node sets, not a transport family. The proxy values
-        // are Arc-backed and can be shared by TCP and UDP selectors; building
-        // them twice would reopen every tagged node during startup/reload.
-        let udp_tagged = tagged.clone();
-        let metadata = Arc::new(
-            snapshot
-                .proxy_context_metadata(direct_id, tcp_proxy_id, udp_proxy_id, bypass_id, drop_id)
-                .await?,
-        );
         Ok(Self {
             metrics: Arc::clone(&snapshot.metrics),
-            state: ArcSwap::from_pointee(SelectorState {
-                current: track_selector(current, &loopback),
-                udp_current: track_selector(udp_current, &loopback),
-                tagged: track_tagged_proxies(tagged, &loopback),
-                udp_tagged: track_tagged_proxies(udp_tagged, &loopback),
-                closed_nodes: BTreeSet::new(),
-                retargeted_nodes: BTreeSet::new(),
-                metadata,
-                settings: snapshot.settings.clone(),
-            }),
-            direct_id: direct_id.to_owned(),
-            proxy_id: tcp_proxy_id.to_owned(),
-            udp_proxy_id: udp_proxy_id.to_owned(),
-            bypass_id: bypass_id.to_owned(),
-            drop_id: drop_id.to_owned(),
+            state: ArcSwap::from_pointee(state),
             timeout,
             loopback,
         })
     }
 
-    pub(crate) async fn prepare(
-        &self,
-        snapshot: &RuntimeSnapshot,
-    ) -> Result<PreparedProxySelector> {
-        let state = self.state.load();
-        let direct_id = self.effective_node_id(&state, &self.direct_id);
-        let proxy_id = self.effective_node_id(&state, &self.proxy_id);
-        let udp_proxy_id = self.effective_node_id(&state, &self.udp_proxy_id);
-        let bypass_id = self.effective_node_id(&state, &self.bypass_id);
-        let drop_id = self.effective_node_id(&state, &self.drop_id);
-        let tagged = snapshot.build_tagged_proxies(self.timeout).await?;
-        let udp_tagged = tagged.clone();
-        Ok(PreparedProxySelector {
-            selector: track_selector(
-                snapshot
-                    .build_routed_proxy_selector(
-                        &direct_id,
-                        &proxy_id,
-                        &bypass_id,
-                        &drop_id,
-                        self.timeout,
-                    )
-                    .await?,
-                &self.loopback,
-            ),
-            udp_selector: track_selector(
-                snapshot
-                    .build_routed_proxy_selector(
-                        &direct_id,
-                        &udp_proxy_id,
-                        &bypass_id,
-                        &drop_id,
-                        self.timeout,
-                    )
-                    .await?,
-                &self.loopback,
-            ),
-            tagged: track_tagged_proxies(tagged, &self.loopback),
-            udp_tagged: track_tagged_proxies(udp_tagged, &self.loopback),
-            metadata: Arc::new(
-                snapshot
-                    .proxy_context_metadata(
-                        &direct_id,
-                        &proxy_id,
-                        &udp_proxy_id,
-                        &bypass_id,
-                        &drop_id,
-                    )
-                    .await?,
-            ),
-            settings: snapshot.settings.clone(),
-        })
+    pub(crate) async fn prepare(&self, snapshot: &RuntimeSnapshot) -> Result<SelectorState> {
+        let selection = self.state.load().selection.clone();
+        SelectorBuild::new(snapshot, self.timeout, &self.loopback)
+            .build(selection)
+            .await
     }
 
-    pub(crate) fn replace(&self, next: PreparedProxySelector) {
-        self.state.store(Arc::new(SelectorState {
-            current: next.selector,
-            udp_current: next.udp_selector,
-            tagged: next.tagged,
-            udp_tagged: next.udp_tagged,
-            closed_nodes: BTreeSet::new(),
-            retargeted_nodes: BTreeSet::new(),
-            metadata: next.metadata,
-            settings: next.settings,
-        }));
+    pub(crate) fn replace(&self, next: SelectorState) {
+        self.state.store(Arc::new(next));
     }
 
     /// Close every slot that currently points at `id`, then make new flows
@@ -193,51 +105,52 @@ impl RuntimeProxySelector {
     }
 
     async fn close_node_with_retarget(&self, id: &str, retarget: bool) {
-        let mut old_proxies = Vec::new();
-        let mut closed_proxy_ids = BTreeSet::new();
         let current = self.state.load_full();
         let mut next = (*current).clone();
-
+        let proxy = next.nodes.remove(id);
+        let mut changed = proxy.is_some();
         macro_rules! close_slot {
             ($slot_id:expr, $slot:expr) => {
                 if $slot_id == id {
-                    let proxy = Arc::clone($slot);
-                    if closed_proxy_ids.insert(Arc::as_ptr(&proxy).cast::<()>() as usize) {
-                        old_proxies.push(proxy);
-                    }
                     *$slot = Arc::new(DropAsyncProxy);
+                    changed = true;
                 }
             };
         }
-        close_slot!(&self.direct_id, &mut next.current.direct);
-        close_slot!(&self.proxy_id, &mut next.current.proxy);
-        close_slot!(&self.bypass_id, &mut next.current.bypass);
-        close_slot!(&self.drop_id, &mut next.current.drop);
-        close_slot!(&self.direct_id, &mut next.udp_current.direct);
-        close_slot!(&self.udp_proxy_id, &mut next.udp_current.proxy);
-        close_slot!(&self.bypass_id, &mut next.udp_current.bypass);
-        close_slot!(&self.drop_id, &mut next.udp_current.drop);
-        if !old_proxies.is_empty() {
-            for proxy in std::mem::take(&mut next.tagged).into_values() {
-                if closed_proxy_ids.insert(Arc::as_ptr(&proxy).cast::<()>() as usize) {
-                    old_proxies.push(proxy);
+        close_slot!(&next.selection.direct, &mut next.current.direct);
+        close_slot!(&next.selection.tcp, &mut next.current.proxy);
+        close_slot!(&next.selection.bypass, &mut next.current.bypass);
+        close_slot!(&next.selection.drop, &mut next.current.drop);
+        close_slot!(&next.selection.direct, &mut next.udp_current.direct);
+        close_slot!(&next.selection.udp, &mut next.udp_current.proxy);
+        close_slot!(&next.selection.bypass, &mut next.udp_current.bypass);
+        close_slot!(&next.selection.drop, &mut next.udp_current.drop);
+        for (tag, binding) in &mut next.tagged {
+            if let Some(index) = binding.members.iter().position(|(member, _)| member == id) {
+                binding.members.remove(index);
+                binding.rebuild();
+                let metadata = Arc::make_mut(&mut next.metadata);
+                metadata.tag_endpoints.remove(tag);
+                match binding.members.first() {
+                    Some((member, _)) => {
+                        metadata.tag_node_ids.insert(tag.clone(), member.clone());
+                    }
+                    None => {
+                        metadata.tag_node_ids.remove(tag);
+                    }
                 }
+                changed = true;
             }
-            for proxy in std::mem::take(&mut next.udp_tagged).into_values() {
-                if closed_proxy_ids.insert(Arc::as_ptr(&proxy).cast::<()>() as usize) {
-                    old_proxies.push(proxy);
-                }
-            }
-            next.closed_nodes.insert(id.to_owned());
         }
+        if !changed {
+            return;
+        }
+        next.closed_nodes.insert(id.to_owned());
         if retarget {
-            next.retargeted_nodes.insert(id.to_owned());
+            next.selection.retarget_to_direct(id);
         }
-        if !old_proxies.is_empty() || retarget {
-            self.state.store(Arc::new(next));
-        }
-
-        for proxy in old_proxies {
+        self.state.store(Arc::new(next));
+        if let Some(proxy) = proxy {
             let _ = proxy.close().await;
         }
     }
@@ -250,14 +163,6 @@ impl RuntimeProxySelector {
     /// installs the direct fallback for new flows.
     pub(crate) async fn retarget_node_to_direct(&self, id: &str) {
         self.close_node_with_retarget(id, true).await;
-    }
-
-    fn effective_node_id(&self, state: &SelectorState, id: &str) -> String {
-        if state.retargeted_nodes.contains(id) {
-            String::new()
-        } else {
-            id.to_owned()
-        }
     }
 
     pub(crate) fn relay_buffer_size(&self) -> usize {
@@ -279,22 +184,9 @@ impl RuntimeProxySelector {
         tag: &str,
     ) -> Option<Arc<dyn AsyncProxy>> {
         let state = self.state.load();
-        let tagged = if network == doradus_core::Network::Udp {
-            &state.udp_tagged
-        } else {
-            &state.tagged
-        };
-        tagged.get(tag).cloned()
+        let _ = network;
+        state.tagged.get(tag).map(|binding| binding.proxy.clone())
     }
-}
-
-pub(crate) struct PreparedProxySelector {
-    pub(crate) selector: RuntimeRoutedProxySelector,
-    pub(crate) udp_selector: RuntimeRoutedProxySelector,
-    tagged: BTreeMap<String, Arc<dyn AsyncProxy>>,
-    udp_tagged: BTreeMap<String, Arc<dyn AsyncProxy>>,
-    metadata: Arc<ProxyContextMetadata>,
-    settings: crate::RuntimeSettings,
 }
 
 impl RuntimeSnapshot {
@@ -312,42 +204,6 @@ impl RuntimeSnapshot {
             definitions.insert(name.to_owned(), parse_node_tag(record)?);
         }
         Ok(definitions)
-    }
-
-    async fn build_tagged_proxies(
-        &self,
-        timeout: Duration,
-    ) -> Result<BTreeMap<String, Arc<dyn AsyncProxy>>> {
-        let definitions = self.node_tag_definitions()?;
-
-        let mut tagged = BTreeMap::new();
-        for (tag, definition) in &definitions {
-            let ids = resolve_node_tag_targets(tag, &definitions, &mut BTreeSet::new());
-            let mut members = Vec::new();
-            let mut seen = BTreeSet::new();
-            for id in ids {
-                if !seen.insert(id.clone()) {
-                    continue;
-                }
-                // Go's node set skips members that cannot be opened and lets
-                // the ordinary route-mode slot handle an empty set. This is
-                // important during a partial node migration or after a node
-                // was disabled without deleting its tag membership.
-                if let Ok(build) = self.build_proxy(&id, timeout).await {
-                    members.push(build.proxy);
-                }
-            }
-            if members.is_empty() {
-                continue;
-            }
-            let proxy = if members.len() == 1 {
-                members.pop().expect("one node tag member was checked")
-            } else {
-                Arc::new(NodeSetProxy::new(members, definition.strategy)?)
-            };
-            tagged.insert(tag.clone(), proxy);
-        }
-        Ok(tagged)
     }
 }
 

@@ -24,8 +24,8 @@ use doradus_core::{BoxFuture, Endpoint, FlowContext, RouteMode};
 use doradus_metrics::{FailureStage, RuntimeMetrics};
 use doradus_store::{
     ConfigStore, GoConnectionHistoryRecord, GoFailedHistoryRecord, GoStatisticsDelta,
-    GoStatisticsSnapshot, GoTelemetryBucketRecord, GoTrafficBucketRecord, InboundStatisticsRecord,
-    TELEMETRY_DAILY_BUCKET_SECONDS, TELEMETRY_HOURLY_BUCKET_SECONDS,
+    GoStatisticsQuery, GoStatisticsSnapshot, GoTelemetryBucketRecord, GoTrafficBucketRecord,
+    InboundStatisticsRecord, TELEMETRY_DAILY_BUCKET_SECONDS, TELEMETRY_HOURLY_BUCKET_SECONDS,
 };
 
 use crate::RuntimeLog;
@@ -180,13 +180,13 @@ impl ConnectionRecord {
 struct ConnectionEntry {
     id: String,
     record: ConnectionRecord,
-    telemetry: Arc<[(String, String)]>,
+    telemetry: Arc<[(Arc<str>, Arc<str>)]>,
 }
 
 #[derive(Debug, Clone)]
 struct TrafficFlowEntry {
-    id: String,
-    telemetry: Arc<[(String, String)]>,
+    id: Arc<str>,
+    telemetry: Arc<[(Arc<str>, Arc<str>)]>,
     inbound_id: Option<Arc<str>>,
     is_tun: bool,
     upload: u64,
@@ -198,13 +198,13 @@ struct MonitorTrafficState {
     total_upload: u64,
     total_download: u64,
     flows: HashMap<TunFlowKey, TrafficFlowEntry>,
-    counters: BTreeMap<String, (u64, u64)>,
-    inbound_bytes: BTreeMap<String, (u64, u64)>,
+    counters: BTreeMap<Arc<str>, (u64, u64)>,
+    inbound_bytes: BTreeMap<Arc<str>, (u64, u64)>,
     buckets: BTreeMap<i64, (u64, u64)>,
-    telemetry: BTreeMap<(String, String), (u64, u64, u64)>,
-    telemetry_buckets: BTreeMap<TelemetryBucketKey, TelemetryBucketValue>,
+    telemetry: BTreeMap<(Arc<str>, Arc<str>), TelemetryBucketValue>,
+    telemetry_buckets: BTreeMap<TrafficTelemetryBucketKey, TelemetryBucketValue>,
     pending_traffic: BTreeMap<i64, (u64, u64)>,
-    pending_telemetry: BTreeMap<TelemetryBucketKey, TelemetryBucketValue>,
+    pending_telemetry: BTreeMap<TrafficTelemetryBucketKey, TelemetryBucketValue>,
 }
 
 #[derive(Debug)]
@@ -247,12 +247,14 @@ impl InboundStatistics {
     }
 }
 
+type TrafficTelemetryBucketKey = (i64, i64, Arc<str>, Arc<str>);
 type TelemetryBucketKey = (i64, i64, String, String);
 type TelemetryBucketValue = (u64, u64, u64);
 
 struct PersistenceState {
     store: ConfigStore,
     dirty: AtomicBool,
+    snapshot_lock: Mutex<()>,
     shutdown: watch::Sender<bool>,
     worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
 }
